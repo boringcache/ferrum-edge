@@ -224,8 +224,13 @@ impl Waf {
         outcome
     }
 
-    pub(super) fn run_request_body_scan(&self, ctx: &RequestContext, body: &[u8]) -> ScanOutcome {
-        self.scan_request_body_rules(ScanSubject::Http(ctx), body)
+    pub(super) fn run_request_body_scan(
+        &self,
+        ctx: &RequestContext,
+        body: &[u8],
+        content_type: Option<&str>,
+    ) -> ScanOutcome {
+        self.scan_request_body_rules(ScanSubject::Http(ctx), body, content_type)
     }
 
     /// Request-side body rule engine, shared by the HTTP final-request-body
@@ -234,6 +239,7 @@ impl Waf {
         &self,
         subject: ScanSubject<'_>,
         body: &[u8],
+        content_type: Option<&str>,
     ) -> ScanOutcome {
         let mut outcome = ScanOutcome::default();
         self.scan_bytes_set(
@@ -246,7 +252,31 @@ impl Waf {
         // normalization cannot rewrite unrelated `+` characters (for example
         // `application/ld+json`) and bypass per-rule `fp_filters`.
         self.scan_json_path_rules(&mut outcome, body, subject);
-        let text = String::from_utf8_lossy(body);
+        // Charset transcoding is needed only when the active pack has request
+        // body-text rules. A pack with only JSON-path rules or body-scoped
+        // encoding specials retains the old raw/lossy path and does no new
+        // per-request work. Eligibility was already decided before this
+        // scanner runs; decoding must never widen the content-type, multipart,
+        // or binary body gates.
+        let utf16_text = self
+            .compiled
+            .request_body_text_rules_active
+            .then(|| normalize::decode_utf16_body(body, content_type))
+            .flatten();
+        let text = utf16_text
+            .as_deref()
+            .map(std::borrow::Cow::Borrowed)
+            .unwrap_or_else(|| String::from_utf8_lossy(body));
+        // The initial bytes scan saw the wire representation. A transcoded
+        // body also needs one scan of its UTF-8 view before layered decoding.
+        if let Some(decoded) = utf16_text.as_deref() {
+            self.scan_bytes_set(
+                &mut outcome,
+                self.compiled.body_bytes.as_ref(),
+                decoded.as_bytes(),
+                subject,
+            );
+        }
         // Re-scan decoded forms so payloads hidden behind JSON `\uXXXX`,
         // HTML entities, or percent-encoding cannot evade the raw-byte set.
         // Lossy UTF-8 keeps one hostile byte from disabling text decoding for

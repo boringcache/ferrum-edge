@@ -52,6 +52,19 @@ fn test_invalid_max_bytes_type_returns_error() {
     assert!(result.err().unwrap().contains("max_bytes"));
 }
 
+#[test]
+fn test_unknown_config_key_max_bytez_is_rejected() {
+    let err = RequestSizeLimiting::new(&json!({
+        "max_bytes": 1024,
+        "max_bytez": 2048
+    }))
+    .err()
+    .expect("typo max_bytez must be rejected");
+    assert!(err.contains("unknown configuration key"), "{err}");
+    assert!(err.contains("max_bytez"), "{err}");
+    assert!(err.contains("did you mean 'max_bytes'?"), "{err}");
+}
+
 // === Content-Length fast path ===
 
 #[tokio::test]

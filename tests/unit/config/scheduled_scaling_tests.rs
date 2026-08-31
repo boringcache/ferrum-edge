@@ -14,13 +14,14 @@ mod scheduled_scaling;
 use scheduled_scaling::{
     ADMIN_BATCH_REQUEST_TIMEOUT_SECS, APPLY_STATUS_WAIT_MS, BATCH_ROLLBACK_NOT_NEEDED,
     BatchApplyCursor, BatchProvisionDecision, CONFIG_CONVERGENCE_MAX_WAIT_SECS,
-    CONFIG_CONVERGENCE_POLL_INTERVAL_SECS, NAMESPACE_FENCE_DEFAULT_RETRY_AFTER_SECS,
-    NAMESPACE_FENCE_MAX_ATTEMPTS, NAMESPACE_FENCE_MAX_BACKOFF_SECS,
-    NAMESPACE_FENCE_MAX_RETRY_AFTER_SECS, NAMESPACE_FENCE_MAX_TOTAL_RETRY_SECS,
-    NAMESPACE_FENCE_RETRY_MESSAGE, SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS,
-    classify_admin_batch_response, documented_batch_rollback_not_needed_body,
-    documented_namespace_fence_body, namespace_fence_backoff, namespace_fence_retry_after_delay,
-    parse_config_cursor_header, scheduled_scaling_admin_jwt_max_ttl_value,
+    CONFIG_CONVERGENCE_POLL_INTERVAL_SECS, MEASUREMENT_WINDOW_MAX_ATTEMPTS,
+    NAMESPACE_FENCE_DEFAULT_RETRY_AFTER_SECS, NAMESPACE_FENCE_MAX_ATTEMPTS,
+    NAMESPACE_FENCE_MAX_BACKOFF_SECS, NAMESPACE_FENCE_MAX_RETRY_AFTER_SECS,
+    NAMESPACE_FENCE_MAX_TOTAL_RETRY_SECS, NAMESPACE_FENCE_RETRY_MESSAGE,
+    SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS, classify_admin_batch_response,
+    documented_batch_rollback_not_needed_body, documented_namespace_fence_body,
+    namespace_fence_backoff, namespace_fence_retry_after_delay, parse_config_cursor_header,
+    scheduled_scaling_admin_jwt_max_ttl_value,
 };
 
 const WORKFLOW: &str = include_str!("../../../.github/workflows/scaling-regression.yml");
@@ -372,6 +373,12 @@ fn both_harnesses_gate_measurement_on_bounded_convergence_not_a_fixed_sleep() {
             "{name} harness must not fall back to a fixed sleep after a failed sample probe"
         );
     }
+
+    assert_eq!(MEASUREMENT_WINDOW_MAX_ATTEMPTS, 2);
+    assert!(SCALE.contains("convergence_interruption.notified()"));
+    assert!(SCALE.contains("r.status() == reqwest::StatusCode::NOT_FOUND"));
+    assert!(SCALE.contains("discarding interrupted measurement window"));
+    assert!(SCALE.contains("Configuration convergence instability interrupted all"));
 }
 
 #[test]

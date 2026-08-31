@@ -28,6 +28,10 @@ use super::utils::size_limit::{
     required_positive_u64,
 };
 use super::{Plugin, PluginResult, RequestContext};
+use crate::util::unknown_keys::reject_unknown_keys;
+
+/// Authoritative closed set of top-level `request_size_limiting` configuration keys.
+const REQUEST_SIZE_LIMITING_CONFIG_KEYS: &[&str] = &["max_bytes"];
 
 pub struct RequestSizeLimiting {
     max_bytes: u64,
@@ -35,9 +39,15 @@ pub struct RequestSizeLimiting {
 
 impl RequestSizeLimiting {
     pub fn new(config: &Value) -> Result<Self, String> {
-        if !config.is_object() {
+        let Some(config_obj) = config.as_object() else {
             return Err("request_size_limiting: config must be an object".to_string());
-        }
+        };
+        reject_unknown_keys(
+            config_obj,
+            "config",
+            REQUEST_SIZE_LIMITING_CONFIG_KEYS,
+            "request_size_limiting: ",
+        )?;
 
         let max_bytes = required_positive_u64(config, "max_bytes", "request_size_limiting")?;
 

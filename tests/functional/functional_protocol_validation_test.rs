@@ -4,10 +4,19 @@
 //! that reflects headers as JSON, then exercises:
 //!
 //! - HTTP/1.0 + `Transfer-Encoding` rejection (RFC 9112 §6.2)
-//! - `Content-Length` + `Transfer-Encoding` smuggling conflict (RFC 9112 §6.1)
+//! - Wire-order-independent `Content-Length` + `Transfer-Encoding` smuggling
+//!   conflict rejection (RFC 9112 §6.1)
 //! - Multiple `Content-Length` with conflicting values
 //! - Non-numeric `Content-Length` (negative, decimal, hex, alpha)
 //! - Multiple `Host` headers (HTTP/1.1)
+//! - HTTP/1.1 missing `Host` (RFC 9112 §3.2.2) — catch-all and host-scoped routes
+//! - HTTP/2 missing both `:authority` and `Host` (RFC 9113 §8.3.1) — catch-all and host-scoped
+//! - HTTP/3 missing both `:authority` and `Host` (RFC 9114 §4.3.1) — raw QPACK in
+//!   `functional_h3_authority_validation_test.rs`; `:authority`-only still served here
+//! - HTTP/2 `:authority`-only (no Host) is still served
+//! - HTTP/2 Extended CONNECT (`:protocol=websocket`) with `:authority` still proceeds
+//! - HTTP/1.0 missing `Host` is still served
+//! - HTTP/1.1 absolute-form request-target without a Host field is still served
 //! - `Host` trailing-dot normalization
 //! - `FERRUM_MAX_HEADER_SIZE_BYTES` total-header rejection on H1
 //! - Configured request header count limits and `0` disable semantics
@@ -217,19 +226,40 @@ fn header_ci<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str>
 /// status line, headers, and body. Used when the request itself must violate
 /// HTTP framing (CL+TE, multi-Host, etc.) — `reqwest` refuses to emit these.
 async fn send_raw_h1(proxy_port: u16, raw: &[u8]) -> RawResponse {
+    send_raw_h1_parts(proxy_port, &[raw]).await
+}
+
+/// Variant of [`send_raw_h1`] that preserves separate client writes. A short
+/// pause between parts makes the gateway observe a partial request head instead
+/// of relying on the kernel to keep adjacent writes separate.
+async fn send_raw_h1_parts(proxy_port: u16, parts: &[&[u8]]) -> RawResponse {
     let stream = TcpStream::connect(("127.0.0.1", proxy_port))
         .await
         .expect("connect to gateway");
     let _ = stream.set_nodelay(true);
     let (read_half, mut write_half) = stream.into_split();
-    write_half.write_all(raw).await.expect("send raw request");
-    write_half.flush().await.expect("flush");
+    for (index, part) in parts.iter().enumerate() {
+        write_half
+            .write_all(part)
+            .await
+            .expect("send raw request part");
+        write_half.flush().await.expect("flush raw request part");
+        if index + 1 < parts.len() {
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
     // NOTE: intentionally NOT calling write_half.shutdown() — a half-close can
     // cause hyper to drop the connection before writing the error response.
     // Reading with a timeout is enough to keep the test bounded.
 
     let mut reader = BufReader::new(read_half);
+    read_raw_h1_response(&mut reader).await
+}
 
+async fn read_raw_h1_response<R>(reader: &mut BufReader<R>) -> RawResponse
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     // Status line (with timeout so malformed requests that the gateway silently
     // drops still fail fast instead of hanging)
     let mut status_line = Vec::new();
@@ -722,23 +752,157 @@ async fn functional_protocol_validation_http10_plus_te_rejected() {
 
 #[ignore]
 #[tokio::test]
-async fn functional_protocol_validation_cl_and_te_rejected() {
+async fn functional_protocol_validation_te_then_cl_rejected_across_wire_shapes() {
     let h = Harness::new(false).await;
 
-    let req = b"POST / HTTP/1.1\r\n\
-                Host: example.com\r\n\
-                Content-Length: 5\r\n\
-                Transfer-Encoding: chunked\r\n\
-                \r\n\
-                0\r\n\r\n";
-    let resp = send_raw_h1(h.proxy_port, req).await;
+    const ERROR_BODY: &str =
+        r#"{"error":"Request contains both Content-Length and Transfer-Encoding headers"}"#;
+    let te_then_cl = b"POST / HTTP/1.1\r\n\
+                       Host: app.example\r\n\
+                       Transfer-Encoding: chunked\r\n\
+                       Content-Length: 6\r\n\
+                       \r\n\
+                       0\r\n\r\n";
 
-    assert_eq!(resp.status_code, 400, "body={}", resp.body);
+    let te_then_cl_resp = send_raw_h1(h.proxy_port, te_then_cl).await;
+    assert_eq!(te_then_cl_resp.status_code, 400);
+    assert_eq!(te_then_cl_resp.body, ERROR_BODY);
+    assert_eq!(raw_header(&te_then_cl_resp, "connection"), Some("close"));
+
+    let cl_then_te = b"POST / HTTP/1.1\r\n\
+                       Host: app.example\r\n\
+                       Content-Length: 6\r\n\
+                       Transfer-Encoding: chunked\r\n\
+                       \r\n\
+                       0\r\n\r\n";
+    let cl_then_te_resp = send_raw_h1(h.proxy_port, cl_then_te).await;
+    assert_eq!(cl_then_te_resp.status_code, 400);
+    assert_eq!(cl_then_te_resp.body, ERROR_BODY);
+    assert_eq!(raw_header(&cl_then_te_resp, "connection"), Some("close"));
+
+    let lowercase_te = b"POST / HTTP/1.1\r\n\
+                         Host: app.example\r\n\
+                         transfer-encoding: chunked\r\n\
+                         Content-Length: 6\r\n\
+                         \r\n\
+                         0\r\n\r\n";
+    let lowercase_resp = send_raw_h1(h.proxy_port, lowercase_te).await;
+    assert_eq!(lowercase_resp.status_code, 400);
+    assert_eq!(lowercase_resp.body, ERROR_BODY);
+
+    let split_one = b"POST / HTTP/1.1\r\nHost: app.example\r\n\
+                      Transfer-Encoding: chunked\r\nContent-Len";
+    let split_two = b"gth: 6\r\n\r\n0\r\n\r\n";
+    let split_resp = send_raw_h1_parts(h.proxy_port, &[split_one, split_two]).await;
+    assert_eq!(split_resp.status_code, 400);
+    assert_eq!(split_resp.body, ERROR_BODY);
+
+    let leading_crlf = b"\r\nPOST / HTTP/1.1\r\n\
+                         Host: app.example\r\n\
+                         Transfer-Encoding: chunked\r\n\
+                         Content-Length: 6\r\n\
+                         \r\n\
+                         0\r\n\r\n";
+    let leading_crlf_resp = send_raw_h1(h.proxy_port, leading_crlf).await;
+    assert_eq!(leading_crlf_resp.status_code, 400);
+    assert_eq!(leading_crlf_resp.body, ERROR_BODY);
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_fixed_body_keeps_framing_aligned() {
+    let h = Harness::new(false).await;
+
+    let cl_only = b"POST / HTTP/1.1\r\n\
+                    Host: app.example\r\n\
+                    Content-Length: 6\r\n\
+                    \r\n\
+                    hello!";
+
+    // The observer must realign after a fixed-length body; otherwise a
+    // keep-alive TE.CL request could still bypass after an ordinary request.
+    let stream = TcpStream::connect(("127.0.0.1", h.proxy_port))
+        .await
+        .expect("connect to gateway");
+    let _ = stream.set_nodelay(true);
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    write_half
+        .write_all(cl_only)
+        .await
+        .expect("send keep-alive CL-only request");
+    write_half.flush().await.expect("flush CL-only request");
+    let first = read_raw_h1_response(&mut reader).await;
+    assert_eq!(first.status_code, 200, "body={}", first.body);
+
+    let te_then_cl = b"POST / HTTP/1.1\r\n\
+                       Host: app.example\r\n\
+                       Transfer-Encoding: chunked\r\n\
+                       Content-Length: 6\r\n\
+                       \r\n\
+                       0\r\n\r\n";
+    write_half
+        .write_all(te_then_cl)
+        .await
+        .expect("send keep-alive TE.CL request");
+    write_half.flush().await.expect("flush TE.CL request");
+    let second = read_raw_h1_response(&mut reader).await;
+    assert_eq!(second.status_code, 400);
+    assert_eq!(
+        second.body,
+        r#"{"error":"Request contains both Content-Length and Transfer-Encoding headers"}"#
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_nonempty_rejected_chunk_closes_pipeline() {
+    let h = Harness::new(false).await;
+
+    const ERROR_BODY: &str =
+        r#"{"error":"Request contains both Content-Length and Transfer-Encoding headers"}"#;
+    let pipelined = b"POST /first HTTP/1.1\r\n\
+                      Host: app.example\r\n\
+                      Transfer-Encoding: chunked\r\n\
+                      Content-Length: 6\r\n\
+                      \r\n\
+                      6\r\nhello!\r\n0\r\n\r\n\
+                      GET /second HTTP/1.1\r\n\
+                      Host: app.example\r\n\
+                      \r\n";
+
+    let stream = TcpStream::connect(("127.0.0.1", h.proxy_port))
+        .await
+        .expect("connect to gateway");
+    let _ = stream.set_nodelay(true);
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    write_half
+        .write_all(pipelined)
+        .await
+        .expect("send pipelined requests");
+    write_half.flush().await.expect("flush pipelined requests");
+
+    let first = read_raw_h1_response(&mut reader).await;
+    assert_eq!(first.status_code, 400);
+    assert_eq!(first.body, ERROR_BODY);
+    assert_eq!(raw_header(&first, "connection"), Some("close"));
+
+    // Hyper can buffer the non-empty DATA frame before the service rejects the
+    // request, then drain the terminating chunk and preserve keep-alive after
+    // the service drops the unread body. RFC 9112 §6.1 requires the explicit
+    // close so the buffered second request is never dispatched.
+    let mut trailing = [0u8; 1];
+    let close_result =
+        tokio::time::timeout(Duration::from_secs(2), reader.read(&mut trailing)).await;
+    let connection_closed = matches!(&close_result, Ok(Ok(0)));
     assert!(
-        resp.body
-            .contains("Request contains both Content-Length and Transfer-Encoding"),
-        "unexpected body: {}",
-        resp.body
+        connection_closed,
+        "expected connection EOF after rejected non-empty chunked body, got {close_result:?}"
     );
 
     h.cleanup();
@@ -819,6 +983,276 @@ async fn functional_protocol_validation_multiple_host_headers_rejected() {
     );
 
     h.cleanup();
+}
+
+// --- 5b. HTTP/1.1 missing Host (RFC 9112 §3.2.2) ---------------------------
+//
+// These tests write literal request bytes over a raw TCP socket so they
+// exercise what hyper's HTTP/1 parser actually hands `check_protocol_headers`.
+// Building a HeaderMap in a unit test cannot reproduce a header that is
+// absent on the wire.
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http11_missing_host_catchall_rejected() {
+    // Catch-all (empty hosts) + `GET /catchall HTTP/1.1` with no Host is the
+    // reported bypass: routing used to skip host tiers and fall through to
+    // the catch-all for a 200. Must be 400 before routing.
+    let h = Harness::new(false).await;
+
+    let req = b"GET /catchall HTTP/1.1\r\n\r\n";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+
+    assert_eq!(resp.status_code, 400, "body={}", resp.body);
+    assert!(
+        resp.body.contains("missing a Host"),
+        "unexpected body: {}",
+        resp.body
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http11_missing_host_host_scoped_rejected() {
+    // Host-scoped route. Previously this was 404 (no host match); after the
+    // guard it must be 400 so omitting Host cannot probe vhost isolation.
+    let h = Harness::new(true).await;
+
+    let req = b"GET / HTTP/1.1\r\n\r\n";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+
+    assert_eq!(resp.status_code, 400, "body={}", resp.body);
+    assert!(
+        resp.body.contains("missing a Host"),
+        "unexpected body: {}",
+        resp.body
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http11_valid_host_still_routes() {
+    let h = Harness::new(true).await;
+
+    let req = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+
+    assert_eq!(resp.status_code, 200, "body={}", resp.body);
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http10_missing_host_not_rejected() {
+    // Host is not required in HTTP/1.0. Catch-all so a Host-less 1.0 request
+    // still has a route and is served rather than 404'd.
+    let h = Harness::new(false).await;
+
+    let req = b"GET / HTTP/1.0\r\n\r\n";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+
+    assert_eq!(
+        resp.status_code, 200,
+        "HTTP/1.0 without Host must still be served; body={}",
+        resp.body
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http11_absolute_form_without_host_not_rejected() {
+    // Absolute-form request-target carries the authority. Must not be
+    // rejected as missing Host, and must still reach the host-scoped route.
+    let h = Harness::new(true).await;
+
+    let req = b"GET http://example.com/ HTTP/1.1\r\n\r\n";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+
+    assert_eq!(
+        resp.status_code, 200,
+        "absolute-form without Host must still route; body={}",
+        resp.body
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http11_empty_host_rejected() {
+    // `Host:` with no tokens is present but empty — invalid field value.
+    let h = Harness::new(false).await;
+
+    let req = b"GET / HTTP/1.1\r\nHost:\r\n\r\n";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+
+    assert_eq!(resp.status_code, 400, "body={}", resp.body);
+
+    h.cleanup();
+}
+
+// --- 5c. HTTP/2 missing `:authority` and Host (RFC 9113 §8.3.1) ------------
+//
+// hyper's H2 encoder omits `:authority` when the request URI is origin-form
+// (`/path`) and no Host header is set. That is the wire shape that used to
+// skip host routing tiers and fall through to a catch-all. HeaderMap unit
+// tests cannot reproduce it.
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http2_missing_authority_and_host_catchall_rejected() {
+    let h = Harness::new(false).await;
+
+    let (status, body) = send_h2_get(h.proxy_port, "/catchall", &[]).await;
+
+    assert_eq!(status, 400, "body={body}");
+    assert!(
+        body.contains("missing both :authority and Host"),
+        "unexpected body: {body}"
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http2_missing_authority_and_host_host_scoped_rejected() {
+    let h = Harness::new(true).await;
+
+    let (status, body) = send_h2_get(h.proxy_port, "/", &[]).await;
+
+    assert_eq!(status, 400, "body={body}");
+    assert!(
+        body.contains("missing both :authority and Host"),
+        "unexpected body: {body}"
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http2_authority_only_still_routes() {
+    let h = Harness::new(true).await;
+
+    let (status, body) = send_h2_get(h.proxy_port, "http://example.com/", &[]).await;
+
+    assert_eq!(
+        status, 200,
+        "`:authority`-only H2 request must still route; body={body}"
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http2_extended_connect_websocket_authority_only() {
+    // RFC 8441 Extended CONNECT carries `:authority` (absolute-form URI) and
+    // typically omits Host. The both-absent reject must not fire; this
+    // catch-all HTTP echo is not a WebSocket backend, so we only assert we
+    // got past the authority check. Full echo coverage lives in
+    // `test_h2_websocket_extended_connect_echo`.
+    let h = Harness::new(false).await;
+
+    let mut req = Request::builder()
+        .method("CONNECT")
+        .version(hyper::Version::HTTP_2)
+        .uri("http://example.com/")
+        .header("sec-websocket-version", "13")
+        .body(Full::new(Bytes::new()))
+        .expect("build H2 Extended CONNECT");
+    req.extensions_mut()
+        .insert(hyper::ext::Protocol::from_static("websocket"));
+    let (status, body_str, _headers) =
+        send_h2_prior_knowledge_with_headers(h.proxy_port, req, "CONNECT websocket").await;
+
+    assert!(
+        !body_str.contains("missing both :authority and Host"),
+        "Extended CONNECT with :authority must not trip the both-absent reject; status={status} body={body_str}"
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http3_authority_only_still_routes() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let (mut gateway, https_port) = start_h3_validation_gateway(echo_port, &[]).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{https_port}/");
+    // HostHeader::Auto (default): only `:authority`, no explicit Host.
+    let resp = h3_get_with_startup_retry(&client, &url, GetOptions::default()).await;
+
+    assert_eq!(
+        resp.status.as_u16(),
+        200,
+        "`:authority`-only H3 request must still route; body={}",
+        resp.body_text()
+    );
+
+    gateway.shutdown();
+    echo_task.abort();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http3_extended_connect_websocket_authority_only() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let (mut gateway, https_port) = start_h3_validation_gateway(echo_port, &[]).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{https_port}/");
+    let mut last_err = None;
+    let resp = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(40);
+        loop {
+            match client
+                .extended_connect(&url, h3::ext::Protocol::WEB_SOCKET)
+                .await
+            {
+                Ok(resp) => break resp,
+                Err(err) if std::time::Instant::now() < deadline => {
+                    last_err = Some(err.to_string());
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => {
+                    panic!(
+                        "H3 Extended CONNECT websocket request did not complete; last startup error={last_err:?}; final error={err}"
+                    );
+                }
+            }
+        }
+    };
+
+    assert!(
+        !resp
+            .body_text()
+            .contains("missing both :authority and Host"),
+        "H3 Extended CONNECT with :authority must not trip the both-absent reject; status={} body={}",
+        resp.status.as_u16(),
+        resp.body_text()
+    );
+
+    gateway.shutdown();
+    echo_task.abort();
 }
 
 // --- 6. Host trailing dot normalizes ---------------------------------------

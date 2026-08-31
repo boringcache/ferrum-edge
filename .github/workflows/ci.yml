@@ -854,6 +854,7 @@ jobs:
               integration::audit_retention_tests
               integration::admin_backend_capabilities_tests
               integration::admin_batch_atomicity_tests
+              integration::admin_batch_reference_check_tests
               integration::admin_runtime_metrics_tests
               integration::admin_observability_auth_tests
               integration::admin_metrics_tls_inventory_snapshot_tests
@@ -2211,6 +2212,9 @@ jobs:
             --namespace ferrum \
             --set observability.enabled=true \
             --set observability.alerts.enabled=true \
+            --set observability.metrics.allowedCidrs=10.0.0.0/8 \
+            --set observability.metrics.serviceMonitor.enabled=false \
+            --set observability.metrics.podMonitor.enabled=false \
             > "$RUNNER_TEMP/ferrum-helm-results/prometheus-rule-rendered.yaml"
           python3 -I .github/scripts/extract_rendered_prometheus_rules.py \
             "$RUNNER_TEMP/ferrum-helm-results/prometheus-rule-rendered.yaml" \
@@ -3040,7 +3044,300 @@ jobs:
             --set nodeAgent.proxyMode=node_waypoint \
             --set-string nodeAgent.admin.port=19090 \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-waypoint.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set injector.enabled=true \
+            --set injector.tls.secretName=ferrum-mesh-injector-tls \
+            --set injector.probes.startup.override.exec.command[0]=/bin/startup-inj \
+            --set ca.enabled=true \
+            --set ca.probes.startup.override.exec.command[0]=/bin/startup-ca \
+            --set eastWest.enabled=true \
+            --set eastWest.probes.startup.override.exec.command[0]=/bin/startup-ew \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set ambient.probes.startup.override.exec.command[0]=/bin/startup-amb \
+            --set controlPlane.probes.startup.override.exec.command[0]=/bin/startup-cp \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-startup-overrides.yaml"
           python3 -I .github/scripts/verify_mesh_workload_probes.py \
+            --results-dir "$RUNNER_TEMP/ferrum-helm-results"
+          # Mesh production-readiness (#4266/#4267/#4288): helm stays in this
+          # trusted workflow shell; assertions live in
+          # verify_mesh_production_readiness.py so the ARM64 build-policy gate
+          # does not freeze PodSpec/monitor-shape edits here.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set controlPlane.terminationGracePeriodSeconds=35 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-low-grace.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-low-grace.err"; then
+            echo "::error title=Under-budget mesh grace accepted::controlPlane.terminationGracePeriodSeconds must cover preStop + full shutdown budget"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --kube-version 1.28.0 \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-kube-1.28.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-kube-1.28.err"; then
+            echo "::error title=SleepAction accepted on Kubernetes 1.28::preStop.sleep requires 1.29+ or shutdownPreStopSeconds=0"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set controlPlane.shutdownDrainSeconds=0 \
+            --set controlPlane.shutdownPreStopSeconds=0 \
+            --set controlPlane.terminationGracePeriodSeconds=25 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-zero-drain.yaml"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set controlPlane.resources.requests.cpu= \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-empty-resources.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-empty-resources.err"; then
+            echo "::error title=Empty mesh resources accepted::serving requests.cpu/memory must be non-empty"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set observability.enabled=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-no-cred.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-no-cred.err"; then
+            echo "::error title=Observability without scrape credential accepted::alerts/monitors must fail closed without bearer or allowedCidrs"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set observability.enabled=true \
+            --set observability.metrics.bearerToken.value=lab-only-not-a-secret \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-inline-bearer.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-inline-bearer.err"; then
+            echo "::error title=Inline metrics bearer accepted for ServiceMonitor::monitors without allowedCidrs need existingSecret.name"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ca.enabled=true \
+            --set eastWest.enabled=true \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set injector.enabled=true \
+            --set injector.tls.secretName=ferrum-mesh-injector-tls \
+            --set observability.enabled=true \
+            --set-string 'observability.metrics.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
+            --set controlPlane.admin.bindAddress=0.0.0.0 \
+            --set-string 'controlPlane.admin.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
+            --set ca.admin.bindAddress=0.0.0.0 \
+            --set-string 'ca.admin.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
+            --set eastWest.admin.bindAddress=0.0.0.0 \
+            --set ambient.admin.bindAddress=0.0.0.0 \
+            --set nodeAgent.admin.bindAddress=0.0.0.0 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs.yaml"
+          # Strict admin/metrics IP+CIDR validation ported from ferrum-gateway.
+          # Each of these renders cleanly under a permissive approximation and
+          # then CrashLoops (or has the admin accept loop silently drop the
+          # in-pod exec probes), so every one must fail at render.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.admin.bindAddress=0.0.0.0 \
+            --set-string 'controlPlane.admin.allowedCidrs=10.0.0.0/8\,10.0.0.300/24' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-bad-cidr.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-bad-cidr.err"; then
+            echo "::error title=Malformed admin CIDR accepted::CidrSet::parse_strict rejects 10.0.0.300/24 at startup"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.admin.bindAddress=0.0.0.0 \
+            --set-string 'controlPlane.admin.allowedCidrs=0.0.0.0/0' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-catchall-cidr.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-catchall-cidr.err"; then
+            echo "::error title=Catch-all admin allowlist accepted::a full-family allowlist is not plaintext protection for cp/ca"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.admin.bindAddress=localhost \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-hostname-bind.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-hostname-bind.err"; then
+            echo "::error title=Hostname admin bind accepted::FERRUM_ADMIN_BIND_ADDRESS must be an IP literal"
+            exit 1
+          fi
+          # IPv6 wildcard bind with an IPv4-only loopback allowlist: the computed
+          # exec probes dial ::1 and the admin TCP allowlist drops them.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.admin.bindAddress=:: \
+            --set-string 'controlPlane.admin.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-probe-family.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-probe-family.err"; then
+            echo "::error title=Probe-source family mismatch accepted::an IPv6 wildcard bind probes from ::1, not 127.0.0.1"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set observability.enabled=true \
+            --set-string 'observability.metrics.allowedCidrs=10.0.0.300/24' \
+            --set observability.metrics.serviceMonitor.enabled=false \
+            --set observability.metrics.podMonitor.enabled=false \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-bad-metrics-cidr.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-bad-metrics-cidr.err"; then
+            echo "::error title=Malformed metrics CIDR accepted::FERRUM_METRICS_ALLOWED_CIDRS is parsed strictly too"
+            exit 1
+          fi
+          # An enabled computed probe with no usable handler must fail rather
+          # than render a PodSpec that silently omits drain-aware readiness.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set eastWest.enabled=true \
+            --set eastWest.admin.httpPort=0 \
+            --set-string 'eastWest.probes.liveness.override.tcpSocket.port=tls-passthru' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-missing-ready-handler.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-missing-ready-handler.err"; then
+            echo "::error title=Handler-less readiness accepted::renderProbes would silently omit east-west readiness"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set-string 'ambient.securityContext.capabilities.drop[0]=NET_BIND_SERVICE' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-drop.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-drop.err"; then
+            echo "::error title=Narrowed ambient capability drop accepted::ambient must keep drop ALL"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --skip-schema-validation \
+            --set-json 'ambient.securityContext.capabilities.drop=[]' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-drop-empty.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-drop-empty.err"; then
+            echo "::error title=Empty ambient capability drop accepted::drop [] must not become [ALL]"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --skip-schema-validation \
+            --set-string 'ambient.securityContext.capabilities.add[0]=*' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-add-malformed.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-add-malformed.err"; then
+            echo "::error title=Malformed ambient capability add accepted::capability names must match the Linux grammar"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set-string 'ambient.securityContext.capabilities.add[0]=ALL' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-add-all.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-add-all.err"; then
+            echo "::error title=Ambient capabilities.add ALL accepted::add ALL re-grants every capability after drop ALL"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --skip-schema-validation \
+            --set-string 'ambient.securityContext.capabilities.add[0]=CAP_ALL' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-add-cap-all.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-add-cap-all.err"; then
+            echo "::error title=Ambient capabilities.add CAP_ALL accepted::CAP_ALL normalizes to ALL and must fail closed even with --skip-schema-validation"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set-string 'ambient.securityContext.runAsUser=1000' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-unknown-sc.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-unknown-sc.err"; then
+            echo "::error title=Unsupported ambient securityContext key accepted::the template never reads it; the schema must reject it"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.admin.bindAddress=0.0.0.0 \
+            --set-string 'controlPlane.admin.allowedCidrs=::ffff:0.0.0.0/96' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-mapped-catchall.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-mapped-catchall.err"; then
+            echo "::error title=Mapped IPv6 /96 catch-all accepted::a mapped /96 canonicalizes to IPv4 /0"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.admin.bindAddress=0.0.0.0 \
+            --set-string 'controlPlane.admin.allowedCidrs=::ffff:127.0.0.1' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-mapped-bare.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.admin.bindAddress=0.0.0.0 \
+            --set-string 'controlPlane.admin.allowedCidrs=::ffff:127.0.0.1/128' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-mapped-cidr-host.yaml"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.admin.bindAddress=::ffff:127.0.0.2 \
+            --set-string 'controlPlane.admin.allowedCidrs=::ffff:127.0.0.2' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-mapped-loopback-probe.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-mapped-loopback-probe.err"; then
+            echo "::error title=Mapped loopback probe source not canonicalized::::ffff:127.0.0.2 must probe from 127.0.0.1"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.admin.bindAddress=::ffff:127.0.0.2 \
+            --set-string 'controlPlane.admin.allowedCidrs=127.0.0.1/32' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-mapped-loopback-probe-ok.yaml"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set ambient.admin.httpPort=0 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-admin-port0.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-admin-port0.err"; then
+            echo "::error title=Ambient admin-port-zero probes omitted::enabled computed probes must fail closed"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set ambient.admin.httpPort=0 \
+            --set ambient.probes.startup.enabled=false \
+            --set ambient.probes.liveness.enabled=false \
+            --set ambient.probes.readiness.enabled=false \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-admin-port0-disabled.yaml"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.env.FERRUM_ALLOW_INSECURE_ADMIN_HTTP=not-a-bool \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-bad-admin-bool.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-bad-admin-bool.err"; then
+            echo "::error title=Invalid admin insecure-http boolean accepted::EnvConfig rejects non-boolean FERRUM_ALLOW_INSECURE_ADMIN_HTTP at startup"
+            exit 1
+          fi
+          # Valid narrow IPv6 allowlist covering the IPv6 probe source, plus the
+          # <1.29 pre-drain remediation on a cp-mode workload and an ambient
+          # capabilities.add merge, must all render.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set-string 'ambient.securityContext.capabilities.add[0]=SYS_RESOURCE' \
+            --set-string controlPlane.admin.bindAddress=:: \
+            --set-string 'controlPlane.admin.allowedCidrs=fd00::/8\,::1/128' \
+            --set controlPlane.shutdownPreStopSeconds=0 \
+            --set controlPlane.shutdownPreDrainSeconds=30 \
+            --set controlPlane.terminationGracePeriodSeconds=115 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-narrow-ipv6.yaml"
+          # A <workload>.env-supplied admin key must still reach the container.
+          # ferrum-mesh.adminEnv is the sole renderer of the four admin keys and
+          # the workload env loops filter them, so a resolver that skipped an
+          # env-supplied value would drop it from the PodSpec entirely.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.env.FERRUM_ADMIN_HTTP_PORT=19000 \
+            --set-string controlPlane.env.FERRUM_ADMIN_BIND_ADDRESS=0.0.0.0 \
+            --set-string controlPlane.env.FERRUM_ADMIN_ALLOWED_CIDRS=127.0.0.0/8 \
+            --set-string controlPlane.env.FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-admin-env-override.yaml"
+          python3 -I .github/scripts/verify_mesh_production_readiness.py \
             --results-dir "$RUNNER_TEMP/ferrum-helm-results"
 
       - name: Core gateway chart static validation
@@ -3127,6 +3424,41 @@ jobs:
           grep -Fq 'name: FERRUM_DP_CP_GRPC_URLS' "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-rendered.yaml"
           grep -Fq 'http://ferrum-cp-ferrum-gateway-grpc.ferrum.svc:50051' "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-rendered.yaml"
           grep -Fq 'name: ferrum-cp-ferrum-gateway-grpc' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-rendered.yaml"
+          # Issue #4384: mode=cp must disable the in-cluster K8s controller (the
+          # binary defaults it on inside a pod) because this chart renders no
+          # ClusterRole. Opt-in must fail and point at ferrum-mesh; env cannot
+          # re-enable the watches because the names are reserved.
+          if ! grep -A1 'name: FERRUM_K8S_CONTROLLER_ENABLED' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-rendered.yaml" | grep -Fq 'value: "false"'; then
+            echo "::error title=Gateway CP left K8s controller default-on::mode=cp must render FERRUM_K8S_CONTROLLER_ENABLED=false"
+            exit 1
+          fi
+          if ! grep -A1 'name: FERRUM_K8S_POD_DISCOVERY_ENABLED' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-rendered.yaml" | grep -Fq 'value: "false"'; then
+            echo "::error title=Gateway CP left pod discovery default-on::mode=cp must render FERRUM_K8S_POD_DISCOVERY_ENABLED=false"
+            exit 1
+          fi
+          if grep -E '^kind: (ClusterRole|ClusterRoleBinding|Role|RoleBinding)$' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-rendered.yaml"; then
+            echo "::error title=Gateway CP must not render controller RBAC::ferrum-mesh is the designated Kubernetes CRD controller"
+            exit 1
+          fi
+          if helm template ferrum-cp ./charts/ferrum-gateway --namespace ferrum \
+            -f ./charts/ferrum-gateway/examples/cp-values.yaml \
+            --set k8sController.enabled=true \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/k8s-controller-opt-in.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/k8s-controller-opt-in.err"; then
+            echo "::error title=k8sController.enabled=true rendered successfully::must fail and point at ferrum-mesh rather than ship an un-granted controller"
+            exit 1
+          fi
+          grep -F 'k8sController.enabled=true is not supported' "$RUNNER_TEMP/ferrum-gateway-helm-results/k8s-controller-opt-in.err"
+          grep -F 'ferrum-mesh' "$RUNNER_TEMP/ferrum-gateway-helm-results/k8s-controller-opt-in.err"
+          if helm template ferrum-cp ./charts/ferrum-gateway --namespace ferrum \
+            -f ./charts/ferrum-gateway/examples/cp-values.yaml \
+            --set env.FERRUM_K8S_CONTROLLER_ENABLED=true \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/k8s-controller-env.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/k8s-controller-env.err"; then
+            echo "::error title=env.FERRUM_K8S_CONTROLLER_ENABLED rendered successfully::reserved first-class env must reject re-enabling the controller"
+            exit 1
+          fi
+          grep -F 'env.FERRUM_K8S_CONTROLLER_ENABLED is managed by first-class chart values' "$RUNNER_TEMP/ferrum-gateway-helm-results/k8s-controller-env.err"
           long_name="$(printf 'a%.0s' {1..63})"
           helm template ferrum-cp ./charts/ferrum-gateway --namespace ferrum \
             -f ./charts/ferrum-gateway/examples/cp-values.yaml \
@@ -4315,6 +4647,42 @@ jobs:
             "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-prom-rule-rendered.yaml" \
             "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-prometheus-rules.yaml"
           promtool check rules "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-prometheus-rules.yaml"
+          # Issue #4289: database poll freshness must not render in file/dp modes.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set metrics.enabled=true \
+            --set metrics.serviceMonitor.enabled=false \
+            --set metrics.allowedCidrs=10.0.0.0/8 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-file.yaml"
+          if grep -Fq 'FerrumGatewayDatabasePollStale' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-file.yaml"; then
+            echo "::error title=Database poll alert in file mode::FerrumGatewayDatabasePollStale must not render when mode=file"
+            exit 1
+          fi
+          if grep -Fq 'absent(ferrum_database_poll_' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-file.yaml"; then
+            echo "::error title=Database poll absent() in file mode::absent(ferrum_database_poll_*) must not render when mode=file"
+            exit 1
+          fi
+          helm template ferrum-dp ./charts/ferrum-gateway --namespace ferrum \
+            -f ./charts/ferrum-gateway/examples/dp-values.yaml \
+            --set metrics.enabled=true \
+            --set metrics.serviceMonitor.enabled=false \
+            --set metrics.allowedCidrs=10.0.0.0/8 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-dp.yaml"
+          if grep -Fq 'FerrumGatewayDatabasePollStale' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-dp.yaml"; then
+            echo "::error title=Database poll alert in dp mode::FerrumGatewayDatabasePollStale must not render when mode=dp"
+            exit 1
+          fi
+          helm template ferrum-db ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=database \
+            --set database.type=sqlite \
+            --set metrics.enabled=true \
+            --set metrics.serviceMonitor.enabled=false \
+            --set metrics.allowedCidrs=10.0.0.0/8 \
+            --set admin.jwtSecret.existingSecret.name=ferrum-gateway-credentials \
+            --set database.existingSecret.name=ferrum-db \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-database.yaml"
+          grep -Fq 'FerrumGatewayDatabasePollStale' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-database.yaml"
+          grep -Fq 'ferrum_database_poll_last_completed_timestamp_seconds' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-database.yaml"
+          grep -Fq 'FerrumGatewayOverloadSheddingActive' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-file.yaml"
           # DOC-02: migrate is an external Job workflow, not a chart mode and not
           # redirected to ferrum-mesh. mesh-family modes still point at ferrum-mesh.
           # helm stays in this trusted workflow shell; the automation script only
@@ -5903,9 +6271,33 @@ jobs:
         if: github.event_name == 'pull_request' || (github.event_name == 'merge_group' && runner.os != 'macOS')
         run: cargo build --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
 
+      # Every target except x86_64 GNU is compiled natively on its runner.
+      # The x86_64 GNU cell is deliberately excluded: `ubuntu-latest` is a
+      # moving image whose glibc would define the published runtime floor,
+      # which is exactly the defect issue #4301 fixes.
       - name: Build release binary
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && matrix.target != 'x86_64-unknown-linux-gnu'
         run: cargo build --features cloud-secrets --release --target ${{ matrix.target }}
+
+      # Canonical x86_64 GNU producer for the moving `latest` prerelease. The
+      # digest-pinned AlmaLinux 8.10 sysroot links against glibc 2.28, below
+      # the declared GLIBC_2.34 floor, and writes into an isolated
+      # CARGO_TARGET_DIR before copying the two regular files to
+      # `target/x86_64-unknown-linux-gnu/release/`. `Prepare release assets`
+      # below therefore publishes these exact bytes as
+      # `binary-x86_64-unknown-linux-gnu`; there is no second build.
+      - name: Build x86_64 GNU release binaries in the pinned sysroot
+        if: github.event_name == 'push' && matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          LINUX_GNU_TARGET: x86_64-unknown-linux-gnu
+          LINUX_GNU_FEATURES: cloud-secrets
+          LINUX_GNU_PROFILE: release
+        run: |
+          set -euo pipefail
+          python3 -I .github/scripts/verify_linux_gnu_abi.py --self-test
+          python3 -I .github/scripts/verify_linux_gnu_abi.py --check-contract
+          python3 -I .github/scripts/smoke_linux_gnu_baseline.py --self-test
+          bash .github/scripts/build_linux_gnu_sysroot.sh
 
       - name: Report sccache stats
         if: always()
@@ -5947,6 +6339,34 @@ jobs:
             fi
             cat "$asset.sha256"
           done
+
+      # Fail closed on the exact bytes that are about to be uploaded. The
+      # checksum re-verification proves the scanned and smoked files are the
+      # same bytes the `.sha256` sidecars and the `latest` prerelease
+      # advertise. Both steps run before `Upload artifacts`, so a floor
+      # violation means the canonical artifact never exists and every
+      # downstream consumer (`latest-release`, `docker`, `docker-manifest`)
+      # fails closed with it.
+      - name: Re-verify the staged x86_64 GNU asset checksums
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        working-directory: release-assets
+        run: |
+          set -euo pipefail
+          sha256sum -c ferrum-edge-linux-x86_64.sha256
+          sha256sum -c ferrum-cni-linux-x86_64.sha256
+
+      - name: Verify published x86_64 GNU ABI floor and oldest baselines
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I .github/scripts/verify_linux_gnu_abi.py \
+            release-assets/ferrum-edge-linux-x86_64 \
+            release-assets/ferrum-cni-linux-x86_64
+          bash .github/scripts/smoke_linux_gnu_baseline.sh \
+            --edge release-assets/ferrum-edge-linux-x86_64 \
+            --cni release-assets/ferrum-cni-linux-x86_64
 
       - name: Upload artifacts
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -6306,6 +6726,172 @@ jobs:
             --prerelease \
             --target "${{ github.sha }}" \
             release-assets/*
+
+  verify-latest-linux-gnu-abi-aarch64:
+    name: Verify latest Linux GNU ABI (aarch64)
+    # x86_64 GNU is scanned and smoked inside its producer job
+    # (`build-binaries`) on the exact bytes it uploads, so it is NOT rebuilt
+    # here. ARM64 is produced by the trusted-policy-frozen Cross job, whose
+    # text no pull request may change, so its actual uploaded artifact is
+    # downloaded, checksum-verified, and scanned here instead.
+    needs: build-arm64-cross
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Download ARM64 GNU artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: binary-aarch64-unknown-linux-gnu
+          path: gnu-artifacts
+
+      - name: Verify the published ARM64 artifact checksums
+        working-directory: gnu-artifacts
+        run: |
+          set -euo pipefail
+          sha256sum -c ferrum-edge-linux-aarch64.sha256
+          sha256sum -c ferrum-cni-linux-aarch64.sha256
+          chmod +x ferrum-edge-linux-aarch64 ferrum-cni-linux-aarch64
+
+      - name: Verify the ABI floor and oldest baselines
+        run: |
+          set -euo pipefail
+          python3 -I .github/scripts/verify_linux_gnu_abi.py --self-test
+          python3 -I .github/scripts/verify_linux_gnu_abi.py --check-contract
+          python3 -I .github/scripts/smoke_linux_gnu_baseline.py --self-test
+          python3 -I .github/scripts/verify_linux_gnu_abi.py \
+            gnu-artifacts/ferrum-edge-linux-aarch64 \
+            gnu-artifacts/ferrum-cni-linux-aarch64
+          bash .github/scripts/smoke_linux_gnu_baseline.sh \
+            --edge gnu-artifacts/ferrum-edge-linux-aarch64 \
+            --cni gnu-artifacts/ferrum-cni-linux-aarch64
+
+  linux-gnu-abi-latest-gate:
+    name: Gate latest release on Linux GNU ABI
+    # ARM64 ONLY. The x86_64 GNU floor is enforced inside the producer job
+    # before its artifact exists, so no post-publication step is involved in
+    # it. ARM64 is built by the trusted-policy-frozen Cross job and consumed
+    # by frozen `latest-release`/`docker` needs, neither of which a pull
+    # request may edit, so its actual-artifact scan can only join after
+    # publication. A `latest` release is deleted only when it is proven to
+    # target the current GITHUB_SHA, so a failed publisher cannot retract an
+    # older known-good `latest`.
+    needs: [latest-release, verify-latest-linux-gnu-abi-aarch64]
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Require GNU ABI success and retract unverified current latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST_RESULT: ${{ needs.latest-release.result }}
+          ABI_RESULT: ${{ needs.verify-latest-linux-gnu-abi-aarch64.result }}
+        run: |
+          set -euo pipefail
+
+          latest_targets_current_sha() {
+            local payload tag_name target prerelease ref_json object_type object_sha
+            payload="$(gh release view latest --repo "$GITHUB_REPOSITORY" --json tagName,targetCommitish,isPrerelease)"
+            tag_name="$(jq -r .tagName <<<"$payload")"
+            target="$(jq -r .targetCommitish <<<"$payload")"
+            prerelease="$(jq -r .isPrerelease <<<"$payload")"
+            if [ "$tag_name" != "latest" ] || [ "$prerelease" != "true" ]; then
+              return 1
+            fi
+            if [ "$target" = "$GITHUB_SHA" ]; then
+              return 0
+            fi
+            ref_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/latest")"
+            object_type="$(jq -r .object.type <<<"$ref_json")"
+            object_sha="$(jq -r .object.sha <<<"$ref_json")"
+            if [ "$object_type" = "tag" ]; then
+              object_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}" --jq .object.sha)"
+            fi
+            [ "$object_sha" = "$GITHUB_SHA" ]
+          }
+
+          if [ "$ABI_RESULT" != "success" ]; then
+            if gh release view latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              if latest_targets_current_sha; then
+                gh release delete latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+                echo "Deleted latest prerelease because it targeted ${GITHUB_SHA} and verify-latest-linux-gnu-abi-aarch64 did not succeed (result=${ABI_RESULT})"
+              else
+                echo "Leaving latest in place; it does not target current ${GITHUB_SHA}"
+              fi
+            fi
+            echo "::error::latest publication is blocked until verify-latest-linux-gnu-abi-aarch64 succeeds (result=${ABI_RESULT})"
+            exit 1
+          fi
+
+          if [ "$LATEST_RESULT" != "success" ]; then
+            echo "::error::latest-release did not succeed (result=${LATEST_RESULT})"
+            exit 1
+          fi
+
+          echo "latest prerelease remains published after successful Linux GNU ABI verification of ${GITHUB_SHA}"
+
+  verify-pr-linux-gnu-abi:
+    name: Verify PR Linux GNU ABI
+    # Pre-merge regression signal for the GNU runtime floor (issue #4301).
+    # Pull requests publish nothing, so no producer artifact exists to scan;
+    # this job runs the SAME pinned sysroot builder the publishing producers
+    # (`build-binaries` on main-push, `build-release-binaries` on tags) run,
+    # and scans its outputs. It is a check, not a publication input: nothing
+    # downstream consumes it.
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      LINUX_GNU_SYSROOT_IMAGE: almalinux@sha256:4a87d2615a770506e204c27d6248ac97f4df67f4e41e2e9c47c81f0ed0be98cb
+      LINUX_GNU_SMOKE_FLOOR_IMAGE: almalinux@sha256:1c718a4cd7bab3bdb069ddbbd1eb593a390e6932d51d0048a2f6556303bafba7
+      LINUX_GNU_SMOKE_UBUNTU2204_IMAGE: ubuntu@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc
+      LINUX_GNU_PROTOC_SHA256: ed8fca87a11c888fed329d6a59c34c7d436165f662a2c875246ddb1ac2b6dd50
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Build Linux GNU release binaries in the pinned sysroot
+        env:
+          LINUX_GNU_TARGET: x86_64-unknown-linux-gnu
+          LINUX_GNU_FEATURES: cloud-secrets
+          LINUX_GNU_PROFILE: release
+          LIBZ_SYS_STATIC: "1"
+          LINUX_GNU_SYSROOT_IMAGE: almalinux@sha256:4a87d2615a770506e204c27d6248ac97f4df67f4e41e2e9c47c81f0ed0be98cb
+          LINUX_GNU_PROTOC_SHA256: ed8fca87a11c888fed329d6a59c34c7d436165f662a2c875246ddb1ac2b6dd50
+        run: |
+          set -euo pipefail
+          export LIBZ_SYS_STATIC=1
+          python3 -I .github/scripts/verify_linux_gnu_abi.py --self-test
+          python3 -I .github/scripts/verify_linux_gnu_abi.py --check-contract
+          python3 -I .github/scripts/smoke_linux_gnu_baseline.py --self-test
+          bash .github/scripts/build_linux_gnu_sysroot.sh
+
+      - name: Scan Linux GNU ABI and smoke oldest baselines
+        run: |
+          set -euo pipefail
+          python3 -I .github/scripts/verify_linux_gnu_abi.py \
+            target/x86_64-unknown-linux-gnu/release/ferrum-edge \
+            target/x86_64-unknown-linux-gnu/release/ferrum-cni
+          bash .github/scripts/smoke_linux_gnu_baseline.sh \
+            --edge target/x86_64-unknown-linux-gnu/release/ferrum-edge \
+            --cni target/x86_64-unknown-linux-gnu/release/ferrum-cni
 
   docker:
     name: Docker (${{ matrix.platform }})

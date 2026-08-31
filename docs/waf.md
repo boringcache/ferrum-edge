@@ -14,7 +14,9 @@ concerns are handled by dedicated layers and the WAF does not duplicate them:
 
 | Concern | Handled by |
 | --- | --- |
-| Request smuggling (CL/TE conflicts, duplicate Content-Length) | core proxy `check_protocol_headers()` + hyper strict parsing |
+| Missing or empty HTTP/1.1 `Host` (RFC 9112 §3.2.2) | core proxy `check_protocol_headers()` (HTTP/1.0 and absolute-form URI authority are not rejected; HTTP/2/3 `:authority` is `check_host_authority_consistency()`) |
+| Request smuggling (CL/TE conflicts, duplicate Content-Length) | bounded proxy-frontend HTTP/1 wire framing guard + core proxy `check_protocol_headers()` + Hyper parsing |
+| Missing both HTTP/2 and HTTP/3 `:authority` and `Host` (RFC 9113 §8.3.1 / RFC 9114 §4.3.1) | core proxy `check_host_authority_consistency()` (`:authority`-only and Host-only remain valid; Extended CONNECT is `:authority`-only) |
 | Header/URI/body size limits | `FERRUM_MAX_*` env vars, `request_size_limiting` |
 | Authentication / authorization | auth plugins, `access_control`, `mesh_authz`, `opa` |
 | Rate limiting / flooding | `rate_limiting`, `*_rate_limiting` |
@@ -22,6 +24,16 @@ concerns are handled by dedicated layers and the WAF does not duplicate them:
 | Bot / IP / geo filtering | `bot_detection`, `ip_restriction`, `geo_restriction` |
 | Backend SSRF allow/deny | `FERRUM_BACKEND_ALLOW_IPS` + `FERRUM_BACKEND_ALLOW_CIDRS` / `FERRUM_BACKEND_DENY_CIDRS` (metadata/link-local/multicast blocked by default) |
 | Response security headers | `security_headers` |
+
+On plaintext and TLS proxy frontends, HTTP/1 requests that carry both
+`Content-Length` and `Transfer-Encoding` are rejected with `400` and the client
+connection is closed, independently of field order or casing. Enforcement
+starts in the proxy frontend I/O adapter, which observes each bounded raw
+request head before Hyper applies transfer-coding precedence, and finishes in
+the shared `check_protocol_headers()` rejection path before routing. The admin
+and injector HTTP listeners do not use this adapter. HTTP/2 and HTTP/3 do not
+use this wire observer; their existing protocol-specific TE validation is
+unchanged.
 
 The WAF focuses on injection and disclosure signatures: SQLi, NoSQLi, command
 injection, XSS, SSTI, JNDI/Log4Shell, path traversal, LFI, RFI, SSRF, XXE,
@@ -121,15 +133,26 @@ cost of more false positives. Loud rules retuned to `paranoia_min: 2` or `3`
 Attackers hide payloads behind encodings a raw-byte scan never sees. Before
 matching request and response bodies, the WAF also scans **decoded variants**:
 
+- UTF-16LE / UTF-16BE request bodies admitted by the body content-type gates,
+  using an explicit `charset` or a byte-order mark
 - JSON / JavaScript unicode escapes — `\uXXXX`, `\u{...}`, `\xXX`
 - HTML entities — `&lt;`, `&#60;`, `&#x3c;`
 - Percent-encoding and `+`-as-space (form bodies)
 - a fully layered decode for stacked encodings
 
 So a `<script>` written as `<script>`, `&lt;script&gt;`, or
-`%3Cscript%3E` in a body is still caught by the script-tag rule. Decoding is
-content-type-agnostic (an attacker controls the declared `Content-Type`), and
-bounded to a small number of variants.
+`%3Cscript%3E` in a body is still caught by the script-tag rule. The layered
+escape decoders are content-type-agnostic (an attacker controls the declared
+`Content-Type`) and bounded to a small number of variants.
+
+UTF-16 transcoding does **not** decide whether a request body is scanned. The
+existing `body_content_types`, `inspect_multipart`, and `inspect_binary_body`
+gates run first and remain authoritative; an excluded body is not admitted
+merely because it declares a UTF-16 charset or carries a BOM. For an admitted
+body, UTF-8 continues to borrow the buffered bytes without allocating, while a
+valid UTF-16 view is allocated only within the already-applied
+`max_scan_bytes` bound. Malformed or truncated UTF-16 is never partially
+decoded or allowed to panic; it retains the existing raw/lossy inspection view.
 
 Query matching is per decoded parameter value, not the raw whole URI. Query
 **values** (each `&`/`=`-split component — never the structural delimiters,
@@ -204,12 +227,12 @@ and `rule_overrides`. Categories:
 
 | Category | Rules | Notes |
 | --- | --- | --- |
-| `sqli` | FE-SQLI-001..005 | UNION/tautology/stacked are level 1; comment-token (004) and SQLSTATE (005) are level 2 |
+| `sqli` | FE-SQLI-001..005 plus FE-SQLI-001-B..003-B | UNION/tautology/stacked (001–003) are level 1 across decoded query values and admitted request bodies; body mirrors use the exact query patterns. Comment-token (004) is query-only level 2; SQLSTATE (005) is body-only level 2. |
 | `nosqli` | FE-NOSQL-001 (operator key), FE-NOSQL-002 (bracket operator, L2) | |
 | `command_injection` | FE-CMD-001..003 | shell-substitution (003) is level 2 |
 | `jndi_injection` | FE-JNDI-001-{B,Q,H}, FE-JNDI-002-{B,Q,H} | **Log4Shell**; direct lookup is Critical/level 1 across body, query, and header; nested-obfuscation is level 2 |
 | `rce` | FE-SPRING4SHELL-001-{B,Q} | class-loader manipulation (CVE-2022-22965) |
-| `prototype_pollution` | FE-PROTO-001 (`__proto__`), FE-PROTO-002 (`constructor.prototype`, L2) | |
+| `prototype_pollution` | FE-PROTO-001/002 plus FE-PROTO-{001,002}-{Q,QV} | Body `__proto__` is level 1 and body `constructor.prototype` is level 2. The level-1 `-Q`/`-QV` mirrors scan decoded keys/values for `__proto__` and `constructor[prototype]`. |
 | `ldap_injection` | FE-LDAP-001..002 | |
 | `xpath_injection` | FE-XPATH-001, FE-XPATH-002 (L3, low value) | |
 | `ssti` | FE-SSTI-001 (broad, L2), FE-SSTI-002 (arithmetic probe, L1), FE-SSTI-003 (Java/Spring EL, L2) | |

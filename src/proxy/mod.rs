@@ -49,12 +49,16 @@ pub(crate) mod frontend_admission;
 pub mod gateway_listener;
 pub mod gateway_listener_status;
 pub mod grpc_proxy;
+mod h1_framing_guard;
 /// Shared h2c (cleartext, prior-knowledge HTTP/2) peer-preface observation.
 /// Hyper's client handshake proves only the client half, so both h2c transports
 /// — the pooled gRPC path and the Unix-socket path — establish through here.
 pub(crate) mod h2c_preface;
 pub mod hbone_pool;
 mod hbone_proxy;
+#[allow(unused_imports)]
+// Used by external tests; unused in the separately compiled bin target.
+pub(crate) use hbone_proxy::settle_hbone_backend_connect_circuit_breaker_outcome;
 pub mod headers;
 pub mod host_udp_capture;
 /// Privileged live-kernel gate for Ambient host-network UDP capture (#3705).
@@ -209,7 +213,8 @@ use crate::util::http_headers::{
 use self::backend_capabilities::{
     BackendCapabilityProbeTarget, BackendCapabilityRecord, BackendCapabilityRefreshOutcome,
     BackendCapabilityRegistry, BackendCapabilitySnapshot, CapabilityCommitOutcome, ProtocolSupport,
-    RefreshCoalescer, SharedBackendCapabilityRegistry, SharedRefreshCoalescer,
+    RefreshCoalescer, RefreshRole, RefreshRunnerGuard, SharedBackendCapabilityRegistry,
+    SharedRefreshCoalescer,
 };
 pub use self::body::ProxyBody;
 use self::grpc_proxy::{
@@ -2379,9 +2384,11 @@ pub fn is_udp_hbone_connect_request<B>(req: &Request<B>, env_config: &EnvConfig)
 /// for — its own pod (proved by `terminator_local_ip`, the accepted
 /// connection's own local address) plus a narrow slice-derived inventory for
 /// the topologies that legitimately terminate for a workload other than the
-/// pod the proxy runs in (`Sidecar` / `Ambient` own-identity workload records,
-/// `NodeWaypoint` enrolled pods, `ServiceWaypoint` waypoint-bound backing
-/// workloads). Being declared ANYWHERE in the slice is deliberately not
+/// pod the proxy runs in (`Ambient` own-identity workload records, bounded to
+/// what this node's agent currently enrols; `NodeWaypoint` enrolled pods;
+/// `ServiceWaypoint` waypoint-bound backing workloads — a `Sidecar` shares its
+/// pod's netns and carries no such inventory). Being declared ANYWHERE in the
+/// slice is deliberately not
 /// enough: relaying to another node's workload would dial that pod in
 /// plaintext from this pod's IP, skipping the destination's own
 /// `AuthorizationPolicy` set and arriving as a trusted-looking unauthenticated
@@ -6614,6 +6621,11 @@ fn via_header_for_backend_response_body<'a>(
 #[derive(Clone, Default)]
 struct RequestConnectionMetadata {
     frontend_listen_port: Option<u16>,
+    /// Raw HTTP/1 framing result captured before Hyper applied framing
+    /// precedence. [`h1_framing_guard::H1FramingResult::NotObserved`] is the
+    /// default and means no observer ran (H2/H3/tests). Only a completed
+    /// observation may be [`h1_framing_guard::H1FramingResult::Clear`].
+    http1_framing_result: h1_framing_guard::H1FramingResult,
     /// Concrete local address of the accepted TCP connection. Unlike the
     /// listener's wildcard bind address, this identifies the pod IP the peer
     /// actually reached — it binds a Sidecar ingress CONNECT to this replica
@@ -6670,6 +6682,69 @@ struct RequestConnectionMetadata {
     /// own downstream writes (native HTTP/3).
     authorization_connection_closer:
         Option<crate::proxy::auth_lifetime::AuthorizationConnectionCloser>,
+}
+
+static H1_FRAMING_OBSERVER_FAILED_WARN: crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter =
+    crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter::new();
+
+/// RFC 9112 §6.1 requires closing after any HTTP/1 CL+TE response, even
+/// when Hyper drained the body according to Transfer-Encoding. A peer honoring
+/// Content-Length could place the next request boundary elsewhere, so no
+/// response path may leave a known-conflicting connection reusable.
+/// [`h1_framing_guard::H1FramingResult::NotObserved`] and
+/// [`h1_framing_guard::H1FramingResult::Clear`] both skip this; only
+/// [`h1_framing_guard::H1FramingResult::Conflict`] forces `Connection: close`.
+#[inline]
+fn apply_h1_framing_connection_close(
+    response: &mut Result<Response<ProxyBody>, hyper::Error>,
+    framing_result: h1_framing_guard::H1FramingResult,
+) {
+    if !matches!(framing_result, h1_framing_guard::H1FramingResult::Conflict) {
+        return;
+    }
+    let Ok(response) = response else {
+        return;
+    };
+    response.headers_mut().insert(
+        hyper::header::CONNECTION,
+        hyper::header::HeaderValue::from_static("close"),
+    );
+}
+
+/// Consume the connection-local HTTP/1 framing signal, or record that this
+/// request was never observed.
+///
+/// HTTP/2 and HTTP/3 are [`h1_framing_guard::H1FramingResult::NotObserved`].
+/// An HTTP/1 request with no observer installed is
+/// [`h1_framing_guard::H1FramingResult::ObserverFailed`] (fail-closed), not a
+/// silent [`h1_framing_guard::H1FramingResult::Clear`].
+#[inline]
+fn consume_h1_framing_result(
+    version: hyper::Version,
+    signals: Option<&h1_framing_guard::H1FramingSignals>,
+) -> h1_framing_guard::H1FramingResult {
+    if !matches!(version, hyper::Version::HTTP_10 | hyper::Version::HTTP_11) {
+        return h1_framing_guard::H1FramingResult::NotObserved;
+    }
+    match signals {
+        Some(signals) => signals.next_conflict(),
+        None => h1_framing_guard::H1FramingResult::ObserverFailed,
+    }
+}
+
+/// Hyper's HTTP/1 role marks the connection `is_last` for `101 Switching
+/// Protocols` and for a successful CONNECT (`proto/h1/role.rs`). Ferrum
+/// returns 405 for non-WebSocket H1 CONNECT, so the second arm is unreachable
+/// today; key both so observation disable does not depend on that internal.
+#[inline]
+fn h1_response_ends_framing_observation(
+    method: &hyper::Method,
+    response: &Result<Response<ProxyBody>, hyper::Error>,
+) -> bool {
+    response.as_ref().is_ok_and(|response| {
+        response.status() == StatusCode::SWITCHING_PROTOCOLS
+            || (*method == hyper::Method::CONNECT && response.status().is_success())
+    })
 }
 
 fn empty_svid_bundle_slot() -> SharedSvidBundle {
@@ -10752,36 +10827,59 @@ impl ProxyState {
     /// still picked up without spawning N duplicate tasks or orphaning the
     /// queued request.
     pub(crate) fn spawn_backend_capability_refresh(&self) {
-        if !self.backend_capabilities_refresh.request() {
-            debug!("Backend capability refresh coalesced into in-flight task");
-            return;
+        match self.backend_capabilities_refresh.request() {
+            RefreshRole::Joined => {
+                debug!("Backend capability refresh coalesced into in-flight task");
+            }
+            RefreshRole::Runner(guard) => self.spawn_capability_refresh_runner(guard),
         }
+    }
+
+    fn spawn_capability_refresh_runner(&self, guard: RefreshRunnerGuard) {
         let state = self.clone();
+        // Detached from the caller future: aborting an admin/DP waiter
+        // cannot cancel the probe. Guard Drop is last-resort only, when
+        // this task itself is cancelled (runtime teardown).
         tokio::spawn(async move {
-            state.run_backend_capability_refresh_loop().await;
+            state.run_backend_capability_refresh_loop(guard).await;
         });
     }
 
     /// Synchronously refresh backend capabilities through the shared
     /// [`RefreshCoalescer`], preserving the admin endpoint's post-refresh
     /// snapshot contract while collapsing concurrent callers onto one pass.
+    ///
+    /// The exclusive drain loop always runs in a detached Tokio task so
+    /// dropping this caller (HTTP disconnect, DP task abort) cannot cancel
+    /// the runner. A caller that won the role spawns that task and then
+    /// joins through [`RefreshCoalescer::wait_until_idle`], returning
+    /// [`BackendCapabilityRefreshOutcome::Ran`]. A coalesced caller waits
+    /// the same way and returns
+    /// [`BackendCapabilityRefreshOutcome::Joined`]. `Ran` versus `Joined`
+    /// stays tied to who acquired the role, not to who happened to still
+    /// be awaiting when the probe finished.
     pub async fn refresh_backend_capabilities_coalesced(&self) -> BackendCapabilityRefreshOutcome {
-        if self.backend_capabilities_refresh.request() {
-            self.run_backend_capability_refresh_loop().await;
-            BackendCapabilityRefreshOutcome::Ran
-        } else {
-            self.backend_capabilities_refresh.wait_until_idle().await;
-            BackendCapabilityRefreshOutcome::Joined
+        match self.backend_capabilities_refresh.request() {
+            RefreshRole::Runner(guard) => {
+                self.spawn_capability_refresh_runner(guard);
+                self.backend_capabilities_refresh.wait_until_idle().await;
+                BackendCapabilityRefreshOutcome::Ran
+            }
+            RefreshRole::Joined => {
+                self.backend_capabilities_refresh.wait_until_idle().await;
+                BackendCapabilityRefreshOutcome::Joined
+            }
         }
     }
 
-    async fn run_backend_capability_refresh_loop(&self) {
+    async fn run_backend_capability_refresh_loop(&self, mut guard: RefreshRunnerGuard) {
         loop {
             while self.backend_capabilities_refresh.take_pending() {
                 self.refresh_backend_capabilities().await;
             }
             if self.backend_capabilities_refresh.try_finish() {
                 self.backend_capabilities_refresh.signal_idle();
+                guard.disarm();
                 break;
             }
         }
@@ -13435,7 +13533,12 @@ async fn handle_connection(
     // Set TCP keepalive on inbound connection to detect stale clients
     set_tcp_keepalive(&stream);
 
-    // Use TokioIo to adapt the TCP stream for hyper
+    // Observe raw H1 framing before Hyper normalizes TE-first CL+TE requests.
+    // The adapter disables itself for the H2 prior-knowledge preface.
+    let (stream, h1_framing_signals) = h1_framing_guard::H1FramingGuardIo::new(
+        stream,
+        http1_parser_max_buf_size(state.max_header_size_bytes),
+    );
     let io = TokioIo::new(stream);
 
     // Use auto builder to support both HTTP/1.1 and HTTP/2 cleartext (h2c).
@@ -13489,12 +13592,25 @@ async fn handle_connection(
     let header_read_timeout_seconds = state.env_config.http_header_read_timeout_seconds;
     let admission = frontend_admission::FrontendAdmission::new();
     let service_admission = Arc::clone(&admission);
+    let service_h1_framing_signals = Arc::clone(&h1_framing_signals);
     let svc = service_fn(move |req: Request<Incoming>| {
         service_admission.mark();
         let state = Arc::clone(&state);
         let addr = remote_addr;
+        let http1_framing_result =
+            consume_h1_framing_result(req.version(), Some(service_h1_framing_signals.as_ref()));
+        let request_method = req.method().clone();
+        let response_h1_framing_signals = if matches!(
+            req.version(),
+            hyper::Version::HTTP_10 | hyper::Version::HTTP_11
+        ) {
+            Some(Arc::clone(&service_h1_framing_signals))
+        } else {
+            None
+        };
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port,
+            http1_framing_result,
             accepted_local_addr,
             frontend_sni_hostname: None,
             node_waypoint_identity: node_waypoint_identity.clone(),
@@ -13511,7 +13627,7 @@ async fn handle_connection(
             authorization_connection_closer: Some(authorization_closer.clone()),
         };
         async move {
-            handle_proxy_request_on_frontend_port(
+            let mut response = handle_proxy_request_on_frontend_port(
                 req,
                 state,
                 addr,
@@ -13521,7 +13637,14 @@ async fn handle_connection(
                 None,
                 connection_metadata,
             )
-            .await
+            .await;
+            apply_h1_framing_connection_close(&mut response, http1_framing_result);
+            if let Some(signals) = response_h1_framing_signals.as_ref()
+                && h1_response_ends_framing_observation(&request_method, &response)
+            {
+                signals.disable_observation();
+            }
+            response
         }
     });
 
@@ -21384,7 +21507,23 @@ async fn handle_tls_connection(
         .server_name()
         .map(str::to_ascii_lowercase);
 
-    // Convert TLS stream to TokioIo for hyper
+    // Observe decrypted H1 framing before Hyper normalizes TE-first CL+TE
+    // requests. ALPN `h2` is already HTTP/2: skip the observer so those
+    // connections do not allocate `H1FramingSignals`. Otherwise wrap; the
+    // adapter still disables itself if the bytes are an h2c-style preface.
+    let (tls_stream, h1_framing_signals) =
+        if matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2")) {
+            (
+                h1_framing_guard::MaybeH1FramingGuardIo::passthrough(tls_stream),
+                None,
+            )
+        } else {
+            let (io, signals) = h1_framing_guard::MaybeH1FramingGuardIo::observed(
+                tls_stream,
+                http1_parser_max_buf_size(state.max_header_size_bytes),
+            );
+            (io, Some(signals))
+        };
     let io = hyper_util::rt::TokioIo::new(tls_stream);
 
     // Use hyper-util's auto builder which negotiates HTTP/1.1 or HTTP/2 via ALPN.
@@ -21438,6 +21577,7 @@ async fn handle_tls_connection(
     let header_read_timeout_seconds = state.env_config.http_header_read_timeout_seconds;
     let admission = frontend_admission::FrontendAdmission::new();
     let service_admission = Arc::clone(&admission);
+    let service_h1_framing_signals = h1_framing_signals;
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         service_admission.mark();
         let state = Arc::clone(&state);
@@ -21446,8 +21586,20 @@ async fn handle_tls_connection(
         let chain = client_cert_chain_der.clone();
         let mtls_auth_connection_cache = mtls_auth_connection_cache.clone();
         let frontend_sni_hostname = frontend_sni_hostname.clone();
+        let http1_framing_result =
+            consume_h1_framing_result(req.version(), service_h1_framing_signals.as_deref());
+        let request_method = req.method().clone();
+        let response_h1_framing_signals = if matches!(
+            req.version(),
+            hyper::Version::HTTP_10 | hyper::Version::HTTP_11
+        ) {
+            service_h1_framing_signals.clone()
+        } else {
+            None
+        };
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port: tls_connection_metadata.frontend_listen_port,
+            http1_framing_result,
             accepted_local_addr: tls_connection_metadata.accepted_local_addr,
             frontend_sni_hostname,
             node_waypoint_identity: tls_connection_metadata.node_waypoint_identity.clone(),
@@ -21462,7 +21614,7 @@ async fn handle_tls_connection(
             authorization_connection_closer: Some(authorization_closer.clone()),
         };
         async move {
-            handle_proxy_request_on_frontend_port(
+            let mut response = handle_proxy_request_on_frontend_port(
                 req,
                 state,
                 addr,
@@ -21472,7 +21624,14 @@ async fn handle_tls_connection(
                 mtls_auth_connection_cache,
                 connection_metadata,
             )
-            .await
+            .await;
+            apply_h1_framing_connection_close(&mut response, http1_framing_result);
+            if let Some(signals) = response_h1_framing_signals.as_ref()
+                && h1_response_ends_framing_observation(&request_method, &response)
+            {
+                signals.disable_observation();
+            }
+            response
         }
     });
 
@@ -28793,6 +28952,7 @@ pub async fn handle_proxy_request(
         mtls_auth_connection_cache,
         RequestConnectionMetadata {
             peer_spiffe_extraction_cache,
+            http1_framing_result: h1_framing_guard::H1FramingResult::NotObserved,
             ..RequestConnectionMetadata::default()
         },
     )
@@ -28810,6 +28970,33 @@ async fn handle_proxy_request_on_frontend_port(
     mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
     connection_metadata: RequestConnectionMetadata,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
+    // An observer failure is connection-scoped and must outrank every
+    // request-level early return below. Otherwise a stale-config, trust,
+    // ACME, or overload response could leave the unverified H1 connection
+    // reusable and turn a fail-closed state back into an unbounded stream.
+    if matches!(
+        connection_metadata.http1_framing_result,
+        h1_framing_guard::H1FramingResult::ObserverFailed
+    ) {
+        let error_body = r#"{"error":"HTTP/1 request framing could not be verified; connection will be closed"}"#;
+        if let Some(suppressed) =
+            H1_FRAMING_OBSERVER_FAILED_WARN.on_event(crate::socket_opts::monotonic_now_ms())
+        {
+            warn!(
+                framing_observer_state = "unknown_or_overflowed",
+                suppressed,
+                "Rejected HTTP/1 request because wire framing could not be verified; closing connection"
+            );
+        }
+        record_request(&state, 400);
+        let mut response = build_response(StatusCode::BAD_REQUEST, error_body);
+        response.headers_mut().insert(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("close"),
+        );
+        return Ok(response);
+    }
+
     // Stale-configuration admission fence (issue #3726). One relaxed atomic
     // load on a process-global word that only a data plane whose applied CP
     // snapshot aged past `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` — with no CP
@@ -28960,6 +29147,7 @@ async fn handle_proxy_request_inner(
     connection_metadata: RequestConnectionMetadata,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
+    let http1_framing_result = connection_metadata.http1_framing_result;
     let accepted_local_ip = connection_metadata
         .accepted_local_addr
         .map(|addr| addr.ip());
@@ -29147,7 +29335,15 @@ async fn handle_proxy_request_inner(
     // Protocol-level header validation to prevent request smuggling and desync attacks.
     // Must run before routing because these are transport-level violations that apply
     // regardless of which backend the request would be forwarded to.
-    if let Some(error_body) = check_protocol_headers(req.headers(), req.version()) {
+    if let Some(error_body) = check_protocol_headers_with_wire_framing(
+        req.headers(),
+        req.version(),
+        req.uri(),
+        matches!(
+            http1_framing_result,
+            h1_framing_guard::H1FramingResult::Conflict
+        ),
+    ) {
         warn!("Rejected request: {}", error_body);
         record_request(&state, 400);
         return Ok(build_response(StatusCode::BAD_REQUEST, error_body));
@@ -45464,10 +45660,17 @@ pub fn normalize_request_authority_for_signing(
 
 /// Validate HTTP/2 and HTTP/3 `Host`/`:authority` consistency before routing.
 ///
-/// RFC 9113 states that `Host` and `:authority` are not permitted to disagree;
-/// RFC 9114 says that if both are present, they must contain the same value.
-/// Rejecting disagreement here prevents routing/plugin decisions from keying on
-/// one authority while a backend sees another during H2/H3-to-H1 translation.
+/// RFC 9113 §8.3.1 and RFC 9114 §4.3.1 require a request to include either
+/// `:authority` or `Host`. Both absent is malformed: routing would skip
+/// exact/wildcard host tiers and fall through to a catch-all (empty `hosts`)
+/// route. RFC 9113 also states that `Host` and `:authority` are not permitted
+/// to disagree; RFC 9114 says that if both are present, they must contain the
+/// same value. Rejecting disagreement here prevents routing/plugin decisions
+/// from keying on one authority while a backend sees another during H2/H3-to-H1
+/// translation.
+///
+/// `:authority`-only is the usual H2/H3 client shape, including RFC 8441 /
+/// RFC 9220 Extended CONNECT (`:protocol=websocket`), and is accepted.
 pub fn check_host_authority_consistency(
     headers: &hyper::HeaderMap,
     uri: &hyper::Uri,
@@ -45483,7 +45686,16 @@ pub fn check_host_authority_consistency(
         return Some(r#"{"error":"Request contains multiple Host headers"}"#);
     }
 
-    let host = host?;
+    let Some(host) = host else {
+        // RFC 9113 §8.3.1 / RFC 9114 §4.3.1: a request with neither
+        // `:authority` nor Host is malformed. One extra `uri.authority()`
+        // probe, no allocation; the common `:authority`-only path (no Host)
+        // returns None immediately.
+        if uri.authority().is_none() {
+            return Some(r#"{"error":"Request is missing both :authority and Host"}"#);
+        }
+        return None;
+    };
     let Ok(host) = host.to_str() else {
         return Some(r#"{"error":"Host header contains invalid characters"}"#);
     };
@@ -45519,9 +45731,15 @@ pub fn check_host_authority_consistency(
 /// 2. **Multiple Content-Length with mismatched values** (all HTTP versions): RFC 9110 §8.6
 ///    — different CL values in the same message indicate tampering or a broken intermediary.
 ///
-/// 3. **Multiple Host headers** (HTTP/1.1 only): RFC 9112 §3.2 — a request with
-///    duplicate Host headers MUST be rejected with 400 to prevent host-header routing
-///    confusion between the proxy and backend.
+/// 3. **Host header constraints** (HTTP/1.x): RFC 9112 §3.2.2 —
+///    duplicate Host headers MUST be rejected with 400 (HTTP/1.0 and 1.1).
+///    HTTP/1.1 origin-form requests that lack a Host field MUST be rejected
+///    with 400; HTTP/1.0 does not require Host. Absolute-form request-targets
+///    (`GET http://host/path HTTP/1.1`) carry the authority on the URI
+///    (`uri.authority()`) and are accepted without a Host field. An empty
+///    Host value (`Host:` with no tokens) is present but invalid and MUST 400
+///    on HTTP/1.1. HTTP/2 and HTTP/3 are not checked here; they use
+///    `:authority`, governed by `check_host_authority_consistency()`.
 ///
 /// 4. **Transfer-Encoding rejection** (HTTP/2 and HTTP/3): RFC 9113 §8.2.2 and
 ///    RFC 9114 §4.2 forbid this HTTP/1.x framing header on multiplexed protocols.
@@ -45533,6 +45751,16 @@ pub fn check_host_authority_consistency(
 pub fn check_protocol_headers(
     headers: &hyper::HeaderMap,
     version: hyper::Version,
+    uri: &hyper::Uri,
+) -> Option<&'static str> {
+    check_protocol_headers_with_wire_framing(headers, version, uri, false)
+}
+
+fn check_protocol_headers_with_wire_framing(
+    headers: &hyper::HeaderMap,
+    version: hyper::Version,
+    uri: &hyper::Uri,
+    http1_te_cl_conflict_on_wire: bool,
 ) -> Option<&'static str> {
     let is_http1 = version == hyper::Version::HTTP_10 || version == hyper::Version::HTTP_11;
 
@@ -45544,8 +45772,8 @@ pub fn check_protocol_headers(
     // 1b. Content-Length + Transfer-Encoding conflict (HTTP/1.x request smuggling)
     // HTTP/2 and HTTP/3 don't use Transfer-Encoding (framing is at the protocol layer).
     if is_http1
-        && headers.contains_key("transfer-encoding")
-        && headers.contains_key("content-length")
+        && (http1_te_cl_conflict_on_wire
+            || headers.contains_key("transfer-encoding") && headers.contains_key("content-length"))
     {
         return Some(
             r#"{"error":"Request contains both Content-Length and Transfer-Encoding headers"}"#,
@@ -45602,12 +45830,41 @@ pub fn check_protocol_headers(
         }
     }
 
-    // 3. Multiple Host headers (HTTP/1.1 only)
-    // HTTP/2 and HTTP/3 use the :authority pseudo-header (exposed via URI), not Host.
+    // 3. Host header constraints (HTTP/1.x).
+    // Reuse `headers.get_all("host")` so the missing-Host check cannot
+    // disagree with the multiple-Host check about what counts as present.
+    // HTTP/2 and HTTP/3 use the :authority pseudo-header (exposed via URI),
+    // not Host; their Host/:authority agreement is
+    // `check_host_authority_consistency()` and must not change here.
     if is_http1 {
         let mut host_iter = headers.get_all("host").iter();
-        if host_iter.next().is_some() && host_iter.next().is_some() {
+        let first_host = host_iter.next();
+        if host_iter.next().is_some() {
             return Some(r#"{"error":"Request contains multiple Host headers"}"#);
+        }
+        // RFC 9112 §3.2.2: HTTP/1.1 MUST have a Host field. HTTP/1.0 does not
+        // require Host — do not reject 1.0 here.
+        if version == hyper::Version::HTTP_11 {
+            match first_host {
+                None => {
+                    // Absolute-form (`GET http://host/path HTTP/1.1`) surfaces
+                    // as `uri.authority()`. Reject only when BOTH the Host
+                    // field and the URI authority are absent.
+                    if uri.authority().is_none() {
+                        return Some(r#"{"error":"HTTP/1.1 request is missing a Host header"}"#);
+                    }
+                }
+                Some(value) => {
+                    // A Host field line is present even when the value is
+                    // empty (`Host:` with no tokens). That is not "missing";
+                    // it is an invalid field value. RFC 9112 §3.2.2 also MUST
+                    // 400 invalid Host values, and an empty Host cannot select
+                    // a vhost (it would otherwise fall through to catch-all).
+                    if trim_ows(value.as_bytes()).is_empty() {
+                        return Some(r#"{"error":"Host header contains invalid empty value"}"#);
+                    }
+                }
+            }
         }
     }
 
@@ -62751,7 +63008,9 @@ mod tests {
     /// not every workload the slice happens to declare.
     #[test]
     fn inbound_hbone_relay_guard_allows_only_the_terminators_own_destinations() {
-        use crate::modes::mesh::config::{InboundRelayDenial, MeshConfig};
+        use crate::modes::mesh::config::{
+            InboundRelayDenial, MeshConfig, own_address_port_bounds_from_workloads,
+        };
 
         let own_ip: std::net::IpAddr = "10.1.2.3".parse().expect("own pod IP");
         let own_v6: std::net::IpAddr = "fd00:10:244:1::4".parse().expect("own pod IPv6");
@@ -62765,15 +63024,21 @@ mod tests {
         assert_eq!(no_slice("localhost"), Err(InboundRelayDenial::NoSlice));
         assert_eq!(no_slice("10.1.2.3"), Err(InboundRelayDenial::NoSlice));
 
-        // An own-pod terminator (Sidecar / Ambient): this pod plus a SIBLING pod
-        // the slice also declares. Only the first is a destination we terminate
-        // for.
+        // Sidecar: this pod plus a SIBLING pod the slice also declares. Only
+        // the first is a destination we terminate for. Loopback is the
+        // Sidecar own-network-namespace shortcut.
         let mesh = MeshConfig {
             workloads: vec![
                 relay_guard_workload("app", &["10.1.2.3", "fd00:10:244:1::4"], &[8080]),
                 relay_guard_workload("peer", &["10.9.9.9"], &[8080]),
             ],
             inbound_relay_admits_accepted_local_address: true,
+            inbound_relay_admits_loopback_namespace: true,
+            // What the apply path projects for an own-pod terminator: the
+            // per-address port bound of the record it owns (issue #4249).
+            inbound_relay_own_address_ports: own_address_port_bounds_from_workloads(&[
+                relay_guard_workload("app", &["10.1.2.3", "fd00:10:244:1::4"], &[8080]),
+            ]),
             ..MeshConfig::default()
         };
         let decide = |host: &str, port: u16, local: Option<std::net::IpAddr>| {
@@ -62784,6 +63049,9 @@ mod tests {
         assert_eq!(decide("127.0.0.1", 8080, Some(own_ip)), Ok(()));
         assert_eq!(decide("::1", 8080, Some(own_ip)), Ok(()));
         assert_eq!(decide("localhost", 8080, Some(own_ip)), Ok(()));
+        assert_eq!(decide("localhost.", 8080, Some(own_ip)), Ok(()));
+        assert_eq!(decide("LocalHost", 8080, Some(own_ip)), Ok(()));
+        assert_eq!(decide("app.localhost", 8080, Some(own_ip)), Ok(()));
         // ...but undeclared loopback ports remain refused.
         assert_eq!(
             decide("127.0.0.1", 9999, Some(own_ip)),
@@ -62849,6 +63117,78 @@ mod tests {
             decide("127.0.0.1", 8080, None),
             Err(InboundRelayDenial::AddressNotTerminated)
         );
+
+        // Ambient admits the accepted non-loopback local address but must not
+        // inherit Sidecar's loopback-namespace shortcut, even when inventory
+        // lists those names.
+        let ambient = MeshConfig {
+            workloads: vec![relay_guard_workload(
+                "app",
+                &["10.1.2.3", "127.0.0.1"],
+                &[8080],
+            )],
+            inbound_relay_destinations: vec![
+                crate::modes::mesh::config::MeshInboundRelayDestination {
+                    host: crate::modes::mesh::config::MeshInboundRelayHost::Ip(own_ip),
+                    ports: vec![8080],
+                    enrollment: Default::default(),
+                    registry_uncontested: true,
+                },
+                crate::modes::mesh::config::MeshInboundRelayDestination {
+                    host: crate::modes::mesh::config::MeshInboundRelayHost::Ip(
+                        "127.0.0.1".parse().expect("loopback"),
+                    ),
+                    ports: vec![8080],
+                    enrollment: Default::default(),
+                    registry_uncontested: true,
+                },
+                crate::modes::mesh::config::MeshInboundRelayDestination {
+                    host: crate::modes::mesh::config::MeshInboundRelayHost::Name(
+                        "localhost".to_string(),
+                    ),
+                    ports: vec![8080],
+                    enrollment: Default::default(),
+                    registry_uncontested: true,
+                },
+                crate::modes::mesh::config::MeshInboundRelayDestination {
+                    host: crate::modes::mesh::config::MeshInboundRelayHost::Name(
+                        "app.localhost".to_string(),
+                    ),
+                    ports: vec![8080],
+                    enrollment: Default::default(),
+                    registry_uncontested: true,
+                },
+            ],
+            inbound_relay_admits_accepted_local_address: true,
+            // What the apply path projects for an own-pod terminator: the
+            // per-address port bound of the record it owns (issue #4249).
+            inbound_relay_own_address_ports: own_address_port_bounds_from_workloads(&[
+                relay_guard_workload("app", &["10.1.2.3", "127.0.0.1"], &[8080]),
+            ]),
+            ..MeshConfig::default()
+        };
+        let ambient_decide = |host: &str, port: u16| {
+            inbound_hbone_relay_destination_decision(host, port, Some(&ambient), Some(own_ip))
+        };
+        assert_eq!(ambient_decide("10.1.2.3", 8080), Ok(()));
+        assert_eq!(
+            ambient_decide("10.1.2.3", 9999),
+            Err(InboundRelayDenial::PortNotDeclared)
+        );
+        for host in [
+            "127.0.0.1",
+            "::1",
+            "localhost",
+            "localhost.",
+            "LocalHost",
+            "app.localhost",
+        ] {
+            assert_eq!(
+                ambient_decide(host, 8080),
+                Err(InboundRelayDenial::AddressNotTerminated),
+                "Ambient must refuse loopback-namespace authority {host}"
+            );
+        }
     }
 
     /// Issue #4150: the two topologies that legitimately terminate for OTHER
@@ -62857,7 +63197,8 @@ mod tests {
     #[test]
     fn inbound_hbone_relay_guard_admits_the_waypoint_termination_inventory_only() {
         use crate::modes::mesh::config::{
-            InboundRelayDenial, MeshConfig, inbound_relay_destinations_from_workloads,
+            InboundRelayDenial, MeshConfig, MeshInboundRelayDestination, MeshInboundRelayHost,
+            inbound_relay_destinations_from_workloads,
         };
 
         let waypoint_ip: std::net::IpAddr = "10.4.4.4".parse().expect("waypoint IP");
@@ -62899,9 +63240,8 @@ mod tests {
             Err(InboundRelayDenial::AddressNotTerminated)
         );
 
-        // Loopback listed IN the inventory is a real termination target —
-        // the functional waypoint suite declares `127.0.0.1` as the
-        // workload address. The own-namespace shortcut stays off.
+        // Inventory data cannot make the waypoint/host network namespace's
+        // loopback address into a workload termination target.
         let loopback_mesh = MeshConfig {
             inbound_relay_destinations: inbound_relay_destinations_from_workloads(&[
                 relay_guard_workload("loopback-app", &["127.0.0.1"], &[8080]),
@@ -62915,7 +63255,7 @@ mod tests {
                 Some(&loopback_mesh),
                 Some(waypoint_ip),
             ),
-            Ok(())
+            Err(InboundRelayDenial::AddressNotTerminated)
         );
         assert_eq!(
             inbound_hbone_relay_destination_decision(
@@ -62926,15 +63266,51 @@ mod tests {
             ),
             Err(InboundRelayDenial::AddressNotTerminated)
         );
+
+        // DNS localhost namespace spellings must not bypass the loopback refusal
+        // via inventory Name entries that the backend dial would resolve to
+        // loopback.
+        let localhost_namespace_mesh = MeshConfig {
+            inbound_relay_destinations: vec![
+                MeshInboundRelayDestination {
+                    host: MeshInboundRelayHost::Name("localhost.".to_string()),
+                    ports: vec![8080],
+                    enrollment: Default::default(),
+                    registry_uncontested: true,
+                },
+                MeshInboundRelayDestination {
+                    host: MeshInboundRelayHost::Name("app.localhost".to_string()),
+                    ports: vec![8080],
+                    enrollment: Default::default(),
+                    registry_uncontested: true,
+                },
+            ],
+            ..MeshConfig::default()
+        };
+        for host in ["localhost.", "LocalHost", "app.localhost", "APP.Localhost"] {
+            assert_eq!(
+                inbound_hbone_relay_destination_decision(
+                    host,
+                    8080,
+                    Some(&localhost_namespace_mesh),
+                    Some(waypoint_ip),
+                ),
+                Err(InboundRelayDenial::AddressNotTerminated),
+                "waypoint must refuse loopback-namespace authority {host} even when inventory-listed"
+            );
+        }
     }
 
     #[test]
     fn inbound_hbone_relay_proxy_normalizes_bracketed_ipv6_authority() {
-        use crate::modes::mesh::config::MeshConfig;
+        use crate::modes::mesh::config::{MeshConfig, own_address_port_bounds_from_workloads};
 
         let mesh = MeshConfig {
             workloads: vec![relay_guard_workload("app", &["fd00:10:244:1::4"], &[8080])],
             inbound_relay_admits_accepted_local_address: true,
+            inbound_relay_own_address_ports: own_address_port_bounds_from_workloads(&[
+                relay_guard_workload("app", &["fd00:10:244:1::4"], &[8080]),
+            ]),
             ..MeshConfig::default()
         };
         let authority: http::uri::Authority = "[fd00:10:244:1::4]:8080".parse().unwrap();

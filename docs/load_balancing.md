@@ -556,18 +556,32 @@ upstreams:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `unhealthy_status_codes` | array | `[500, 502, 503, 504]` | Status codes that count as failures |
-| `unhealthy_threshold` | integer | `3` | Failures within window to mark unhealthy |
-| `unhealthy_window_seconds` | integer | `30` | Time window for failure counting |
+| `unhealthy_threshold` | integer | `3` | Windowed failures, or consecutive failures when `consecutive_error_mode=true`, required to mark unhealthy |
+| `unhealthy_window_seconds` | integer | `30` | Time window for windowed failure counting; not consulted in consecutive mode |
 | `healthy_after_seconds` | integer | `30` | Seconds before an unhealthy target is automatically restored (0 to disable) |
+| `max_ejection_percent` | integer/null | `null` | Maximum percentage of targets that may remain passively ejected; uses Envoy's integer prospective-ejection gate, which can permit zero ejections in a small pool; null is uncapped |
+| `gateway_error_codes` | array/null | `null` | Reserved DestinationRule gateway-error bucket; validated and persisted but not yet applied |
+| `split_external_local_origin_errors` | boolean/null | `null` | Reserved separate local/external-origin buckets; validated and persisted but not yet applied |
+| `consecutive_error_mode` | boolean | `false` | Evaluate the threshold against a consecutive failure streak; one success resets it |
+| `consecutive_5xx_ejection_disabled` | boolean | `false` | Ignore configured unhealthy status codes and connection errors for this detector (Istio `consecutive5xxErrors: 0` sentinel) |
 
 **How it works:**
 
 1. After each proxied request, the response status code is reported to the health checker.
-2. A failure is recorded (with a timestamp) when **either** condition is true:
+2. Unless `consecutive_5xx_ejection_disabled=true`, a failure is recorded when
+   **either** condition is true:
    - The status code is in `unhealthy_status_codes` (e.g., backend returned 500)
    - The request was a **connection error** — TCP connection refused, read timeout, DNS resolution failure, or TLS handshake error. These always count as failures regardless of `unhealthy_status_codes`.
-3. Old failures outside the `unhealthy_window_seconds` window are cleaned up.
-4. If the number of failures within the window reaches `unhealthy_threshold`, the target is marked **unhealthy**.
+3. In the default windowed mode, old failures outside
+   `unhealthy_window_seconds` are cleaned up. With
+   `consecutive_error_mode=true`, the timestamp ring is not touched; the
+   consecutive streak resets to zero on one success.
+4. The target is marked **unhealthy** when the active mode's count reaches
+   `unhealthy_threshold`. If `max_ejection_percent` is set, selection keeps
+   a prospective next ejection only when
+   `(currently_ejected + 1) × 100 / total_targets <= max_ejection_percent`
+   (integer division), and re-admits the earliest excess ejections first.
+   Active-health failures are never re-admitted by this passive cap.
 5. Recovery happens via two mechanisms:
    - **Automatic recovery timer**: After `healthy_after_seconds`, the target is automatically restored to the rotation with a clean slate — similar to a circuit breaker's half-open state. If it immediately fails again, passive checks will re-mark it unhealthy. The recovery deadline is captured on the **ejection entry itself** from the **effective** passive policy that caused the ejection (per-port override, then subset overlay, then upstream). That deadline is honored across config reloads, applies only to the owning proxy's map (two proxies sharing one `host:port` keep independent cooldowns), and covers targets introduced only through service discovery — not merely the static `upstream.targets` list at timer spawn.
    - **On-success recovery**: If a request to the target succeeds (e.g., via the all-unhealthy fallback path), it is immediately restored.

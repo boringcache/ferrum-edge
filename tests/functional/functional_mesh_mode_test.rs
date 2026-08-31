@@ -10,7 +10,7 @@
 //!   cargo test --test functional_tests functional_mesh_mode -- --ignored --nocapture
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -57,10 +57,10 @@ use ferrum_edge::identity::workload_api::proto::{
 use ferrum_edge::modes::mesh::config::{
     AppProtocol, EastWestGateway, MeshConfig, MeshConsistentHash, MeshDestinationRule,
     MeshEndpoint, MeshLoadBalancer, MeshPolicy, MeshRule, MeshService, MeshSimpleLb,
-    MeshTrafficPolicy, MtlsMode, MultiClusterConfig, PeerAuthentication, PolicyAction, PolicyScope,
-    PolicyTargetAttachment, PrincipalMatch, Resolution, ServiceEntry, ServiceEntryLocation,
-    ServicePort, ServiceTargetPort, TrustBundle, TrustBundleSet, Workload, WorkloadPort,
-    WorkloadRef, WorkloadSelector,
+    MeshTrafficPolicy, MeshWaypointServiceRef, MtlsMode, MultiClusterConfig, PeerAuthentication,
+    PolicyAction, PolicyScope, PolicyTargetAttachment, PrincipalMatch, Resolution, ServiceEntry,
+    ServiceEntryLocation, ServicePort, ServiceTargetPort, TrustBundle, TrustBundleSet, Workload,
+    WorkloadPort, WorkloadRef, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::proxy::ConfigApplyOutcome;
@@ -486,6 +486,81 @@ pub(crate) fn loopback_ephemeral() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 0))
 }
 
+/// Local IPv4 outside the loopback namespace.
+///
+/// Ambient / NodeWaypoint / ServiceWaypoint ordinary relay refuse `127.0.0.1`
+/// / `::1` / `localhost` because those names reach the terminator netns, not the
+/// destination pod. Sidecar fixtures keep [`loopback_ephemeral`].
+fn fixture_non_loopback_local_v4() -> Ipv4Addr {
+    let probe = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .expect("bind UDP probe for Ambient/waypoint fixture address");
+    probe
+        .connect((Ipv4Addr::new(1, 1, 1, 1), 80))
+        .expect("select a local non-loopback IPv4 for Ambient/waypoint fixtures");
+    match probe.local_addr().expect("UDP probe local addr").ip() {
+        std::net::IpAddr::V4(ip)
+            if !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !ip.is_broadcast()
+                && !ip.is_multicast()
+                && !ip.is_link_local() =>
+        {
+            ip
+        }
+        other => panic!(
+            "Ambient/waypoint fixtures need a non-loopback local IPv4; probe selected {other}"
+        ),
+    }
+}
+
+fn topology_relay_workload_v4(topology: &str) -> Ipv4Addr {
+    if topology == "sidecar" {
+        Ipv4Addr::LOCALHOST
+    } else {
+        fixture_non_loopback_local_v4()
+    }
+}
+
+/// Same-cluster Ambient HBONE TCP dials the advertised workload IP, so the dest
+/// terminator must listen on every local address of the reserved HBONE port.
+fn ambient_dest_hbone_listen_override(port: u16) -> (&'static str, String) {
+    ("FERRUM_MESH_HBONE_LISTEN_ADDR", format!("0.0.0.0:{port}"))
+}
+
+/// Kubernetes UUID leaf for host-netns Ambient dest fixtures that enroll the
+/// advertised workload address in the node-agent registry (issue #4249).
+/// Registry `spiffe_id=` requires a UUID; an alphanumeric leaf retracts the
+/// enrolled-destination index and the dest relay then refuses the CONNECT.
+const AMBIENT_DEST_RELAY_POD_UID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+/// Publish a node-agent registry leaf so an Ambient dest terminator whose HBONE
+/// listener is reached at `127.0.0.1` still admits a CONNECT `:authority`
+/// naming the advertised non-loopback workload address (issue #4249).
+///
+/// Ambient with a configured registry directory treats the enrolled-pod index
+/// as AUTHORITATIVE for the inventory arm. [`spawn_mesh_gateway`] always points
+/// `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR` at an empty `node-waypoint-pods/`
+/// dir, so without this leaf `destination_is_node_local_enrolled` refuses every
+/// inventory destination (`AddressNotTerminated`) even though the slice
+/// declares the dest as local. Same-cluster, host-netns UDP-dest, and
+/// third-workload refusal fixtures avoid this by dialing the workload IP on a
+/// `0.0.0.0` HBONE bind (own-address arm); cross-cluster fixtures dial
+/// `127.0.0.1` and therefore need enrollment. Write the leaf before spawning
+/// the dest gateway so the startup `reconcile_once` sees it. UDP dest and the
+/// third-workload datagram sibling must not enroll: a matching `ipv4=` makes
+/// `open_hbone_udp_relay_socket` enter the enrolled pod netns, which a
+/// host-netns echo fixture does not have.
+fn publish_ambient_dest_relay_enrollment(temp: &TempDir, ipv4: &str, spiffe_id: &str) {
+    let registry_dir = temp.path().join("node-waypoint-pods");
+    std::fs::create_dir_all(&registry_dir).expect("create ambient dest pod registry");
+    let pod_uid = AMBIENT_DEST_RELAY_POD_UID;
+    std::fs::write(
+        registry_dir.join(pod_uid),
+        format!("/sys/fs/cgroup/kubepods/{pod_uid}\nspiffe_id={spiffe_id}\nipv4={ipv4}\n"),
+    )
+    .expect("publish ambient dest pod registry enrollment");
+}
+
 /// Bind an ephemeral listener for a fixture-owned server (a control plane, an
 /// echo backend, …) on a port no mesh gateway subprocess has been given.
 ///
@@ -508,6 +583,31 @@ pub(crate) fn loopback_ephemeral() -> SocketAddr {
 /// can see.
 pub(crate) async fn bind_fixture_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
     bind_fixture_listener_where(addr, |port| !mesh_port_is_reserved(port)).await
+}
+
+/// UDP counterpart of [`bind_fixture_listener`] (issue #2132): re-roll past
+/// ports already promised to a mesh gateway subprocess. Rejected sockets are
+/// held so the kernel cannot re-offer the same port.
+async fn bind_fixture_udp_socket(addr: SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
+    if addr.port() != 0 {
+        return tokio::net::UdpSocket::bind(addr).await;
+    }
+    let mut rejected = Vec::new();
+    for _ in 0..FIXTURE_BIND_ATTEMPTS {
+        let socket = tokio::net::UdpSocket::bind(addr).await?;
+        let port = socket.local_addr()?.port();
+        if !mesh_port_is_reserved(port) {
+            return Ok(socket);
+        }
+        rejected.push(socket);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        format!(
+            "no acceptable ephemeral UDP port for a fixture socket after \
+             {FIXTURE_BIND_ATTEMPTS} attempts"
+        ),
+    ))
 }
 
 /// [`bind_fixture_listener`] with an injectable acceptance predicate, so the
@@ -982,6 +1082,7 @@ const CHILD_BOUND_READINESS_FIXTURES: &[&str] = &[
     "drive_sidecar_ingress_connect_relay",
     "functional_mesh_sidecar_ingress_stream_reload_withdraws_declared_listener",
     "drive_waypoint_target_refs",
+    "drive_inbound_relay_third_workload_refusal",
 ];
 
 /// Drivers that must void an attempt whose gateway died mid-run.
@@ -999,6 +1100,7 @@ const DEAD_GATEWAY_VOIDING_DRIVERS: &[&str] = &[
     "drive_sidecar_ingress_connect_relay",
     "functional_mesh_sidecar_ingress_stream_reload_withdraws_declared_listener",
     "drive_waypoint_target_refs",
+    "drive_inbound_relay_third_workload_refusal",
 ];
 
 /// Extract one top-level `async fn <name>` body from [`MESH_MODE_TEST_SOURCE`].
@@ -1079,21 +1181,148 @@ fn fixture_servers_bind_through_the_mesh_port_aware_helper() {
     for name in [
         "start_static_mesh_cp_on",
         "start_xds_cp",
-        "start_echo_backend",
+        "start_echo_backend_on",
         "start_labeled_echo_backend",
-        "start_grpc_trailers_echo_backend",
-        "start_websocket_echo_backend",
-        "start_websocket_path_echo_backend",
+        "start_grpc_trailers_echo_backend_on",
+        "start_websocket_echo_backend_on",
+        "start_websocket_path_echo_backend_on",
         "start_tagged_tcp_backend",
-        "start_loopback_tcp_echo",
+        "start_tcp_echo_on",
+        "start_counting_tcp_echo_on",
+        "start_counting_udp_echo_on",
+        "start_udp_echo_on",
     ] {
         let body = mesh_test_fn_body(name);
+        let through_helper =
+            body.contains("bind_fixture_listener(") || body.contains("bind_fixture_udp_socket(");
         assert!(
-            body.contains("bind_fixture_listener("),
-            "`{name}` must bind through `bind_fixture_listener` so it can never take a port \
-             already handed to a mesh gateway subprocess (issue #2132)"
+            through_helper,
+            "`{name}` must bind through `bind_fixture_listener` or \
+             `bind_fixture_udp_socket` so it can never take a port already \
+             handed to a mesh gateway subprocess (issue #2132)"
         );
     }
+}
+
+/// Issue #4252: these functional cases exercise production synthesis-time
+/// refusal (`build_inbound_hbone_relay_proxy` → 404, zero dials). Mesh-mode
+/// has no deployed source that puts `mesh_route_dispatch` on a synthesized
+/// inbound relay; do not invent a `MeshSlice` plugin/config bypass. The
+/// post-plugin handler re-check is proved in-process by
+/// `inbound_hbone_relay_refuses_post_plugin_third_workload_*` in
+/// `tests/integration/mesh_hbone_tests.rs`.
+#[test]
+fn third_workload_refusal_exercises_synthesis_time_guard() {
+    let drive = mesh_test_fn_body("drive_inbound_relay_third_workload_refusal");
+    assert!(
+        drive.contains("fixture_non_loopback_local_v4("),
+        "B's own destination must be a non-loopback local IPv4; Ambient \
+         refuses the loopback namespace, so a 127.0.0.1 control CONNECT \
+         cannot prove the terminator still relays"
+    );
+    assert!(
+        drive.contains("discover_bindable_non_loopback_local_ip("),
+        "C must be a discovered non-loopback interface address so PR #4315's \
+         loopback-namespace guard cannot stand in for the ownership check"
+    );
+    assert!(
+        drive.contains("SocketAddr::new(b_ip, b_local_port)"),
+        "the control CONNECT must name B's non-loopback own destination, \
+         not 127.0.0.1 — Ambient refuses that namespace"
+    );
+    assert!(
+        drive.contains("SocketAddr::new(c_ip, c_port)"),
+        "the peer CONNECT authority must name C (a dest B does not terminate \
+         for) so synthesis refuses without reaching the handlers"
+    );
+    assert!(
+        !drive.contains("third_workload_route_override_plugin("),
+        "mesh-mode has no production path that puts mesh_route_dispatch on \
+         the synthesized inbound relay; do not invent a slice/plugin bypass"
+    );
+    // Without an in-fixture positive control, a terminator that refuses EVERY
+    // destination (slice never applied, SVID mismatch, wrong topology) 404s for
+    // C and passes as a security proof. These pin the control in place.
+    assert!(
+        drive.contains("start_own_dest_echo_for("),
+        "the driver must stand up B's OWN declared destination as a live echo \
+         so the same terminator can be proved to still relay"
+    );
+    assert!(
+        drive.contains("control_failure"),
+        "the driver must require a positive control CONNECT that IS relayed; \
+         otherwise C's 404 is not attributable to C being a third workload"
+    );
+    assert!(
+        drive.contains("observe_third_workload_backend_hits("),
+        "zero backend hits must come from the bounded observation helper, \
+         which reports a dead backend as inconclusive rather than as zero"
+    );
+    // Own-address arm (issue #4249): HBONE on 0.0.0.0, dial B's advertised IP.
+    // Enrollment would take the inventory arm and then have the datagram
+    // sibling enter a pod netns the host-netns echo does not have.
+    assert!(
+        drive.contains("ambient_dest_hbone_listen_override("),
+        "B's HBONE must bind 0.0.0.0 so a CONNECT dialed at B's advertised IP \
+         takes the own-address arm"
+    );
+    assert!(
+        !drive.contains("Ipv4Addr::LOCALHOST"),
+        "HBONE must be dialed at B's advertised workload IP, not 127.0.0.1, so \
+         the accepted local address matches the CONNECT authority"
+    );
+    assert!(
+        !drive.contains("publish_ambient_dest_relay_enrollment("),
+        "do not enroll B — this is a host-netns fixture; enrollment would make \
+         the datagram sibling enter a pod netns the echo does not have"
+    );
+
+    let slice_header = "\nfn third_workload_refusal_slice(";
+    let slice_start = MESH_MODE_TEST_SOURCE
+        .find(slice_header)
+        .expect("`fn third_workload_refusal_slice(` not found");
+    let slice_rest = &MESH_MODE_TEST_SOURCE[slice_start + 1..];
+    let slice_end = slice_rest
+        .find("\n}\n")
+        .expect("no top-level closing brace for third_workload_refusal_slice");
+    let slice = &slice_rest[..slice_end];
+    assert!(
+        !slice.contains("plugin_configs"),
+        "MeshSlice must not grow a plugin_configs wire field for this test"
+    );
+    assert!(
+        !slice.contains("mesh_route_dispatch"),
+        "the functional slice must stay production-shaped MeshConfig content"
+    );
+    assert!(
+        !slice.contains("127.0.0.1"),
+        "Ambient refuses the loopback namespace; B's own identity must not be \
+         hardcoded to 127.0.0.1"
+    );
+    assert!(
+        slice.contains("b_ip.to_string()"),
+        "B's own identity must declare the non-loopback address the control \
+         CONNECT names"
+    );
+
+    let assert_header = "\nfn assert_third_workload_connect_refused(";
+    let assert_start = MESH_MODE_TEST_SOURCE
+        .find(assert_header)
+        .expect("`fn assert_third_workload_connect_refused(` not found");
+    let assert_rest = &MESH_MODE_TEST_SOURCE[assert_start + 1..];
+    let assert_end = assert_rest
+        .find("\n}\n")
+        .expect("no top-level closing brace for assert_third_workload_connect_refused");
+    let assertion = &assert_rest[..assert_end];
+    assert!(
+        assertion.contains("outcome.status, 404"),
+        "both flavors must require synthesis-time 404; this functional setup \
+         never reaches the post-plugin handler re-check"
+    );
+    assert!(
+        !assertion.contains("403 | 404"),
+        "do not treat a handler-path status as equivalent to synthesis refusal"
+    );
 }
 
 /// [`bind_fixture_listener_where`] must re-roll past a rejected port rather than
@@ -3166,8 +3395,12 @@ async fn functional_mesh_mode_strict_inbound_requires_peer_svid() {
 /// sidecar-generated 403 without it. (Connection counts are unreliable here — the
 /// capability-registry refresh probes the backend regardless of authz/warmup.)
 async fn start_echo_backend() -> u16 {
+    start_echo_backend_on(loopback_ephemeral()).await
+}
+
+async fn start_echo_backend_on(addr: SocketAddr) -> u16 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let listener = bind_fixture_listener(loopback_ephemeral())
+    let listener = bind_fixture_listener(addr)
         .await
         .expect("bind echo backend");
     let port = listener.local_addr().expect("echo backend addr").port();
@@ -4093,13 +4326,16 @@ pub(crate) fn generate_two_gateway_svids(
 }
 
 /// The egress slice BOTH gateways consume: one in-mesh HTTP service `svc-b`
-/// backed by gateway B's workload at `127.0.0.1:backend_port`, under STRICT
-/// PeerAuthentication. The same slice serves both roles — B's inbound
-/// materializer recognizes `b_spiffe` as local (via
-/// `FERRUM_MESH_WORKLOAD_SPIFFE_ID`) and builds the loopback route; A's
-/// outbound materializer (whose workload identity differs) builds the egress
-/// route whose targets dial B.
-fn egress_service_slice(node_id: &str, b_spiffe: &str, backend_port: u16) -> MeshSlice {
+/// backed by gateway B's workload at `workload_address:backend_port`, under
+/// STRICT PeerAuthentication. Sidecar uses loopback (own-pod netns privilege).
+/// Ambient/waypoint must use a non-loopback local address: the terminator
+/// refuses loopback because it would reach the host/waypoint namespace.
+fn egress_service_slice(
+    node_id: &str,
+    b_spiffe: &str,
+    backend_port: u16,
+    workload_address: &str,
+) -> MeshSlice {
     let b_id = SpiffeId::new(b_spiffe).expect("b SPIFFE id");
     let trust_domain = TrustDomain::new("cluster.local").expect("trust domain");
     MeshSlice {
@@ -4114,7 +4350,7 @@ fn egress_service_slice(node_id: &str, b_spiffe: &str, backend_port: u16) -> Mes
             },
             service_name: "svc-b".to_string(),
             service_namespace: None,
-            addresses: vec!["127.0.0.1".to_string()],
+            addresses: vec![workload_address.to_string()],
             ports: vec![WorkloadPort {
                 port: backend_port,
                 protocol: AppProtocol::Http,
@@ -4190,12 +4426,24 @@ async fn drive_egress_a_to_b(
         } else {
             generate_gateway_svid(temp_a.path(), a_spiffe)
         };
-        let backend_port = start_echo_backend().await;
+        let workload_ip = topology_relay_workload_v4(topology);
+        let backend_port = start_echo_backend_on(SocketAddr::from((workload_ip, 0))).await;
+        let workload_address = workload_ip.to_string();
 
-        let cp_b =
-            start_static_mesh_cp(egress_service_slice(&node_b, b_spiffe, backend_port)).await;
-        let cp_a =
-            start_static_mesh_cp(egress_service_slice(&node_a, b_spiffe, backend_port)).await;
+        let cp_b = start_static_mesh_cp(egress_service_slice(
+            &node_b,
+            b_spiffe,
+            backend_port,
+            &workload_address,
+        ))
+        .await;
+        let cp_a = start_static_mesh_cp(egress_service_slice(
+            &node_a,
+            b_spiffe,
+            backend_port,
+            &workload_address,
+        ))
+        .await;
         let ports_a = reserve_mesh_ports().await;
         let ports_b = reserve_mesh_ports().await;
         let a_outbound_port = ports_a.outbound;
@@ -4209,6 +4457,20 @@ async fn drive_egress_a_to_b(
         // svc-b local, so (sidecar) the inbound materializer routes
         // :inbound → 127.0.0.1:backend_port, or (ambient) the HBONE relay
         // tunnels CONNECT authorities directly.
+        let mut b_env = vec![
+            ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+            ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+            ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", b_spiffe.to_string()),
+            ("FERRUM_GATEWAY_SVID_CERT_PATH", svids.b.cert_path.clone()),
+            ("FERRUM_GATEWAY_SVID_KEY_PATH", svids.b.key_path.clone()),
+            (
+                "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                svids.b.trust_bundle_path.clone(),
+            ),
+        ];
+        if topology != "sidecar" {
+            b_env.push(ambient_dest_hbone_listen_override(ports_b.hbone));
+        }
         let mut child_b = spawn_mesh_gateway(
             &temp_b,
             MeshGatewaySpawnOptions {
@@ -4218,17 +4480,7 @@ async fn drive_egress_a_to_b(
                 config_protocol: "native",
                 topology,
                 waypoint_name: None,
-                env_overrides: vec![
-                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
-                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
-                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", b_spiffe.to_string()),
-                    ("FERRUM_GATEWAY_SVID_CERT_PATH", svids.b.cert_path.clone()),
-                    ("FERRUM_GATEWAY_SVID_KEY_PATH", svids.b.key_path.clone()),
-                    (
-                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
-                        svids.b.trust_bundle_path.clone(),
-                    ),
-                ],
+                env_overrides: b_env,
             },
         );
         let readiness =
@@ -4397,6 +4649,13 @@ async fn functional_mesh_ambient_egress_routes_a_to_b_over_hbone() {
         "the response must carry point B's backend body: {body:?}\n{logs}"
     );
 }
+
+// The #4150 / #4252 negative of this keystone — an authenticated peer CONNECTs
+// to B naming a third slice-declared workload B does not terminate for — is
+// `functional_mesh_ambient_hbone_refuses_third_workload_{byte_stream,datagram}`
+// (synthesis-time 404, zero dials). The post-plugin handler re-check is
+// `inbound_hbone_relay_refuses_post_plugin_third_workload_*` in
+// `tests/integration/mesh_hbone_tests.rs`.
 
 /// Egress keystone (Sidecar): a captured plaintext request at gateway A reaches
 /// the echo backend behind gateway B over **plain SVID-mTLS HTTP/2** to B's
@@ -5179,7 +5438,11 @@ plugin_configs: []
 /// header-encoded Trailers-Only shape, this exercises the full
 /// data-then-trailers relay the mesh-mTLS gRPC path must preserve end-to-end.
 async fn start_grpc_trailers_echo_backend() -> u16 {
-    let listener = bind_fixture_listener(loopback_ephemeral())
+    start_grpc_trailers_echo_backend_on(loopback_ephemeral()).await
+}
+
+async fn start_grpc_trailers_echo_backend_on(addr: SocketAddr) -> u16 {
+    let listener = bind_fixture_listener(addr)
         .await
         .expect("bind gRPC trailers echo backend");
     let port = listener.local_addr().expect("backend local addr").port();
@@ -5360,12 +5623,25 @@ async fn drive_grpc_egress_a_to_b(
         } else {
             generate_gateway_svid(temp_a.path(), a_spiffe)
         };
-        let backend_port = start_grpc_trailers_echo_backend().await;
+        let workload_ip = topology_relay_workload_v4(topology);
+        let backend_port =
+            start_grpc_trailers_echo_backend_on(SocketAddr::from((workload_ip, 0))).await;
+        let workload_address = workload_ip.to_string();
 
-        let cp_b =
-            start_static_mesh_cp(egress_service_slice(&node_b, b_spiffe, backend_port)).await;
-        let cp_a =
-            start_static_mesh_cp(egress_service_slice(&node_a, b_spiffe, backend_port)).await;
+        let cp_b = start_static_mesh_cp(egress_service_slice(
+            &node_b,
+            b_spiffe,
+            backend_port,
+            &workload_address,
+        ))
+        .await;
+        let cp_a = start_static_mesh_cp(egress_service_slice(
+            &node_a,
+            b_spiffe,
+            backend_port,
+            &workload_address,
+        ))
+        .await;
         let ports_a = reserve_mesh_ports().await;
         let ports_b = reserve_mesh_ports().await;
         let a_outbound_port = ports_a.outbound;
@@ -5375,6 +5651,20 @@ async fn drive_grpc_egress_a_to_b(
             other => return Err(format!("unsupported egress topology {other}")),
         };
 
+        let mut b_env = vec![
+            ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+            ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+            ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", b_spiffe.to_string()),
+            ("FERRUM_GATEWAY_SVID_CERT_PATH", svids.b.cert_path.clone()),
+            ("FERRUM_GATEWAY_SVID_KEY_PATH", svids.b.key_path.clone()),
+            (
+                "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                svids.b.trust_bundle_path.clone(),
+            ),
+        ];
+        if topology != "sidecar" {
+            b_env.push(ambient_dest_hbone_listen_override(ports_b.hbone));
+        }
         let mut child_b = spawn_mesh_gateway(
             &temp_b,
             MeshGatewaySpawnOptions {
@@ -5384,17 +5674,7 @@ async fn drive_grpc_egress_a_to_b(
                 config_protocol: "native",
                 topology,
                 waypoint_name: None,
-                env_overrides: vec![
-                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
-                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
-                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", b_spiffe.to_string()),
-                    ("FERRUM_GATEWAY_SVID_CERT_PATH", svids.b.cert_path.clone()),
-                    ("FERRUM_GATEWAY_SVID_KEY_PATH", svids.b.key_path.clone()),
-                    (
-                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
-                        svids.b.trust_bundle_path.clone(),
-                    ),
-                ],
+                env_overrides: b_env,
             },
         );
         let readiness =
@@ -7329,17 +7609,19 @@ async fn functional_mesh_sidecar_cross_cluster_ws_rejects_untrusted_client() {
 // backend.
 
 /// Destination (gateway C) slice for the Ambient cross-cluster path: Ambient
-/// topology, trust domain B. Its workload addr:port (`127.0.0.1:backend_port`)
+/// topology, trust domain B. Its workload addr:port (`workload_address:backend_port`)
 /// is the inner HBONE CONNECT `:authority` C's transparent relay dials under the
-/// open-relay guard (loopback + a slice-declared workload port — so the
-/// authority is admitted and reaches the echo backend). `trust_bundles` federate
-/// cluster-A's CA so C's HBONE inbound peer-verifier accepts client A's SVID
-/// (trust domain A). No materialized inbound routes (Ambient) — the relay handles
-/// the CONNECT.
+/// open-relay guard. Ambient refuses loopback because that would reach C's
+/// terminator namespace, so the fixture advertises a non-loopback local IPv4
+/// bound by the echo backend. `trust_bundles` federate cluster-A's CA so C's
+/// HBONE inbound peer-verifier accepts client A's SVID (trust domain A). No
+/// materialized inbound routes (Ambient) — the relay handles the CONNECT.
 fn cross_cluster_ambient_dest_slice(
     node_id: &str,
     c_spiffe: &str,
     backend_port: u16,
+    workload_address: &str,
+    pod_uid: &str,
     b_local_ca_pem: &str,
     a_ca_pem: &str,
 ) -> MeshSlice {
@@ -7356,12 +7638,10 @@ fn cross_cluster_ambient_dest_slice(
             },
             service_name: "svc-c".to_string(),
             service_namespace: None,
-            // Loopback + the backend port — the inner CONNECT authority the relay
-            // dials. Loopback passes the relay guard only for the port this
-            // proxy's OWN accepted local address declares (issue #4150); before
-            // that it passed as long as any workload
-            // declares the port; dialing it reaches the echo backend.
-            addresses: vec!["127.0.0.1".to_string()],
+            // Non-loopback local IPv4 + the backend port — the inner CONNECT
+            // authority the Ambient relay dials. Loopback is refused here
+            // because it would reach C's terminator namespace.
+            addresses: vec![workload_address.to_string()],
             ports: vec![WorkloadPort {
                 port: backend_port,
                 protocol: AppProtocol::Http,
@@ -7374,7 +7654,7 @@ fn cross_cluster_ambient_dest_slice(
             weight: None,
             locality: None,
             service_account: Some("svc-c".to_string()),
-            pod_uid: None,
+            pod_uid: Some(pod_uid.to_string()),
             node_waypoint: None,
             remote_provenance: false,
         }],
@@ -7420,10 +7700,10 @@ fn cross_cluster_ambient_dest_slice(
 /// destination service FQDN as the outer-TLS SNI; the gateway forwards the opaque
 /// TLS to the destination workload's HBONE listener. The functional test cannot
 /// run a flat dest network / iptables, so it models the east-west "workload" as
-/// C's HBONE listener directly (`c_hbone_port`) and (in the client slice) the
-/// remote pod address as loopback, so the passthrough lands on C's HBONE
-/// terminator and the inner CONNECT authority is a loopback port C can dial. The
-/// live two-cluster fixture exercises the realistic pod-IP path.
+/// C's HBONE listener directly (`127.0.0.1:c_hbone_port`). The inner CONNECT
+/// authority is C's advertised non-loopback app address, which C can dial
+/// without crossing the loopback-namespace boundary. The live two-cluster
+/// fixture exercises the realistic pod-IP path.
 fn cross_cluster_ambient_east_west_slice(
     node_id: &str,
     c_spiffe: &str,
@@ -7476,17 +7756,18 @@ fn cross_cluster_ambient_east_west_slice(
 
 /// Client (gateway A) slice for the Ambient cross-cluster path: Ambient topology,
 /// trust domain A. Declares `svc-c` with a REMOTE workload (network net-b, trust
-/// domain B) whose address is LOOPBACK + the backend port (so the materialized
-/// per-pod cross-cluster HBONE target's identity = the inner CONNECT authority
-/// `127.0.0.1:backend_port`, which C's relay can dial under the open-relay
-/// guard), and a `MultiClusterConfig` whose `EastWestGateway{network:net-b,
-/// host:127.0.0.1, port:b_east_west_port}` fronts net-b. `trust_bundles` federate
-/// cluster-B's CA so A's outbound (trust-domain-only) verification accepts C's
-/// server SVID (trust domain B).
+/// domain B) whose address is the dest pod's non-loopback app IP + the backend
+/// port (so the materialized per-pod cross-cluster HBONE target's identity = the
+/// inner CONNECT authority `workload_address:backend_port`, which C's relay
+/// can dial under the open-relay guard), and a `MultiClusterConfig` whose
+/// `EastWestGateway{network:net-b, host:127.0.0.1, port:b_east_west_port}`
+/// fronts net-b. `trust_bundles` federate cluster-B's CA so A's outbound
+/// (trust-domain-only) verification accepts C's server SVID (trust domain B).
 fn cross_cluster_ambient_client_slice(
     node_id: &str,
     c_spiffe: &str,
     backend_port: u16,
+    workload_address: &str,
     b_east_west_port: u16,
     a_local_ca_pem: &str,
     b_ca_pem: &str,
@@ -7502,10 +7783,10 @@ fn cross_cluster_ambient_client_slice(
             service_name: "svc-c".to_string(),
             service_namespace: None,
             // The remote pod address. In production this is a real remote pod IP
-            // (slice-declared on both sides); the test collapses it to loopback +
-            // the backend port so the inner CONNECT authority is a loopback port
-            // C can dial (the in-cluster Ambient e2e collapses the same way).
-            addresses: vec!["127.0.0.1".to_string()],
+            // (slice-declared on both sides). Ambient refuses loopback as an
+            // inner CONNECT authority, so the test uses a non-loopback local
+            // IPv4 C can dial to the echo backend.
+            addresses: vec![workload_address.to_string()],
             ports: vec![WorkloadPort {
                 port: backend_port,
                 protocol: AppProtocol::Http,
@@ -7624,7 +7905,9 @@ async fn drive_ambient_cross_cluster_egress(
             throwaway_ca.0
         };
 
-        let backend_port = start_echo_backend().await;
+        let workload_ip = fixture_non_loopback_local_v4();
+        let backend_port = start_echo_backend_on(SocketAddr::from((workload_ip, 0))).await;
+        let workload_address = workload_ip.to_string();
         let ports_a = reserve_mesh_ports().await;
         let ports_b = reserve_mesh_ports().await;
         let ports_c = reserve_mesh_ports().await;
@@ -7636,6 +7919,8 @@ async fn drive_ambient_cross_cluster_egress(
             &node_c,
             c_spiffe,
             backend_port,
+            &workload_address,
+            AMBIENT_DEST_RELAY_POD_UID,
             &b_ca_pem,
             &a_ca_for_c_federation,
         ))
@@ -7650,11 +7935,18 @@ async fn drive_ambient_cross_cluster_egress(
             &node_a,
             c_spiffe,
             backend_port,
+            &workload_address,
             b_east_west_port,
             &a_ca_pem,
             &b_ca_for_a_federation,
         ))
         .await;
+
+        // Issue #4249: C's HBONE is reached at 127.0.0.1, so the CONNECT
+        // authority (non-loopback workload IP) takes the inventory arm, which
+        // the empty spawn-helper registry would refuse. Enroll the dest before
+        // C starts so the startup reconcile sees it.
+        publish_ambient_dest_relay_enrollment(&temp_c, &workload_address, c_spiffe);
 
         // Gateway C (dest, Ambient): HBONE relay → echo backend.
         let mut child_c = spawn_mesh_gateway(
@@ -8010,12 +8302,13 @@ impl AmbientCrossClusterFixture {
 
 /// Start the three-gateway Ambient cross-cluster fixture for one attempt, or
 /// return `None` (after cleaning up) on any bind failure. `backend_port` is C's
-/// already-spawned app backend (its HBONE relay open-relay guard admits the
-/// loopback workload addr:port), so HTTP / WebSocket share this topology.
+/// already-spawned app backend and `workload_address` is that backend's
+/// non-loopback IPv4 (the inner CONNECT authority Ambient will admit).
 async fn try_start_ambient_cross_cluster_fixture(
     attempt: u32,
     client_trusted: bool,
     backend_port: u16,
+    workload_address: &str,
 ) -> Option<AmbientCrossClusterFixture> {
     let a_spiffe = "spiffe://cluster.local/ns/ferrum/sa/client-app";
     let c_spiffe = "spiffe://cluster-b.local/ns/ferrum/sa/svc-c";
@@ -8074,6 +8367,8 @@ async fn try_start_ambient_cross_cluster_fixture(
         &node_c,
         c_spiffe,
         backend_port,
+        workload_address,
+        AMBIENT_DEST_RELAY_POD_UID,
         &b_ca_pem,
         &a_ca_for_c_federation,
     ))
@@ -8088,11 +8383,18 @@ async fn try_start_ambient_cross_cluster_fixture(
         &node_a,
         c_spiffe,
         backend_port,
+        workload_address,
         b_east_west_port,
         &a_ca_pem,
         &b_ca_for_a_federation,
     ))
     .await;
+
+    // Issue #4249: C's HBONE is reached at 127.0.0.1, so the CONNECT
+    // authority (non-loopback workload IP) takes the inventory arm, which
+    // the empty spawn-helper registry would refuse. Enroll the dest before
+    // C starts so the startup reconcile sees it.
+    publish_ambient_dest_relay_enrollment(&temp_c, workload_address, c_spiffe);
 
     // Gateway C (dest, Ambient): HBONE relay → the app backend.
     let mut child_c = spawn_mesh_gateway(
@@ -8259,9 +8561,17 @@ async fn drive_ambient_cross_cluster_ws_egress(
 
     let mut last_failure = String::new();
     for attempt in 1..=RETRY_ATTEMPTS {
-        let backend_port = start_websocket_echo_backend().await;
-        let Some(mut fixture) =
-            try_start_ambient_cross_cluster_fixture(attempt, client_trusted, backend_port).await
+        let workload_ip = fixture_non_loopback_local_v4();
+        let backend_port =
+            start_websocket_echo_backend_on(SocketAddr::from((workload_ip, 0))).await;
+        let workload_address = workload_ip.to_string();
+        let Some(mut fixture) = try_start_ambient_cross_cluster_fixture(
+            attempt,
+            client_trusted,
+            backend_port,
+            &workload_address,
+        )
+        .await
         else {
             last_failure = format!("attempt {attempt}: ambient cross-cluster fixture never bound");
             continue;
@@ -8358,9 +8668,13 @@ async fn drive_ambient_cross_cluster_ws_path_egress() -> Result<(String, String)
     const CLIENT_PATH: &str = "/ws/echo?room=42";
     let mut last_failure = String::new();
     for attempt in 1..=RETRY_ATTEMPTS {
-        let backend_port = start_websocket_path_echo_backend().await;
+        let workload_ip = fixture_non_loopback_local_v4();
+        let backend_port =
+            start_websocket_path_echo_backend_on(SocketAddr::from((workload_ip, 0))).await;
+        let workload_address = workload_ip.to_string();
         let Some(mut fixture) =
-            try_start_ambient_cross_cluster_fixture(attempt, true, backend_port).await
+            try_start_ambient_cross_cluster_fixture(attempt, true, backend_port, &workload_address)
+                .await
         else {
             last_failure = format!("attempt {attempt}: ambient cross-cluster fixture never bound");
             continue;
@@ -8716,7 +9030,7 @@ async fn functional_mesh_file_source_serves_inbound_and_reloads_on_sighup() {
 /// remote workload — the multi-port shape that materializes per-port outbound
 /// siblings disambiguated by `SO_ORIGINAL_DST`.
 fn multi_port_egress_slice(node_id: &str, b_spiffe: &str, backend_port: u16) -> MeshSlice {
-    let mut slice = egress_service_slice(node_id, b_spiffe, backend_port);
+    let mut slice = egress_service_slice(node_id, b_spiffe, backend_port, "127.0.0.1");
     slice.services[0].ports.push(ServicePort {
         port: backend_port.wrapping_add(1),
         protocol: AppProtocol::Grpc,
@@ -8878,8 +9192,12 @@ async fn functional_mesh_sidecar_outbound_multi_port_without_orig_dst_fails_clos
 /// the test can prove frames traversed the full A→B→app→B→A datapath, then
 /// honors a Close.
 async fn start_websocket_echo_backend() -> u16 {
+    start_websocket_echo_backend_on(loopback_ephemeral()).await
+}
+
+async fn start_websocket_echo_backend_on(addr: SocketAddr) -> u16 {
     use futures_util::{SinkExt, StreamExt};
-    let listener = bind_fixture_listener(loopback_ephemeral())
+    let listener = bind_fixture_listener(addr)
         .await
         .expect("bind websocket echo backend");
     let port = listener
@@ -8933,10 +9251,10 @@ async fn start_websocket_echo_backend() -> u16 {
 // The `accept_hdr_async` callback returns tungstenite's large `ErrorResponse`
 // in its `Err` arm — the same accepted shape as `functional_websocket_test.rs`.
 #[allow(clippy::result_large_err)]
-async fn start_websocket_path_echo_backend() -> u16 {
+async fn start_websocket_path_echo_backend_on(addr: SocketAddr) -> u16 {
     use futures_util::{SinkExt, StreamExt};
     use std::sync::{Arc, Mutex};
-    let listener = bind_fixture_listener(loopback_ephemeral())
+    let listener = bind_fixture_listener(addr)
         .await
         .expect("bind websocket path-echo backend");
     let port = listener
@@ -9141,12 +9459,25 @@ async fn drive_websocket_egress_a_to_b(
         } else {
             generate_gateway_svid(temp_a.path(), a_spiffe)
         };
-        let backend_port = start_websocket_echo_backend().await;
+        let workload_ip = topology_relay_workload_v4(topology);
+        let backend_port =
+            start_websocket_echo_backend_on(SocketAddr::from((workload_ip, 0))).await;
+        let workload_address = workload_ip.to_string();
 
-        let cp_b =
-            start_static_mesh_cp(egress_service_slice(&node_b, b_spiffe, backend_port)).await;
-        let cp_a =
-            start_static_mesh_cp(egress_service_slice(&node_a, b_spiffe, backend_port)).await;
+        let cp_b = start_static_mesh_cp(egress_service_slice(
+            &node_b,
+            b_spiffe,
+            backend_port,
+            &workload_address,
+        ))
+        .await;
+        let cp_a = start_static_mesh_cp(egress_service_slice(
+            &node_a,
+            b_spiffe,
+            backend_port,
+            &workload_address,
+        ))
+        .await;
         let ports_a = reserve_mesh_ports().await;
         let ports_b = reserve_mesh_ports().await;
         let a_outbound_port = ports_a.outbound;
@@ -9156,6 +9487,20 @@ async fn drive_websocket_egress_a_to_b(
             other => return Err(format!("unsupported ws egress topology {other}")),
         };
 
+        let mut b_env = vec![
+            ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+            ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+            ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", b_spiffe.to_string()),
+            ("FERRUM_GATEWAY_SVID_CERT_PATH", svids.b.cert_path.clone()),
+            ("FERRUM_GATEWAY_SVID_KEY_PATH", svids.b.key_path.clone()),
+            (
+                "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                svids.b.trust_bundle_path.clone(),
+            ),
+        ];
+        if topology != "sidecar" {
+            b_env.push(ambient_dest_hbone_listen_override(ports_b.hbone));
+        }
         let mut child_b = spawn_mesh_gateway(
             &temp_b,
             MeshGatewaySpawnOptions {
@@ -9165,17 +9510,7 @@ async fn drive_websocket_egress_a_to_b(
                 config_protocol: "native",
                 topology,
                 waypoint_name: None,
-                env_overrides: vec![
-                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
-                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
-                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", b_spiffe.to_string()),
-                    ("FERRUM_GATEWAY_SVID_CERT_PATH", svids.b.cert_path.clone()),
-                    ("FERRUM_GATEWAY_SVID_KEY_PATH", svids.b.key_path.clone()),
-                    (
-                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
-                        svids.b.trust_bundle_path.clone(),
-                    ),
-                ],
+                env_overrides: b_env,
             },
         );
         let readiness =
@@ -9468,9 +9803,16 @@ impl rustls::client::danger::ServerCertVerifier for AnyServerCert {
 
 /// A mesh slice declaring svc-b's workload with a single UDP service port, so
 /// gateway B (which owns `b_spiffe`) recognizes the workload as local and its
-/// inbound open-relay guard admits a `udp` CONNECT to `127.0.0.1:<udp_port>`.
+/// inbound open-relay guard admits a `udp` CONNECT to `workload_address:<udp_port>`.
+/// Ambient refuses loopback; the fixture advertises a non-loopback local IPv4.
 /// STRICT PeerAuthentication so B requires + verifies the client SVID.
-fn udp_dest_slice(node_id: &str, b_spiffe: &str, udp_port: u16) -> MeshSlice {
+fn udp_dest_slice(
+    node_id: &str,
+    b_spiffe: &str,
+    udp_port: u16,
+    workload_address: &str,
+    pod_uid: &str,
+) -> MeshSlice {
     let b_id = SpiffeId::new(b_spiffe).expect("b SPIFFE id");
     let trust_domain = TrustDomain::new("cluster.local").expect("trust domain");
     MeshSlice {
@@ -9485,7 +9827,7 @@ fn udp_dest_slice(node_id: &str, b_spiffe: &str, udp_port: u16) -> MeshSlice {
             },
             service_name: "svc-b".to_string(),
             service_namespace: None,
-            addresses: vec!["127.0.0.1".to_string()],
+            addresses: vec![workload_address.to_string()],
             ports: vec![WorkloadPort {
                 port: udp_port,
                 protocol: AppProtocol::Udp,
@@ -9498,7 +9840,7 @@ fn udp_dest_slice(node_id: &str, b_spiffe: &str, udp_port: u16) -> MeshSlice {
             weight: None,
             locality: None,
             service_account: Some("svc-b".to_string()),
-            pod_uid: None,
+            pod_uid: Some(pod_uid.to_string()),
             node_waypoint: None,
             remote_provenance: false,
         }],
@@ -9528,10 +9870,12 @@ fn udp_dest_slice(node_id: &str, b_spiffe: &str, udp_port: u16) -> MeshSlice {
     }
 }
 
-/// Bind a UDP echo backend on loopback; returns (port, task). Echoes each
-/// datagram back to its sender. Holds the socket for the task's lifetime.
-async fn start_udp_echo_backend() -> (u16, tokio::task::JoinHandle<()>) {
-    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+/// Bind a UDP echo backend on a non-loopback local IPv4 (Ambient dest relay
+/// refuses loopback); returns (address, port, task). Echoes each datagram back
+/// to its sender. Holds the socket for the task's lifetime.
+async fn start_udp_echo_backend() -> (Ipv4Addr, u16, tokio::task::JoinHandle<()>) {
+    let ip = fixture_non_loopback_local_v4();
+    let socket = tokio::net::UdpSocket::bind((ip, 0))
         .await
         .expect("bind udp echo backend");
     let port = socket.local_addr().expect("udp echo local addr").port();
@@ -9541,7 +9885,7 @@ async fn start_udp_echo_backend() -> (u16, tokio::task::JoinHandle<()>) {
             let _ = socket.send_to(&buf[..n], src).await;
         }
     });
-    (port, handle)
+    (ip, port, handle)
 }
 
 /// Build an mTLS HTTP/2 client config presenting `svid`'s leaf cert + key, with
@@ -9599,18 +9943,18 @@ async fn read_one_framed_reply(
 /// Open mTLS H2 to B, send a `udp` CONNECT + one framed `ping`, return
 /// (status, optional framed reply).
 async fn drive_one_udp_connect(
+    hbone_ip: Ipv4Addr,
     hbone_port: u16,
     authority: &str,
     client_svid: &GeneratedGatewaySvid,
 ) -> Result<(u16, Option<Vec<u8>>), String> {
-    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", hbone_port))
+    let tcp = tokio::net::TcpStream::connect((hbone_ip, hbone_port))
         .await
         .map_err(|e| format!("connect B: {e}"))?;
     let _ = tcp.set_nodelay(true);
     let connector = tokio_rustls::TlsConnector::from(udp_dest_client_config(client_svid));
-    let server_name = rustls::pki_types::ServerName::IpAddress(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)).into(),
-    );
+    let server_name =
+        rustls::pki_types::ServerName::IpAddress(std::net::IpAddr::V4(hbone_ip).into());
     // Bound the handshakes: if the HBONE port is bound but the TLS server wedges
     // (or a regression binds a non-TLS listener), an unbounded handshake await
     // would hang the ignored test forever before reaching the later timeouts.
@@ -9709,11 +10053,25 @@ async fn drive_udp_dest_connect(
             generate_gateway_svid(temp_client.path(), a_spiffe)
         };
 
-        let (udp_port, echo) = start_udp_echo_backend().await;
-        let cp_b = start_static_mesh_cp(udp_dest_slice(&node_b, b_spiffe, udp_port)).await;
+        let (workload_ip, udp_port, echo) = start_udp_echo_backend().await;
+        let workload_address = workload_ip.to_string();
+        let cp_b = start_static_mesh_cp(udp_dest_slice(
+            &node_b,
+            b_spiffe,
+            udp_port,
+            &workload_address,
+            AMBIENT_DEST_RELAY_POD_UID,
+        ))
+        .await;
         let ports_b = reserve_mesh_ports().await;
         let hbone_port = ports_b.hbone;
 
+        // Same-cluster Ambient dest shape (issue #4249): bind HBONE on 0.0.0.0
+        // and dial the advertised workload IP so the CONNECT takes the
+        // own-address arm. Do not enroll that IP — enrollment is what the
+        // inventory arm needs when HBONE is reached at 127.0.0.1, but
+        // `open_hbone_udp_relay_socket` then enters the enrolled pod netns,
+        // and this host-netns echo has none (502).
         let mut child_b = spawn_mesh_gateway(
             &temp_b,
             MeshGatewaySpawnOptions {
@@ -9733,6 +10091,7 @@ async fn drive_udp_dest_connect(
                         "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
                         svids.b.trust_bundle_path.clone(),
                     ),
+                    ambient_dest_hbone_listen_override(hbone_port),
                 ],
             },
         );
@@ -9755,9 +10114,10 @@ async fn drive_udp_dest_connect(
             // A port no workload declares — the open-relay guard must refuse it.
             udp_port.checked_add(1).unwrap_or(1)
         };
-        let authority = format!("127.0.0.1:{dial_port}");
+        let authority = format!("{workload_address}:{dial_port}");
 
-        let outcome = drive_one_udp_connect(hbone_port, &authority, &client_svid).await;
+        let outcome =
+            drive_one_udp_connect(workload_ip, hbone_port, &authority, &client_svid).await;
 
         let logs = captured_output(&temp_b);
         kill_child(&mut child_b);
@@ -9805,7 +10165,7 @@ async fn functional_mesh_udp_dest_relays_datagram_round_trip() {
 
 /// Stage 7 fail-closed (open-relay guard): a `udp` CONNECT whose authority is a
 /// port the slice does NOT declare is refused at the destination — the inbound
-/// open-relay guard admits only loopback / slice-declared workload addr+port, so
+/// open-relay guard admits only a slice-declared workload addr+port, so
 /// an authenticated peer can never ride a `udp` CONNECT to an arbitrary port.
 #[ignore]
 #[tokio::test]
@@ -9861,6 +10221,711 @@ async fn functional_mesh_udp_dest_untrusted_peer_fails_closed() {
             );
         }
     }
+}
+
+// ===================================================================
+// Issue #4252 — inbound relay refuses a third, slice-declared workload
+// ===================================================================
+//
+// Production mesh-mode (native MeshSubscribe / xDS / file MeshConfig) has no
+// path that places operator `mesh_route_dispatch` on the synthesized inbound
+// HBONE relay. These functional cases therefore prove the production-shaped
+// synthesis refusal: an authenticated peer CONNECTs to terminator B naming
+// slice-declared workload C, `build_inbound_hbone_relay_proxy` returns None,
+// the dispatcher 404s, and C's backend records zero hits.
+//
+// That is not the post-plugin handler re-check. The independently placed
+// re-checks in `handle_hbone_request` / `handle_hbone_udp_request` are proved
+// in-process by `inbound_hbone_relay_refuses_post_plugin_third_workload_*` in
+// `tests/integration/mesh_hbone_tests.rs`, which uses a normal GatewayConfig
+// plugin cache (global `mesh_route_dispatch`) and requires exact 403.
+//
+// C is a bindable non-loopback local interface address: PR #4315 can refuse
+// the whole loopback namespace for Ambient/waypoint terminators before
+// inventory fall-through, which would keep a 127.0.0.2 fixture green even if
+// the ownership guard regressed to accepting the full slice inventory.
+//
+// Each case carries an IN-FIXTURE POSITIVE CONTROL: before the C-named
+// CONNECT, the same peer SVID and the same CONNECT flavor name B's OWN
+// declared non-loopback destination and must be relayed (200 + byte-exact echo).
+// Ambient refuses the loopback namespace (#4315), so the control cannot name
+// `127.0.0.1`. A 404 is only evidence of an ownership refusal once the same
+// terminator has been shown to relay something. Without the control, a
+// fixture whose slice never applied, whose SVID did not chain, or whose
+// topology was wrong would 404 for C and pass as a security proof.
+
+/// After a CONNECT result, wait this long for C's backend task to report a
+/// TCP accept or UDP datagram that was already queued while that task had not
+/// yet been polled. An immediate atomic load can miss that race and treat an
+/// admission as a refusal. The wait is a bounded channel recv, not a sleep.
+const THIRD_WORKLOAD_BACKEND_OBSERVE: Duration = Duration::from_secs(2);
+
+fn is_usable_non_loopback_unicast(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !v4.is_loopback()
+                && !v4.is_unspecified()
+                && !v4.is_link_local()
+                && !v4.is_multicast()
+                && !v4.is_broadcast()
+        }
+        IpAddr::V6(v6) => {
+            !v6.is_loopback()
+                && !v6.is_unspecified()
+                && !v6.is_multicast()
+                && (v6.segments()[0] & 0xffc0) != 0xfe80
+        }
+    }
+}
+
+/// UDP-connect probe: the kernel picks the local address it would use to
+/// reach `dest`. The socket is dropped immediately; this is discovery, not a
+/// fixture listener.
+async fn probe_udp_egress_local_ip(dest: SocketAddr) -> Result<IpAddr, String> {
+    let bind = if dest.is_ipv4() {
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
+    };
+    let socket = tokio::net::UdpSocket::bind(bind)
+        .await
+        .map_err(|e| format!("probe bind {bind}: {e}"))?;
+    socket
+        .connect(dest)
+        .await
+        .map_err(|e| format!("probe connect {dest}: {e}"))?;
+    socket
+        .local_addr()
+        .map(|addr| addr.ip())
+        .map_err(|e| format!("probe local_addr: {e}"))
+}
+
+/// Discover a host-namespace address the gateway child can also bind (it
+/// shares the network namespace). Fail with probe/bind evidence when the
+/// runner has only loopback.
+async fn discover_bindable_non_loopback_local_ip() -> Result<IpAddr, String> {
+    let probes = [
+        SocketAddr::from((Ipv4Addr::new(1, 1, 1, 1), 53)),
+        SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 53)),
+        SocketAddr::from((
+            std::net::Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
+            53,
+        )),
+    ];
+    let mut evidence = Vec::new();
+    let mut seen = HashSet::new();
+    for dest in probes {
+        match probe_udp_egress_local_ip(dest).await {
+            Ok(ip) => {
+                if !seen.insert(ip) {
+                    continue;
+                }
+                if !is_usable_non_loopback_unicast(ip) {
+                    evidence.push(format!(
+                        "probe {dest} → {ip}: rejected (loopback/unspecified/link-local/multicast/broadcast)"
+                    ));
+                    continue;
+                }
+                match bind_fixture_listener(SocketAddr::new(ip, 0)).await {
+                    Ok(listener) => {
+                        drop(listener);
+                        return Ok(ip);
+                    }
+                    Err(e) => evidence.push(format!("probe {dest} → {ip}: TCP bind failed: {e}")),
+                }
+            }
+            Err(e) => evidence.push(format!("probe {dest}: {e}")),
+        }
+    }
+    Err(format!(
+        "no usable non-loopback local interface address for workload C \
+         (the gateway child shares this host network namespace). Evidence:\n{}",
+        evidence.join("\n")
+    ))
+}
+
+/// CONNECT flavor under test. Byte-stream and datagram-over-CONNECT take
+/// different dispatch branches into `build_inbound_hbone_relay_proxy`
+/// (UDP forces a route miss); both must synthesis-refuse C.
+#[derive(Clone, Copy)]
+enum ThirdWorkloadConnectFlavor {
+    ByteStream,
+    Datagram,
+}
+
+/// Counting TCP listener bound on `ip`. Each `accept()` is sent on the
+/// returned channel — the destination-side "a backend dial occurred" signal
+/// for the byte-stream relay. The ready oneshot fires before the first
+/// `accept`, so the caller knows the accept loop has been scheduled.
+async fn start_counting_tcp_echo_on(
+    ip: std::net::IpAddr,
+) -> (
+    SocketAddr,
+    mpsc::UnboundedReceiver<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = bind_fixture_listener(SocketAddr::new(ip, 0))
+        .await
+        .unwrap_or_else(|e| panic!("bind third-workload TCP echo on {ip}: {e}"));
+    let addr = listener.local_addr().expect("third-workload TCP echo addr");
+    let (hit_tx, hit_rx) = mpsc::unbounded_channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = ready_tx.send(());
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            // Record the dial and drop the socket. Echoing would spawn a
+            // detached per-connection task that aborting this accept loop
+            // cannot join.
+            drop(stream);
+            if hit_tx.send(()).is_err() {
+                return;
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), ready_rx)
+        .await
+        .expect("third-workload TCP echo became ready")
+        .expect("third-workload TCP echo task dropped ready");
+    (addr, hit_rx, task)
+}
+
+/// Counting UDP socket bound on `ip`. Each `recv_from` is sent on the
+/// returned channel — the destination-side "a datagram was delivered" signal
+/// for the datagram-over-CONNECT relay.
+async fn start_counting_udp_echo_on(
+    ip: std::net::IpAddr,
+) -> (
+    SocketAddr,
+    mpsc::UnboundedReceiver<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let socket = bind_fixture_udp_socket(SocketAddr::new(ip, 0))
+        .await
+        .unwrap_or_else(|e| panic!("bind third-workload UDP echo on {ip}: {e}"));
+    let addr = socket.local_addr().expect("third-workload UDP echo addr");
+    let (hit_tx, hit_rx) = mpsc::unbounded_channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = ready_tx.send(());
+        let mut buf = vec![0u8; 65535];
+        while socket.recv_from(&mut buf).await.is_ok() {
+            if hit_tx.send(()).is_err() {
+                return;
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), ready_rx)
+        .await
+        .expect("third-workload UDP echo became ready")
+        .expect("third-workload UDP echo task dropped ready");
+    (addr, hit_rx, task)
+}
+
+/// Wait until C's backend reports a hit, or until `window` elapses with none.
+/// Returning early on the first hit keeps a regression from burning the full
+/// window; a timeout is the only way to conclude zero hits.
+///
+/// `None` means the channel CLOSED — C's backend task exited, so it could not
+/// have recorded a dial and "zero hits" is not evidence of anything. That is
+/// reported as a setup failure rather than folded into a passing `0`.
+async fn observe_third_workload_backend_hits(
+    hit_rx: &mut mpsc::UnboundedReceiver<()>,
+    window: Duration,
+) -> Option<usize> {
+    match tokio::time::timeout(window, hit_rx.recv()).await {
+        Ok(Some(())) => {
+            let mut hits = 1;
+            while hit_rx.try_recv().is_ok() {
+                hits += 1;
+            }
+            Some(hits)
+        }
+        // Timed out with the backend still listening: a genuine zero.
+        Err(_) => Some(0),
+        Ok(None) => None,
+    }
+}
+
+/// UDP echo bound through the mesh-port-aware helper (issue #2132).
+/// This is B's OWN declared destination for the datagram control, so it must
+/// echo: `drive_one_udp_connect` only reports 200 after a framed round trip.
+async fn start_udp_echo_on(addr: SocketAddr) -> (u16, tokio::task::JoinHandle<()>) {
+    let socket = bind_fixture_udp_socket(addr)
+        .await
+        .expect("bind third-workload control UDP echo");
+    let port = socket
+        .local_addr()
+        .expect("third-workload control UDP echo addr")
+        .port();
+    let task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        while let Ok((n, src)) = socket.recv_from(&mut buf).await {
+            if socket.send_to(&buf[..n], src).await.is_err() {
+                return;
+            }
+        }
+    });
+    (port, task)
+}
+
+/// Stand up B's OWN declared destination for the in-fixture positive control.
+/// Ambient refuses the loopback namespace, so `ip` is a non-loopback local
+/// bind. Both CONNECT helpers require a byte-exact round trip before they
+/// report 200, so this echoes rather than counting.
+async fn start_own_dest_echo_for(
+    flavor: ThirdWorkloadConnectFlavor,
+    ip: IpAddr,
+) -> (u16, tokio::task::JoinHandle<()>) {
+    let addr = SocketAddr::new(ip, 0);
+    match flavor {
+        ThirdWorkloadConnectFlavor::ByteStream => {
+            let (port, _accepted, task) = start_tcp_echo_on(addr).await;
+            (port, task)
+        }
+        ThirdWorkloadConnectFlavor::Datagram => start_udp_echo_on(addr).await,
+    }
+}
+
+async fn abort_third_workload_backend(task: tokio::task::JoinHandle<()>) {
+    task.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+}
+
+/// Slice consumed by terminator B: B's own-identity record at a non-loopback
+/// local address plus workload C — a different SPIFFE, a discovered non-loopback
+/// address. No operator plugins: this is the production MeshSubscribe shape.
+#[allow(clippy::too_many_arguments)]
+fn third_workload_refusal_slice(
+    node_id: &str,
+    b_spiffe: &str,
+    c_spiffe: &str,
+    b_ip: IpAddr,
+    b_local_port: u16,
+    c_ip: IpAddr,
+    c_port: u16,
+    protocol: AppProtocol,
+) -> MeshSlice {
+    let b_id = SpiffeId::new(b_spiffe).expect("b SPIFFE id");
+    let c_id = SpiffeId::new(c_spiffe).expect("c SPIFFE id");
+    let trust_domain = TrustDomain::new("cluster.local").expect("trust domain");
+    let proto_name = match protocol {
+        AppProtocol::Udp => "udp",
+        _ => "tcp",
+    };
+    MeshSlice {
+        node_id: node_id.to_string(),
+        namespace: "ferrum".to_string(),
+        version: Utc::now().to_rfc3339(),
+        workloads: vec![
+            Workload {
+                spiffe_id: b_id.clone(),
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "svc-b".to_string())]),
+                    namespace: Some("ferrum".to_string()),
+                },
+                service_name: "svc-b".to_string(),
+                service_namespace: None,
+                addresses: vec![b_ip.to_string()],
+                ports: vec![WorkloadPort {
+                    port: b_local_port,
+                    protocol,
+                    name: Some(proto_name.to_string()),
+                }],
+                trust_domain: trust_domain.clone(),
+                namespace: "ferrum".to_string(),
+                network: None,
+                cluster: None,
+                weight: None,
+                locality: None,
+                service_account: Some("svc-b".to_string()),
+                pod_uid: None,
+                node_waypoint: None,
+                remote_provenance: false,
+            },
+            Workload {
+                spiffe_id: c_id.clone(),
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "svc-c".to_string())]),
+                    namespace: Some("ferrum".to_string()),
+                },
+                service_name: "svc-c".to_string(),
+                service_namespace: None,
+                addresses: vec![c_ip.to_string()],
+                ports: vec![WorkloadPort {
+                    port: c_port,
+                    protocol,
+                    name: Some(proto_name.to_string()),
+                }],
+                trust_domain,
+                namespace: "ferrum".to_string(),
+                network: None,
+                cluster: None,
+                weight: None,
+                locality: None,
+                service_account: Some("svc-c".to_string()),
+                pod_uid: None,
+                node_waypoint: None,
+                remote_provenance: false,
+            },
+        ],
+        services: vec![
+            MeshService {
+                cluster_ips: Vec::new(),
+                name: "svc-b".to_string(),
+                namespace: "ferrum".to_string(),
+                ports: vec![ServicePort {
+                    port: b_local_port,
+                    protocol,
+                    name: Some(proto_name.to_string()),
+                    target_port: None,
+                }],
+                workloads: vec![WorkloadRef { spiffe_id: b_id }],
+                protocol_overrides: HashMap::new(),
+                uid: None,
+            },
+            MeshService {
+                cluster_ips: Vec::new(),
+                name: "svc-c".to_string(),
+                namespace: "ferrum".to_string(),
+                ports: vec![ServicePort {
+                    port: c_port,
+                    protocol,
+                    name: Some(proto_name.to_string()),
+                    target_port: None,
+                }],
+                workloads: vec![WorkloadRef { spiffe_id: c_id }],
+                protocol_overrides: HashMap::new(),
+                uid: None,
+            },
+        ],
+        peer_authentications: vec![PeerAuthentication {
+            name: "mesh-strict".to_string(),
+            namespace: "ferrum".to_string(),
+            scope: None,
+            selector: None,
+            mtls_mode: MtlsMode::Strict,
+            port_overrides: HashMap::new(),
+        }],
+        ..MeshSlice::default()
+    }
+}
+
+/// CONNECT status plus how many times C's backend was actually reached.
+struct ThirdWorkloadRefusalOutcome {
+    status: u16,
+    backend_hits: usize,
+    logs: String,
+}
+
+/// Spawn Ambient terminator B over a slice that also declares workload C, prove
+/// the terminator live with a positive control CONNECT naming B's OWN declared
+/// destination, then drive one authenticated CONNECT at B's HBONE port naming
+/// C. Synthesis refuses because C is not a dest B terminates for. Setup
+/// failures retry; both CONNECT observations are made exactly once against a
+/// live child, and a control that is NOT relayed is a hard failure rather than
+/// another retry — it means the fixture, not the guard, produced the refusal.
+async fn drive_inbound_relay_third_workload_refusal(
+    flavor: ThirdWorkloadConnectFlavor,
+) -> Result<ThirdWorkloadRefusalOutcome, String> {
+    ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
+    let a_spiffe = "spiffe://cluster.local/ns/ferrum/sa/client-app";
+    let b_spiffe = "spiffe://cluster.local/ns/ferrum/sa/svc-b";
+    let c_spiffe = "spiffe://cluster.local/ns/ferrum/sa/svc-c";
+    let flavor_label = match flavor {
+        ThirdWorkloadConnectFlavor::ByteStream => "byte-stream",
+        ThirdWorkloadConnectFlavor::Datagram => "datagram",
+    };
+    let protocol = match flavor {
+        ThirdWorkloadConnectFlavor::ByteStream => AppProtocol::Tcp,
+        ThirdWorkloadConnectFlavor::Datagram => AppProtocol::Udp,
+    };
+    // `drive_one_udp_connect` sends a fixed `ping`; the byte helper takes the
+    // payload. Both require the echo back byte-for-byte before reporting 200.
+    let control_payload: &[u8] = match flavor {
+        ThirdWorkloadConnectFlavor::ByteStream => b"own-dest-control",
+        ThirdWorkloadConnectFlavor::Datagram => b"ping",
+    };
+    // Ambient refuses the loopback namespace (#4315). B's own dest and C must
+    // both be non-loopback so a control 200 and a C 404 are attributable to
+    // ownership, not to loopback-namespace denial. `b_hbone_ip` is the address
+    // the client dials for B's HBONE so the accepted local address matches
+    // the CONNECT authority (own-address arm).
+    let b_hbone_ip = fixture_non_loopback_local_v4();
+    let b_ip = IpAddr::V4(b_hbone_ip);
+    let c_ip = discover_bindable_non_loopback_local_ip().await?;
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_b = format!("functional-mesh-third-workload-{flavor_label}-b-{attempt}");
+        let temp_b = TempDir::new().map_err(|e| format!("temp dir b: {e}"))?;
+        let svids = generate_two_gateway_svids(temp_b.path(), a_spiffe, b_spiffe);
+
+        let (c_addr, mut hit_rx, echo) = match flavor {
+            ThirdWorkloadConnectFlavor::ByteStream => start_counting_tcp_echo_on(c_ip).await,
+            ThirdWorkloadConnectFlavor::Datagram => start_counting_udp_echo_on(c_ip).await,
+        };
+        let c_port = c_addr.port();
+        // B's own-identity record must declare a port, otherwise an empty port
+        // list leaves the owned address unconstrained. It is a LIVE echo so the
+        // positive control below can prove this terminator still relays for the
+        // destination it owns.
+        let (b_local_port, control_echo) = start_own_dest_echo_for(flavor, b_ip).await;
+        if b_ip == c_ip && b_local_port == c_port {
+            // Keep the two ports distinct so an unconstrained own-address arm
+            // could not admit C's port on B's owned address. Both are
+            // ephemeral, so this is a re-roll, not a failure.
+            abort_third_workload_backend(echo).await;
+            abort_third_workload_backend(control_echo).await;
+            last_failure = format!("attempt {attempt}: B and C drew the same port {c_port}");
+            continue;
+        }
+
+        let cp_b = start_static_mesh_cp(third_workload_refusal_slice(
+            &node_b,
+            b_spiffe,
+            c_spiffe,
+            b_ip,
+            b_local_port,
+            c_ip,
+            c_port,
+            protocol,
+        ))
+        .await;
+        let ports_b = reserve_mesh_ports().await;
+        let hbone_port = ports_b.hbone;
+
+        // Same-cluster Ambient dest shape (issue #4249): bind HBONE on 0.0.0.0
+        // and dial B's advertised workload IP so the own-destination control
+        // CONNECT takes the own-address arm. Do not enroll that IP — enrollment
+        // is what the inventory arm needs when HBONE is reached at 127.0.0.1,
+        // but `open_hbone_udp_relay_socket` then enters the enrolled pod netns,
+        // and this host-netns echo (shared by the datagram sibling) has none
+        // (502).
+        let mut child_b = spawn_mesh_gateway(
+            &temp_b,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp_b.addr,
+                ports: ports_b,
+                node_id: &node_b,
+                config_protocol: "native",
+                topology: "ambient",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", b_spiffe.to_string()),
+                    ("FERRUM_GATEWAY_SVID_CERT_PATH", svids.b.cert_path.clone()),
+                    ("FERRUM_GATEWAY_SVID_KEY_PATH", svids.b.key_path.clone()),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        svids.b.trust_bundle_path.clone(),
+                    ),
+                    ambient_dest_hbone_listen_override(hbone_port),
+                ],
+            },
+        );
+
+        let readiness = wait_for_gateway_listener(&mut child_b, hbone_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
+            last_failure = format!(
+                "attempt {attempt}: {}\n{}",
+                readiness.describe("gateway B HBONE listener", hbone_port),
+                captured_output(&temp_b)
+            );
+            kill_child(&mut child_b);
+            cp_b.shutdown().await;
+            abort_third_workload_backend(echo).await;
+            abort_third_workload_backend(control_echo).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        // In-fixture POSITIVE CONTROL. Same terminator, same peer SVID, same
+        // CONNECT flavor — but naming B's OWN declared destination. A 200 with
+        // a byte-exact echo proves the slice loaded, the peer is trusted, and
+        // synthesis still builds a relay on this child. Without it, a fixture
+        // that refuses EVERY destination (slice never applied, SVID mismatch,
+        // wrong topology) would 404 for C and pass as a security proof.
+        let control_authority = SocketAddr::new(b_ip, b_local_port).to_string();
+        let control = match flavor {
+            ThirdWorkloadConnectFlavor::ByteStream => {
+                drive_one_waypoint_byte_connect(
+                    b_hbone_ip,
+                    hbone_port,
+                    &control_authority,
+                    &svids.a,
+                    control_payload,
+                )
+                .await
+            }
+            ThirdWorkloadConnectFlavor::Datagram => {
+                drive_one_udp_connect(b_hbone_ip, hbone_port, &control_authority, &svids.a).await
+            }
+        };
+
+        // Two steps on purpose: the `&mut [..]` scrutinee temporary must be
+        // dropped before the body reborrows `child_b` for `kill_child`.
+        let control_died = exited_gateway_diagnostic(&mut [("gateway B", &mut child_b)]);
+        if let Some(diagnostic) = control_died {
+            let logs = captured_output(&temp_b);
+            last_failure = format!("attempt {attempt}: {diagnostic}\n{logs}");
+            kill_child(&mut child_b);
+            cp_b.shutdown().await;
+            abort_third_workload_backend(echo).await;
+            abort_third_workload_backend(control_echo).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        let control_failure = match &control {
+            Ok((200, echoed)) if echoed.as_deref() == Some(control_payload) => None,
+            Ok((200, echoed)) => Some(format!(
+                "own-destination control CONNECT to {control_authority} relayed but echoed \
+                 {echoed:?}, expected {control_payload:?}"
+            )),
+            Ok((status, _)) => Some(format!(
+                "own-destination control CONNECT to {control_authority} returned {status}, \
+                 expected 200: this terminator refuses even the destination it owns, so a \
+                 404 for C would not be attributable to C being a third workload"
+            )),
+            Err(e) => Some(format!(
+                "own-destination control CONNECT to {control_authority} failed: {e}"
+            )),
+        };
+        if let Some(failure) = control_failure {
+            let logs = captured_output(&temp_b);
+            kill_child(&mut child_b);
+            cp_b.shutdown().await;
+            abort_third_workload_backend(echo).await;
+            abort_third_workload_backend(control_echo).await;
+            return Err(format!("{failure}\n--- gateway B ---\n{logs}"));
+        }
+
+        // CONNECT names C, a dest B does not terminate for. Synthesis 404s
+        // before either HBONE handler runs. When this host has only one
+        // non-loopback IPv4, B and C share that address and the own-address
+        // arm refuses C as PortNotDeclared (C's port lives only on C's
+        // SPIFFE); distinct addresses miss the own-address arm and inventory
+        // refuses as AddressNotTerminated. Both are synthesis 404, and C is
+        // not loopback so the 404 is not the #4315 namespace refusal.
+        let authority = SocketAddr::new(c_ip, c_port).to_string();
+        let connect = match flavor {
+            ThirdWorkloadConnectFlavor::ByteStream => drive_one_waypoint_byte_connect(
+                b_hbone_ip,
+                hbone_port,
+                &authority,
+                &svids.a,
+                b"third-workload-must-not-be-dialed",
+            )
+            .await
+            .map(|(status, _)| status),
+            ThirdWorkloadConnectFlavor::Datagram => {
+                drive_one_udp_connect(b_hbone_ip, hbone_port, &authority, &svids.a)
+                    .await
+                    .map(|(status, _)| status)
+            }
+        };
+
+        let died = exited_gateway_diagnostic(&mut [("gateway B", &mut child_b)]);
+        let logs = captured_output(&temp_b);
+
+        if let Some(diagnostic) = died {
+            last_failure = format!("attempt {attempt}: {diagnostic}\n{logs}");
+            kill_child(&mut child_b);
+            cp_b.shutdown().await;
+            abort_third_workload_backend(echo).await;
+            abort_third_workload_backend(control_echo).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        // Observe while the terminator is still alive so a queued dial can
+        // still complete accept/recv and fail the zero-hit assertion.
+        let observed = if connect.is_ok() {
+            observe_third_workload_backend_hits(&mut hit_rx, THIRD_WORKLOAD_BACKEND_OBSERVE).await
+        } else {
+            Some(0)
+        };
+        kill_child(&mut child_b);
+        cp_b.shutdown().await;
+        abort_third_workload_backend(echo).await;
+        abort_third_workload_backend(control_echo).await;
+
+        let Some(backend_hits) = observed else {
+            return Err(format!(
+                "workload C's backend task exited before the observation window, so zero \
+                 hits proves nothing\n--- gateway B ---\n{logs}"
+            ));
+        };
+
+        return match connect {
+            Ok(status) => Ok(ThirdWorkloadRefusalOutcome {
+                status,
+                backend_hits,
+                logs,
+            }),
+            Err(e) => Err(format!(
+                "trusted CONNECT naming C failed against a healthy terminator: \
+                 {e}\n--- gateway B ---\n{logs}"
+            )),
+        };
+    }
+
+    Err(format!(
+        "third-workload refusal gateway never bound after {RETRY_ATTEMPTS} \
+         attempts\n{last_failure}"
+    ))
+}
+
+fn assert_third_workload_connect_refused(outcome: ThirdWorkloadRefusalOutcome, flavor: &str) {
+    assert_eq!(
+        outcome.status, 404,
+        "{flavor}: authenticated CONNECT naming C must be refused at \
+         synthesis time; 200/502 means the terminator relayed a dest it \
+         does not own\n{}",
+        outcome.logs
+    );
+    assert_eq!(
+        outcome.backend_hits, 0,
+        "{flavor}: workload C's backend must see zero accepts/datagrams — a \
+         guard that refuses after dialling would still pass a status-only \
+         assertion\n{}",
+        outcome.logs
+    );
+}
+
+/// Issue #4252 (byte-stream, synthesis): an authenticated HBONE CONNECT to
+/// terminator B naming slice-declared workload C is refused with 404, and C's
+/// TCP echo records zero accepts — proving `build_inbound_hbone_relay_proxy`
+/// still withholds the relay before `handle_hbone_request`. The same
+/// terminator relays B's own declared destination in the same attempt, so the
+/// 404 is attributable to C being a third workload.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_ambient_hbone_refuses_third_workload_byte_stream() {
+    let outcome =
+        drive_inbound_relay_third_workload_refusal(ThirdWorkloadConnectFlavor::ByteStream)
+            .await
+            .expect("third-workload byte-stream setup");
+    assert_third_workload_connect_refused(outcome, "byte-stream HBONE CONNECT");
+}
+
+/// Issue #4252 (datagram-over-CONNECT, synthesis): the same C-named CONNECT
+/// over the UDP-marked flavor, asserting synthesis 404 and C's UDP echo
+/// records zero datagrams — proving the UDP branch of
+/// `build_inbound_hbone_relay_proxy` still withholds the relay before
+/// `handle_hbone_udp_request`. The same terminator round-trips a datagram to
+/// B's own declared destination in the same attempt.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_ambient_hbone_refuses_third_workload_datagram() {
+    let outcome = drive_inbound_relay_third_workload_refusal(ThirdWorkloadConnectFlavor::Datagram)
+        .await
+        .expect("third-workload datagram setup");
+    assert_third_workload_connect_refused(outcome, "datagram-over-CONNECT HBONE CONNECT");
 }
 
 // ===================================================================
@@ -10792,25 +11857,26 @@ async fn wait_for_ingress_connect(
 //     onto that sibling through its unmatched Gateway arm.
 //
 // The waypoint terminates HBONE on :15008 and transparently relays a route-miss
-// CONNECT to its authority, so two loopback TCP echoes on distinct ports stand
-// in for two distinct destination Services. `mesh_authz` runs in the authorize
-// phase, before the relay dials anything.
+// CONNECT to its authority, so two non-loopback TCP echoes on distinct ports
+// stand in for two distinct destination Services. ServiceWaypoint refuses
+// loopback because it would reach the waypoint namespace. `mesh_authz` runs in
+// the authorize phase, before the relay dials anything.
 
 const WAYPOINT_TARGET_REFS_NAME: &str = "reviews-waypoint";
 const WAYPOINT_TARGET_REFS_OTHER: &str = "other-waypoint";
 const WAYPOINT_TARGET_REFS_NAMESPACE: &str = "ferrum";
 
-/// Raw loopback TCP echo: the ServiceWaypoint byte-stream relay copies bytes
-/// straight through, so an echo proves the relay actually completed. The
-/// accepted-connection counter is what makes a DENY assertion real — a denied
-/// request must leave this backend with ZERO connections, because `mesh_authz`
-/// rejects in the authorize phase, before the relay dials anything.
-async fn start_loopback_tcp_echo() -> (u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+/// Raw TCP echo used as a ServiceWaypoint destination. Ambient/waypoint ordinary
+/// relay copies bytes straight through, so an echo proves the relay actually
+/// completed. The accepted-connection counter is what makes a DENY assertion real
+/// — a denied request must leave this backend with ZERO connections, because
+/// `mesh_authz` rejects in the authorize phase, before the relay dials anything.
+async fn start_tcp_echo_on(
+    addr: SocketAddr,
+) -> (u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let listener = bind_fixture_listener(loopback_ephemeral())
-        .await
-        .expect("bind loopback TCP echo");
+    let listener = bind_fixture_listener(addr).await.expect("bind TCP echo");
     let port = listener.local_addr().expect("TCP echo address").port();
     let accepted = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&accepted);
@@ -10841,10 +11907,11 @@ async fn start_loopback_tcp_echo() -> (u16, Arc<AtomicUsize>, tokio::task::JoinH
 }
 
 /// Destination workload for one Service behind the waypoint. Each service gets
-/// its OWN loopback port so the two destinations are distinct backend keys, and
+/// its OWN port so the two destinations are distinct backend keys, and
 /// deliberately IDENTICAL selector labels so a regression that matched on
 /// shared labels instead of exact Service identity would be caught.
-fn waypoint_destination_workload(service: &str, port: u16) -> Workload {
+/// `address` is a non-loopback local IPv4: ServiceWaypoint refuses loopback.
+fn waypoint_destination_workload(service: &str, port: u16, address: &str) -> Workload {
     let spiffe = format!("spiffe://cluster.local/ns/{WAYPOINT_TARGET_REFS_NAMESPACE}/sa/{service}");
     Workload {
         spiffe_id: SpiffeId::new(&spiffe).expect("destination SPIFFE id"),
@@ -10854,7 +11921,7 @@ fn waypoint_destination_workload(service: &str, port: u16) -> Workload {
         },
         service_name: service.to_string(),
         service_namespace: None,
-        addresses: vec!["127.0.0.1".to_string()],
+        addresses: vec![address.to_string()],
         ports: vec![WorkloadPort {
             port,
             protocol: AppProtocol::Http,
@@ -10900,6 +11967,7 @@ fn target_refs_waypoint_slice(
     node_id: &str,
     reviews_port: u16,
     ratings_port: u16,
+    workload_address: &str,
     attachments: Vec<PolicyTargetAttachment>,
 ) -> MeshSlice {
     MeshSlice {
@@ -10918,10 +11986,21 @@ fn target_refs_waypoint_slice(
         // read only by GatewayClass ownership validation and DestinationRule
         // tier arbitration, and this slice carries no DestinationRules.
         istio_root_namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
+        waypoint_name: Some(WAYPOINT_TARGET_REFS_NAME.to_string()),
         waypoint_gateway_class: Some("istio-waypoint".to_string()),
+        service_waypoint_bound_services: vec![
+            MeshWaypointServiceRef {
+                namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
+                name: "reviews".to_string(),
+            },
+            MeshWaypointServiceRef {
+                namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
+                name: "ratings".to_string(),
+            },
+        ],
         workloads: vec![
-            waypoint_destination_workload("reviews", reviews_port),
-            waypoint_destination_workload("ratings", ratings_port),
+            waypoint_destination_workload("reviews", reviews_port, workload_address),
+            waypoint_destination_workload("ratings", ratings_port, workload_address),
         ],
         services: vec![
             waypoint_destination_service("reviews", reviews_port),
@@ -10975,22 +12054,23 @@ async fn read_relayed_bytes(
     .map_err(|_| "timed out reading relayed bytes".to_string())?
 }
 
-/// Open mTLS H2 to the waypoint, send a MARKER-LESS (byte-stream) HBONE CONNECT
-/// to `authority`, write `payload`, and return (status, echoed bytes).
+/// Open mTLS H2 to `hbone_ip:hbone_port`, send a MARKER-LESS (byte-stream)
+/// HBONE CONNECT to `authority`, write `payload`, and return (status, echoed
+/// bytes).
 async fn drive_one_waypoint_byte_connect(
+    hbone_ip: Ipv4Addr,
     hbone_port: u16,
     authority: &str,
     client_svid: &GeneratedGatewaySvid,
     payload: &[u8],
 ) -> Result<(u16, Option<Vec<u8>>), String> {
-    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", hbone_port))
+    let tcp = tokio::net::TcpStream::connect((hbone_ip, hbone_port))
         .await
         .map_err(|e| format!("connect waypoint: {e}"))?;
     let _ = tcp.set_nodelay(true);
     let connector = tokio_rustls::TlsConnector::from(udp_dest_client_config(client_svid));
-    let server_name = rustls::pki_types::ServerName::IpAddress(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)).into(),
-    );
+    let server_name =
+        rustls::pki_types::ServerName::IpAddress(std::net::IpAddr::V4(hbone_ip).into());
     let tls = tokio::time::timeout(Duration::from_secs(10), connector.connect(server_name, tcp))
         .await
         .map_err(|_| "client TLS handshake timed out".to_string())?
@@ -11067,13 +12147,18 @@ async fn drive_waypoint_target_refs(
         let temp = TempDir::new().map_err(|e| format!("temp dir: {e}"))?;
         let svids = generate_two_gateway_svids(temp.path(), client_spiffe, waypoint_spiffe);
 
-        let (reviews_port, reviews_hits, reviews_echo) = start_loopback_tcp_echo().await;
-        let (ratings_port, ratings_hits, ratings_echo) = start_loopback_tcp_echo().await;
+        let workload_ip = fixture_non_loopback_local_v4();
+        let workload_address = workload_ip.to_string();
+        let (reviews_port, reviews_hits, reviews_echo) =
+            start_tcp_echo_on(SocketAddr::from((workload_ip, 0))).await;
+        let (ratings_port, ratings_hits, ratings_echo) =
+            start_tcp_echo_on(SocketAddr::from((workload_ip, 0))).await;
 
         let cp = start_static_mesh_cp(target_refs_waypoint_slice(
             &node_id,
             reviews_port,
             ratings_port,
+            &workload_address,
             attachments.clone(),
         ))
         .await;
@@ -11122,15 +12207,17 @@ async fn drive_waypoint_target_refs(
         }
 
         let reviews = drive_one_waypoint_byte_connect(
+            Ipv4Addr::LOCALHOST,
             hbone_port,
-            &format!("127.0.0.1:{reviews_port}"),
+            &format!("{workload_address}:{reviews_port}"),
             &svids.a,
             b"reviews-payload",
         )
         .await;
         let ratings = drive_one_waypoint_byte_connect(
+            Ipv4Addr::LOCALHOST,
             hbone_port,
-            &format!("127.0.0.1:{ratings_port}"),
+            &format!("{workload_address}:{ratings_port}"),
             &svids.a,
             b"ratings-payload",
         )
@@ -11440,6 +12527,38 @@ impl Drop for LiveGatewayChild {
     }
 }
 
+/// Registry leaves that publish `spiffe_id=` are identity-bound: the production
+/// strict snapshot constructs `UdpSourceIdentity::new`, which requires a
+/// Kubernetes UUID. A merely path-safe alphanumeric token is a valid registry
+/// filename but retracts the enrolled-destination index.
+#[cfg(target_os = "linux")]
+fn require_identity_bound_pod_uid(pod_uid: &str) -> Result<(), String> {
+    ferrum_edge::modes::mesh::node_waypoint::parse_pod_uid(pod_uid)
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "registry spiffe_id= requires a Kubernetes UUID pod UID, \
+                 not a path-safe alphanumeric leaf: {error}"
+            )
+        })
+}
+
+/// Drift guard for identity-bound live registry helpers. An alphanumeric leaf
+/// with `spiffe_id=` is the exact fixture shape that timed out the enrolled-
+/// destination live gate; fail at construction instead of after 30s of HBONE 404s.
+#[cfg(target_os = "linux")]
+#[test]
+fn identity_bound_registry_helpers_reject_non_uuid_pod_uid() {
+    assert!(
+        require_identity_bound_pod_uid("functional-udp-enrolled-destination-pod").is_err(),
+        "the alphanumeric dest-pod fixture must fail at setup when paired with spiffe_id="
+    );
+    assert!(
+        require_identity_bound_pod_uid("dddddddd-dddd-4ddd-8ddd-dddddddddddd").is_ok(),
+        "a Kubernetes UUID must remain valid identity-binding evidence"
+    );
+}
+
 /// A pod-shaped network namespace plus a synthetic cgroup directory. Production
 /// cgroup resolution only needs `cgroup.procs`, so this lets the real manager and
 /// backend resolve `/proc/<pid>/ns/net` without mutating the runner's cgroup tree.
@@ -11561,6 +12680,9 @@ impl LivePodNetns {
         pod_uid: &str,
         spiffe_id: Option<&str>,
     ) -> Result<PathBuf, String> {
+        if spiffe_id.is_some() {
+            require_identity_bound_pod_uid(pod_uid)?;
+        }
         std::fs::create_dir_all(registry_dir)
             .map_err(|error| format!("create pod registry: {error}"))?;
         let path = registry_dir.join(pod_uid);
@@ -11878,8 +13000,14 @@ impl Drop for LiveNetnsUdpEcho {
 }
 
 #[cfg(target_os = "linux")]
-async fn start_counting_udp_echo() -> (u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
-    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+async fn start_counting_udp_echo(
+    bind_ip: std::net::Ipv4Addr,
+) -> (u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    assert!(
+        !bind_ip.is_loopback(),
+        "Ambient host-UDP echo must not bind loopback; Sidecar alone has that namespace authority"
+    );
+    let socket = tokio::net::UdpSocket::bind((bind_ip, 0))
         .await
         .expect("bind live source-capture UDP echo");
     let port = socket.local_addr().expect("UDP echo address").port();
@@ -12024,9 +13152,16 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
 
     const VIP: &str = "192.0.2.40";
     const UNROUTABLE_VIP: &str = "192.0.2.41";
+    // Source capture publishes cgroup-only (no `spiffe_id=`): a path-safe
+    // alphanumeric leaf is the production registry grammar, not an identity
+    // binding. The destination entry below publishes identity and must be a UUID.
     const SOURCE_POD_UID: &str = "functional-udp-source-capture-pod";
-    const DEST_POD_UID: &str = "functional-udp-enrolled-destination-pod";
-    const ECHO_HOST: &str = "enrolled-udp-echo.live.ferrum.test";
+    // Registry filenames ARE the pod UIDs. `publish_enrolled` writes `spiffe_id=`,
+    // so the strict complete-snapshot reader constructs `UdpSourceIdentity::new`
+    // and requires a Kubernetes UUID. An alphanumeric token is a safe registry
+    // leaf but retracts the enrolled-destination index (Gateway B then 404s the
+    // UDP CONNECT and this live gate times out).
+    const DEST_POD_UID: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
     let capture_port = ferrum_edge::capture::DEFAULT_UDP_OUTBOUND_PORT;
     let source = match LiveVethPod::spawn_indexed(8) {
         Ok(pod) => pod,
@@ -12102,26 +13237,37 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
     let svids = generate_two_gateway_svids(temp_b.path(), a_spiffe, b_spiffe);
     let node_a = "functional-live-udp-source-a";
     let node_b = "functional-live-udp-source-b";
-    let a_dns_overrides = format!(r#"{{"{ECHO_HOST}":"127.0.0.1"}}"#);
-    let b_dns_overrides = format!(r#"{{"{ECHO_HOST}":"{}"}}"#, destination.pod_ip());
-    let cp_a = start_static_mesh_cp(live_source_capture_slice(
+    // Issue #4249: the destination workload is declared by its ENROLLED POD
+    // ADDRESS, not by a DNS name. Gateway B's inbound relay guard is bounded by
+    // the node-agent registry it was given (`dest_registry`), which is
+    // authoritative for an Ambient proxy, and an authoritative registry refuses
+    // a declared NAME outright — the guard never resolves one, so nothing it
+    // checked would still bind the socket the relay opens. Declaring the pod
+    // address instead keeps this live gate proving the REAL binding end to end:
+    // B admits the CONNECT only because its registry currently enrols exactly
+    // that address for `DEST_POD_UID` under `b_spiffe`, and the same address is
+    // what the relay dials into the destination pod's netns.
+    let workload_address = destination.pod_ip().to_string();
+    let mut slice_a = live_source_capture_slice(
         node_a,
         b_spiffe,
-        ECHO_HOST,
+        &workload_address,
         VIP,
         echo_port,
         AppProtocol::Udp,
-    ))
-    .await;
-    let cp_b = start_static_mesh_cp(live_source_capture_slice(
+    );
+    slice_a.workloads[0].pod_uid = Some(DEST_POD_UID.to_string());
+    let mut slice_b = live_source_capture_slice(
         node_b,
         b_spiffe,
-        ECHO_HOST,
+        &workload_address,
         VIP,
         echo_port,
         AppProtocol::Udp,
-    ))
-    .await;
+    );
+    slice_b.workloads[0].pod_uid = Some(DEST_POD_UID.to_string());
+    let cp_a = start_static_mesh_cp(slice_a).await;
+    let cp_b = start_static_mesh_cp(slice_b).await;
 
     let ports_b = reserve_mesh_ports().await;
     let b_hbone_port = ports_b.hbone;
@@ -12149,7 +13295,6 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
                     "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR",
                     dest_registry.path().display().to_string(),
                 ),
-                ("FERRUM_DNS_OVERRIDES", b_dns_overrides),
             ],
         },
     ));
@@ -12158,6 +13303,23 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
         "UDP destination HBONE listener did not bind\n{}",
         captured_output(&temp_b)
     );
+
+    // Issue #4249: gateway B terminates for the enrolled destination pod but
+    // runs in the HOST netns, while the pod address gateway A now names routes
+    // into the pod's own netns. Model the node's Ambient inbound redirect so the
+    // CONNECT reaches the terminator, exactly as a real node steers
+    // `pod-ip:15008` into its ztunnel. Installed before gateway A starts and
+    // removed on drop.
+    let installed_redirect = LiveHbonePodRedirect::install(destination.pod_ip(), b_hbone_port);
+    let _hbone_pod_redirect = match installed_redirect {
+        Ok(redirect) => redirect,
+        Err(error) => {
+            skip_or_fail_live_source_capture(&format!(
+                "cannot install enrolled-destination HBONE redirect: {error}"
+            ));
+            return;
+        }
+    };
 
     // Disabled-mode negative: the same enrolled pod produces no rules and no
     // capture socket. This is an independent fixture ownership generation;
@@ -12243,7 +13405,6 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
                 ("FERRUM_MESH_CAPTURE_UDP_PORT", capture_port.to_string()),
                 ("FERRUM_MESH_IP6TABLES_ENABLED", "false".to_string()),
                 ("FERRUM_MESH_EGRESS_HBONE_PORT", b_hbone_port.to_string()),
-                ("FERRUM_DNS_OVERRIDES", a_dns_overrides),
             ],
         },
     ));
@@ -12516,6 +13677,7 @@ impl LiveVethPod {
         pod_uid: &str,
         spiffe_id: &str,
     ) -> Result<PathBuf, String> {
+        require_identity_bound_pod_uid(pod_uid)?;
         std::fs::create_dir_all(registry_dir)
             .map_err(|error| format!("create enrolled destination registry: {error}"))?;
         let path = registry_dir.join(pod_uid);
@@ -12527,6 +13689,73 @@ impl LiveVethPod {
         std::fs::write(&path, contents)
             .map_err(|error| format!("publish enrolled destination registry entry: {error}"))?;
         Ok(path)
+    }
+}
+
+/// Model a node's Ambient inbound redirect for the two-gateway live fixtures
+/// (issue #4249).
+///
+/// A real Ambient node steers traffic aimed at an enrolled pod's HBONE port
+/// into the ztunnel that terminates for that pod, before the packet ever
+/// reaches the pod. In this fixture the terminator (gateway B) runs in the HOST
+/// netns on `127.0.0.1:<hbone port>` while the enrolled pod address routes over
+/// the veth into the pod's own netns, so the same redirect is what lets the
+/// destination be named by its REGISTRY-ENROLLED ADDRESS rather than by a DNS
+/// name the inbound relay guard would (correctly) refuse.
+///
+/// Fixture-owned and exact: one `nat OUTPUT` rule scoped to a single address and
+/// the run's reserved ephemeral HBONE port, deleted on drop.
+#[cfg(target_os = "linux")]
+struct LiveHbonePodRedirect {
+    pod_ip: std::net::Ipv4Addr,
+    port: u16,
+}
+
+#[cfg(target_os = "linux")]
+impl LiveHbonePodRedirect {
+    fn install(pod_ip: std::net::Ipv4Addr, port: u16) -> Result<Self, String> {
+        let redirect = Self { pod_ip, port };
+        // Idempotent: clear any leftover from an aborted earlier run first.
+        let _ = redirect.apply("-D");
+        redirect.apply("-A")?;
+        Ok(redirect)
+    }
+
+    fn apply(&self, op: &str) -> Result<(), String> {
+        let port = self.port.to_string();
+        let args = vec![
+            "-t".to_string(),
+            "nat".to_string(),
+            op.to_string(),
+            "OUTPUT".to_string(),
+            "-p".to_string(),
+            "tcp".to_string(),
+            "-d".to_string(),
+            self.pod_ip.to_string(),
+            "--dport".to_string(),
+            port.clone(),
+            "-j".to_string(),
+            "REDIRECT".to_string(),
+            "--to-ports".to_string(),
+            port,
+        ];
+        let status = Command::new("iptables")
+            .args(&args)
+            .status()
+            .map_err(|error| format!("run iptables {op} for the HBONE pod redirect: {error}"))?;
+        if !status.success() {
+            return Err(format!(
+                "iptables {op} for the HBONE pod redirect failed with {status}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LiveHbonePodRedirect {
+    fn drop(&mut self) {
+        let _ = self.apply("-D");
     }
 }
 
@@ -12546,6 +13775,7 @@ impl Drop for LiveVethPod {
 struct LiveHostUdpVethPod {
     pod: LivePodNetns,
     host_if: String,
+    host_v4: std::net::Ipv4Addr,
     pod_v4: std::net::Ipv4Addr,
     pod_v6: std::net::Ipv6Addr,
 }
@@ -12651,6 +13881,7 @@ impl LiveHostUdpVethPod {
         Ok(Self {
             pod,
             host_if,
+            host_v4,
             pod_v4,
             pod_v6,
         })
@@ -12662,6 +13893,7 @@ impl LiveHostUdpVethPod {
         pod_uid: &str,
         spiffe_id: &str,
     ) -> Result<PathBuf, String> {
+        require_identity_bound_pod_uid(pod_uid)?;
         std::fs::create_dir_all(registry_dir)
             .map_err(|error| format!("create host-udp registry: {error}"))?;
         let path = registry_dir.join(pod_uid);
@@ -12682,6 +13914,49 @@ impl Drop for LiveHostUdpVethPod {
     fn drop(&mut self) {
         let _ = Command::new("ip")
             .args(["link", "del", &self.host_if])
+            .status();
+    }
+}
+
+/// Host-netns IPv4 that is local via `lo` but not in the loopback namespace.
+///
+/// Destination Ambient UDP relay must dial a terminator-owned non-loopback
+/// address. Attaching that address to `lo` keeps delivery inside the host
+/// netns so the datagram never appears on a captured pod veth, where host-UDP
+/// TPROXY would intercept it before the echo socket.
+#[cfg(target_os = "linux")]
+struct LiveHostLocalNonLoopbackV4 {
+    ip: std::net::Ipv4Addr,
+}
+
+#[cfg(target_os = "linux")]
+impl LiveHostLocalNonLoopbackV4 {
+    fn install(ip: std::net::Ipv4Addr) -> Result<Self, String> {
+        if ip.is_loopback() {
+            return Err(format!(
+                "refusing to install loopback {ip} as Ambient host-UDP echo authority"
+            ));
+        }
+        let spec = format!("{ip}/32");
+        let status = Command::new("ip")
+            .args(["addr", "add", &spec, "dev", "lo"])
+            .status()
+            .map_err(|error| format!("add host-local echo address {spec} on lo: {error}"))?;
+        if !status.success() {
+            return Err(format!(
+                "add host-local echo address {spec} on lo failed with {status}"
+            ));
+        }
+        Ok(Self { ip })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LiveHostLocalNonLoopbackV4 {
+    fn drop(&mut self) {
+        let spec = format!("{}/32", self.ip);
+        let _ = Command::new("ip")
+            .args(["addr", "del", &spec, "dev", "lo"])
             .status();
     }
 }
@@ -12881,13 +14156,44 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
     let temp_a = TempDir::new().expect("gateway A tempdir");
     let temp_b = TempDir::new().expect("gateway B tempdir");
     let svids = generate_two_gateway_svids(temp_b.path(), a_spiffe, echo_spiffe);
-    let (echo_port, _echo_received, echo_task) = start_counting_udp_echo().await;
+    // Destination Ambient runs in the host netns and must not use loopback
+    // authority. Binding the echo to a source-pod veth /32 is also wrong:
+    // the destination relay's connect() can egress that captured interface,
+    // host-UDP TPROXY intercepts the datagram, and the client recv times out
+    // with EAGAIN. Attach a TEST-NET IPv4 to lo so delivery stays host-local.
+    const ECHO_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(192, 0, 2, 80);
+    let _echo_local = match LiveHostLocalNonLoopbackV4::install(ECHO_V4) {
+        Ok(addr) => addr,
+        Err(error) => {
+            skip_or_fail_live_source_capture(&format!(
+                "cannot install host-local non-loopback echo address: {error}"
+            ));
+            return;
+        }
+    };
+    assert!(
+        !ECHO_V4.is_loopback(),
+        "Ambient host-UDP echo authority must stay outside the loopback namespace"
+    );
+    for (label, ip) in [
+        ("pod A host veth", pod_a.host_v4),
+        ("pod A pod IP", pod_a.pod_v4),
+        ("pod B host veth", pod_b.host_v4),
+        ("pod B pod IP", pod_b.pod_v4),
+    ] {
+        assert_ne!(
+            ECHO_V4, ip,
+            "Ambient host-UDP echo authority must not be the captured {label} address"
+        );
+    }
+    let echo_address = ECHO_V4.to_string();
+    let (echo_port, _echo_received, echo_task) = start_counting_udp_echo(ECHO_V4).await;
     let node_a = "functional-live-host-udp-a";
     let node_b = "functional-live-host-udp-b";
     let mut slice_a = live_source_capture_slice(
         node_a,
         echo_spiffe,
-        "127.0.0.1",
+        &echo_address,
         VIP_V4,
         echo_port,
         AppProtocol::Udp,
@@ -12896,7 +14202,7 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
     let mut slice_b = live_source_capture_slice(
         node_b,
         echo_spiffe,
-        "127.0.0.1",
+        &echo_address,
         VIP_V4,
         echo_port,
         AppProtocol::Udp,
@@ -12926,6 +14232,7 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
                     "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
                     svids.b.trust_bundle_path.clone(),
                 ),
+                ambient_dest_hbone_listen_override(b_hbone_port),
             ],
         },
     ));
