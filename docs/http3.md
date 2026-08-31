@@ -1364,14 +1364,17 @@ frame ceiling through `h3::client::builder()` as well; `h3::client::new` keeps
 the unbounded upstream default and is not used on those constructors. A
 malicious or compromised H3 backend can declare an enormous HEADERS, unknown,
 CONTROL, or PUSH frame the same way a frontend client can; QUIC flow control
-does not bound accumulation on either side. Backend clients deliberately do
-not set `max_field_section_size`: `FERRUM_MAX_HEADER_SIZE_BYTES` is documented
-as a request-header policy, not an H3-only backend response-header limit.
+does not bound accumulation on either side. Backend clients also set a distinct
+decoded response field-section ceiling to the buffered-frame ceiling (twice
+the frontend request policy), capped just below 1 MiB. This preserves response
+headroom without leaving QPACK expansion or decoded field count effectively
+unbounded, including when an operator configures a very large request limit.
 
 | Value | Source | Effect |
 |---|---|---|
 | Frontend `SETTINGS_MAX_FIELD_SECTION_SIZE` | `FERRUM_MAX_HEADER_SIZE_BYTES`, floored at 16 KiB, clamped into the QUIC varint range | Advertised to the client, and enforced by frontend QPACK decoding. Before this the listener advertised `VarInt::MAX` (2^62-1) while enforcing the configured limit only after a complete decode. |
 | Buffered non-`DATA` frame ceiling | 2x the frontend field-section size | On frontend and pooled backend connections, a frame whose **declared** payload length exceeds it is refused before a single payload byte is buffered. |
+| Backend decoded response field-section ceiling | Buffered non-`DATA` frame ceiling, capped below 1 MiB | On pooled backend connections, QPACK decoding stops before a compact response can expand into an unsafe number of fields. |
 
 **Failure posture.** The refusal happens as soon as the frame's type and length
 varints are decoded — before the payload is stored and before the decoder arms
