@@ -11,8 +11,7 @@ const UPGRADE_GUIDE: &str = include_str!("../../../docs/upgrade_guide.md");
 const MIGRATIONS_DOC: &str = include_str!("../../../docs/migrations.md");
 
 /// Present while build-out folds core schema into the editable `V001` baseline.
-const BUILD_OUT_BASELINE_POLICY_MARKER: &str =
-    "folded into the current baseline schema (`V001`)";
+const BUILD_OUT_BASELINE_POLICY_MARKER: &str = "folded into the current baseline schema (`V001`)";
 
 /// Phrases that imply an in-place or automatic **core database schema** migration
 /// workflow. Must stay absent from the upgrade guide while `MIGRATIONS_DOC`
