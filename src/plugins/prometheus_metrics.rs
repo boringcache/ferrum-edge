@@ -1116,7 +1116,7 @@ impl MetricsRegistry {
             protocol: Arc::from(summary.protocol.as_str()),
             cause: disconnect_cause_label(summary.disconnect_cause),
             direction: direction_label(summary.disconnect_direction),
-            error_class: summary.error_class.map(ErrorClass::as_str),
+            error_class: summary.error_class.as_ref().map(ErrorClass::as_str),
         };
         self.stream_disconnect_counter
             .entry(disconnect_key)
