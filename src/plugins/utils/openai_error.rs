@@ -58,7 +58,7 @@ pub(crate) fn ferrum_flat_error_message(body: &[u8]) -> Option<String> {
 /// Whether an effective plugin chain includes an OpenAI-envelope AI gateway
 /// plugin whose downstream rejects already speak the nested contract.
 pub(crate) fn proxy_has_openai_auth_error_envelope_plugin(plugins: &[Arc<dyn Plugin>]) -> bool {
-    plugins.iter().any(|plugin| {
-        matches!(plugin.name(), "ai_federation" | "ai_stream_router")
-    })
+    plugins
+        .iter()
+        .any(|plugin| matches!(plugin.name(), "ai_federation" | "ai_stream_router"))
 }

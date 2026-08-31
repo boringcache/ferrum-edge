@@ -221,10 +221,10 @@ use tracing::debug;
 use url::{Host, Url};
 
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
-use super::utils::openai_error::openai_error_body;
 use super::utils::content_encoding::{
     DecodeLimits, decode_content_encoding, parse_content_codings,
 };
+use super::utils::openai_error::openai_error_body;
 use super::{
     Plugin, PluginHttpClient, PluginResult, RequestContext, ResponseStreamAction,
     ResponseStreamInspector, ResponseStreamInspectorStage,

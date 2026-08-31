@@ -28794,6 +28794,25 @@ fn attach_auth_rejection_set_cookie(
     }
 }
 
+/// Authentication phase without the AI-envelope adaptation.
+///
+/// This is the stable entry point the external `tests/` crate drives (52 call
+/// sites across seven modules). Production dispatch calls
+/// [`run_authentication_phase_with_envelope`] directly so it can pass the
+/// per-proxy OpenAI-envelope flag. `tests/` is a separate crate, so this is
+/// unreachable from the `ferrum-edge` binary target and would otherwise be
+/// reported as dead code there.
+#[allow(dead_code)]
+pub async fn run_authentication_phase(
+    auth_mode: AuthMode,
+    auth_plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    consumer_index: &ConsumerIndex,
+) -> Option<(u16, Bytes, HashMap<String, String>)> {
+    run_authentication_phase_with_envelope(auth_mode, auth_plugins, ctx, consumer_index, false)
+        .await
+}
+
 pub async fn run_authentication_phase_with_envelope(
     auth_mode: AuthMode,
     auth_plugins: &[Arc<dyn Plugin>],
