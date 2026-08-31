@@ -524,6 +524,7 @@ Ferrum also **won the E2E TLS /api/users test outright** — 29,808 req/s, the h
 | Docker deployment | [docs/docker.md](docs/docker.md) |
 | CI/CD pipeline | [docs/ci_cd.md](docs/ci_cd.md) |
 | Database migrations | [docs/migrations.md](docs/migrations.md) |
+| Upgrade procedure (build-out) | [docs/upgrade_guide.md](docs/upgrade_guide.md) |
 | Custom plugins | [CUSTOM_PLUGINS.md](CUSTOM_PLUGINS.md) |
 | Feature list | [FEATURES.md](FEATURES.md) |
 | OpenAPI spec | [openapi.yaml](openapi.yaml) |
