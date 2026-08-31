@@ -315,9 +315,7 @@ fn declared_utf32_endian(
     let value = charset_value(content_type)?;
     if value.eq_ignore_ascii_case("utf-32le") || value.eq_ignore_ascii_case("utf32le") {
         Some(Utf32Endian::Little)
-    } else if value.eq_ignore_ascii_case("utf-32be")
-        || value.eq_ignore_ascii_case("utf32be")
-    {
+    } else if value.eq_ignore_ascii_case("utf-32be") || value.eq_ignore_ascii_case("utf32be") {
         Some(Utf32Endian::Big)
     } else if value.eq_ignore_ascii_case("utf-32") || value.eq_ignore_ascii_case("utf32") {
         // Bare `utf-32` without a BOM is endian-unspecified. The dual-endian

@@ -270,11 +270,7 @@ impl Waf {
         };
         if transcoded_views.is_empty() || transcoded_views.include_lossy() {
             let text = String::from_utf8_lossy(body);
-            self.scan_request_body_text_view(
-                &mut outcome,
-                text.as_ref(),
-                subject,
-            );
+            self.scan_request_body_text_view(&mut outcome, text.as_ref(), subject);
         }
         for decoded in transcoded_views.iter() {
             // The initial bytes scan saw the wire representation. A
@@ -286,11 +282,7 @@ impl Waf {
                 decoded.as_bytes(),
                 subject,
             );
-            self.scan_request_body_text_view(
-                &mut outcome,
-                decoded,
-                subject,
-            );
+            self.scan_request_body_text_view(&mut outcome, decoded, subject);
         }
         outcome
     }
@@ -312,12 +304,7 @@ impl Waf {
         // beyond-cap residual in the body, mirroring the URL-side FE-ENCODING
         // check (markers `percent_decode_plus` cannot recover, and stacks the
         // layered decode cannot fully peel, are otherwise silent).
-        self.scan_body_encoding_specials(
-            outcome,
-            text,
-            residual_encoding,
-            subject,
-        );
+        self.scan_body_encoding_specials(outcome, text, residual_encoding, subject);
         for variant in variants {
             self.scan_bytes_set(
                 outcome,

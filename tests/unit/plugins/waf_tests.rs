@@ -2874,7 +2874,7 @@ async fn utf32_malformed_bodies_retain_raw_lossy_scan() {
     let mut truncated = encode_utf32(payload, false);
     truncated.pop();
     assert!(
-        truncated.len() % 4 != 0,
+        !truncated.len().is_multiple_of(4),
         "truncated body must not be a multiple of 4"
     );
     let (truncated_result, truncated_ctx) =
