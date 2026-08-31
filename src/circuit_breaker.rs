@@ -121,10 +121,7 @@ impl CircuitBreaker {
     /// Deterministic-clock variant used by external unit tests.
     #[doc(hidden)]
     #[allow(dead_code)]
-    pub fn can_execute_at_for_test(
-        &self,
-        monotonic_now_ms: u64,
-    ) -> Result<bool, CircuitOpenError> {
+    pub fn can_execute_at_for_test(&self, monotonic_now_ms: u64) -> Result<bool, CircuitOpenError> {
         self.can_execute_inner(Some(monotonic_now_ms))
     }
 
@@ -143,8 +140,7 @@ impl CircuitBreaker {
                 // OPEN recovery is elapsed-time state, so it uses the single
                 // process-local monotonic origin. The clock is read only in
                 // OPEN; the common CLOSED request path remains one atomic load.
-                let now = monotonic_now_ms
-                    .unwrap_or_else(crate::socket_opts::monotonic_now_ms);
+                let now = monotonic_now_ms.unwrap_or_else(crate::socket_opts::monotonic_now_ms);
                 let last_failure = self.last_failure_tick_ms.load(Ordering::Relaxed);
                 let timeout_ms = self.config.timeout_seconds.saturating_mul(1000);
 
@@ -347,12 +343,7 @@ impl CircuitBreaker {
         connection_error: bool,
         is_half_open_probe: bool,
     ) {
-        self.record_failure_inner(
-            status_code,
-            connection_error,
-            is_half_open_probe,
-            None,
-        );
+        self.record_failure_inner(status_code, connection_error, is_half_open_probe, None);
     }
 
     /// Deterministic-clock variant used by external unit tests. Wall time is
@@ -400,12 +391,8 @@ impl CircuitBreaker {
         }
 
         let packed = self.packed.load(Ordering::Acquire);
-        let (failure_tick_ms, failure_epoch_ms) = injected_time.unwrap_or_else(|| {
-            (
-                crate::socket_opts::monotonic_now_ms(),
-                wall_now_epoch_ms(),
-            )
-        });
+        let (failure_tick_ms, failure_epoch_ms) = injected_time
+            .unwrap_or_else(|| (crate::socket_opts::monotonic_now_ms(), wall_now_epoch_ms()));
 
         match packed_state(packed) {
             STATE_CLOSED => {

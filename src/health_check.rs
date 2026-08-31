@@ -4210,8 +4210,7 @@ fn recover_due_passive_ejections_inner(
     injected_monotonic_now_ms: Option<u64>,
     mut hooks: PassiveRecoveryInterleaveHooks<'_>,
 ) {
-    let now = injected_monotonic_now_ms
-        .unwrap_or_else(crate::socket_opts::monotonic_now_ms);
+    let now = injected_monotonic_now_ms.unwrap_or_else(crate::socket_opts::monotonic_now_ms);
 
     let any_unhealthy = passive_health
         .iter()
