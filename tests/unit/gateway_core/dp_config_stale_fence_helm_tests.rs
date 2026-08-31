@@ -39,8 +39,11 @@ fn schema_bounds_dp_stale_fence() {
     assert!(
         schema.contains("\"configMaxStaleSeconds\"")
             && schema.contains("\"minimum\": 0")
-            && schema.contains("\"pattern\": \"^[0-9]+$\""),
-        "schema must bound configMaxStaleSeconds as a non-negative integer"
+            // The optional group is what admits the documented empty-string
+            // "unset" form in values.yaml; a bare `^[0-9]+$` rejects it and
+            // `helm lint` fails the default render.
+            && schema.contains("\"pattern\": \"^([0-9]+)?$\""),
+        "schema must bound configMaxStaleSeconds as a non-negative integer or the unset form"
     );
     assert!(
         schema.contains("\"configStaleAction\"")
