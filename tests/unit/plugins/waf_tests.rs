@@ -2823,12 +2823,9 @@ async fn utf32_body_rules_block_declared_endianness_with_and_without_bom() {
     assert!(matches!(be_bom_result, PluginResult::Reject { .. }));
     assert!(monitored(&be_bom_ctx, "FE-SQLI-001-B"));
 
-    let (benign_result, benign_ctx) = scan_body_with_content_type(
-        &plugin,
-        form_le,
-        &encode_utf32("ordinary request body", false),
-    )
-    .await;
+    let (benign_result, benign_ctx) =
+        scan_body_with_content_type(&plugin, form_le, &encode_utf32("ordinary request body", false))
+            .await;
     assert!(matches!(benign_result, PluginResult::Continue));
     assert!(!monitored(&benign_ctx, "FE-SQLI-001-B"));
 }
@@ -2842,23 +2839,16 @@ async fn utf32le_bom_is_not_misdecoded_as_utf16le_bom() {
     // the decoder; checking UTF-16 first would skip two bytes, scan
     // NUL-padded UTF-16, and miss FE-SQLI-001-B.
     let body = with_bom(UTF32_LE_BOM, &encode_utf32(payload, false));
-    let (result, ctx) = scan_body_with_content_type(
-        &plugin,
-        "application/x-www-form-urlencoded",
-        &body,
-    )
-    .await;
+    let (result, ctx) =
+        scan_body_with_content_type(&plugin, "application/x-www-form-urlencoded", &body).await;
     assert!(matches!(result, PluginResult::Reject { .. }));
     assert!(monitored(&ctx, "FE-SQLI-001-B"));
 
     // The same payload with a real UTF-16LE BOM still transcodes as UTF-16.
     let utf16_bom_body = with_bom(UTF16_LE_BOM, &encode_utf16(payload, false));
-    let (utf16_result, utf16_ctx) = scan_body_with_content_type(
-        &plugin,
-        "application/x-www-form-urlencoded",
-        &utf16_bom_body,
-    )
-    .await;
+    let (utf16_result, utf16_ctx) =
+        scan_body_with_content_type(&plugin, "application/x-www-form-urlencoded", &utf16_bom_body)
+            .await;
     assert!(matches!(utf16_result, PluginResult::Reject { .. }));
     assert!(monitored(&utf16_ctx, "FE-SQLI-001-B"));
 }
@@ -2883,10 +2873,7 @@ async fn utf32_malformed_bodies_retain_raw_lossy_scan() {
     // Surrogate-range code unit in the middle of an otherwise-valid payload.
     let mut surrogate_range = encode_utf32("id=1 ", false);
     surrogate_range.extend_from_slice(&0xD800u32.to_le_bytes());
-    surrogate_range.extend_from_slice(&encode_utf32(
-        "UNION SELECT password FROM users",
-        false,
-    ));
+    surrogate_range.extend_from_slice(&encode_utf32("UNION SELECT password FROM users", false));
     let (surrogate_result, surrogate_ctx) =
         scan_body_with_content_type(&plugin, form_le, &surrogate_range).await;
     assert!(matches!(surrogate_result, PluginResult::Continue));
@@ -2904,10 +2891,7 @@ async fn utf32_malformed_bodies_retain_raw_lossy_scan() {
 
     let mut over_max = encode_utf32("id=1 ", false);
     over_max.extend_from_slice(&0x110000u32.to_le_bytes());
-    over_max.extend_from_slice(&encode_utf32(
-        "UNION SELECT password FROM users",
-        false,
-    ));
+    over_max.extend_from_slice(&encode_utf32("UNION SELECT password FROM users", false));
     let (over_result, over_ctx) =
         scan_body_with_content_type(&plugin, form_le, &over_max).await;
     assert!(matches!(over_result, PluginResult::Continue));
@@ -2956,12 +2940,9 @@ async fn utf32_transcoding_does_not_change_utf8_or_utf16_body_matches() {
 
     let mut truncated_utf16 = encode_utf16(ssrf, false);
     truncated_utf16.pop();
-    let (truncated_result, truncated_ctx) = scan_body_with_content_type(
-        &plugin,
-        "text/plain; charset=utf-16le",
-        &truncated_utf16,
-    )
-    .await;
+    let (truncated_result, truncated_ctx) =
+        scan_body_with_content_type(&plugin, "text/plain; charset=utf-16le", &truncated_utf16)
+            .await;
     assert!(matches!(truncated_result, PluginResult::Continue));
     assert!(!monitored(&truncated_ctx, "FE-SSRF-001"));
 
@@ -2981,21 +2962,13 @@ async fn bare_utf32_charset_without_bom_blocks_both_endians() {
     let payload = "id=1 UNION SELECT password FROM users";
     let form = "application/x-www-form-urlencoded; charset=utf-32";
 
-    let (le_result, le_ctx) = scan_body_with_content_type(
-        &plugin,
-        form,
-        &encode_utf32(payload, false),
-    )
-    .await;
+    let (le_result, le_ctx) =
+        scan_body_with_content_type(&plugin, form, &encode_utf32(payload, false)).await;
     assert!(matches!(le_result, PluginResult::Reject { .. }));
     assert!(monitored(&le_ctx, "FE-SQLI-001-B"));
 
-    let (be_result, be_ctx) = scan_body_with_content_type(
-        &plugin,
-        form,
-        &encode_utf32(payload, true),
-    )
-    .await;
+    let (be_result, be_ctx) =
+        scan_body_with_content_type(&plugin, form, &encode_utf32(payload, true)).await;
     assert!(matches!(be_result, PluginResult::Reject { .. }));
     assert!(monitored(&be_ctx, "FE-SQLI-001-B"));
 
@@ -3013,21 +2986,13 @@ async fn bare_utf16_charset_without_bom_blocks_both_endians() {
     let payload = "id=1 UNION SELECT password FROM users";
     let form = "application/x-www-form-urlencoded; charset=utf-16";
 
-    let (le_result, le_ctx) = scan_body_with_content_type(
-        &plugin,
-        form,
-        &encode_utf16(payload, false),
-    )
-    .await;
+    let (le_result, le_ctx) =
+        scan_body_with_content_type(&plugin, form, &encode_utf16(payload, false)).await;
     assert!(matches!(le_result, PluginResult::Reject { .. }));
     assert!(monitored(&le_ctx, "FE-SQLI-001-B"));
 
-    let (be_result, be_ctx) = scan_body_with_content_type(
-        &plugin,
-        form,
-        &encode_utf16(payload, true),
-    )
-    .await;
+    let (be_result, be_ctx) =
+        scan_body_with_content_type(&plugin, form, &encode_utf16(payload, true)).await;
     assert!(matches!(be_result, PluginResult::Reject { .. }));
     assert!(monitored(&be_ctx, "FE-SQLI-001-B"));
 
@@ -3046,41 +3011,25 @@ async fn bare_wide_charset_without_bom_does_not_block_benign_body() {
     let form_utf32 = "application/x-www-form-urlencoded; charset=utf-32";
     let form_utf16 = "application/x-www-form-urlencoded; charset=utf-16";
 
-    let (utf32_le_result, utf32_le_ctx) = scan_body_with_content_type(
-        &plugin,
-        form_utf32,
-        &encode_utf32(benign, false),
-    )
-    .await;
+    let (utf32_le_result, utf32_le_ctx) =
+        scan_body_with_content_type(&plugin, form_utf32, &encode_utf32(benign, false)).await;
     assert!(matches!(utf32_le_result, PluginResult::Continue));
     assert!(!monitored(&utf32_le_ctx, "FE-SQLI-001-B"));
 
-    let (utf32_be_result, utf32_be_ctx) = scan_body_with_content_type(
-        &plugin,
-        form_utf32,
-        &encode_utf32(benign, true),
-    )
-    .await;
+    let (utf32_be_result, utf32_be_ctx) =
+        scan_body_with_content_type(&plugin, form_utf32, &encode_utf32(benign, true)).await;
     assert!(matches!(utf32_be_result, PluginResult::Continue));
     assert!(!monitored(&utf32_be_ctx, "FE-SQLI-001-B"));
 
     // UTF-16 reverse-endian of ASCII is valid BMP text (not a decode
     // failure). Scanning that nonsense view must not fire L1 body rules.
-    let (utf16_le_result, utf16_le_ctx) = scan_body_with_content_type(
-        &plugin,
-        form_utf16,
-        &encode_utf16(benign, false),
-    )
-    .await;
+    let (utf16_le_result, utf16_le_ctx) =
+        scan_body_with_content_type(&plugin, form_utf16, &encode_utf16(benign, false)).await;
     assert!(matches!(utf16_le_result, PluginResult::Continue));
     assert!(!monitored(&utf16_le_ctx, "FE-SQLI-001-B"));
 
-    let (utf16_be_result, utf16_be_ctx) = scan_body_with_content_type(
-        &plugin,
-        form_utf16,
-        &encode_utf16(benign, true),
-    )
-    .await;
+    let (utf16_be_result, utf16_be_ctx) =
+        scan_body_with_content_type(&plugin, form_utf16, &encode_utf16(benign, true)).await;
     assert!(matches!(utf16_be_result, PluginResult::Continue));
     assert!(!monitored(&utf16_be_ctx, "FE-SQLI-001-B"));
 }
