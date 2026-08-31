@@ -41,6 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CONNECT-UDP admission respects DNS-SD SRV priority tiers**. A client that
+  names a standby-tier `host:port` while a lower-numbered RFC 2782 tier is
+  healthy is refused with the same 403 as an unconfigured destination; the
+  gateway-side reason is `connect_udp_target_srv_tier_standby`. The live
+  generation re-check stays configuration-only, so a health flap or a
+  recovered primary cannot tear down an established tunnel.
+
 - **Injector inbound capture excludes kubelet HTTP and TCP probe ports**
   (issue #4431). `startupProbe` / `readinessProbe` / `livenessProbe` `httpGet`
   and `tcpSocket` ports on every container in the pod are unioned into the

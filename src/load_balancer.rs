@@ -1619,6 +1619,11 @@ impl LoadBalancerCache {
 
     /// Check whether a client-named target belongs to the currently reachable
     /// RFC 2782 SRV priority tier without advancing any load-balancer cursor.
+    ///
+    /// An absent balancer is treated as eligible so CONNECT-UDP falls through
+    /// to membership screening. Balancers are published alongside their
+    /// upstreams; a missing balancer must not refuse a destination the
+    /// upstream index still lists.
     pub fn is_srv_priority_eligible_from(
         snapshot: &LoadBalancerCacheInner,
         namespace: &str,
@@ -1629,7 +1634,8 @@ impl LoadBalancerCache {
     ) -> bool {
         snapshot
             .balancer(namespace, upstream_id)
-            .is_some_and(|balancer| balancer.is_srv_priority_eligible(host, port, health))
+            .map(|balancer| balancer.is_srv_priority_eligible(host, port, health))
+            .unwrap_or(true)
     }
 
     /// Select a target from a pre-loaded snapshot.
