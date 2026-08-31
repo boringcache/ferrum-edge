@@ -21,6 +21,7 @@ mod cni_ownership_tests;
 mod config_delta_namespace_prune_tests;
 mod config_delta_tests;
 mod configsync_lifecycle_tests;
+mod container_base_pinning_tests;
 mod consumer_index_tests;
 mod cp_listener_supervision_tests;
 mod cp_server_tests;

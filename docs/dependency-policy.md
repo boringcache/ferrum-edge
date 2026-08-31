@@ -335,6 +335,36 @@ reqwest/h3/tungstenite lineage needs an explicit path:
 6. Never silence an advisory without an expiry and a rationale — the expiry
    check will fail the weekly run otherwise (by design).
 
+## Base image pinning
+
+Production container images (`Dockerfile`, `Dockerfile.release`, and
+`Dockerfile.test`) must pin every external `FROM` base by registry digest, not
+by a mutable tag alone. Keep the human-readable tag in a trailing comment on the
+same line, for example:
+
+```dockerfile
+FROM gcr.io/distroless/cc-debian13@sha256:… # nonroot, resolved YYYY-MM-DD
+FROM rust@sha256:… AS builder # latest, resolved YYYY-MM-DD
+```
+
+`ARG` defaults that feed a `FROM ${VAR}` line follow the same rule. `scratch`
+and local stage aliases (`FROM builder`, `FROM runtime-common`, …) are exempt.
+Always resolve and pin the **manifest-list** digest (OCI image index), never a
+single-platform manifest, so multi-arch builds keep working.
+
+To refresh a base:
+
+1. Resolve the digest for the existing tag with `docker buildx imagetools inspect
+   <image>:<tag>` or the registry v2 API; confirm the media type is an image
+   index / manifest list.
+2. Update the `@sha256:` pin and the trailing comment date (and tag label when
+   the tag itself changes).
+3. Land via PR and let hosted CI rebuild the Docker targets.
+
+`tests/unit/gateway_core/container_base_pinning_tests.rs` enforces digest pins
+and rejects unapproved floating Rust channels (`latest`, `stable`, `nightly`,
+`beta`) on those Dockerfiles.
+
 ## CI Actions and Kubernetes tooling
 
 GitHub Actions and the kind / kubectl / Helm binaries used by live Kubernetes
