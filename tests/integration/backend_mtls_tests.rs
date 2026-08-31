@@ -512,14 +512,13 @@ fn spawn_client_cert_required_origin(
     )
     .build()
     .expect("client cert verifier");
-    let config = ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .expect("tls versions")
-    .with_client_cert_verifier(verifier)
-    .with_single_cert(cert_chain, key)
-    .expect("server cert");
+    let config =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("tls versions")
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(cert_chain, key)
+            .expect("server cert");
     let acceptor = TlsAcceptor::from(Arc::new(config));
     tokio::spawn(async move {
         loop {

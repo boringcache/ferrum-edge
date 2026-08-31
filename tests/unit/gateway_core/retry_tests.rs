@@ -1428,8 +1428,7 @@ fn test_classify_boxed_error_post_connect_rustls_is_post_wire() {
     // requests whose bytes may already have crossed the encrypted
     // channel. Handshake-class rustls (CertificateRequired, etc.) is
     // a different case — see the tests below.
-    let err: Box<dyn std::error::Error + Send + Sync> =
-        Box::new(rustls::Error::DecryptError);
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(rustls::Error::DecryptError);
     let class = classify_boxed_error(&*err);
     assert_eq!(
         class,

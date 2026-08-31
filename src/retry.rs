@@ -719,7 +719,9 @@ pub(crate) fn rustls_error_in_chain(e: &(dyn std::error::Error + 'static)) -> bo
 }
 
 /// First `rustls::Error` in `e`'s chain, including `io::Error::get_ref()`.
-fn rustls_error_from_chain(e: &(dyn std::error::Error + 'static)) -> Option<&rustls::Error> {
+fn rustls_error_from_chain<'a>(
+    e: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a rustls::Error> {
     let mut current = Some(e);
     while let Some(err) = current {
         if let Some(rustls_err) = err.downcast_ref::<rustls::Error>() {
