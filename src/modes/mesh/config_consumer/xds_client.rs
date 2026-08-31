@@ -2095,6 +2095,10 @@ struct RecoveredSliceCarriers {
     /// ECDS carrier (issue #4251). Empty when the CP emitted no carrier —
     /// missing/old evidence — so the inbound HBONE relay inventory is empty.
     service_waypoint_bound_services: Vec<crate::modes::mesh::config::MeshWaypointServiceRef>,
+    /// Guards against multiple ServiceWaypointBoundServices carriers in one
+    /// ECDS response. This binding evidence is authoritative when present, so
+    /// accepting last-wins duplicates would make admission order-dependent.
+    service_waypoint_bound_services_seen: bool,
     /// `meshConfig.rootNamespace` recovered from its own carrier (issue
     /// #2469). Empty when the producer emitted no carrier.
     istio_root_namespace: String,
@@ -2568,7 +2572,13 @@ fn apply_recovered_carrier(
             recovered.waypoint_gateway_class = Some(value);
         }
         MeshSliceCarrier::ServiceWaypointBoundServices(value) => {
-            recovered.service_waypoint_bound_services = value
+            if recovered.service_waypoint_bound_services_seen {
+                return Err("xDS ServiceWaypointBoundServices carrier appeared more than once; \
+                     exactly one authoritative bound-service value is required"
+                    .to_string());
+            }
+            recovered.service_waypoint_bound_services_seen = true;
+            recovered.service_waypoint_bound_services = value;
         }
         // Decode already drops blank root carriers; ignore empty values here
         // so in-process construction cannot clear trustworthy provenance.

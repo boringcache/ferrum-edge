@@ -63116,6 +63116,7 @@ mod tests {
                     host: crate::modes::mesh::config::MeshInboundRelayHost::Ip(own_ip),
                     ports: vec![8080],
                     enrollment: Default::default(),
+                    registry_uncontested: true,
                 },
                 crate::modes::mesh::config::MeshInboundRelayDestination {
                     host: crate::modes::mesh::config::MeshInboundRelayHost::Ip(
@@ -63123,6 +63124,7 @@ mod tests {
                     ),
                     ports: vec![8080],
                     enrollment: Default::default(),
+                    registry_uncontested: true,
                 },
                 crate::modes::mesh::config::MeshInboundRelayDestination {
                     host: crate::modes::mesh::config::MeshInboundRelayHost::Name(
@@ -63130,6 +63132,7 @@ mod tests {
                     ),
                     ports: vec![8080],
                     enrollment: Default::default(),
+                    registry_uncontested: true,
                 },
                 crate::modes::mesh::config::MeshInboundRelayDestination {
                     host: crate::modes::mesh::config::MeshInboundRelayHost::Name(
@@ -63137,6 +63140,7 @@ mod tests {
                     ),
                     ports: vec![8080],
                     enrollment: Default::default(),
+                    registry_uncontested: true,
                 },
             ],
             inbound_relay_admits_accepted_local_address: true,
@@ -63256,11 +63260,13 @@ mod tests {
                     host: MeshInboundRelayHost::Name("localhost.".to_string()),
                     ports: vec![8080],
                     enrollment: Default::default(),
+                    registry_uncontested: true,
                 },
                 MeshInboundRelayDestination {
                     host: MeshInboundRelayHost::Name("app.localhost".to_string()),
                     ports: vec![8080],
                     enrollment: Default::default(),
+                    registry_uncontested: true,
                 },
             ],
             ..MeshConfig::default()

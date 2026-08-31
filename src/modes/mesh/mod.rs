@@ -1970,7 +1970,10 @@ fn prepare_normalized_gateway_config_for_mesh(
         // must NOT become a permissive fallback to the whole declared workload
         // view: the same ambiguity rule is applied to that view instead, so a
         // shared address still fails closed while an unambiguous one still
-        // serves. Topologies that never consult these arms
+        // serves. Remote-provenance records remain excluded here just as they
+        // are from the resolved owned view; an overlapping remote pod CIDR
+        // must not manufacture a local-address contest. Topologies that never
+        // consult these arms
         // (`inbound_relay_admits_accepted_local_address` false) get an empty
         // projection. Assigned UNCONDITIONALLY, like the two fields below it.
         let own_address_ports = if !admits_accepted_local_address {
@@ -1980,8 +1983,11 @@ fn prepare_normalized_gateway_config_for_mesh(
                 owned_records.iter().copied(),
             )
         } else {
-            let declared = mesh.workloads.as_slice();
-            crate::modes::mesh::config::own_address_port_bounds_from_workloads(declared.iter())
+            crate::modes::mesh::config::own_address_port_bounds_from_workloads(
+                mesh.workloads
+                    .iter()
+                    .filter(|workload| !workload.remote_provenance),
+            )
         };
         // Issue #4249: the node bound for `Ambient`'s multi-destination
         // inventory, and only for it. No other topology reads a node-local
@@ -13643,9 +13649,16 @@ fn remove_mesh_managed_plugin(config: &mut GatewayConfig, id: &str, namespace: &
 }
 
 pub async fn run(
-    env_config: EnvConfig,
+    mut env_config: EnvConfig,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<(), anyhow::Error> {
+    // Normalize once before either the arming decision or any filesystem
+    // reader sees the path. A whitespace-padded configured value must not arm
+    // an authoritative bound and then poll a different, untrimmed directory.
+    env_config.mesh_node_waypoint_pod_registry_dir = env_config
+        .mesh_node_waypoint_pod_registry_dir
+        .trim()
+        .to_string();
     let runtime = MeshRuntimeConfig::from_env_config(&env_config)
         .map_err(|e| anyhow::anyhow!("invalid mesh runtime configuration: {e}"))?;
     ensure_runtime_config_protocol_supported(&runtime)?;
@@ -14021,7 +14034,7 @@ fn arm_inbound_relay_enrolled_destinations(
     if runtime.topology != MeshTopology::Ambient {
         return None;
     }
-    let registry_dir = env_config.mesh_node_waypoint_pod_registry_dir.trim();
+    let registry_dir = env_config.mesh_node_waypoint_pod_registry_dir.as_str();
     if registry_dir.is_empty() {
         warn!(
             "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR is empty, so no node-local enrolled-pod \
@@ -14033,7 +14046,7 @@ fn arm_inbound_relay_enrolled_destinations(
     }
     let index = Arc::new(enrolled_destinations::NodeLocalEnrolledDestinations::new());
     info!(
-        registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
+        registry_dir = %registry_dir,
         "Authenticated inbound HBONE relay destinations are bounded by the node-agent's \
          enrolled-pod registry"
     );
@@ -41547,7 +41560,11 @@ mod tests {
             ..test_mesh_runtime_config()
         };
         let config = gateway_config_from_mesh_slice(&slice, &runtime, None, None);
-        let mesh = *config.expect("slice → config").mesh.expect("prepared mesh");
+        let mut mesh = *config.expect("slice → config").mesh.expect("prepared mesh");
+        // This assertion exercises the documented no-registry identity bound.
+        // The installation-ownership tests mutate the process-wide serving
+        // slot in parallel, so make this config's intended posture explicit.
+        mesh.inbound_relay_node_local_registry = Default::default();
         // The ztunnel-style proxy's own socket address is the NODE, not any
         // workload — so nothing below is admitted by the own-address arm.
         let node_ip = "10.244.0.1".parse::<std::net::IpAddr>().expect("node IP");

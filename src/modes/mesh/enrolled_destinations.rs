@@ -63,6 +63,11 @@
 //! * An address claimed by two DIFFERENT pod UIDs is ambiguous and refused for
 //!   BOTH claimants, mirroring the contested-interface rule
 //!   `plan_host_udp_bindings` already applies to ingress interfaces.
+//! * Independently, mesh apply marks an inventory IP contested when several
+//!   raw workload records declare it without one identical non-empty pod UID.
+//!   While this index is authoritative the guard refuses every such claimant,
+//!   so a UID-less same-identity record cannot borrow an enrolled pod's address
+//!   and widen its ports. A lone UID-less record remains admissible.
 //! * A registry entry with an unsafe/absent pod UID, or with no published pod
 //!   address, contributes nothing.
 //! * Identity-based fallback exists ONLY when no registry source is configured
@@ -76,12 +81,12 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use tokio::sync::watch;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::proxy::netns_capture::{PodCaptureSource, PodCaptureTarget};
 
@@ -169,6 +174,60 @@ struct EnrolledGeneration {
     by_address: HashMap<IpAddr, Arc<EnrolledAddressOwner>>,
 }
 
+/// One preloaded enrolled-destination generation for a complete relay-guard
+/// decision. Holding the `ArcSwap` guard pins one coherent generation while
+/// every matching inventory entry is compared.
+pub(crate) struct NodeLocalEnrolledDestinationsSnapshot {
+    current: arc_swap::Guard<Arc<EnrolledGeneration>>,
+}
+
+impl NodeLocalEnrolledDestinationsSnapshot {
+    /// Resolve one canonical destination address from this generation. The
+    /// caller performs this once before walking matching inventory entries.
+    pub(crate) fn owner_for(
+        &self,
+        address: IpAddr,
+    ) -> Option<NodeLocalEnrolledDestinationOwner<'_>> {
+        if !self.current.published {
+            return None;
+        }
+        self.current
+            .by_address
+            .get(&address.to_canonical())
+            .map(|owner| NodeLocalEnrolledDestinationOwner {
+                owner: owner.as_ref(),
+            })
+    }
+}
+
+/// Borrowed enrollment evidence for one address from a pinned generation.
+/// Copying this view performs no allocation or lookup.
+#[derive(Clone, Copy)]
+pub(crate) struct NodeLocalEnrolledDestinationOwner<'a> {
+    owner: &'a EnrolledAddressOwner,
+}
+
+impl NodeLocalEnrolledDestinationOwner<'_> {
+    /// Whether this enrolled owner satisfies the slice record's evidence.
+    pub(crate) fn terminates_for(
+        self,
+        identity: Option<&str>,
+        pod_uid: Option<&str>,
+    ) -> bool {
+        if let Some(pod_uid) = pod_uid
+            && self.owner.pod_uid != pod_uid
+        {
+            return false;
+        }
+        if let (Some(required), Some(attested)) = (identity, self.owner.identity.as_deref())
+            && required != attested
+        {
+            return false;
+        }
+        true
+    }
+}
+
 /// Lock-free, poller-published index of the pods enrolled on THIS node.
 ///
 /// Read once per authenticated inbound CONNECT (and per UDP CONNECT) through
@@ -192,6 +251,13 @@ impl Default for NodeLocalEnrolledDestinations {
 impl NodeLocalEnrolledDestinations {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Load one coherent generation for one complete guard decision.
+    fn snapshot(&self) -> NodeLocalEnrolledDestinationsSnapshot {
+        NodeLocalEnrolledDestinationsSnapshot {
+            current: self.current.load(),
+        }
     }
 
     /// Publish a complete new generation, returning its number.
@@ -275,24 +341,11 @@ impl NodeLocalEnrolledDestinations {
         identity: Option<&str>,
         pod_uid: Option<&str>,
     ) -> bool {
-        let snapshot = self.current.load();
-        if !snapshot.published {
-            return false;
-        }
-        let Some(owner) = snapshot.by_address.get(&address.to_canonical()) else {
+        let snapshot = self.snapshot();
+        let Some(owner) = snapshot.owner_for(address) else {
             return false;
         };
-        if let Some(pod_uid) = pod_uid
-            && owner.pod_uid != pod_uid
-        {
-            return false;
-        }
-        if let (Some(required), Some(attested)) = (identity, owner.identity.as_deref())
-            && required != attested
-        {
-            return false;
-        }
-        true
+        owner.terminates_for(identity, pod_uid)
     }
 }
 
@@ -322,6 +375,14 @@ impl NodeLocalEnrolledDestinationsHandle {
     /// The index, when a node-local registry is authoritative for this proxy.
     pub fn index(&self) -> Option<&NodeLocalEnrolledDestinations> {
         self.0.as_deref()
+    }
+
+    /// Load the authoritative registry generation once for a complete guard
+    /// decision. `None` means this proxy has no registry source configured.
+    pub(crate) fn snapshot(&self) -> Option<NodeLocalEnrolledDestinationsSnapshot> {
+        self.0
+            .as_deref()
+            .map(NodeLocalEnrolledDestinations::snapshot)
     }
 
     /// Whether a node-local registry bounds this proxy's relay inventory.
@@ -363,11 +424,13 @@ struct InstalledEnrolledDestinationsToken {
 /// thread a runtime handle. Installing once per serving cycle keeps the handle
 /// coherent across all of them without widening `MeshRuntimeConfig`.
 ///
-/// Unset outside a serving mesh runtime (including `validate` and every test
-/// that builds a config directly), so the guard's default is the identity
-/// bound. Tests that need the registry boundary assign
-/// `MeshConfig::inbound_relay_node_local_registry` on the built config instead
-/// of touching this slot, so no test can leak an index into another.
+/// Unset outside a serving mesh runtime (including `validate`), so the guard's
+/// default is the identity bound. The installation-ownership tests below are
+/// the only tests that exercise this slot and serialize their own mutations.
+/// Tests that build a `MeshConfig` assign
+/// `MeshConfig::inbound_relay_node_local_registry` on the built config (or
+/// explicitly clear it after mesh apply) so a parallel slot test cannot change
+/// their expected registry posture.
 static INSTALLED_ENROLLED_DESTINATIONS: std::sync::LazyLock<
     ArcSwapOption<InstalledEnrolledDestinationsToken>,
 > = std::sync::LazyLock::new(ArcSwapOption::empty);
@@ -450,6 +513,7 @@ pub struct NodeLocalEnrolledDestinationsManager {
     source: Arc<dyn PodCaptureSource>,
     index: Arc<NodeLocalEnrolledDestinations>,
     poll_interval: Duration,
+    snapshot_unhealthy: AtomicBool,
 }
 
 /// Retract the enrolled set whenever the manager future leaves scope — not only
@@ -476,6 +540,7 @@ impl NodeLocalEnrolledDestinationsManager {
             source,
             index,
             poll_interval,
+            snapshot_unhealthy: AtomicBool::new(false),
         }
     }
 
@@ -490,9 +555,10 @@ impl NodeLocalEnrolledDestinationsManager {
     /// module docs.
     ///
     /// Returns the entries that were published (empty after a retraction).
-    /// Diagnostics are a fixed-shape debug line; the error payload is discarded
-    /// so registry contents, identities, pod UIDs, and attacker-controlled
-    /// names never reach a log.
+    /// Diagnostics are fixed-shape transition lines; the error payload is
+    /// discarded so registry contents, identities, pod UIDs, and attacker-
+    /// controlled names never reach a log. The first retraction warns, repeated
+    /// failures are debug-only, and recovery warns once.
     pub fn reconcile_once(&self) -> Vec<EnrolledPodEntry> {
         match self.source.list_complete_targets() {
             Ok(targets) => {
@@ -501,14 +567,27 @@ impl NodeLocalEnrolledDestinationsManager {
                     .filter_map(EnrolledPodEntry::from_capture_target)
                     .collect();
                 self.index.publish(&entries);
+                if self.snapshot_unhealthy.swap(false, Ordering::Relaxed) {
+                    warn!(
+                        "Node-local enrolled destination registry recovered; complete snapshots \
+                         are publishing again"
+                    );
+                }
                 entries
             }
             Err(_) => {
                 self.index.clear();
-                debug!(
-                    "Node-local enrolled destination index retracted; \
-                     registry snapshot was not complete"
-                );
+                if !self.snapshot_unhealthy.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        "Node-local enrolled destination registry is unavailable; the \
+                         authenticated inbound HBONE relay inventory is retracted"
+                    );
+                } else {
+                    debug!(
+                        "Node-local enrolled destination index remains retracted; \
+                         registry snapshot was not complete"
+                    );
+                }
                 Vec::new()
             }
         }

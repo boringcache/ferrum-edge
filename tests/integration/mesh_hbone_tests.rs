@@ -1682,21 +1682,25 @@ fn ambient_terminator_mesh() -> MeshConfig {
                 host: MeshInboundRelayHost::Ip(ip("10.244.1.7")),
                 ports: vec![8080],
                 enrollment: Default::default(),
+                registry_uncontested: true,
             },
             MeshInboundRelayDestination {
                 host: MeshInboundRelayHost::Ip(ip("127.0.0.1")),
                 ports: vec![8080],
                 enrollment: Default::default(),
+                registry_uncontested: true,
             },
             MeshInboundRelayDestination {
                 host: MeshInboundRelayHost::Name("localhost".to_string()),
                 ports: vec![8080],
                 enrollment: Default::default(),
+                registry_uncontested: true,
             },
             MeshInboundRelayDestination {
                 host: MeshInboundRelayHost::Name("app.localhost".to_string()),
                 ports: vec![8080],
                 enrollment: Default::default(),
+                registry_uncontested: true,
             },
         ],
         inbound_relay_admits_accepted_local_address: true,
@@ -1959,11 +1963,13 @@ fn inbound_relay_admits_only_the_waypoint_termination_inventory() {
                 host: MeshInboundRelayHost::Name("localhost.".to_string()),
                 ports: vec![8080],
                 enrollment: Default::default(),
+                registry_uncontested: true,
             },
             MeshInboundRelayDestination {
                 host: MeshInboundRelayHost::Name("app.localhost".to_string()),
                 ports: vec![8080],
                 enrollment: Default::default(),
+                registry_uncontested: true,
             },
         ],
         ..MeshConfig::default()
@@ -2827,13 +2833,10 @@ fn inbound_relay_ambient_registry_refuses_declared_name_destinations() {
 
 /// Issue #4249: several workload records can declare ONE address while
 /// belonging to DIFFERENT pods (`hostNetwork` pods all declare the node IP).
-/// Inventory entries are keyed by the owning record's enrollment evidence as
-/// well as the host, so those records do not merge into one entry whose ports
-/// are their union — an unenrolled sibling cannot lend its ports to the
-/// enrolled pod's admission, and the enrolled pod's ports do not make the
-/// sibling relayable either.
+/// Once the registry is authoritative, that address is contested and refused
+/// for every claimant instead of trying to admit one record's ports.
 #[test]
-fn inbound_relay_ambient_registry_does_not_union_shared_address_ports() {
+fn inbound_relay_ambient_registry_refuses_shared_address_claimed_by_different_pods() {
     let own_spiffe = reviews_spiffe();
 
     let mut enrolled_pod = reviews_replica("10.244.5.5", LOCAL_POD_UID);
@@ -2855,19 +2858,103 @@ fn inbound_relay_ambient_registry_does_not_union_shared_address_ports() {
     let mut mesh = prepared_mesh(&slice, &runtime);
     let node = Some(ip("10.244.0.1"));
 
+    assert!(!mesh.inbound_relay_node_local_registry.is_authoritative());
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 9443, node),
+        Ok(()),
+        "without a registry, the documented identity/locality fallback still admits both records"
+    );
+
     let enrollment = [enrolled(LOCAL_POD_UID, &own_spiffe, "10.244.5.5")];
     bind_enrolled_registry(&mut mesh, &enrollment);
 
     assert_eq!(
         mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
-        Ok(()),
-        "the enrolled pod's own declared port stays relayable"
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "different pod UIDs contest the address for every inventory claimant"
     );
     assert_eq!(
         mesh.inbound_relay_destination_decision("10.244.5.5", 9443, node),
-        Err(InboundRelayDenial::PortNotDeclared),
-        "a co-located pod this node does not enrol must not union its port into \
-         the enrolled pod's admission"
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+}
+
+/// Issue #4249: `WorkloadEntry` records carry no pod UID. If one declares an
+/// enrolled pod's IP under the same service-account identity, identity-only
+/// enrollment comparison would otherwise let it widen the admitted port set.
+/// A lone UID-less record remains valid; only the shared-address contest is
+/// refused once the registry is authoritative.
+#[test]
+fn inbound_relay_ambient_registry_refuses_uidless_record_contesting_enrolled_address() {
+    let own_spiffe = reviews_spiffe();
+
+    let mut enrolled_pod = reviews_replica("10.244.5.5", LOCAL_POD_UID);
+    enrolled_pod.ports = vec![WorkloadPort {
+        port: 8080,
+        protocol: AppProtocol::Http,
+        name: Some("http".to_string()),
+    }];
+    let mut uidless_record = reviews_replica("10.244.5.5", OTHER_POD_UID);
+    uidless_record.pod_uid = None;
+    uidless_record.ports = vec![WorkloadPort {
+        port: 9443,
+        protocol: AppProtocol::Http,
+        name: Some("operator-admin".to_string()),
+    }];
+    let mut lone_uidless_record = reviews_replica("10.244.5.6", OTHER_POD_UID);
+    lone_uidless_record.pod_uid = None;
+    lone_uidless_record.ports = vec![WorkloadPort {
+        port: 7070,
+        protocol: AppProtocol::Http,
+        name: Some("vm-http".to_string()),
+    }];
+    let (slice, runtime) = ambient_relay_fixture(vec![
+        enrolled_pod,
+        uidless_record,
+        lone_uidless_record,
+    ]);
+
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let node = Some(ip("10.244.0.1"));
+
+    // First pin the old/no-registry behavior: both records pass the shared
+    // identity, cluster, and labels bound. The later refusal is therefore the
+    // registry-bounded contested-address rule, not a fixture mismatch.
+    assert!(!mesh.inbound_relay_node_local_registry.is_authoritative());
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 9443, node),
+        Ok(()),
+        "a UID-less same-identity record widens the no-registry fallback"
+    );
+
+    let enrollment = [
+        enrolled(LOCAL_POD_UID, &own_spiffe, "10.244.5.5"),
+        enrolled(OTHER_POD_UID, &own_spiffe, "10.244.5.6"),
+    ];
+    bind_enrolled_registry(&mut mesh, &enrollment);
+
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a UID-less sibling makes the address contested for every claimant"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 9443, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "the UID-less record must not widen the enrolled pod's admitted ports"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 7070, node),
+        Ok(()),
+        "a lone UID-less WorkloadEntry / VM record at an enrolled IP stays admissible"
     );
 }
 
@@ -3682,14 +3769,21 @@ fn inbound_relay_own_address_fails_closed_on_missing_and_mixed_pod_uids() {
 /// terminator, so there is no owned view to project. That must not become a
 /// permissive fallback to the whole declared workload view: the same ambiguity
 /// rule is applied to that view instead, so a shared address still fails closed
-/// while an unambiguous one still serves.
+/// while an unambiguous one still serves. Remote-provenance records are not
+/// candidates: an overlapping remote pod CIDR must not manufacture ambiguity
+/// at the local pod's address.
 #[test]
 fn inbound_relay_own_address_without_identity_does_not_union_a_shared_address() {
     let shared_a = reviews_replica_declaring("10.244.5.5", Some(LOCAL_POD_UID), &[8080]);
     let shared_b = reviews_replica_declaring("10.244.5.5", Some(OTHER_POD_UID), &[9443]);
     let lone = reviews_replica_declaring("10.244.5.6", Some(LOCAL_POD_UID), &[7070]);
-    let (slice, mut runtime) =
-        own_pod_relay_fixture(MeshTopology::Sidecar, vec![shared_a, shared_b, lone]);
+    let mut remote_overlap =
+        reviews_replica_declaring("10.244.5.6", Some(OTHER_POD_UID), &[7443]);
+    remote_overlap.remote_provenance = true;
+    let (slice, mut runtime) = own_pod_relay_fixture(
+        MeshTopology::Sidecar,
+        vec![shared_a, shared_b, lone, remote_overlap],
+    );
     // No `FERRUM_MESH_WORKLOAD_SPIFFE_ID`.
     runtime.workload_spiffe_id = None;
 
@@ -3724,6 +3818,11 @@ fn inbound_relay_own_address_without_identity_does_not_union_a_shared_address() 
     assert_eq!(
         mesh.inbound_relay_destination_decision("10.244.5.6", 9443, lone_ip),
         Err(InboundRelayDenial::PortNotDeclared)
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 7443, lone_ip),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "an overlapping remote-provenance record must not widen or contest the local bound"
     );
 }
 

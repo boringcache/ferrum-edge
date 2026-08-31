@@ -4827,10 +4827,12 @@ pub struct MeshConfig {
     /// accepted connection's local address and the own-namespace loopback
     /// shortcut (issue #4249).
     ///
-    /// AUTHORITATIVE and exhaustive: an address absent from this projection is
-    /// not port-declared for those arms and they refuse it. There is no
-    /// fallback scan of the declared workload view, under any configuration —
-    /// a permissive fallback is exactly what this field exists to remove.
+    /// AUTHORITATIVE and exhaustive once projected: an address absent from this
+    /// field is not port-declared for those arms and they refuse it. Mesh apply
+    /// normally builds it from the resolved owned-workload view. When no
+    /// workload identity is configured, apply instead projects the declared
+    /// workload view through the SAME ambiguity rule below; the hot guard never
+    /// falls back to scanning either broader view.
     ///
     /// At most ONE entry per canonical address, which is the whole point.
     /// Several workload RECORDS can legitimately declare one address:
@@ -4911,6 +4913,17 @@ pub struct MeshInboundRelayDestination {
     /// when no registry is authoritative for this proxy
     /// ([`MeshConfig::inbound_relay_node_local_registry`]).
     pub enrollment: MeshRelayEnrollmentEvidence,
+    /// Whether the raw workload records declaring this IP provide
+    /// unambiguous same-pod evidence for a registry-bounded inventory.
+    ///
+    /// Cold-path projection: true for a lone record, or for several records
+    /// that all carry one identical non-empty pod UID. False for every record
+    /// at an address contested by different, mixed, or entirely absent pod
+    /// UIDs. Ignored when no registry is authoritative; when one is, false
+    /// refuses the address for every claimant before any port can be admitted.
+    /// Declared names carry true because an authoritative registry already
+    /// refuses them outright.
+    pub registry_uncontested: bool,
 }
 
 /// The owning workload record's own node-local enrollment evidence, carried
@@ -4918,10 +4931,12 @@ pub struct MeshInboundRelayDestination {
 /// node-agent actually enrolls rather than to a SPIFFE identity, a cluster, or
 /// a label set that every replica of a Deployment shares (issue #4249).
 ///
-/// It is part of the inventory entry's IDENTITY, not a payload: two records
-/// that declare one address but belong to DIFFERENT pods keep separate entries
-/// (see [`inbound_relay_destinations_from_workloads`]), so neither can union
-/// its ports into the other's admission.
+/// It is part of the inventory entry's IDENTITY, not a payload. Distinct
+/// identity or pod-UID evidence keeps records separate, while two records with
+/// the same identity and no pod UID can still collapse. The cold contested-
+/// address projection therefore independently refuses every claimant while a
+/// registry is authoritative unless all raw records prove one identical
+/// non-empty pod UID (see [`inbound_relay_destinations_from_workloads`]).
 ///
 /// Built once per mesh apply; the guard only compares it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -5002,6 +5017,8 @@ impl InboundRelayDenial {
 pub fn inbound_relay_destinations_from_workloads<'a>(
     workloads: impl IntoIterator<Item = &'a Workload>,
 ) -> Vec<MeshInboundRelayDestination> {
+    let workloads: Vec<&Workload> = workloads.into_iter().collect();
+    let contested_addresses = contested_inbound_relay_addresses(&workloads);
     let mut destinations: Vec<MeshInboundRelayDestination> = Vec::new();
     for workload in workloads {
         // The owning record's own node-local enrollment evidence (issue
@@ -5034,20 +5051,27 @@ pub fn inbound_relay_destinations_from_workloads<'a>(
             // #4249). Several records can back ONE pod — several Services on
             // the same workload — and those agree on identity and pod UID, so
             // they still collapse into a single entry whose ports are their
-            // union. Records belonging to DIFFERENT pods that happen to declare
-            // one address (`hostNetwork` pods all declare the node IP) stay
-            // SEPARATE entries rather than merging into one whose evidence had
-            // to be collapsed: each is then admitted, or refused, on its own
-            // node-local enrollment, so an unenrolled sibling can never union
-            // its ports into another pod's admission.
+            // union. Different evidence keeps entries separate, but absent pod
+            // UIDs can make two records' keys identical. The independent
+            // `registry_uncontested` projection below closes both shapes: while
+            // a registry is authoritative, several raw records on one address
+            // are all refused unless they prove one identical non-empty UID.
+            // A lone UID-less WorkloadEntry / VM record remains admissible.
             let existing = destinations
                 .iter()
                 .position(|existing| existing.host == host && existing.enrollment == enrollment);
             let Some(index) = existing else {
+                let registry_uncontested = match &host {
+                    MeshInboundRelayHost::Ip(address) => {
+                        !contested_addresses.contains(address)
+                    }
+                    MeshInboundRelayHost::Name(_) => true,
+                };
                 destinations.push(MeshInboundRelayDestination {
                     host,
                     ports,
                     enrollment: enrollment.clone(),
+                    registry_uncontested,
                 });
                 continue;
             };
@@ -5074,6 +5098,53 @@ pub fn inbound_relay_destinations_from_workloads<'a>(
     }
     destinations.sort();
     destinations
+}
+
+/// IPs whose raw workload records do not prove one unambiguous pod owner.
+///
+/// This is the registry-bounded inventory counterpart of
+/// [`own_address_port_bounds_from_workloads`]'s ambiguity rule. It stays
+/// separate from destination dedup because collapsing records first would hide
+/// two records with the same identity and no pod UID. A duplicate spelling of
+/// one address inside one record still counts once.
+fn contested_inbound_relay_addresses(
+    workloads: &[&Workload],
+) -> std::collections::BTreeSet<std::net::IpAddr> {
+    let mut by_address: std::collections::BTreeMap<std::net::IpAddr, Vec<Option<&str>>> =
+        std::collections::BTreeMap::new();
+    for workload in workloads {
+        let pod_uid = workload
+            .pod_uid
+            .as_deref()
+            .map(str::trim)
+            .filter(|uid| !uid.is_empty());
+        let mut seen: Vec<std::net::IpAddr> = Vec::new();
+        for address in &workload.addresses {
+            let Ok(address) = address.parse::<std::net::IpAddr>() else {
+                continue;
+            };
+            let address = address.to_canonical();
+            if seen.contains(&address) {
+                continue;
+            }
+            seen.push(address);
+            by_address.entry(address).or_default().push(pod_uid);
+        }
+    }
+
+    by_address
+        .into_iter()
+        .filter_map(|(address, pod_uids)| {
+            if pod_uids.len() < 2 {
+                return None;
+            }
+            let proven_same_pod = match pod_uids.first().copied().flatten() {
+                Some(uid) => pod_uids.iter().all(|candidate| *candidate == Some(uid)),
+                None => false,
+            };
+            (!proven_same_pod).then_some(address)
+        })
+        .collect()
 }
 
 /// The application ports the one workload record set this terminator can PROVE
@@ -5494,6 +5565,15 @@ impl MeshConfig {
         address: Option<std::net::IpAddr>,
         port: u16,
     ) -> Result<(), InboundRelayDenial> {
+        // Load the live registry generation and resolve this authority's owner
+        // once for the whole decision. Every matching IP inventory entry names
+        // this same canonical address, so loading or looking it up again inside
+        // the loop would add work without changing the evidence.
+        let registry_snapshot = self.inbound_relay_node_local_registry.snapshot();
+        let registry_authoritative = registry_snapshot.is_some();
+        let enrolled_owner = registry_snapshot
+            .as_ref()
+            .and_then(|snapshot| address.and_then(|address| snapshot.owner_for(address)));
         let mut terminates_for_host = false;
         for destination in &self.inbound_relay_destinations {
             let matches = match &destination.host {
@@ -5505,7 +5585,11 @@ impl MeshConfig {
             if !matches {
                 continue;
             }
-            if !self.destination_is_node_local_enrolled(destination) {
+            if !self.destination_is_node_local_enrolled(
+                destination,
+                registry_authoritative,
+                enrolled_owner,
+            ) {
                 continue;
             }
             terminates_for_host = true;
@@ -5544,22 +5628,30 @@ impl MeshConfig {
     fn destination_is_node_local_enrolled(
         &self,
         destination: &MeshInboundRelayDestination,
+        registry_authoritative: bool,
+        enrolled_owner: Option<
+            crate::modes::mesh::enrolled_destinations::NodeLocalEnrolledDestinationOwner<'_>,
+        >,
     ) -> bool {
-        let Some(index) = self.inbound_relay_node_local_registry.index() else {
+        if !registry_authoritative {
             return true;
-        };
-        // A DECLARED NAME is refused outright while the registry is
-        // authoritative. The guard never resolves a name, and the address the
-        // relay eventually dials for it is selected AFTER this decision — DNS
-        // may answer with an off-node sibling, or with anything else — so no
-        // evidence checked here would still bind the socket. Admitting a name
-        // because some record that shares it declares an enrolled address is
-        // exactly the union this must not perform.
-        let MeshInboundRelayHost::Ip(address) = &destination.host else {
+        }
+        // Several raw records on one address are refused for EVERY claimant
+        // unless they all proved one identical non-empty pod UID at mesh apply.
+        // This runs before port admission, so a UID-less sibling cannot lend a
+        // port to an enrolled pod even though identity-only registry comparison
+        // would otherwise admit it.
+        if !destination.registry_uncontested {
+            return false;
+        }
+        // `None` covers both an unenrolled IP and a DECLARED NAME. Names are
+        // refused outright while the registry is authoritative: the guard
+        // never resolves one, and the eventual DNS answer is selected after
+        // this decision.
+        let Some(enrolled_owner) = enrolled_owner else {
             return false;
         };
-        index.terminates_for(
-            *address,
+        enrolled_owner.terminates_for(
             destination.enrollment.identity.as_deref(),
             destination.enrollment.pod_uid.as_deref(),
         )
