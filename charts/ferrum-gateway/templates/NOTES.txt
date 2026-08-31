@@ -50,6 +50,11 @@ CONTROL-PLANE MODE (read/write admin, no proxy, gRPC distribution)
 
 DATA-PLANE MODE (read-only admin + proxy, config from CP)
 - CP gRPC URLs: {{ .Values.dp.cpGrpcUrls }}
+- Stale-config fence: when every CP is lost and the applied snapshot reaches
+  {{ include "ferrum-gateway.dpConfigMaxStaleSecondsEffective" . }}s, readiness
+  degrades and new traffic is {{ if eq (include "ferrum-gateway.dpConfigStaleActionEffective" .) "fail_closed" }}refused (fail_closed){{ else }}still admitted (readiness_only){{ end }}.
+  Partial CP loss and successful failover do not trigger the fence. See
+  docs/cp_dp_mode.md#bounded-last-known-good-configuration-age.
 - The pod becomes Ready once its admin listener is up; routes appear after the
   CP pushes config. Proxy Service: {{ include "ferrum-gateway.fullname" . }}.
 {{- end }}
