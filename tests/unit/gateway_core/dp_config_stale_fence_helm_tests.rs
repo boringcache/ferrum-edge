@@ -21,9 +21,7 @@ fn read(rel: &str) -> String {
 #[test]
 fn values_default_dp_stale_fence_unset() {
     let values = read("values.yaml");
-    let idx = values
-        .find("dp:")
-        .expect("values.yaml must declare dp");
+    let idx = values.find("dp:").expect("values.yaml must declare dp");
     let window = &values[idx..values.len().min(idx + 900)];
     assert!(
         window.contains("configMaxStaleSeconds: \"\""),
