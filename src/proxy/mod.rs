@@ -45632,6 +45632,102 @@ fn default_port_for_scheme(scheme: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// Authority string Hyper will put in `:authority` after default-port omission.
+///
+/// Borrowed from the already-parsed URI: a non-default (or absent) port is
+/// `authority.as_str()`; an explicit default port (80 for `http`/`ws`, 443
+/// for `https`/`wss`) is the same slice with `:{port}` stripped, so IPv6
+/// brackets stay (`[::1]:443` → `[::1]`). No extra `String`.
+fn outbound_h2_authority(uri: &hyper::Uri) -> Option<&str> {
+    let authority = uri.authority()?;
+    let authority_str = authority.as_str();
+    if let Some(port) = authority.port()
+        && Some(port.as_str()) == default_port_for_scheme(uri.scheme_str())
+    {
+        return authority_str.rsplit_once(':').map(|(host, _)| host);
+    }
+    Some(authority_str)
+}
+
+/// Rewrite `uri`'s authority so Hyper's `:authority` equals `authority`.
+///
+/// Returns `true` when they already agree or the rewrite succeeded. A URI
+/// clone is allocated only when the authority actually changes (explicit
+/// default port, or a preserved client Host that differs from the backend
+/// URL).
+fn align_outbound_h2_uri_authority(uri: &mut hyper::Uri, authority: &str) -> bool {
+    if uri
+        .authority()
+        .is_some_and(|existing| existing.as_str() == authority)
+    {
+        return true;
+    }
+    let Ok(parsed) = authority.parse::<http::uri::Authority>() else {
+        return false;
+    };
+    let mut parts = uri.clone().into_parts();
+    parts.authority = Some(parsed);
+    match hyper::Uri::from_parts(parts) {
+        Ok(aligned) => {
+            *uri = aligned;
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// RFC 9113 §8.3.1: outbound `Host` and `:authority` must be the same string.
+///
+/// Used by the direct-H2 pool (`proxy_to_backend_http2`) and native-gRPC
+/// dispatch. Hyper derives `:authority` from `uri.authority().as_str()`, so
+/// `Host` is taken from that URI (default ports omitted) rather than from
+/// `uri.host()` / `proxy.backend_host` (hostname-only).
+///
+/// `preserve_host_header` is honoured by rewriting the URI authority to the
+/// client Host so Hyper emits a matching `:authority`. If the client Host is
+/// missing or is not a valid URI authority, RFC agreement wins: both fields
+/// use the backend URI authority. A disagreeing Host is never emitted.
+///
+/// Computed from the already-parsed outbound URI (built at dispatch from the
+/// selected target host/port). The common non-default-port, preserve-off path
+/// is a borrow plus the `HeaderValue` insert that already existed.
+pub(crate) fn apply_outbound_h2_host(
+    headers: &mut hyper::HeaderMap,
+    uri: &mut hyper::Uri,
+    preserve_host_header: bool,
+) {
+    if preserve_host_header
+        && let Some(host) = headers
+            .get(hyper::header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .filter(|host| !host.is_empty())
+        && align_outbound_h2_uri_authority(uri, host)
+    {
+        return;
+    }
+
+    let Some(authority) = outbound_h2_authority(uri) else {
+        return;
+    };
+    let Ok(value) = hyper::header::HeaderValue::from_str(authority) else {
+        return;
+    };
+    let needs_align = uri
+        .authority()
+        .is_none_or(|existing| existing.as_str() != authority);
+    headers.insert(hyper::header::HOST, value);
+    if needs_align
+        && let Some(host) = headers
+            .get(hyper::header::HOST)
+            .and_then(|value| value.to_str().ok())
+        && !align_outbound_h2_uri_authority(uri, host)
+    {
+        // URI rewrite failed; omitting Host lets Hyper emit `:authority`
+        // alone rather than a disagreeing pair.
+        headers.remove(hyper::header::HOST);
+    }
+}
+
 fn normalize_authority_for_consistency(value: &str, scheme: Option<&str>) -> Option<String> {
     split_request_authority(value).map(|(host, port)| {
         if let Some(port) = port
@@ -51473,12 +51569,16 @@ async fn proxy_to_backend_http2(
 
     // Clear and rebuild headers from the plugin-processed headers map
     parts.headers.clear();
-    let effective_host = &proxy.backend_host;
     let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
     let peer_trusted = forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies);
     for (k, v) in headers {
         match k.as_str() {
             "host" => {
+                // Preserve-off Host is applied after the loop via
+                // `apply_outbound_h2_host` so it matches Hyper's `:authority`
+                // (including a non-default port). Preserve-on keeps the client
+                // Host here; the same helper then rewrites the URI authority
+                // to agree.
                 if proxy.preserve_host_header {
                     insert_outbound_header_or_warn(
                         &mut parts.headers,
@@ -51487,15 +51587,6 @@ async fn proxy_to_backend_http2(
                         "client_host",
                         "host",
                         v,
-                    );
-                } else {
-                    insert_outbound_header_or_warn(
-                        &mut parts.headers,
-                        &proxy.id,
-                        "direct_h2",
-                        "backend_host",
-                        "host",
-                        effective_host,
                     );
                 }
             }
@@ -51595,6 +51686,8 @@ async fn proxy_to_backend_http2(
     if let Some(deadline) = grpc_deadline_at {
         grpc_proxy::apply_remaining_grpc_timeout_header(&mut parts.headers, deadline);
     }
+
+    apply_outbound_h2_host(&mut parts.headers, &mut parts.uri, proxy.preserve_host_header);
 
     let backend_req = Request::from_parts(parts, body);
 

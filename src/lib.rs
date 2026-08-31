@@ -123,6 +123,35 @@ pub mod _test_support {
         Some((url_authority, host))
     }
 
+    /// RFC 9113 §8.3.1 outbound `Host` / `:authority` pair the direct-H2 and
+    /// native-gRPC dispatch paths emit for `backend_url`.
+    ///
+    /// Returns `None` when `backend_url` is not a URI or has no authority.
+    /// `client_host` is the preserved inbound Host; ignored when
+    /// `preserve_host_header` is false.
+    pub fn outbound_h2_host_and_authority_for_test(
+        backend_url: &str,
+        preserve_host_header: bool,
+        client_host: Option<&str>,
+    ) -> Option<(String, String)> {
+        let mut uri: hyper::Uri = backend_url.parse().ok()?;
+        let mut headers = hyper::HeaderMap::new();
+        if let Some(host) = client_host {
+            headers.insert(
+                hyper::header::HOST,
+                hyper::header::HeaderValue::from_str(host).ok()?,
+            );
+        }
+        crate::proxy::apply_outbound_h2_host(&mut headers, &mut uri, preserve_host_header);
+        let host = headers
+            .get(hyper::header::HOST)?
+            .to_str()
+            .ok()?
+            .to_string();
+        let authority = uri.authority()?.as_str().to_string();
+        Some((host, authority))
+    }
+
     /// Release an xDS node permit through the production last-stream cleanup
     /// fence. The closure runs while same-key registration is excluded, which
     /// lets external tests prove a departing generation cannot delete its

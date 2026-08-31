@@ -4332,7 +4332,7 @@ async fn proxy_grpc_streaming_dispatch(
         .and_then(|value| value.to_str().ok());
     let resolved_uri =
         transport.resolve_backend_uri(backend_url, proxy.preserve_host_header, client_host_header);
-    let uri = match resolved_uri {
+    let mut uri = match resolved_uri {
         Ok(uri) => uri,
         Err(e) => {
             *held_frontend_upload = Some(grpc_body);
@@ -4349,12 +4349,11 @@ async fn proxy_grpc_streaming_dispatch(
     // strip set, so order vs strip is safe — but Host MUST be applied
     // after the synthesise step so it's not accidentally targeted by a
     // future strip predicate change.)
-    if !proxy.preserve_host_header
-        && let Some(target_host) = uri.host()
-        && let Ok(val) = hyper::header::HeaderValue::from_str(target_host)
-    {
-        headers.insert(hyper::header::HOST, val);
-    }
+    //
+    // RFC 9113 §8.3.1: Host must equal the `:authority` Hyper derives from
+    // this URI, including a non-default port. `uri.host()` is hostname-only
+    // and disagrees with `:authority` on every non-default backend port.
+    crate::proxy::apply_outbound_h2_host(&mut headers, &mut uri, proxy.preserve_host_header);
 
     // For the streaming path, send_request() covers both body upload and
     // response header wait. Unlike the buffered path (where body sends
@@ -4722,7 +4721,7 @@ pub(crate) async fn proxy_grpc_request_core(
     let client_host_header = headers
         .get(hyper::header::HOST)
         .and_then(|value| value.to_str().ok());
-    let uri = transport.resolve_backend_uri(
+    let mut uri = transport.resolve_backend_uri(
         backend_url,
         proxy.preserve_host_header,
         client_host_header,
@@ -4733,16 +4732,11 @@ pub(crate) async fn proxy_grpc_request_core(
     // H3 frontend that synthesized `host` from `:authority` (see
     // `src/http3/server.rs` and `src/proxy/mod.rs`) would forward the client's
     // external authority to the gRPC backend even when
-    // `preserve_host_header == false`. With the override, the backend sees the
-    // upstream target host (taken from the parsed backend URL) in both
-    // `:authority` (set from the URI below) and `Host`, matching the plain
-    // HTTP non-preserve semantics.
-    if !proxy.preserve_host_header
-        && let Some(target_host) = uri.host()
-        && let Ok(val) = hyper::header::HeaderValue::from_str(target_host)
-    {
-        headers.insert(hyper::header::HOST, val);
-    }
+    // `preserve_host_header == false`. RFC 9113 §8.3.1 requires Host to equal
+    // the `:authority` Hyper derives from this URI, including a non-default
+    // port — `uri.host()` is hostname-only and disagrees on every non-default
+    // backend port.
+    crate::proxy::apply_outbound_h2_host(&mut headers, &mut uri, proxy.preserve_host_header);
 
     // Carry forward the receipt-anchored absolute deadline from
     // `prepare_request_deadline` (parsed before before_proxy plugins and

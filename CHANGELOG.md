@@ -25,6 +25,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Outbound direct-H2 and native-gRPC `Host` now matches `:authority` on
+  non-default ports** (issue #4410). Ferrum previously stamped a hostname-only
+  `Host` (`127.0.0.1`) while Hyper derived `:authority` from the backend URI
+  including the port (`127.0.0.1:21212`). RFC 9113 §8.3.1 forbids that
+  disagreement; RFC-compliant H2 origins reset the stream and the client saw
+  502 `backend_error` or gRPC UNAVAILABLE(14). Default ports (80 for
+  `http`/`ws`, 443 for `https`/`wss`) are still omitted from both. When
+  `preserve_host_header` is true, the client Host is honoured by rewriting
+  the outbound URI authority so `:authority` agrees; if that Host is not a
+  valid URI authority, both fields fall back to the backend URI authority.
+
 - **Linux GNU release ABI floor is now GLIBC_2.34** (issue #4301). Generic
   `ferrum-edge-linux-{x86_64,aarch64}` and `ferrum-cni-linux-{x86_64,aarch64}`
   artifacts previously linked against whatever glibc `ubuntu-latest` shipped
