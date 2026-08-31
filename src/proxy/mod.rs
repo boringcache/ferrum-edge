@@ -45678,17 +45678,83 @@ fn align_outbound_h2_uri_authority(uri: &mut hyper::Uri, authority: &str) -> boo
     }
 }
 
+/// A preserved client `Host` may become outbound `:authority` only when it
+/// is a valid request authority.
+///
+/// Reuses [`split_request_authority`]: rejects userinfo (`@`), empty or
+/// whitespace-only values, unbracketed IPv6, opaque `[not-an-ip]` literals,
+/// paths, and invalid ports. Returns the trimmed slice so surrounding
+/// whitespace cannot survive into `Host` / `:authority`.
+fn validated_outbound_host(host: &str) -> Option<&str> {
+    let trimmed = host.trim();
+    split_request_authority(trimmed).map(|_| trimmed)
+}
+
+/// Rewrite `uri` so its authority is the final outbound `:authority`.
+///
+/// When `preserve_host_header` is on and `client_host` is a valid request
+/// authority, that Host becomes the URI authority. Otherwise the backend URI
+/// authority is kept, with an explicit default port (80/443) stripped so
+/// Hyper's `:authority` matches the Host [`outbound_h2_authority`] emits.
+/// Used by native-gRPC Direct `resolve_backend_uri` so every transport arm
+/// returns a URI whose authority is already final — gRPC call sites then
+/// only sync `Host`, and must not run a second preserve pass (that would
+/// clobber a pinned mesh-mTLS service authority).
+pub(crate) fn apply_outbound_h2_preserve_to_uri(
+    uri: &mut hyper::Uri,
+    preserve_host_header: bool,
+    client_host: Option<&str>,
+) {
+    if preserve_host_header
+        && let Some(host) = client_host.and_then(validated_outbound_host)
+        && align_outbound_h2_uri_authority(uri, host)
+    {
+        return;
+    }
+    if let Some(authority) = outbound_h2_authority(uri) {
+        let _ = align_outbound_h2_uri_authority(uri, authority);
+    }
+}
+
+/// Set `Host` from the URI's outbound authority. Never rewrites the URI.
+///
+/// Default ports are omitted via [`outbound_h2_authority`]. Callers must
+/// already have made `uri`'s authority the final `:authority` (Direct
+/// preserve / mesh-mTLS / HBONE resolver). The common preserve-off,
+/// non-default-port path is a borrow of that authority plus the
+/// `HeaderValue` insert that already existed.
+pub(crate) fn sync_outbound_h2_host_to_authority(
+    headers: &mut hyper::HeaderMap,
+    uri: &hyper::Uri,
+) {
+    let Some(authority) = outbound_h2_authority(uri) else {
+        return;
+    };
+    let Ok(value) = hyper::header::HeaderValue::from_str(authority) else {
+        return;
+    };
+    headers.insert(hyper::header::HOST, value);
+}
+
 /// RFC 9113 §8.3.1: outbound `Host` and `:authority` must be the same string.
 ///
-/// Used by the direct-H2 pool (`proxy_to_backend_http2`) and native-gRPC
-/// dispatch. Hyper derives `:authority` from `uri.authority().as_str()`, so
-/// `Host` is taken from that URI (default ports omitted) rather than from
+/// Used by the direct-H2 pool (`proxy_to_backend_http2`), which builds its
+/// URI from the selected target and has no prior preserve resolution.
+/// Native-gRPC dispatch resolves authority in `resolve_backend_uri` and
+/// then calls [`sync_outbound_h2_host_to_authority`] so a second preserve
+/// pass cannot clobber a pinned mesh service authority.
+///
+/// Hyper derives `:authority` from `uri.authority().as_str()`, so `Host`
+/// is taken from that URI (default ports omitted) rather than from
 /// `uri.host()` / `proxy.backend_host` (hostname-only).
 ///
 /// `preserve_host_header` is honoured by rewriting the URI authority to the
-/// client Host so Hyper emits a matching `:authority`. If the client Host is
-/// missing or is not a valid URI authority, RFC agreement wins: both fields
-/// use the backend URI authority. A disagreeing Host is never emitted.
+/// client Host so Hyper emits a matching `:authority`. The client Host is
+/// admitted only after [`split_request_authority`] (RFC 9113 §8.3.1
+/// forbids userinfo in `:authority`). If it is missing or invalid, RFC
+/// agreement wins: both fields use the backend URI authority. A disagreeing
+/// Host is never emitted. The value written to `Host` is the validated
+/// (trimmed) form, not the raw header bytes.
 ///
 /// Computed from the already-parsed outbound URI (built at dispatch from the
 /// selected target host/port). The common non-default-port, preserve-off path
@@ -45702,32 +45768,28 @@ pub(crate) fn apply_outbound_h2_host(
         && let Some(host) = headers
             .get(hyper::header::HOST)
             .and_then(|value| value.to_str().ok())
-            .filter(|host| !host.is_empty())
+            .and_then(validated_outbound_host)
         && align_outbound_h2_uri_authority(uri, host)
     {
+        if let Ok(value) = hyper::header::HeaderValue::from_str(host) {
+            headers.insert(hyper::header::HOST, value);
+        }
         return;
     }
 
     let Some(authority) = outbound_h2_authority(uri) else {
         return;
     };
-    let Ok(value) = hyper::header::HeaderValue::from_str(authority) else {
-        return;
-    };
     let needs_align = uri
         .authority()
         .is_none_or(|existing| existing.as_str() != authority);
-    headers.insert(hyper::header::HOST, value);
-    if needs_align
-        && let Some(host) = headers
-            .get(hyper::header::HOST)
-            .and_then(|value| value.to_str().ok())
-        && !align_outbound_h2_uri_authority(uri, host)
-    {
+    if needs_align && !align_outbound_h2_uri_authority(uri, authority) {
         // URI rewrite failed; omitting Host lets Hyper emit `:authority`
         // alone rather than a disagreeing pair.
         headers.remove(hyper::header::HOST);
+        return;
     }
+    sync_outbound_h2_host_to_authority(headers, uri);
 }
 
 fn normalize_authority_for_consistency(value: &str, scheme: Option<&str>) -> Option<String> {

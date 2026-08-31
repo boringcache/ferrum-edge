@@ -2089,6 +2089,52 @@ fn native_grpc_outbound_host_matches_authority_including_non_default_port() {
         Some("api.example.com"),
         "api.example.com",
     );
+    assert_outbound_h2_host_matches_authority(
+        "http://127.0.0.1:21213/grpc.Service/Method",
+        true,
+        Some("  api.example.com  "),
+        "api.example.com",
+    );
+    assert_outbound_h2_host_matches_authority(
+        "https://127.0.0.1:8443/grpc.Service/Method",
+        true,
+        Some("[::1]:8443"),
+        "[::1]:8443",
+    );
+
+    let fallback = "127.0.0.1:8443";
+    let backend = "https://127.0.0.1:8443/grpc.Service/Method";
+    for host in [
+        "user@host",
+        "user:pass@host:8443",
+        "host/evil",
+        "",
+        "   ",
+        "2001:db8::1",
+        "[not-an-ip]:1",
+    ] {
+        assert_outbound_h2_host_matches_authority(backend, true, Some(host), fallback);
+    }
+}
+
+#[test]
+fn native_grpc_mesh_mtls_pinned_authority_wins_over_preserve_host() {
+    let (host, authority) =
+        ferrum_edge::_test_support::mesh_mtls_outbound_host_and_authority_for_test(
+            true,
+            Some("attacker.example:9000"),
+            "reviews.default.svc",
+            Some(9080),
+            "10.0.0.5",
+            15006,
+        )
+        .expect("pinned mesh-mTLS authority");
+    assert_eq!(host, "reviews.default.svc:9080");
+    assert_eq!(authority, "reviews.default.svc:9080");
+    assert_eq!(
+        host, authority,
+        "RFC 9113 §8.3.1: mesh-mTLS Host and :authority must agree"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
