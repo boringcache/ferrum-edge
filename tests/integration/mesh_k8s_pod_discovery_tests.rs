@@ -400,6 +400,10 @@ fn k8s_pod_discovery_attaches_node_waypoint_metadata_to_identity_only_sources() 
         .metadata
         .labels
         .insert("app".to_string(), "frontend".to_string());
+    source
+        .metadata
+        .labels
+        .insert("ferrum.io/mesh".to_string(), "enabled".to_string());
     source.status = json!({
         "phase": "Running",
         "podIP": "10.1.0.20",
@@ -477,6 +481,66 @@ fn k8s_pod_discovery_attaches_node_waypoint_metadata_to_identity_only_sources() 
         asserted,
         vec![source_spiffe, dest_spiffe],
         "per-assertor inventory must include identity-only sources and service-backed destinations"
+    );
+}
+
+#[test]
+fn k8s_pod_discovery_does_not_grant_unenrolled_identity_only_sources() {
+    let waypoint_spiffe = "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/node-a";
+    let source_spiffe = "spiffe://cluster.local/ns/default/sa/frontend";
+    let mut source = object(
+        "Pod",
+        "default",
+        "frontend-v1",
+        json!({
+            "serviceAccountName": "frontend",
+            "nodeName": "node-a",
+            "containers": [{"name": "curl"}]
+        }),
+    );
+    source.metadata.uid = "frontend-pod-uid".to_string();
+    source.status = json!({
+        "phase": "Running",
+        "podIP": "10.1.0.20",
+        "conditions": [{"type": "Ready", "status": "True"}]
+    });
+
+    let translation = translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            source,
+            node_waypoint_pod_with_spiffe("node-a", "192.0.2.10", true, 15008, waypoint_spiffe),
+        ],
+        options(),
+    )
+    .expect("K8s core translation succeeds");
+
+    let mesh = translation.config.mesh.as_ref().expect("mesh config");
+    let source_workload = mesh
+        .workloads
+        .iter()
+        .find(|workload| workload.spiffe_id.as_str() == source_spiffe)
+        .expect("identity-only source remains available for identity lookup");
+    assert!(
+        source_workload.node_waypoint.is_none(),
+        "a same-node pod without ambient opt-in must not enter the assertion grant"
+    );
+
+    let slice = MeshSlice::from_gateway_config(
+        &translation.config,
+        MeshSliceRequest {
+            node_id: waypoint_spiffe.to_string(),
+            namespace: "ferrum-system".to_string(),
+            workload_spiffe_id: Some(waypoint_spiffe.to_string()),
+            ..MeshSliceRequest::default()
+        },
+    );
+    assert!(
+        slice.node_waypoint_assertors.iter().all(|assertor| assertor
+            .asserts
+            .iter()
+            .all(|id| id.as_str() != source_spiffe)),
+        "the NodeWaypoint must not be authorized to assert an unenrolled pod identity"
     );
 }
 
