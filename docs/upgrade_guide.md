@@ -30,6 +30,12 @@ baseline contract above.
 
 Every current `[Unreleased]` `BREAKING` changelog entry is listed here exactly once, with its issue number and the operator action that entry already states. Several of these fail **silently** at cutover (HMAC clients get `401`, WAF `literal` rules stop matching folded spellings, backends stop seeing client-supplied XFF hops) rather than refusing config load. Read this section before the per-mode procedures below.
 
+### Backend mTLS handshake without a client certificate is pre-wire (issue [#4406](https://github.com/ferrum-edge/ferrum-edge/issues/4406))
+
+An HTTPS origin that requires a client certificate previously logged `error_class=connection_reset` (or the `request_error` catch-all) and `X-Gateway-Error: backend_error` when the gateway presented none. That failure never reached HTTP. Typed rustls handshake errors still log `error_class=tls_error`. On the reqwest HTTP/1 path the rustls error is not in the request chain (hyper `is_canceled`), so the class is `connection_pool_error`. Both are pre-wire; `X-Gateway-Error` is `connection_failure`. `retry_on_connect_failure` replays regardless of method. The circuit breaker uses the connect-error path (`trip_on_connection_errors`) instead of a 502-status / post-wire reset charge. Plugin outbound HTTP (`FERRUM_PLUGIN_HTTP_MAX_RETRIES`) also retries `connection_pool_error` on GET/HEAD/OPTIONS; that list is not identical to `request_reached_wire`.
+
+**Operator action:** retarget alerts keyed on `connection_reset` / `backend_error` for this misconfig onto `tls_error` / `connection_pool_error` / `connection_failure`. If you set `trip_on_connection_errors: false` to ignore connect failures, this handshake will no longer trip the breaker via 502 in `failure_status_codes`. Configure `backend_tls_client_cert_path` / `backend_tls_client_key_path` (or stop requiring client certs on the origin).
+
 ### Injected Ferrum is a Kubernetes native sidecar (issue [#4430](https://github.com/ferrum-edge/ferrum-edge/issues/4430))
 
 The injector no longer appends Ferrum as an ordinary `spec.containers` entry. New pods receive a native sidecar (`spec.initContainers` with `restartPolicy: Always`) and exec probes against loopback `/health`. That is also what unblocks Kubernetes Job completion. **Minimum Kubernetes version is 1.29** (native sidecars enabled by default; 1.28 needs `SidecarContainers=true`). There is no ordinary-container fallback: the webhook always emits the native-sidecar shape, and a cluster older than that will reject the patched Pod.

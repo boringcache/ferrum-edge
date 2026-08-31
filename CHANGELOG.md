@@ -119,6 +119,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **BREAKING — backend mTLS handshake without a client certificate is
+  pre-wire, not `connection_reset`** (issue #4406). An HTTPS origin that
+  requires a client certificate previously classified as post-wire
+  `connection_reset` (OpenSSL RST) or the `request_error` catch-all
+  (reqwest HTTP/1: hyper `Canceled`, no rustls in the request chain).
+  Typed rustls handshake / certificate / alert errors still classify as
+  `tls_error`. On the live reqwest path the rustls error dies with the
+  connection future, so that case is `connection_pool_error` — the same
+  hyper `is_canceled` pre-wire class as pooled H2 / gRPC
+  `DispatchCanceled` (issue #3578). Classification keys on the typed
+  flag, not the `"connection was not ready"` Display label. Connect-phase
+  RST/refused with no rustls still collapses to `connection_refused`.
+  Mid-stream RST with no handshake rustls stays `connection_reset`.
+  Omitted `close_notify` stays `connection_closed` (#4051).
+  HTTPS-to-plaintext stays `tls_error` (#4053). **Operator action**:
+  retarget alerts that grepped `error_class=connection_reset` or
+  `X-Gateway-Error: backend_error` for this misconfig onto `tls_error` /
+  `connection_pool_error` / `connection_failure`.
+  `retry_on_connect_failure` now replays regardless of method. The
+  circuit breaker charges the **connect-error** path
+  (`trip_on_connection_errors`, default on) instead of the 502-status /
+  post-wire reset path; operators who set
+  `trip_on_connection_errors: false` will no longer trip on this
+  handshake via a 502 in `failure_status_codes`. Passive health still
+  records a backend failure. Plugin outbound HTTP
+  (`FERRUM_PLUGIN_HTTP_MAX_RETRIES`) retries `connection_pool_error` on
+  GET/HEAD/OPTIONS so a hyper `is_canceled` drop still replays; that
+  list is not identical to `request_reached_wire`.
+
 - **Identity-only NodeWaypoint assertion grants require ambient enrollment.**
   Kubernetes pod discovery no longer lets a same-node identity-only pod
   enter a NodeWaypoint's HBONE assertion inventory merely by sharing that
