@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`ferrum-gateway` exposes the DP stale-config fence** (issue #4438). Data
+  plane installs can set `dp.configMaxStaleSeconds` and
+  `dp.configStaleAction`, which render `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` and
+  `FERRUM_DP_CONFIG_STALE_ACTION` with the same defaults as the binary (3600 /
+  `fail_closed`). Architecture, README, FEATURES, and Kubernetes deployment docs
+  now describe the one-hour fail-closed bound when every CP is lost.
+  **BREAKING (chart)**: both variables are now reserved, so supplying them —
+  or any `_VAULT`/`_AWS`/`_AZURE`/`_GCP`/`_FILE` suffixed form — through `env:`
+  or `extraEnv:` fails template rendering. Move existing overrides to the new
+  values; see [docs/upgrade_guide.md](docs/upgrade_guide.md).
+
 ### Security
 
 - **BREAKING — HTTP/2 and HTTP/3 requests without `:authority` or Host are rejected with 400**
