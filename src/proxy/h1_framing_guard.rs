@@ -34,6 +34,10 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 pub(super) const PARSE_HINT_NONE: u8 = 0;
 pub(super) const PARSE_HINT_CONFLICTING_CONTENT_LENGTH: u8 = 1;
 pub(super) const PARSE_HINT_HTTP10_TRANSFER_ENCODING: u8 = 2;
+
+/// Request-line version token whose presence makes `Transfer-Encoding` a
+/// protocol error. Length-bound so the window width cannot drift from it.
+const HTTP_10_VERSION: &[u8] = b"HTTP/1.0";
 pub(super) const PARSE_HINT_INVALID_REQUEST_TARGET_UTF8: u8 = 3;
 
 const JSON_CONFLICTING_CONTENT_LENGTH: &str =
@@ -952,10 +956,12 @@ impl HeadScanner {
 
         if self.request_line {
             self.request_line = false;
+            // `b"HTTP/1.0"` is 8 bytes: a 9-byte window can never compare
+            // equal to it, so `windows(9)` silently made this always false.
             self.http10_request = self
                 .request_line_tail
-                .windows(9)
-                .any(|window| window.eq_ignore_ascii_case(b"HTTP/1.0"));
+                .windows(HTTP_10_VERSION.len())
+                .any(|window| window.eq_ignore_ascii_case(HTTP_10_VERSION));
             if !self.request_line_utf8.finish_ok() {
                 signals.store_parse_reject_hint(PARSE_HINT_INVALID_REQUEST_TARGET_UTF8);
             }
