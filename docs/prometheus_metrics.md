@@ -243,8 +243,10 @@ Label sets are bounded by *configuration*, never by traffic or endpoint churn:
 (`dns_lookup_error`, `connection_refused`, `tls_error`, `read_write_timeout`,
 …). When a gateway-authored 503 has no `ErrorClass`, the label is one of
 `circuit_breaker_open` / `overload` / `config_stale` / `concurrency_limit`.
-2xx/3xx/4xx omit the label, as do backend 5xx with neither a class nor a
-gateway phase. Cardinality bound is **23** compiled-in tokens.
+A backend 5xx with neither a class nor a gateway phase carries
+`backend_error`, matching its `X-Gateway-Error` header so the two can be
+joined. 2xx/3xx/4xx omit the label. Cardinality bound is **24** compiled-in
+tokens.
 
 `X-Gateway-Error` stays on the coarser seven-token header vocabulary
 (`connection_failure` / `backend_timeout` / `backend_error` plus the four

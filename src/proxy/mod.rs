@@ -24136,11 +24136,10 @@ pub(crate) fn restore_authoritative_allow_header(
 /// historical `X-Gateway-Error` casing. HTTP header names are
 /// case-insensitive either way.
 pub(crate) const X_GATEWAY_ERROR_HEADER: &str = "x-gateway-error";
-pub(crate) const X_GATEWAY_ERROR_CONNECTION_FAILURE: &str =
-    crate::retry::OBS_CONNECTION_FAILURE;
-pub(crate) const X_GATEWAY_ERROR_BACKEND_TIMEOUT: &str =
-    crate::retry::OBS_BACKEND_TIMEOUT;
-pub(crate) const X_GATEWAY_ERROR_BACKEND_ERROR: &str = crate::retry::OBS_BACKEND_ERROR;
+// The backend-path tokens (`connection_failure` / `backend_timeout` /
+// `backend_error`) have no alias here: those paths now take them straight from
+// `crate::retry::OBS_*` through `http_observability_error_class`, so a second
+// spelling would only be a place for the two to drift.
 /// Distinct from `backend_error`: the gateway never contacted a backend on
 /// this request, so reusing that bucket would make open-breaker 503s
 /// indistinguishable from a backend that actually returned 5xx.

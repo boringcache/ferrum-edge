@@ -2809,7 +2809,7 @@ fn http_observability_error_class_set_is_closed() {
     assert!(intern_http_observability_error_class("backend_down").is_none());
     assert!(intern_http_observability_error_class("connection_timeout").is_none());
     assert_eq!(ErrorClass::ALL.len(), 19);
-    assert_eq!(HTTP_METRICS_GATEWAY_ERROR_CLASSES.len(), 4);
+    assert_eq!(HTTP_METRICS_GATEWAY_ERROR_CLASSES.len(), 5);
     assert_eq!(
         ErrorClass::ALL.len() + HTTP_METRICS_GATEWAY_ERROR_CLASSES.len(),
         HTTP_METRICS_ERROR_CLASS_BOUND

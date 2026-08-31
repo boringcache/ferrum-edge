@@ -221,36 +221,36 @@ pub const HTTP_OBSERVABILITY_ERROR_CLASSES: &[&str] = &[
     OBS_CONCURRENCY_LIMIT,
 ];
 
-/// Gateway-authored `ferrum_requests_total{error_class}` tokens that have
-/// no [`ErrorClass`] variant. Combined with [`ErrorClass::ALL`] they are
-/// the closed HTTP metrics label set (bound:
-/// [`HTTP_METRICS_ERROR_CLASS_BOUND`]).
+/// `ferrum_requests_total{error_class}` tokens that have no [`ErrorClass`]
+/// variant. Four are gateway-authored rejects; `backend_error` is the
+/// fallback for a backend 5xx the gateway never classified, so that series
+/// stays selectable and agrees with its `X-Gateway-Error` header. Combined
+/// with [`ErrorClass::ALL`] they are the closed HTTP metrics label set
+/// (bound: [`HTTP_METRICS_ERROR_CLASS_BOUND`]).
 pub const HTTP_METRICS_GATEWAY_ERROR_CLASSES: &[&str] = &[
     OBS_CIRCUIT_BREAKER_OPEN,
     OBS_OVERLOAD,
     OBS_CONFIG_STALE,
     OBS_CONCURRENCY_LIMIT,
+    OBS_BACKEND_ERROR,
 ];
 
 /// Closed `ferrum_requests_total{error_class}` vocabulary.
 ///
-/// Cardinality bound: **23** = [`ErrorClass::ALL`] (19) plus the four
-/// gateway-authored tokens in [`HTTP_METRICS_GATEWAY_ERROR_CLASSES`].
+/// Cardinality bound: **24** = [`ErrorClass::ALL`] (19) plus the five
+/// tokens in [`HTTP_METRICS_GATEWAY_ERROR_CLASSES`].
 /// Values are compiled-in `&'static str` only — never an error message,
 /// never a client- or backend-influenced string. `X-Gateway-Error` stays
 /// on the coarser seven-token [`HTTP_OBSERVABILITY_ERROR_CLASSES`] set;
 /// map each granular class to its header token with
 /// [`x_gateway_error_token_for_class`].
-pub const HTTP_METRICS_ERROR_CLASS_BOUND: usize = 23;
+pub const HTTP_METRICS_ERROR_CLASS_BOUND: usize = 24;
 
 /// Map a backend-path HTTP status plus the pre-wire flag onto the closed
 /// `X-Gateway-Error` vocabulary. `None` for non-5xx without a connection
 /// failure so 2xx responses do not carry the header.
 #[inline]
-pub fn http_observability_error_class(
-    connection_error: bool,
-    status: u16,
-) -> Option<&'static str> {
+pub fn http_observability_error_class(connection_error: bool, status: u16) -> Option<&'static str> {
     if connection_error {
         Some(OBS_CONNECTION_FAILURE)
     } else if status == 504 {
@@ -341,7 +341,16 @@ pub fn http_metrics_error_class(
     if let Some(class) = error_class {
         return Some(class.as_str());
     }
-    rejection_phase.and_then(token_for_rejection_phase)
+    if let Some(token) = rejection_phase.and_then(token_for_rejection_phase) {
+        return Some(token);
+    }
+    // A backend 5xx with no `ErrorClass` and no gateway rejection phase is the
+    // most common failure there is: the request reached the origin and the
+    // origin answered. Omitting the label there would leave that series
+    // unselectable while its `X-Gateway-Error` header still says
+    // `backend_error`, which is exactly the header/metric divergence this
+    // vocabulary exists to remove.
+    Some(OBS_BACKEND_ERROR)
 }
 
 /// Access-log `error_class` for an HTTP-family summary: always the granular

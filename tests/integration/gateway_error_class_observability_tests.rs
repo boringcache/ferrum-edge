@@ -14,9 +14,8 @@ use ferrum_edge::retry::{
     ErrorClass, HTTP_METRICS_ERROR_CLASS_BOUND, HTTP_METRICS_GATEWAY_ERROR_CLASSES,
     HTTP_OBSERVABILITY_ERROR_CLASSES, OBS_BACKEND_ERROR, OBS_BACKEND_TIMEOUT,
     OBS_CIRCUIT_BREAKER_OPEN, OBS_CONCURRENCY_LIMIT, OBS_CONFIG_STALE, OBS_CONNECTION_FAILURE,
-    OBS_OVERLOAD, http_log_error_class, http_metrics_error_class,
-    intern_http_metrics_error_class, intern_http_observability_error_class,
-    x_gateway_error_token_for_class,
+    OBS_OVERLOAD, http_log_error_class, http_metrics_error_class, intern_http_metrics_error_class,
+    intern_http_observability_error_class, x_gateway_error_token_for_class,
 };
 
 fn http_summary(status: u16, class: Option<ErrorClass>, phase: Option<&str>) -> TransactionSummary {
@@ -93,10 +92,7 @@ fn header_stays_coarse_while_metrics_and_logs_stay_granular() {
         http_log_error_class(Some(ErrorClass::ConnectionRefused)),
         Some("connection_refused")
     );
-    assert_eq!(
-        refused.serialized_error_class(),
-        Some("connection_refused")
-    );
+    assert_eq!(refused.serialized_error_class(), Some("connection_refused"));
     assert_eq!(
         refused.metrics_error_class_label(),
         Some("connection_refused")
@@ -120,13 +116,16 @@ fn header_stays_coarse_while_metrics_and_logs_stay_granular() {
     assert_eq!(dns.metrics_error_class_label(), Some("dns_lookup_error"));
     registry.record(&dns);
 
-    assert!(registry.request_counter.contains_key(&counter_key(
-        502,
-        Some("connection_refused")
-    )));
-    assert!(registry
-        .request_counter
-        .contains_key(&counter_key(502, Some("dns_lookup_error"))));
+    assert!(
+        registry
+            .request_counter
+            .contains_key(&counter_key(502, Some("connection_refused")))
+    );
+    assert!(
+        registry
+            .request_counter
+            .contains_key(&counter_key(502, Some("dns_lookup_error")))
+    );
     assert!(
         !registry
             .request_counter
@@ -143,10 +142,7 @@ fn header_stays_coarse_while_metrics_and_logs_stay_granular() {
         timeout.metrics_error_class_label(),
         Some("read_write_timeout")
     );
-    assert_eq!(
-        timeout.serialized_error_class(),
-        Some("read_write_timeout")
-    );
+    assert_eq!(timeout.serialized_error_class(), Some("read_write_timeout"));
     registry.record(&timeout);
 
     let backend = http_summary(503, None, None);
@@ -154,9 +150,20 @@ fn header_stays_coarse_while_metrics_and_logs_stay_granular() {
         x_gateway_error_for_backend_failure_for_test(false, 503),
         Some(OBS_BACKEND_ERROR)
     );
-    assert_eq!(backend.metrics_error_class_label(), None);
+    // A backend 5xx the gateway never classified still carries the metrics
+    // label its header advertises, so PromQL can select the series; the
+    // access log stays granular and simply has nothing to report here.
+    assert_eq!(
+        backend.metrics_error_class_label(),
+        Some(OBS_BACKEND_ERROR)
+    );
     assert_eq!(backend.serialized_error_class(), None);
     registry.record(&backend);
+    assert!(
+        registry
+            .request_counter
+            .contains_key(&counter_key(503, Some(OBS_BACKEND_ERROR)))
+    );
 
     for (token, phase) in [
         (OBS_CIRCUIT_BREAKER_OPEN, "circuit_breaker_open"),
@@ -172,14 +179,20 @@ fn header_stays_coarse_while_metrics_and_logs_stay_granular() {
             "gateway-authored 503s with no ErrorClass omit log error_class"
         );
         registry.record(&summary);
-        assert!(registry
-            .request_counter
-            .contains_key(&counter_key(503, Some(token))));
+        assert!(
+            registry
+                .request_counter
+                .contains_key(&counter_key(503, Some(token)))
+        );
     }
 
     let ok = http_summary(200, None, None);
     registry.record(&ok);
-    assert!(registry.request_counter.contains_key(&counter_key(200, None)));
+    assert!(
+        registry
+            .request_counter
+            .contains_key(&counter_key(200, None))
+    );
     let output = registry.render_uncached();
     assert!(
         !output.contains(r#"status_code="200",error_class="#),
@@ -196,7 +209,7 @@ fn header_stays_coarse_while_metrics_and_logs_stay_granular() {
 #[test]
 fn http_metrics_cardinality_is_error_class_all_plus_four_gateway_tokens() {
     assert_eq!(HTTP_OBSERVABILITY_ERROR_CLASSES.len(), 7);
-    assert_eq!(HTTP_METRICS_GATEWAY_ERROR_CLASSES.len(), 4);
+    assert_eq!(HTTP_METRICS_GATEWAY_ERROR_CLASSES.len(), 5);
     assert_eq!(ErrorClass::ALL.len(), 19);
     assert_eq!(
         ErrorClass::ALL.len() + HTTP_METRICS_GATEWAY_ERROR_CLASSES.len(),
