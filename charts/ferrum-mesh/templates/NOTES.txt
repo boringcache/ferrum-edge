@@ -1,0 +1,31 @@
+Ferrum mesh chart "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+UDPResponseAmplificationPolicy CRD schema marker: v1alpha1-1
+  kubectl get crd udpresponseamplificationpolicies.gateway.ferrum.io \
+    -o jsonpath='{.metadata.annotations.gateway\.ferrum\.io/crd-schema-version}'
+{{- if not .Values.crds.install }}
+
+WARNING: crds.install=false — helm upgrade will NOT update
+UDPResponseAmplificationPolicy. Apply templates/crds-udpresponseamplificationpolicy.yaml
+with kubectl apply --server-side if the live annotation is not v1alpha1-1.
+{{- end }}
+
+{{- if .Values.injector.enabled }}
+{{- $cm := .Values.injector.certManager | default dict }}
+{{- $injectFrom := index $cm "injectCaFrom" | default "" | toString | trim }}
+
+Injector webhook is enabled (failurePolicy={{ .Values.injector.failurePolicy }}).
+{{- if $injectFrom }}
+  cert-manager.io/inject-ca-from={{ $injectFrom }}
+{{- else }}
+  clientConfig.caBundle is set from injector.caBundle
+{{- end }}
+{{- end }}
+
+Existing clusters that installed the CRD from the former crds/ directory must
+adopt it once before the first upgrade:
+
+  helm upgrade {{ .Release.Name }} ./charts/ferrum-mesh -n {{ .Release.Namespace }} \
+    --take-ownership --set crds.adoptExisting=true
+
+Docs: docs/kubernetes_deployment.md and docs/upgrade_guide.md

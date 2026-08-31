@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **BREAKING — Enabled mesh injector cannot render an unauthenticatable fail-closed webhook**
+  (issue #4433). `injector.enabled=true` still defaults to `failurePolicy: Fail`,
+  but Helm now requires exactly one trust source: `injector.caBundle` (base64
+  PEM) or `injector.certManager.injectCaFrom` (`cert-manager.io/inject-ca-from`).
+  Neither, both, or a non-PEM `caBundle` fail render with an actionable message.
+  The chart never changes `failurePolicy` to `Ignore` to make a broken webhook
+  render. **Operator action:** set `injector.caBundle` or
+  `injector.certManager.injectCaFrom` before enabling the injector.
+
 - **`request_mirror` denies cross-origin query credentials by default**
   (issue #4295). Sensitive query pairs (`access_token`, `api_key`,
   delimiter-bounded `token`/`sig`/`signature` including `oauth_token` and
@@ -52,6 +61,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `libz.so.1`.
 
 ### Changed
+
+- **BREAKING — Ferrum-owned UDP policy CRD upgrades with the mesh chart**
+  (issue #4443). `UDPResponseAmplificationPolicy` moved from Helm's install-once
+  `charts/ferrum-mesh/crds/` directory to
+  `templates/crds-udpresponseamplificationpolicy.yaml` behind `crds.install`
+  (default `true`). `helm upgrade` now applies schema changes. The CRD is stamped
+  with `gateway.ferrum.io/crd-schema-version: v1alpha1-1`; compare that live
+  annotation to `crds.udpResponseAmplificationPolicy.schemaVersion`. Uninstall
+  keeps the CRD (`helm.sh/resource-policy: keep`). `crds.install=false` fails
+  render unless `crds.skipInstallAcknowledged=true`. **Operator action (existing
+  clusters that already have this CRD from `crds/`):** adopt it once with
+  `helm upgrade --take-ownership --set crds.adoptExisting=true`. Do not set
+  `crds.install=false` to skip the error — that leaves the cluster on a stale
+  schema.
 
 - **BREAKING — `FERRUM_TLS_OFFLOAD_THREADS` nonzero values fail startup**
   (issue #4294). TLS handshake offload is not implemented; a nonzero setting
