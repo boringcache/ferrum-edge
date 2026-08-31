@@ -97,6 +97,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **BREAKING — backend mTLS handshake without a client certificate is
+  `tls_error`, not `connection_reset`** (issue #4406). An HTTPS origin that
+  requires a client certificate (`CertificateRequired` / `HandshakeFailure`
+  / other typed rustls handshake variants) previously classified as
+  post-wire `connection_reset` because reqwest's `is_connect()` is
+  TCP-only. The handshake never reached HTTP. It is now `tls_error`
+  (pre-wire). Connect-phase RST/refused with no rustls still collapses to
+  `connection_refused`. Mid-stream RST with no handshake rustls stays
+  `connection_reset`. Omitted `close_notify` stays `connection_closed`
+  (#4051). HTTPS-to-plaintext stays `tls_error` (#4053). **Operator
+  action**: retarget alerts that grepped `error_class=connection_reset` or
+  `X-Gateway-Error: backend_error` for this misconfig onto `tls_error` /
+  `connection_failure`. `retry_on_connect_failure` now replays the request
+  regardless of method (nothing reached the origin application). The
+  circuit breaker charges the **connect-error** path
+  (`trip_on_connection_errors`, default on) instead of the 502-status /
+  post-wire reset path; operators who set
+  `trip_on_connection_errors: false` will no longer trip on this handshake
+  via a 502 in `failure_status_codes`. Passive health still records a
+  backend failure.
+
 - **Injector inbound capture excludes kubelet HTTP and TCP probe ports**
   (issue #4431). `startupProbe` / `readinessProbe` / `livenessProbe` `httpGet`
   and `tcpSocket` ports on every container in the pod are unioned into the
