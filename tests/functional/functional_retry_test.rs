@@ -706,8 +706,7 @@ async fn retry_on_connect_failure_fires_with_empty_methods_and_statuses() {
     // connect attempt and parallel tests cannot steal the port while this
     // reservation is held (unlike reserve+drop, which let another gateway's
     // admin listener occupy the backend port and return 401 through the proxy).
-    let dead_port_reservation =
-        reserve_refused_tcp_port().expect("reserve refused backend port");
+    let dead_port_reservation = reserve_refused_tcp_port().expect("reserve refused backend port");
     let backend_port = dead_port_reservation.port;
 
     let yaml = http_with_retry(
