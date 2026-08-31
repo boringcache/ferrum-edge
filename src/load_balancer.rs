@@ -4150,7 +4150,7 @@ impl LoadBalancer {
             if let Some(ref ps) = h.proxy_passive
                 && let Some(entry) = ps.unhealthy.get(&self.host_port_keys[i])
             {
-                passive_ejected.push((i, entry.ejected_at_ms));
+                passive_ejected.push((i, entry.ejected_at_tick_ms));
                 continue;
             }
             bitset.set(i);
@@ -4206,7 +4206,7 @@ impl LoadBalancer {
             if let Some(ref ps) = h.proxy_passive
                 && let Some(entry) = ps.unhealthy.get(&self.host_port_keys[i])
             {
-                passive_ejected.push((i, entry.ejected_at_ms));
+                passive_ejected.push((i, entry.ejected_at_tick_ms));
                 continue;
             }
             bitset.set(i);
@@ -4264,7 +4264,7 @@ impl LoadBalancer {
             if let Some(ref ps) = h.proxy_passive
                 && let Some(entry) = ps.unhealthy.get(&self.host_port_keys[i])
             {
-                passive_ejected.push((i, entry.ejected_at_ms));
+                passive_ejected.push((i, entry.ejected_at_tick_ms));
                 return;
             }
             bitset.set(i);
@@ -4310,7 +4310,7 @@ impl LoadBalancer {
             if let Some(ref ps) = h.proxy_passive
                 && let Some(entry) = ps.unhealthy.get(&self.host_port_keys[i])
             {
-                passive_ejected.push((i, entry.ejected_at_ms));
+                passive_ejected.push((i, entry.ejected_at_tick_ms));
                 continue;
             }
             healthy.push((i, target));
@@ -4364,7 +4364,7 @@ impl LoadBalancer {
             if let Some(ref ps) = h.proxy_passive
                 && let Some(entry) = ps.unhealthy.get(&self.host_port_keys[i])
             {
-                passive_ejected.push((i, entry.ejected_at_ms));
+                passive_ejected.push((i, entry.ejected_at_tick_ms));
                 continue;
             }
             healthy.push((i, target));

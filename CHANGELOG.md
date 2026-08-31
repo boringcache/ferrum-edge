@@ -41,6 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Circuit-breaker OPEN timeouts and passive-health failure/ejection windows now
+  use process-monotonic time, so NTP corrections and VM wall-clock jumps cannot
+  freeze protection or release a backend early (issue #4436). Operator-facing
+  ejection timestamps remain Unix epoch milliseconds.
+
 - **Injector inbound capture excludes kubelet HTTP and TCP probe ports**
   (issue #4431). `startupProbe` / `readinessProbe` / `livenessProbe` `httpGet`
   and `tcpSocket` ports on every container in the pod are unioned into the
