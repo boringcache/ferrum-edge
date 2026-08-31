@@ -7,9 +7,9 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::task::{Context, Poll, ready};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -128,10 +128,9 @@ impl<T> H1ParseErrorEnvelopeIo<T> {
             return Poll::Ready(Ok(()));
         };
         while this.substitute_offset < substitute.len() {
-            let wrote = ready!(Pin::new(&mut this.inner).poll_write(
-                cx,
-                &substitute[this.substitute_offset..],
-            )?);
+            let wrote = ready!(
+                Pin::new(&mut this.inner).poll_write(cx, &substitute[this.substitute_offset..],)?
+            );
             if wrote == 0 {
                 return Poll::Pending;
             }
@@ -146,7 +145,10 @@ impl<T> H1ParseErrorEnvelopeIo<T> {
         if self.pending_substitute.is_some() {
             return;
         }
-        let Some(headers_end) = self.capture.windows(4).position(|window| window == b"\r\n\r\n")
+        let Some(headers_end) = self
+            .capture
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
         else {
             return;
         };
