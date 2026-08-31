@@ -10,8 +10,8 @@ use bytes::Bytes;
 use ferrum_edge::backend_conn_limit::BackendConnectionLimiter;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, H2UpgradePolicy,
-    Proxy, ResolvedPortOverride,
+    AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, H2UpgradePolicy, Proxy,
+    ResolvedPortOverride,
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::grpc_proxy::GrpcConnectionPool;
@@ -1677,12 +1677,7 @@ fn direct_h2_outbound_host_matches_authority_including_non_default_port() {
         None,
         "[::1]:8443",
     );
-    assert_outbound_h2_host_matches_authority(
-        "https://[::1]:443/h2tls",
-        false,
-        None,
-        "[::1]",
-    );
+    assert_outbound_h2_host_matches_authority("https://[::1]:443/h2tls", false, None, "[::1]");
     assert_outbound_h2_host_matches_authority(
         "https://127.0.0.1:21212/h2tls",
         true,
@@ -1778,9 +1773,7 @@ async fn start_direct_h2_test_gateway(
                     .max_header_list_size(state.max_header_size_bytes as u32);
                 let svc = service_fn(move |req: Request<Incoming>| {
                     let state = state.clone();
-                    async move {
-                        handle_proxy_request(req, state, remote_addr, false, None, None).await
-                    }
+                    async move { handle_proxy_request(req, state, remote_addr, false, None, None).await }
                 });
                 let _ = builder.serve_connection_with_upgrades(io, svc).await;
             });
@@ -1815,8 +1808,8 @@ async fn direct_h2_backend_sees_matching_host_and_authority_on_non_default_port(
         loaded_at: chrono::Utc::now(),
         ..Default::default()
     };
-    let (state, _health_handles) = ProxyState::new(config, dns_cache, env_config, None, None)
-        .expect("proxy state");
+    let (state, _health_handles) =
+        ProxyState::new(config, dns_cache, env_config, None, None).expect("proxy state");
     let (gateway_addr, _gateway_handle) = start_direct_h2_test_gateway(state).await;
 
     let stream = tokio::net::TcpStream::connect(gateway_addr)
@@ -1837,7 +1830,10 @@ async fn direct_h2_backend_sees_matching_host_and_authority_on_non_default_port(
         .header("host", "client.example:9000")
         .body(Full::new(Bytes::new()))
         .expect("request");
-    let response = sender.send_request(request).await.expect("gateway response");
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("gateway response");
     assert_eq!(response.status(), 200, "direct-H2 dispatch should succeed");
     let headers = response.headers();
     assert_eq!(

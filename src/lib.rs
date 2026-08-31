@@ -143,11 +143,7 @@ pub mod _test_support {
             );
         }
         crate::proxy::apply_outbound_h2_host(&mut headers, &mut uri, preserve_host_header);
-        let host = headers
-            .get(hyper::header::HOST)?
-            .to_str()
-            .ok()?
-            .to_string();
+        let host = headers.get(hyper::header::HOST)?.to_str().ok()?.to_string();
         let authority = uri.authority()?.as_str().to_string();
         Some((host, authority))
     }

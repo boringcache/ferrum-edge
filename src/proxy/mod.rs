@@ -51687,7 +51687,11 @@ async fn proxy_to_backend_http2(
         grpc_proxy::apply_remaining_grpc_timeout_header(&mut parts.headers, deadline);
     }
 
-    apply_outbound_h2_host(&mut parts.headers, &mut parts.uri, proxy.preserve_host_header);
+    apply_outbound_h2_host(
+        &mut parts.headers,
+        &mut parts.uri,
+        proxy.preserve_host_header,
+    );
 
     let backend_req = Request::from_parts(parts, body);
 
