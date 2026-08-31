@@ -41,6 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Injector inbound capture excludes kubelet HTTP and TCP probe ports**
+  (issue #4431). `startupProbe` / `readinessProbe` / `livenessProbe` `httpGet`
+  and `tcpSocket` ports on every container in the pod are unioned into the
+  inbound exclusion set (named ports resolve against that container's
+  `ports`). `exec` and `grpc` probes are skipped. Unresolved named ports fail
+  admission rather than leaving the probe captured. Explicit
+  `excludeInboundPorts` annotations and `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS`
+  still win.
 - **Gateway-authored HTTP 503s now set `X-Gateway-Error`** (issues #4396,
   #4399). The DP stale-config fence (`config_stale`), overload/drain
   `reject_new_requests` (`overload`), and `adaptive_concurrency` admission
@@ -77,6 +85,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING — injected Ferrum is a Kubernetes native sidecar**
+  (issue #4430). The webhook now emits `ferrum-edge` under `spec.initContainers`
+  with `restartPolicy: Always`, plus exec startup and readiness probes against
+  loopback `/health` (not `/live`). Capture rules (`ferrum-edge-init`) run
+  after that startup probe succeeds, so application traffic is not redirected
+  at a proxy that is not listening, and injected Jobs can complete. **Minimum
+  Kubernetes version is 1.29** (native sidecars enabled by default; 1.28
+  requires the `SidecarContainers` feature gate). There is no
+  ordinary-container fallback. **Operator action**: run the injector only on
+  Kubernetes 1.29+ (or 1.28 with the feature gate), then roll injected
+  workloads so new pods pick up the native-sidecar shape; pods that still
+  carry Ferrum in `spec.containers` must be recreated.
 - **BREAKING — HTTP 5xx access-log `error_class` matches `X-Gateway-Error`**
   (issue #4397). A 502 from `ConnectionRefused` now logs
   `error_class=connection_failure` (the same token as the header and as
@@ -111,6 +131,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   controller, migrate to `charts/ferrum-mesh` (`controlPlane.enabled=true`).
   Database-backed CP+DP pairs need no change; the documented
   `examples/cp-values.yaml` quickstart now matches the chart's grant surface.
+
+- **BREAKING — Ambient pod-registry migration proofs and publication use one
+  canonical strict grammar** (issue #4249). Durable UDP placement cleanup now
+  reads `PodCaptureSource::list_complete_targets`, the same bounded, all-or-
+  nothing snapshot used by the inbound HBONE relay node bound. A registry leaf
+  that disappears between enumeration and open is skipped as a withdrawn pod,
+  but a present malformed `spiffe_id=` / `ipv4=` / `ipv6=` value, duplicate
+  recognized key, unknown non-empty line, unsafe leaf name, symlink, oversized
+  or non-regular file, ownership mismatch, or other read failure reports
+  `registry_not_synchronized`; several of those body shapes were previously
+  tolerated by migration cleanup. The node-agent writer now applies the same
+  canonical leaf grammar (non-empty, at most 256 bytes, ASCII alphanumeric
+  first, then ASCII alphanumeric / `-` / `_`) before publishing. **Operator
+  action**: before an Ambient UDP placement migration, remove stale hand-
+  authored registry artifacts and let the node-agent regenerate every pod
+  entry; do not publish custom leaf names or body lines outside the documented
+  grammar.
 
 - **BREAKING — `FERRUM_TLS_OFFLOAD_THREADS` nonzero values fail startup**
   (issue #4294). TLS handshake offload is not implemented; a nonzero setting

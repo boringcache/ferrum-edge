@@ -6,6 +6,14 @@ This document describes how to safely upgrade Ferrum Edge between versions with 
 
 Every current `[Unreleased]` `BREAKING` changelog entry is listed here exactly once, with its issue number and the operator action that entry already states. Several of these fail **silently** at cutover (HMAC clients get `401`, WAF `literal` rules stop matching folded spellings, backends stop seeing client-supplied XFF hops) rather than refusing config load. Read this section before the per-mode procedures below.
 
+### Injected Ferrum is a Kubernetes native sidecar (issue [#4430](https://github.com/ferrum-edge/ferrum-edge/issues/4430))
+
+The injector no longer appends Ferrum as an ordinary `spec.containers` entry. New pods receive a native sidecar (`spec.initContainers` with `restartPolicy: Always`) and exec probes against loopback `/health`. That is also what unblocks Kubernetes Job completion. **Minimum Kubernetes version is 1.29** (native sidecars enabled by default; 1.28 needs `SidecarContainers=true`). There is no ordinary-container fallback: the webhook always emits the native-sidecar shape, and a cluster older than that will reject the patched Pod.
+
+HTTP `httpGet` and TCP `tcpSocket` kubelet probe ports are now inbound-excluded automatically (issue [#4431](https://github.com/ferrum-edge/ferrum-edge/issues/4431)); unresolved named probe ports fail admission.
+
+**Operator action:** run the injector only on Kubernetes 1.29+ (or 1.28 with the `SidecarContainers` feature gate), then roll every injected Deployment/StatefulSet/DaemonSet/Job so replacement pods receive the new shape. Pods that still carry `ferrum-edge` in `spec.containers` will be refused on re-admission until they are recreated.
+
 ### `ferrum-gateway` `mode=cp` no longer starts the in-cluster K8s controller (issue [#4384](https://github.com/ferrum-edge/ferrum-edge/issues/4384))
 
 The `ferrum-edge` binary defaults `FERRUM_K8S_CONTROLLER_ENABLED` and
@@ -33,6 +41,23 @@ RFC 9113 §8.3.1 and RFC 9114 §4.3.1 require either `:authority` or Host. Ferru
 
 **Operator action:** any HTTP/2 or HTTP/3 client that omitted both `:authority` and Host will start seeing `400` `{"error":"Request is missing both :authority and Host"}` instead of being routed. Send `:authority` or Host.
 
+### Ambient pod-registry migration proofs require canonical entries (issue [#4249](https://github.com/ferrum-edge/ferrum-edge/issues/4249))
+
+Durable Ambient UDP placement cleanup now reads the same strict, bounded,
+all-or-nothing pod-registry snapshot as the inbound HBONE relay node bound. A
+leaf that disappears between directory enumeration and open is treated as an
+ordinary pod withdrawal and skipped. Any present malformed optional field,
+duplicate recognized key, unknown non-empty line, unsafe leaf name, symlink,
+oversized or non-regular file, ownership mismatch, or other read failure makes
+the cleanup pass report `registry_not_synchronized`; several malformed body
+shapes were previously tolerated. The node-agent publisher also refuses leaf
+names outside the canonical grammar: non-empty, at most 256 bytes, ASCII
+alphanumeric first, then ASCII alphanumeric, hyphen, or underscore.
+
+**Operator action:** before starting an Ambient UDP placement migration, remove
+stale hand-authored pod-registry artifacts and let the node-agent regenerate
+every pod entry. Any external publisher must use only the documented leaf and
+body grammar; otherwise cleanup/finalize remains fail-closed.
 ### HTTP 5xx log `error_class` matches `X-Gateway-Error` (issue [#4397](https://github.com/ferrum-edge/ferrum-edge/issues/4397))
 
 HTTP-family 5xx access logs now emit the closed `X-Gateway-Error` token
