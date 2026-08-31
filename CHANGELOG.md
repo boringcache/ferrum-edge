@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subscribers as well as ADS; set finite values (or the explicit unsafe
   override) before upgrading a production control plane that previously relied
   on unbounded `0` limits.
+  A ConfigSync or MeshSubscribe recovery snapshot that cannot be prepared or
+  serialized now ends the stream with an `INTERNAL` status instead of silently
+  skipping that snapshot, so the data plane reconnects (and its permit is
+  released) rather than serving on with configuration the control plane could
+  not produce. A data plane that keeps failing recovery still reaches its
+  `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` fence.
 
 - **BREAKING — HTTP/2 and HTTP/3 requests without `:authority` or Host are rejected with 400**
   (issue #4416). RFC 9113 §8.3.1 and RFC 9114 §4.3.1 require a request to
