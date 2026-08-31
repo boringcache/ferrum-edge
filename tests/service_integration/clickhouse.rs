@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use ferrum_edge::plugins::api_chargeback_sink::{
-    ApiChargebackSink, ChargeEvent, compile_charge_event_projection,
-    serialize_json_each_row, serialize_json_each_row_projected,
+    ApiChargebackSink, ChargeEvent, compile_charge_event_projection, serialize_json_each_row,
+    serialize_json_each_row_projected,
 };
 use ferrum_edge::plugins::{
     Plugin, PluginHttpClient, StreamTransactionSummary, TransactionSummary,
@@ -54,9 +54,7 @@ async fn start_clickhouse_container(
             Ok(container) => return Ok(container),
             Err(error) => {
                 if is_host_port_collision(&error.to_string()) {
-                    return Err(
-                        format!("ClickHouse container start failed: {error}").into(),
-                    );
+                    return Err(format!("ClickHouse container start failed: {error}").into());
                 }
                 if attempt == START_ATTEMPTS {
                     return Err(format!(
@@ -77,10 +75,7 @@ async fn start_clickhouse_container(
     Err("ClickHouse container start retry loop did not execute".into())
 }
 
-async fn wait_clickhouse_ready(
-    client: &reqwest::Client,
-    url: &str,
-) -> Result<(), BoxError> {
+async fn wait_clickhouse_ready(client: &reqwest::Client, url: &str) -> Result<(), BoxError> {
     let ping = format!("{url}/ping");
     let mut last_error = String::new();
     for _ in 0..90 {

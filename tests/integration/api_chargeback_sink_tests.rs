@@ -594,19 +594,13 @@ fn charges_raw_ddl_declares_twenty_six_physical_columns() {
 #[test]
 fn fully_populated_native_jsoneachrow_matches_charges_raw_columns() {
     let row = serialize_row(&fully_populated_event());
-    assert_wire_contract(
-        &row,
-        "fully populated native ChargeEvent",
-    );
+    assert_wire_contract(&row, "fully populated native ChargeEvent");
 }
 
 #[test]
 fn identity_projection_jsoneachrow_matches_charges_raw_columns() {
     let row = projected_row(identity_schema(), &fully_populated_event());
-    assert_wire_contract(
-        &row,
-        "identity (order-only) charge-event projection",
-    );
+    assert_wire_contract(&row, "identity (order-only) charge-event projection");
 }
 
 #[test]
@@ -671,10 +665,7 @@ fn wire_contract_names_emitted_key_without_column() {
 
 #[test]
 fn wire_contract_names_column_without_emitted_key() {
-    let row = projected_row(
-        json!({ "omit": ["node_id"] }),
-        &fully_populated_event(),
-    );
+    let row = projected_row(json!({ "omit": ["node_id"] }), &fully_populated_event());
     let object = row.as_object().expect("projected row must be an object");
     let columns = parse_charges_raw_columns(CHARGES_RAW_DDL);
     let errors = wire_contract_errors(object, &columns);
@@ -722,17 +713,10 @@ fn wire_contract_rejects_string_against_uint64() {
         .find(|(name, _)| name == "call_count")
         .map(|(_, declared)| declared.as_str())
         .expect("call_count column");
-    let error = type_mismatch(
-        "call_count",
-        JsonValueKind::String,
-        call_count,
-        &json!("1"),
-    )
-    .expect("string vs UInt64 must be a contradiction");
+    let error = type_mismatch("call_count", JsonValueKind::String, call_count, &json!("1"))
+        .expect("string vs UInt64 must be a contradiction");
     assert!(
-        error.contains("call_count")
-            && error.contains("string")
-            && error.contains("UInt64"),
+        error.contains("call_count") && error.contains("string") && error.contains("UInt64"),
         "type mismatch must name field and column type, got {error}"
     );
 }
