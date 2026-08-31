@@ -4006,8 +4006,7 @@ impl Default for EnvConfig {
             tls_curves: None,
             tls_session_cache_size: 4096,
             tls_max_material_size_bytes: DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES,
-            tls_source_max_blocking_concurrency:
-                DEFAULT_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY,
+            tls_source_max_blocking_concurrency: DEFAULT_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY,
             tls_source_load_timeout_seconds: DEFAULT_TLS_SOURCE_LOAD_TIMEOUT_SECONDS,
             service_discovery_max_response_body_bytes:
                 DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES,

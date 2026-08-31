@@ -125,7 +125,10 @@ fn stream_listener_material_preparation_precedes_lock_without_await_in_critical_
     let lock = reconcile
         .find(lock_text)
         .expect("reconciliation listener-map lock");
-    assert!(preparation < lock, "TLS preparation must precede the listener-map lock");
+    assert!(
+        preparation < lock,
+        "TLS preparation must precede the listener-map lock"
+    );
 
     let after_lock = &reconcile[lock + lock_text.len()..];
     let drop = after_lock

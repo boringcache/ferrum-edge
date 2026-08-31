@@ -17,8 +17,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
-use tokio::sync::Semaphore;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use zeroize::Zeroizing;
 
 /// Immutable process snapshot of the validated TLS material byte ceiling.
@@ -786,8 +786,7 @@ impl TlsSourceExecutor {
         {
             return Err(MaterialError::InvalidSource {
                 source_id: "tls-source-executor".to_string(),
-                details: "TLS source execution policy is outside the supported bounds"
-                    .to_string(),
+                details: "TLS source execution policy is outside the supported bounds".to_string(),
             });
         }
         Ok(Self {
@@ -822,13 +821,11 @@ impl TlsSourceExecutor {
         F: FnOnce() -> Result<T, E> + Send + 'static,
     {
         let deadline = tokio::time::Instant::now() + self.deadline;
-        let permit = tokio::time::timeout_at(
-            deadline,
-            Arc::clone(&self.blocking_limit).acquire_owned(),
-        )
-        .await
-        .map_err(|_| MaterialError::DeadlineExceeded)?
-        .map_err(|_| MaterialError::ExecutorUnavailable)?;
+        let permit =
+            tokio::time::timeout_at(deadline, Arc::clone(&self.blocking_limit).acquire_owned())
+                .await
+                .map_err(|_| MaterialError::DeadlineExceeded)?
+                .map_err(|_| MaterialError::ExecutorUnavailable)?;
         let task = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             operation()
@@ -882,9 +879,8 @@ pub fn install_tls_source_execution_policy(
                 } else {
                     Err(MaterialError::InvalidSource {
                         source_id: "tls-source-executor".to_string(),
-                        details:
-                            "TLS source execution policy install raced with a different value"
-                                .to_string(),
+                        details: "TLS source execution policy install raced with a different value"
+                            .to_string(),
                     })
                 }
             }
@@ -956,9 +952,7 @@ pub async fn load_material_with(
 ) -> Result<MaterializedMaterial, MaterialError> {
     let source = source.clone();
     effective_tls_source_executor()?
-        .run_blocking(move || {
-            load_material_blocking_with(&source, fallback_kind, max_bytes)
-        })
+        .run_blocking(move || load_material_blocking_with(&source, fallback_kind, max_bytes))
         .await
 }
 

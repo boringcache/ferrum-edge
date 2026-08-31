@@ -459,11 +459,8 @@ impl BackendTlsReloadKey {
             verify_server_cert: proxy.resolved_tls.verify_server_cert,
             server_ca_cert: match server_ca_cert_source {
                 Some(source) => Some(
-                    BackendTlsMaterialReloadKey::from_source_value(
-                        source,
-                        MaterialKind::CaBundle,
-                    )
-                    .await,
+                    BackendTlsMaterialReloadKey::from_source_value(source, MaterialKind::CaBundle)
+                        .await,
                 ),
                 None => None,
             },
@@ -476,8 +473,7 @@ impl BackendTlsReloadKey {
             },
             client_key: match proxy.resolved_tls.client_key_path.as_deref() {
                 Some(source) => Some(
-                    BackendTlsMaterialReloadKey::from_source_value(source, MaterialKind::Key)
-                        .await,
+                    BackendTlsMaterialReloadKey::from_source_value(source, MaterialKind::Key).await,
                 ),
                 None => None,
             },
@@ -2331,8 +2327,7 @@ impl StreamListenerManager {
                         .node_waypoint_udp_destination_routes
                         .iter()
                         .any(|route| {
-                            route.proxy.namespace == proxy.namespace
-                                && route.proxy.id == proxy.id
+                            route.proxy.namespace == proxy.namespace && route.proxy.id == proxy.id
                         }),
                     udp_amplification_factor_bits: proxy
                         .udp_max_response_amplification_factor
@@ -3851,11 +3846,7 @@ impl StreamListenerManager {
     /// new listener, so an invalid config never installs a listener that
     /// would fail every backend handshake. Returns the message to surface in
     /// `bind_failures` on failure.
-    async fn prepare_backend_tls_config(
-        &self,
-        proxy: &Proxy,
-        port: u16,
-    ) -> Result<(), String> {
+    async fn prepare_backend_tls_config(&self, proxy: &Proxy, port: u16) -> Result<(), String> {
         let proxy = proxy.clone();
         let tls_no_verify = self.tls_no_verify;
         let tls_ca_bundle_path = self.tls_ca_bundle_path.clone();

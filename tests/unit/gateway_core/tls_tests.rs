@@ -118,8 +118,7 @@ fn tls_source_execution_policy_defaults_and_bounds_are_fail_closed() {
             DEFAULT_TLS_SOURCE_LOAD_TIMEOUT_SECONDS,
         )
     );
-    let hard_max = parse_tls_source_execution_policy(Some("256"), Some("5"))
-        .expect("hard maxima");
+    let hard_max = parse_tls_source_execution_policy(Some("256"), Some("5")).expect("hard maxima");
     assert_eq!(
         hard_max,
         (
@@ -1109,18 +1108,16 @@ async fn stalled_tls_source_work_does_not_stall_tokio_heartbeat() {
     let operation = tokio::spawn(async move {
         executor
             .run_blocking(move || {
-                started_tx.send(()).map_err(|_| {
-                    ferrum_edge::tls::source::MaterialError::ExecutorUnavailable
-                })?;
+                started_tx
+                    .send(())
+                    .map_err(|_| ferrum_edge::tls::source::MaterialError::ExecutorUnavailable)?;
                 let (lock, condition) = &*operation_release;
-                let ready = lock.lock().map_err(|_| {
-                    ferrum_edge::tls::source::MaterialError::ExecutorUnavailable
-                })?;
+                let ready = lock
+                    .lock()
+                    .map_err(|_| ferrum_edge::tls::source::MaterialError::ExecutorUnavailable)?;
                 let _ready = condition
                     .wait_while(ready, |ready| !*ready)
-                    .map_err(|_| {
-                        ferrum_edge::tls::source::MaterialError::ExecutorUnavailable
-                    })?;
+                    .map_err(|_| ferrum_edge::tls::source::MaterialError::ExecutorUnavailable)?;
                 Ok(())
             })
             .await
@@ -1156,7 +1153,9 @@ async fn tls_source_executor_bounds_admission_and_deadline() {
             .run_blocking(move || {
                 let _ = started_tx.send(());
                 let (lock, condition) = &*operation_release;
-                let ready = lock.lock().map_err(|_| MaterialError::ExecutorUnavailable)?;
+                let ready = lock
+                    .lock()
+                    .map_err(|_| MaterialError::ExecutorUnavailable)?;
                 let _ready = condition
                     .wait_while(ready, |ready| !*ready)
                     .map_err(|_| MaterialError::ExecutorUnavailable)?;

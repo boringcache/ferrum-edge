@@ -683,13 +683,7 @@ pub async fn run_gateway_svid_source_rotation_loop(
                 record_refresh_for_entries(GATEWAY_SVID_SURFACE, &report.refreshed, "unchanged");
             }
             GatewaySvidPollOutcome::Changed => {
-                reload_and_publish(
-                    &sources,
-                    &mut tracker,
-                    publish.as_ref(),
-                    &mut reporter,
-                )
-                .await;
+                reload_and_publish(&sources, &mut tracker, publish.as_ref(), &mut reporter).await;
             }
         }
 
@@ -778,10 +772,7 @@ impl FailureReporter {
 fn note_recovery(reporter: &mut FailureReporter, sources: &GatewaySvidSourceSet) {
     let (had_unavailable, had_rebuild) = reporter.clear();
     if had_unavailable {
-        crate::tls::events::record_load_recovery(
-            GATEWAY_SVID_SURFACE,
-            sources.watched_sources(),
-        );
+        crate::tls::events::record_load_recovery(GATEWAY_SVID_SURFACE, sources.watched_sources());
     }
     if had_unavailable || had_rebuild {
         info!("Gateway SVID source watcher recovered source access");
@@ -830,7 +821,7 @@ fn record_source_failures(
 async fn reload_and_publish(
     sources: &GatewaySvidSourceSet,
     tracker: &mut GatewaySvidSourceTracker,
-    publish: &dyn Fn(SvidBundle) -> u64,
+    publish: &(dyn Fn(SvidBundle) -> u64 + Send + Sync),
     reporter: &mut FailureReporter,
 ) {
     let entries = tracker.current_fingerprints().unwrap_or_default();
