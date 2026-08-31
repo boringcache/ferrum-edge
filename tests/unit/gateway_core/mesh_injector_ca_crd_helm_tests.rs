@@ -237,8 +237,7 @@ fn docs_name_operator_action_for_crd_adoption_and_injector_ca() {
     );
     let deploy = read_repo("docs/kubernetes_deployment.md");
     assert!(
-        deploy.contains("crds.install")
-            && deploy.contains("gateway.ferrum.io/crd-schema-version"),
+        deploy.contains("crds.install") && deploy.contains("gateway.ferrum.io/crd-schema-version"),
         "deployment docs must describe the CRD upgrade path and schema marker"
     );
     assert!(
