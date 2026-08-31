@@ -17,13 +17,13 @@ Every classifier funnels its result into [`crate::retry::ErrorClass`](../src/ret
 | `ConnectionReset` | Mid-stream RST received after the connection was established **and** (for TLS) after the handshake completed. A handshake-phase reset that carries a typed rustls handshake/alert/certificate error is `TlsError`, not this class. An origin that RSTs during handshake with **no** rustls error in the chain is indistinguishable from a mid-stream RST and stays here. | `true` (post-wire) |
 | `ConnectionClosed` | Peer sent FIN before a response was completed; broken pipe; aborted connection; post-connect `UnexpectedEof` / hyper incomplete message (truncated HTTP body). | `true` (post-wire) |
 | `DnsLookupError` | Hostname could not be resolved. | `false` (pre-wire) |
-| `TlsError` | TLS or DTLS handshake failed (certificate, ALPN, handshake alert, rustls error under an `io::Error` after TCP connected). Includes a backend that requires a client certificate when the gateway presents none (issue #4406). Missing `close_notify` is teardown, not this class. | `false` (pre-wire) |
+| `TlsError` | TLS or DTLS handshake failed (certificate, ALPN, handshake alert, rustls error under an `io::Error` after TCP connected) **when a typed `rustls::Error` is in the chain**. Missing `close_notify` is teardown, not this class. | `false` (pre-wire) |
 | `ReadWriteTimeout` | Backend read or write exceeded the per-direction watermark. | `true` (post-wire) |
 | `ProtocolError` | HTTP/2 or HTTP/3 protocol-level error after a stream is opened (stream reset, GOAWAY, RST_STREAM), or RFC 6455 WebSocket protocol violation. NOTE: gRPC h2c handshake failure classifies as `ConnectionRefused` (pre-wire), NOT `ProtocolError` — see the gRPC kind table below. | `true` (post-wire) |
 | `ResponseBodyTooLarge` | Backend response exceeded the configured maximum size. | `true` (post-wire) |
 | `GatewayBufferCapacity` | The gateway's process-wide budget for *retained* (buffered) response bodies could not admit this response (`FERRUM_RESPONSE_BUFFER_MAX_TOTAL_BYTES`). The backend answered correctly and within every per-response ceiling, so this is gateway-local transient capacity, not a backend fault: it is non-retryable and backend-health-neutral (`client_side_no_backend_signal`), and surfaces as HTTP `503` / gRPC `RESOURCE_EXHAUSTED`. | `true` (gateway-local terminal) |
 | `RequestBodyTooLarge` | Request body exceeded the configured maximum size. | `true` (post-wire) |
-| `ConnectionPoolError` | Could not acquire or create an HTTP client from the pool. | `false` (pre-wire) |
+| `ConnectionPoolError` | Could not acquire or create an HTTP client from the pool. Also the reqwest/HTTP/1 mapping of hyper `is_canceled()` (the request was never dispatched — issue #3578). A backend that requires a client certificate can land here on the reqwest path when rustls is not in the request chain (issue #4406). | `false` (pre-wire) |
 | `PortExhaustion` | EADDRNOTAVAIL — all ephemeral ports in use. | `false` (pre-wire) |
 | `ClientDisconnect` | Client gave up before the gateway could complete the response. | `true` (post-wire) |
 | `GracefulRemoteClose` | Peer closed the session cleanly: HTTP/3 `H3_NO_ERROR`/GOAWAY at the response read boundary, or RFC 6455 Close frame on a WebSocket. Excluded from H3 capability downgrades so a backend that closes after every response stays on H3. | `true` (post-wire) |
@@ -37,21 +37,22 @@ Two helpers live with the enum:
 - [`request_reached_wire(class)`](../src/retry.rs) — the single boundary that decides whether `BackendResponse::connection_error` is `true` (the body never went on the wire, so retry-on-connect-failure can fire regardless of method idempotency) or `false` (the body may have been processed, so retries must respect `retryable_methods`). Every classifier funnels through this; per-classifier `connection_error: bool` fields are intentionally absent so the predicate cannot drift.
 - [`error_class_log_kind(class)`](../src/retry.rs) — stable short labels (`"connect_failure"`, `"tls_error"`, `"graceful_remote_close"`, …) emitted as the `error_kind` field on `tracing::error!` lines from every dispatcher. Operators grep one set of strings across protocols.
 
-## Connect / handshake / reset boundary (HTTP reqwest)
+## Connect / handshake / cancel / reset boundary (HTTP reqwest)
 
-`reqwest::Error::is_connect()` is TCP-only. After the SYN completes, a TLS handshake failure is a **third** case, distinct from a connect-phase RST and from a mid-stream RST:
+`reqwest::Error::is_connect()` is TCP-only. After the SYN completes, a TLS handshake failure is a **third** case, distinct from a connect-phase RST and from a mid-stream RST. When rustls is **not** in the request chain, hyper `is_canceled()` is a **fourth** case (pre-wire pool cancel):
 
 | Case | Evidence | Class | `request_reached_wire` |
 |---|---|---|---|
 | (1) Connect-phase TCP | `is_connect() = true`, no rustls in the chain; RST / refused | `ConnectionRefused` | `false` |
 | (2) Handshake-phase | Typed `rustls::Error` handshake / certificate / ALPN / handshake alert (`CertificateRequired`, `HandshakeFailure`, `InvalidCertificate`, `HandshakeNotComplete`, …), including rustls in `io::Error::get_ref()` after TCP connected | `TlsError` | `false` |
-| (3) Post-handshake mid-stream | RST with no handshake rustls, or post-handshake rustls (`DecryptError`, oversized record, mid-stream alert) | `ConnectionReset` | `true` |
+| (3) Pool cancel | `hyper::Error::is_canceled()` (no rustls). Live backend-mTLS on reqwest HTTP/1: hyper-util returns the connection, the handshake failure then kills the connection future, and the queued request is canceled with no rustls in the chain (issue #4406) | `ConnectionPoolError` | `false` |
+| (4) Post-handshake mid-stream | RST with no handshake rustls and not canceled, or post-handshake rustls (`DecryptError`, oversized record, mid-stream alert) | `ConnectionReset` | `true` |
 
-Handshake evidence is the **typed** rustls variant (and `io::Error::get_ref()` so `source()` cannot skip the payload). Display text is not used when a typed source is reachable. An origin that RSTs during handshake **without** a rustls error is indistinguishable from case (3) and stays `ConnectionReset`.
+Handshake `TlsError` evidence is the **typed** rustls variant (and `io::Error::get_ref()` so `source()` cannot skip the payload). Display text is not used when a typed source is reachable. Do **not** classify by matching `"connection was not ready"`: that label also covers every other reason a pooled connection was not ready; the typed `is_canceled` flag is the evidence. An origin that RSTs during handshake **without** rustls and **without** `is_canceled` is indistinguishable from case (4) and stays `ConnectionReset`.
 
 Omitted TLS `close_notify` is teardown (#4051): `UnexpectedEof` whose Display contains `without sending TLS close_notify` is matched **before** rustls so it cannot become `TlsError`. HTTPS-to-plaintext remains `TlsError` (#4053).
 
-Because `TlsError` is pre-wire, a backend mTLS handshake failure is replayable under `retry_on_connect_failure` regardless of method — nothing reached the origin's application layer. Circuit-breaker charging follows the **connect-error** path (`trip_on_connection_errors`, default on) instead of the post-wire `ConnectionReset` / 502-status path. Passive health still records a backend failure (`connection_error` is true). The public `X-Gateway-Error` token is `connection_failure`, not `backend_error`.
+Because `TlsError` and `ConnectionPoolError` are pre-wire, a backend mTLS failure on this path is replayable under `retry_on_connect_failure` regardless of method — nothing reached the origin's application layer. Circuit-breaker charging follows the **connect-error** path (`trip_on_connection_errors`, default on) instead of the post-wire `ConnectionReset` / 502-status path. Passive health still records a backend failure (`connection_error` is true). The public `X-Gateway-Error` token is `connection_failure`, not `backend_error`.
 
 ## Per-protocol classifiers
 
@@ -59,7 +60,7 @@ Each dispatcher hands its native error type to a classifier; every classifier re
 
 | Protocol | Classifier | Input | Technique |
 |---|---|---|---|
-| HTTP/1.1 (reqwest) | [`classify_reqwest_error`](../src/retry.rs) | `&reqwest::Error` | `is_connect()` / `is_timeout()` typed methods → typed source-chain walk for io/TLS/DNS. **Three-way boundary:** (1) connect-phase RST/refused with no rustls → `ConnectionRefused`; (2) typed handshake rustls (`CertificateRequired`, `HandshakeFailure`, `InvalidCertificate`, …) → `TlsError` even when `is_connect()` is false (reqwest's flag is TCP-only); (3) mid-stream RST with no handshake rustls → `ConnectionReset`. Missing `close_notify` is matched *before* rustls so it stays `ConnectionClosed` (#4051). Post-connect `UnexpectedEof` / incomplete message → `ConnectionClosed`. Bounded substring fallback inside the `is_connect()` branch |
+| HTTP/1.1 (reqwest) | [`classify_reqwest_error`](../src/retry.rs) | `&reqwest::Error` | `is_connect()` / `is_timeout()` typed methods → typed source-chain walk for io/TLS/DNS. **Four-way boundary:** (1) connect-phase RST/refused with no rustls → `ConnectionRefused`; (2) typed handshake rustls (`CertificateRequired`, `HandshakeFailure`, `InvalidCertificate`, …) → `TlsError` even when `is_connect()` is false (reqwest's flag is TCP-only); (3) hyper `is_canceled()` with no rustls → `ConnectionPoolError` (issue #4406 live reqwest path; issue #3578); (4) mid-stream RST with no handshake rustls → `ConnectionReset`. Missing `close_notify` is matched *before* rustls so it stays `ConnectionClosed` (#4051). Post-connect `UnexpectedEof` / incomplete message → `ConnectionClosed`. Bounded substring fallback inside the `is_connect()` branch |
 | HTTP/2 (direct pool acquisition) | [`classify_http2_pool_error`](../src/proxy/http2_pool.rs) | `&Http2PoolError` (typed enum) | Pattern match on typed variants. `BackendUnavailableSource::Tls` is a construction-site handshake-phase signal and classifies as `TlsError` (except TimedOut → `ConnectionTimeout` and port exhaustion). Other io walks peek rustls via `io::Error::get_ref()` before the connect-phase RST collapse. |
 | HTTP/2 (pooled request send) | [`classify_pooled_h2_send_request_error`](../src/proxy/http2_pool.rs) | `&hyper::Error` | Hyper typed predicates → post-wire io source-chain walk → conservative `ProtocolError` fallback |
 | HTTP/3 (native pool) | [`classify_http3_error`](../src/http3/client.rs) | `&dyn Error` | Typed walk for `quinn::ConnectionError` / `quinn::ConnectError` / `io::Error` → anchored substring fallback for `h3::Error` Display |
@@ -277,13 +278,15 @@ For a TCP/DTLS session that the backend tore down mid-relay — same `proxy_id` 
 
 Refer to the canonical-taxonomy table above for what each class means. A few class-specific operational notes:
 
-- **`ConnectionPoolError`** — pool exhaustion. Increase `FERRUM_POOL_MAX_IDLE_PER_HOST` or per-proxy `pool_idle_timeout`.
+- **`ConnectionPoolError`** — pool exhaustion, or a reqwest/H1 send that hyper canceled before dispatch (`is_canceled`; issue #3578). A backend mTLS misconfig (origin requires a client certificate, gateway presents none) lands here on the reqwest HTTP/1 path when rustls is not in the request chain (issue #4406). Increase `FERRUM_POOL_MAX_IDLE_PER_HOST` or per-proxy `pool_idle_timeout` for genuine pool exhaustion; for the mTLS case configure `backend_tls_client_cert_path` / `backend_tls_client_key_path`.
 - **`PortExhaustion`** — EADDRNOTAVAIL. Widen the port range with `sysctl net.ipv4.ip_local_port_range="1024 65535"`, enable `net.ipv4.tcp_tw_reuse=1`, and reduce idle pool timeouts (`FERRUM_POOL_IDLE_TIMEOUT_SECONDS`). Monitor via the `port_exhaustion_events` counter on authenticated `GET /overload` detail (unauthenticated callers receive only `{"level": ...}`).
 - **`TlsError`** — for self-signed certs in development, set
   `FERRUM_TLS_NO_VERIFY=true`. For mTLS backends, verify the client certificate
   and CA chain. An origin that **requires** a client certificate when the
-  gateway presents none is this class (issue #4406), not `connection_reset`.
-  The typed `StreamSetupKind::FrontendTlsHandshake` vs
+  gateway presents none is this class **when a typed rustls handshake error
+  is in the chain**; on the reqwest HTTP/1 path that error is often missing
+  and the class is `connection_pool_error` instead (issue #4406). Neither
+  is `connection_reset`. The typed `StreamSetupKind::FrontendTlsHandshake` vs
   `BackendTlsHandshake`/`BackendDtlsHandshake` tells you which side failed
   without inspecting the message. Do **not** key alerts on `tls_error` for
   omitted `close_notify`: userspace rustls reports that as `UnexpectedEof`

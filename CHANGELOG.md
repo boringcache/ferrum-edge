@@ -107,25 +107,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **BREAKING — backend mTLS handshake without a client certificate is
-  `tls_error`, not `connection_reset`** (issue #4406). An HTTPS origin that
-  requires a client certificate (`CertificateRequired` / `HandshakeFailure`
-  / other typed rustls handshake variants) previously classified as
-  post-wire `connection_reset` because reqwest's `is_connect()` is
-  TCP-only. The handshake never reached HTTP. It is now `tls_error`
-  (pre-wire). Connect-phase RST/refused with no rustls still collapses to
-  `connection_refused`. Mid-stream RST with no handshake rustls stays
-  `connection_reset`. Omitted `close_notify` stays `connection_closed`
-  (#4051). HTTPS-to-plaintext stays `tls_error` (#4053). **Operator
-  action**: retarget alerts that grepped `error_class=connection_reset` or
+  pre-wire, not `connection_reset`** (issue #4406). An HTTPS origin that
+  requires a client certificate previously classified as post-wire
+  `connection_reset` (OpenSSL RST) or the `request_error` catch-all
+  (reqwest HTTP/1: hyper `Canceled`, no rustls in the request chain).
+  Typed rustls handshake / certificate / alert errors still classify as
+  `tls_error`. On the live reqwest path the rustls error dies with the
+  connection future, so that case is `connection_pool_error` — the same
+  hyper `is_canceled` pre-wire class as pooled H2 / gRPC
+  `DispatchCanceled` (issue #3578). Classification keys on the typed
+  flag, not the `"connection was not ready"` Display label. Connect-phase
+  RST/refused with no rustls still collapses to `connection_refused`.
+  Mid-stream RST with no handshake rustls stays `connection_reset`.
+  Omitted `close_notify` stays `connection_closed` (#4051).
+  HTTPS-to-plaintext stays `tls_error` (#4053). **Operator action**:
+  retarget alerts that grepped `error_class=connection_reset` or
   `X-Gateway-Error: backend_error` for this misconfig onto `tls_error` /
-  `connection_failure`. `retry_on_connect_failure` now replays the request
-  regardless of method (nothing reached the origin application). The
+  `connection_pool_error` / `connection_failure`.
+  `retry_on_connect_failure` now replays regardless of method. The
   circuit breaker charges the **connect-error** path
   (`trip_on_connection_errors`, default on) instead of the 502-status /
   post-wire reset path; operators who set
-  `trip_on_connection_errors: false` will no longer trip on this handshake
-  via a 502 in `failure_status_codes`. Passive health still records a
-  backend failure.
+  `trip_on_connection_errors: false` will no longer trip on this
+  handshake via a 502 in `failure_status_codes`. Passive health still
+  records a backend failure.
 
 - **Injector inbound capture excludes kubelet HTTP and TCP probe ports**
   (issue #4431). `startupProbe` / `readinessProbe` / `livenessProbe` `httpGet`

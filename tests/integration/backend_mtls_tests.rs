@@ -539,13 +539,20 @@ fn gateway_error_header(headers: &reqwest::header::HeaderMap) -> Option<&str> {
 }
 
 /// Anonymous HTTPS proxy against an origin that requires a client
-/// certificate: 502, `error_class=tls_error`, pre-wire gateway-error token.
+/// certificate: 502, pre-wire class, pre-wire gateway-error token.
 ///
 /// Regression for issue #4406. Distinct from #4053 (HTTPS-to-plaintext
 /// already `tls_error`) and #4051 (omitted `close_notify` is not
 /// `tls_error`).
+///
+/// The live reqwest error on this path is hyper `Canceled` / connection
+/// not ready: rustls dies on the connection future and is **not** in the
+/// request chain, so the class is `ConnectionPoolError` (typed
+/// `is_canceled`), not `tls_error`. When a typed rustls handshake error
+/// *is* in the chain, it remains `tls_error`. Either way the failure is
+/// pre-wire.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn anonymous_proxy_to_required_client_cert_origin_is_tls_error() {
+async fn anonymous_proxy_to_required_client_cert_origin_is_pre_wire() {
     ensure_crypto_provider();
     let ca = TestCa::new("issue-4406-mtls-ca").expect("test CA");
     let (cert_pem, key_pem) = ca.valid().expect("server leaf");
@@ -579,15 +586,19 @@ async fn anonymous_proxy_to_required_client_cert_origin_is_tls_error() {
         .await
         .expect_err("origin must reject a client with no certificate");
     let live_class = classify_reqwest_error(&live_err);
-    assert_eq!(
-        live_class,
-        ErrorClass::TlsError,
-        "reqwest handshake without a client cert must be tls_error, not \
-         connection_reset/refused; is_connect={} err={live_err:?}",
+    assert!(
+        matches!(
+            live_class,
+            ErrorClass::ConnectionPoolError | ErrorClass::TlsError
+        ),
+        "reqwest handshake without a client cert must be pre-wire \
+         (pool cancel or typed rustls), not connection_reset/refused; \
+         is_connect={} class={live_class:?} err={live_err:?}",
         live_err.is_connect(),
     );
     assert_ne!(live_class, ErrorClass::ConnectionReset);
     assert_ne!(live_class, ErrorClass::ConnectionRefused);
+    assert_ne!(live_class, ErrorClass::RequestError);
     assert!(
         !ferrum_edge::retry::request_reached_wire(live_class),
         "backend mTLS handshake failure is pre-wire: retry_on_connect_failure \
@@ -626,9 +637,9 @@ async fn anonymous_proxy_to_required_client_cert_origin_is_tls_error() {
         "body={}",
         resp.body_text(),
     );
-    // TlsError is pre-wire, so the public token is connection_failure
-    // (not backend_error, which is the post-wire 502 token this
-    // misconfig previously emitted as connection_reset).
+    // TlsError and ConnectionPoolError are both pre-wire, so the public
+    // token is connection_failure (not backend_error, which is the
+    // post-wire 502 token this misconfig previously emitted).
     assert_eq!(
         gateway_error_header(&resp.headers),
         Some("connection_failure"),

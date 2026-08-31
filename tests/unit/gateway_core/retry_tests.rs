@@ -1472,6 +1472,28 @@ fn test_classify_boxed_error_handshake_failure_alert_is_tls_error() {
 }
 
 #[test]
+fn test_classify_typed_chain_treats_hyper_is_canceled_as_pool_error() {
+    // Issue #4406 live reqwest path: hyper reports is_canceled with no
+    // rustls in the request chain. classify_typed_chain must map that
+    // typed flag to ConnectionPoolError (pre-wire). hyper::Error is not
+    // constructible here; this guards the arm, and the live reqwest
+    // handshake in backend_mtls_tests exercises the real error.
+    let src = include_str!("../../../src/retry.rs");
+    assert!(
+        src.contains("if hyper_err.is_canceled()")
+            && src.contains("// hyper 1.9 contract (issue #3578 rejected a downgrade)")
+            && src.contains("return Some(ErrorClass::ConnectionPoolError);"),
+        "classify_typed_chain must map hyper is_canceled to ConnectionPoolError"
+    );
+    assert!(
+        !src.contains("source_chain.contains(\"connection was not ready\")")
+            && !src.contains("error_str.contains(\"connection was not ready\")")
+            && !src.contains("debug_str.contains(\"connection was not ready\")"),
+        "must not classify by matching the hyper Display label"
+    );
+}
+
+#[test]
 fn test_classify_boxed_error_close_notify_alert_is_connection_closed() {
     // #4051: CloseNotify is teardown, not a handshake. Must not become
     // tls_error even when the typed rustls error is reachable.
