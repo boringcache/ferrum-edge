@@ -3,6 +3,30 @@ Ferrum mesh chart helpers. These helpers intentionally fail at template time for
 invalid CP settings so an unusable control-plane pod is not rendered.
 */}}
 
+{{- define "ferrum-mesh.validateImageTag" -}}
+{{- $tag := trim (toString (.Values.image.tag | default "")) -}}
+{{- if not $tag -}}
+{{- fail "image.tag is required: no immutable vX.Y.Z Ferrum Edge release has been published yet, so this chart does not default an image tag. Set image.tag to a published container tag from docker.io/ferrumedge/ferrum-edge or ghcr.io/ferrum-edge/ferrum-edge (for example helm install ... --set image.tag=<tag>). The mutable latest tag exists for evaluation but must not be used in production." -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "ferrum-mesh.imageTag" -}}
+{{- trim (toString .Values.image.tag) -}}
+{{- end -}}
+
+{{- define "ferrum-mesh.image" -}}
+{{- printf "%s:%s" .Values.image.repository (include "ferrum-mesh.imageTag" .) -}}
+{{- end -}}
+
+{{- define "ferrum-mesh.resolveImageTag" -}}
+{{- $override := trim (toString (.override | default "")) -}}
+{{- if $override -}}
+{{- $override -}}
+{{- else -}}
+{{- include "ferrum-mesh.imageTag" .root -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "ferrum-mesh.validateOneSource" -}}
 {{- $label := .label -}}
 {{- $source := .source | default dict -}}

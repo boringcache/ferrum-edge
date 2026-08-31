@@ -115,9 +115,15 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 {{- end -}}
 
+{{- define "ferrum-gateway.validateImageTag" -}}
+{{- $tag := trim (toString (.Values.image.tag | default "")) -}}
+{{- if not $tag -}}
+{{- fail "image.tag is required: no immutable vX.Y.Z Ferrum Edge release has been published yet, so this chart does not default an image tag. Set image.tag to a published container tag from docker.io/ferrumedge/ferrum-edge or ghcr.io/ferrum-edge/ferrum-edge (for example helm install ... --set image.tag=<tag>). The mutable latest tag exists for evaluation but must not be used in production." -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "ferrum-gateway.image" -}}
-{{- $tag := .Values.image.tag | default .Chart.AppVersion -}}
-{{- printf "%s:%s" .Values.image.repository $tag -}}
+{{- printf "%s:%s" .Values.image.repository (trim (toString .Values.image.tag)) -}}
 {{- end -}}
 
 {{/* File-mode config path (kept in sync with the ConfigMap mount). */}}
@@ -695,6 +701,7 @@ Validation: fail render on missing/unsafe configuration.
 {{- end -}}
 
 {{- define "ferrum-gateway.validate" -}}
+{{- include "ferrum-gateway.validateImageTag" . -}}
 {{- $mode := .Values.mode | default "" -}}
 {{- if eq $mode "migrate" -}}
 {{- fail "mode=migrate is not deployed by the ferrum-gateway or ferrum-mesh charts. Run explicit migrate as an external pre-deploy Kubernetes Job (see charts/ferrum-gateway/examples/migrate-job-*.yaml and docs/kubernetes_deployment.md#explicit-migrate-mode-external-job). database/cp installs still auto-apply pending core schema migrations on startup." -}}

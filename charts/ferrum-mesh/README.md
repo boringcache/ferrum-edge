@@ -17,6 +17,16 @@ naming, labelling, secret, and validation conventions.
 
 Example value overlays live under [`examples/`](examples/).
 
+## Container image tag (required)
+
+`image.tag` is required. No immutable `vX.Y.Z` Ferrum Edge release has been
+published yet, so this chart does not default a container tag. `helm template` /
+`helm install` fail with an actionable message when `image.tag` is empty. Set a
+published tag from `docker.io/ferrumedge/ferrum-edge` or
+`ghcr.io/ferrum-edge/ferrum-edge` (for example
+`--set image.tag=<published-tag>`). The mutable `latest` tag exists for
+evaluation but must not be used in production.
+
 ## Gateway API CRDs (required)
 
 When `controlPlane.enabled=true` and `controlPlane.rbac.gatewayApi=true` (the

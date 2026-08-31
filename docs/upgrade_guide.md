@@ -6,6 +6,18 @@ This document describes how to safely upgrade Ferrum Edge between versions with 
 
 Every current `[Unreleased]` `BREAKING` changelog entry is listed here exactly once, with its issue number and the operator action that entry already states. Several of these fail **silently** at cutover (HMAC clients get `401`, WAF `literal` rules stop matching folded spellings, backends stop seeing client-supplied XFF hops) rather than refusing config load. Read this section before the per-mode procedures below.
 
+### Helm charts require an explicit `image.tag` (issue [#4440](https://github.com/ferrum-edge/ferrum-edge/issues/4440))
+
+`charts/ferrum-gateway` no longer defaults an empty `image.tag` to
+`Chart.appVersion`, and `charts/ferrum-mesh` no longer hard-codes `0.9.0`.
+Neither tag is published, so installs that relied on chart defaults rendered
+successfully and then failed at image pull. Both charts now fail at
+`helm template` / `helm install` when `image.tag` is unset.
+
+**Operator action:** pass a published container tag on every install (for
+example `helm install ... --set image.tag=<published-tag>`). The mutable
+`latest` tag exists for evaluation but must not be used in production.
+
 ### Injected Ferrum is a Kubernetes native sidecar (issue [#4430](https://github.com/ferrum-edge/ferrum-edge/issues/4430))
 
 The injector no longer appends Ferrum as an ordinary `spec.containers` entry. New pods receive a native sidecar (`spec.initContainers` with `restartPolicy: Always`) and exec probes against loopback `/health`. That is also what unblocks Kubernetes Job completion. **Minimum Kubernetes version is 1.29** (native sidecars enabled by default; 1.28 needs `SidecarContainers=true`). There is no ordinary-container fallback: the webhook always emits the native-sidecar shape, and a cluster older than that will reject the patched Pod.

@@ -37,6 +37,13 @@ migrations; use the explicit Job for `status`, dry-run, and operator-controlled
 
 ## Security defaults you should know
 
+- **`image.tag` is required.** No immutable `vX.Y.Z` Ferrum Edge release has
+  been published yet, so this chart does not default a container tag (it no
+  longer falls back to `Chart.appVersion`). `helm template` / `helm install`
+  fail with an actionable message when `image.tag` is empty. Set a published tag
+  from `docker.io/ferrumedge/ferrum-edge` or `ghcr.io/ferrum-edge/ferrum-edge`
+  (for example `--set image.tag=<tag>`). The mutable `latest` tag exists for
+  evaluation but must not be used in production.
 - **Secrets are never generated or rendered into ConfigMaps.** Admin JWT, DB
   URL, and CP/DP gRPC JWT material come from inline values (dev only) or Secret
   references you own. The chart validates that database, cp, and dp modes have
@@ -236,6 +243,7 @@ kubectl -n ferrum create secret generic ferrum-gateway-credentials \
   --from-literal=admin-jwt-secret="$(openssl rand -hex 32)"
 
 helm install ferrum ./charts/ferrum-gateway -n ferrum \
+  --set image.tag=<published-tag> \
   -f charts/ferrum-gateway/examples/database-values.yaml
 ```
 
@@ -243,6 +251,7 @@ helm install ferrum ./charts/ferrum-gateway -n ferrum \
 
 ```bash
 helm install ferrum ./charts/ferrum-gateway -n ferrum \
+  --set image.tag=<published-tag> \
   -f charts/ferrum-gateway/examples/file-values.yaml
 ```
 
@@ -268,8 +277,10 @@ kubectl -n ferrum create secret generic ferrum-grpc-credentials \
   --from-literal=cp-dp-grpc-jwt-secret="$(openssl rand -hex 32)"
 
 helm install ferrum-cp ./charts/ferrum-gateway -n ferrum \
+  --set image.tag=<published-tag> \
   -f charts/ferrum-gateway/examples/cp-values.yaml
 helm install ferrum-dp ./charts/ferrum-gateway -n ferrum \
+  --set image.tag=<published-tag> \
   -f charts/ferrum-gateway/examples/dp-values.yaml
 ```
 
@@ -304,7 +315,7 @@ of the Job manifests under [`examples/`](examples/):
 | Dry-run pending DB migrations | [`migrate-job-up-dry-run.yaml`](examples/migrate-job-up-dry-run.yaml) |
 | Persist file-config version migration on a pre-staged writable PVC | [`migrate-job-config.yaml`](examples/migrate-job-config.yaml) |
 
-Reuse the same image tag, DB Secret, ServiceAccount, and security context as the
+Reuse the same published `image.tag`, DB Secret, ServiceAccount, and security context as the
 gateway Deployment so the Job cannot drift from the running release. Do not run
 overlapping `up` Jobs against the same database; the binary takes a migration
 lock, but one operator-owned Job at a time is the supported workflow.

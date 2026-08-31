@@ -9,7 +9,7 @@
 #   kubectl -n ferrum create secret generic ferrum-gateway-db \
 #     --from-literal=url='postgres://ferrum:<percent-encoded-pw>@postgres.ferrum.svc:5432/ferrum'
 #
-# Pin image.tag to the same tag as the gateway Deployment. Do not run overlapping
+# Pin image.tag to the same published tag as the gateway Deployment. Do not run overlapping
 # migrate-up Jobs against the same database.
 apiVersion: batch/v1
 kind: Job
@@ -44,7 +44,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: ferrum-edge
-          image: ferrumedge/ferrum-edge:0.9.0
+          image: ferrumedge/ferrum-edge:latest  # pin the same published tag as the gateway Deployment
           imagePullPolicy: IfNotPresent
           args: ["run"]
           securityContext:

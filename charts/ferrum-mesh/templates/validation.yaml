@@ -1,3 +1,4 @@
+{{- include "ferrum-mesh.validateImageTag" . -}}
 {{- include "ferrum-mesh.validateControlPlaneInputs" . -}}
 {{- include "ferrum-mesh.validateServingShutdowns" . -}}
 {{- include "ferrum-mesh.validateObservability" . -}}

@@ -7,8 +7,12 @@
 #     --from-literal=admin-jwt-secret="$(openssl rand -hex 32)"
 #
 #   helm install ferrum ./charts/ferrum-gateway -n ferrum \
+#     --set image.tag=<published-tag> \
 #     -f charts/ferrum-gateway/examples/database-values.yaml
 mode: database
+
+image:
+  tag: latest  # evaluation only; pin an immutable release tag in production
 
 replicaCount: 2
 

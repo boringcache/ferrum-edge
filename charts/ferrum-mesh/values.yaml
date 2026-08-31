@@ -1,6 +1,9 @@
 image:
   repository: ferrumedge/ferrum-edge
-  tag: "0.9.0"
+  # Required. No immutable release tag is published yet, so helm template/install
+  # fails when this is empty. Set to a published tag (for example
+  # --set image.tag=<tag>). latest is mutable and for evaluation only.
+  tag: ""
   pullPolicy: IfNotPresent
 
 namespace: ferrum

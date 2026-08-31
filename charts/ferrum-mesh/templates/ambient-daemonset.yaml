@@ -1,6 +1,6 @@
 {{- if .Values.ambient.enabled }}
 {{- $ambientImageRepository := toString .Values.image.repository -}}
-{{- $ambientImageTag := toString .Values.image.tag -}}
+{{- $ambientImageTag := include "ferrum-mesh.imageTag" . -}}
 {{- $ambientEnv := default dict .Values.ambient.env -}}
 {{- $ambientSpire := default dict .Values.ambient.spire -}}
 {{- $ambientSpireEnabled := eq (lower (toString (default false $ambientSpire.enabled))) "true" -}}

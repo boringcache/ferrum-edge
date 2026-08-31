@@ -53,7 +53,7 @@ spec:
       {{- end }}
       containers:
         - name: ferrum-edge
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: {{ include "ferrum-mesh.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["run"]
           {{- with .Values.eastWest.securityContext }}
