@@ -97,6 +97,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Mesh chart image tag defaults from `Chart.appVersion` instead of a hard-coded
+  version** (issue #4440). `charts/ferrum-mesh` now matches
+  `charts/ferrum-gateway` by deriving the default tag from `Chart.appVersion`
+  when `image.tag` is empty, so the two charts cannot drift after a version
+  bump. Root `README.md` quickstart prose now matches its copy/paste example
+  about pinning releases versus using the mutable `latest` tag for evaluation.
+
 - **Injector inbound capture excludes kubelet HTTP and TCP probe ports**
   (issue #4431). `startupProbe` / `readinessProbe` / `livenessProbe` `httpGet`
   and `tcpSocket` ports on every container in the pod are unioned into the
@@ -133,17 +140,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `libz.so.1`.
 
 ### Changed
-
-- **BREAKING — Helm charts require an explicit `image.tag`**
-  (issue #4440). `charts/ferrum-gateway` no longer defaults an empty
-  `image.tag` to `Chart.appVersion`, and `charts/ferrum-mesh` no longer
-  hard-codes `0.9.0`. Neither published tag exists, so a default `helm install`
-  previously rendered and then failed at image pull with `ImagePullBackOff`.
-  Both charts now fail at `helm template` / `helm install` with an actionable
-  message when `image.tag` is unset. **Operator action**: pass a published
-  container tag on every install (for example
-  `helm install ... --set image.tag=<published-tag>`). The mutable `latest`
-  tag exists for evaluation but must not be used in production.
 
 - **BREAKING — injected Ferrum is a Kubernetes native sidecar**
   (issue #4430). The webhook now emits `ferrum-edge` under `spec.initContainers`

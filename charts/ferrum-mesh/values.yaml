@@ -1,7 +1,7 @@
 image:
   repository: ferrumedge/ferrum-edge
-  # Required. No immutable release tag is published yet, so helm template/install
-  # fails when this is empty. Set to a published tag (for example
+  # Defaults to the chart appVersion when empty. That tag must exist in the
+  # container registry. Override with a published tag (for example
   # --set image.tag=<tag>). latest is mutable and for evaluation only.
   tag: ""
   pullPolicy: IfNotPresent

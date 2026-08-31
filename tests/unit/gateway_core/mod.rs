@@ -13,8 +13,8 @@ mod build_profile_panic_strategy_tests;
 mod cached_synthetic_bytes_share_tests;
 #[cfg(unix)]
 mod cgroup_tree_walk_tests;
-mod cidr_tests;
 mod chart_image_tag_helm_tests;
+mod cidr_tests;
 mod circuit_breaker_tests;
 mod client_identity_tests;
 mod client_ip_tests;

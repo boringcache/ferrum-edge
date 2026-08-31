@@ -69,21 +69,20 @@ either chart — see [Explicit migrate mode (external Job)](#explicit-migrate-mo
 The chart validates configuration at `helm template`/`helm install` time and
 fails early with a helpful message when, for example, a database/cp/dp install
 is missing its `>=32`-char admin JWT secret, a dp install is missing
-`dp.cpGrpcUrls`, `image.tag` is unset (no immutable release tag is published
-yet), or an admin Service is requested without a non-loopback admin bind (which
-the binary hard-fails on in database/cp modes).
+`dp.cpGrpcUrls`, or an admin Service is requested without a non-loopback admin
+bind (which the binary hard-fails on in database/cp modes).
 
-Both `charts/ferrum-gateway` and `charts/ferrum-mesh` require an explicit
-`image.tag` for every install. Neither chart defaults to `Chart.appVersion`,
-`0.9.0`, or `latest`. Pass a published container tag on the command line or in
-your values file (for example `--set image.tag=<published-tag>`).
+Both `charts/ferrum-gateway` and `charts/ferrum-mesh` default an empty
+`image.tag` to `Chart.appVersion`. That tag must exist in the container
+registry before install. Override with a published tag on the command line or in
+your values file (for example `--set image.tag=<published-tag>`). The mutable
+`latest` tag exists for evaluation but must not be used in production.
 
 Per-mode quickstarts:
 
 ```bash
 # File mode (inline config, no Secrets needed)
 helm install ferrum ./charts/ferrum-gateway -n ferrum --create-namespace \
-  --set image.tag=<published-tag> \
   -f charts/ferrum-gateway/examples/file-values.yaml
 
 # Database mode (PostgreSQL via existing Secrets)
@@ -92,7 +91,6 @@ kubectl -n ferrum create secret generic ferrum-gateway-db \
 kubectl -n ferrum create secret generic ferrum-gateway-credentials \
   --from-literal=admin-jwt-secret="$(openssl rand -hex 32)"
 helm install ferrum ./charts/ferrum-gateway -n ferrum \
-  --set image.tag=<published-tag> \
   -f charts/ferrum-gateway/examples/database-values.yaml
 
 # Control plane + data plane pair (shared gRPC JWT Secret)
@@ -102,10 +100,8 @@ kubectl -n ferrum create secret generic ferrum-grpc-credentials \
   --from-literal=admin-jwt-secret="$(openssl rand -hex 32)" \
   --from-literal=cp-dp-grpc-jwt-secret="$(openssl rand -hex 32)"
 helm install ferrum-cp ./charts/ferrum-gateway -n ferrum \
-  --set image.tag=<published-tag> \
   -f charts/ferrum-gateway/examples/cp-values.yaml
 helm install ferrum-dp ./charts/ferrum-gateway -n ferrum \
-  --set image.tag=<published-tag> \
   -f charts/ferrum-gateway/examples/dp-values.yaml
 ```
 
@@ -325,7 +321,6 @@ kubectl -n ferrum create secret generic ferrum-mesh-dev-credentials \
   --from-literal=cp-dp-grpc-jwt-secret="$(openssl rand -hex 32)"
 
 helm install ferrum ./charts/ferrum-mesh -n ferrum --create-namespace \
-  --set image.tag=<published-tag> \
   -f charts/ferrum-mesh/examples/development-values.yaml
 ```
 
@@ -344,7 +339,6 @@ kubectl -n ferrum create secret generic ferrum-mesh-production-credentials \
   --from-literal=cp-dp-grpc-jwt-secret="$(openssl rand -hex 32)"
 
 helm install ferrum ./charts/ferrum-mesh -n ferrum \
-  --set image.tag=<published-tag> \
   -f charts/ferrum-mesh/examples/production-existing-secrets-values.yaml
 ```
 

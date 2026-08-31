@@ -1,128 +1,112 @@
-//! Static Helm/chart contract coverage for required image.tag (issue #4440).
+//! Static Helm/chart contract coverage for image tag drift (issue #4440).
 //!
-//! These tests prove both charts fail render without an explicit tag and accept
-//! one when set, without requiring a local `helm` binary. Hosted CI still runs
-//! `helm template` end-to-end.
+//! These tests assert both charts derive their default image tag from
+//! `Chart.appVersion` and stay aligned with `Cargo.toml`, without requiring a
+//! local `helm` binary.
 
-use std::path::PathBuf;
+const CARGO_TOML: &str = include_str!("../../../Cargo.toml");
+const GATEWAY_CHART_YAML: &str = include_str!("../../../charts/ferrum-gateway/Chart.yaml");
+const MESH_CHART_YAML: &str = include_str!("../../../charts/ferrum-mesh/Chart.yaml");
+const GATEWAY_HELPERS: &str = include_str!("../../../charts/ferrum-gateway/templates/_helpers.tpl");
+const MESH_HELPERS: &str = include_str!("../../../charts/ferrum-mesh/templates/_helpers.tpl");
+const GATEWAY_VALUES: &str = include_str!("../../../charts/ferrum-gateway/values.yaml");
+const MESH_VALUES: &str = include_str!("../../../charts/ferrum-mesh/values.yaml");
 
-fn gateway_chart_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("charts/ferrum-gateway")
+fn parse_cargo_version() -> String {
+    for line in CARGO_TOML.lines() {
+        if let Some(rest) = line.strip_prefix("version = ") {
+            return rest.trim().trim_matches('"').to_string();
+        }
+    }
+    panic!("Cargo.toml: missing version field");
 }
 
-fn mesh_chart_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("charts/ferrum-mesh")
-}
-
-fn read_gateway(rel: &str) -> String {
-    std::fs::read_to_string(gateway_chart_root().join(rel)).unwrap_or_else(|e| {
-        panic!("failed to read charts/ferrum-gateway/{rel}: {e}");
-    })
-}
-
-fn read_mesh(rel: &str) -> String {
-    std::fs::read_to_string(mesh_chart_root().join(rel)).unwrap_or_else(|e| {
-        panic!("failed to read charts/ferrum-mesh/{rel}: {e}");
-    })
-}
-
-const FAIL_SNIPPET: &str = "image.tag is required";
-
-#[test]
-fn gateway_values_default_tag_empty_without_appversion_fallback() {
-    let values = read_gateway("values.yaml");
-    assert!(
-        values.contains("tag: \"\""),
-        "gateway values must leave image.tag empty so installs fail without an explicit tag"
-    );
-    assert!(
-        !values.contains("Defaults to the chart appVersion"),
-        "gateway values must not document an appVersion image fallback"
-    );
+fn parse_chart_app_version(chart_yaml: &str, chart_path: &str) -> String {
+    for line in chart_yaml.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("appVersion:") {
+            return rest.trim().trim_matches('"').to_string();
+        }
+    }
+    panic!("{chart_path}: missing appVersion field");
 }
 
 #[test]
-fn gateway_helpers_fail_render_without_tag_and_name_value() {
-    let helpers = read_gateway("templates/_helpers.tpl");
-    assert!(
-        helpers.contains("define \"ferrum-gateway.validateImageTag\""),
-        "gateway chart must validate image.tag at render time"
+fn chart_app_versions_match_cargo_toml() {
+    let cargo_version = parse_cargo_version();
+    let gateway =
+        parse_chart_app_version(GATEWAY_CHART_YAML, "charts/ferrum-gateway/Chart.yaml");
+    let mesh = parse_chart_app_version(MESH_CHART_YAML, "charts/ferrum-mesh/Chart.yaml");
+
+    assert_eq!(
+        gateway, mesh,
+        "charts/ferrum-gateway/Chart.yaml appVersion ({gateway}) must match \
+         charts/ferrum-mesh/Chart.yaml appVersion ({mesh})"
     );
-    assert!(
-        helpers.contains(FAIL_SNIPPET),
-        "gateway validation must name image.tag in the failure message"
-    );
-    assert!(
-        !helpers.contains("default .Chart.AppVersion"),
-        "gateway image helper must not fall back to Chart.AppVersion"
-    );
-    assert!(
-        helpers.contains("include \"ferrum-gateway.validateImageTag\" ."),
-        "gateway validate must call image.tag validation"
+    assert_eq!(
+        gateway, cargo_version,
+        "charts/ferrum-gateway/Chart.yaml appVersion ({gateway}) must match \
+         Cargo.toml version ({cargo_version})"
     );
 }
 
 #[test]
-fn gateway_schema_requires_nonempty_image_tag() {
-    let schema = read_gateway("values.schema.json");
+fn gateway_image_tag_defaults_from_chart_app_version() {
     assert!(
-        schema.contains("\"required\": [\"repository\", \"tag\"]"),
-        "gateway schema must require image.tag"
+        GATEWAY_HELPERS.contains("default .Chart.AppVersion"),
+        "charts/ferrum-gateway/templates/_helpers.tpl must default image.tag from \
+         .Chart.AppVersion"
     );
     assert!(
-        schema.contains("No immutable vX.Y.Z release is published yet"),
-        "gateway schema must document why image.tag has no default"
-    );
-}
-
-#[test]
-fn mesh_values_default_tag_empty_without_hardcoded_release() {
-    let values = read_mesh("values.yaml");
-    assert!(
-        values.contains("tag: \"\""),
-        "mesh values must leave image.tag empty so installs fail without an explicit tag"
+        !GATEWAY_HELPERS.contains("define \"ferrum-gateway.validateImageTag\""),
+        "charts/ferrum-gateway/templates/_helpers.tpl must not fail render on unset image.tag"
     );
     assert!(
-        !values.contains("tag: \"0.9.0\""),
-        "mesh values must not hard-code an unpublished 0.9.0 image tag"
+        !GATEWAY_VALUES.contains("tag: \"0.9.0\""),
+        "charts/ferrum-gateway/values.yaml must not hard-code a version literal as the \
+         default image tag"
     );
 }
 
 #[test]
-fn mesh_helpers_fail_render_without_tag_and_render_image_helper() {
-    let helpers = read_mesh("templates/_helpers.tpl");
+fn mesh_image_tag_defaults_from_chart_app_version() {
     assert!(
-        helpers.contains("define \"ferrum-mesh.validateImageTag\""),
-        "mesh chart must validate image.tag at render time"
+        MESH_HELPERS.contains("default .Chart.AppVersion"),
+        "charts/ferrum-mesh/templates/_helpers.tpl must default image.tag from \
+         .Chart.AppVersion"
     );
     assert!(
-        helpers.contains(FAIL_SNIPPET),
-        "mesh validation must name image.tag in the failure message"
+        !MESH_HELPERS.contains("define \"ferrum-mesh.validateImageTag\""),
+        "charts/ferrum-mesh/templates/_helpers.tpl must not fail render on unset image.tag"
     );
     assert!(
-        helpers.contains("define \"ferrum-mesh.image\""),
-        "mesh chart must centralize image rendering"
-    );
-}
-
-#[test]
-fn mesh_validation_template_calls_image_tag_guard() {
-    let validation = read_mesh("templates/validation.yaml");
-    assert!(
-        validation.contains("include \"ferrum-mesh.validateImageTag\" ."),
-        "mesh validation.yaml must fail when image.tag is unset"
+        !MESH_VALUES.contains("tag: \"0.9.0\""),
+        "charts/ferrum-mesh/values.yaml must not hard-code 0.9.0 as the default image tag"
     );
 }
 
 #[test]
 fn mesh_workloads_use_image_helper_not_raw_tag() {
-    for rel in [
-        "templates/injector-deployment.yaml",
-        "templates/control-plane-deployment.yaml",
-        "templates/ca-deployment.yaml",
-        "templates/east-west-gateway-deployment.yaml",
+    for (rel, template) in [
+        (
+            "templates/injector-deployment.yaml",
+            include_str!("../../../charts/ferrum-mesh/templates/injector-deployment.yaml"),
+        ),
+        (
+            "templates/control-plane-deployment.yaml",
+            include_str!("../../../charts/ferrum-mesh/templates/control-plane-deployment.yaml"),
+        ),
+        (
+            "templates/ca-deployment.yaml",
+            include_str!("../../../charts/ferrum-mesh/templates/ca-deployment.yaml"),
+        ),
+        (
+            "templates/east-west-gateway-deployment.yaml",
+            include_str!(
+                "../../../charts/ferrum-mesh/templates/east-west-gateway-deployment.yaml"
+            ),
+        ),
     ] {
-        let template = read_mesh(rel);
         assert!(
             template.contains("include \"ferrum-mesh.image\" ."),
             "{rel} must render image through ferrum-mesh.image helper"
@@ -132,17 +116,4 @@ fn mesh_workloads_use_image_helper_not_raw_tag() {
             "{rel} must not reference .Values.image.tag directly"
         );
     }
-}
-
-#[test]
-fn mesh_schema_requires_nonempty_image_tag() {
-    let schema = read_mesh("values.schema.json");
-    assert!(
-        schema.contains("\"required\": [\"repository\", \"tag\"]"),
-        "mesh schema must require image.tag"
-    );
-    assert!(
-        schema.contains("No immutable vX.Y.Z release is published yet"),
-        "mesh schema must document why image.tag has no default"
-    );
 }

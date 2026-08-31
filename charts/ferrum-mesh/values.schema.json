@@ -8,7 +8,6 @@
     "image": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["repository", "tag"],
       "properties": {
         "repository": {
           "type": "string",
@@ -16,8 +15,7 @@
         },
         "tag": {
           "type": "string",
-          "minLength": 1,
-          "description": "Published ferrum-edge container tag (required). No immutable vX.Y.Z release is published yet, so the chart does not default a tag. Set image.tag explicitly (for example --set image.tag=<tag>). The mutable latest tag exists for evaluation but must not be used in production."
+          "description": "Container image tag. Defaults to Chart.appVersion when empty; that tag must exist in the registry. Override with a published tag (for example --set image.tag=<tag>). The mutable latest tag exists for evaluation but must not be used in production."
         },
         "pullPolicy": {
           "type": "string",
