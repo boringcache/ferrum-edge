@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **BREAKING — HTTP/2 and HTTP/3 requests without `:authority` or Host are rejected with 400**
+  (issue #4416). RFC 9113 §8.3.1 and RFC 9114 §4.3.1 require a request to
+  include either `:authority` or a Host field. Ferrum previously treated the
+  both-absent case as a vacuous Host/`:authority` agreement and admitted the
+  request, so routing skipped exact/wildcard host tiers and fell through to a
+  catch-all (empty `hosts`) route — the HTTP/2 and HTTP/3 counterpart of the
+  HTTP/1.1 bypass closed in issue #4390. `check_host_authority_consistency()`
+  now returns 400 when both are absent. `:authority`-only (the usual H2/H3
+  client shape, including RFC 8441 / RFC 9220 Extended CONNECT) and Host-only
+  remain valid. HTTP/1.1 is unchanged and still owned by
+  `check_protocol_headers()`. **Operator action**: any HTTP/2 or HTTP/3 client
+  that omitted both `:authority` and Host (non-conformant scanners, some raw
+  frames) will start seeing `400`
+  `{"error":"Request is missing both :authority and Host"}` instead of being
+  routed. Send `:authority` or Host.
+
 - **`request_mirror` denies cross-origin query credentials by default**
   (issue #4295). Sensitive query pairs (`access_token`, `api_key`,
   delimiter-bounded `token`/`sig`/`signature` including `oauth_token` and
@@ -24,6 +40,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `forward_sensitive_query_allowlist`. Mirror logs still omit the entire query.
 
 ### Fixed
+
+- **Injector inbound capture excludes kubelet HTTP and TCP probe ports**
+  (issue #4431). `startupProbe` / `readinessProbe` / `livenessProbe` `httpGet`
+  and `tcpSocket` ports on every container in the pod are unioned into the
+  inbound exclusion set (named ports resolve against that container's
+  `ports`). `exec` and `grpc` probes are skipped. Unresolved named ports fail
+  admission rather than leaving the probe captured. Explicit
+  `excludeInboundPorts` annotations and `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS`
+  still win.
 
 - **Linux GNU release ABI floor is now GLIBC_2.34** (issue #4301). Generic
   `ferrum-edge-linux-{x86_64,aarch64}` and `ferrum-cni-linux-{x86_64,aarch64}`
@@ -53,6 +78,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING — injected Ferrum is a Kubernetes native sidecar**
+  (issue #4430). The webhook now emits `ferrum-edge` under `spec.initContainers`
+  with `restartPolicy: Always`, plus exec startup and readiness probes against
+  loopback `/health` (not `/live`). Capture rules (`ferrum-edge-init`) run
+  after that startup probe succeeds, so application traffic is not redirected
+  at a proxy that is not listening, and injected Jobs can complete. **Minimum
+  Kubernetes version is 1.29** (native sidecars enabled by default; 1.28
+  requires the `SidecarContainers` feature gate). There is no
+  ordinary-container fallback. **Operator action**: run the injector only on
+  Kubernetes 1.29+ (or 1.28 with the feature gate), then roll injected
+  workloads so new pods pick up the native-sidecar shape; pods that still
+  carry Ferrum in `spec.containers` must be recreated.
+
 - **BREAKING — `ferrum-gateway` `mode=cp` disables the in-cluster K8s controller**
   (issue #4384). The binary still defaults `FERRUM_K8S_CONTROLLER_ENABLED` and
   `FERRUM_K8S_POD_DISCOVERY_ENABLED` to true when `KUBERNETES_SERVICE_HOST` is
@@ -65,6 +103,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   controller, migrate to `charts/ferrum-mesh` (`controlPlane.enabled=true`).
   Database-backed CP+DP pairs need no change; the documented
   `examples/cp-values.yaml` quickstart now matches the chart's grant surface.
+
+- **BREAKING — Ambient pod-registry migration proofs and publication use one
+  canonical strict grammar** (issue #4249). Durable UDP placement cleanup now
+  reads `PodCaptureSource::list_complete_targets`, the same bounded, all-or-
+  nothing snapshot used by the inbound HBONE relay node bound. A registry leaf
+  that disappears between enumeration and open is skipped as a withdrawn pod,
+  but a present malformed `spiffe_id=` / `ipv4=` / `ipv6=` value, duplicate
+  recognized key, unknown non-empty line, unsafe leaf name, symlink, oversized
+  or non-regular file, ownership mismatch, or other read failure reports
+  `registry_not_synchronized`; several of those body shapes were previously
+  tolerated by migration cleanup. The node-agent writer now applies the same
+  canonical leaf grammar (non-empty, at most 256 bytes, ASCII alphanumeric
+  first, then ASCII alphanumeric / `-` / `_`) before publishing. **Operator
+  action**: before an Ambient UDP placement migration, remove stale hand-
+  authored registry artifacts and let the node-agent regenerate every pod
+  entry; do not publish custom leaf names or body lines outside the documented
+  grammar.
 
 - **BREAKING — `FERRUM_TLS_OFFLOAD_THREADS` nonzero values fail startup**
   (issue #4294). TLS handshake offload is not implemented; a nonzero setting

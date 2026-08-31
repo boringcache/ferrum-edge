@@ -2384,9 +2384,11 @@ pub fn is_udp_hbone_connect_request<B>(req: &Request<B>, env_config: &EnvConfig)
 /// for — its own pod (proved by `terminator_local_ip`, the accepted
 /// connection's own local address) plus a narrow slice-derived inventory for
 /// the topologies that legitimately terminate for a workload other than the
-/// pod the proxy runs in (`Sidecar` / `Ambient` own-identity workload records,
-/// `NodeWaypoint` enrolled pods, `ServiceWaypoint` waypoint-bound backing
-/// workloads). Being declared ANYWHERE in the slice is deliberately not
+/// pod the proxy runs in (`Ambient` own-identity workload records, bounded to
+/// what this node's agent currently enrols; `NodeWaypoint` enrolled pods;
+/// `ServiceWaypoint` waypoint-bound backing workloads — a `Sidecar` shares its
+/// pod's netns and carries no such inventory). Being declared ANYWHERE in the
+/// slice is deliberately not
 /// enough: relaying to another node's workload would dial that pod in
 /// plaintext from this pod's IP, skipping the destination's own
 /// `AuthorizationPolicy` set and arriving as a trusted-looking unauthenticated
@@ -45658,10 +45660,17 @@ pub fn normalize_request_authority_for_signing(
 
 /// Validate HTTP/2 and HTTP/3 `Host`/`:authority` consistency before routing.
 ///
-/// RFC 9113 states that `Host` and `:authority` are not permitted to disagree;
-/// RFC 9114 says that if both are present, they must contain the same value.
-/// Rejecting disagreement here prevents routing/plugin decisions from keying on
-/// one authority while a backend sees another during H2/H3-to-H1 translation.
+/// RFC 9113 §8.3.1 and RFC 9114 §4.3.1 require a request to include either
+/// `:authority` or `Host`. Both absent is malformed: routing would skip
+/// exact/wildcard host tiers and fall through to a catch-all (empty `hosts`)
+/// route. RFC 9113 also states that `Host` and `:authority` are not permitted
+/// to disagree; RFC 9114 says that if both are present, they must contain the
+/// same value. Rejecting disagreement here prevents routing/plugin decisions
+/// from keying on one authority while a backend sees another during H2/H3-to-H1
+/// translation.
+///
+/// `:authority`-only is the usual H2/H3 client shape, including RFC 8441 /
+/// RFC 9220 Extended CONNECT (`:protocol=websocket`), and is accepted.
 pub fn check_host_authority_consistency(
     headers: &hyper::HeaderMap,
     uri: &hyper::Uri,
@@ -45677,7 +45686,16 @@ pub fn check_host_authority_consistency(
         return Some(r#"{"error":"Request contains multiple Host headers"}"#);
     }
 
-    let host = host?;
+    let Some(host) = host else {
+        // RFC 9113 §8.3.1 / RFC 9114 §4.3.1: a request with neither
+        // `:authority` nor Host is malformed. One extra `uri.authority()`
+        // probe, no allocation; the common `:authority`-only path (no Host)
+        // returns None immediately.
+        if uri.authority().is_none() {
+            return Some(r#"{"error":"Request is missing both :authority and Host"}"#);
+        }
+        return None;
+    };
     let Ok(host) = host.to_str() else {
         return Some(r#"{"error":"Host header contains invalid characters"}"#);
     };
@@ -62990,7 +63008,9 @@ mod tests {
     /// not every workload the slice happens to declare.
     #[test]
     fn inbound_hbone_relay_guard_allows_only_the_terminators_own_destinations() {
-        use crate::modes::mesh::config::{InboundRelayDenial, MeshConfig};
+        use crate::modes::mesh::config::{
+            InboundRelayDenial, MeshConfig, own_address_port_bounds_from_workloads,
+        };
 
         let own_ip: std::net::IpAddr = "10.1.2.3".parse().expect("own pod IP");
         let own_v6: std::net::IpAddr = "fd00:10:244:1::4".parse().expect("own pod IPv6");
@@ -63014,6 +63034,11 @@ mod tests {
             ],
             inbound_relay_admits_accepted_local_address: true,
             inbound_relay_admits_loopback_namespace: true,
+            // What the apply path projects for an own-pod terminator: the
+            // per-address port bound of the record it owns (issue #4249).
+            inbound_relay_own_address_ports: own_address_port_bounds_from_workloads(&[
+                relay_guard_workload("app", &["10.1.2.3", "fd00:10:244:1::4"], &[8080]),
+            ]),
             ..MeshConfig::default()
         };
         let decide = |host: &str, port: u16, local: Option<std::net::IpAddr>| {
@@ -63106,27 +63131,40 @@ mod tests {
                 crate::modes::mesh::config::MeshInboundRelayDestination {
                     host: crate::modes::mesh::config::MeshInboundRelayHost::Ip(own_ip),
                     ports: vec![8080],
+                    enrollment: Default::default(),
+                    registry_uncontested: true,
                 },
                 crate::modes::mesh::config::MeshInboundRelayDestination {
                     host: crate::modes::mesh::config::MeshInboundRelayHost::Ip(
                         "127.0.0.1".parse().expect("loopback"),
                     ),
                     ports: vec![8080],
+                    enrollment: Default::default(),
+                    registry_uncontested: true,
                 },
                 crate::modes::mesh::config::MeshInboundRelayDestination {
                     host: crate::modes::mesh::config::MeshInboundRelayHost::Name(
                         "localhost".to_string(),
                     ),
                     ports: vec![8080],
+                    enrollment: Default::default(),
+                    registry_uncontested: true,
                 },
                 crate::modes::mesh::config::MeshInboundRelayDestination {
                     host: crate::modes::mesh::config::MeshInboundRelayHost::Name(
                         "app.localhost".to_string(),
                     ),
                     ports: vec![8080],
+                    enrollment: Default::default(),
+                    registry_uncontested: true,
                 },
             ],
             inbound_relay_admits_accepted_local_address: true,
+            // What the apply path projects for an own-pod terminator: the
+            // per-address port bound of the record it owns (issue #4249).
+            inbound_relay_own_address_ports: own_address_port_bounds_from_workloads(&[
+                relay_guard_workload("app", &["10.1.2.3", "127.0.0.1"], &[8080]),
+            ]),
             ..MeshConfig::default()
         };
         let ambient_decide = |host: &str, port: u16| {
@@ -63237,10 +63275,14 @@ mod tests {
                 MeshInboundRelayDestination {
                     host: MeshInboundRelayHost::Name("localhost.".to_string()),
                     ports: vec![8080],
+                    enrollment: Default::default(),
+                    registry_uncontested: true,
                 },
                 MeshInboundRelayDestination {
                     host: MeshInboundRelayHost::Name("app.localhost".to_string()),
                     ports: vec![8080],
+                    enrollment: Default::default(),
+                    registry_uncontested: true,
                 },
             ],
             ..MeshConfig::default()
@@ -63261,11 +63303,14 @@ mod tests {
 
     #[test]
     fn inbound_hbone_relay_proxy_normalizes_bracketed_ipv6_authority() {
-        use crate::modes::mesh::config::MeshConfig;
+        use crate::modes::mesh::config::{MeshConfig, own_address_port_bounds_from_workloads};
 
         let mesh = MeshConfig {
             workloads: vec![relay_guard_workload("app", &["fd00:10:244:1::4"], &[8080])],
             inbound_relay_admits_accepted_local_address: true,
+            inbound_relay_own_address_ports: own_address_port_bounds_from_workloads(&[
+                relay_guard_workload("app", &["fd00:10:244:1::4"], &[8080]),
+            ]),
             ..MeshConfig::default()
         };
         let authority: http::uri::Authority = "[fd00:10:244:1::4]:8080".parse().unwrap();
