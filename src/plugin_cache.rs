@@ -6448,7 +6448,7 @@ impl PluginCache {
                 inner.insert(proto, build_protocol_entry(plugins, proto));
             }
             protocol_snapshot.proxy.insert(proxy_key.clone(), inner);
-            grpc_web_proxy.insert(proxy_key, build_grpc_web_protocol_entry(plugins));
+            grpc_web_proxy.insert(proxy_key.clone(), build_grpc_web_protocol_entry(plugins));
         }
         protocol_snapshot.grpc_web_proxy = grpc_web_proxy;
 
