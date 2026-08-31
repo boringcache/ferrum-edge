@@ -34,8 +34,7 @@ fn parse_chart_app_version(chart_yaml: &str, chart_path: &str) -> String {
 #[test]
 fn chart_app_versions_match_cargo_toml() {
     let cargo_version = parse_cargo_version();
-    let gateway =
-        parse_chart_app_version(GATEWAY_CHART_YAML, "charts/ferrum-gateway/Chart.yaml");
+    let gateway = parse_chart_app_version(GATEWAY_CHART_YAML, "charts/ferrum-gateway/Chart.yaml");
     let mesh = parse_chart_app_version(MESH_CHART_YAML, "charts/ferrum-mesh/Chart.yaml");
 
     assert_eq!(
@@ -102,9 +101,7 @@ fn mesh_workloads_use_image_helper_not_raw_tag() {
         ),
         (
             "templates/east-west-gateway-deployment.yaml",
-            include_str!(
-                "../../../charts/ferrum-mesh/templates/east-west-gateway-deployment.yaml"
-            ),
+            include_str!("../../../charts/ferrum-mesh/templates/east-west-gateway-deployment.yaml"),
         ),
     ] {
         assert!(
