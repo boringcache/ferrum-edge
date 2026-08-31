@@ -597,9 +597,8 @@ fn k8s_pod_discovery_does_not_grant_identity_only_sources_in_excluded_namespaces
         "conditions": [{"type": "Ready", "status": "True"}]
     });
 
-    let options = options().with_excluded_namespaces(build_excluded_namespaces(&[
-        "monitoring".to_string(),
-    ]));
+    let options =
+        options().with_excluded_namespaces(build_excluded_namespaces(&["monitoring".to_string()]));
     let translation = translate_k8s_objects(
         &[
             node("node-a", "node-uid-a"),
