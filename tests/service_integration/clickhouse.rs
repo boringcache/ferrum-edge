@@ -82,8 +82,7 @@ async fn wait_clickhouse_ready(client: &reqwest::Client, url: &str) -> Result<()
         match client.get(&ping).send().await {
             Ok(response) if response.status().is_success() => {
                 let body = response.text().await.unwrap_or_default();
-                if body.trim().eq_ignore_ascii_case("ok.")
-                    || body.trim().eq_ignore_ascii_case("ok")
+                if body.trim().eq_ignore_ascii_case("ok.") || body.trim().eq_ignore_ascii_case("ok")
                 {
                     return Ok(());
                 }
@@ -154,23 +153,16 @@ async fn clickhouse_post(
 }
 
 async fn apply_ddl(fixture: &ClickHouseFixture) -> Result<(), String> {
-    clickhouse_post(
-        fixture,
-        &[("multiquery", "1")],
-        CHARGES_DDL.to_string(),
-    )
-    .await
-    .map(|_| ())
+    clickhouse_post(fixture, &[("multiquery", "1")], CHARGES_DDL.to_string())
+        .await
+        .map(|_| ())
 }
 
 fn insert_query() -> String {
     "INSERT INTO charges_raw FORMAT JSONEachRow".to_string()
 }
 
-async fn insert_json_each_row(
-    fixture: &ClickHouseFixture,
-    body: String,
-) -> Result<(), String> {
+async fn insert_json_each_row(fixture: &ClickHouseFixture, body: String) -> Result<(), String> {
     clickhouse_post(
         fixture,
         &[("database", "ferrum"), ("query", &insert_query())],
@@ -240,10 +232,9 @@ fn grpc_summary(request_id: &str, consumer: &str) -> TransactionSummary {
 
 fn unicode_summary(request_id: &str, consumer: &str) -> TransactionSummary {
     let mut summary = http_summary(request_id, consumer);
-    summary.metadata.insert(
-        "consumer_name".to_string(),
-        "消费者-münchen".to_string(),
-    );
+    summary
+        .metadata
+        .insert("consumer_name".to_string(), "消费者-münchen".to_string());
     summary
 }
 
@@ -357,17 +348,10 @@ async fn wait_for_count(
     where_clause: &str,
     at_least: u64,
 ) -> Result<u64, String> {
-    let query = format!(
-        "SELECT count() FROM ferrum.charges_raw FINAL WHERE {where_clause}"
-    );
+    let query = format!("SELECT count() FROM ferrum.charges_raw FINAL WHERE {where_clause}");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
-        let body = clickhouse_post(
-            fixture,
-            &[("query", query.as_str())],
-            String::new(),
-        )
-        .await?;
+        let body = clickhouse_post(fixture, &[("query", query.as_str())], String::new()).await?;
         let count = body.trim().parse::<u64>().unwrap_or(0);
         if count >= at_least {
             return Ok(count);
@@ -394,10 +378,7 @@ fn json_i64(value: &Value) -> Option<i64> {
         .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
 }
 
-async fn select_row(
-    fixture: &ClickHouseFixture,
-    where_clause: &str,
-) -> Result<Value, String> {
+async fn select_row(fixture: &ClickHouseFixture, where_clause: &str) -> Result<Value, String> {
     let query = format!(
         "SELECT event_id, toUnixTimestamp64Nano(received_at) AS received_at, \
          node_id, namespace, consumer_id, consumer_name, proxy_id, proxy_name, \
