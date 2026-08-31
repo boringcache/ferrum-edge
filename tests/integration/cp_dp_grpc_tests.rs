@@ -5800,16 +5800,13 @@ async fn open_configsync_stream(
     addr: SocketAddr,
     subject: &str,
 ) -> tonic::Streaming<ferrum_edge::grpc::proto::ConfigUpdate> {
-    let channel = tonic::transport::Channel::from_shared(format!(
-        "http://127.0.0.1:{}",
-        addr.port()
-    ))
-    .unwrap()
-    .connect()
-    .await
-    .unwrap();
-    let mut client =
-        ferrum_edge::grpc::proto::config_sync_client::ConfigSyncClient::new(channel);
+    let channel =
+        tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{}", addr.port()))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+    let mut client = ferrum_edge::grpc::proto::config_sync_client::ConfigSyncClient::new(channel);
     let mut request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: subject.to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
@@ -5817,12 +5814,9 @@ async fn open_configsync_stream(
         real_ip_header: Some(String::new()),
         supports_heartbeat: true,
     });
-    let token = dp_client::generate_dp_jwt_with_issuer(
-        TEST_JWT_SECRET,
-        subject,
-        TEST_DEFAULT_ISSUER,
-    )
-    .unwrap();
+    let token =
+        dp_client::generate_dp_jwt_with_issuer(TEST_JWT_SECRET, subject, TEST_DEFAULT_ISSUER)
+            .unwrap();
     request.metadata_mut().insert(
         "authorization",
         tonic::metadata::MetadataValue::try_from(format!("Bearer {token}")).unwrap(),
@@ -5834,14 +5828,12 @@ async fn open_mesh_subscribe_stream(
     addr: SocketAddr,
     subject: &str,
 ) -> tonic::Streaming<ferrum_edge::grpc::proto::MeshConfigUpdate> {
-    let channel = tonic::transport::Channel::from_shared(format!(
-        "http://127.0.0.1:{}",
-        addr.port()
-    ))
-    .unwrap()
-    .connect()
-    .await
-    .unwrap();
+    let channel =
+        tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{}", addr.port()))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
     let mut client =
         ferrum_edge::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient::new(channel);
     let mut request = tonic::Request::new(ferrum_edge::grpc::proto::MeshSubscribeRequest {
@@ -5973,9 +5965,7 @@ async fn wait_for_shared_active_streams(
 #[tokio::test(flavor = "multi_thread")]
 async fn rejected_native_stream_flood_keeps_all_shared_state_bounded() {
     let harness = start_native_admission_harness(
-        native_limits_for(
-            ferrum_edge::grpc::admission::CpGrpcAdmissionRejection::TotalStreams,
-        ),
+        native_limits_for(ferrum_edge::grpc::admission::CpGrpcAdmissionRejection::TotalStreams),
         Duration::from_secs(30),
     )
     .await;
@@ -6113,9 +6103,7 @@ async fn start_severable_native_admission_server() -> SeverableNativeAdmissionSe
         .unwrap();
     let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
     runtime.spawn(async move {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         if addr_tx.send(addr).is_err() {
             return;
@@ -6180,11 +6168,11 @@ async fn native_stream_permits_survive_lag_recovery_then_release_on_close() {
     assert!(mesh_stream.message().await.unwrap().is_some());
     assert_eq!(harness.admission.active_streams(), 1);
     for _ in 0..8 {
-        let _ = harness.mesh_tx.send(
-            ferrum_edge::grpc::mesh_server::MeshConfigBroadcast::Full(Arc::clone(
-                &snapshot,
-            )),
-        );
+        let _ = harness
+            .mesh_tx
+            .send(ferrum_edge::grpc::mesh_server::MeshConfigBroadcast::Full(
+                Arc::clone(&snapshot),
+            ));
     }
     let _ = timeout(Duration::from_secs(5), mesh_stream.message()).await;
     assert_eq!(harness.admission.active_streams(), 1);
@@ -6200,12 +6188,8 @@ async fn native_configsync_rejects_unsafe_node_id_before_allocation() {
         Duration::from_secs(30),
     )
     .await;
-    let token = dp_client::generate_dp_jwt_with_issuer(
-        TEST_JWT_SECRET,
-        "dp",
-        TEST_DEFAULT_ISSUER,
-    )
-    .unwrap();
+    let token =
+        dp_client::generate_dp_jwt_with_issuer(TEST_JWT_SECRET, "dp", TEST_DEFAULT_ISSUER).unwrap();
     let mut client = connect_client_with_token!(harness.addr, token);
     let status = client
         .subscribe(tonic::Request::new(

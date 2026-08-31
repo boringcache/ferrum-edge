@@ -345,6 +345,11 @@ impl MeshGrpcServer {
         MeshConfigSyncServer::new(self)
     }
 
+    /// Shared admission controller, for asserting stream/node occupancy.
+    ///
+    /// Reachable only from the external `tests/` crate, so the bin target sees
+    /// it as dead — same as the constructors above.
+    #[allow(dead_code)]
     pub fn admission(&self) -> CpGrpcAdmissionController {
         self.admission.clone()
     }
