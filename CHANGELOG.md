@@ -146,7 +146,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`api_chargeback_sink` ClickHouse JSONEachRow wire contract is gated in CI**
   (issue #4441). A static integration test parses
   `migrations/clickhouse/0001_charges.sql` and asserts the serializer's
-  emitted keys and JSON value kinds against the 26-column `ferrum.charges_raw`
+  emitted keys and JSON value kinds against the 25-column `ferrum.charges_raw`
   table (native fully-populated rows and the identity projection). The Service
   Integration job boots `clickhouse/clickhouse-server:24.8` and round-trips
   HTTP, gRPC, stream, Unicode, max-integer, and durable-artifact replay

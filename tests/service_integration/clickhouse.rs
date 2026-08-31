@@ -116,6 +116,9 @@ async fn start_clickhouse() -> Result<ClickHouseFixture, BoxError> {
 }
 
 fn clickhouse_url_with_query(base: &str, params: &[(&str, &str)]) -> String {
+    if params.is_empty() {
+        return base.to_string();
+    }
     let mut url = url::Url::parse(base).expect("ClickHouse fixture URL");
     {
         let mut pairs = url.query_pairs_mut();
@@ -124,6 +127,44 @@ fn clickhouse_url_with_query(base: &str, params: &[(&str, &str)]) -> String {
         }
     }
     url.to_string()
+}
+
+/// First ~2000 chars of a ClickHouse HTTP body for fixture errors.
+/// The `Code: NNN. DB::Exception: …` line must survive into the message.
+fn clickhouse_error_body(text: &str) -> String {
+    const LIMIT: usize = 2000;
+    let trimmed = text.trim();
+    let mut chars = trimmed.chars();
+    let bounded: String = chars.by_ref().take(LIMIT).collect();
+    if chars.next().is_some() {
+        format!("{bounded}...")
+    } else {
+        bounded
+    }
+}
+
+/// Split `0001_charges.sql` into ClickHouse statements.
+///
+/// Line comments are stripped first so the `--` block before
+/// `charges_hourly` is not a statement of its own. The file's only
+/// string literal is `DateTime64(9, 'UTC')`, which has no semicolon,
+/// so splitting the comment-stripped copy on `;` is safe.
+fn split_clickhouse_statements(sql: &str) -> Vec<String> {
+    let mut without_comments = String::new();
+    for line in sql.lines() {
+        let code = match line.find("--") {
+            Some(idx) => &line[..idx],
+            None => line,
+        };
+        without_comments.push_str(code);
+        without_comments.push('\n');
+    }
+    without_comments
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 async fn clickhouse_post(
@@ -141,21 +182,35 @@ async fn clickhouse_post(
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("ClickHouse HTTP {status} ({})", text.len()));
+        return Err(format!(
+            "ClickHouse HTTP {status}: {}",
+            clickhouse_error_body(&text)
+        ));
     }
     if text.contains("Code:") || text.contains("Exception") {
         return Err(format!(
-            "ClickHouse exception in success body ({})",
-            text.len()
+            "ClickHouse exception in success body: {}",
+            clickhouse_error_body(&text)
         ));
     }
     Ok(text)
 }
 
 async fn apply_ddl(fixture: &ClickHouseFixture) -> Result<(), String> {
-    clickhouse_post(fixture, &[("multiquery", "1")], CHARGES_DDL.to_string())
-        .await
-        .map(|_| ())
+    let statements = split_clickhouse_statements(CHARGES_DDL);
+    for (index, statement) in statements.iter().enumerate() {
+        let ordinal = index + 1;
+        let total = statements.len();
+        match clickhouse_post(fixture, &[], statement.clone()).await {
+            Ok(_) => {}
+            Err(error) => {
+                return Err(format!(
+                    "DDL statement {ordinal} of {total} failed: {error}"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn insert_query() -> String {

@@ -302,7 +302,7 @@ multi-generation sinks never produce unitless rollups.
 The sink serializes each `ChargeEvent` as ClickHouse `JSONEachRow` and inserts
 with `INSERT INTO <table> FORMAT JSONEachRow` (no explicit column list).
 ClickHouse maps JSON object keys to physical column names. The native,
-unprojected row is the 26-column `ferrum.charges_raw` contract:
+unprojected row is the 25-column `ferrum.charges_raw` contract:
 
 | JSON key | JSON kind | ClickHouse type |
 |---|---|---|

@@ -102,7 +102,7 @@ under parallel jobs) and do not blanket-retry unrelated container errors.
 | Redpanda | `redpandadata/redpanda:v24.2.4` | Kafka API on external listener `127.0.0.1:<mapped-port>`; auto-topic-create disabled; readiness via librdkafka metadata; topics created with `rpk` |
 | MySQL | `mysql:8.4` | isolated `ferrum` database; readiness polled with the same SQLx Any driver used by migrations/runtime persistence |
 | Hydra | `oryd/hydra:v2.2.0` | `serve all --dev` with `DSN=memory`; host ports allocated outside the ephemeral range for public (4444) and admin (4445); opaque access tokens; clients seeded via admin API; login/consent accepted through admin challenge APIs (no external IdP). Readiness polled via OIDC discovery + admin API |
-| ClickHouse | `clickhouse/clickhouse-server:24.8` | HTTP on mapped `8123`; readiness polled via `/ping`; baseline `migrations/clickhouse/0001_charges.sql` applied over `multiquery=1` |
+| ClickHouse | `clickhouse/clickhouse-server:24.8` | HTTP on mapped `8123`; readiness polled via `/ping`; baseline `migrations/clickhouse/0001_charges.sql` applied as one HTTP POST per statement |
 
 Readiness is confirmed by **active polling** (Consul leader endpoint; LDAP
 `ldapadd` retry; Redpanda metadata fetch; a MySQL connection; Hydra discovery;

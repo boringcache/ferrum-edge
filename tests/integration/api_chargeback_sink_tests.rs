@@ -76,6 +76,30 @@ fn clickhouse_url_with_query(base: &str, params: &[(&str, &str)]) -> String {
     url.to_string()
 }
 
+/// Split `0001_charges.sql` into ClickHouse statements.
+///
+/// Line comments are stripped first so the `--` block before
+/// `charges_hourly` is not a statement of its own. The file's only
+/// string literal is `DateTime64(9, 'UTC')`, which has no semicolon,
+/// so splitting the comment-stripped copy on `;` is safe.
+fn split_clickhouse_statements(sql: &str) -> Vec<String> {
+    let mut without_comments = String::new();
+    for line in sql.lines() {
+        let code = match line.find("--") {
+            Some(idx) => &line[..idx],
+            None => line,
+        };
+        without_comments.push_str(code);
+        without_comments.push('\n');
+    }
+    without_comments
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Durable export must pin `wait_for_async_insert=1` on the on-wire INSERT URL
 /// even when Ferrum omits both async settings, so a ClickHouse user/profile
 /// default cannot enable fire-and-forget async inserts. Exercises the plugin's
@@ -150,21 +174,23 @@ async fn clickhouse_insert_round_trip_when_configured() {
         return;
     };
     let client = reqwest::Client::new();
-    let ddl = include_str!("../../migrations/clickhouse/0001_charges.sql");
-    let ddl_response = client
-        .post(clickhouse_url_with_query(
-            &clickhouse_url,
-            &[("multiquery", "1")],
-        ))
-        .body(ddl)
-        .send()
-        .await
-        .expect("ClickHouse DDL request should send");
-    assert!(
-        ddl_response.status().is_success(),
-        "DDL failed: {}",
-        ddl_response.text().await.unwrap_or_default()
-    );
+    let statements = split_clickhouse_statements(CHARGES_RAW_DDL);
+    for (index, statement) in statements.iter().enumerate() {
+        let ddl_response = client
+            .post(&clickhouse_url)
+            .body(statement.clone())
+            .send()
+            .await
+            .expect("ClickHouse DDL request should send");
+        let status = ddl_response.status();
+        let body = ddl_response.text().await.unwrap_or_default();
+        assert!(
+            status.is_success(),
+            "DDL statement {} of {} failed: {status}: {body}",
+            index + 1,
+            statements.len()
+        );
+    }
 
     let temp = tempfile::tempdir().unwrap();
     let config = json!({
@@ -269,7 +295,7 @@ async fn clickhouse_insert_round_trip_when_configured() {
 
 const CHARGES_RAW_DDL: &str = include_str!("../../migrations/clickhouse/0001_charges.sql");
 
-const CHARGES_RAW_COLUMN_COUNT: usize = 26;
+const CHARGES_RAW_COLUMN_COUNT: usize = 25;
 
 const OPTIONAL_NATIVE_KEYS: &[&str] = &[
     "consumer_name",
@@ -580,7 +606,12 @@ fn identity_schema() -> Value {
 }
 
 #[test]
-fn charges_raw_ddl_declares_twenty_six_physical_columns() {
+fn charges_raw_ddl_matches_native_field_order() {
+    assert_eq!(
+        NATIVE_FIELD_ORDER.len(),
+        CHARGES_RAW_COLUMN_COUNT,
+        "NATIVE_FIELD_ORDER must list exactly {CHARGES_RAW_COLUMN_COUNT} keys"
+    );
     let columns = parse_charges_raw_columns(CHARGES_RAW_DDL);
     assert_eq!(
         columns.len(),
@@ -589,6 +620,28 @@ fn charges_raw_ddl_declares_twenty_six_physical_columns() {
     );
     let names: Vec<&str> = columns.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(names, NATIVE_FIELD_ORDER);
+}
+
+#[test]
+fn baseline_charges_ddl_splits_into_five_statements() {
+    let statements = split_clickhouse_statements(CHARGES_RAW_DDL);
+    assert_eq!(statements.len(), 5);
+    assert!(statements[0].starts_with("CREATE DATABASE"));
+    assert!(statements[1].contains("CREATE TABLE"));
+    assert!(statements[1].contains("ferrum.charges_raw"));
+    assert!(statements[2].contains("charges_hourly"));
+    assert!(statements[3].contains("charges_daily"));
+    assert!(statements[4].contains("charges_monthly"));
+    for statement in &statements {
+        assert!(
+            !statement.contains("--"),
+            "statement must not retain line comments: {statement}"
+        );
+        assert!(
+            !statement.contains(';'),
+            "statement must not retain the terminator: {statement}"
+        );
+    }
 }
 
 #[test]
