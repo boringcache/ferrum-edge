@@ -4,7 +4,10 @@ use std::collections::HashMap;
 
 const PRODUCTION_DOCKERFILES: &[(&str, &str)] = &[
     ("Dockerfile", include_str!("../../../Dockerfile")),
-    ("Dockerfile.release", include_str!("../../../Dockerfile.release")),
+    (
+        "Dockerfile.release",
+        include_str!("../../../Dockerfile.release"),
+    ),
     ("Dockerfile.test", include_str!("../../../Dockerfile.test")),
 ];
 
@@ -17,7 +20,11 @@ const FLOATING_RUST_TAGS: &[&str] = &["latest", "stable", "nightly", "beta"];
 /// exactly the failure this gate exists to prevent.
 fn instruction_line(line: &str) -> &str {
     let trimmed = line.trim();
-    if trimmed.starts_with('#') { "" } else { trimmed }
+    if trimmed.starts_with('#') {
+        ""
+    } else {
+        trimmed
+    }
 }
 
 fn parse_arg_defaults(dockerfile: &str) -> HashMap<String, String> {
@@ -38,11 +45,7 @@ fn parse_arg_defaults(dockerfile: &str) -> HashMap<String, String> {
 fn from_image_token(line: &str) -> Option<String> {
     let trimmed = instruction_line(line);
     let rest = trimmed.strip_prefix("FROM ")?;
-    let image = rest
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .trim();
+    let image = rest.split_whitespace().next().unwrap_or_default().trim();
     if image.is_empty() {
         return None;
     }
@@ -50,14 +53,14 @@ fn from_image_token(line: &str) -> Option<String> {
 }
 
 fn is_local_stage_reference(image: &str) -> bool {
-    !image.contains('/')
-        && !image.contains('@')
-        && !image.contains(':')
-        && !image.starts_with("${")
+    !image.contains('/') && !image.contains('@') && !image.contains(':') && !image.starts_with("${")
 }
 
 fn resolve_image_reference(image: &str, arg_defaults: &HashMap<String, String>) -> String {
-    if let Some(var) = image.strip_prefix("${").and_then(|name| name.strip_suffix('}')) {
+    if let Some(var) = image
+        .strip_prefix("${")
+        .and_then(|name| name.strip_suffix('}'))
+    {
         return arg_defaults
             .get(var)
             .cloned()
@@ -91,7 +94,10 @@ fn assert_rust_channel_approved(file: &str, line_no: usize, line: &str, resolved
         return;
     }
 
-    let tag = resolved.rsplit_once(':').map(|(_, tag)| tag).unwrap_or("latest");
+    let tag = resolved
+        .rsplit_once(':')
+        .map(|(_, tag)| tag)
+        .unwrap_or("latest");
 
     assert!(
         !FLOATING_RUST_TAGS.contains(&tag),
