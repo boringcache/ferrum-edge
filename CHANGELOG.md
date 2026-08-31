@@ -106,6 +106,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Identity-only NodeWaypoint assertion grants require ambient enrollment.**
+  Kubernetes pod discovery no longer lets a same-node identity-only pod
+  enter a NodeWaypoint's HBONE assertion inventory merely by sharing that
+  node. The pod must pass the node-agent ambient enrollment predicate
+  (`ferrum.io/mesh: enabled` or `ferrum.io/inject: true`, and not
+  host-network, sidecar-injected, or an excluded namespace).
+
 - **Injector inbound capture excludes kubelet HTTP and TCP probe ports**
   (issue #4431). `startupProbe` / `readinessProbe` / `livenessProbe` `httpGet`
   and `tcpSocket` ports on every container in the pod are unioned into the
