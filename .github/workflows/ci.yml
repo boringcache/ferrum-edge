@@ -1139,14 +1139,14 @@ jobs:
           # a future cargo-deny release can't silently change gate behavior.
           tool: cargo-deny@0.19.9
 
-      - name: cargo-deny (advisories, bans, sources)
+      - name: cargo-deny (advisories, bans, sources, licenses)
         # BLOCKING dependency-security gate. A new RUSTSEC advisory not
-        # explicitly time-boxed in deny.toml fails the PR. License checks are
-        # intentionally outside this gate (see deny.toml header). The weekly
+        # explicitly time-boxed in deny.toml fails the PR. The `[licenses]`
+        # allowlist and confidence threshold are blocking too. The weekly
         # .github/workflows/dependency-audit.yml re-runs this plus the
         # advisory-patch-status check.
         # Policy: docs/dependency-policy.md.
-        run: cargo deny check advisories bans sources
+        run: cargo deny check advisories bans sources licenses
 
       - name: Advisory-exception expiry
         # cargo-deny accepts ignores without the repo's [expires:] convention, so

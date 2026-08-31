@@ -78,6 +78,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- CI `dependency-audit` jobs now run `cargo deny check licenses` alongside
+  advisories, bans, and sources (issue #4439). The `[licenses]` allowlist and
+  confidence threshold in `deny.toml` are blocking on every PR and in the weekly
+  `dependency-audit` workflow.
+
 - **BREAKING — injected Ferrum is a Kubernetes native sidecar**
   (issue #4430). The webhook now emits `ferrum-edge` under `spec.initContainers`
   with `restartPolicy: Always`, plus exec startup and readiness probes against
