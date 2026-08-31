@@ -389,19 +389,13 @@ async fn select_row(fixture: &ClickHouseFixture, where_clause: &str) -> Result<V
          FROM ferrum.charges_raw FINAL WHERE {where_clause} \
          FORMAT JSONEachRow"
     );
-    let body = clickhouse_post(
-        fixture,
-        &[("query", query.as_str())],
-        String::new(),
-    )
-    .await?;
+    let body = clickhouse_post(fixture, &[("query", query.as_str())], String::new()).await?;
     let line = body
         .lines()
         .find(|line| !line.trim().is_empty())
         .ok_or_else(|| format!("no JSONEachRow for {where_clause}"))?;
-    serde_json::from_str(line).map_err(|error| {
-        format!("ClickHouse JSONEachRow parse failed: {error}")
-    })
+    serde_json::from_str(line)
+        .map_err(|error| format!("ClickHouse JSONEachRow parse failed: {error}"))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -436,7 +430,9 @@ async fn clickhouse_ddl_jsoneachrow_round_trip() {
         .expect("chargeback live integration requires start_background_tasks");
     plugin.commit_background_tasks();
 
-    plugin.log(&http_summary("it-http", "it-http-consumer")).await;
+    plugin
+        .log(&http_summary("it-http", "it-http-consumer"))
+        .await;
     plugin
         .log(&grpc_summary("it-grpc", "it-grpc-consumer"))
         .await;
@@ -515,10 +511,7 @@ async fn clickhouse_ddl_jsoneachrow_round_trip() {
     )
     .await
     .expect("Unicode row");
-    assert_eq!(
-        unicode_row["consumer_name"],
-        json!("消费者-münchen")
-    );
+    assert_eq!(unicode_row["consumer_name"], json!("消费者-münchen"));
 
     let stream_row = select_row(
         &fixture,
@@ -546,13 +539,9 @@ async fn clickhouse_ddl_jsoneachrow_round_trip() {
         .await
         .expect("re-applying baseline DDL must stay compatible");
 
-    wait_for_count(
-        &fixture,
-        "event_id='evt-extreme-max'",
-        1,
-    )
-    .await
-    .expect("extreme row must land");
+    wait_for_count(&fixture, "event_id='evt-extreme-max'", 1)
+        .await
+        .expect("extreme row must land");
     let extreme_row = select_row(&fixture, "event_id='evt-extreme-max'")
         .await
         .expect("extreme row");
@@ -596,11 +585,9 @@ async fn clickhouse_ddl_jsoneachrow_round_trip() {
     let mut projected = extreme_event();
     projected.event_id = "evt-identity-projection".to_string();
     projected.consumer_id = "it-identity".to_string();
-    let projected_body = serialize_json_each_row_projected(
-        std::slice::from_ref(&projected),
-        Some(&projection),
-    )
-    .expect("identity projection must serialize");
+    let projected_body =
+        serialize_json_each_row_projected(std::slice::from_ref(&projected), Some(&projection))
+            .expect("identity projection must serialize");
     insert_json_each_row(&fixture, projected_body)
         .await
         .expect("identity-projected JSONEachRow must insert");
