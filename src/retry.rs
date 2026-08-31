@@ -284,6 +284,12 @@ pub fn http_observability_error_class(connection_error: bool, status: u16) -> Op
 /// granular [`ErrorClass`]. Pre-wire classes collapse to
 /// `connection_failure`; `ReadWriteTimeout` is `backend_timeout`; every
 /// other class is `backend_error`.
+///
+/// The dispatch paths derive the header from `BackendResponse` state rather
+/// than from a class, so this mapping exists for the external `tests/` crate
+/// to assert the granular-to-coarse relationship in one place. `tests/` is a
+/// separate crate, so the `ferrum-edge` binary target sees it as dead.
+#[allow(dead_code)]
 #[inline]
 pub fn x_gateway_error_token_for_class(class: ErrorClass) -> &'static str {
     if !request_reached_wire(class) {

@@ -646,10 +646,9 @@ fn representative_exposition() -> String {
 
     let mut failed = make_summary("contract-5xx-proxy");
     failed.response_status_code = 503;
-    failed.metadata.insert(
-        "rejection_phase".to_string(),
-        "overload".to_string(),
-    );
+    failed
+        .metadata
+        .insert("rejection_phase".to_string(), "overload".to_string());
     registry.record(&failed);
 
     let mut mesh_http = make_summary("mesh-http");
