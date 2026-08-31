@@ -302,10 +302,7 @@ impl CpGrpcAdmissionRejection {
 
 /// Record a native admission refusal without accepting any caller-controlled
 /// metric label or log field.
-pub fn record_native_rejection(
-    surface: CpGrpcStreamSurface,
-    rejection: CpGrpcAdmissionRejection,
-) {
+pub fn record_native_rejection(surface: CpGrpcStreamSurface, rejection: CpGrpcAdmissionRejection) {
     tracing::warn!(
         method = surface.method(),
         reason = rejection.metric_reason(),
@@ -668,10 +665,6 @@ impl CpGrpcAdmissionController {
             // delete state that may belong to a successor generation.
             Entry::Vacant(_) => false,
         }
-    }
-
-    fn unregister_node(&self, node_key: &str) -> bool {
-        self.unregister_node_with_cleanup(node_key, || {})
     }
 
     fn release_stream(&self, namespace: &str, principal_key: &str) {

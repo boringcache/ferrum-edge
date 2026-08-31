@@ -932,10 +932,7 @@ pub fn increment_xds_stream_rejected() {
 
 /// Count one shared CP gRPC stream refusal. `surface` and `reason` are closed
 /// enums at the call site; no namespace, subject, or node id is accepted here.
-pub fn increment_cp_grpc_stream_admission_rejection(
-    surface: &'static str,
-    reason: &'static str,
-) {
+pub fn increment_cp_grpc_stream_admission_rejection(surface: &'static str, reason: &'static str) {
     CP_GRPC_STREAM_ADMISSION_REJECTIONS
         .entry((surface, reason))
         .or_insert_with(|| AtomicU64::new(0))

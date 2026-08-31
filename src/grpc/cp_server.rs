@@ -52,8 +52,8 @@ use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
 use super::admission::{
-    CpGrpcAdmissionController, CpGrpcAdmissionLimits, CpGrpcStreamPermit,
-    CpGrpcStreamSurface, record_native_rejection,
+    CpGrpcAdmissionController, CpGrpcAdmissionLimits, CpGrpcStreamPermit, CpGrpcStreamSurface,
+    record_native_rejection,
 };
 use super::auth::{
     AllowedNamespaces, AuthorizedResponseStream, DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS,
@@ -2136,25 +2136,25 @@ impl ConfigSync for CpGrpcServer {
         // The native request already carries its node id, so all five layers
         // are acquired before broadcast subscription, snapshot filtering /
         // serialization, registry insertion, or response-stream allocation.
-        let admission_permit = match self.admission.reserve_native_stream(
-            &dp_namespace,
-            &identity.subject,
-            &node_id,
-        ) {
-            Ok(permit) => permit,
-            Err(rejection) => {
-                record_native_rejection(CpGrpcStreamSurface::ConfigSync, rejection);
-                let status = rejection.into_native_status();
-                Self::audit_tenant_subscription(
-                    "ConfigSync.Subscribe",
-                    "",
-                    &dp_namespace,
-                    "failure",
-                    status.message(),
-                );
-                return Err(status);
-            }
-        };
+        let admission_permit =
+            match self
+                .admission
+                .reserve_native_stream(&dp_namespace, &identity.subject, &node_id)
+            {
+                Ok(permit) => permit,
+                Err(rejection) => {
+                    record_native_rejection(CpGrpcStreamSurface::ConfigSync, rejection);
+                    let status = rejection.into_native_status();
+                    Self::audit_tenant_subscription(
+                        "ConfigSync.Subscribe",
+                        "",
+                        &dp_namespace,
+                        "failure",
+                        status.message(),
+                    );
+                    return Err(status);
+                }
+            };
         // Register the receiver before loading the initial snapshot so a
         // concurrent CP broadcast is either captured by this stream or already
         // reflected in the loaded snapshot.

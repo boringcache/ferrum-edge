@@ -2278,8 +2278,7 @@ pub async fn run(
     let stream_admission_limits = env_config.xds_admission_limits();
     let mut unbounded_stream_scopes = stream_admission_limits.unbounded_scope_names();
     if !env_config.xds_enabled {
-        unbounded_stream_scopes
-            .retain(|name| *name != "FERRUM_XDS_FIRST_REQUEST_TIMEOUT_SECONDS");
+        unbounded_stream_scopes.retain(|name| *name != "FERRUM_XDS_FIRST_REQUEST_TIMEOUT_SECONDS");
     }
     if unbounded_stream_scopes.is_empty() {
         info!(
@@ -2289,8 +2288,7 @@ pub async fn run(
             max_streams_per_node = stream_admission_limits.max_streams_per_node,
             max_active_nodes = stream_admission_limits.max_active_nodes,
             max_node_id_bytes = stream_admission_limits.max_node_id_bytes,
-            first_request_timeout_seconds =
-                stream_admission_limits.first_request_timeout.as_secs(),
+            first_request_timeout_seconds = stream_admission_limits.first_request_timeout.as_secs(),
             "Shared CP gRPC configuration-stream admission budgets active"
         );
     } else {
@@ -2301,9 +2299,8 @@ pub async fn run(
              memory by cycling node ids. Set finite values for production."
         );
     }
-    let stream_admission = crate::grpc::admission::CpGrpcAdmissionController::new(
-        stream_admission_limits,
-    );
+    let stream_admission =
+        crate::grpc::admission::CpGrpcAdmissionController::new(stream_admission_limits);
     let (grpc_server, update_tx) = CpGrpcServer::builder(config_arc.clone(), grpc_secret.clone())
         .channel_capacity(env_config.cp_broadcast_channel_capacity)
         .admission(stream_admission.clone())
