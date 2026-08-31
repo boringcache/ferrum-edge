@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **WAF inspects UTF-32LE/UTF-32BE request bodies** (issue #4455). A body
+  admitted by the existing content-type gates whose `charset` is `utf-32`,
+  `utf-32le`, or `utf-32be`, or that carries a UTF-32 BOM, is transcoded
+  into the same UTF-8 inspection view UTF-16 already uses, then scanned by
+  level-1 body rules. UTF-32 BOMs are recognized before UTF-16 BOMs so a
+  UTF-32LE BOM (`FF FE 00 00`) is not misdecoded as UTF-16LE. Malformed,
+  truncated, surrogate-range, or out-of-range UTF-32 is not partially
+  decoded; it retains the existing raw/lossy scan. **Operator-visible**: a
+  previously forwarded UTF-32 encoding of a blocked L1 payload (for example
+  `UNION SELECT` as `charset=utf-32le`) now returns 403 under the
+  recommended `mode: enforce` / `paranoia_level: 1` pack. Body content-type,
+  multipart, and binary gates are unchanged. **Operator action**: review WAF
+  monitor logs for the new UTF-32 body matches before using
+  `default_rule_action: enforce` if application payloads legitimately use
+  UTF-32 and contain attack-shaped tokens.
+
 - **BREAKING — HTTP/2 and HTTP/3 requests without `:authority` or Host are rejected with 400**
   (issue #4416). RFC 9113 §8.3.1 and RFC 9114 §4.3.1 require a request to
   include either `:authority` or a Host field. Ferrum previously treated the

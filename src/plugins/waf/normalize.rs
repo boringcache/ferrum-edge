@@ -23,6 +23,12 @@ enum Utf16Endian {
     Big,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Utf32Endian {
+    Little,
+    Big,
+}
+
 /// Maximum number of normalized variants produced per value (excluding the
 /// raw input). Bounds body-scan cost at `O(VARIANTS × bytes × rules)`; the
 /// underlying `RegexSet` matching is linear so this is a hard multiplier.
@@ -93,6 +99,9 @@ pub(super) fn decoded_variants_with_residual(text: &str) -> (Vec<String>, bool) 
 /// UTF-8 bodies return `None` without allocating. UTF-16 output is bounded by
 /// the caller's already-clamped body slice, and malformed/truncated input also
 /// returns `None` so the caller retains its existing lossy raw-byte scan.
+///
+/// UTF-32 BOMs are recognized first (see [`utf32_bom`]): a UTF-32LE BOM is
+/// `FF FE 00 00` and would otherwise be misread as a UTF-16LE BOM.
 pub(super) fn decode_utf16_body(body: &[u8], content_type: Option<&str>) -> Option<String> {
     let bom = utf16_bom(body);
     let declared = declared_utf16_endian(content_type, bom.map(|(endian, _)| endian));
@@ -104,6 +113,29 @@ pub(super) fn decode_utf16_body(body: &[u8], content_type: Option<&str>) -> Opti
         (None, None) => return None,
     };
     decode_utf16(&body[skip..], endian)
+}
+
+/// Decode an already-admitted request body when its representation is UTF-32.
+///
+/// Mirrors [`decode_utf16_body`] exactly: this helper does not decide
+/// eligibility; it only creates the UTF-8 inspection view used by active
+/// request-body rules. Ordinary UTF-8 bodies return `None` without allocating.
+/// UTF-32 output is bounded by the caller's already-clamped body slice (at
+/// most one UTF-8 byte per wire byte). Malformed, truncated, surrogate-range,
+/// or out-of-range input returns `None` so the caller retains its existing
+/// lossy raw-byte scan and whatever encoding specials that view already
+/// raises — the same fail-closed posture as malformed UTF-16.
+pub(super) fn decode_utf32_body(body: &[u8], content_type: Option<&str>) -> Option<String> {
+    let bom = utf32_bom(body);
+    let declared = declared_utf32_endian(content_type, bom.map(|(endian, _)| endian));
+    let (endian, skip) = match (declared, bom) {
+        (Some(declared), Some((bom_endian, skip))) if declared == bom_endian => (declared, skip),
+        (Some(_), Some(_)) => return None,
+        (Some(declared), None) => (declared, 0),
+        (None, Some((bom_endian, skip))) => (bom_endian, skip),
+        (None, None) => return None,
+    };
+    decode_utf32(&body[skip..], endian)
 }
 
 fn declared_utf16_endian(
@@ -141,10 +173,65 @@ fn declared_utf16_endian(
 }
 
 fn utf16_bom(body: &[u8]) -> Option<(Utf16Endian, usize)> {
+    // A UTF-32LE BOM is `FF FE 00 00` and therefore also starts with the
+    // UTF-16LE BOM `FF FE`. Consult the 4-byte marks first so a UTF-32LE
+    // body is never misdecoded as UTF-16LE (issue #4455). UTF-32BE
+    // (`00 00 FE FF`) is not a UTF-16 BOM; the same guard keeps both
+    // 4-byte marks in one place.
+    if utf32_bom(body).is_some() {
+        return None;
+    }
     if body.starts_with(&[0xFF, 0xFE]) {
         Some((Utf16Endian::Little, 2))
     } else if body.starts_with(&[0xFE, 0xFF]) {
         Some((Utf16Endian::Big, 2))
+    } else {
+        None
+    }
+}
+
+fn declared_utf32_endian(
+    content_type: Option<&str>,
+    bom_endian: Option<Utf32Endian>,
+) -> Option<Utf32Endian> {
+    let content_type = content_type?;
+    let mut declared = None;
+    for parameter in content_type.split(';').skip(1) {
+        let Some((name, raw_value)) = parameter.split_once('=') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("charset") {
+            continue;
+        }
+        if declared.is_some() {
+            return None;
+        }
+        let value = raw_value.trim().trim_matches('"');
+        declared =
+            if value.eq_ignore_ascii_case("utf-32le") || value.eq_ignore_ascii_case("utf32le") {
+                Some(Utf32Endian::Little)
+            } else if value.eq_ignore_ascii_case("utf-32be") || value.eq_ignore_ascii_case("utf32be")
+            {
+                Some(Utf32Endian::Big)
+            } else if value.eq_ignore_ascii_case("utf-32") || value.eq_ignore_ascii_case("utf32") {
+                // Bare `charset=utf-16` does not invent little- or big-endian
+                // when no BOM is present: IANA UTF-16 without a BOM is
+                // endian-unspecified, so that path returns `None` and the
+                // caller keeps the raw/lossy scan. Bare `utf-32` follows the
+                // same rule so the two cannot drift.
+                bom_endian
+            } else {
+                None
+            };
+    }
+    declared
+}
+
+fn utf32_bom(body: &[u8]) -> Option<(Utf32Endian, usize)> {
+    if body.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) {
+        Some((Utf32Endian::Little, 4))
+    } else if body.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) {
+        Some((Utf32Endian::Big, 4))
     } else {
         None
     }
@@ -164,6 +251,32 @@ fn decode_utf16(payload: &[u8], endian: Utf16Endian) -> Option<String> {
     });
     for decoded in char::decode_utf16(units) {
         output.push(decoded.ok()?);
+    }
+    Some(output)
+}
+
+fn decode_utf32(payload: &[u8], endian: Utf32Endian) -> Option<String> {
+    if !payload.len().is_multiple_of(4) {
+        return None;
+    }
+    // Each UTF-32 code unit is 4 wire bytes; UTF-8 is at most 4 bytes per
+    // scalar, so the inspection view never exceeds the already-clamped body.
+    let mut output = String::with_capacity(payload.len());
+    // The multiple-of-4 guard above leaves no remainder, so `.0` is the
+    // whole body. Decode directly into `output`; no intermediate buffer.
+    let (quads, _) = payload.as_chunks::<4>();
+    for quad in quads {
+        let unit = match endian {
+            Utf32Endian::Little => u32::from_le_bytes(*quad),
+            Utf32Endian::Big => u32::from_be_bytes(*quad),
+        };
+        // UTF-32 has no surrogate pairs. Code units in the surrogate range
+        // or above U+10FFFF are malformed; fail closed rather than pushing
+        // U+FFFD and forwarding the rest.
+        if (0xD800..=0xDFFF).contains(&unit) || unit > 0x10FFFF {
+            return None;
+        }
+        output.push(char::from_u32(unit)?);
     }
     Some(output)
 }

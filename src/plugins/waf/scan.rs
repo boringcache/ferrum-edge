@@ -257,19 +257,23 @@ impl Waf {
         // encoding specials retains the old raw/lossy path and does no new
         // per-request work. Eligibility was already decided before this
         // scanner runs; decoding must never widen the content-type, multipart,
-        // or binary body gates.
-        let utf16_text = self
+        // or binary body gates. UTF-32 is tried first: a UTF-32LE BOM is
+        // `FF FE 00 00` and would otherwise be stolen by the UTF-16LE BOM.
+        let transcoded_text = self
             .compiled
             .request_body_text_rules_active
-            .then(|| normalize::decode_utf16_body(body, content_type))
+            .then(|| {
+                normalize::decode_utf32_body(body, content_type)
+                    .or_else(|| normalize::decode_utf16_body(body, content_type))
+            })
             .flatten();
-        let text = utf16_text
+        let text = transcoded_text
             .as_deref()
             .map(std::borrow::Cow::Borrowed)
             .unwrap_or_else(|| String::from_utf8_lossy(body));
         // The initial bytes scan saw the wire representation. A transcoded
         // body also needs one scan of its UTF-8 view before layered decoding.
-        if let Some(decoded) = utf16_text.as_deref() {
+        if let Some(decoded) = transcoded_text.as_deref() {
             self.scan_bytes_set(
                 &mut outcome,
                 self.compiled.body_bytes.as_ref(),
