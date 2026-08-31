@@ -33,6 +33,24 @@ RFC 9113 §8.3.1 and RFC 9114 §4.3.1 require either `:authority` or Host. Ferru
 
 **Operator action:** any HTTP/2 or HTTP/3 client that omitted both `:authority` and Host will start seeing `400` `{"error":"Request is missing both :authority and Host"}` instead of being routed. Send `:authority` or Host.
 
+### Ambient pod-registry migration proofs require canonical entries (issue [#4249](https://github.com/ferrum-edge/ferrum-edge/issues/4249))
+
+Durable Ambient UDP placement cleanup now reads the same strict, bounded,
+all-or-nothing pod-registry snapshot as the inbound HBONE relay node bound. A
+leaf that disappears between directory enumeration and open is treated as an
+ordinary pod withdrawal and skipped. Any present malformed optional field,
+duplicate recognized key, unknown non-empty line, unsafe leaf name, symlink,
+oversized or non-regular file, ownership mismatch, or other read failure makes
+the cleanup pass report `registry_not_synchronized`; several malformed body
+shapes were previously tolerated. The node-agent publisher also refuses leaf
+names outside the canonical grammar: non-empty, at most 256 bytes, ASCII
+alphanumeric first, then ASCII alphanumeric, hyphen, or underscore.
+
+**Operator action:** before starting an Ambient UDP placement migration, remove
+stale hand-authored pod-registry artifacts and let the node-agent regenerate
+every pod entry. Any external publisher must use only the documented leaf and
+body grammar; otherwise cleanup/finalize remains fail-closed.
+
 ### HTTP/1.1 requests without a Host header are rejected with 400 (issue [#4390](https://github.com/ferrum-edge/ferrum-edge/issues/4390))
 
 RFC 9112 §3.2.2 requires a 400 when an HTTP/1.1 request lacks a Host field. Ferrum previously only rejected multiple Host fields, so a Host-less origin-form request skipped exact/wildcard host tiers and could fall through to a catch-all (empty `hosts`) route. `check_protocol_headers()` now rejects HTTP/1.1 when both the Host field and the URI authority are absent. HTTP/1.0 still does not require Host. Absolute-form request-targets that already carry an authority are accepted without a Host field. An empty Host value (`Host:` with no tokens) is treated as present-but-invalid and also returns 400 on HTTP/1.1. HTTP/2 and HTTP/3 are unchanged.
