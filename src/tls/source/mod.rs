@@ -605,6 +605,18 @@ impl MaterialError {
             Self::ExecutorUnavailable => "executor_unavailable",
         }
     }
+
+    /// Event-log payload for a load failure.
+    ///
+    /// Closed classes for every variant except oversized, whose redacted
+    /// Display (`exceeds the configured maximum`) is the stable classification
+    /// the event log already documents. Dedup still keys on [`Self::failure_class`].
+    pub fn event_detail(&self) -> String {
+        match self {
+            Self::Oversized { .. } => self.to_string(),
+            _ => self.failure_class().to_string(),
+        }
+    }
 }
 
 pub struct MaterializedMaterial {
@@ -837,6 +849,8 @@ impl TlsSourceExecutor {
         Ok(result)
     }
 
+    /// Process-wide blocking admission bound. Reinstall equality uses this
+    /// getter so the bin target and tests share one reader.
     pub fn max_blocking_concurrency(&self) -> usize {
         self.max_blocking_concurrency
     }
@@ -856,8 +870,8 @@ pub fn install_tls_source_execution_policy(
         Duration::from_secs(timeout_seconds),
     )?;
     if let Some(existing) = TLS_SOURCE_EXECUTION_POLICY.get() {
-        return if existing.max_blocking_concurrency == candidate.max_blocking_concurrency
-            && existing.deadline == candidate.deadline
+        return if existing.max_blocking_concurrency() == candidate.max_blocking_concurrency()
+            && existing.deadline() == candidate.deadline()
         {
             Ok(())
         } else {
@@ -872,8 +886,8 @@ pub fn install_tls_source_execution_policy(
         Ok(()) => Ok(()),
         Err(_) => match TLS_SOURCE_EXECUTION_POLICY.get() {
             Some(existing) => {
-                if existing.max_blocking_concurrency == candidate.max_blocking_concurrency
-                    && existing.deadline == candidate.deadline
+                if existing.max_blocking_concurrency() == candidate.max_blocking_concurrency()
+                    && existing.deadline() == candidate.deadline()
                 {
                     Ok(())
                 } else {

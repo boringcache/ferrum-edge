@@ -233,7 +233,6 @@ impl TlsEventLog {
         // Allocate the id before publication. Gaps after a refused persist are
         // acceptable. Mutate in place and roll back on failure so recording a
         // transition never clones the entire bounded ring.
-        sanitize_event(&mut event);
         event.id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let Ok(mut events) = self.events.lock() else {
             return;
@@ -244,6 +243,23 @@ impl TlsEventLog {
         } else {
             None
         };
+        // Size-check the unsanitized candidate first. Sanitization closes
+        // error classes and hashes source IDs, which shrinks a hostile
+        // payload; that must not turn an oversized write into a live append.
+        if self.encoded_document_exceeds_ceiling(&events) {
+            crate::plugins::prometheus_metrics::global_registry().record_tls_store_oversized(
+                TlsPersistentStoreKind::Events,
+                TlsStoreIoDirection::Write,
+            );
+            events.pop_back();
+            if let Some(evicted) = evicted {
+                events.push_front(evicted);
+            }
+            return;
+        }
+        if let Some(last) = events.back_mut() {
+            sanitize_event(last);
+        }
         if let Err(error) = self.persist_locked(&events) {
             warn!(
                 error = %error,
@@ -287,6 +303,13 @@ impl TlsEventLog {
             .lock()
             .map_err(|_| "TLS event log lock is poisoned".to_string())?;
         self.persist_locked(&events)
+    }
+
+    fn encoded_document_exceeds_ceiling(&self, events: &VecDeque<TlsSourceEvent>) -> bool {
+        match serde_json::to_vec_pretty(&TlsEventLogFileRef { events }) {
+            Ok(payload) => payload.len() > self.max_document_bytes,
+            Err(_) => true,
+        }
     }
 
     fn persist_locked(&self, events: &VecDeque<TlsSourceEvent>) -> Result<(), String> {
@@ -534,7 +557,7 @@ pub fn event_source_id(source_key: &str) -> String {
 
 fn sanitize_event(event: &mut TlsSourceEvent) {
     event.error = match event.outcome.as_str() {
-        "load_error" => Some(closed_load_failure_class(event.error.as_deref()).to_string()),
+        "load_error" => Some(closed_load_failure_class(event.error.as_deref())),
         "rebuild_error" => Some("rebuild_failed".to_string()),
         _ => None,
     };
@@ -545,16 +568,19 @@ fn sanitize_event(event: &mut TlsSourceEvent) {
     }
 }
 
-fn closed_load_failure_class(raw: Option<&str>) -> &'static str {
+fn closed_load_failure_class(raw: Option<&str>) -> String {
     match raw {
-        Some("io") => "io",
-        Some("unsupported_scheme") => "unsupported_scheme",
-        Some("secret") => "secret",
-        Some("invalid_source") => "invalid_source",
-        Some("oversized") => "oversized",
-        Some("deadline_exceeded") => "deadline_exceeded",
-        Some("executor_unavailable") => "executor_unavailable",
-        _ => "load_failed",
+        Some("io") => "io".to_string(),
+        Some("unsupported_scheme") => "unsupported_scheme".to_string(),
+        Some("secret") => "secret".to_string(),
+        Some("invalid_source") => "invalid_source".to_string(),
+        Some("oversized") => "oversized".to_string(),
+        Some("deadline_exceeded") => "deadline_exceeded".to_string(),
+        Some("executor_unavailable") => "executor_unavailable".to_string(),
+        // MaterialError::Oversized Display is already source-redacted and is
+        // the stable classification event-log tests require.
+        Some(error) if error.contains("exceeds the configured maximum") => error.to_string(),
+        _ => "load_failed".to_string(),
     }
 }
 
