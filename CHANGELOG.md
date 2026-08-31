@@ -130,7 +130,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   post-wire reset path; operators who set
   `trip_on_connection_errors: false` will no longer trip on this
   handshake via a 502 in `failure_status_codes`. Passive health still
-  records a backend failure.
+  records a backend failure. Plugin outbound HTTP
+  (`FERRUM_PLUGIN_HTTP_MAX_RETRIES`) retries `connection_pool_error` on
+  GET/HEAD/OPTIONS so a hyper `is_canceled` drop still replays; that
+  list is not identical to `request_reached_wire`.
 
 - **Identity-only NodeWaypoint assertion grants require ambient enrollment.**
   Kubernetes pod discovery no longer lets a same-node identity-only pod

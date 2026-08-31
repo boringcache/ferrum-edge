@@ -54,6 +54,8 @@ Omitted TLS `close_notify` is teardown (#4051): `UnexpectedEof` whose Display co
 
 Because `TlsError` and `ConnectionPoolError` are pre-wire, a backend mTLS failure on this path is replayable under `retry_on_connect_failure` regardless of method — nothing reached the origin's application layer. Circuit-breaker charging follows the **connect-error** path (`trip_on_connection_errors`, default on) instead of the post-wire `ConnectionReset` / 502-status path. Passive health still records a backend failure (`connection_error` is true). The public `X-Gateway-Error` token is `connection_failure`, not `backend_error`.
 
+`PluginHttpClient` (`FERRUM_PLUGIN_HTTP_MAX_RETRIES`) has a separate safe-method transport-retry list. It is not `!request_reached_wire()`: GET/HEAD/OPTIONS also replay some post-wire classes (`ConnectionReset`, `ConnectionClosed`, `ProtocolError`, `RequestError`, `ReadWriteTimeout`). After issue #4406 that list includes `ConnectionPoolError` so a hyper `is_canceled` drop still retries. It still omits `TlsError` (handshake misconfig rarely recovers on replay) and the health-neutral policy classes. Gateway backend dispatch continues to use `request_reached_wire` / `retry_on_connect_failure`.
+
 ## Per-protocol classifiers
 
 Each dispatcher hands its native error type to a classifier; every classifier returns `ErrorClass`. **Typed source-chain walking is preferred to substring matching** — string fallbacks remain only as defence-in-depth for legacy error types that don't expose typed sources.
