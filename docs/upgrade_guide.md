@@ -6,6 +6,12 @@ This document describes how to safely upgrade Ferrum Edge between versions with 
 
 Every current `[Unreleased]` `BREAKING` changelog entry is listed here exactly once, with its issue number and the operator action that entry already states. Several of these fail **silently** at cutover (HMAC clients get `401`, WAF `literal` rules stop matching folded spellings, backends stop seeing client-supplied XFF hops) rather than refusing config load. Read this section before the per-mode procedures below.
 
+### Native ConfigSync and MeshSubscribe share xDS stream admission (issue [#4432](https://github.com/ferrum-edge/ferrum-edge/issues/4432))
+
+Authenticated `ConfigSync.Subscribe` and `MeshConfigSync.MeshSubscribe` streams previously had no process, namespace, principal, or node ceiling. They now draw from the existing ADS admission controller (`FERRUM_XDS_MAX_TOTAL_STREAMS` and the per-namespace / per-principal / per-node / distinct-node ceilings). Excess streams are refused with gRPC `RESOURCE_EXHAUSTED` before a snapshot or response channel is allocated. Under `FERRUM_MESH_PRODUCTION_MODE=true`, a previously valid unbounded (`0`) configuration is refused at validate and CP startup unless `FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS=true`, including when ADS is disabled.
+
+**Operator action:** size the `FERRUM_XDS_MAX_*` budgets for native DP and mesh subscribers as well as ADS, and replace any production `0` (unbounded) values with finite ceilings or the explicit unsafe override before upgrading.
+
 ### Injected Ferrum is a Kubernetes native sidecar (issue [#4430](https://github.com/ferrum-edge/ferrum-edge/issues/4430))
 
 The injector no longer appends Ferrum as an ordinary `spec.containers` entry. New pods receive a native sidecar (`spec.initContainers` with `restartPolicy: Always`) and exec probes against loopback `/health`. That is also what unblocks Kubernetes Job completion. **Minimum Kubernetes version is 1.29** (native sidecars enabled by default; 1.28 needs `SidecarContainers=true`). There is no ordinary-container fallback: the webhook always emits the native-sidecar shape, and a cluster older than that will reject the patched Pod.

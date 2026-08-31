@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **BREAKING — native ConfigSync and MeshSubscribe streams share the xDS
+  admission budgets** (issue #4432). `ConfigSync.Subscribe` and
+  `MeshConfigSync.MeshSubscribe` previously authenticated, subscribed to a
+  broadcast channel, filtered/cloned configuration, and retained stream state
+  with no process, namespace, principal, or node ceiling. They now acquire a
+  permit from the existing ADS admission controller **before** broadcast
+  subscription, snapshot serialization, registry insertion, or response-channel
+  allocation. Capacity refusals are gRPC `RESOURCE_EXHAUSTED`. The same
+  production posture applies: a `0` (unbounded) `FERRUM_XDS_MAX_*` budget is
+  refused at `ferrum-edge validate` and CP startup under
+  `FERRUM_MESH_PRODUCTION_MODE=true` unless
+  `FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS=true`, **including when
+  `FERRUM_XDS_ENABLED=false`**. **Operator action**: size
+  `FERRUM_XDS_MAX_TOTAL_STREAMS` (default 1024) and the per-namespace /
+  per-principal / per-node / distinct-node ceilings for native DP and mesh
+  subscribers as well as ADS; set finite values (or the explicit unsafe
+  override) before upgrading a production control plane that previously relied
+  on unbounded `0` limits.
+
 - **BREAKING — HTTP/2 and HTTP/3 requests without `:authority` or Host are rejected with 400**
   (issue #4416). RFC 9113 §8.3.1 and RFC 9114 §4.3.1 require a request to
   include either `:authority` or a Host field. Ferrum previously treated the
