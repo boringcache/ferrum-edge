@@ -30,9 +30,20 @@ enum Utf32Endian {
 }
 
 /// Maximum number of normalized variants produced per value (excluding the
-/// raw input). Bounds body-scan cost at `O(VARIANTS × bytes × rules)`; the
-/// underlying `RegexSet` matching is linear so this is a hard multiplier.
+/// raw input). Bounds body-scan cost at `O(VARIANTS × bytes × rules)` for a
+/// single inspection view; the underlying `RegexSet` matching is linear so
+/// this is a hard multiplier. A bare `charset=utf-16` / `utf-32` with no BOM
+/// may produce up to [`MAX_WIDE_CHARSET_VIEWS`] transcoded views and still
+/// scans the raw/lossy view, so that path's worst case is
+/// `O((1 + MAX_WIDE_CHARSET_VIEWS) × (1 + MAX_VARIANTS) × bytes × rules)`.
+/// That is a deliberate bound for an uncommon Content-Type, not an unbounded
+/// expansion — do not raise this cap to "make room" for more endians.
 const MAX_VARIANTS: usize = 4;
+
+/// Cap on UTF-16 / UTF-32 inspection views of one body. Explicit little/big
+/// names and BOMs resolve to one view. Bare `utf-16` / `utf-32` without a
+/// BOM tries both endiannesses; successful views are kept up to this cap.
+const MAX_WIDE_CHARSET_VIEWS: usize = 2;
 const MAX_NUMERIC_ENTITY_DIGITS: usize = 16;
 
 /// Maximum decode rounds in [`layered_decode_inner`]. Each round peels at most one
@@ -91,18 +102,113 @@ pub(super) fn decoded_variants_with_residual(text: &str) -> (Vec<String>, bool) 
     (out, !converged)
 }
 
-/// Decode an already-admitted request body when its representation is UTF-16.
+/// Zero, one, or two UTF-8 inspection views of a UTF-16 / UTF-32 body.
+///
+/// Ordinary UTF-8 produces [`WideCharsetViews::empty`] — no heap allocation.
+/// A resolved endianness (explicit `utf-16le` / `utf-32be`, or a BOM) yields
+/// one view. A bare `charset=utf-16` / `utf-32` with no BOM tries both
+/// endiannesses and keeps each successful view, capped at
+/// [`MAX_WIDE_CHARSET_VIEWS`], and still asks the scanner to keep the
+/// raw/lossy view (`include_lossy`).
+pub(super) struct WideCharsetViews {
+    views: [Option<String>; MAX_WIDE_CHARSET_VIEWS],
+    include_lossy: bool,
+}
+
+impl WideCharsetViews {
+    pub(super) fn empty() -> Self {
+        Self {
+            views: [None, None],
+            include_lossy: false,
+        }
+    }
+
+    fn resolved(text: String) -> Self {
+        Self {
+            views: [Some(text), None],
+            include_lossy: false,
+        }
+    }
+
+    fn unresolved(little: Option<String>, big: Option<String>) -> Self {
+        let mut out = Self::from_endians(little, big);
+        // Lossy fallback is used whenever there is no transcoded view. When
+        // at least one endian decoded, still keep that raw/lossy scan so a
+        // bare declaration cannot drop it.
+        out.include_lossy = !out.is_empty();
+        out
+    }
+
+    fn from_endians(little: Option<String>, big: Option<String>) -> Self {
+        match (little, big) {
+            (None, None) => Self::empty(),
+            (Some(text), None) | (None, Some(text)) => Self::resolved(text),
+            (Some(little), Some(big)) if little == big => Self::resolved(little),
+            (Some(little), Some(big)) => Self {
+                views: [Some(little), Some(big)],
+                include_lossy: false,
+            },
+        }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.views.iter().all(Option::is_none)
+    }
+
+    pub(super) fn include_lossy(&self) -> bool {
+        self.include_lossy
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = &str> {
+        self.views.iter().filter_map(|view| view.as_deref())
+    }
+}
+
+/// Decode already-admitted UTF-16 / UTF-32 request bodies into inspection
+/// views.
 ///
 /// This helper does not decide whether a body is eligible for WAF inspection;
 /// the request content-type/multipart/binary gates run before the scanner. It
-/// only creates the text view used by active request-body rules. Ordinary
-/// UTF-8 bodies return `None` without allocating. UTF-16 output is bounded by
-/// the caller's already-clamped body slice, and malformed/truncated input also
-/// returns `None` so the caller retains its existing lossy raw-byte scan.
+/// only creates the text views used by active request-body rules. Ordinary
+/// UTF-8 bodies return [`WideCharsetViews::empty`] without allocating.
 ///
 /// UTF-32 BOMs are recognized first (see [`utf32_bom`]): a UTF-32LE BOM is
-/// `FF FE 00 00` and would otherwise be misread as a UTF-16LE BOM.
-pub(super) fn decode_utf16_body(body: &[u8], content_type: Option<&str>) -> Option<String> {
+/// `FF FE 00 00` and would otherwise be misread as a UTF-16LE BOM. When a
+/// charset declares the UTF-16 or UTF-32 family without an endianness and
+/// without a BOM, both endiannesses are decoded; a view that is not a
+/// multiple of the code-unit width, is truncated, or contains surrogate-range
+/// / above-`U+10FFFF` units is omitted so the caller retains its existing
+/// lossy raw-byte scan for that endian.
+pub(super) fn decode_wide_charset_body_views(
+    body: &[u8],
+    content_type: Option<&str>,
+) -> WideCharsetViews {
+    if charset_is_unspecified_utf32(content_type) && utf32_bom(body).is_none() {
+        return WideCharsetViews::unresolved(
+            decode_utf32(body, Utf32Endian::Little),
+            decode_utf32(body, Utf32Endian::Big),
+        );
+    }
+    if let Some(text) = decode_utf32_body(body, content_type) {
+        return WideCharsetViews::resolved(text);
+    }
+    if charset_is_unspecified_utf16(content_type) && utf16_bom(body).is_none() {
+        return WideCharsetViews::unresolved(
+            decode_utf16(body, Utf16Endian::Little),
+            decode_utf16(body, Utf16Endian::Big),
+        );
+    }
+    match decode_utf16_body(body, content_type) {
+        Some(text) => WideCharsetViews::resolved(text),
+        None => WideCharsetViews::empty(),
+    }
+}
+
+/// Decode an already-admitted request body when its UTF-16 endianness is
+/// resolved (explicit `charset` or a BOM). Bare `charset=utf-16` with no BOM
+/// is handled by [`decode_wide_charset_body_views`] instead of inventing an
+/// endianness here.
+fn decode_utf16_body(body: &[u8], content_type: Option<&str>) -> Option<String> {
     let bom = utf16_bom(body);
     let declared = declared_utf16_endian(content_type, bom.map(|(endian, _)| endian));
     let (endian, skip) = match (declared, bom) {
@@ -115,17 +221,11 @@ pub(super) fn decode_utf16_body(body: &[u8], content_type: Option<&str>) -> Opti
     decode_utf16(&body[skip..], endian)
 }
 
-/// Decode an already-admitted request body when its representation is UTF-32.
-///
-/// Mirrors [`decode_utf16_body`] exactly: this helper does not decide
-/// eligibility; it only creates the UTF-8 inspection view used by active
-/// request-body rules. Ordinary UTF-8 bodies return `None` without allocating.
-/// UTF-32 output is bounded by the caller's already-clamped body slice (at
-/// most one UTF-8 byte per wire byte). Malformed, truncated, surrogate-range,
-/// or out-of-range input returns `None` so the caller retains its existing
-/// lossy raw-byte scan and whatever encoding specials that view already
-/// raises — the same fail-closed posture as malformed UTF-16.
-pub(super) fn decode_utf32_body(body: &[u8], content_type: Option<&str>) -> Option<String> {
+/// Decode an already-admitted request body when its UTF-32 endianness is
+/// resolved (explicit `charset` or a BOM). Bare `charset=utf-32` with no BOM
+/// is handled by [`decode_wide_charset_body_views`] instead of inventing an
+/// endianness here.
+fn decode_utf32_body(body: &[u8], content_type: Option<&str>) -> Option<String> {
     let bom = utf32_bom(body);
     let declared = declared_utf32_endian(content_type, bom.map(|(endian, _)| endian));
     let (endian, skip) = match (declared, bom) {
@@ -138,10 +238,10 @@ pub(super) fn decode_utf32_body(body: &[u8], content_type: Option<&str>) -> Opti
     decode_utf32(&body[skip..], endian)
 }
 
-fn declared_utf16_endian(
-    content_type: Option<&str>,
-    bom_endian: Option<Utf16Endian>,
-) -> Option<Utf16Endian> {
+/// First `charset` parameter of a Content-Type. Duplicate `charset=`
+/// parameters are treated as unspecified (return `None`) so a conflicting
+/// pair cannot pick an endianness.
+fn charset_value(content_type: Option<&str>) -> Option<&str> {
     let content_type = content_type?;
     let mut declared = None;
     for parameter in content_type.split(';').skip(1) {
@@ -154,22 +254,40 @@ fn declared_utf16_endian(
         if declared.is_some() {
             return None;
         }
-        let value = raw_value.trim().trim_matches('"');
-        declared =
-            if value.eq_ignore_ascii_case("utf-16le") || value.eq_ignore_ascii_case("utf16le") {
-                Some(Utf16Endian::Little)
-            } else if value.eq_ignore_ascii_case("utf-16be")
-                || value.eq_ignore_ascii_case("utf16be")
-                || value.eq_ignore_ascii_case("unicodefffe")
-            {
-                Some(Utf16Endian::Big)
-            } else if value.eq_ignore_ascii_case("utf-16") || value.eq_ignore_ascii_case("utf16") {
-                bom_endian
-            } else {
-                None
-            };
+        declared = Some(raw_value.trim().trim_matches('"'));
     }
     declared
+}
+
+fn charset_is_unspecified_utf16(content_type: Option<&str>) -> bool {
+    charset_value(content_type).is_some_and(|value| {
+        value.eq_ignore_ascii_case("utf-16") || value.eq_ignore_ascii_case("utf16")
+    })
+}
+
+fn charset_is_unspecified_utf32(content_type: Option<&str>) -> bool {
+    charset_value(content_type).is_some_and(|value| {
+        value.eq_ignore_ascii_case("utf-32") || value.eq_ignore_ascii_case("utf32")
+    })
+}
+
+fn declared_utf16_endian(
+    content_type: Option<&str>,
+    bom_endian: Option<Utf16Endian>,
+) -> Option<Utf16Endian> {
+    let value = charset_value(content_type)?;
+    if value.eq_ignore_ascii_case("utf-16le") || value.eq_ignore_ascii_case("utf16le") {
+        Some(Utf16Endian::Little)
+    } else if value.eq_ignore_ascii_case("utf-16be")
+        || value.eq_ignore_ascii_case("utf16be")
+        || value.eq_ignore_ascii_case("unicodefffe")
+    {
+        Some(Utf16Endian::Big)
+    } else if value.eq_ignore_ascii_case("utf-16") || value.eq_ignore_ascii_case("utf16") {
+        bom_endian
+    } else {
+        None
+    }
 }
 
 fn utf16_bom(body: &[u8]) -> Option<(Utf16Endian, usize)> {
@@ -194,37 +312,22 @@ fn declared_utf32_endian(
     content_type: Option<&str>,
     bom_endian: Option<Utf32Endian>,
 ) -> Option<Utf32Endian> {
-    let content_type = content_type?;
-    let mut declared = None;
-    for parameter in content_type.split(';').skip(1) {
-        let Some((name, raw_value)) = parameter.split_once('=') else {
-            continue;
-        };
-        if !name.trim().eq_ignore_ascii_case("charset") {
-            continue;
-        }
-        if declared.is_some() {
-            return None;
-        }
-        let value = raw_value.trim().trim_matches('"');
-        declared =
-            if value.eq_ignore_ascii_case("utf-32le") || value.eq_ignore_ascii_case("utf32le") {
-                Some(Utf32Endian::Little)
-            } else if value.eq_ignore_ascii_case("utf-32be") || value.eq_ignore_ascii_case("utf32be")
-            {
-                Some(Utf32Endian::Big)
-            } else if value.eq_ignore_ascii_case("utf-32") || value.eq_ignore_ascii_case("utf32") {
-                // Bare `charset=utf-16` does not invent little- or big-endian
-                // when no BOM is present: IANA UTF-16 without a BOM is
-                // endian-unspecified, so that path returns `None` and the
-                // caller keeps the raw/lossy scan. Bare `utf-32` follows the
-                // same rule so the two cannot drift.
-                bom_endian
-            } else {
-                None
-            };
+    let value = charset_value(content_type)?;
+    if value.eq_ignore_ascii_case("utf-32le") || value.eq_ignore_ascii_case("utf32le") {
+        Some(Utf32Endian::Little)
+    } else if value.eq_ignore_ascii_case("utf-32be")
+        || value.eq_ignore_ascii_case("utf32be")
+    {
+        Some(Utf32Endian::Big)
+    } else if value.eq_ignore_ascii_case("utf-32") || value.eq_ignore_ascii_case("utf32") {
+        // Bare `utf-32` without a BOM is endian-unspecified. The dual-endian
+        // path in [`decode_wide_charset_body_views`] handles that case before
+        // this helper is consulted. When a BOM is present, use it; otherwise
+        // return `None` so this helper does not invent an endianness.
+        bom_endian
+    } else {
+        None
     }
-    declared
 }
 
 fn utf32_bom(body: &[u8]) -> Option<(Utf32Endian, usize)> {

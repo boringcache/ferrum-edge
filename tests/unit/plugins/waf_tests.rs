@@ -2977,6 +2977,116 @@ async fn utf32_transcoding_does_not_change_utf8_or_utf16_body_matches() {
     assert!(!monitored(&binary_ctx, "FE-SQLI-001-B"));
 }
 
+#[tokio::test]
+async fn bare_utf32_charset_without_bom_blocks_both_endians() {
+    let plugin = recommended_enforcing_waf();
+    let payload = "id=1 UNION SELECT password FROM users";
+    let form = "application/x-www-form-urlencoded; charset=utf-32";
+
+    let (le_result, le_ctx) = scan_body_with_content_type(
+        &plugin,
+        form,
+        &encode_utf32(payload, false),
+    )
+    .await;
+    assert!(matches!(le_result, PluginResult::Reject { .. }));
+    assert!(monitored(&le_ctx, "FE-SQLI-001-B"));
+
+    let (be_result, be_ctx) = scan_body_with_content_type(
+        &plugin,
+        form,
+        &encode_utf32(payload, true),
+    )
+    .await;
+    assert!(matches!(be_result, PluginResult::Reject { .. }));
+    assert!(monitored(&be_ctx, "FE-SQLI-001-B"));
+
+    let mut truncated = encode_utf32(payload, false);
+    truncated.pop();
+    let (truncated_result, truncated_ctx) =
+        scan_body_with_content_type(&plugin, form, &truncated).await;
+    assert!(matches!(truncated_result, PluginResult::Continue));
+    assert!(!monitored(&truncated_ctx, "FE-SQLI-001-B"));
+}
+
+#[tokio::test]
+async fn bare_utf16_charset_without_bom_blocks_both_endians() {
+    let plugin = recommended_enforcing_waf();
+    let payload = "id=1 UNION SELECT password FROM users";
+    let form = "application/x-www-form-urlencoded; charset=utf-16";
+
+    let (le_result, le_ctx) = scan_body_with_content_type(
+        &plugin,
+        form,
+        &encode_utf16(payload, false),
+    )
+    .await;
+    assert!(matches!(le_result, PluginResult::Reject { .. }));
+    assert!(monitored(&le_ctx, "FE-SQLI-001-B"));
+
+    let (be_result, be_ctx) = scan_body_with_content_type(
+        &plugin,
+        form,
+        &encode_utf16(payload, true),
+    )
+    .await;
+    assert!(matches!(be_result, PluginResult::Reject { .. }));
+    assert!(monitored(&be_ctx, "FE-SQLI-001-B"));
+
+    let mut truncated = encode_utf16(payload, false);
+    truncated.pop();
+    let (truncated_result, truncated_ctx) =
+        scan_body_with_content_type(&plugin, form, &truncated).await;
+    assert!(matches!(truncated_result, PluginResult::Continue));
+    assert!(!monitored(&truncated_ctx, "FE-SQLI-001-B"));
+}
+
+#[tokio::test]
+async fn bare_wide_charset_without_bom_does_not_block_benign_body() {
+    let plugin = recommended_enforcing_waf();
+    let benign = "id=42&name=alice";
+    let form_utf32 = "application/x-www-form-urlencoded; charset=utf-32";
+    let form_utf16 = "application/x-www-form-urlencoded; charset=utf-16";
+
+    let (utf32_le_result, utf32_le_ctx) = scan_body_with_content_type(
+        &plugin,
+        form_utf32,
+        &encode_utf32(benign, false),
+    )
+    .await;
+    assert!(matches!(utf32_le_result, PluginResult::Continue));
+    assert!(!monitored(&utf32_le_ctx, "FE-SQLI-001-B"));
+
+    let (utf32_be_result, utf32_be_ctx) = scan_body_with_content_type(
+        &plugin,
+        form_utf32,
+        &encode_utf32(benign, true),
+    )
+    .await;
+    assert!(matches!(utf32_be_result, PluginResult::Continue));
+    assert!(!monitored(&utf32_be_ctx, "FE-SQLI-001-B"));
+
+    // UTF-16 reverse-endian of ASCII is valid BMP text (not a decode
+    // failure). Scanning that nonsense view must not fire L1 body rules.
+    let (utf16_le_result, utf16_le_ctx) = scan_body_with_content_type(
+        &plugin,
+        form_utf16,
+        &encode_utf16(benign, false),
+    )
+    .await;
+    assert!(matches!(utf16_le_result, PluginResult::Continue));
+    assert!(!monitored(&utf16_le_ctx, "FE-SQLI-001-B"));
+
+    let (utf16_be_result, utf16_be_ctx) = scan_body_with_content_type(
+        &plugin,
+        form_utf16,
+        &encode_utf16(benign, true),
+    )
+    .await;
+    assert!(matches!(utf16_be_result, PluginResult::Continue));
+    assert!(!monitored(&utf16_be_ctx, "FE-SQLI-001-B"));
+}
+
 #[test]
 fn response_body_buffering_narrows_to_inspectable_content_types() {
     // With response body inspection enabled, the WAF requests buffering at the

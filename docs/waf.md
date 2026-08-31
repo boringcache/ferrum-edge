@@ -135,6 +135,7 @@ matching request and response bodies, the WAF also scans **decoded variants**:
 
 - UTF-16LE / UTF-16BE and UTF-32LE / UTF-32BE request bodies admitted by the
   body content-type gates, using an explicit `charset` or a byte-order mark
+  (bare `utf-16` / `utf-32` without a BOM tries both endiannesses)
 - JSON / JavaScript unicode escapes — `\uXXXX`, `\u{...}`, `\xXX`
 - HTML entities — `&lt;`, `&#60;`, `&#x3c;`
 - Percent-encoding and `+`-as-space (form bodies)
@@ -156,11 +157,14 @@ only within the already-applied `max_scan_bytes` bound. UTF-32 BOMs
 **before** the 2-byte UTF-16 BOMs, because a UTF-32LE BOM also starts with
 the UTF-16LE mark `FF FE`. Bare `charset=utf-16` / `charset=utf-32` with no
 BOM does not invent an endianness (IANA leaves both unspecified without a
-BOM); those bodies keep the raw/lossy view. Malformed or truncated UTF-16 or
-UTF-32 — including a length that is not a multiple of the code-unit size,
-code units in the surrogate range `U+D800..=U+DFFF`, or UTF-32 units above
-`U+10FFFF` — is never partially decoded or allowed to panic; it retains the
-existing raw/lossy inspection view.
+BOM). Both little-endian and big-endian decodes are attempted; each view
+that decodes cleanly is scanned by the request-body rules, and the existing
+raw/lossy view is still scanned. If neither endianness decodes, only the
+raw/lossy view remains. Malformed or truncated UTF-16 or UTF-32 — including
+a length that is not a multiple of the code-unit size, code units in the
+surrogate range `U+D800..=U+DFFF`, or UTF-32 units above `U+10FFFF` — is
+never partially decoded or allowed to panic; that endian is omitted and the
+raw/lossy inspection view is retained.
 
 Query matching is per decoded parameter value, not the raw whole URI. Query
 **values** (each `&`/`=`-split component — never the structural delimiters,
