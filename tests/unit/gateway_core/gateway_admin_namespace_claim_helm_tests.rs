@@ -17,15 +17,36 @@ fn read(rel: &str) -> String {
     })
 }
 
+/// The YAML block under a top-level `key:`, ending at the next top-level key.
+///
+/// A fixed character window is not usable here: the `admin:` block carries
+/// long explanatory comments, so a byte budget silently truncates before the
+/// value under test and the assertion fails for the wrong reason.
+fn top_level_block<'a>(values: &'a str, key: &str) -> &'a str {
+    let header = format!("\n{key}:");
+    let start = values
+        .find(&header)
+        .map(|idx| idx + 1)
+        .or_else(|| values.starts_with(&header[1..]).then_some(0))
+        .unwrap_or_else(|| panic!("values.yaml must declare {key}"));
+    let rest = &values[start..];
+    let end = rest
+        .match_indices('\n')
+        .find(|(idx, _)| {
+            let line = rest[idx + 1..].split('\n').next().unwrap_or("");
+            !line.is_empty() && !line.starts_with([' ', '\t', '#'])
+        })
+        .map(|(idx, _)| idx + 1)
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
 #[test]
 fn values_default_admin_require_namespace_claim_off() {
     let values = read("values.yaml");
-    let idx = values
-        .find("admin:")
-        .expect("values.yaml must declare admin");
-    let window = &values[idx..values.len().min(idx + 900)];
+    let block = top_level_block(&values, "admin");
     assert!(
-        window.contains("requireNamespaceClaim: false"),
+        block.contains("requireNamespaceClaim: false"),
         "admin.requireNamespaceClaim must default to false"
     );
 }
