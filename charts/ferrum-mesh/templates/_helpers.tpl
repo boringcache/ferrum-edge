@@ -1269,11 +1269,11 @@ failurePolicy to Ignore to make that configuration render.
 {{- end -}}
 {{- if $hasCa -}}
 {{- if not (regexMatch "^[A-Za-z0-9+/]+={0,2}$" $ca) -}}
-{{- fail "injector.caBundle must be a base64-encoded PEM CA certificate (decoded value must contain BEGIN CERTIFICATE)" -}}
+{{- fail "injector.caBundle must be SINGLE-LINE base64 of a PEM CA certificate (decoded value must contain BEGIN CERTIFICATE). Wrapped base64 is rejected because the rendered webhook would be invalid: produce it with `base64 -w0 < ca.crt` (macOS: `base64 < ca.crt | tr -d '\n'`)." -}}
 {{- end -}}
 {{- $decoded := $ca | b64dec -}}
 {{- if not (contains "BEGIN CERTIFICATE" $decoded) -}}
-{{- fail "injector.caBundle must be a base64-encoded PEM CA certificate (decoded value must contain BEGIN CERTIFICATE)" -}}
+{{- fail "injector.caBundle must be SINGLE-LINE base64 of a PEM CA certificate (decoded value must contain BEGIN CERTIFICATE). Wrapped base64 is rejected because the rendered webhook would be invalid: produce it with `base64 -w0 < ca.crt` (macOS: `base64 < ca.crt | tr -d '\n'`)." -}}
 {{- end -}}
 {{- end -}}
 {{- if $hasInject -}}

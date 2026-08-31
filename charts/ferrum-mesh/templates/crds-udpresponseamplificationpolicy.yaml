@@ -23,7 +23,9 @@
 {{- fail "UDPResponseAmplificationPolicy CRD exists but is not Helm-managed (installed from the former charts/ferrum-mesh/crds/ directory). Operator action: helm upgrade --take-ownership --set crds.adoptExisting=true. See docs/upgrade_guide.md. Do not set crds.install=false; that leaves the cluster on a stale schema." -}}
 {{- end -}}
 {{- end -}}
-{{- if not $foreign -}}
+{{- if $foreign -}}
+{{- fail (printf "UDPResponseAmplificationPolicy CRD is already owned by Helm release %q, so this release would silently manage no CRD and could sit on a stale schema — the exact drift crds.install exists to prevent. Operator action: if that release is meant to own the CRD, make it explicit here with --set crds.install=false --set crds.skipInstallAcknowledged=true; otherwise adopt it with helm upgrade --take-ownership --set crds.adoptExisting=true. See docs/upgrade_guide.md." $owner) -}}
+{{- end -}}
 {{- $schemaVersion := "v1alpha1-1" -}}
 {{- $policy := $crds.udpResponseAmplificationPolicy | default dict -}}
 {{- $wanted := index $policy "schemaVersion" | default $schemaVersion | toString -}}
@@ -139,5 +141,4 @@ spec:
                         items:
                           type: object
                           x-kubernetes-preserve-unknown-fields: true
-{{- end -}}
 {{- end -}}
