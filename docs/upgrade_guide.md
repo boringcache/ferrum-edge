@@ -6,6 +6,12 @@ This document describes how to safely upgrade Ferrum Edge between versions with 
 
 Every current `[Unreleased]` `BREAKING` changelog entry is listed here exactly once, with its issue number and the operator action that entry already states. Several of these fail **silently** at cutover (HMAC clients get `401`, WAF `literal` rules stop matching folded spellings, backends stop seeing client-supplied XFF hops) rather than refusing config load. Read this section before the per-mode procedures below.
 
+### Malformed or out-of-range `FERRUM_POOL_*` settings refuse to start (issue [#4428](https://github.com/ferrum-edge/ferrum-edge/issues/4428))
+
+Connection-pool environment settings previously ignored failed numeric parses, treated two boolean parse failures as `true`, and silently clamped several out-of-range values. `ferrum-edge validate` and `run` now fail closed with the variable name and the offending value. These are process environment / `ferrum.conf` settings, not CP-pushed gateway config, so a DP does not newly reject a snapshot it previously accepted.
+
+**Operator action:** run `ferrum-edge validate` before upgrade and correct typos (`flase` → `false`) and out-of-range values. Accepted booleans are `true`/`false`/`1`/`0`. Idle per host must be 4–1024; H2 connections per host and max concurrent streams must be ≥ 1; stream/connection windows 65535–134217728; max frame 16384–1048576. `FERRUM_POOL_ENABLE_HTTP2=0` now disables HTTP/2 instead of remaining enabled.
+
 ### Injected Ferrum is a Kubernetes native sidecar (issue [#4430](https://github.com/ferrum-edge/ferrum-edge/issues/4430))
 
 The injector no longer appends Ferrum as an ordinary `spec.containers` entry. New pods receive a native sidecar (`spec.initContainers` with `restartPolicy: Always`) and exec probes against loopback `/health`. That is also what unblocks Kubernetes Job completion. **Minimum Kubernetes version is 1.29** (native sidecars enabled by default; 1.28 needs `SidecarContainers=true`). There is no ordinary-container fallback: the webhook always emits the native-sidecar shape, and a cluster older than that will reject the patched Pod.
