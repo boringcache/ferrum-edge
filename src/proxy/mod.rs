@@ -188,6 +188,10 @@ use crate::modes::mesh::node_waypoint::{
     NodeWaypointIdentity, NodeWaypointIdentityError, NodeWaypointIdentityResolver, pod_uid_label,
 };
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
+use crate::plugins::utils::openai_error::{
+    OPENAI_CODE_INVALID_API_KEY, OPENAI_CODE_MISSING_API_KEY, OPENAI_INVALID_REQUEST_ERROR,
+    ferrum_flat_error_message, openai_error_body_bytes,
+};
 use crate::plugins::{
     BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
     RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext, TransactionSummary,
@@ -28171,6 +28175,36 @@ pub fn request_is_authenticated(ctx: &RequestContext) -> bool {
 
 const MISSING_AUTHENTICATION_BODY: &[u8] = br#"{"error":"Authentication required"}"#;
 
+pub fn adapt_auth_reject_for_openai_envelope(
+    uses_envelope: bool,
+    status_code: u16,
+    body: Bytes,
+    headers: HashMap<String, String>,
+    missing_credential: bool,
+) -> (u16, Bytes, HashMap<String, String>) {
+    if !uses_envelope || status_code != 401 {
+        return (status_code, body, headers);
+    }
+    let adapted_body = if missing_credential {
+        openai_error_body_bytes(
+            "Authentication required",
+            OPENAI_INVALID_REQUEST_ERROR,
+            None,
+            Some(OPENAI_CODE_MISSING_API_KEY),
+        )
+    } else if let Some(message) = ferrum_flat_error_message(&body) {
+        openai_error_body_bytes(
+            &message,
+            OPENAI_INVALID_REQUEST_ERROR,
+            None,
+            Some(OPENAI_CODE_INVALID_API_KEY),
+        )
+    } else {
+        body
+    };
+    (status_code, adapted_body, headers)
+}
+
 fn missing_authentication_reject(
     auth_plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
@@ -28766,6 +28800,23 @@ pub async fn run_authentication_phase(
     ctx: &mut RequestContext,
     consumer_index: &ConsumerIndex,
 ) -> Option<(u16, Bytes, HashMap<String, String>)> {
+    run_authentication_phase_with_envelope(
+        auth_mode,
+        auth_plugins,
+        ctx,
+        consumer_index,
+        false,
+    )
+    .await
+}
+
+pub async fn run_authentication_phase_with_envelope(
+    auth_mode: AuthMode,
+    auth_plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    consumer_index: &ConsumerIndex,
+    uses_openai_auth_error_envelope: bool,
+) -> Option<(u16, Bytes, HashMap<String, String>)> {
     // Mark every configured query credential location before multi-auth can
     // stop at the first successful mechanism. Presence is enough to redact:
     // an invalid token may coexist with a different successful credential and
@@ -28845,11 +28896,18 @@ pub async fn run_authentication_phase(
                 ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
                 None
             } else {
+                let used_missing_reject = server_reject.is_none() && last_reject.is_none();
                 let mut reject = server_reject
                     .or(last_reject)
                     .unwrap_or_else(|| missing_authentication_reject(auth_plugins, ctx));
                 attach_auth_rejection_set_cookie(ctx, &mut reject.2);
-                Some(reject)
+                Some(adapt_auth_reject_for_openai_envelope(
+                    uses_openai_auth_error_envelope,
+                    reject.0,
+                    reject.1,
+                    reject.2,
+                    used_missing_reject,
+                ))
             }
         }
         AuthMode::Single => {
@@ -28873,7 +28931,13 @@ pub async fn run_authentication_phase(
                         if let Some(reject) = plugin_result_into_reject_parts(reject) {
                             let mut reject = (reject.status_code, reject.body, reject.headers);
                             attach_auth_rejection_set_cookie(ctx, &mut reject.2);
-                            return Some(reject);
+                            return Some(adapt_auth_reject_for_openai_envelope(
+                                uses_openai_auth_error_envelope,
+                                reject.0,
+                                reject.1,
+                                reject.2,
+                                false,
+                            ));
                         }
                     }
                     PluginResult::Continue => {
@@ -28895,8 +28959,15 @@ pub async fn run_authentication_phase(
                 || mesh_permissive_only_auth_plugin
             {
                 None
-            } else {
-                Some(missing_authentication_reject(auth_plugins, ctx))
+            } else             {
+                let reject = missing_authentication_reject(auth_plugins, ctx);
+                Some(adapt_auth_reject_for_openai_envelope(
+                    uses_openai_auth_error_envelope,
+                    reject.0,
+                    reject.1,
+                    reject.2,
+                    true,
+                ))
             }
         }
     }
@@ -30577,11 +30648,12 @@ async fn handle_proxy_request_inner(
 
     {
         let auth_phase_start = Instant::now();
-        if let Some((status_code, body, headers)) = run_authentication_phase(
+        if let Some((status_code, body, headers)) = run_authentication_phase_with_envelope(
             proxy.auth_mode.clone(),
             &auth_plugins,
             &mut ctx,
             &consumer_index,
+            plugin_cache_view.uses_openai_auth_error_envelope(),
         )
         .await
         {

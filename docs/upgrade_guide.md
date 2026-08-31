@@ -6,6 +6,12 @@ This document describes how to safely upgrade Ferrum Edge between versions with 
 
 Every current `[Unreleased]` `BREAKING` changelog entry is listed here exactly once, with its issue number and the operator action that entry already states. Several of these fail **silently** at cutover (HMAC clients get `401`, WAF `literal` rules stop matching folded spellings, backends stop seeing client-supplied XFF hops) rather than refusing config load. Read this section before the per-mode procedures below.
 
+### AI gateway authentication `401` bodies use the OpenAI nested envelope (issue [#4408](https://github.com/ferrum-edge/ferrum-edge/issues/4408))
+
+Proxies with an effective `ai_federation` or `ai_stream_router` plugin now return OpenAI-shaped `{"error":{"message","type","param","code"}}` bodies for gateway-authored authentication `401`s (missing or invalid credentials from `key_auth`, JWT/JWKS/Basic/HMAC/LDAP/mTLS/OIDC/introspection plugins). Status codes and `WWW-Authenticate` are unchanged. Authorization-phase rejects (`acl`, `rate_limiting`, and other `authorize` plugins) and non-`401` authentication outcomes keep their existing bodies.
+
+**Operator action:** on AI gateway routes, read `error.message` / `error.code` (or use an OpenAI-compatible client) instead of parsing the flat `{"error":"<string>"}` shape for authentication failures.
+
 ### Injected Ferrum is a Kubernetes native sidecar (issue [#4430](https://github.com/ferrum-edge/ferrum-edge/issues/4430))
 
 The injector no longer appends Ferrum as an ordinary `spec.containers` entry. New pods receive a native sidecar (`spec.initContainers` with `restartPolicy: Always`) and exec probes against loopback `/health`. That is also what unblocks Kubernetes Job completion. **Minimum Kubernetes version is 1.29** (native sidecars enabled by default; 1.28 needs `SidecarContainers=true`). There is no ordinary-container fallback: the webhook always emits the native-sidecar shape, and a cluster older than that will reject the patched Pod.

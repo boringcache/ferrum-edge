@@ -62,7 +62,7 @@ use crate::proxy::headers::{
 use crate::proxy::{
     ProxyState, apply_plugin_rejection_response, apply_reject_after_proxy_and_synthetic_body_hooks,
     log_pre_backend_rejected_request, log_rejected_request, log_rejected_request_with_path,
-    plugin_result_into_reject_parts, run_after_proxy_hooks, run_authentication_phase,
+    plugin_result_into_reject_parts, run_after_proxy_hooks, run_authentication_phase_with_envelope,
 };
 use crate::tls::{CrlList, TlsPolicy};
 
@@ -3330,11 +3330,12 @@ async fn handle_h3_request(
     let auth_plugins = plugin_cache_view.auth_plugins();
 
     let auth_phase_start = std::time::Instant::now();
-    if let Some((status_code, body, mut headers)) = run_authentication_phase(
+    if let Some((status_code, body, mut headers)) = run_authentication_phase_with_envelope(
         proxy.auth_mode.clone(),
         &auth_plugins,
         &mut ctx,
         &consumer_index,
+        plugin_cache_view.uses_openai_auth_error_envelope(),
     )
     .await
     {

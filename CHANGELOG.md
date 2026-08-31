@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING — AI gateway routes return OpenAI-shaped authentication `401` bodies**
+  (issue #4408). Proxies with an effective `ai_federation` or `ai_stream_router`
+  plugin now rewrite gateway-authored authentication `401` responses to the same
+  nested OpenAI Chat Completions error envelope those plugins use for their own
+  rejects (`type: invalid_request_error`, `code: missing_api_key` or
+  `invalid_api_key`). Missing-credential and invalid-credential messages are
+  unchanged; only the JSON shape changes. Routes without an AI gateway plugin
+  still return Ferrum `{"error":"<string>"}`. **Operator action:** if you parse
+  authentication `401` bodies on AI routes with custom code that expects the flat
+  Ferrum shape, switch to `error.message` / `error.code` or use an OpenAI SDK.
+
 ### Security
 
 - **BREAKING — HTTP/2 and HTTP/3 requests without `:authority` or Host are rejected with 400**
