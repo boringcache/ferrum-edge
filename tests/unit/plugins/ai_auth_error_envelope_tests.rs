@@ -132,9 +132,14 @@ async fn ai_route_invalid_credential_uses_openai_auth_envelope() {
     let key_auth: Arc<dyn Plugin> = Arc::new(KeyAuth::new(&json!({})).unwrap());
     let auth_plugins = vec![key_auth];
     let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
-    let mut ctx = create_test_context();
-    ctx.method = "POST".to_string();
-    ctx.path = "/ai/chat".to_string();
+    // Build the context directly: `create_test_context()` pre-seeds a VALID
+    // `X-API-Key` and an already-identified consumer, so authentication
+    // succeeds and there is no reject to inspect.
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/ai/chat".to_string(),
+    );
     ctx.headers
         .insert("X-API-Key".to_string(), "wrong-key".to_string());
 
