@@ -264,6 +264,22 @@ pub(super) struct H1FramingGuardIo<T> {
     scanner: WireScanner,
     signals: Arc<H1FramingSignals>,
     parse_reject: ParseRejectWrite,
+    /// Whether Hyper has already written response bytes on this connection.
+    ///
+    /// The parse-reject envelope is written straight to `inner` from inside
+    /// `poll_read`, bypassing Hyper's write buffer. Hyper's HTTP/1 *server*
+    /// reads the next request head while an earlier response is still being
+    /// written (`should_read_first()` is true for servers, and the dispatch
+    /// loop polls read before flush), so on a keep-alive connection under
+    /// write backpressure a pipelined malformed request would splice the
+    /// envelope into the middle of the previous response.
+    ///
+    /// The envelope is therefore armed only before the first response byte —
+    /// the fresh-connection case, which is every real client that sends one
+    /// malformed request. A malformed request pipelined behind a response
+    /// falls back to Hyper's own empty-bodied `400`, the same documented
+    /// residual as the parse failures the scanner cannot name.
+    wrote_response_bytes: bool,
 }
 
 impl<T> H1FramingGuardIo<T> {
@@ -275,6 +291,7 @@ impl<T> H1FramingGuardIo<T> {
                 scanner: WireScanner::new(max_head_bytes),
                 signals: Arc::clone(&signals),
                 parse_reject: ParseRejectWrite::Idle,
+                wrote_response_bytes: false,
             },
             signals,
         )
@@ -376,9 +393,19 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for H1FramingGuardIo<T> {
             if this.parse_reject.is_idle() {
                 let hint = this.signals.take_parse_reject_hint();
                 if hint != PARSE_HINT_NONE {
-                    buf.set_filled(filled_before);
-                    this.begin_parse_reject(hint);
-                    return this.poll_finish_parse_reject(cx);
+                    if this.wrote_response_bytes {
+                        // See `wrote_response_bytes`: writing the envelope now
+                        // would interleave it with an in-flight response.
+                        tracing::debug!(
+                            parse_reject_hint = hint,
+                            "HTTP/1 parse reject after a response began; \
+                             deferring to Hyper's empty 400"
+                        );
+                    } else {
+                        buf.set_filled(filled_before);
+                        this.begin_parse_reject(hint);
+                        return this.poll_finish_parse_reject(cx);
+                    }
                 }
             }
         }
@@ -397,7 +424,11 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for H1FramingGuardIo<T> {
             ready!(this.poll_write_envelope(cx))?;
             return Poll::Ready(Ok(buf.len()));
         }
-        Pin::new(&mut this.inner).poll_write(cx, buf)
+        let wrote = ready!(Pin::new(&mut this.inner).poll_write(cx, buf))?;
+        if wrote > 0 {
+            this.wrote_response_bytes = true;
+        }
+        Poll::Ready(Ok(wrote))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -427,7 +458,11 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for H1FramingGuardIo<T> {
             let total = bufs.iter().map(|slice| slice.len()).sum();
             return Poll::Ready(Ok(total));
         }
-        Pin::new(&mut this.inner).poll_write_vectored(cx, bufs)
+        let wrote = ready!(Pin::new(&mut this.inner).poll_write_vectored(cx, bufs))?;
+        if wrote > 0 {
+            this.wrote_response_bytes = true;
+        }
+        Poll::Ready(Ok(wrote))
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -1528,6 +1563,98 @@ mod tests {
         assert_eq!(
             envelope_body(malformed),
             JSON_MALFORMED_HTTP_REQUEST.as_bytes()
+        );
+    }
+
+    /// Minimal duplex used to drive `H1FramingGuardIo` directly: `reads` are
+    /// handed out one chunk per `poll_read`, and everything written lands in
+    /// `written` so a test can prove exactly what reached the socket.
+    struct MockIo {
+        reads: std::collections::VecDeque<Vec<u8>>,
+        written: Vec<u8>,
+    }
+
+    impl MockIo {
+        fn new(reads: &[&[u8]]) -> Self {
+            Self {
+                reads: reads.iter().map(|chunk| chunk.to_vec()).collect(),
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl AsyncRead for MockIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if let Some(chunk) = self.reads.pop_front() {
+                buf.put_slice(&chunk);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for MockIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    const CONFLICTING_CL_HEAD: &[u8] =
+        b"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n";
+
+    /// Read the guard once per queued chunk and report what reached the socket.
+    fn drive(io_reads: &[&[u8]], preceding_response: Option<&[u8]>) -> Vec<u8> {
+        let (mut guard, _signals) =
+            H1FramingGuardIo::new(MockIo::new(io_reads), TEST_MAX_HEAD_BYTES);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+
+        if let Some(response) = preceding_response {
+            let wrote = Pin::new(&mut guard).poll_write(&mut cx, response);
+            assert!(matches!(wrote, Poll::Ready(Ok(n)) if n == response.len()));
+        }
+
+        let mut storage = [0u8; 4096];
+        for _ in 0..io_reads.len() {
+            let mut buf = ReadBuf::new(&mut storage);
+            let _ = Pin::new(&mut guard).poll_read(&mut cx, &mut buf);
+        }
+        guard.inner.written
+    }
+
+    #[test]
+    fn parse_reject_envelope_is_written_on_a_fresh_connection() {
+        let written = drive(&[CONFLICTING_CL_HEAD], None);
+        assert_eq!(
+            written,
+            ENVELOPE_CONFLICTING_CONTENT_LENGTH,
+            "a malformed first request must get the JSON envelope"
+        );
+    }
+
+    #[test]
+    fn parse_reject_envelope_is_withheld_once_a_response_has_begun() {
+        let response = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
+        let written = drive(&[CONFLICTING_CL_HEAD], Some(response));
+        assert_eq!(
+            written, response,
+            "the envelope must never be spliced into an in-flight response; a \
+             malformed request pipelined behind one falls back to Hyper's 400"
         );
     }
 }

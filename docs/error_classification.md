@@ -207,6 +207,16 @@ outbound HTTP/1 response on the hot path. Duplicate `Host` and combined
 `Content-Length` + `Transfer-Encoding` still reach the handler and keep their
 existing JSON bodies.
 
+The envelope is armed only before the connection's first response byte. It is
+written straight to the socket from the read path, bypassing Hyper's write
+buffer, and Hyper's HTTP/1 server reads the next request head while an earlier
+response is still being written — so on a keep-alive connection under write
+backpressure a *pipelined* malformed request would otherwise splice the
+envelope into the middle of the previous response. A malformed request
+pipelined behind a response therefore falls back to Hyper's empty-bodied
+`400`, exactly like the unnameable parse failures above. The common case — one
+malformed request on a fresh connection — always gets the JSON envelope.
+
 ## Transaction summary integration
 
 Two summary types in [`src/plugins/mod.rs`](../src/plugins/mod.rs) carry classification fields:

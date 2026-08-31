@@ -117,7 +117,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Connection: close` directly on the connection so Hyper never sees the
   request. Well-formed requests keep the existing observe path and vectored
   writes. Other Hyper parse failures the guard cannot name stay empty-bodied
-  `400`s. Not marked **BREAKING**: status remains `400`, connection close
+  `400`s, as does a malformed request pipelined behind a response on a
+  keep-alive connection (the envelope is armed only before the connection's
+  first response byte, so it can never be spliced into an in-flight
+  response). Not marked **BREAKING**: status remains `400`, connection close
   semantics are unchanged, and clients that ignored the body are unaffected;
   only strict empty-body assertions need updating.
 
