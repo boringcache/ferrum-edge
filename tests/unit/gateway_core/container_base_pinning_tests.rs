@@ -10,14 +10,20 @@ const PRODUCTION_DOCKERFILES: &[(&str, &str)] = &[
 
 const FLOATING_RUST_TAGS: &[&str] = &["latest", "stable", "nightly", "beta"];
 
-fn strip_inline_comment(line: &str) -> &str {
-    line.split_once('#').map(|(before, _)| before).unwrap_or(line)
+/// A Dockerfile comment is a WHOLE line beginning with `#`; the parser has no
+/// inline-comment form, so everything after a `#` on an `ARG` or `FROM` line is
+/// part of that instruction's arguments. Treating `#` as an inline comment here
+/// would let this test pass over a Dockerfile the builder cannot parse, which is
+/// exactly the failure this gate exists to prevent.
+fn instruction_line(line: &str) -> &str {
+    let trimmed = line.trim();
+    if trimmed.starts_with('#') { "" } else { trimmed }
 }
 
 fn parse_arg_defaults(dockerfile: &str) -> HashMap<String, String> {
     let mut defaults = HashMap::new();
     for line in dockerfile.lines() {
-        let trimmed = strip_inline_comment(line).trim();
+        let trimmed = instruction_line(line);
         let Some(rest) = trimmed.strip_prefix("ARG ") else {
             continue;
         };
@@ -30,7 +36,7 @@ fn parse_arg_defaults(dockerfile: &str) -> HashMap<String, String> {
 }
 
 fn from_image_token(line: &str) -> Option<String> {
-    let trimmed = strip_inline_comment(line).trim();
+    let trimmed = instruction_line(line);
     let rest = trimmed.strip_prefix("FROM ")?;
     let image = rest
         .split_whitespace()
@@ -78,18 +84,19 @@ fn assert_rust_channel_approved(file: &str, line_no: usize, line: &str, resolved
         return;
     }
 
-    let tag = resolved
-        .split_once('@')
-        .and_then(|(before_digest, _)| before_digest.rsplit_once(':'))
-        .map(|(_, tag)| tag);
-    let Some(tag) = tag else {
+    // `repo:tag@sha256:...` is the pinned form this repository already uses for
+    // `IPROUTE2_BASE`: the digest decides which bytes are pulled and the tag is
+    // documentation, so a floating tag is only a finding when NO digest pins it.
+    if resolved.contains("@sha256:") {
         return;
-    };
+    }
+
+    let tag = resolved.rsplit_once(':').map(|(_, tag)| tag).unwrap_or("latest");
 
     assert!(
         !FLOATING_RUST_TAGS.contains(&tag),
         "{file}:{line_no}: unapproved floating Rust channel `{tag}` in `{line}`; pin the \
-         manifest-list digest and record the human-readable tag in a trailing comment"
+         manifest-list digest as `rust:<tag>@sha256:<digest>`"
     );
 }
 
