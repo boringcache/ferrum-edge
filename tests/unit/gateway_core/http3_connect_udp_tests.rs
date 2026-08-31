@@ -374,14 +374,8 @@ fn a_transport_constrained_target_is_refused_even_when_a_sibling_is_directly_dia
     let lb: &LoadBalancerCacheInner = &guard;
     let proxy = upstream_proxy("mixed-pool");
 
-    let admitted = admit_connect_udp_destination(
-        &proxy,
-        lb,
-        "direct.internal",
-        5353,
-        None,
-    )
-    .expect("the direct member is tunnelable");
+    let admitted = admit_connect_udp_destination(&proxy, lb, "direct.internal", 5353, None)
+        .expect("the direct member is tunnelable");
     match admitted {
         AdmittedConnectUdpDestination::UpstreamTarget(target) => {
             assert_eq!(target.host, "direct.internal");
@@ -391,14 +385,7 @@ fn a_transport_constrained_target_is_refused_even_when_a_sibling_is_directly_dia
     }
 
     assert_eq!(
-        admit_connect_udp_destination(
-            &proxy,
-            lb,
-            "hbone.internal",
-            5353,
-            None,
-        )
-        .unwrap_err(),
+        admit_connect_udp_destination(&proxy, lb, "hbone.internal", 5353, None,).unwrap_err(),
         ConnectUdpDestinationRefusal::TransportRequired(
             "HBONE dispatch required for this backend target"
         ),
@@ -479,13 +466,7 @@ fn a_direct_duplicate_cannot_launder_a_transport_constrained_sibling() {
 
     assert!(
         matches!(
-            admit_connect_udp_destination(
-                &proxy,
-                lb,
-                "relay.internal",
-                5353,
-                None,
-            ),
+            admit_connect_udp_destination(&proxy, lb, "relay.internal", 5353, None,),
             Err(ConnectUdpDestinationRefusal::TransportRequired(_))
         ),
         "admission must fail closed across every matching target"
@@ -508,14 +489,8 @@ fn admission_returns_the_requested_member_never_a_balanced_one() {
 
     for _ in 0..8 {
         for host in ["relay-a.internal", "relay-b.internal"] {
-            let admitted = admit_connect_udp_destination(
-                &proxy,
-                lb,
-                host,
-                5353,
-                None,
-            )
-            .expect("every configured member is admissible");
+            let admitted = admit_connect_udp_destination(&proxy, lb, host, 5353, None)
+                .expect("every configured member is admissible");
             match admitted {
                 AdmittedConnectUdpDestination::UpstreamTarget(target) => {
                     assert_eq!(target.host, host, "must describe the requested member");
@@ -551,24 +526,12 @@ fn dns_sd_standby_tier_is_not_admitted_while_primary_is_healthy() {
     let health = all_healthy(&active);
 
     assert!(
-        admit_connect_udp_destination(
-            &proxy,
-            &guard,
-            "primary.internal",
-            5353,
-            Some(&health),
-        )
-        .is_ok()
+        admit_connect_udp_destination(&proxy, &guard, "primary.internal", 5353, Some(&health),)
+            .is_ok()
     );
     assert_eq!(
-        admit_connect_udp_destination(
-            &proxy,
-            &guard,
-            "standby.internal",
-            5353,
-            Some(&health),
-        )
-        .unwrap_err(),
+        admit_connect_udp_destination(&proxy, &guard, "standby.internal", 5353, Some(&health),)
+            .unwrap_err(),
         ConnectUdpDestinationRefusal::SrvPriorityTierNotActive,
     );
     assert_eq!(
@@ -600,14 +563,7 @@ fn untagged_upstream_is_unaffected_by_srv_priority_admission() {
 
     for host in ["relay-a.internal", "relay-b.internal"] {
         assert!(
-            admit_connect_udp_destination(
-                &proxy,
-                &guard,
-                host,
-                5353,
-                Some(&health),
-            )
-            .is_ok(),
+            admit_connect_udp_destination(&proxy, &guard, host, 5353, Some(&health),).is_ok(),
             "{host} has no SRV priority tags and must stay admissible"
         );
         assert!(
@@ -625,24 +581,11 @@ fn a_route_backend_destination_is_admitted_as_the_route_backend() {
     let proxy = direct_proxy("dns.example", 853);
 
     assert!(matches!(
-        admit_connect_udp_destination(
-            &proxy,
-            lb,
-            "dns.example",
-            853,
-            None,
-        ),
+        admit_connect_udp_destination(&proxy, lb, "dns.example", 853, None,),
         Ok(AdmittedConnectUdpDestination::RouteBackend)
     ));
     assert_eq!(
-        admit_connect_udp_destination(
-            &proxy,
-            lb,
-            "attacker.example",
-            853,
-            None,
-        )
-        .unwrap_err(),
+        admit_connect_udp_destination(&proxy, lb, "attacker.example", 853, None,).unwrap_err(),
         ConnectUdpDestinationRefusal::NotConfigured
     );
 }
