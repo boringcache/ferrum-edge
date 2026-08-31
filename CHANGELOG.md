@@ -62,6 +62,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING — `ferrum-gateway` `mode=cp` disables the in-cluster K8s controller**
+  (issue #4384). The binary still defaults `FERRUM_K8S_CONTROLLER_ENABLED` and
+  `FERRUM_K8S_POD_DISCOVERY_ENABLED` to true when `KUBERNETES_SERVICE_HOST` is
+  set, but this chart renders no ClusterRole, so those core watches 403-retry
+  for the life of the process. `k8sController.enabled` now defaults to `false`
+  and `mode=cp` emits both env vars as `"false"`. Setting the value to `true`
+  fails render (use `charts/ferrum-mesh`, which already ships matching RBAC).
+  Both names are reserved so `env` / `extraEnv` cannot re-enable the watches.
+  **Operator action**: if you were running this chart as a Kubernetes CRD
+  controller, migrate to `charts/ferrum-mesh` (`controlPlane.enabled=true`).
+  Database-backed CP+DP pairs need no change; the documented
+  `examples/cp-values.yaml` quickstart now matches the chart's grant surface.
+
 - **BREAKING — Ferrum-owned UDP policy CRD upgrades with the mesh chart**
   (issue #4443). `UDPResponseAmplificationPolicy` moved from Helm's install-once
   `charts/ferrum-mesh/crds/` directory to
