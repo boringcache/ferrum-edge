@@ -2823,9 +2823,12 @@ async fn utf32_body_rules_block_declared_endianness_with_and_without_bom() {
     assert!(matches!(be_bom_result, PluginResult::Reject { .. }));
     assert!(monitored(&be_bom_ctx, "FE-SQLI-001-B"));
 
-    let (benign_result, benign_ctx) =
-        scan_body_with_content_type(&plugin, form_le, &encode_utf32("ordinary request body", false))
-            .await;
+    let (benign_result, benign_ctx) = scan_body_with_content_type(
+        &plugin,
+        form_le,
+        &encode_utf32("ordinary request body", false),
+    )
+    .await;
     assert!(matches!(benign_result, PluginResult::Continue));
     assert!(!monitored(&benign_ctx, "FE-SQLI-001-B"));
 }
@@ -2846,9 +2849,12 @@ async fn utf32le_bom_is_not_misdecoded_as_utf16le_bom() {
 
     // The same payload with a real UTF-16LE BOM still transcodes as UTF-16.
     let utf16_bom_body = with_bom(UTF16_LE_BOM, &encode_utf16(payload, false));
-    let (utf16_result, utf16_ctx) =
-        scan_body_with_content_type(&plugin, "application/x-www-form-urlencoded", &utf16_bom_body)
-            .await;
+    let (utf16_result, utf16_ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/x-www-form-urlencoded",
+        &utf16_bom_body,
+    )
+    .await;
     assert!(matches!(utf16_result, PluginResult::Reject { .. }));
     assert!(monitored(&utf16_ctx, "FE-SQLI-001-B"));
 }
@@ -2892,8 +2898,7 @@ async fn utf32_malformed_bodies_retain_raw_lossy_scan() {
     let mut over_max = encode_utf32("id=1 ", false);
     over_max.extend_from_slice(&0x110000u32.to_le_bytes());
     over_max.extend_from_slice(&encode_utf32("UNION SELECT password FROM users", false));
-    let (over_result, over_ctx) =
-        scan_body_with_content_type(&plugin, form_le, &over_max).await;
+    let (over_result, over_ctx) = scan_body_with_content_type(&plugin, form_le, &over_max).await;
     assert!(matches!(over_result, PluginResult::Continue));
     assert!(!monitored(&over_ctx, "FE-SQLI-001-B"));
 }
