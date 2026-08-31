@@ -1641,8 +1641,7 @@ mod tests {
     fn parse_reject_envelope_is_written_on_a_fresh_connection() {
         let written = drive(&[CONFLICTING_CL_HEAD], None);
         assert_eq!(
-            written,
-            ENVELOPE_CONFLICTING_CONTENT_LENGTH,
+            written, ENVELOPE_CONFLICTING_CONTENT_LENGTH,
             "a malformed first request must get the JSON envelope"
         );
     }
