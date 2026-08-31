@@ -5136,11 +5136,22 @@ fn contested_inbound_relay_addresses(
             if pod_uids.len() < 2 {
                 return None;
             }
-            let proven_same_pod = match pod_uids.first().copied().flatten() {
-                Some(uid) => pod_uids.iter().all(|candidate| *candidate == Some(uid)),
-                None => false,
-            };
-            (!proven_same_pod).then_some(address)
+            // Only ABSENT pod-UID evidence is ambiguous here. This is the
+            // registry-bounded arm, and `terminates_for` already compares each
+            // entry's pod UID against the enrolled pod's, so several records
+            // that all carry a non-empty UID are separated correctly: the
+            // enrolled one matches and every other one is refused. Treating
+            // merely-DIFFERENT UIDs as contested would refuse the enrolled pod
+            // too, and `hostNetwork` pods legitimately share the node IP with
+            // distinct UIDs — that is an availability loss with no security
+            // gain. A record with NO pod UID is the real hazard: the
+            // comparison is skipped for it, so it would ride the address on
+            // identity alone and widen the admitted port set (issue #4249).
+            //
+            // This is deliberately WEAKER than
+            // `own_address_port_bounds_from_workloads`, which demands one
+            // proven pod because that arm has no registry to disambiguate with.
+            pod_uids.iter().any(Option::is_none).then_some(address)
         })
         .collect()
 }

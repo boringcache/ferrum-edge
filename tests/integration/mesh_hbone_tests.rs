@@ -2833,10 +2833,13 @@ fn inbound_relay_ambient_registry_refuses_declared_name_destinations() {
 
 /// Issue #4249: several workload records can declare ONE address while
 /// belonging to DIFFERENT pods (`hostNetwork` pods all declare the node IP).
-/// Once the registry is authoritative, that address is contested and refused
-/// for every claimant instead of trying to admit one record's ports.
+/// While the registry is authoritative each record is judged on its OWN pod
+/// UID against the enrolled owner, so the sibling's ports are refused without
+/// also refusing the enrolled pod. Absent pod-UID evidence is the case the
+/// registry cannot separate; that is covered by
+/// `inbound_relay_ambient_registry_refuses_uidless_record_contesting_enrolled_address`.
 #[test]
-fn inbound_relay_ambient_registry_refuses_shared_address_claimed_by_different_pods() {
+fn inbound_relay_ambient_registry_separates_shared_address_claimed_by_different_pods() {
     let own_spiffe = reviews_spiffe();
 
     let mut enrolled_pod = reviews_replica("10.244.5.5", LOCAL_POD_UID);
@@ -2874,12 +2877,16 @@ fn inbound_relay_ambient_registry_refuses_shared_address_claimed_by_different_po
 
     assert_eq!(
         mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
-        Err(InboundRelayDenial::AddressNotTerminated),
-        "different pod UIDs contest the address for every inventory claimant"
+        Ok(()),
+        "both records carry a pod UID, so the registry separates them: the \
+         enrolled pod is admitted on the port its OWN record declares"
     );
     assert_eq!(
         mesh.inbound_relay_destination_decision("10.244.5.5", 9443, node),
-        Err(InboundRelayDenial::AddressNotTerminated)
+        Err(InboundRelayDenial::PortNotDeclared),
+        "the unenrolled sibling's pod UID does not match the registry owner, so \
+         its port is never admitted — that is the issue #4249 property, and it \
+         does not require refusing the enrolled pod as well"
     );
 }
 
