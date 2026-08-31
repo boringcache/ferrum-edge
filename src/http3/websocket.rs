@@ -673,8 +673,7 @@ pub(crate) async fn handle_h3_websocket(
     // of waiting for the later `begin_drain` latch (which fires only after
     // the H3 listener — and this session — have already returned).
     let ws_shutdown_rx = ctx.websocket_shutdown_rx.clone();
-    let ws_shutdown_rx = ws_shutdown_rx
-        .or_else(|| state.health_check_shutdown_rx.clone());
+    let ws_shutdown_rx = ws_shutdown_rx.or_else(|| state.health_check_shutdown_rx.clone());
     let ws_session_deadline = crate::proxy::effective_websocket_session_deadline(
         &ctx,
         state.env_config.websocket_max_lifetime_seconds,
