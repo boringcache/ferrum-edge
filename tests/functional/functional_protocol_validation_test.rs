@@ -740,6 +740,7 @@ async fn functional_protocol_validation_http10_plus_te_rejected() {
     assert_eq!(resp.body, ERROR_BODY);
     assert_eq!(raw_header(&resp, "content-type"), Some("application/json"));
     assert_eq!(raw_header(&resp, "x-gateway-error"), Some("request_error"));
+    assert_eq!(raw_header(&resp, "connection"), Some("close"));
 
     h.cleanup();
 }
@@ -925,6 +926,7 @@ async fn functional_protocol_validation_multiple_content_length_conflicting() {
     assert_eq!(resp.body, ERROR_BODY);
     assert_eq!(raw_header(&resp, "content-type"), Some("application/json"));
     assert_eq!(raw_header(&resp, "x-gateway-error"), Some("request_error"));
+    assert_eq!(raw_header(&resp, "connection"), Some("close"));
 
     h.cleanup();
 }
@@ -988,6 +990,7 @@ async fn functional_protocol_validation_non_utf8_request_target_rejected() {
     assert_eq!(resp.body, ERROR_BODY);
     assert_eq!(raw_header(&resp, "content-type"), Some("application/json"));
     assert_eq!(raw_header(&resp, "x-gateway-error"), Some("request_error"));
+    assert_eq!(raw_header(&resp, "connection"), Some("close"));
 
     h.cleanup();
 }
@@ -1008,6 +1011,21 @@ async fn functional_protocol_validation_handler_layer_te_cl_body_unchanged() {
     let resp = send_raw_h1(h.proxy_port, req).await;
     assert_eq!(resp.status_code, 400);
     assert_eq!(resp.body, ERROR_BODY);
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_normal_h1_request_unaffected() {
+    let h = Harness::new(false).await;
+
+    let req = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+
+    assert_eq!(resp.status_code, 200, "body={}", resp.body);
+    assert_eq!(raw_header(&resp, "content-type"), Some("text/plain"));
+    assert!(raw_header(&resp, "x-gateway-error").is_none());
 
     h.cleanup();
 }
