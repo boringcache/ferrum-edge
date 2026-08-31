@@ -33,6 +33,24 @@ RFC 9113 §8.3.1 and RFC 9114 §4.3.1 require either `:authority` or Host. Ferru
 
 **Operator action:** any HTTP/2 or HTTP/3 client that omitted both `:authority` and Host will start seeing `400` `{"error":"Request is missing both :authority and Host"}` instead of being routed. Send `:authority` or Host.
 
+### Ambient pod-registry migration proofs require canonical entries (issue [#4249](https://github.com/ferrum-edge/ferrum-edge/issues/4249))
+
+Durable Ambient UDP placement cleanup now reads the same strict, bounded,
+all-or-nothing pod-registry snapshot as the inbound HBONE relay node bound. A
+leaf that disappears between directory enumeration and open is treated as an
+ordinary pod withdrawal and skipped. Any present malformed optional field,
+duplicate recognized key, unknown non-empty line, unsafe leaf name, symlink,
+oversized or non-regular file, ownership mismatch, or other read failure makes
+the cleanup pass report `registry_not_synchronized`; several malformed body
+shapes were previously tolerated. The node-agent publisher also refuses leaf
+names outside the canonical grammar: non-empty, at most 256 bytes, ASCII
+alphanumeric first, then ASCII alphanumeric, hyphen, or underscore.
+
+**Operator action:** before starting an Ambient UDP placement migration, remove
+stale hand-authored pod-registry artifacts and let the node-agent regenerate
+every pod entry. Any external publisher must use only the documented leaf and
+body grammar; otherwise cleanup/finalize remains fail-closed.
+
 ### `preserve_host_header` now sets `:authority` on direct-H2 and gRPC backends (issue [#4410](https://github.com/ferrum-edge/ferrum-edge/issues/4410))
 
 Ferrum's outbound direct-H2 and native-gRPC dispatch previously sent a hostname-only `Host` while Hyper derived `:authority` from the full backend URI including a non-default port. RFC 9113 §8.3.1 forbids that disagreement, so RFC-compliant HTTP/2 origins reset the stream and the client saw `502 backend_error` or gRPC `UNAVAILABLE`. Both fields now carry the same authority.
