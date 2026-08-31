@@ -733,6 +733,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`charts/ferrum-gateway` `admin.requireNamespaceClaim`** (issue #4456).
+  First-class chart value (default `false`, matching the binary) rendering
+  `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` in `database`, `file`, `cp`, and `dp`
+  modes. Reserved so `env` / `extraEnv` cannot desync it. Pair with
+  `cp.requireNamespaceClaim` for tenancy enforcement on both planes; enabling
+  only the CP flag does not constrain admin JWTs. Not breaking.
+
 - **`DELETE /proxies/{id}?cleanup_orphaned_upstream=` opt-out** (issue #4064).
   This is a non-breaking feature addition: omitting the parameter preserves
   existing behavior, which orphan-cleans a last-referenced hand-owned
