@@ -262,10 +262,14 @@ Do not reuse `backend_error` for a response that never reached a backend.
 | *(no `ErrorClass`; `rejection_phase=overload`)* | `overload` |
 | *(no `ErrorClass`; `rejection_phase=config_stale`)* | `config_stale` |
 | *(no `ErrorClass`; `rejection_phase=adaptive_concurrency`)* | `concurrency_limit` |
+| *(no `ErrorClass`; no `rejection_phase`; backend 5xx)* | `backend_error` |
 
-The four gateway-authored tokens appear on the metric (and the header) when
-there is no `ErrorClass`. They are omitted from the access log in that case;
-`metadata.rejection_phase` still names the fence. Stream disconnects keep
+Those five gateway-authored tokens appear on the metric (and the header) when
+there is no `ErrorClass`. The first four are named by a `rejection_phase`;
+`backend_error` is the fallback for a backend 5xx the gateway never
+classified and no fence rejected, so the metric never loses a 5xx to an
+empty label. They are omitted from the access log in that case;
+`metadata.rejection_phase` still names the fence where there is one. Stream disconnects keep
 the granular `ErrorClass::as_str` values (19 compiled-in variants) and add
 that optional label on `ferrum_stream_disconnects_total`.
 

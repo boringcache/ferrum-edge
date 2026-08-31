@@ -165,7 +165,7 @@ impl ErrorClass {
     /// Every compiled-in [`ErrorClass`] variant. Stream `error_class` metrics
     /// labels are drawn only from [`Self::as_str`] of this set (or omitted).
     /// HTTP `ferrum_requests_total{error_class}` uses the same strings plus
-    /// the four gateway-authored tokens in
+    /// the five gateway-authored tokens in
     /// [`HTTP_METRICS_GATEWAY_ERROR_CLASSES`].
     pub const ALL: &'static [ErrorClass] = &[
         Self::ConnectionTimeout,
@@ -350,8 +350,8 @@ pub fn intern_http_metrics_error_class(value: &str) -> Option<&'static str> {
 
 /// HTTP `ferrum_requests_total{error_class}` label for one transaction.
 ///
-/// Closed set: [`ErrorClass::ALL`] (`as_str`) plus the four gateway-authored
-/// tokens. Cardinality bound: [`HTTP_METRICS_ERROR_CLASS_BOUND`] (23).
+/// Closed set: [`ErrorClass::ALL`] (`as_str`) plus the five gateway-authored
+/// tokens. Cardinality bound: [`HTTP_METRICS_ERROR_CLASS_BOUND`] (24).
 ///
 /// When an [`ErrorClass`] is present on a 5xx, the label is that class's
 /// `as_str` so `dns_lookup_error` stays distinguishable from
