@@ -2100,11 +2100,19 @@ async fn native_grpc_backend_sees_matching_host_and_authority_on_non_default_por
     let state = create_test_proxy_state(vec![proxy]);
     let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
 
+    // The client Host must AGREE with the `:authority` the helper emits from
+    // `gateway_addr`: since issue #4416 the inbound guard rejects an H2
+    // Host/`:authority` disagreement with 400 before routing, so a made-up
+    // client Host would never reach backend dispatch. Sending the gateway's own
+    // authority is what a conforming client does, and it still proves the
+    // outbound side REPLACES it — `x-echo-host` below must be the backend
+    // authority, not this one.
+    let client_host = gateway_addr.to_string();
     let (status, headers, _body) = send_grpc_request(
         gateway_addr,
         "/grpc/my.Service/Echo",
         b"",
-        &[("host", "client.example:9000")],
+        &[("host", client_host.as_str())],
     )
     .await
     .expect("gRPC request should succeed");
