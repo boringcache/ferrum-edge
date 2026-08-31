@@ -41,6 +41,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **HTTP/3 graceful shutdown sends GOAWAY** (issue #4429). The H3 listener
+  already stopped accepting new QUIC handshakes on SIGTERM, but each accepted
+  connection was spawned without a shutdown receiver, never sent HTTP/3 GOAWAY,
+  and was later closed with QUIC application code `0`, which reset in-flight
+  streams. Each connection now clones the process shutdown watch, calls the
+  vendored `h3::server::Connection::shutdown(0)` API so the peer receives
+  GOAWAY, refuses new request streams with `H3_REQUEST_REJECTED`, and lets
+  already-accepted work finish — including gRPC trailers, RFC 9220 WebSocket
+  close frames, and CONNECT-UDP relays. After drain completes or
+  `FERRUM_SHUTDOWN_DRAIN_SECONDS` expires, remaining connections close with
+  `H3_NO_ERROR` (`0x0100`). `FERRUM_SHUTDOWN_DRAIN_SECONDS` semantics are
+  unchanged. **Operator action**: none; planned restarts now drain HTTP/3 the
+  same way as HTTP/1.1 and HTTP/2.
+
 - **Injector inbound capture excludes kubelet HTTP and TCP probe ports**
   (issue #4431). `startupProbe` / `readinessProbe` / `livenessProbe` `httpGet`
   and `tcpSocket` ports on every container in the pod are unioned into the
