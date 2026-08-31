@@ -2860,6 +2860,41 @@ async fn utf32le_bom_is_not_misdecoded_as_utf16le_bom() {
 }
 
 #[tokio::test]
+async fn ambiguous_ffef0000_prefix_scans_both_utf32le_and_utf16le_readings() {
+    let plugin = recommended_enforcing_waf();
+    let payload = "id=1 UNION SELECT password FROM users";
+
+    // `FF FE 00 00` is a UTF-32LE BOM *and* a UTF-16LE BOM followed by
+    // U+0000. Unicode makes UTF-32LE the correct reading, so committing to
+    // it alone leaves a backend that has no UTF-32 support -- which reads
+    // these exact bytes as UTF-16LE -- looking at an unscanned payload.
+    // Here the UTF-32 reading is not even well formed (the remainder is not
+    // a whole number of 4-byte units), and the raw/lossy scan sees only
+    // NUL-interleaved ASCII, which no rule matches. Only scanning the
+    // UTF-16LE reading catches this.
+    let body = with_bom(UTF32_LE_BOM, &encode_utf16(payload, false));
+    let (result, ctx) =
+        scan_body_with_content_type(&plugin, "application/x-www-form-urlencoded", &body).await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "UTF-16LE reading of an ambiguous FF FE 00 00 body must still be scanned"
+    );
+    assert!(monitored(&ctx, "FE-SQLI-001-B"));
+
+    // A charset that names the UTF-32 family settles the width, so the
+    // UTF-32LE reading is authoritative and still blocks on its own.
+    let utf32_body = with_bom(UTF32_LE_BOM, &encode_utf32(payload, false));
+    let (utf32_result, utf32_ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/x-www-form-urlencoded; charset=utf-32",
+        &utf32_body,
+    )
+    .await;
+    assert!(matches!(utf32_result, PluginResult::Reject { .. }));
+    assert!(monitored(&utf32_ctx, "FE-SQLI-001-B"));
+}
+
+#[tokio::test]
 async fn utf32_malformed_bodies_retain_raw_lossy_scan() {
     let plugin = recommended_enforcing_waf();
     let payload = "id=1 UNION SELECT password FROM users";

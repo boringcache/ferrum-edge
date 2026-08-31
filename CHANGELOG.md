@@ -17,7 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   BOM does not invent an endianness; both endiannesses are decoded and each
   successful view is scanned, plus the existing raw/lossy view. UTF-32 BOMs
   are recognized before UTF-16 BOMs so a UTF-32LE BOM (`FF FE 00 00`) is
-  not misdecoded as UTF-16LE. Malformed, truncated, surrogate-range, or
+  not misdecoded as UTF-16LE; because that prefix is equally a UTF-16LE BOM
+  followed by `U+0000`, both readings are scanned unless the charset names
+  the UTF-32 family. Malformed, truncated, surrogate-range, or
   out-of-range UTF-32 is not partially decoded; it retains the existing
   raw/lossy scan. **Operator-visible**: a previously forwarded UTF-32
   encoding of a blocked L1 payload (for example `UNION SELECT` as

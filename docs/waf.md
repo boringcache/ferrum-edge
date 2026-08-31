@@ -155,7 +155,15 @@ bytes without allocating, while a valid UTF-16 or UTF-32 view is allocated
 only within the already-applied `max_scan_bytes` bound. UTF-32 BOMs
 (`FF FE 00 00` little-endian, `00 00 FE FF` big-endian) are recognized
 **before** the 2-byte UTF-16 BOMs, because a UTF-32LE BOM also starts with
-the UTF-16LE mark `FF FE`. Bare `charset=utf-16` / `charset=utf-32` with no
+the UTF-16LE mark `FF FE`. That prefix is genuinely ambiguous — it is a
+UTF-32LE BOM, and equally a UTF-16LE BOM followed by `U+0000` — so unless the
+charset names the UTF-32 family, **both** readings are scanned along with the
+raw/lossy view. Unicode makes UTF-32LE the correct decode, but a backend
+without UTF-32 support reads the same bytes as UTF-16LE, and committing to
+one reading would leave the other unscanned. A charset that does name UTF-32
+(`utf-32`, `utf-32le`, `utf-32be`) settles the width, and only the UTF-32
+reading is used. `00 00 FE FF` is not a UTF-16 BOM prefix and is
+unambiguous. Bare `charset=utf-16` / `charset=utf-32` with no
 BOM does not invent an endianness (IANA leaves both unspecified without a
 BOM). Both little-endian and big-endian decodes are attempted; each view
 that decodes cleanly is scanned by the request-body rules, and the existing

@@ -130,11 +130,14 @@ impl WideCharsetViews {
         }
     }
 
-    fn unresolved(little: Option<String>, big: Option<String>) -> Self {
-        let mut out = Self::from_endians(little, big);
+    /// Two candidate readings of the same bytes that the declaration does not
+    /// disambiguate: either endianness of a bare `utf-16` / `utf-32`, or the
+    /// UTF-32LE / UTF-16LE split of a `FF FE 00 00` prefix.
+    fn unresolved(first: Option<String>, second: Option<String>) -> Self {
+        let mut out = Self::from_endians(first, second);
         // Lossy fallback is used whenever there is no transcoded view. When
-        // at least one endian decoded, still keep that raw/lossy scan so a
-        // bare declaration cannot drop it.
+        // at least one candidate decoded, still keep that raw/lossy scan so an
+        // ambiguous body cannot drop it.
         out.include_lossy = !out.is_empty();
         out
     }
@@ -187,6 +190,22 @@ pub(super) fn decode_wide_charset_body_views(
         return WideCharsetViews::unresolved(
             decode_utf32(body, Utf32Endian::Little),
             decode_utf32(body, Utf32Endian::Big),
+        );
+    }
+    // `FF FE 00 00` is simultaneously a UTF-32LE BOM and a UTF-16LE BOM
+    // followed by U+0000. Unicode makes UTF-32LE the correct reading, and
+    // `utf16_bom` defers to it — but a backend without UTF-32 support reads
+    // exactly the same bytes as UTF-16LE, so committing to one view would
+    // leave the other unscanned. Unless the charset names the UTF-32 family
+    // (in which case the declaration, not the BOM, settles it), scan both and
+    // keep the raw/lossy view as well. `00 00 FE FF` (UTF-32BE) is not a
+    // UTF-16 BOM prefix and is therefore unambiguous.
+    if matches!(utf32_bom(body), Some((Utf32Endian::Little, _)))
+        && !charset_declares_utf32_family(content_type)
+    {
+        return WideCharsetViews::unresolved(
+            decode_utf32(&body[4..], Utf32Endian::Little),
+            decode_utf16(&body[2..], Utf16Endian::Little),
         );
     }
     if let Some(text) = decode_utf32_body(body, content_type) {
@@ -326,6 +345,14 @@ fn declared_utf32_endian(
     } else {
         None
     }
+}
+
+/// Whether the declared charset names the UTF-32 family at all (bare
+/// `utf-32` or an explicit endianness). A body whose charset says UTF-32 is
+/// read as UTF-32 by any backend honouring the declaration, so its BOM is not
+/// ambiguous; one with no UTF-32 declaration is.
+fn charset_declares_utf32_family(content_type: Option<&str>) -> bool {
+    declared_utf32_endian(content_type, Some(Utf32Endian::Little)).is_some()
 }
 
 fn utf32_bom(body: &[u8]) -> Option<(Utf32Endian, usize)> {
