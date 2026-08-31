@@ -1046,8 +1046,7 @@ fn injected_shape_matches(
     config: &InjectorConfig,
     admission_namespace: Option<&str>,
 ) -> Result<bool, String> {
-    let Some(sidecar) = named_container(pod, "/spec/initContainers", SIDECAR_CONTAINER_NAME)
-    else {
+    let Some(sidecar) = named_container(pod, "/spec/initContainers", SIDECAR_CONTAINER_NAME) else {
         return Ok(false);
     };
     let namespace = pod_namespace(pod, admission_namespace, config);
@@ -1274,10 +1273,7 @@ a patch Kubernetes would reject"
     }
 }
 
-fn ensure_init_containers(
-    pod: &Value,
-    patch: &mut Vec<JsonPatchOperation>,
-) -> Result<(), String> {
+fn ensure_init_containers(pod: &Value, patch: &mut Vec<JsonPatchOperation>) -> Result<(), String> {
     match pod.pointer("/spec/initContainers") {
         None => {
             patch.push(JsonPatchOperation {
@@ -1300,9 +1296,9 @@ fn named_container<'a>(pod: &'a Value, pointer: &str, name: &str) -> Option<&'a 
     pod.pointer(pointer)
         .and_then(Value::as_array)
         .and_then(|containers| {
-            containers.iter().find(|container| {
-                container.get("name").and_then(Value::as_str) == Some(name)
-            })
+            containers
+                .iter()
+                .find(|container| container.get("name").and_then(Value::as_str) == Some(name))
         })
 }
 
@@ -1741,12 +1737,9 @@ fn collect_container_probe_ports(container: &Value, ports: &mut Vec<u16>) -> Res
         let Some(probe) = container.get(probe_field) else {
             continue;
         };
-        if let Some(port) = inbound_exclusion_port_for_probe(
-            container,
-            container_name,
-            probe_field,
-            probe,
-        )? {
+        if let Some(port) =
+            inbound_exclusion_port_for_probe(container, container_name, probe_field, probe)?
+        {
             ports.push(port);
         }
     }
@@ -1826,12 +1819,7 @@ empty; refusing injection"
                     )
                 })
             } else {
-                resolve_named_container_port(
-                    container,
-                    container_name,
-                    probe_field,
-                    trimmed,
-                )
+                resolve_named_container_port(container, container_name, probe_field, trimmed)
             }
         }
         _ => Err(format!(
@@ -2047,14 +2035,11 @@ mod tests {
             .expect("injector test server panicked");
     }
 
-    fn patch_named_container<'a>(
-        patch: &'a [JsonPatchOperation],
-        name: &str,
-    ) -> Option<&'a Value> {
+    fn patch_named_container<'a>(patch: &'a [JsonPatchOperation], name: &str) -> Option<&'a Value> {
         patch.iter().find_map(|op| {
-            op.value.as_ref().filter(|value| {
-                value.get("name").and_then(Value::as_str) == Some(name)
-            })
+            op.value
+                .as_ref()
+                .filter(|value| value.get("name").and_then(Value::as_str) == Some(name))
         })
     }
 
@@ -2268,10 +2253,8 @@ mod tests {
             !patch.iter().any(|op| op.path == "/spec/containers/-"),
             "native sidecar must not be appended as an ordinary container"
         );
-        let sidecar = patch_named_container(&patch, "ferrum-edge")
-            .expect("sidecar container");
-        let init = patch_named_container(&patch, "ferrum-edge-init")
-            .expect("init container");
+        let sidecar = patch_named_container(&patch, "ferrum-edge").expect("sidecar container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let env = sidecar
             .get("env")
             .and_then(Value::as_array)
@@ -2768,8 +2751,7 @@ mod tests {
         let mut config = test_config(true, CaptureMode::Iptables);
         config.udp_capture_enabled = false;
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let sidecar = patch_named_container(&patch, "ferrum-edge")
-            .expect("sidecar container");
+        let sidecar = patch_named_container(&patch, "ferrum-edge").expect("sidecar container");
         assert_eq!(
             sidecar.pointer("/securityContext/capabilities/drop"),
             Some(&json!(["ALL"]))
@@ -2784,8 +2766,7 @@ mod tests {
         let mut config = test_config(true, CaptureMode::Iptables);
         config.udp_capture_enabled = true;
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let sidecar = patch_named_container(&patch, "ferrum-edge")
-            .expect("sidecar container");
+        let sidecar = patch_named_container(&patch, "ferrum-edge").expect("sidecar container");
         assert_eq!(
             sidecar.pointer("/securityContext/capabilities/drop"),
             Some(&json!(["ALL"]))
@@ -2815,8 +2796,7 @@ mod tests {
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
 
         // Init container: UDP TPROXY/mangle rules ARE emitted.
-        let init = patch_named_container(&patch, "ferrum-edge-init")
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -2835,8 +2815,7 @@ mod tests {
         );
 
         // Sidecar container: runtime UDP-enable env IS set.
-        let sidecar = patch_named_container(&patch, "ferrum-edge")
-            .expect("sidecar container");
+        let sidecar = patch_named_container(&patch, "ferrum-edge").expect("sidecar container");
         let env = sidecar
             .pointer("/env")
             .and_then(Value::as_array)
@@ -2879,8 +2858,7 @@ mod tests {
         let mut config = test_config(true, CaptureMode::Iptables);
         config.udp_capture_enabled = false;
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch_named_container(&patch, "ferrum-edge-init")
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -2889,8 +2867,7 @@ mod tests {
             !commands.contains("-p udp"),
             "UDP capture off must emit no `-p udp` rules: {commands}"
         );
-        let sidecar = patch_named_container(&patch, "ferrum-edge")
-            .expect("sidecar container");
+        let sidecar = patch_named_container(&patch, "ferrum-edge").expect("sidecar container");
         if let Some(env) = sidecar.pointer("/env").and_then(Value::as_array) {
             assert!(
                 !env.iter().any(|e| {
@@ -2918,8 +2895,7 @@ mod tests {
         config.exclude_outbound_ports = vec![3306, 5432];
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch_named_container(&patch, "ferrum-edge-init")
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -3119,10 +3095,8 @@ mod tests {
         config.init_resources = test_resources("2m", "8Mi", "20m", "32Mi");
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let sidecar = patch_named_container(&patch, "ferrum-edge")
-            .expect("sidecar container");
-        let init = patch_named_container(&patch, "ferrum-edge-init")
-            .expect("init container");
+        let sidecar = patch_named_container(&patch, "ferrum-edge").expect("sidecar container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
 
         assert_eq!(
             sidecar.pointer("/resources/requests/cpu"),
@@ -3392,10 +3366,7 @@ mod tests {
         let operations: Vec<Value> = serde_json::from_slice(&decoded).expect("json patch");
         let sidecar = operations
             .iter()
-            .find(|op| {
-                op.get("path").and_then(Value::as_str)
-                    == Some("/spec/initContainers/0")
-            })
+            .find(|op| op.get("path").and_then(Value::as_str) == Some("/spec/initContainers/0"))
             .and_then(|op| op.get("value"))
             .expect("sidecar patch");
         let env = sidecar
@@ -3755,8 +3726,7 @@ mod tests {
         config.exclude_inbound_ports = vec![22, 8080];
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch_named_container(&patch, "ferrum-edge-init")
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -4066,8 +4036,7 @@ mod tests {
         config.exclude_outbound_cidrs = vec!["10.0.0.0/8".to_string()];
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch_named_container(&patch, "ferrum-edge-init")
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -4097,8 +4066,7 @@ mod tests {
         config.include_outbound_cidrs = vec!["172.16.0.0/12".to_string()];
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch_named_container(&patch, "ferrum-edge-init")
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -4124,8 +4092,7 @@ mod tests {
         config.include_outbound_cidrs = vec!["10.0.0.0/8".to_string()];
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch_named_container(&patch, "ferrum-edge-init")
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -4578,8 +4545,7 @@ mod tests {
         config.ip6tables_mode = Ip6TablesMode::Required;
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch_named_container(&patch, "ferrum-edge-init")
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -4608,8 +4574,7 @@ mod tests {
         config.ip6tables_mode = Ip6TablesMode::Disabled;
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch_named_container(&patch, "ferrum-edge-init")
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)

@@ -123,9 +123,8 @@ fn admission_webhook_injects_core_v1_pod() {
         "native sidecar must be inserted at initContainers[0]"
     );
     let sidecar = ops.iter().find_map(|op| {
-        op.get("value").filter(|value| {
-            value.get("name").and_then(Value::as_str) == Some("ferrum-edge")
-        })
+        op.get("value")
+            .filter(|value| value.get("name").and_then(Value::as_str) == Some("ferrum-edge"))
     });
     let sidecar = sidecar.expect("sidecar container");
     assert_eq!(
