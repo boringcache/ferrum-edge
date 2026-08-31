@@ -172,9 +172,15 @@ async fn clickhouse_post(
     params: &[(&str, &str)],
     body: String,
 ) -> Result<String, String> {
+    // ClickHouse 24.8 rejects a POST that carries neither `Content-Length` nor
+    // chunked `Transfer-Encoding` with `411 Length Required` (`Code: 381`).
+    // Read-only helpers pass an empty body, so set the length explicitly
+    // instead of relying on reqwest to frame a zero-length body.
+    let content_length = body.len();
     let response = fixture
         .client
         .post(clickhouse_url_with_query(&fixture.url, params))
+        .header(reqwest::header::CONTENT_LENGTH, content_length)
         .body(body)
         .send()
         .await
