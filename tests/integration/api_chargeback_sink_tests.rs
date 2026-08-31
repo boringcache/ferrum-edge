@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use ferrum_edge::plugins::api_chargeback_sink::{
-    ApiChargebackSink, ChargeEvent, compile_charge_event_projection,
-    serialize_json_each_row, serialize_json_each_row_projected,
+    ApiChargebackSink, ChargeEvent, compile_charge_event_projection, serialize_json_each_row,
+    serialize_json_each_row_projected,
 };
 use ferrum_edge::plugins::{Plugin, PluginHttpClient, TransactionSummary};
 use serde_json::{Map, Value, json};
@@ -267,8 +267,7 @@ async fn clickhouse_insert_round_trip_when_configured() {
 // `tests/service_integration/clickhouse.rs`.
 // ---------------------------------------------------------------------------
 
-const CHARGES_RAW_DDL: &str =
-    include_str!("../../migrations/clickhouse/0001_charges.sql");
+const CHARGES_RAW_DDL: &str = include_str!("../../migrations/clickhouse/0001_charges.sql");
 
 const CHARGES_RAW_COLUMN_COUNT: usize = 26;
 
@@ -387,10 +386,7 @@ fn parse_charges_raw_columns(ddl: &str) -> Vec<(String, String)> {
             .next()
             .expect("column line must start with a name")
             .trim();
-        let declared = parts
-            .next()
-            .unwrap_or("")
-            .trim();
+        let declared = parts.next().unwrap_or("").trim();
         assert!(
             !name.is_empty() && !declared.is_empty(),
             "ferrum.charges_raw column line must be `<name> <type>`, got {line:?}"
@@ -400,7 +396,7 @@ fn parse_charges_raw_columns(ddl: &str) -> Vec<(String, String)> {
     columns
 }
 
-fn strip_clickhouse_wrapper(declared: &str, wrapper: &str) -> Option<&str> {
+fn strip_clickhouse_wrapper<'a>(declared: &'a str, wrapper: &str) -> Option<&'a str> {
     let prefix = format!("{wrapper}(");
     if declared.starts_with(&prefix) && declared.ends_with(')') {
         Some(&declared[prefix.len()..declared.len() - 1])
@@ -490,20 +486,13 @@ fn json_integer(value: &Value) -> Option<i128> {
         .or_else(|| value.as_i64().map(|n| n as i128))
 }
 
-fn type_mismatch(
-    key: &str,
-    kind: JsonValueKind,
-    declared: &str,
-    value: &Value,
-) -> Option<String> {
+fn type_mismatch(key: &str, kind: JsonValueKind, declared: &str, value: &Value) -> Option<String> {
     let (base, nullable) = unwrap_clickhouse_type(declared);
     let family = clickhouse_family(&base);
     let compatible = match kind {
         JsonValueKind::Null => nullable,
         JsonValueKind::String => family == "string" || family == "datetime",
-        JsonValueKind::Integer => {
-            family == "integer" || family == "datetime" || family == "float"
-        }
+        JsonValueKind::Integer => family == "integer" || family == "datetime" || family == "float",
         JsonValueKind::Float => family == "float",
         JsonValueKind::Bool => family == "bool",
         JsonValueKind::Nested => false,
@@ -528,10 +517,7 @@ fn type_mismatch(
     None
 }
 
-fn wire_contract_errors(
-    row: &Map<String, Value>,
-    columns: &[(String, String)],
-) -> Vec<String> {
+fn wire_contract_errors(row: &Map<String, Value>, columns: &[(String, String)]) -> Vec<String> {
     let mut errors = Vec::new();
     for (key, value) in row {
         match columns.iter().find(|(name, _)| name == key) {
@@ -584,11 +570,8 @@ fn projected_row(schema: Value, event: &ChargeEvent) -> Value {
     let projection = compile_charge_event_projection(&config)
         .expect("charge-event schema must compile")
         .expect("schema present");
-    let body = serialize_json_each_row_projected(
-        std::slice::from_ref(event),
-        Some(&projection),
-    )
-    .expect("projected ChargeEvent must serialize");
+    let body = serialize_json_each_row_projected(std::slice::from_ref(event), Some(&projection))
+        .expect("projected ChargeEvent must serialize");
     serde_json::from_str(&body).expect("projected JSONEachRow body must be JSON")
 }
 
