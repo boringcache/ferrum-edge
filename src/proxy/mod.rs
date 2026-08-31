@@ -28794,22 +28794,6 @@ fn attach_auth_rejection_set_cookie(
     }
 }
 
-pub async fn run_authentication_phase(
-    auth_mode: AuthMode,
-    auth_plugins: &[Arc<dyn Plugin>],
-    ctx: &mut RequestContext,
-    consumer_index: &ConsumerIndex,
-) -> Option<(u16, Bytes, HashMap<String, String>)> {
-    run_authentication_phase_with_envelope(
-        auth_mode,
-        auth_plugins,
-        ctx,
-        consumer_index,
-        false,
-    )
-    .await
-}
-
 pub async fn run_authentication_phase_with_envelope(
     auth_mode: AuthMode,
     auth_plugins: &[Arc<dyn Plugin>],
@@ -28959,7 +28943,7 @@ pub async fn run_authentication_phase_with_envelope(
                 || mesh_permissive_only_auth_plugin
             {
                 None
-            } else             {
+            } else {
                 let reject = missing_authentication_reject(auth_plugins, ctx);
                 Some(adapt_auth_reject_for_openai_envelope(
                     uses_openai_auth_error_envelope,
