@@ -608,6 +608,12 @@ async fn start_test_gateway(state: ProxyState) -> (SocketAddr, tokio::task::Join
 }
 
 /// Send a gRPC-like request through the gateway using hyper's HTTP/2 client.
+///
+/// The request target is absolute-form (`http://{gateway_addr}{path}`) so hyper
+/// emits `:authority`. Since issue #4416 an HTTP/2 request carrying neither
+/// `:authority` nor Host is rejected with 400 before routing, and the HMAC
+/// signed-request regression binds that exact authority, so an origin-form
+/// target here would fail every caller rather than exercise the gateway.
 async fn send_grpc_request(
     gateway_addr: SocketAddr,
     path: &str,
@@ -657,56 +663,6 @@ async fn send_grpc_request(
         .unwrap_or_default();
 
     Ok((status, headers, body_bytes))
-}
-
-/// Send a native gRPC request with an explicit HTTP/2 authority. HMAC binds
-/// that authority, so the signed-request regression must emit `:authority`
-/// from `gateway_addr` rather than a Host-only or origin-form request.
-async fn send_grpc_request_with_authority(
-    gateway_addr: SocketAddr,
-    path: &str,
-    body: &[u8],
-    extra_headers: &[(&str, &str)],
-) -> Result<(u16, HashMap<String, String>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
-    use hyper::client::conn::http2;
-
-    let stream = tokio::net::TcpStream::connect(gateway_addr).await?;
-    let _ = stream.set_nodelay(true);
-    let io = TokioIo::new(stream);
-
-    let (mut sender, conn) = http2::handshake(TokioExecutor::new(), io).await?;
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            eprintln!("Client connection error: {}", e);
-        }
-    });
-
-    let mut req_builder = Request::builder()
-        .method("POST")
-        .uri(format!("http://{gateway_addr}{path}"))
-        .header("content-type", "application/grpc")
-        .header("te", "trailers");
-
-    for (key, value) in extra_headers {
-        req_builder = req_builder.header(*key, *value);
-    }
-
-    let response = sender
-        .send_request(req_builder.body(Full::new(Bytes::copy_from_slice(body)))?)
-        .await?;
-    let status = response.status().as_u16();
-    let headers = response
-        .headers()
-        .iter()
-        .filter_map(|(key, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (key.as_str().to_string(), value.to_string()))
-        })
-        .collect();
-    let body = response.into_body().collect().await?.to_bytes().to_vec();
-    Ok((status, headers, body))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2074,7 +2030,7 @@ async fn hmac_auth_reuses_prebuffered_native_grpc_body_for_primary_dispatch() {
         "hmac username=\"grpc-hmac-user\", algorithm=\"hmac-sha256\", signature=\"{signature}\""
     );
 
-    let (status, headers, body) = send_grpc_request_with_authority(
+    let (status, headers, body) = send_grpc_request(
         gateway_addr,
         path,
         grpc_message,
@@ -2146,7 +2102,7 @@ async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambigu
         "hmac username=\"grpc-hmac-cd-user\", algorithm=\"hmac-sha256\", signature=\"{signature}\""
     );
 
-    let (status, headers, body) = send_grpc_request_with_authority(
+    let (status, headers, body) = send_grpc_request(
         gateway_addr,
         path,
         grpc_message,
@@ -2178,7 +2134,7 @@ async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambigu
     let empty_authorization = format!(
         "hmac username=\"grpc-hmac-cd-user\", algorithm=\"hmac-sha256\", signature=\"{empty_signature}\""
     );
-    let (empty_status, empty_headers, empty_response) = send_grpc_request_with_authority(
+    let (empty_status, empty_headers, empty_response) = send_grpc_request(
         gateway_addr,
         path,
         empty_body,
@@ -2211,7 +2167,7 @@ async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambigu
     let ambiguous_authorization = format!(
         "hmac username=\"grpc-hmac-cd-user\", algorithm=\"hmac-sha256\", signature=\"{ambiguous_signature}\""
     );
-    let (ambiguous_status, ambiguous_headers, _) = send_grpc_request_with_authority(
+    let (ambiguous_status, ambiguous_headers, _) = send_grpc_request(
         gateway_addr,
         path,
         grpc_message,
