@@ -213,7 +213,7 @@ HTTP-family 5xx use **two** closed vocabularies across three surfaces:
 |---|---|---|
 | `X-Gateway-Error` (client header) | seven coarse tokens below | **7** |
 | Access-log `error_class` | [`ErrorClass::as_str`](../src/retry.rs) | **19** (omitted when unset) |
-| `ferrum_requests_total{error_class}` | `ErrorClass::as_str` plus four gateway-authored tokens | **23** (omitted on 2xx/3xx/4xx and on backend 5xx with no class) |
+| `ferrum_requests_total{error_class}` | `ErrorClass::as_str` plus five non-class tokens | **24** (omitted on 2xx/3xx/4xx; an unclassified backend 5xx carries `backend_error`) |
 
 The header is the stable client-facing contract and must not change spelling.
 Metrics and logs keep the granular class so PromQL and log alerts can split

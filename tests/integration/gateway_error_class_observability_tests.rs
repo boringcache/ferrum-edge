@@ -207,7 +207,7 @@ fn header_stays_coarse_while_metrics_and_logs_stay_granular() {
 }
 
 #[test]
-fn http_metrics_cardinality_is_error_class_all_plus_four_gateway_tokens() {
+fn http_metrics_cardinality_is_error_class_all_plus_five_gateway_tokens() {
     assert_eq!(HTTP_OBSERVABILITY_ERROR_CLASSES.len(), 7);
     assert_eq!(HTTP_METRICS_GATEWAY_ERROR_CLASSES.len(), 5);
     assert_eq!(ErrorClass::ALL.len(), 19);
@@ -215,7 +215,7 @@ fn http_metrics_cardinality_is_error_class_all_plus_four_gateway_tokens() {
         ErrorClass::ALL.len() + HTTP_METRICS_GATEWAY_ERROR_CLASSES.len(),
         HTTP_METRICS_ERROR_CLASS_BOUND
     );
-    assert_eq!(HTTP_METRICS_ERROR_CLASS_BOUND, 23);
+    assert_eq!(HTTP_METRICS_ERROR_CLASS_BOUND, 24);
 
     let mut header_seen = std::collections::HashSet::new();
     for token in HTTP_OBSERVABILITY_ERROR_CLASSES {

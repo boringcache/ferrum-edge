@@ -2726,12 +2726,14 @@ async fn http_error_class_label_is_granular_error_class() {
             "status {status} must carry error_class={token}"
         );
     }
+    // An unclassified backend 5xx carries the same token its
+    // `X-Gateway-Error` header advertises, so the series stays selectable.
     assert!(registry.request_counter.contains_key(&CounterKey {
         proxy_id: Arc::from("obs-http"),
         method: "GET",
         status_code: 503,
         grpc_status: None,
-        error_class: None,
+        error_class: Some("backend_error"),
     }));
     assert!(registry.request_counter.contains_key(&CounterKey {
         proxy_id: Arc::from("obs-http"),
