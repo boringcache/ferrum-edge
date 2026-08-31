@@ -6,6 +6,27 @@ This document describes how to safely upgrade Ferrum Edge between versions with 
 
 Every current `[Unreleased]` `BREAKING` changelog entry is listed here exactly once, with its issue number and the operator action that entry already states. Several of these fail **silently** at cutover (HMAC clients get `401`, WAF `literal` rules stop matching folded spellings, backends stop seeing client-supplied XFF hops) rather than refusing config load. Read this section before the per-mode procedures below.
 
+### `ferrum-gateway` `mode=cp` no longer starts the in-cluster K8s controller (issue [#4384](https://github.com/ferrum-edge/ferrum-edge/issues/4384))
+
+The `ferrum-edge` binary defaults `FERRUM_K8S_CONTROLLER_ENABLED` and
+`FERRUM_K8S_POD_DISCOVERY_ENABLED` to true whenever `KUBERNETES_SERVICE_HOST` is
+set, which is every in-cluster pod. `charts/ferrum-gateway` renders no
+`ClusterRole`, so those core watches (namespaces, services, secrets, configmaps,
+endpointslices) were rejected `403` on every list and retried for the life of the
+process.
+
+`k8sController.enabled` now defaults to `false`, and `mode=cp` renders both
+environment variables as `"false"`. Setting `k8sController.enabled=true` fails
+rendering with a message pointing at `charts/ferrum-mesh`, which already ships the
+matching RBAC — the chart will not render a controller it cannot grant. Both
+variable names are reserved, so `env` / `extraEnv` cannot re-enable the watch
+loops behind the first-class value.
+
+**Operator action:** if you were running this chart as a Kubernetes CRD
+controller, migrate to `charts/ferrum-mesh` (`controlPlane.enabled=true`).
+Database-backed CP + DP pairs need no change, and the documented
+`examples/cp-values.yaml` quickstart now matches the chart's grant surface.
+
 ### HTTP/1.1 requests without a Host header are rejected with 400 (issue [#4390](https://github.com/ferrum-edge/ferrum-edge/issues/4390))
 
 RFC 9112 §3.2.2 requires a 400 when an HTTP/1.1 request lacks a Host field. Ferrum previously only rejected multiple Host fields, so a Host-less origin-form request skipped exact/wildcard host tiers and could fall through to a catch-all (empty `hosts`) route. `check_protocol_headers()` now rejects HTTP/1.1 when both the Host field and the URI authority are absent. HTTP/1.0 still does not require Host. Absolute-form request-targets that already carry an authority are accepted without a Host field. An empty Host value (`Host:` with no tokens) is treated as present-but-invalid and also returns 400 on HTTP/1.1. HTTP/2 and HTTP/3 are unchanged.
