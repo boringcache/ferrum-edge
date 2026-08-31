@@ -3,7 +3,7 @@
 use chrono::Utc;
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::types::{
-    AuthMode, GatewayConfig, PluginConfig, PluginScope, Proxy, default_namespace,
+    AuthMode, GatewayConfig, PluginConfig, PluginScope, default_namespace,
 };
 use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::plugins::key_auth::KeyAuth;
@@ -76,7 +76,7 @@ fn plugin_cache_sets_openai_auth_error_envelope_flag_for_ai_plugins() {
         ],
     );
     let cache = PluginCache::new(&config).expect("ai gateway cache must build");
-    assert!(cache.uses_openai_auth_error_envelope(default_namespace(), "ai"));
+    assert!(cache.uses_openai_auth_error_envelope(&default_namespace(), "ai"));
 
     let plain_config = GatewayConfig {
         version: "1".to_string(),
@@ -95,7 +95,7 @@ fn plugin_cache_sets_openai_auth_error_envelope_flag_for_ai_plugins() {
         ..Default::default()
     };
     let plain_cache = PluginCache::new(&plain_config).expect("plain cache must build");
-    assert!(!plain_cache.uses_openai_auth_error_envelope(default_namespace(), "plain"));
+    assert!(!plain_cache.uses_openai_auth_error_envelope(&default_namespace(), "plain"));
 }
 
 #[tokio::test]
@@ -163,14 +163,10 @@ async fn non_ai_route_keeps_flat_auth_reject_body() {
         "/plain".to_string(),
     );
 
-    let (status_code, body, _) = run_authentication_phase(
-        AuthMode::Single,
-        &auth_plugins,
-        &mut ctx,
-        &consumer_index,
-    )
-    .await
-    .expect("missing credential must reject");
+    let (status_code, body, _) =
+        run_authentication_phase(AuthMode::Single, &auth_plugins, &mut ctx, &consumer_index)
+            .await
+            .expect("missing credential must reject");
 
     assert_eq!(status_code, 401);
     assert_eq!(&body[..], br#"{"error":"Authentication required"}"#);
@@ -179,14 +175,16 @@ async fn non_ai_route_keeps_flat_auth_reject_body() {
 #[test]
 fn adapt_auth_reject_leaves_non_401_and_already_nested_bodies_alone() {
     let flat = bytes::Bytes::from_static(br#"{"error":"Invalid API key"}"#);
-    let adapted = adapt_auth_reject_for_openai_envelope(true, 403, flat.clone(), Default::default(), false);
+    let adapted =
+        adapt_auth_reject_for_openai_envelope(true, 403, flat.clone(), Default::default(), false);
     assert_eq!(adapted.0, 403);
     assert_eq!(adapted.1, flat);
 
     let nested = bytes::Bytes::from_static(
         br#"{"error":{"message":"nope","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}"#,
     );
-    let adapted = adapt_auth_reject_for_openai_envelope(true, 401, nested.clone(), Default::default(), false);
+    let adapted =
+        adapt_auth_reject_for_openai_envelope(true, 401, nested.clone(), Default::default(), false);
     assert_eq!(adapted.1, nested);
 }
 
