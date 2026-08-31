@@ -2814,14 +2814,12 @@ async fn utf32_body_rules_block_declared_endianness_with_and_without_bom() {
     assert!(monitored(&be_ctx, "FE-SQLI-001-B"));
 
     let le_bom = with_bom(UTF32_LE_BOM, &utf32le);
-    let (le_bom_result, le_bom_ctx) =
-        scan_body_with_content_type(&plugin, form_le, &le_bom).await;
+    let (le_bom_result, le_bom_ctx) = scan_body_with_content_type(&plugin, form_le, &le_bom).await;
     assert!(matches!(le_bom_result, PluginResult::Reject { .. }));
     assert!(monitored(&le_bom_ctx, "FE-SQLI-001-B"));
 
     let be_bom = with_bom(UTF32_BE_BOM, &utf32be);
-    let (be_bom_result, be_bom_ctx) =
-        scan_body_with_content_type(&plugin, form_be, &be_bom).await;
+    let (be_bom_result, be_bom_ctx) = scan_body_with_content_type(&plugin, form_be, &be_bom).await;
     assert!(matches!(be_bom_result, PluginResult::Reject { .. }));
     assert!(monitored(&be_bom_ctx, "FE-SQLI-001-B"));
 

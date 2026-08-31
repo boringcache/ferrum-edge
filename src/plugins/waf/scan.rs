@@ -312,31 +312,11 @@ impl Waf {
                 variant.as_bytes(),
                 subject,
             );
-            self.scan_luhn_rules(
-                outcome,
-                &variant,
-                &self.compiled.body_luhn_rules,
-                subject,
-            );
-            self.scan_cidr_rules(
-                outcome,
-                &variant,
-                &self.compiled.body_cidr_rules,
-                subject,
-            );
+            self.scan_luhn_rules(outcome, &variant, &self.compiled.body_luhn_rules, subject);
+            self.scan_cidr_rules(outcome, &variant, &self.compiled.body_cidr_rules, subject);
         }
-        self.scan_luhn_rules(
-            outcome,
-            text,
-            &self.compiled.body_luhn_rules,
-            subject,
-        );
-        self.scan_cidr_rules(
-            outcome,
-            text,
-            &self.compiled.body_cidr_rules,
-            subject,
-        );
+        self.scan_luhn_rules(outcome, text, &self.compiled.body_luhn_rules, subject);
+        self.scan_cidr_rules(outcome, text, &self.compiled.body_cidr_rules, subject);
     }
 
     pub(super) fn run_response_header_scan(
