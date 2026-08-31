@@ -233,6 +233,21 @@ Staleness additionally requires the DP to have actually lost its authoritative C
 
 **Operator action:** set `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` and `FERRUM_DP_CONFIG_STALE_ACTION` before cutover so orchestrators and load balancers honor degraded readiness at the bound; do not rely on `0` except as a deliberate unsafe opt-in. After a CP outage, restore an authoritative CP and confirm an applied snapshot before steering new traffic back.
 
+**`ferrum-gateway` chart users (issue [#4438](https://github.com/ferrum-edge/ferrum-edge/issues/4438)):** both variables are now first-class chart values — `dp.configMaxStaleSeconds` and `dp.configStaleAction` — and are therefore **reserved**. Setting `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` or `FERRUM_DP_CONFIG_STALE_ACTION` (or any `_VAULT` / `_AWS` / `_AZURE` / `_GCP` / `_FILE` suffixed form) through `env:` or `extraEnv:` now **fails template rendering** instead of being applied, so an existing DP install that configured the fence that way will not upgrade until the values move. Translate directly:
+
+```yaml
+# before (now rejected)
+extraEnv:
+  - name: FERRUM_DP_CONFIG_STALE_ACTION
+    value: "readiness_only"
+
+# after
+dp:
+  configStaleAction: readiness_only
+```
+
+Leave either value as `""` (the chart default) to omit the env entirely and take the binary defaults (`3600` / `fail_closed`). An explicit `dp.configMaxStaleSeconds: 0` still renders, and remains the deliberately unsafe opt-in described above.
+
 ### `a2a_gateway` `endpoint.grpc_services` default and declared Agent Card wire layouts (issue [#3297](https://github.com/ferrum-edge/ferrum-edge/issues/3297))
 
 `endpoint.grpc_services` now defaults to the canonical A2A **0.3** service `a2a.v1.A2AService` (package `a2a.v1`, from `a2aproject/A2A` at tag `v0.3.0`) and A2A **1.0**'s `lf.a2a.v1.A2AService`. Every configured entry carries a declared Agent Card wire layout. The default 0.3 identity matches the card layout that default `endpoint.protocol_versions` (`0.3.0`) actually describes; retaining the 1.0 identity preserves method-policy enforcement for deployments that relied on the former default, while its schema prevents the 0.3 decoder from interpreting its renumbered card.
