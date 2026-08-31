@@ -2339,7 +2339,7 @@ impl StreamListenerManager {
         }
         // `OwnedMutexGuard` is never used: this ordinary Tokio `MutexGuard` is
         // acquired only after every source await and prepared-config build.
-        let mut listeners = self.listeners.lock().await;
+        let listeners = self.listeners.lock().await;
         let listener_candidates_compatible = |ids: &[NamespacedResourceId]| {
             let Some(first) = ids.first().and_then(|id| desired.get(id)) else {
                 return false;
@@ -4333,8 +4333,8 @@ mod tests {
         assert_eq!(active_backend_session_estimate_from_entries(&entries), 5);
     }
 
-    #[test]
-    fn backend_tls_material_reload_key_changes_when_same_path_content_changes() {
+    #[tokio::test]
+    async fn backend_tls_material_reload_key_changes_when_same_path_content_changes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ca_path = dir.path().join("ca.pem");
         std::fs::write(&ca_path, b"first-ca").expect("write first ca");
@@ -4342,10 +4342,11 @@ mod tests {
             .to_str()
             .expect("test temp path must be utf-8 for proxy config");
 
-        let first = BackendTlsMaterialReloadKey::from_source_value(ca_path, MaterialKind::CaBundle);
+        let first = BackendTlsMaterialReloadKey::from_source_value(ca_path, MaterialKind::CaBundle)
+            .await;
         std::fs::write(ca_path, b"second-ca").expect("write second ca");
-        let second =
-            BackendTlsMaterialReloadKey::from_source_value(ca_path, MaterialKind::CaBundle);
+        let second = BackendTlsMaterialReloadKey::from_source_value(ca_path, MaterialKind::CaBundle)
+            .await;
 
         assert_eq!(first.source, second.source);
         assert_ne!(
@@ -4354,8 +4355,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn backend_tls_material_reload_key_changes_when_missing_file_appears() {
+    #[tokio::test]
+    async fn backend_tls_material_reload_key_changes_when_missing_file_appears() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ca_path = dir.path().join("ca.pem");
         let ca_path = ca_path
@@ -4363,10 +4364,10 @@ mod tests {
             .expect("test temp path must be utf-8 for proxy config");
 
         let missing =
-            BackendTlsMaterialReloadKey::from_source_value(ca_path, MaterialKind::CaBundle);
+            BackendTlsMaterialReloadKey::from_source_value(ca_path, MaterialKind::CaBundle).await;
         std::fs::write(ca_path, b"first-ca").expect("write ca");
         let present =
-            BackendTlsMaterialReloadKey::from_source_value(ca_path, MaterialKind::CaBundle);
+            BackendTlsMaterialReloadKey::from_source_value(ca_path, MaterialKind::CaBundle).await;
 
         assert_eq!(missing.source, present.source);
         assert!(
@@ -4380,8 +4381,8 @@ mod tests {
         assert_ne!(missing.fingerprint, present.fingerprint);
     }
 
-    #[test]
-    fn backend_tls_material_reload_key_file_uri_rotation_changes_fingerprint() {
+    #[tokio::test]
+    async fn backend_tls_material_reload_key_file_uri_rotation_changes_fingerprint() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ca_path = dir.path().join("ca.pem");
         std::fs::write(&ca_path, b"first-ca").expect("write first ca");
@@ -4392,10 +4393,11 @@ mod tests {
                 .expect("test temp path must be utf-8 for proxy config")
         );
 
-        let first = BackendTlsMaterialReloadKey::from_source_value(&ca_uri, MaterialKind::CaBundle);
+        let first = BackendTlsMaterialReloadKey::from_source_value(&ca_uri, MaterialKind::CaBundle)
+            .await;
         std::fs::write(&ca_path, b"second-ca").expect("write second ca");
-        let second =
-            BackendTlsMaterialReloadKey::from_source_value(&ca_uri, MaterialKind::CaBundle);
+        let second = BackendTlsMaterialReloadKey::from_source_value(&ca_uri, MaterialKind::CaBundle)
+            .await;
 
         assert_eq!(first.source, second.source);
         assert!(
@@ -4410,11 +4412,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn backend_tls_material_reload_key_digests_inline_pem_without_leaking_it() {
+    #[tokio::test]
+    async fn backend_tls_material_reload_key_digests_inline_pem_without_leaking_it() {
         let inline_pem = "-----BEGIN CERTIFICATE-----\nMIIBsecret\n-----END CERTIFICATE-----\n";
 
-        let key = BackendTlsMaterialReloadKey::from_source_value(inline_pem, MaterialKind::Cert);
+        let key = BackendTlsMaterialReloadKey::from_source_value(inline_pem, MaterialKind::Cert)
+            .await;
 
         assert!(
             !key.source.contains("MIIBsecret"),
@@ -4428,8 +4431,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn same_tls_sources_distinguishes_content_rotation_from_source_or_policy_change() {
+    #[tokio::test]
+    async fn same_tls_sources_distinguishes_content_rotation_from_source_or_policy_change() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ca_path = dir.path().join("ca.pem");
         std::fs::write(&ca_path, b"first-ca").expect("write first ca");
@@ -4442,24 +4445,28 @@ mod tests {
             .to_str()
             .expect("test temp path must be utf-8 for proxy config");
 
-        let key = |source: &str, san: Vec<String>| BackendTlsReloadKey {
-            verify_server_cert: true,
-            server_ca_cert: Some(BackendTlsMaterialReloadKey::from_source_value(
-                source,
-                MaterialKind::CaBundle,
-            )),
-            client_cert: None,
-            client_key: None,
-            san_allow_list: san,
-            crl_fingerprint: None,
-        };
+        // Nested async helper: a sync closure cannot `.await` the reload-key
+        // builder, so the key is resolved here before each comparison.
+        async fn key(source: &str, san: Vec<String>) -> BackendTlsReloadKey {
+            BackendTlsReloadKey {
+                verify_server_cert: true,
+                server_ca_cert: Some(
+                    BackendTlsMaterialReloadKey::from_source_value(source, MaterialKind::CaBundle)
+                        .await,
+                ),
+                client_cert: None,
+                client_key: None,
+                san_allow_list: san,
+                crl_fingerprint: None,
+            }
+        }
 
-        let original = key(ca_path_str, vec![]);
+        let original = key(ca_path_str, vec![]).await;
 
         // In-place content rotation: same source, new bytes -> same sources,
         // different key (eligible for the keep-old path).
         std::fs::write(&ca_path, b"second-ca").expect("rotate ca");
-        let rotated = key(ca_path_str, vec![]);
+        let rotated = key(ca_path_str, vec![]).await;
         assert_ne!(original, rotated, "rotation must change the key");
         assert!(
             original.same_tls_sources(&rotated),
@@ -4467,14 +4474,14 @@ mod tests {
         );
 
         // Source path change -> NOT a content-only rotation.
-        let new_source = key(other_ca_path_str, vec![]);
+        let new_source = key(other_ca_path_str, vec![]).await;
         assert!(
             !original.same_tls_sources(&new_source),
             "a different CA source must not count as an in-place rotation"
         );
 
         // SAN allow-list change -> NOT a content-only rotation.
-        let san_changed = key(ca_path_str, vec!["backend.example".to_string()]);
+        let san_changed = key(ca_path_str, vec!["backend.example".to_string()]).await;
         assert!(
             !original.same_tls_sources(&san_changed),
             "a SAN allow-list change must not count as an in-place rotation"

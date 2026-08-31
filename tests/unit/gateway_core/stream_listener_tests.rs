@@ -121,7 +121,7 @@ fn stream_listener_material_preparation_precedes_lock_without_await_in_critical_
     let preparation = reconcile
         .find("let backend_tls_reload_key = if prepares_backend_tls")
         .expect("reconciliation prepares backend TLS material");
-    let lock_text = "let mut listeners = self.listeners.lock().await;";
+    let lock_text = "let listeners = self.listeners.lock().await;";
     let lock = reconcile
         .find(lock_text)
         .expect("reconciliation listener-map lock");
