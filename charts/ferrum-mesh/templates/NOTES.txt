@@ -3,6 +3,20 @@ Ferrum mesh chart "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
 UDPResponseAmplificationPolicy CRD schema marker: v1alpha1-1
   kubectl get crd udpresponseamplificationpolicies.gateway.ferrum.io \
     -o jsonpath='{.metadata.annotations.gateway\.ferrum\.io/crd-schema-version}'
+{{- $crdOwner := "" -}}
+{{- $liveCrd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "udpresponseamplificationpolicies.gateway.ferrum.io" -}}
+{{- if and $liveCrd $liveCrd.metadata -}}
+{{- $crdOwner = index ($liveCrd.metadata.annotations | default dict) "meta.helm.sh/release-name" | default "" -}}
+{{- end -}}
+{{- if and $crdOwner (ne $crdOwner .Release.Name) }}
+
+NOTE: UDPResponseAmplificationPolicy is owned by Helm release "{{ $crdOwner }}",
+so THIS release manages no CRD and will not update its schema on upgrade.
+That is fine when one release intentionally owns the cluster-scoped CRD — keep
+that release upgraded, and check the schema marker above. To make the split
+explicit here instead, set crds.install=false and crds.skipInstallAcknowledged=true.
+To take ownership: helm upgrade --take-ownership --set crds.adoptExisting=true
+{{- end }}
 {{- if not .Values.crds.install }}
 
 WARNING: crds.install=false — helm upgrade will NOT update

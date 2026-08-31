@@ -252,7 +252,9 @@ Ferrum-owned `UDPResponseAmplificationPolicy` is **not** in Helm's install-once
 Uninstall keeps the CRD (`helm.sh/resource-policy: keep`) so policy objects are
 not cascade-deleted.
 
-Compare the live CRD to the chart (expected `v1alpha1-1`):
+The chart stamps the shipped schema onto the CRD as the annotation
+`gateway.ferrum.io/crd-schema-version`. Compare the live CRD to the chart
+(expected `v1alpha1-1`) — the jsonpath below escapes the dots in the key:
 
 ```bash
 kubectl get crd udpresponseamplificationpolicies.gateway.ferrum.io \
