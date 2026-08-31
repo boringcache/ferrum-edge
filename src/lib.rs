@@ -187,11 +187,8 @@ pub mod _test_support {
             locality: None,
             path: None,
         };
-        let authority = crate::proxy::mesh_mtls_dispatch_authority(
-            &target,
-            preserve_host_header,
-            client_host,
-        );
+        let authority =
+            crate::proxy::mesh_mtls_dispatch_authority(&target, preserve_host_header, client_host);
         let uri = hyper::Uri::builder()
             .scheme("https")
             .authority(authority.as_ref())

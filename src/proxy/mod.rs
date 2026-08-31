@@ -45723,10 +45723,7 @@ pub(crate) fn apply_outbound_h2_preserve_to_uri(
 /// preserve / mesh-mTLS / HBONE resolver). The common preserve-off,
 /// non-default-port path is a borrow of that authority plus the
 /// `HeaderValue` insert that already existed.
-pub(crate) fn sync_outbound_h2_host_to_authority(
-    headers: &mut hyper::HeaderMap,
-    uri: &hyper::Uri,
-) {
+pub(crate) fn sync_outbound_h2_host_to_authority(headers: &mut hyper::HeaderMap, uri: &hyper::Uri) {
     let Some(authority) = outbound_h2_authority(uri) else {
         return;
     };
