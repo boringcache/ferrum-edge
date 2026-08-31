@@ -50,6 +50,19 @@ pub mod gateway_listener;
 pub mod gateway_listener_status;
 pub mod grpc_proxy;
 mod h1_framing_guard;
+mod h1_parse_error_envelope;
+
+#[doc(hidden)]
+pub fn envelope_for_hint_for_test(hint: u8) -> &'static [u8] {
+    h1_parse_error_envelope::envelope_for_hint_for_test(hint)
+}
+
+#[doc(hidden)]
+pub const PARSE_HINT_CONFLICTING_CONTENT_LENGTH_FOR_TEST: u8 =
+    h1_parse_error_envelope::PARSE_HINT_CONFLICTING_CONTENT_LENGTH;
+#[doc(hidden)]
+pub const PARSE_HINT_HTTP10_TRANSFER_ENCODING_FOR_TEST: u8 =
+    h1_parse_error_envelope::PARSE_HINT_HTTP10_TRANSFER_ENCODING;
 /// Shared h2c (cleartext, prior-knowledge HTTP/2) peer-preface observation.
 /// Hyper's client handshake proves only the client half, so both h2c transports
 /// — the pooled gRPC path and the Unix-socket path — establish through here.
@@ -13712,12 +13725,12 @@ async fn handle_connection(
                 "Client disconnected before response completed"
             );
         } else {
-            error!(
-                remote_addr = %remote_addr,
-                listen_port = frontend_listen_port,
-                tls = false,
-                error = %e,
-                "HTTP connection error"
+            h1_parse_error_envelope::log_http1_connection_error(
+                &e,
+                &err_string,
+                &remote_addr,
+                frontend_listen_port,
+                false,
             );
         }
     }
@@ -21723,10 +21736,12 @@ async fn handle_tls_connection(
                 "Client disconnected before response completed (TLS)"
             );
         } else {
-            error!(
-                remote_addr = %remote_addr.ip(),
-                error = %e,
-                "HTTP connection error over TLS"
+            h1_parse_error_envelope::log_http1_connection_error(
+                &e,
+                &err_string,
+                &remote_addr,
+                frontend_listen_port,
+                true,
             );
         }
     }

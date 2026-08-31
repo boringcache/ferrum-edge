@@ -80,6 +80,7 @@ pub(super) struct H1FramingSignals {
     overflowed: AtomicBool,
     unknown: AtomicBool,
     observation_disabled: AtomicBool,
+    parse_reject_hint: Arc<super::h1_parse_error_envelope::H1ParseRejectHint>,
 }
 
 impl H1FramingSignals {
@@ -91,6 +92,19 @@ impl H1FramingSignals {
             overflowed: AtomicBool::new(false),
             unknown: AtomicBool::new(false),
             observation_disabled: AtomicBool::new(false),
+            parse_reject_hint: Arc::new(super::h1_parse_error_envelope::H1ParseRejectHint::new()),
+        }
+    }
+
+    pub(super) fn parse_reject_hint(
+        &self,
+    ) -> Arc<super::h1_parse_error_envelope::H1ParseRejectHint> {
+        Arc::clone(&self.parse_reject_hint)
+    }
+
+    fn store_parse_reject_hint(&self, hint: u8) {
+        if hint != super::h1_parse_error_envelope::PARSE_HINT_NONE {
+            self.parse_reject_hint.store(hint);
         }
     }
 
@@ -190,16 +204,24 @@ pub(super) struct H1FramingGuardIo<T> {
 }
 
 impl<T> H1FramingGuardIo<T> {
-    pub(super) fn new(inner: T, max_head_bytes: usize) -> (Self, Arc<H1FramingSignals>) {
+    pub(super) fn new(
+        inner: T,
+        max_head_bytes: usize,
+    ) -> (
+        super::h1_parse_error_envelope::H1ParseErrorEnvelopeIo<Self>,
+        Arc<H1FramingSignals>,
+    ) {
         let signals = Arc::new(H1FramingSignals::new());
-        (
-            Self {
-                inner,
-                scanner: WireScanner::new(max_head_bytes),
-                signals: Arc::clone(&signals),
-            },
-            signals,
-        )
+        let guard = Self {
+            inner,
+            scanner: WireScanner::new(max_head_bytes),
+            signals: Arc::clone(&signals),
+        };
+        let io = super::h1_parse_error_envelope::H1ParseErrorEnvelopeIo::new(
+            guard,
+            signals.parse_reject_hint(),
+        );
+        (io, signals)
     }
 }
 
@@ -282,14 +304,14 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for H1FramingGuardIo<T> {
 /// Plaintext still wraps because protocol detection happens on the first read
 /// (h2c preface vs HTTP/1).
 pub(super) enum MaybeH1FramingGuardIo<T> {
-    Observed(Box<H1FramingGuardIo<T>>),
+    Observed(Box<super::h1_parse_error_envelope::H1ParseErrorEnvelopeIo<H1FramingGuardIo<T>>>),
     Passthrough(T),
 }
 
 impl<T> MaybeH1FramingGuardIo<T> {
     pub(super) fn observed(inner: T, max_head_bytes: usize) -> (Self, Arc<H1FramingSignals>) {
-        let (guard, signals) = H1FramingGuardIo::new(inner, max_head_bytes);
-        (Self::Observed(Box::new(guard)), signals)
+        let (io, signals) = H1FramingGuardIo::new(inner, max_head_bytes);
+        (Self::Observed(Box::new(io)), signals)
     }
 
     pub(super) fn passthrough(inner: T) -> Self {
@@ -479,7 +501,7 @@ impl H1StreamScanner {
         while offset < bytes.len() {
             let transition = match &mut self.state {
                 H1State::Head(head) => {
-                    let step = head.observe(bytes[offset]);
+                    let step = head.observe(bytes[offset], signals);
                     offset += 1;
                     match step {
                         HeadStep::Continue => None,
@@ -618,6 +640,10 @@ struct HeadScanner {
     seen_content_length: bool,
     seen_transfer_encoding: bool,
     conflict: bool,
+    http10_request: bool,
+    request_line_non_ascii: bool,
+    request_line_tail: [u8; 12],
+    request_line_tail_len: usize,
 }
 
 impl HeadScanner {
@@ -628,20 +654,24 @@ impl HeadScanner {
             request_line: true,
             line_has_data: false,
             pending_cr: false,
-            current_header: CurrentHeader::Other,
+            current_header: CurrentHeader::Name,
             name_len: 0,
-            content_length_candidate: false,
-            transfer_encoding_candidate: false,
+            content_length_candidate: true,
+            transfer_encoding_candidate: true,
             content_length_value: ContentLengthScanner::new(),
             canonical_content_length: None,
             content_length_valid: true,
             seen_content_length: false,
             seen_transfer_encoding: false,
             conflict: false,
+            http10_request: false,
+            request_line_non_ascii: false,
+            request_line_tail: [0; 12],
+            request_line_tail_len: 0,
         }
     }
 
-    fn observe(&mut self, byte: u8) -> HeadStep {
+    fn observe(&mut self, byte: u8, signals: &H1FramingSignals) -> HeadStep {
         self.bytes_seen = self.bytes_seen.saturating_add(1);
         if self.bytes_seen > self.max_bytes {
             return HeadStep::Disable;
@@ -650,7 +680,7 @@ impl HeadScanner {
         if self.pending_cr {
             self.pending_cr = false;
             if byte == b'\n' {
-                return self.finish_line();
+                return self.finish_line(signals);
             }
             self.observe_line_byte(b'\r');
         }
@@ -660,7 +690,7 @@ impl HeadScanner {
                 self.pending_cr = true;
                 HeadStep::Continue
             }
-            b'\n' => self.finish_line(),
+            b'\n' => self.finish_line(signals),
             _ => {
                 self.observe_line_byte(byte);
                 HeadStep::Continue
@@ -670,7 +700,22 @@ impl HeadScanner {
 
     fn observe_line_byte(&mut self, byte: u8) {
         self.line_has_data = true;
-        if self.request_line || self.conflict {
+        if self.request_line {
+            if byte >= 0x80 {
+                self.request_line_non_ascii = true;
+            }
+            if self.request_line_tail_len < self.request_line_tail.len() {
+                self.request_line_tail[self.request_line_tail_len] = byte;
+                self.request_line_tail_len += 1;
+            } else {
+                self.request_line_tail.copy_within(1.., 0);
+                if let Some(slot) = self.request_line_tail.last_mut() {
+                    *slot = byte;
+                }
+            }
+            return;
+        }
+        if self.conflict {
             return;
         }
 
@@ -702,12 +747,17 @@ impl HeadScanner {
         }
     }
 
-    fn finish_line(&mut self) -> HeadStep {
+    fn finish_line(&mut self, signals: &H1FramingSignals) -> HeadStep {
         if !self.line_has_data {
             if self.request_line {
                 // httparse skips any run of CRLF or bare LF before the request
                 // line, so an empty leading line is not a request head.
                 return HeadStep::Continue;
+            }
+            if self.http10_request && self.seen_transfer_encoding {
+                signals.store_parse_reject_hint(
+                    super::h1_parse_error_envelope::PARSE_HINT_HTTP10_TRANSFER_ENCODING,
+                );
             }
             let framing = if self.seen_transfer_encoding {
                 BodyFraming::Chunked
@@ -730,6 +780,15 @@ impl HeadScanner {
 
         if self.request_line {
             self.request_line = false;
+            self.http10_request = self
+                .request_line_tail
+                .windows(9)
+                .any(|window| window.eq_ignore_ascii_case(b"HTTP/1.0"));
+            if self.request_line_non_ascii {
+                signals.store_parse_reject_hint(
+                    super::h1_parse_error_envelope::PARSE_HINT_INVALID_REQUEST_TARGET_UTF8,
+                );
+            }
         } else if matches!(self.current_header, CurrentHeader::ContentLength) && !self.conflict {
             match self.content_length_value.finish() {
                 Some(value)
@@ -738,7 +797,13 @@ impl HeadScanner {
                 {
                     self.canonical_content_length = Some(value);
                 }
-                Some(_) | None => self.content_length_valid = false,
+                Some(_) => {
+                    self.content_length_valid = false;
+                    signals.store_parse_reject_hint(
+                        super::h1_parse_error_envelope::PARSE_HINT_CONFLICTING_CONTENT_LENGTH,
+                    );
+                }
+                None => self.content_length_valid = false,
             }
         }
 
@@ -747,6 +812,7 @@ impl HeadScanner {
         self.name_len = 0;
         self.content_length_candidate = true;
         self.transfer_encoding_candidate = true;
+        self.request_line_tail_len = 0;
         HeadStep::Continue
     }
 }

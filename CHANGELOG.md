@@ -97,6 +97,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **HTTP/1.1 parser-layer 400s now return the JSON protocol-reject envelope**
+  (issue #4393). Conflicting `Content-Length`, HTTP/1.0 +
+  `Transfer-Encoding`, and other Hyper request-parse failures on the proxy
+  frontend previously answered `400 Bad Request` with an empty body while
+  handler-layer protocol rejects already returned
+  `Content-Type: application/json` and a fixed `{"error":"..."}` payload.
+  Parser-layer rejects now synthesize the same contract (including
+  `X-Gateway-Error: request_error`). Not marked **BREAKING**: status remains
+  `400`, connection close semantics are unchanged, and clients that ignored the
+  body are unaffected; only strict empty-body assertions need updating.
+
 - **Injector inbound capture excludes kubelet HTTP and TCP probe ports**
   (issue #4431). `startupProbe` / `readinessProbe` / `livenessProbe` `httpGet`
   and `tcpSocket` ports on every container in the pod are unioned into the

@@ -182,6 +182,22 @@ Handshake failures already populate `TransactionSummary.error_class` on the HTTP
 
 `GracefulRemoteClose` is shared with the HTTP/3 graceful-close path: operators see one label whether the peer closed an H3 connection with `H3_NO_ERROR` or a WS connection with a normal Close frame.
 
+## HTTP/1.1 parse-layer 400 contract
+
+Hyper rejects some HTTP/1.1 wire shapes during header parsing before Ferrum's
+`handle_proxy_request` / `check_protocol_headers()` run (for example conflicting
+`Content-Length` values, HTTP/1.0 + `Transfer-Encoding`, and a non-UTF-8
+request-target). The plaintext and TLS proxy frontends wrap accepted HTTP/1
+connections with a write adapter that replaces Hyper's empty-bodied automatic
+`400 Bad Request` with the same JSON envelope handler-layer protocol rejects
+use: `Content-Type: application/json`, a fixed `{"error":"..."}` body, and
+`X-Gateway-Error: request_error`. Known wire shapes map to the same JSON strings
+as `check_protocol_headers()`; anything Hyper classifies as a request parse
+failure without a confident mapping uses
+`{"error":"Malformed HTTP request"}`. Hyper's `Error::kind()` is not public, so
+finer sub-kind mapping uses Hyper's stable `Display` descriptions plus the
+wire-hint observer documented in `src/proxy/h1_parse_error_envelope.rs`.
+
 ## Transaction summary integration
 
 Two summary types in [`src/plugins/mod.rs`](../src/plugins/mod.rs) carry classification fields:
