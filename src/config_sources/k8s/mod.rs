@@ -261,7 +261,7 @@ impl K8sTranslationOptions {
             mesh_sidecar_ingress_enforced: false,
             mesh_overlay_authority: false,
             node_waypoint_inventory: NodeWaypointInventory::new(),
-            excluded_namespaces: excluded_namespaces_from_node_agent_env(),
+            excluded_namespaces: crate::ebpf::pod_watcher::excluded_namespaces_from_env(),
             source_namespaces: Some(source_namespaces),
             pod_source_namespaces: Some(pod_source_namespaces),
         }
@@ -356,22 +356,6 @@ impl K8sTranslationOptions {
             .as_ref()
             .is_none_or(|namespaces| namespaces.contains(namespace))
     }
-}
-
-/// Same extra-namespace parse as `modes::node_agent` so K8s translation and
-/// capture enrollment cannot disagree on `FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES`.
-fn excluded_namespaces_from_node_agent_env() -> HashSet<String> {
-    let extra: Vec<String> = crate::config::conf_file::resolve_ferrum_var(
-        "FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES",
-    )
-    .map(|raw| {
-        raw.split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    })
-    .unwrap_or_default();
-    crate::ebpf::pod_watcher::build_excluded_namespaces(&extra)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
