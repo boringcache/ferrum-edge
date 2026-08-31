@@ -61,10 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `mode=cp` emits both env vars as `"false"`. Setting the value to `true`
   fails render (use `charts/ferrum-mesh`, which already ships matching RBAC).
   Both names are reserved so `env` / `extraEnv` cannot re-enable the watches.
-  **Operator action**: if this release was a Kubernetes CRD controller, migrate
-  to `charts/ferrum-mesh` (`controlPlane.enabled=true`). Database-backed CP+DP
-  pairs need no change; the documented `examples/cp-values.yaml` quickstart now
-  matches the chart's grant surface.
+  **Operator action**: if you were running this chart as a Kubernetes CRD
+  controller, migrate to `charts/ferrum-mesh` (`controlPlane.enabled=true`).
+  Database-backed CP+DP pairs need no change; the documented
+  `examples/cp-values.yaml` quickstart now matches the chart's grant surface.
 
 - **BREAKING — `FERRUM_TLS_OFFLOAD_THREADS` nonzero values fail startup**
   (issue #4294). TLS handshake offload is not implemented; a nonzero setting
