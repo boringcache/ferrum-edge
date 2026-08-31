@@ -5692,9 +5692,7 @@ struct NativeAdmissionHarness {
     addr: SocketAddr,
     admission: ferrum_edge::grpc::admission::CpGrpcAdmissionController,
     config_tx: tokio::sync::broadcast::Sender<ferrum_edge::grpc::proto::ConfigUpdate>,
-    mesh_tx: tokio::sync::broadcast::Sender<
-        ferrum_edge::grpc::mesh_server::MeshConfigBroadcast,
-    >,
+    mesh_tx: tokio::sync::broadcast::Sender<ferrum_edge::grpc::mesh_server::MeshConfigBroadcast>,
     dp_registry: Arc<ferrum_edge::grpc::cp_server::DpNodeRegistry>,
     mesh_registry: Arc<ferrum_edge::grpc::mesh_registry::MeshNodeRegistry>,
     handle: tokio::task::JoinHandle<()>,
@@ -5714,27 +5712,19 @@ async fn start_native_admission_harness(
     let admission = ferrum_edge::grpc::admission::CpGrpcAdmissionController::new(limits);
     let dp_registry = Arc::new(ferrum_edge::grpc::cp_server::DpNodeRegistry::new());
     let mesh_registry = Arc::new(ferrum_edge::grpc::mesh_registry::MeshNodeRegistry::new());
-    let (cp_server, config_tx) = CpGrpcServer::builder(
-        config.clone(),
-        TEST_JWT_SECRET.to_string(),
-    )
-    .channel_capacity(1)
-    .admission(admission.clone())
-    .registry(dp_registry.clone())
-    .max_stream_lifetime(max_stream_lifetime)
-    .build();
-    let (mesh_server, mesh_tx) = MeshGrpcServer::builder(
-        config,
-        TEST_JWT_SECRET.to_string(),
-    )
-    .channel_capacity(1)
-    .admission(admission.clone())
-    .registry(mesh_registry.clone())
-    .max_stream_lifetime(max_stream_lifetime)
-    .build();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let (cp_server, config_tx) = CpGrpcServer::builder(config.clone(), TEST_JWT_SECRET.to_string())
+        .channel_capacity(1)
+        .admission(admission.clone())
+        .registry(dp_registry.clone())
+        .max_stream_lifetime(max_stream_lifetime)
+        .build();
+    let (mesh_server, mesh_tx) = MeshGrpcServer::builder(config, TEST_JWT_SECRET.to_string())
+        .channel_capacity(1)
+        .admission(admission.clone())
+        .registry(mesh_registry.clone())
+        .max_stream_lifetime(max_stream_lifetime)
+        .build();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let handle = tokio::spawn(async move {

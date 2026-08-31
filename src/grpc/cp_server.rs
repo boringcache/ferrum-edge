@@ -571,8 +571,11 @@ impl CpGrpcServer {
         }
     }
 
-    /// Shared stream-admission controller. Production passes one controller to
-    /// ConfigSync, MeshSubscribe, and ADS.
+    /// Shared stream-admission controller. Production wires one controller
+    /// through the BUILDER (`.admission(...)`) into ConfigSync, MeshSubscribe,
+    /// and ADS; this getter exists so external tests can reach the same
+    /// controller, which is why the binary target sees it as dead code.
+    #[allow(dead_code)]
     pub fn admission(&self) -> CpGrpcAdmissionController {
         self.admission.clone()
     }
