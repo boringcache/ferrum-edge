@@ -130,6 +130,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   admission rather than leaving the probe captured. Explicit
   `excludeInboundPorts` annotations and `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS`
   still win.
+- **Outbound direct-H2 and native-gRPC `Host` now matches `:authority` on
+  non-default ports** (issue #4410). Ferrum previously stamped a hostname-only
+  `Host` (`127.0.0.1`) while Hyper derived `:authority` from the backend URI
+  including the port (`127.0.0.1:21212`). RFC 9113 §8.3.1 forbids that
+  disagreement; RFC-compliant H2 origins reset the stream and the client saw
+  502 `backend_error` or gRPC UNAVAILABLE(14). Default ports (80 for
+  `http`/`ws`, 443 for `https`/`wss`) are still omitted from both. When
+  `preserve_host_header` is true on the direct-H2 pool (and native-gRPC Direct
+  transport), the client Host is honoured by rewriting the outbound URI
+  authority so `:authority` agrees, but only after `split_request_authority`
+  admits it: userinfo (`user@host`, `user:pass@host:8443`), paths, empty or
+  whitespace-only values, unbracketed IPv6, and opaque `[not-an-ip]`
+  literals are ignored and both fields fall back to the backend URI
+  authority. Native-gRPC mesh-mTLS / HBONE dispatch keeps authority
+  resolution in `resolve_backend_uri`: a pinned `mesh.mtls_authority_host`
+  (and its mesh service port) wins over `preserve_host_header`, and Host is
+  then synced from that URI without a second preserve rewrite.
+  **Operator action**: on direct-H2 and native-gRPC Direct routes with
+  `preserve_host_header: true`, the backend's `:authority` changes from the
+  backend authority to the client's Host when that Host is a valid
+  authority; an invalid client Host is ignored. Many HTTP/2 servers
+  synthesize their `Host`/virtual-host decision from `:authority` and ignore
+  a separate `Host` header, so such a backend was previously routing on the
+  backend authority despite `preserve_host_header` being on, and will now
+  route on the client's Host — which is what the setting asks for. Re-check
+  backend virtual-host routing on those routes, or set
+  `preserve_host_header: false` to keep the backend authority in both
+  fields. Mesh-mTLS routes with a pinned service authority are unchanged:
+  the peer still sees the mesh service host and port.
 
 - **Linux GNU release ABI floor is now GLIBC_2.34** (issue #4301). Generic
   `ferrum-edge-linux-{x86_64,aarch64}` and `ferrum-cni-linux-{x86_64,aarch64}`
@@ -158,6 +187,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `libz.so.1`.
 
 ### Changed
+
+- CI `dependency-audit` jobs now run `cargo deny check licenses` alongside
+  advisories, bans, and sources (issue #4439). The `[licenses]` allowlist and
+  confidence threshold in `deny.toml` are blocking on every PR and in the weekly
+  `dependency-audit` workflow.
 
 - **BREAKING — injected Ferrum is a Kubernetes native sidecar**
   (issue #4430). The webhook now emits `ferrum-edge` under `spec.initContainers`
@@ -215,6 +249,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `helm upgrade --take-ownership --set crds.adoptExisting=true`. Do not set
   `crds.install=false` to skip the error — that leaves the cluster on a stale
   schema.
+- **BREAKING — `FERRUM_GRPC_POOL_READY_WAIT_MS` removed**
+  (issue #4427). The variable was parsed and documented but never applied at
+  runtime; the gRPC pool uses an immediate `now_or_never` readiness probe by
+  design. **Operator action**: remove `FERRUM_GRPC_POOL_READY_WAIT_MS` from
+  your configuration; it never had a runtime effect.
 
 - **BREAKING — `FERRUM_TLS_OFFLOAD_THREADS` nonzero values fail startup**
   (issue #4294). TLS handshake offload is not implemented; a nonzero setting
@@ -695,6 +734,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (issue #3244) (issue #3317).
 
 ### Added
+
+- **`charts/ferrum-gateway` `admin.requireNamespaceClaim`** (issue #4456).
+  First-class chart value (default `false`, matching the binary) rendering
+  `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` in `database`, `file`, `cp`, and `dp`
+  modes. Reserved so `env` / `extraEnv` cannot desync it. Pair with
+  `cp.requireNamespaceClaim` for tenancy enforcement on both planes; enabling
+  only the CP flag does not constrain admin JWTs. Not breaking.
 
 - **`DELETE /proxies/{id}?cleanup_orphaned_upstream=` opt-out** (issue #4064).
   This is a non-breaking feature addition: omitting the parameter preserves
