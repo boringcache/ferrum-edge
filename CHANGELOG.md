@@ -240,6 +240,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `helm upgrade --take-ownership --set crds.adoptExisting=true`. Do not set
   `crds.install=false` to skip the error — that leaves the cluster on a stale
   schema.
+- **BREAKING — `FERRUM_GRPC_POOL_READY_WAIT_MS` removed**
+  (issue #4427). The variable was parsed and documented but never applied at
+  runtime; the gRPC pool uses an immediate `now_or_never` readiness probe by
+  design. **Operator action**: remove `FERRUM_GRPC_POOL_READY_WAIT_MS` from
+  your configuration; it never had a runtime effect.
 
 - **BREAKING — `FERRUM_TLS_OFFLOAD_THREADS` nonzero values fail startup**
   (issue #4294). TLS handshake offload is not implemented; a nonzero setting
