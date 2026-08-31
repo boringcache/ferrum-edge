@@ -1451,9 +1451,9 @@ fn hyper_headermap_normalizes_header_names() {
 #[test]
 fn h1_parse_envelope_bytes_match_check_protocol_headers_messages() {
     use ferrum_edge::proxy::{
-        envelope_for_hint_for_test, PARSE_HINT_CONFLICTING_CONTENT_LENGTH_FOR_TEST,
+        PARSE_HINT_CONFLICTING_CONTENT_LENGTH_FOR_TEST,
         PARSE_HINT_HTTP10_TRANSFER_ENCODING_FOR_TEST,
-        PARSE_HINT_INVALID_REQUEST_TARGET_UTF8_FOR_TEST,
+        PARSE_HINT_INVALID_REQUEST_TARGET_UTF8_FOR_TEST, envelope_for_hint_for_test,
     };
 
     fn envelope_body(envelope: &[u8]) -> &[u8] {

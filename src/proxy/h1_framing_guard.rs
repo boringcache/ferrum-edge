@@ -24,7 +24,7 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, ready};
 
@@ -245,7 +245,10 @@ impl H1FramingSignals {
 
 enum ParseRejectWrite {
     Idle,
-    Writing { envelope: &'static [u8], offset: usize },
+    Writing {
+        envelope: &'static [u8],
+        offset: usize,
+    },
     Written,
 }
 
@@ -309,10 +312,7 @@ impl<T: AsyncWrite + Unpin> H1FramingGuardIo<T> {
                     (envelope, offset)
                 }
             };
-            let wrote = ready!(Pin::new(&mut self.inner).poll_write(
-                cx,
-                &envelope[offset..],
-            ))?;
+            let wrote = ready!(Pin::new(&mut self.inner).poll_write(cx, &envelope[offset..],))?;
             if wrote == 0 {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::WriteZero,
