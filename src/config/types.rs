@@ -624,6 +624,12 @@ pub struct UpstreamPortOverride {
     /// `outlierDetection`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passive_health_check: Option<PassiveHealthCheck>,
+    /// Raw per-port `outlierDetection` field overlay retained for cold-path
+    /// projection onto a selected subset's inherited passive-health policy.
+    /// The fully resolved `passive_health_check` above remains the serialized
+    /// top-level-plus-port view; this field is mesh-derived state only.
+    #[serde(skip)]
+    pub outlier_detection_overlay: Option<crate::modes::mesh::config::MeshOutlierDetection>,
     /// Per-port locality LB override mapped from DestinationRule
     /// `portLevelSettings[].loadBalancer.localityLbSetting`. When present,
     /// HTTP-family / gRPC / WebSocket / HBONE dispatch consults this before
@@ -1026,6 +1032,48 @@ pub(crate) fn dispatch_port_override_fallback_for_selected_subset(
             .overlay_subset_connection_pool_http(subset_policy);
     }
     inherited
+}
+
+/// Resolve an upstream's per-port overlays for one selected subset.
+///
+/// Passive health needs this subset-specific materialization because its four
+/// represented Istio fields are stored as one `PassiveHealthCheck`. The raw
+/// per-port field mask is therefore applied over the selected subset's fully
+/// resolved passive policy (or the upstream policy when no subset applies),
+/// preserving field-level port > subset > top-level precedence without any
+/// request-path merging. Other per-port fields are projected unchanged.
+pub(crate) fn dispatch_port_overrides_for_selected_subset(
+    upstream: &Upstream,
+    selected_subset: Option<&str>,
+) -> Option<HashMap<u16, ResolvedPortOverride>> {
+    if upstream.port_overrides.is_empty() {
+        return None;
+    }
+
+    let inherited_passive = selected_subset
+        .and_then(|subset| upstream.resolved_subset_tls.get(subset))
+        .and_then(|resolved| resolved.passive_health_check.as_ref())
+        .or_else(|| {
+            upstream
+                .health_checks
+                .as_ref()
+                .and_then(|health| health.passive.as_ref())
+        });
+    let resolved: HashMap<u16, ResolvedPortOverride> = upstream
+        .port_overrides
+        .iter()
+        .filter_map(|(port, override_config)| {
+            let mut resolved =
+                ResolvedPortOverride::from_upstream_override(override_config).unwrap_or_default();
+            if let Some(outlier) = override_config.outlier_detection_overlay.as_ref() {
+                let mut passive = inherited_passive.cloned().unwrap_or_default();
+                crate::modes::mesh::apply_outlier_detection_to_passive(&mut passive, outlier);
+                resolved.passive_health_check = Some(passive);
+            }
+            (!resolved.is_empty()).then_some((*port, resolved))
+        })
+        .collect();
+    (!resolved.is_empty()).then_some(resolved)
 }
 
 /// A named subset of upstream targets identified by label selectors.
@@ -1471,6 +1519,29 @@ pub struct PassiveHealthCheck {
     /// not yet applied by passive health.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub split_external_local_origin_errors: Option<bool>,
+    /// Evaluate `unhealthy_threshold` against the target's CONSECUTIVE failure
+    /// streak instead of the sliding-window failure count (issue #4292).
+    ///
+    /// `false` (default) keeps Ferrum's native windowed passive health: "N
+    /// failures within `unhealthy_window_seconds`". `true` is Istio/Envoy
+    /// `outlierDetection.consecutive5xxErrors` semantics: a single success
+    /// between failures resets the streak, so a backend erroring at a low rate
+    /// under high load is never ejected. The K8s DestinationRule translator
+    /// sets it; hand-written configs opt in explicitly.
+    ///
+    /// `unhealthy_window_seconds` is not consulted in this mode — Istio's
+    /// `interval` is an analysis sweep period, not a failure window.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub consecutive_error_mode: bool,
+    /// When true, the Istio consecutive-5xx detector is disabled
+    /// (`consecutive5xxErrors: 0`). Matching `unhealthy_status_codes` and
+    /// locally originated `connection_error` values are ignored (Envoy's
+    /// default `splitExternalLocalOriginErrors=false` puts those connection
+    /// failures in the same 5xx bucket; Ferrum's split mode is deferred and
+    /// unused). Normally set by translated DestinationRules; direct native
+    /// configuration may opt into the same sentinel explicitly.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub consecutive_5xx_ejection_disabled: bool,
 }
 
 impl Default for PassiveHealthCheck {
@@ -1483,6 +1554,8 @@ impl Default for PassiveHealthCheck {
             max_ejection_percent: None,
             gateway_error_codes: None,
             split_external_local_origin_errors: None,
+            consecutive_error_mode: false,
+            consecutive_5xx_ejection_disabled: false,
         }
     }
 }
@@ -1870,6 +1943,14 @@ pub enum SdProvider {
 }
 
 /// DNS-SD specific configuration (SRV record-based discovery).
+///
+/// The poller honors RFC 2782: undialable RRs (root target `.`, port 0) are
+/// dropped, remaining ports use the same `1..=65535` admission as Kubernetes
+/// and Consul, and every remaining priority tier is published with its priority
+/// stamped in the reserved `ferrum.srv.priority` tag. The load balancer then
+/// serves only from the lowest-numbered tier that still has a HEALTHY target,
+/// falling over to the next tier when a tier goes fully unhealthy and returning
+/// as soon as it recovers (see `docs/dns_resolver.md`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DnsSdConfig {
     /// The DNS name to query for SRV records (e.g., "_http._tcp.my-service.example.com").
@@ -4204,29 +4285,12 @@ impl GatewayConfig {
     /// Same pattern as `resolve_upstream_tls` — derived projection cached on
     /// the proxy so the request path never re-derives it.
     pub fn resolve_dispatch_port_overrides(&mut self) {
-        let by_upstream: HashMap<(&str, &str), HashMap<u16, ResolvedPortOverride>> = self
-            .upstreams
-            .iter()
-            .filter(|u| !u.port_overrides.is_empty())
-            .map(|u| {
-                let ports: HashMap<u16, ResolvedPortOverride> = u
-                    .port_overrides
-                    .iter()
-                    .filter_map(|(port, ovr)| {
-                        ResolvedPortOverride::from_upstream_override(ovr)
-                            .map(|resolved| (*port, resolved))
-                    })
-                    .collect();
-                ((u.namespace.as_str(), u.id.as_str()), ports)
-            })
-            .filter(|(_, m)| !m.is_empty())
-            .collect();
-
         // Inherited top-level `connectionPool.http` fallback. All six applied
         // HTTP fields supported at subset scope are overlaid per proxy via the
         // shared selected-subset helper so admission and runtime stay aligned.
-        // The per-port map stays separate and is consulted first at dispatch,
-        // preserving port > subset > top-level.
+        // The per-port map is likewise materialized for the selected subset so
+        // partial outlierDetection blocks preserve field-level
+        // port > subset > top-level precedence without hot-path merging.
         let upstream_by_key: HashMap<(&str, &str), &Upstream> = self
             .upstreams
             .iter()
@@ -4238,7 +4302,14 @@ impl GatewayConfig {
                 .upstream_id
                 .as_deref()
                 .map(|uid| (proxy.namespace.as_str(), uid));
-            proxy.dispatch_port_overrides = key.and_then(|key| by_upstream.get(&key)).cloned();
+            proxy.dispatch_port_overrides = key.and_then(|key| {
+                upstream_by_key.get(&key).and_then(|upstream| {
+                    dispatch_port_overrides_for_selected_subset(
+                        upstream,
+                        proxy.upstream_subset.as_deref(),
+                    )
+                })
+            });
             proxy.dispatch_port_override_fallback = key.and_then(|key| {
                 upstream_by_key.get(&key).and_then(|upstream| {
                     dispatch_port_override_fallback_for_selected_subset(
@@ -9145,7 +9216,8 @@ impl Upstream {
 
     /// Reject mesh-PROJECTED fields that an OPERATOR must not set directly.
     ///
-    /// Reserved `mesh.*` target tags, `port_overrides`, `source_locality`,
+    /// Reserved `mesh.*` target tags, reserved `ferrum.srv.*` target tags and
+    /// subset labels, `port_overrides`, `source_locality`,
     /// `source_labels`, `locality_lb_strict`, `locality_lb_setting`, and the
     /// mesh-derived fields nested under `subsets[].traffic_policy` are
     /// all populated by the mesh slice-apply layer (from DestinationRules / the
@@ -9174,6 +9246,38 @@ impl Upstream {
                 errors.push(format!(
                     "targets[{target_index}].tags contains a key in the reserved mesh.* namespace \
                      and cannot be set directly via operator-provided config"
+                ));
+            }
+            // Issue #4291: `ferrum.srv.*` carries the internal RFC 2782 SRV
+            // priority-tier contract between the DNS-SD discoverer and the load
+            // balancer's candidate filter. Accepting one from operator config
+            // would let a static target claim (or shadow) a DNS tier it was
+            // never published in.
+            if target
+                .tags
+                .keys()
+                .any(|key| key.starts_with(crate::service_discovery::RESERVED_SRV_TAG_PREFIX))
+            {
+                errors.push(format!(
+                    "targets[{target_index}].tags contains a key in the reserved {prefix}* \
+                     namespace (RFC 2782 SRV discovery metadata) and cannot be set directly via \
+                     operator-provided config",
+                    prefix = crate::service_discovery::RESERVED_SRV_TAG_PREFIX
+                ));
+            }
+        }
+
+        for (subset_index, subset) in self.subsets.iter().flatten().enumerate() {
+            if subset
+                .labels
+                .keys()
+                .any(|key| key.starts_with(crate::service_discovery::RESERVED_SRV_TAG_PREFIX))
+            {
+                errors.push(format!(
+                    "subsets[{subset_index}].labels selects on the reserved {prefix}* namespace \
+                     (RFC 2782 SRV discovery metadata), which is internal load-balancer state \
+                     and not an addressable subset selector",
+                    prefix = crate::service_discovery::RESERVED_SRV_TAG_PREFIX
                 ));
             }
         }
@@ -10102,7 +10206,8 @@ impl GatewayConfig {
 
     /// Reject mesh-PROJECTED upstream fields on operator-PROVIDED config loads.
     ///
-    /// Reserved `mesh.*` target tags, `Upstream.{port_overrides, source_locality,
+    /// Reserved `mesh.*` and `ferrum.srv.*` target tags / subset labels,
+    /// `Upstream.{port_overrides, source_locality,
     /// source_labels, locality_lb_strict, locality_lb_setting}`, and mesh-only fields under
     /// `Upstream.subsets[].traffic_policy` are owned by the mesh slice-apply layer
     /// (Destination rules / workload locality /

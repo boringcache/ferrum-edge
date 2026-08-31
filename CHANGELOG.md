@@ -7,7 +7,186 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **BREAKING — HTTP/2 and HTTP/3 requests without `:authority` or Host are rejected with 400**
+  (issue #4416). RFC 9113 §8.3.1 and RFC 9114 §4.3.1 require a request to
+  include either `:authority` or a Host field. Ferrum previously treated the
+  both-absent case as a vacuous Host/`:authority` agreement and admitted the
+  request, so routing skipped exact/wildcard host tiers and fell through to a
+  catch-all (empty `hosts`) route — the HTTP/2 and HTTP/3 counterpart of the
+  HTTP/1.1 bypass closed in issue #4390. `check_host_authority_consistency()`
+  now returns 400 when both are absent. `:authority`-only (the usual H2/H3
+  client shape, including RFC 8441 / RFC 9220 Extended CONNECT) and Host-only
+  remain valid. HTTP/1.1 is unchanged and still owned by
+  `check_protocol_headers()`. **Operator action**: any HTTP/2 or HTTP/3 client
+  that omitted both `:authority` and Host (non-conformant scanners, some raw
+  frames) will start seeing `400`
+  `{"error":"Request is missing both :authority and Host"}` instead of being
+  routed. Send `:authority` or Host.
+
+- **`request_mirror` denies cross-origin query credentials by default**
+  (issue #4295). Sensitive query pairs (`access_token`, `api_key`,
+  delimiter-bounded `token`/`sig`/`signature` including `oauth_token` and
+  `x-amz-signature` / `x-goog-signature`, nested percent-encoded names, and
+  operator `sensitive_query_patterns`) are dropped from the mirror
+  request-target only. Classification checks every decode layer through a
+  hard cap of 4 and fails closed on residual `%XX`. The primary backend
+  request-target is unchanged. Literal semicolon-bearing segments also fail
+  closed because mirror frameworks disagree on whether `;` separates query
+  pairs; delimiter variants of the `api_key` family are denied as well.
+  Forwarding a denied name requires the
+  fail-closed pair `forward_sensitive_query=true` plus an exact decoded-name
+  `forward_sensitive_query_allowlist`. Mirror logs still omit the entire query.
+
+### Fixed
+
+- **Identity-only NodeWaypoint assertion grants require ambient enrollment.**
+  Kubernetes pod discovery no longer lets a same-node identity-only pod
+  enter a NodeWaypoint's HBONE assertion inventory merely by sharing that
+  node. The pod must pass the node-agent ambient enrollment predicate
+  (`ferrum.io/mesh: enabled` or `ferrum.io/inject: true`, and not
+  host-network, sidecar-injected, or an excluded namespace).
+
+- **Injector inbound capture excludes kubelet HTTP and TCP probe ports**
+  (issue #4431). `startupProbe` / `readinessProbe` / `livenessProbe` `httpGet`
+  and `tcpSocket` ports on every container in the pod are unioned into the
+  inbound exclusion set (named ports resolve against that container's
+  `ports`). `exec` and `grpc` probes are skipped. Unresolved named ports fail
+  admission rather than leaving the probe captured. Explicit
+  `excludeInboundPorts` annotations and `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS`
+  still win.
+
+- **Linux GNU release ABI floor is now GLIBC_2.34** (issue #4301). Generic
+  `ferrum-edge-linux-{x86_64,aarch64}` and `ferrum-cni-linux-{x86_64,aarch64}`
+  artifacts previously linked against whatever glibc `ubuntu-latest` shipped
+  (observed GLIBC_2.39), so they failed on Ubuntu 22.04, RHEL 9, and Debian 12.
+  The x86_64 GNU cell of the release and `latest` producer jobs no longer
+  compiles on the runner: it builds both binaries in a digest-pinned
+  AlmaLinux 8.10 sysroot under an isolated `CARGO_TARGET_DIR`
+  (`target/linux-gnu-sysroot`) so native runner caches cannot contaminate the
+  pinned link, and the same job then stages, checksums, ABI-scans, and
+  oldest-baseline-smokes those exact bytes before uploading them. The GitHub
+  Release, its `.sha256` sidecars, the `latest` prerelease, the x86_64 layer
+  of the default multi-arch container images, and the signing/attestation
+  jobs therefore all consume the x86_64 bytes that were verified; a floor
+  violation means that artifact is never uploaded. ARM64 GNU artifacts still
+  come from the isolated Cross build, already target an older glibc, and are
+  re-checked as published on an ARM64 runner. The `docker` job needs
+  `[test, build-binaries, build-arm64-cross, main-publish-gate]` and does not
+  wait on that ARM64 ABI job, so the arm64 image layer is pushed before
+  verification; `linux-gnu-abi-latest-gate` / `linux-gnu-abi-release-gate`
+  delete only the GitHub Release (or `latest` prerelease), never the
+  `:latest` / `:vX.Y.Z` image tags. Full-mode pull requests run the same
+  sysroot builder as a pre-merge regression signal. Artifact names,
+  checksums, signatures, and container publish behavior are unchanged.
+  Remaining dynamic libraries are `libgcc_s.so.1` and, if not static-linked,
+  `libz.so.1`.
+
 ### Changed
+
+- **BREAKING — injected Ferrum is a Kubernetes native sidecar**
+  (issue #4430). The webhook now emits `ferrum-edge` under `spec.initContainers`
+  with `restartPolicy: Always`, plus exec startup and readiness probes against
+  loopback `/health` (not `/live`). Capture rules (`ferrum-edge-init`) run
+  after that startup probe succeeds, so application traffic is not redirected
+  at a proxy that is not listening, and injected Jobs can complete. **Minimum
+  Kubernetes version is 1.29** (native sidecars enabled by default; 1.28
+  requires the `SidecarContainers` feature gate). There is no
+  ordinary-container fallback. **Operator action**: run the injector only on
+  Kubernetes 1.29+ (or 1.28 with the feature gate), then roll injected
+  workloads so new pods pick up the native-sidecar shape; pods that still
+  carry Ferrum in `spec.containers` must be recreated.
+
+- **BREAKING — `ferrum-gateway` `mode=cp` disables the in-cluster K8s controller**
+  (issue #4384). The binary still defaults `FERRUM_K8S_CONTROLLER_ENABLED` and
+  `FERRUM_K8S_POD_DISCOVERY_ENABLED` to true when `KUBERNETES_SERVICE_HOST` is
+  set, but this chart renders no ClusterRole, so those core watches 403-retry
+  for the life of the process. `k8sController.enabled` now defaults to `false`
+  and `mode=cp` emits both env vars as `"false"`. Setting the value to `true`
+  fails render (use `charts/ferrum-mesh`, which already ships matching RBAC).
+  Both names are reserved so `env` / `extraEnv` cannot re-enable the watches.
+  **Operator action**: if you were running this chart as a Kubernetes CRD
+  controller, migrate to `charts/ferrum-mesh` (`controlPlane.enabled=true`).
+  Database-backed CP+DP pairs need no change; the documented
+  `examples/cp-values.yaml` quickstart now matches the chart's grant surface.
+
+- **BREAKING — Ambient pod-registry migration proofs and publication use one
+  canonical strict grammar** (issue #4249). Durable UDP placement cleanup now
+  reads `PodCaptureSource::list_complete_targets`, the same bounded, all-or-
+  nothing snapshot used by the inbound HBONE relay node bound. A registry leaf
+  that disappears between enumeration and open is skipped as a withdrawn pod,
+  but a present malformed `spiffe_id=` / `ipv4=` / `ipv6=` value, duplicate
+  recognized key, unknown non-empty line, unsafe leaf name, symlink, oversized
+  or non-regular file, ownership mismatch, or other read failure reports
+  `registry_not_synchronized`; several of those body shapes were previously
+  tolerated by migration cleanup. The node-agent writer now applies the same
+  canonical leaf grammar (non-empty, at most 256 bytes, ASCII alphanumeric
+  first, then ASCII alphanumeric / `-` / `_`) before publishing. **Operator
+  action**: before an Ambient UDP placement migration, remove stale hand-
+  authored registry artifacts and let the node-agent regenerate every pod
+  entry; do not publish custom leaf names or body lines outside the documented
+  grammar.
+
+- **BREAKING — `FERRUM_TLS_OFFLOAD_THREADS` nonzero values fail startup**
+  (issue #4294). TLS handshake offload is not implemented; a nonzero setting
+  was previously parsed and then silently ignored. `EnvConfig::validate()`
+  now rejects any value other than `0` before mode dispatch. **Operator
+  action**: leave the variable unset or set it to `0`.
+
+- **BREAKING — seven plugin constructors reject unknown config keys**
+  (issues #4405, #4409). `request_size_limiting`, `ws_message_size_limiting`,
+  `a2a_gateway`, `ws_logging`, and `mcp_gateway` fail closed at construction
+  (file-mode `validate` exit 1). `http_logging` and `prometheus_metrics`
+  remain `OptionalFailOpen`: construction still returns `Err` naming the
+  unknown key, and `validate`/reload warn and omit the instance instead of
+  failing the gateway. `mcp_gateway` also rejects `command` / `args` /
+  `stdio` (root or `servers.*`) with an HTTP-only diagnostic; stdio spawn is
+  not implemented. **Operator action**: rename typos (`max_bytez`,
+  `max_frame_bytez`, `endpont_url`, `render_cache_ttl_secnds`, …) and replace
+  Claude-Desktop `command` with `servers.*.upstream_url` `http://`/`https://`.
+
+- **BREAKING — HTTP/1.1 requests without a Host header are rejected with 400**
+  (issue #4390). RFC 9112 §3.2.2 requires a server to answer 400 when an
+  HTTP/1.1 request lacks a Host field. Ferrum previously only rejected
+  *multiple* Host fields, so a Host-less origin-form request skipped
+  exact/wildcard host tiers and fell through to a catch-all (empty `hosts`)
+  route. `check_protocol_headers()` now rejects HTTP/1.1 when both the Host
+  field and the URI authority are absent. HTTP/1.0 still does not require
+  Host. Absolute-form request-targets (`GET http://host/path HTTP/1.1`) that
+  already carry an authority are accepted without a Host field. An empty
+  Host value (`Host:` with no tokens) is treated as present-but-invalid and
+  also returns 400 on HTTP/1.1. HTTP/2 and HTTP/3 are unchanged
+  (`check_host_authority_consistency()` still governs `:authority`).
+  **Operator action**: any HTTP/1.1 client that omitted Host (non-conformant
+  scanners, some raw sockets, misconfigured health probes) will start seeing
+  `400` `{"error":"HTTP/1.1 request is missing a Host header"}` instead of
+  being routed. Send a Host field, or use HTTP/1.0 / absolute-form if that
+  is the intended protocol.
+
+- The recommended level-1 WAF enforcement posture now blocks SQL injection in
+  admitted request bodies as well as decoded query values, prototype-pollution
+  tokens in decoded query keys and values, and matching payloads carried in
+  declared UTF-16LE/UTF-16BE bodies (issues #4401, #4402, #4403). SQLi body
+  mirrors use the existing query patterns unchanged. UTF-16 transcoding runs
+  only after the existing body content-type, multipart, and binary inspection
+  gates admit the body; those gates are unchanged. **Operator action**: review
+  WAF monitor logs for the new body/query matches before using
+  `default_rule_action: enforce` if application payloads legitimately contain
+  these attack-shaped tokens.
+
+- **BREAKING — translator-owned route header consumers now compose with global
+  transformers** (issue #4304). The auto-emitted `istio-vs-req-xform-*` /
+  `istio-vs-resp-xform-*` instances consume matched
+  `mesh_route_dispatch` header rules without shadowing a same-name global
+  `request_transformer` / `response_transformer`. Before this change, a
+  Gateway API `HTTPRoute` with `RequestHeaderModifier` or
+  `ResponseHeaderModifier` accidentally suppressed the global transformer's
+  static rules on that proxy; those global rules now run first and the matched
+  route rules run last. Istio VirtualService header transforms use the same
+  composition contract. **Operator action**: audit HTTPRoute-backed proxies
+  that relied on the accidental suppression and scope or remove global static
+  rules that should not apply there.
 
 - **BREAKING — `POST /batch` rejects unknown top-level envelope keys**
   (issue #4042). The request is create-only (`consumers`, `upstreams`,
@@ -207,6 +386,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   half-configured identity validate clean.
 
 ### Fixed
+
+- Gateway API `TLSRoute` is watched at `v1` as well as `v1alpha2` (issue #4383).
+  Gateway API v1.5.1 `standard-install.yaml` serves TLSRoute at `v1` only
+  (`v1alpha2`/`v1alpha3` remain on the CRD with `served: false`), so a
+  standard-channel cluster previously skipped the reflector and never
+  programmed passthrough listeners or route status. Experimental-install still
+  serves `v1alpha2`; both versions are dual-watched and de-duplicated the same
+  way as HTTPRoute `v1`/`v1beta1`.
+
+- **DNS background refresh no longer stalls cache eviction** (issue #4270). The
+  proactive refresh task scanned every near-expiry hostname sequentially with
+  no cap, timeout, or delayed tick behavior, and it owned the only production
+  `evict_expired()` call. A degraded resolver with a large cache could leave
+  `FERRUM_DNS_CACHE_MAX_SIZE` unenforced for hours and then burst catch-up
+  sweeps. Refresh now selects soonest-expiry success rows up to
+  `FERRUM_DNS_MAX_CONCURRENT_REFRESHES`, resolves them concurrently through
+  the shared stale-while-revalidate semaphore and dedup map, bounds each
+  SWR and proactive lookup at 15 seconds, observes shutdown with RAII
+  permit/dedup cleanup, and publishes generation-safely
+  (stale-while-revalidate and proactive refresh share one success-generation
+  check) so a stale in-flight result cannot overwrite a newer row or resurrect
+  an evicted hostname. Capacity eviction runs on its own 5s delayed cadence.
+  **Operator action**: none; the existing concurrency env var now also caps
+  proactive refresh per cycle.
+
+- **Security — HTTP/1 CL+TE smuggling rejection is now wire-order-independent**
+  (issue #4391). A TE-first request previously reached Hyper's application
+  service without `Content-Length`, because Hyper applied transfer-coding
+  precedence before Ferrum's header-map guard ran; the same fields in CL-first
+  order returned `400`. Plaintext and TLS proxy HTTP/1 frontends now observe
+  bounded raw request heads before parsing and carry the CL+TE fact into the
+  existing `400` rejection path, which closes the client connection as required
+  by RFC 9112 §6.1. The observer is case-insensitive, survives
+  leading empty lines, split reads, and keep-alive bodies, and disables itself
+  for HTTP/2 (TLS ALPN `h2` is never wrapped; h2c defers the signal ring until
+  the connection classifies as HTTP/1) and after an HTTP/1 `101` upgrade or
+  successful CONNECT, matching Hyper's `is_last` cases. An HTTP/1 request that
+  was never observed is tracked distinctly from a completed no-conflict
+  observation so a missing observer cannot be mistaken for a verified-clear
+  wire. Observer-failure warnings are rate-limited like the accept loop.
+  Body-boundary reads can include an 8 KiB observation suffix instead of being
+  shortened to the current chunk remainder. If observation loses alignment or
+  exhausts its fixed signal ring, the current request is rejected with a
+  distinct error and the connection is closed. This applies only to plaintext
+  and TLS **proxy** HTTP/1 frontends; the admin and injector HTTP listeners are
+  outside this observer boundary. TE-only, CL-only, HTTP/2, and HTTP/3 behavior
+  is unchanged.
 
 - **Security — client-asserted `X-Real-IP` no longer reaches mirror or
   load-test targets** (issue #4164). The primary backend builders drop an

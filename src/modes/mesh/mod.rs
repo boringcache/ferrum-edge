@@ -10,6 +10,7 @@ pub mod access_log_filter;
 pub mod config;
 pub mod config_consumer;
 pub mod dns_proxy;
+pub mod enrolled_destinations;
 pub mod federation;
 pub mod hbone;
 pub mod metric_tag_cel;
@@ -1763,45 +1764,80 @@ fn prepare_normalized_gateway_config_for_mesh(
         // Assigned UNCONDITIONALLY on every apply, so a topology change, a
         // withdrawn NodeWaypoint enrollment, or a service unbound from this
         // waypoint immediately stops being an admissible relay destination
-        // instead of leaving a stale admission behind. Both fields default to
-        // "terminates for nothing", so an unrecognized or gateway topology
-        // refuses every transparent relay rather than falling back to the
-        // slice-wide workload view — which is what made this terminator an
-        // open relay into other nodes' pods.
-        let (inbound_relay_destinations, admits_accepted_local_address) = match runtime.topology {
-            // Own-IDENTITY terminators. Two admission sources, both narrow:
-            //
-            // 1. The accepted connection's own local address — the pod IP the
-            //    peer actually reached on this socket. A transport fact, so it
-            //    needs no inventory and works even when the slice resolved no
-            //    local identity.
-            // 2. The slice workload record(s) carrying THIS proxy's configured
-            //    workload identity (`FERRUM_MESH_WORKLOAD_SPIFFE_ID`). Ambient
-            //    is ztunnel-style: it runs OUTSIDE the workload pods' network
-            //    namespaces and terminates inbound HBONE for the pods the
-            //    node-agent enrolls on its node, dialing the destination pod's
-            //    own address (for UDP, straight into that pod's netns — see
-            //    `docs/mesh.md`, "Enrolled Ambient destination pod UDP relay").
-            //    That destination is legitimately NOT the accepted socket's
-            //    local address, so source 1 alone would break the documented
-            //    datapath. A Sidecar reaches the same records through its own
-            //    pod address, so this is a no-op there in practice.
-            //
-            // The identity is the narrowing: a workload the slice declares
-            // under a DIFFERENT SPIFFE — another service, or another node's pod
-            // of another service — is still refused, which is the issue #4150
-            // property. A blank/absent identity yields an EMPTY inventory
-            // (fail closed), leaving only the accepted local address.
-            MeshTopology::Sidecar | MeshTopology::Ambient => {
-                let own_identity = runtime
-                    .workload_spiffe_id
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|identity| !identity.is_empty());
-                let destinations = match own_identity {
-                    Some(identity) => {
-                        crate::modes::mesh::config::inbound_relay_destinations_from_workloads(
-                            mesh_slice.workloads.iter().filter(|workload| {
+        // instead of leaving a stale admission behind. The admission fields
+        // collectively default to "terminates for nothing", so an unrecognized
+        // or gateway topology refuses every transparent relay rather than
+        // falling back to the slice-wide workload view — which is what made
+        // this terminator an open relay into other nodes' pods. Sidecar's
+        // loopback-namespace shortcut is a separate privilege from
+        // accepted-local-address admission and is never inferred from inventory
+        // or identity.
+        //
+        // Resolved once, ahead of the match: the owned-workload view below is
+        // built from it, and the own-ADDRESS port bound is authoritative only
+        // when it resolved (issue #4249).
+        let own_workload_identity = runtime
+            .workload_spiffe_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|identity| !identity.is_empty());
+        // The slice workload record(s) that ARE this proxy's own local
+        // workload: its configured identity (`FERRUM_MESH_WORKLOAD_SPIFFE_ID`)
+        // plus cluster and label locality, via the shared `workload_is_local`.
+        //
+        // The two own-pod topologies both need this view but for DIFFERENT
+        // purposes (issue #4249), which is why it is resolved once here rather
+        // than inside one match arm:
+        //
+        // * `Ambient` publishes it as the general relay inventory. It is
+        //   ztunnel-style — it runs OUTSIDE the workload pods' network
+        //   namespaces and terminates inbound HBONE for the pods the node-agent
+        //   enrols on its node, dialing the destination pod's own address (for
+        //   UDP, straight into that pod's netns; see `docs/mesh.md`, "Enrolled
+        //   Ambient destination pod UDP relay") — so its legitimate
+        //   destinations are genuinely not the accepted socket's own address.
+        // * `Sidecar` does NOT. It shares the application pod's network
+        //   namespace, so the accepted socket's local address is already a
+        //   pod-unique transport proof of every destination it may relay to;
+        //   this view only bounds the PORT of that address (and of the
+        //   own-namespace loopback shortcut).
+        //
+        // `None` means no workload identity is configured: nothing can be
+        // attributed to this terminator, so there is no ownership evidence at
+        // all — fail closed to an empty inventory. The own-address port bound
+        // does NOT fall back to the declared workload view in that case; it is
+        // rebuilt from the only view available under the same ambiguity rule
+        // (issue #4249, below).
+        //
+        // Kept as the matched RECORDS rather than as the collapsed inventory,
+        // because the own-address projection has to count how many raw records
+        // declare each address before anything merges them.
+        let owned_workload_relay_records: Option<Vec<&crate::modes::mesh::config::Workload>> =
+            match runtime.topology {
+                MeshTopology::Sidecar | MeshTopology::Ambient => {
+                    own_workload_identity.map(|identity| {
+                        // Same inputs the slice builder feeds
+                        // `resolve_local_workloads`, so the CP-side local view
+                        // and this DP-side inventory cannot drift: the cluster
+                        // this slice calls local, and the operator's own
+                        // `FERRUM_MESH_WORKLOAD_LABELS`. The env labels are
+                        // preferred over `mesh_slice.labels` deliberately —
+                        // the slice's copy can be an INFERRED intersection
+                        // (`MeshSlice::labels_ambiguous`) supplied by the
+                        // carrier, and this is a security guard.
+                        let local_cluster = mesh_slice
+                            .multi_cluster
+                            .as_ref()
+                            .and_then(|multi| multi.local_cluster.as_deref());
+                        let workload_labels: BTreeMap<String, String> = runtime
+                            .workload_labels
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value.clone()))
+                            .collect();
+                        mesh_slice
+                            .workloads
+                            .iter()
+                            .filter(|workload| {
                                 // `mesh_slice` here is the MULTICLUSTER-MERGED
                                 // materialization slice, and
                                 // `tag_remote_workloads` deliberately keeps a
@@ -1814,16 +1850,73 @@ fn prepare_normalized_gateway_config_for_mesh(
                                 // `remote_provenance` is the reserved
                                 // `serde(skip)` marker stamped DP-side at
                                 // remote-poll ingestion, so it cannot be forged
-                                // by a remote CP or an operator file.
+                                // by a remote CP or an operator file. It is
+                                // kept ALONGSIDE the cluster check because a
+                                // remote record whose `cluster` the merge left
+                                // unset would otherwise pass the cluster arm.
                                 !workload.remote_provenance
-                                    && workload.spiffe_id.as_str() == identity
-                            }),
-                        )
-                    }
-                    None => Vec::new(),
-                };
-                (destinations, true)
-            }
+                                    && crate::modes::mesh::slice::workload_is_local(
+                                        workload,
+                                        identity,
+                                        &workload_labels,
+                                        local_cluster,
+                                    )
+                            })
+                            .collect()
+                    })
+                }
+                _ => None,
+            };
+        // Flat view of the same records. EMPTY when no identity resolved, which
+        // is NOT the same state as `None` — `is_some()` below is what tells
+        // "this terminator owns nothing" apart from "nothing is attributable".
+        let owned_records: &[&config::Workload] = match &owned_workload_relay_records {
+            Some(records) => records,
+            None => &[],
+        };
+        let (inbound_relay_destinations, admits_accepted_local_address) = match runtime.topology {
+            // A `Sidecar` runs INSIDE the application pod's network namespace.
+            // Every destination it may legitimately relay to is therefore the
+            // pod it shares that namespace with, and the accepted connection's
+            // own local address already proves that pod-uniquely — a transport
+            // fact the peer cannot choose. It needs NO multi-destination
+            // inventory, and carrying one is what let a same-SPIFFE,
+            // same-cluster, same-label sibling replica on another node be
+            // relayed to (issue #4249): those three facts are shared by every
+            // replica of one Deployment, and a Sidecar has no node-agent
+            // registry to bound them with. So the general inventory is EMPTY;
+            // the owned-workload view survives only as the own-address /
+            // loopback PORT bound stamped below.
+            MeshTopology::Sidecar => (Vec::new(), true),
+            // `Ambient` is the ztunnel-style own-identity terminator: it runs
+            // OUTSIDE the workload pods' network namespaces, so the accepted
+            // socket's local address alone cannot name the pods it terminates
+            // for and it does carry a multi-destination inventory.
+            //
+            // The LOCAL-workload predicate that built that inventory narrows it
+            // to records this proxy could plausibly own — a workload declared
+            // under a DIFFERENT SPIFFE, in another cluster, or carrying labels
+            // this workload does not have is refused — but it is NOT a node
+            // bound: two replicas of ONE Deployment share a service-account
+            // SPIFFE id, a cluster, and their pod-template labels while running
+            // on different nodes. The node bound is the authoritative
+            // node-local enrolled-pod registry stamped below as
+            // `MeshConfig::inbound_relay_node_local_registry` (issue #4249) —
+            // the node-agent's own enrollment lifecycle, republished lock-free
+            // on its reconcile cadence and consulted LIVE by the guard, so a
+            // withdrawn pod leaves the admitted set within one poll rather than
+            // at the next mesh apply. Where a registry is configured it is
+            // authoritative: an entry is relayable only while the registry
+            // enrols its destination pod at that exact address, a declared NAME
+            // is refused outright (the guard never resolves one, and the
+            // address the dial would pick is chosen afterwards), and there is
+            // NO per-entry fallback to this predicate.
+            MeshTopology::Ambient => (
+                crate::modes::mesh::config::inbound_relay_destinations_from_workloads(
+                    owned_records.iter().copied(),
+                ),
+                true,
+            ),
             // Deliberate multi-destination allowance #1: a NodeWaypoint IS the
             // inbound terminator for every pod enrolled on its node, so those
             // pods' addresses are legitimately not its own. The inventory is the
@@ -1836,17 +1929,18 @@ fn prepare_normalized_gateway_config_for_mesh(
                 false,
             ),
             // Deliberate multi-destination allowance #2: a GAMMA ServiceWaypoint
-            // IS the L7 terminator for the services bound to it. NOTE the slice
-            // filter is NAMESPACE-level, not service-level:
-            // `service_waypoint_resource_namespaces` yields the waypoint's own
-            // namespace plus the namespaces of its bound services, so this
-            // inventory is every workload VISIBLE in those namespaces — not only
-            // the ones backing the bound services. That still refuses every
-            // workload outside those namespaces, but do not read it as a
-            // per-binding narrowing.
+            // IS the L7 terminator for the services bound to it — and for
+            // nothing else. The slice's own workload filter is NAMESPACE-level
+            // (`service_waypoint_resource_namespaces` yields the waypoint's own
+            // namespace plus the namespaces of its bound services), and
+            // `narrow_for_service_waypoint` still fail-opens that routing view
+            // when the named binding is absent. Reading `mesh_slice.services`
+            // as the bound set would therefore admit every workload backing
+            // any namespace-visible Service (issue #4251). Re-derive the
+            // backing set from explicit binding evidence instead.
             MeshTopology::ServiceWaypoint => (
                 crate::modes::mesh::config::inbound_relay_destinations_from_workloads(
-                    &mesh_slice.workloads,
+                    service_waypoint_backing_workloads(mesh_slice, runtime),
                 ),
                 false,
             ),
@@ -1857,8 +1951,64 @@ fn prepare_normalized_gateway_config_for_mesh(
             // workload address, so it owns no transparent-relay destination.
             MeshTopology::EastWestGateway | MeshTopology::EgressGateway => (Vec::new(), false),
         };
+        // Issue #4249: the own-address and own-namespace-loopback arms bound
+        // their port from the record set this terminator can PROVE owns the
+        // address, not from every record that happens to declare it —
+        // `hostNetwork` pods all declare the node IP, and two replicas of one
+        // Deployment share the SPIFFE id, cluster and labels the owned filter
+        // above matches on, so a plain scan admitted the UNION of two pods'
+        // ports on one address. `own_address_port_bounds_from_workloads`
+        // resolves each address to at most ONE owning pod (a lone record, or
+        // several records agreeing on one non-empty pod UID) and OMITS every
+        // address it cannot, so the hot path has nothing left to union.
+        //
+        // This is also what keeps a `Sidecar` serving after its general
+        // inventory was emptied above: the two own-address arms read this
+        // projection, not `inbound_relay_destinations`.
+        //
+        // With no resolved identity there is no owned view to project, but that
+        // must NOT become a permissive fallback to the whole declared workload
+        // view: the same ambiguity rule is applied to that view instead, so a
+        // shared address still fails closed while an unambiguous one still
+        // serves. Remote-provenance records remain excluded here just as they
+        // are from the resolved owned view; an overlapping remote pod CIDR
+        // must not manufacture a local-address contest. Topologies that never
+        // consult these arms
+        // (`inbound_relay_admits_accepted_local_address` false) get an empty
+        // projection. Assigned UNCONDITIONALLY, like the two fields below it.
+        let own_address_ports = if !admits_accepted_local_address {
+            Vec::new()
+        } else if owned_workload_relay_records.is_some() {
+            crate::modes::mesh::config::own_address_port_bounds_from_workloads(
+                owned_records.iter().copied(),
+            )
+        } else {
+            crate::modes::mesh::config::own_address_port_bounds_from_workloads(
+                mesh.workloads
+                    .iter()
+                    .filter(|workload| !workload.remote_provenance),
+            )
+        };
+        // Issue #4249: the node bound for `Ambient`'s multi-destination
+        // inventory, and only for it. No other topology reads a node-local
+        // registry — a `Sidecar` now carries no general inventory to bound,
+        // `NodeWaypoint` already takes its inventory from the CP-authorized
+        // enrolled-pod list, and `ServiceWaypoint` from its bound Services — so
+        // every other topology is stamped with the unset handle rather than
+        // inheriting an installed one. Assigned UNCONDITIONALLY, like the three
+        // fields above.
+        let node_local_registry = match runtime.topology {
+            MeshTopology::Ambient => {
+                enrolled_destinations::installed_node_local_enrolled_destinations()
+            }
+            _ => Default::default(),
+        };
         mesh.inbound_relay_destinations = inbound_relay_destinations;
         mesh.inbound_relay_admits_accepted_local_address = admits_accepted_local_address;
+        mesh.inbound_relay_admits_loopback_namespace =
+            matches!(runtime.topology, MeshTopology::Sidecar);
+        mesh.inbound_relay_own_address_ports = own_address_ports;
+        mesh.inbound_relay_node_local_registry = node_local_registry;
     }
     materialize_fault_runtime_overlay(&mut config, &mesh_slice.runtime_overlay);
     materialize_transformer_runtime_overlay(&mut config, &mesh_slice.runtime_overlay);
@@ -1866,6 +2016,119 @@ fn prepare_normalized_gateway_config_for_mesh(
     config.resolve_upstream_tls();
 
     Ok(config)
+}
+
+/// The slice workloads that actually BACK one of the services bound to this
+/// `ServiceWaypoint` (issue #4251).
+///
+/// A `ServiceWaypoint` is the L7 terminator for the services bound to it and
+/// for nothing else. The slice's workload filter is NAMESPACE-level, and
+/// `narrow_for_service_waypoint` still fail-opens the routing view when the
+/// named binding is absent (rollout: flipping
+/// `FERRUM_MESH_TOPOLOGY=service_waypoint` before the Gateway lands must not
+/// empty outbound serving). `mesh_slice.services` is therefore NOT the bound
+/// set: with a `waypoint_name` but no matching `MeshWaypointBinding` it is
+/// the namespace-visible Service view, and treating it as a binding would
+/// admit every workload backing any visible Service — a plaintext inbound
+/// relay superset.
+///
+/// Fail closed unless ALL of:
+/// 1. this runtime's exact ServiceWaypoint identity (`waypoint_name` +
+///    namespace) matches the slice that carried the evidence;
+/// 2. that identity has a matching binding that claims service traffic
+///    (`waypoint_for=service` or `all`), carried as
+///    `mesh_slice.service_waypoint_bound_services` (missing / old / empty
+///    evidence, including `waypoint_for=workload` / `none` / blank /
+///    unknown, is empty);
+/// 3. the destination's ATTACHED Service identity is one of those exact
+///    `(namespace, service)` refs, the slice still carries that Service,
+///    and that Service's `workloads[]` list names the workload's SPIFFE —
+///    the same authorization `validate_mesh_config_internal` enforces for a
+///    cross-namespace attachment, so a bare `service_namespace` stamp
+///    cannot spoof membership.
+///
+/// Never infer a binding from namespace visibility, Service names alone, or
+/// the mere presence of `mesh_slice.services`. Cold path — one index build
+/// per mesh apply, then a hash-free ordered lookup per workload; the guard
+/// itself never runs this.
+fn service_waypoint_backing_workloads<'a>(
+    mesh_slice: &'a MeshSlice,
+    runtime: &MeshRuntimeConfig,
+) -> Vec<&'a crate::modes::mesh::config::Workload> {
+    if !service_waypoint_runtime_identity_matches(mesh_slice, runtime) {
+        return Vec::new();
+    }
+    if mesh_slice.service_waypoint_bound_services.is_empty() {
+        return Vec::new();
+    }
+    let bound: BTreeSet<(&str, &str)> = mesh_slice
+        .service_waypoint_bound_services
+        .iter()
+        .map(|reference| (reference.namespace.as_str(), reference.name.as_str()))
+        .collect();
+    let mut backed: BTreeSet<(&str, &str, &str)> = BTreeSet::new();
+    for service in &mesh_slice.services {
+        if !bound.contains(&(service.namespace.as_str(), service.name.as_str())) {
+            continue;
+        }
+        for reference in &service.workloads {
+            backed.insert((
+                service.namespace.as_str(),
+                service.name.as_str(),
+                reference.spiffe_id.as_str(),
+            ));
+        }
+    }
+    let mut backing: Vec<&crate::modes::mesh::config::Workload> = Vec::new();
+    if backed.is_empty() {
+        return backing;
+    }
+    for workload in &mesh_slice.workloads {
+        // A remote cluster's backing pod keeps its SPIFFE and its Service
+        // attachment through `tag_remote_workloads`, so it satisfies the
+        // membership test below. Relaying to it would dial across clusters in
+        // plaintext from this waypoint, bypassing the east-west gateway and its
+        // inner mTLS — the same reason the own-identity arm excludes remote
+        // provenance.
+        if workload.remote_provenance {
+            continue;
+        }
+        let attachment = (
+            workload.attached_service_namespace(),
+            workload.service_name.as_str(),
+            workload.spiffe_id.as_str(),
+        );
+        if backed.contains(&attachment) {
+            backing.push(workload);
+        }
+    }
+    backing
+}
+
+/// Whether this runtime is the ServiceWaypoint whose slice carried the
+/// binding evidence. A slice built for a different waypoint name or
+/// namespace must not license this terminator's inbound relay inventory.
+fn service_waypoint_runtime_identity_matches(
+    mesh_slice: &MeshSlice,
+    runtime: &MeshRuntimeConfig,
+) -> bool {
+    let Some(runtime_name) = runtime
+        .waypoint_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        return false;
+    };
+    let Some(slice_name) = mesh_slice
+        .waypoint_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        return false;
+    };
+    runtime_name == slice_name && runtime.namespace == mesh_slice.namespace
 }
 
 /// Env switch that opts a NodeWaypoint into materializing UDP/DTLS service
@@ -4624,6 +4887,11 @@ where
             // masquerade as remote and be excluded by strict locality LB.
             let mut tags = workload.selector.labels.clone();
             crate::modes::mesh::multicluster::strip_reserved_mesh_tags(&mut tags);
+            // Same reasoning for the reserved `ferrum.srv.*` namespace (issue
+            // #4291): it carries the internal RFC 2782 SRV priority-tier
+            // contract, and a copied workload label must not be able to place a
+            // mesh endpoint into a DNS-SD tier.
+            crate::service_discovery::strip_reserved_srv_tags(&mut tags);
             crate::config::types::merge_derived_topology_labels(
                 &mut tags,
                 workload.locality.as_deref(),
@@ -10036,6 +10304,14 @@ fn apply_destination_rules(
             if let Some(ref policy) = dr.traffic_policy {
                 apply_traffic_policy_to_upstream(upstream, policy, runtime)?;
             }
+            // Capture this DR's settled top-level passive tier before an
+            // owner-gated port policy is also projected onto the upstream for
+            // selection-time fallback. Per-port slots and subsets must inherit
+            // the top-level tier itself, not that later owner-only projection.
+            let top_level_passive = upstream
+                .health_checks
+                .as_ref()
+                .and_then(|health| health.passive.clone());
 
             let upstream_policy_ports: std::collections::HashSet<u16> = upstream
                 .targets
@@ -10190,24 +10466,18 @@ fn apply_destination_rules(
 
                 let is_owner_entry =
                     outbound_upstream_owner_port.get(&upstream_owner_key) == Some(port);
-                // Seed a FRESH fanned slot's passive health from the upstream
-                // level — which carries this DR's top-level outlierDetection,
-                // applied above — so a PARTIAL per-port outlier override
-                // layers over the top-level window/recovery fields instead of
-                // over defaults (`passive_health_for_target` prefers a
-                // per-port slot outright). Owner-gated entries only, and only
-                // when the entry actually carries outlierDetection; a slot an
-                // earlier rule already populated keeps its accumulated
-                // layering.
-                let upstream_passive_seed =
-                    if is_owner_entry && port_policy.outlier_detection.is_some() {
-                        upstream
-                            .health_checks
-                            .as_ref()
-                            .and_then(|h| h.passive.clone())
-                    } else {
-                        None
-                    };
+                // Seed every FRESH fanned slot's passive health from the
+                // upstream level, which already carries this DR's top-level
+                // outlierDetection. Ordinary upstreams need the same seed as
+                // owner-gated synthetic upstreams: `passive_health_for_target`
+                // prefers a per-port slot outright, so starting a partial port
+                // block from engine defaults would discard explicit top-level
+                // fields. Selected-subset projection later reapplies the raw
+                // port field mask over that subset's inherited policy.
+                let upstream_passive_seed = port_policy
+                    .outlier_detection
+                    .as_ref()
+                    .and_then(|_| top_level_passive.clone());
                 for store_port in store_ports {
                     let override_slot = upstream.port_overrides.entry(store_port).or_default();
                     if override_slot.passive_health_check.is_none()
@@ -10282,11 +10552,13 @@ fn apply_destination_rules(
                         name: subset.name.clone(),
                         labels: subset.labels.clone(),
                         traffic_policy: subset.traffic_policy.as_ref().map(|sp| {
-                            // Resolve the subset's outlierDetection into a
-                            // PassiveHealthCheck (ejection thresholds) up front,
-                            // the same projection the upstream-level path uses.
+                            // Resolve the subset's outlierDetection over this
+                            // DR's already-applied top-level passive policy.
+                            // A partial subset therefore inherits every omitted
+                            // represented field instead of synthesizing a fresh
+                            // per-block default.
                             let passive_health_check = sp.outlier_detection.as_ref().map(|od| {
-                                let mut passive = PassiveHealthCheck::default();
+                                let mut passive = top_level_passive.clone().unwrap_or_default();
                                 apply_outlier_detection_to_passive(&mut passive, od);
                                 passive
                             });
@@ -10610,21 +10882,18 @@ fn apply_traffic_policy_to_port_override(
         slot.hash_on = mesh_hash_on_to_ferrum(&policy.load_balancer);
     }
     if let Some(ref od) = policy.outlier_detection {
-        // A PARTIAL per-port `outlierDetection` (e.g. only `consecutiveErrors`)
-        // is overlaid field-by-field by `apply_outlier_detection_to_passive`, so
-        // the *base* it layers onto matters. The caller in `apply_destination_rules`
-        // seeds `slot.passive_health_check` from the UPSTREAM-level passive (which
-        // already carries this DR's TOP-LEVEL `outlierDetection`) before calling
-        // here for the owner-gated port, so a partial override correctly layers
-        // over the DR's top-level window/recovery fields rather than over engine
-        // defaults. The `unwrap_or_default()` base is therefore only reached when
-        // there is genuinely no top-level outlier to inherit (no seed) — the
-        // intended fallback, not a regression. NOTE: this is a per-field merge,
-        // not Istio's portLevelSettings "complete replacement"; that divergence
-        // is uniform across the per-port DR knobs and documented in `docs/mesh.md`.
+        // The caller seeds every fresh slot from upstream-level passive health.
+        // Retain the raw field mask as well: cold-path proxy projection reapplies
+        // it over the selected subset, preserving the documented field-level
+        // port > subset > top-level precedence for all represented fields.
         let mut passive = slot.passive_health_check.clone().unwrap_or_default();
         apply_outlier_detection_to_passive(&mut passive, od);
         slot.passive_health_check = Some(passive);
+        if let Some(accumulated) = slot.outlier_detection_overlay.as_mut() {
+            merge_outlier_detection_overlay(accumulated, od);
+        } else {
+            slot.outlier_detection_overlay = Some(od.clone());
+        }
     }
     // Per-port localityLbSetting projection. A later matching DR entry with no
     // localityLbSetting clears an earlier value, mirroring the upstream-level
@@ -11244,9 +11513,49 @@ fn mesh_hash_on_to_ferrum(lb: &Option<MeshLoadBalancer>) -> Option<String> {
     }
 }
 
-fn apply_outlier_detection_to_passive(passive: &mut PassiveHealthCheck, od: &MeshOutlierDetection) {
-    if let Some(consecutive) = od.consecutive_errors {
-        passive.unhealthy_threshold = consecutive;
+/// Overlay a translated Istio `outlierDetection` onto a passive health policy.
+///
+/// `consecutive5xxErrors` is a CONSECUTIVE-failure threshold in Istio, not a
+/// windowed count (issue #4292), so the overlay switches the policy into
+/// consecutive mode for explicit positive values. When no lower-precedence
+/// tier supplied the field, an omitted threshold/cap receives Istio's 5/10%
+/// defaults here; a partial higher-precedence block therefore inherits an
+/// explicit lower-tier value instead of replacing it with a synthesized
+/// per-block default. Explicit `0` disables the consecutive-5xx detector
+/// (HTTP 5xx and locally originated connection failures; split mode is
+/// deferred) via `consecutive_5xx_ejection_disabled`. Ferrum's native windowed
+/// semantics are untouched for policies this overlay never runs on. `interval`
+/// still lands on `unhealthy_window_seconds`: it is inert while consecutive
+/// mode is on (Istio's `interval` is an analysis sweep period), but keeping it
+/// recorded leaves the operator's declared value visible in the admin view and
+/// correct if a policy is later evaluated windowed.
+pub(crate) fn apply_outlier_detection_to_passive(
+    passive: &mut PassiveHealthCheck,
+    od: &MeshOutlierDetection,
+) {
+    match od.consecutive_errors {
+        Some(0) => {
+            // Istio `consecutive5xxErrors: 0` disables the 5xx detector,
+            // including locally originated connection failures that Envoy
+            // counts in that bucket when split mode is off (the default;
+            // Ferrum's split mode is deferred). It must not map to
+            // threshold 0 (which would eject on the first failure). The
+            // sentinel is normally Istio-translated, while direct native
+            // configuration may opt in explicitly.
+            passive.consecutive_5xx_ejection_disabled = true;
+        }
+        Some(consecutive) => {
+            // A higher-precedence overlay with an explicit positive threshold
+            // must clear a stale disable sentinel left by an earlier `Some(0)`.
+            passive.consecutive_5xx_ejection_disabled = false;
+            passive.unhealthy_threshold = consecutive;
+            passive.consecutive_error_mode = true;
+        }
+        None if !passive.consecutive_error_mode && !passive.consecutive_5xx_ejection_disabled => {
+            passive.unhealthy_threshold = 5;
+            passive.consecutive_error_mode = true;
+        }
+        None => {}
     }
     if let Some(interval) = od.interval_seconds {
         passive.unhealthy_window_seconds = interval;
@@ -11254,8 +11563,30 @@ fn apply_outlier_detection_to_passive(passive: &mut PassiveHealthCheck, od: &Mes
     if let Some(ejection) = od.base_ejection_seconds {
         passive.healthy_after_seconds = ejection;
     }
-    if let Some(max_pct) = od.max_ejection_percent {
-        passive.max_ejection_percent = Some(max_pct);
+    match od.max_ejection_percent {
+        Some(max_pct) => passive.max_ejection_percent = Some(max_pct),
+        None if passive.max_ejection_percent.is_none() => {
+            passive.max_ejection_percent = Some(10);
+        }
+        None => {}
+    }
+}
+
+fn merge_outlier_detection_overlay(
+    accumulated: &mut MeshOutlierDetection,
+    overlay: &MeshOutlierDetection,
+) {
+    if overlay.consecutive_errors.is_some() {
+        accumulated.consecutive_errors = overlay.consecutive_errors;
+    }
+    if overlay.interval_seconds.is_some() {
+        accumulated.interval_seconds = overlay.interval_seconds;
+    }
+    if overlay.base_ejection_seconds.is_some() {
+        accumulated.base_ejection_seconds = overlay.base_ejection_seconds;
+    }
+    if overlay.max_ejection_percent.is_some() {
+        accumulated.max_ejection_percent = overlay.max_ejection_percent;
     }
 }
 
@@ -12135,6 +12466,7 @@ fn build_egress_upstream_targets(
                 // mesh provenance/transport marker the data plane owns.
                 let mut tags = ep.labels.clone();
                 crate::modes::mesh::multicluster::strip_reserved_mesh_tags(&mut tags);
+                crate::service_discovery::strip_reserved_srv_tags(&mut tags);
                 crate::config::types::merge_derived_topology_labels(
                     &mut tags,
                     None,
@@ -13220,6 +13552,23 @@ fn build_jwks_provider_config(rule: &MeshJwtRule) -> Option<serde_json::Value> {
         provider["from_params"] = serde_json::json!(rule.from_params);
     }
 
+    // Istio `outputClaimToHeaders` (issue #4277). The array shape is preserved
+    // (not collapsed into a claim-keyed map) because Istio allows one claim to
+    // be published to several headers. `jwks_auth` owns every destination:
+    // each is stripped from the inbound request before validation and set only
+    // from a validated claim.
+    if !rule.output_claim_to_headers.is_empty() {
+        provider["output_claim_headers"] = serde_json::json!(
+            rule.output_claim_to_headers
+                .iter()
+                .map(|entry| serde_json::json!({
+                    "header": entry.header,
+                    "claim": entry.claim,
+                }))
+                .collect::<Vec<_>>()
+        );
+    }
+
     Some(provider)
 }
 
@@ -13300,12 +13649,29 @@ fn remove_mesh_managed_plugin(config: &mut GatewayConfig, id: &str, namespace: &
 }
 
 pub async fn run(
-    env_config: EnvConfig,
+    mut env_config: EnvConfig,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<(), anyhow::Error> {
+    // Normalize once before either the arming decision or any filesystem
+    // reader sees the path. A whitespace-padded configured value must not arm
+    // an authoritative bound and then poll a different, untrimmed directory.
+    env_config.mesh_node_waypoint_pod_registry_dir = env_config
+        .mesh_node_waypoint_pod_registry_dir
+        .trim()
+        .to_string();
     let runtime = MeshRuntimeConfig::from_env_config(&env_config)
         .map_err(|e| anyhow::anyhow!("invalid mesh runtime configuration: {e}"))?;
     ensure_runtime_config_protocol_supported(&runtime)?;
+
+    // Issue #4249: arm the authoritative node-local enrolled-pod registry
+    // BEFORE the bootstrap config is built, so the very first applied
+    // `MeshConfig` already carries the node bound. The index starts UNPUBLISHED
+    // and therefore admits nothing until `serve_mesh_runtime` runs its first
+    // reconcile — fail closed through startup, never a window in which the
+    // identity/label view is silently authoritative. The guard retracts the
+    // installation when this serving cycle unwinds.
+    let _enrolled_destinations_guard =
+        arm_inbound_relay_enrolled_destinations(&env_config, &runtime);
 
     // Open the observability delivery lifecycle for this serving cycle before
     // any plugin activation registers a queue worker. Re-running this mode in
@@ -13642,6 +14008,49 @@ pub async fn run(
         },
     )
     .await
+}
+
+/// Install this serving cycle's authoritative node-local enrolled-pod registry
+/// index, when one applies (issue #4249).
+///
+/// `Ambient` only. Ambient is the ztunnel-style topology: the proxy runs
+/// OUTSIDE the workload pods' network namespaces and relays inbound HBONE into
+/// the pods the node-agent enrols on its node, and the node-agent publishes
+/// that per-pod registry exactly for the Ambient and NodeWaypoint-in-netns
+/// postures (`NodeAgentConfig::from_env_config`'s `should_publish_registry`).
+/// A `Sidecar` shares its workload pod's network namespace and no node-agent
+/// registry is ever published for it — and since issue #4249 it carries NO
+/// general relay inventory at all, so there is nothing for a registry to bound.
+/// Its only legitimate destination is its own pod, which the
+/// accepted-local-address arm proves as a transport fact, on the ports its own
+/// owned workload view declares.
+///
+/// An operator who clears `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR` also
+/// opts out, for the same reason: there is no registry to be authoritative.
+fn arm_inbound_relay_enrolled_destinations(
+    env_config: &EnvConfig,
+    runtime: &MeshRuntimeConfig,
+) -> Option<enrolled_destinations::InstalledEnrolledDestinationsGuard> {
+    if runtime.topology != MeshTopology::Ambient {
+        return None;
+    }
+    let registry_dir = env_config.mesh_node_waypoint_pod_registry_dir.as_str();
+    if registry_dir.is_empty() {
+        warn!(
+            "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR is empty, so no node-local enrolled-pod \
+             registry bounds the authenticated inbound HBONE relay inventory; it falls back to \
+             this proxy's own workload identity, cluster and labels, which a same-identity \
+             replica on another node also satisfies"
+        );
+        return None;
+    }
+    let index = Arc::new(enrolled_destinations::NodeLocalEnrolledDestinations::new());
+    info!(
+        registry_dir = %registry_dir,
+        "Authenticated inbound HBONE relay destinations are bounded by the node-agent's \
+         enrolled-pod registry"
+    );
+    Some(enrolled_destinations::InstalledEnrolledDestinationsGuard::install(index))
 }
 
 fn ensure_runtime_config_protocol_supported(
@@ -14249,6 +14658,33 @@ async fn arm_mesh_runtime_startup(
                 manager.run(manager_shutdown).await;
             }));
         }
+    }
+
+    // Issue #4249: poll the node-agent's enrolled-pod registry and republish
+    // the lock-free index the inbound HBONE relay guard reads. Armed in `run()`
+    // (Ambient with a configured registry directory), so this is a no-op for
+    // every other posture.
+    //
+    // Deliberately independent of the capture / steering reconcilers below:
+    // those start only when their own datapath feature is enabled, while the
+    // relay guard's node bound must hold for EVERY Ambient proxy. One
+    // synchronous pass runs before the task is spawned so the first
+    // authenticated CONNECT after startup sees the enrolled set rather than the
+    // (fail-closed) unpublished index.
+    if let Some(index) = enrolled_destinations::installed_index() {
+        let source = Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
+            env_config.mesh_node_waypoint_pod_registry_dir.clone(),
+        ));
+        let manager = enrolled_destinations::NodeLocalEnrolledDestinationsManager::new(
+            source,
+            index,
+            std::time::Duration::from_secs(2),
+        );
+        manager.reconcile_once();
+        let manager_shutdown = shutdown_tx.subscribe();
+        owner.push_mesh_background(tokio::spawn(async move {
+            manager.run(manager_shutdown).await;
+        }));
     }
 
     let mut udp_migration_blocks_readiness = false;
@@ -15009,6 +15445,19 @@ async fn arm_mesh_runtime_startup(
                 env_config.frontend_tls_live_reload_enabled,
             )
             .await;
+    }
+
+    // The first mesh slice was converted and accepted before `ProxyState` /
+    // `StreamListenerManager` existed, so the live apply loop correctly treats
+    // it as already applied and never enters the dynamic owner-scoped DTLS
+    // publication path. Seed that exact accepted generation before the first
+    // listener reconcile. A missing or invalid required DTLS identity is fatal
+    // here: no listener may count as started until its owner-scoped material is
+    // valid and the socket is actually serving.
+    if runtime.topology == MeshTopology::NodeWaypoint
+        && let Some(slice) = initial_applied_mesh_slice.as_deref()
+    {
+        publish_initial_node_waypoint_dtls_generation(&proxy_state, runtime, slice).await?;
     }
 
     // Spawn the SPIFFE trust-bundle federation poller reconciler before the
@@ -18370,6 +18819,47 @@ pub fn build_node_waypoint_dtls_owner_configs(
         }
     }
     Ok(configs)
+}
+
+/// Publish the owner-scoped DTLS generation for the already-accepted initial
+/// NodeWaypoint slice before stream listeners reconcile.
+///
+/// The background apply loop receives that slice as its last-applied baseline,
+/// so it intentionally skips the no-op generation. Startup must perform the
+/// corresponding DTLS publication itself or a generated listener has routing
+/// but no owner-scoped certificate/verifier generation and remains deferred.
+/// Any required candidate that cannot be built aborts startup fail-closed;
+/// unlike a later update, there is no prior serving generation to retain.
+pub async fn publish_initial_node_waypoint_dtls_generation(
+    proxy_state: &ProxyState,
+    runtime: &MeshRuntimeConfig,
+    slice: &MeshSlice,
+) -> Result<(), anyhow::Error> {
+    if runtime.topology != MeshTopology::NodeWaypoint {
+        return Ok(());
+    }
+    let config = proxy_state.config.load_full();
+    let configs = match build_node_waypoint_dtls_owner_configs(
+        proxy_state,
+        runtime,
+        slice,
+        config.as_ref(),
+    ) {
+        Ok(configs) => configs,
+        Err(reason) => {
+            proxy_state
+                .stream_listener_manager
+                .record_mesh_node_waypoint_dtls_candidate_failure();
+            return Err(anyhow::anyhow!(
+                "initial NodeWaypoint DTLS generation is not servable: {reason}"
+            ));
+        }
+    };
+    proxy_state
+        .stream_listener_manager
+        .publish_mesh_node_waypoint_dtls_generation(configs)
+        .await;
+    Ok(())
 }
 
 /// Effective `PeerAuthentication` mode for one generated NodeWaypoint DTLS
@@ -28154,6 +28644,12 @@ mod tests {
             .expect("v1 subset passive health resolved from outlierDetection");
         assert_eq!(passive.unhealthy_threshold, 5);
         assert_eq!(passive.unhealthy_window_seconds, 20);
+        // Istio `consecutive5xxErrors` is a consecutive streak, not a windowed
+        // count (issue #4292): the overlay must switch the policy's mode.
+        assert!(
+            passive.consecutive_error_mode,
+            "a translated consecutive5xxErrors must not be evaluated as a sliding-window count"
+        );
     }
 
     #[test]
@@ -28715,6 +29211,7 @@ mod tests {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
             waypoint_gateway_class: None,
+            service_waypoint_bound_services: Vec::new(),
             istio_root_namespace: "istio-system".to_string(),
             workload_spiffe_id: None,
             waypoint_name: None,
@@ -33733,6 +34230,7 @@ mod tests {
                 from_headers: Vec::new(),
                 from_params: Vec::new(),
                 forward_original_token: false,
+                output_claim_to_headers: Vec::new(),
             }],
         }
     }
@@ -34054,6 +34552,7 @@ mod tests {
                         from_headers: Vec::new(),
                         from_params: Vec::new(),
                         forward_original_token: false,
+                        output_claim_to_headers: Vec::new(),
                     }],
                 }],
                 ..MeshConfig::default()
@@ -34110,6 +34609,7 @@ mod tests {
                         ],
                         from_params: vec!["access_token".to_string()],
                         forward_original_token: false,
+                        output_claim_to_headers: Vec::new(),
                     }],
                 }],
                 ..MeshConfig::default()
@@ -34163,6 +34663,7 @@ mod tests {
                         from_headers: Vec::new(),
                         from_params: Vec::new(),
                         forward_original_token: false,
+                        output_claim_to_headers: Vec::new(),
                     }],
                 }],
                 ..MeshConfig::default()
@@ -40824,19 +41325,38 @@ mod tests {
     /// socket's local address alone when no workload identity is configured;
     /// the two waypoint topologies carry exactly their narrow inventory; the
     /// gateway topologies carry neither.
+    ///
+    /// Issue #4251 sharpens the `ServiceWaypoint` arm: `unbound` below is
+    /// VISIBLE in the same namespace as the bound `reviews` Service but backs
+    /// no bound Service, so it must not be a destination the waypoint
+    /// terminates for.
     #[test]
     fn inbound_relay_termination_scope_is_back_projected_per_topology() {
-        use crate::modes::mesh::config::{InboundRelayDenial, MeshInboundRelayHost};
+        use crate::modes::mesh::config::{
+            InboundRelayDenial, MeshInboundRelayHost, MeshWaypointServiceRef,
+        };
+
+        const REVIEWS_SPIFFE: &str = "spiffe://cluster.local/ns/default/sa/reviews";
 
         let mut peer = workload("reviews", "reviews");
         peer.addresses = vec!["10.244.1.7".to_string()];
         let mut enrolled = workload("ratings", "ratings");
         enrolled.addresses = vec!["10.244.2.9".to_string()];
+        let mut unbound = workload("payments", "payments");
+        unbound.addresses = vec!["10.244.3.3".to_string()];
         let slice = MeshSlice {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
             version: "test".to_string(),
-            workloads: vec![peer],
+            waypoint_name: Some("reviews-waypoint".to_string()),
+            workloads: vec![peer, unbound],
+            // Only `reviews` is bound to the waypoint, so only its Service
+            // rides the narrowed slice; `payments` is namespace-visible only.
+            services: vec![http_mesh_service("reviews", 80, REVIEWS_SPIFFE)],
+            service_waypoint_bound_services: vec![MeshWaypointServiceRef {
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
+            }],
             node_waypoint_capture_destinations: vec![enrolled],
             ..MeshSlice::default()
         };
@@ -40870,13 +41390,18 @@ mod tests {
 
         // Own-identity terminators with NO configured workload identity: no
         // inventory at all, so the accepted local address is the only
-        // admission. A slice-declared workload reached WITHOUT that proof is
-        // refused — the open-relay fix.
+        // non-loopback admission. A slice-declared workload reached WITHOUT
+        // that proof is refused — the open-relay fix. Loopback is Sidecar-only.
         for topology in [MeshTopology::Sidecar, MeshTopology::Ambient] {
             let mesh = prepared(topology);
             assert!(
                 mesh.inbound_relay_admits_accepted_local_address,
-                "{topology:?} terminates for its own workload"
+                "{topology:?} may admit its accepted non-loopback local address"
+            );
+            assert_eq!(
+                mesh.inbound_relay_admits_loopback_namespace,
+                topology == MeshTopology::Sidecar,
+                "{topology:?} loopback-namespace privilege must be Sidecar-only"
             );
             assert!(
                 mesh.inbound_relay_destinations.is_empty(),
@@ -40887,26 +41412,61 @@ mod tests {
                 decide(&mesh, "10.244.1.7", None),
                 Err(InboundRelayDenial::AddressNotTerminated)
             );
+            let loopback = decide(&mesh, "127.0.0.1", Some(pod_ip));
+            let localhost = decide(&mesh, "localhost", Some(pod_ip));
+            if topology == MeshTopology::Sidecar {
+                assert_eq!(loopback, Ok(()));
+                assert_eq!(localhost, Ok(()));
+                assert_eq!(decide(&mesh, "app.localhost", Some(pod_ip)), Ok(()));
+                assert_eq!(
+                    decide(&mesh, "127.0.0.1", None),
+                    Err(InboundRelayDenial::AddressNotTerminated)
+                );
+            } else {
+                assert_eq!(loopback, Err(InboundRelayDenial::AddressNotTerminated));
+                assert_eq!(localhost, Err(InboundRelayDenial::AddressNotTerminated));
+                assert_eq!(
+                    decide(&mesh, "app.localhost", Some(pod_ip)),
+                    Err(InboundRelayDenial::AddressNotTerminated)
+                );
+            }
         }
 
         // NodeWaypoint: the CP-authorized enrolled pods, never the
         // subscription-namespace workload view, and never its own address.
         let mesh = prepared(MeshTopology::NodeWaypoint);
         assert!(!mesh.inbound_relay_admits_accepted_local_address);
+        assert!(!mesh.inbound_relay_admits_loopback_namespace);
         assert_eq!(hosts(&mesh), vec![MeshInboundRelayHost::Ip(enrolled_ip)]);
         assert_eq!(decide(&mesh, "10.244.2.9", Some(pod_ip)), Ok(()));
         assert_eq!(
             decide(&mesh, "10.244.1.7", Some(pod_ip)),
             Err(InboundRelayDenial::AddressNotTerminated)
         );
+        assert_eq!(
+            decide(&mesh, "127.0.0.1", Some(pod_ip)),
+            Err(InboundRelayDenial::AddressNotTerminated)
+        );
 
-        // ServiceWaypoint: the already waypoint-narrowed backing workloads.
+        // ServiceWaypoint: the workloads BACKING its bound services, and only
+        // those (issue #4251).
         let mesh = prepared(MeshTopology::ServiceWaypoint);
         assert!(!mesh.inbound_relay_admits_accepted_local_address);
+        assert!(!mesh.inbound_relay_admits_loopback_namespace);
         assert_eq!(hosts(&mesh), vec![MeshInboundRelayHost::Ip(pod_ip)]);
         assert_eq!(decide(&mesh, "10.244.1.7", None), Ok(()));
         assert_eq!(
             decide(&mesh, "10.244.2.9", None),
+            Err(InboundRelayDenial::AddressNotTerminated)
+        );
+        assert_eq!(
+            decide(&mesh, "10.244.3.3", None),
+            Err(InboundRelayDenial::AddressNotTerminated),
+            "a workload merely VISIBLE in a bound service's namespace, backing \
+             no bound service, is not a destination this waypoint terminates for"
+        );
+        assert_eq!(
+            decide(&mesh, "127.0.0.1", None),
             Err(InboundRelayDenial::AddressNotTerminated)
         );
 
@@ -40914,9 +41474,14 @@ mod tests {
         for topology in [MeshTopology::EastWestGateway, MeshTopology::EgressGateway] {
             let mesh = prepared(topology);
             assert!(!mesh.inbound_relay_admits_accepted_local_address);
+            assert!(!mesh.inbound_relay_admits_loopback_namespace);
             assert!(mesh.inbound_relay_destinations.is_empty());
             assert_eq!(
                 decide(&mesh, "10.244.1.7", Some(pod_ip)),
+                Err(InboundRelayDenial::AddressNotTerminated)
+            );
+            assert_eq!(
+                decide(&mesh, "127.0.0.1", Some(pod_ip)),
                 Err(InboundRelayDenial::AddressNotTerminated)
             );
         }
@@ -40942,23 +41507,64 @@ mod tests {
         const OWN_NAME: &str = "reviews.default.svc.cluster.local";
 
         let mut own = workload("reviews", "reviews");
-        own.addresses = vec!["10.244.5.5".to_string(), OWN_NAME.to_string()];
+        own.addresses = vec![
+            "10.244.5.5".to_string(),
+            OWN_NAME.to_string(),
+            "127.0.0.1".to_string(),
+            "localhost".to_string(),
+            "app.localhost".to_string(),
+        ];
+        own.cluster = Some("cluster-a".to_string());
         let mut other = workload("ratings", "ratings");
         other.addresses = vec!["10.244.6.6".to_string()];
+        // Issue #4249: the SAME SPIFFE in another CLUSTER. `tag_remote_workloads`
+        // preserves a remote endpoint's identity, so identity alone admits it.
+        let mut remote_replica = workload("reviews", "reviews");
+        remote_replica.addresses = vec!["10.244.7.7".to_string()];
+        remote_replica.cluster = Some("cluster-b".to_string());
+        // Issue #4249: the same SPIFFE and cluster, but labels this workload
+        // does not carry — a sibling replica of another revision, on some other
+        // node.
+        let mut label_mismatch = workload("reviews", "reviews");
+        label_mismatch.addresses = vec!["10.244.8.8".to_string()];
+        label_mismatch.cluster = Some("cluster-a".to_string());
+        label_mismatch
+            .selector
+            .labels
+            .insert("version".to_string(), "canary".to_string());
+        // Issue #4249: a CO-LOCATED pod declaring the SAME ADDRESS on a port
+        // this workload does not serve. `hostNetwork` pods all declare the node
+        // IP, so the own-address port bound must not union their ports in.
+        let mut co_located = workload("ratings", "ratings");
+        co_located.addresses = vec!["10.244.5.5".to_string()];
+        co_located.ports = vec![WorkloadPort {
+            port: 9443,
+            protocol: AppProtocol::Http,
+            name: Some("admin".to_string()),
+        }];
         let slice = MeshSlice {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
             version: "test".to_string(),
-            workloads: vec![own, other],
+            workloads: vec![own, other, remote_replica, label_mismatch, co_located],
+            multi_cluster: Some(MultiClusterConfig {
+                local_cluster: Some("cluster-a".to_string()),
+                ..MultiClusterConfig::default()
+            }),
             ..MeshSlice::default()
         };
         let runtime = MeshRuntimeConfig {
             topology: MeshTopology::Ambient,
             workload_spiffe_id: Some(OWN_SPIFFE.to_string()),
+            workload_labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
             ..test_mesh_runtime_config()
         };
         let config = gateway_config_from_mesh_slice(&slice, &runtime, None, None);
-        let mesh = *config.expect("slice → config").mesh.expect("prepared mesh");
+        let mut mesh = *config.expect("slice → config").mesh.expect("prepared mesh");
+        // This assertion exercises the documented no-registry identity bound.
+        // The installation-ownership tests mutate the process-wide serving
+        // slot in parallel, so make this config's intended posture explicit.
+        mesh.inbound_relay_node_local_registry = Default::default();
         // The ztunnel-style proxy's own socket address is the NODE, not any
         // workload — so nothing below is admitted by the own-address arm.
         let node_ip = "10.244.0.1".parse::<std::net::IpAddr>().expect("node IP");
@@ -40977,8 +41583,16 @@ mod tests {
             hosts,
             vec![
                 MeshInboundRelayHost::Ip("10.244.5.5".parse().expect("own pod IP")),
+                MeshInboundRelayHost::Ip("127.0.0.1".parse().expect("loopback IP")),
+                MeshInboundRelayHost::Name("app.localhost".to_string()),
+                MeshInboundRelayHost::Name("localhost".to_string()),
                 MeshInboundRelayHost::Name(OWN_NAME.to_string()),
             ]
+        );
+        assert!(mesh.inbound_relay_admits_accepted_local_address);
+        assert!(
+            !mesh.inbound_relay_admits_loopback_namespace,
+            "Ambient must not inherit Sidecar's own-network-namespace loopback privilege"
         );
 
         assert_eq!(decide("10.244.5.5", 8080), Ok(()));
@@ -41004,14 +41618,62 @@ mod tests {
             decide("ratings.default.svc.cluster.local", 8080),
             Err(InboundRelayDenial::UnresolvableHost)
         );
+        // Issue #4249: the same SPIFFE is not ownership. A record the slice
+        // places in another cluster, and one carrying labels this workload does
+        // not have, are both refused — the inventory adopts the shared
+        // LOCAL-workload predicate, not a bare identity compare.
+        assert_eq!(
+            decide("10.244.7.7", 8080),
+            Err(InboundRelayDenial::AddressNotTerminated),
+            "a same-identity record in another cluster must not be an own-pod destination"
+        );
+        assert_eq!(
+            decide("10.244.8.8", 8080),
+            Err(InboundRelayDenial::AddressNotTerminated),
+            "a same-identity sibling whose labels this workload does not carry must be refused"
+        );
         // The accepted socket's own local address is admissible in principle
-        // (this arm serves a Sidecar reached at its pod IP), but on a
+        // (it is what a Sidecar reached at its pod IP rides in on), but on a
         // node-shared Ambient proxy no workload record declares the node
         // address, so the port bound refuses it anyway.
         assert_eq!(
             decide("10.244.0.1", 8080),
             Err(InboundRelayDenial::PortNotDeclared)
         );
+        // Issue #4249, own-ADDRESS arm: reached at the address the co-located
+        // pod also declares, the port bound comes from the records THIS
+        // terminator owns. `co_located`'s 9443 is not unioned in.
+        let own_ip = "10.244.5.5".parse::<std::net::IpAddr>().expect("own IP");
+        let decide_own = |host: &str, port: u16| {
+            mesh.inbound_relay_destination_decision(host, port, Some(own_ip))
+        };
+        assert_eq!(decide_own("10.244.5.5", 8080), Ok(()));
+        assert_eq!(
+            decide_own("10.244.5.5", 9443),
+            Err(InboundRelayDenial::PortNotDeclared),
+            "a co-located pod's port must not widen the own-address bound"
+        );
+        // Inventory-listed loopback / DNS localhost still reach the Ambient
+        // (host) namespace, so they stay refused. An accepted non-loopback
+        // pod IP does not grant that shortcut either.
+        for host in [
+            "127.0.0.1",
+            "::1",
+            "localhost",
+            "localhost.",
+            "app.localhost",
+        ] {
+            assert_eq!(
+                mesh.inbound_relay_destination_decision(host, 8080, Some(own_ip)),
+                Err(InboundRelayDenial::AddressNotTerminated),
+                "Ambient must refuse loopback-namespace authority {host}"
+            );
+            assert_eq!(
+                decide(host, 8080),
+                Err(InboundRelayDenial::AddressNotTerminated),
+                "Ambient must refuse inventory-listed loopback-namespace authority {host}"
+            );
+        }
     }
 
     /// The `sidecar_ingress_declared` marker is SIDECAR-topology only, exactly

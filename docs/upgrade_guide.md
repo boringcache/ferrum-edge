@@ -6,6 +6,78 @@ This document describes how to safely upgrade Ferrum Edge between versions with 
 
 Every current `[Unreleased]` `BREAKING` changelog entry is listed here exactly once, with its issue number and the operator action that entry already states. Several of these fail **silently** at cutover (HMAC clients get `401`, WAF `literal` rules stop matching folded spellings, backends stop seeing client-supplied XFF hops) rather than refusing config load. Read this section before the per-mode procedures below.
 
+### Injected Ferrum is a Kubernetes native sidecar (issue [#4430](https://github.com/ferrum-edge/ferrum-edge/issues/4430))
+
+The injector no longer appends Ferrum as an ordinary `spec.containers` entry. New pods receive a native sidecar (`spec.initContainers` with `restartPolicy: Always`) and exec probes against loopback `/health`. That is also what unblocks Kubernetes Job completion. **Minimum Kubernetes version is 1.29** (native sidecars enabled by default; 1.28 needs `SidecarContainers=true`). There is no ordinary-container fallback: the webhook always emits the native-sidecar shape, and a cluster older than that will reject the patched Pod.
+
+HTTP `httpGet` and TCP `tcpSocket` kubelet probe ports are now inbound-excluded automatically (issue [#4431](https://github.com/ferrum-edge/ferrum-edge/issues/4431)); unresolved named probe ports fail admission.
+
+**Operator action:** run the injector only on Kubernetes 1.29+ (or 1.28 with the `SidecarContainers` feature gate), then roll every injected Deployment/StatefulSet/DaemonSet/Job so replacement pods receive the new shape. Pods that still carry `ferrum-edge` in `spec.containers` will be refused on re-admission until they are recreated.
+
+### `ferrum-gateway` `mode=cp` no longer starts the in-cluster K8s controller (issue [#4384](https://github.com/ferrum-edge/ferrum-edge/issues/4384))
+
+The `ferrum-edge` binary defaults `FERRUM_K8S_CONTROLLER_ENABLED` and
+`FERRUM_K8S_POD_DISCOVERY_ENABLED` to true whenever `KUBERNETES_SERVICE_HOST` is
+set, which is every in-cluster pod. `charts/ferrum-gateway` renders no
+`ClusterRole`, so those core watches (namespaces, services, secrets, configmaps,
+endpointslices) were rejected `403` on every list and retried for the life of the
+process.
+
+`k8sController.enabled` now defaults to `false`, and `mode=cp` renders both
+environment variables as `"false"`. Setting `k8sController.enabled=true` fails
+rendering with a message pointing at `charts/ferrum-mesh`, which already ships the
+matching RBAC — the chart will not render a controller it cannot grant. Both
+variable names are reserved, so `env` / `extraEnv` cannot re-enable the watch
+loops behind the first-class value.
+
+**Operator action:** if you were running this chart as a Kubernetes CRD
+controller, migrate to `charts/ferrum-mesh` (`controlPlane.enabled=true`).
+Database-backed CP + DP pairs need no change, and the documented
+`examples/cp-values.yaml` quickstart now matches the chart's grant surface.
+
+### HTTP/2 and HTTP/3 requests without `:authority` or Host are rejected with 400 (issue [#4416](https://github.com/ferrum-edge/ferrum-edge/issues/4416))
+
+RFC 9113 §8.3.1 and RFC 9114 §4.3.1 require either `:authority` or Host. Ferrum previously treated the both-absent case as agreement and admitted the request, so routing skipped exact/wildcard host tiers and could fall through to a catch-all (empty `hosts`) route. `check_host_authority_consistency()` now rejects that shape with 400. `:authority`-only (typical H2/H3 clients, including RFC 8441 / RFC 9220 Extended CONNECT) and Host-only remain valid. HTTP/1.1 is unchanged and still owned by `check_protocol_headers()` (issue #4390).
+
+**Operator action:** any HTTP/2 or HTTP/3 client that omitted both `:authority` and Host will start seeing `400` `{"error":"Request is missing both :authority and Host"}` instead of being routed. Send `:authority` or Host.
+
+### Ambient pod-registry migration proofs require canonical entries (issue [#4249](https://github.com/ferrum-edge/ferrum-edge/issues/4249))
+
+Durable Ambient UDP placement cleanup now reads the same strict, bounded,
+all-or-nothing pod-registry snapshot as the inbound HBONE relay node bound. A
+leaf that disappears between directory enumeration and open is treated as an
+ordinary pod withdrawal and skipped. Any present malformed optional field,
+duplicate recognized key, unknown non-empty line, unsafe leaf name, symlink,
+oversized or non-regular file, ownership mismatch, or other read failure makes
+the cleanup pass report `registry_not_synchronized`; several malformed body
+shapes were previously tolerated. The node-agent publisher also refuses leaf
+names outside the canonical grammar: non-empty, at most 256 bytes, ASCII
+alphanumeric first, then ASCII alphanumeric, hyphen, or underscore.
+
+**Operator action:** before starting an Ambient UDP placement migration, remove
+stale hand-authored pod-registry artifacts and let the node-agent regenerate
+every pod entry. Any external publisher must use only the documented leaf and
+body grammar; otherwise cleanup/finalize remains fail-closed.
+
+### HTTP/1.1 requests without a Host header are rejected with 400 (issue [#4390](https://github.com/ferrum-edge/ferrum-edge/issues/4390))
+
+RFC 9112 §3.2.2 requires a 400 when an HTTP/1.1 request lacks a Host field. Ferrum previously only rejected multiple Host fields, so a Host-less origin-form request skipped exact/wildcard host tiers and could fall through to a catch-all (empty `hosts`) route. `check_protocol_headers()` now rejects HTTP/1.1 when both the Host field and the URI authority are absent. HTTP/1.0 still does not require Host. Absolute-form request-targets that already carry an authority are accepted without a Host field. An empty Host value (`Host:` with no tokens) is treated as present-but-invalid and also returns 400 on HTTP/1.1. HTTP/2 and HTTP/3 are unchanged.
+
+**Operator action:** any HTTP/1.1 client that omitted Host (non-conformant scanners, some raw sockets, misconfigured health probes) will start seeing `400` `{"error":"HTTP/1.1 request is missing a Host header"}` instead of being routed. Send a Host field, or use HTTP/1.0 / absolute-form if that is the intended protocol.
+
+### Route header transforms now compose with global transformers (issue [#4304](https://github.com/ferrum-edge/ferrum-edge/issues/4304))
+
+Auto-emitted `istio-vs-req-xform-*` / `istio-vs-resp-xform-*` consumers no
+longer shadow global `request_transformer` / `response_transformer` instances.
+Global static rules now run first, followed by the matched route rules. This
+changes existing Gateway API `HTTPRoute` deployments using
+`RequestHeaderModifier` or `ResponseHeaderModifier`; newly supported Istio
+VirtualService header transforms follow the same composition contract.
+
+**Operator action:** audit HTTPRoute-backed proxies that relied on the former
+accidental suppression, then scope or remove global static transformer rules
+that should not compose with those routes.
+
 ### `hmac_auth` v2 nonce / client rollout and DPoP replay protection (issues [#3834](https://github.com/ferrum-edge/ferrum-edge/issues/3834) / [#3837](https://github.com/ferrum-edge/ferrum-edge/issues/3837))
 
 **Silent HMAC outage.** `hmac_auth` now defaults to **`ferrum-hmac-v2`**. Version 2 requires a client-generated `nonce` in the `Authorization: hmac …` parameters and binds it into the signing base:
@@ -46,6 +118,16 @@ This changes what every backend observes, with no error surface.
 
 **Operator action:** if a backend depended on seeing client-supplied XFF hops in front of an untrusted Ferrum, add the connecting peer to `FERRUM_TRUSTED_PROXIES` so Ferrum will honor and append that chain; otherwise configure the backend to trust only the rightmost hop (Ferrum's socket peer).
 
+### Seven plugin constructors reject unknown config keys (issues [#4405](https://github.com/ferrum-edge/ferrum-edge/issues/4405) / [#4409](https://github.com/ferrum-edge/ferrum-edge/issues/4409))
+
+A typo in a plugin's `config` object was previously admitted and silently ignored, so a misspelled key became a no-op that still passed `validate` with exit 0. Unknown keys are now rejected, matching `PluginConfig`'s `deny_unknown_fields` and the behavior `jwt_auth`, `cors`, `ai_federation`, and `ai_stream_router` already had.
+
+`request_size_limiting`, `ws_message_size_limiting`, `a2a_gateway`, `ws_logging`, and `mcp_gateway` fail closed at construction, so file-mode `validate` exits 1. `http_logging` and `prometheus_metrics` keep their `OptionalFailOpen` policy: construction returns an error naming the unknown key, and `validate` / reload warn and omit that instance rather than failing the gateway — the same shape `stdout_logging` already had.
+
+`mcp_gateway` additionally rejects `command`, `args`, and `stdio` at the root and inside `servers.*` with an HTTP-only diagnostic. The gateway speaks HTTP to MCP upstreams and never spawned a stdio child, so a Claude-Desktop-style `command` field was previously accepted and ignored. Diagnostics include a spelling suggestion when the typo is close to a valid key. See [plugins.md](plugins.md).
+
+**Operator action:** run `ferrum-edge validate` before upgrading and fix any key it now names — typos such as `max_bytez`, `max_frame_bytez`, `endpont_url`, or `render_cache_ttl_secnds`. Replace any `servers.*.command` with an `upstream_url` using `http://` or `https://`.
+
 ### `POST /batch` rejects unknown top-level envelope keys (issue [#4042](https://github.com/ferrum-edge/ferrum-edge/issues/4042))
 
 `POST /batch` is create-only (`consumers`, `upstreams`, `proxies`, `plugin_configs`). Sending `updates`, `deletes`, or `dry_run` previously returned `201` and created only the resource arrays while silently ignoring the other keys. Unknown envelope keys now return `400`. `GET /backup` metadata (`version`, `ferrum_version`, `exported_at`, `source`, `counts`) and the backup-only `api_specs` / `gateway_trust_bundles` sections remain accepted and ignored so a backup file is still a valid additive import. See [admin_api.md](admin_api.md) and [admin_backup_restore.md](admin_backup_restore.md).
@@ -81,6 +163,12 @@ Staleness additionally requires the DP to have actually lost its authoritative C
 Entries may be plain service-name strings — a published A2A name resolves to the layout the specification gives it (`a2a.v1.A2AService` → `a2a-0.3`, `lf.a2a.v1.A2AService` → `a2a-1.0`) and any custom name resolves to `none` — or the explicit `{service, card_schema}` object form a custom deployment uses to declare which published layout its own service serves. Declaring a `card_schema` that contradicts a published A2A service name is rejected at admission. Detection, method policy, and `a2a.*` metadata are unchanged for every schema, but Agent Card protobuf rewriting is implemented only for `a2a-0.3` and fails closed with `agent_card_grpc_schema_unsupported` (`a2a-1.0`) or `agent_card_grpc_schema_undeclared` (`none`) before a byte of the reply is decoded — a 1.0 card is never interpreted with 0.3 field numbers.
 
 **Operator action:** for deployments fronting A2A 1.0 or a custom gRPC service whose cards must pass through untouched, set `discovery.rewrite_agent_card_urls: false`, or declare an explicit `{service, card_schema}` pair that truthfully matches the service you publish (for example `card_schema: a2a-0.3` only when the backend actually serves the 0.3 card layout). Do not pair a published A2A service name with a contradicting `card_schema`. See [plugins.md](plugins.md#a2a_gateway).
+
+### `FERRUM_TLS_OFFLOAD_THREADS` nonzero values fail startup (issue [#4294](https://github.com/ferrum-edge/ferrum-edge/issues/4294))
+
+TLS handshake offload is not implemented. A nonzero `FERRUM_TLS_OFFLOAD_THREADS` was parsed, documented in five places, and then silently ignored, so operators who set it believed handshakes were being offloaded when nothing had changed. `EnvConfig::validate()` now rejects any value other than `0` before mode dispatch, which turns a previously accepted configuration into a refused start.
+
+**Operator action:** leave `FERRUM_TLS_OFFLOAD_THREADS` unset, or set it to `0`. There is no configuration that enables offload; removing the variable is equivalent to the behaviour every prior release actually had.
 
 ## Database Mode (`FERRUM_MODE=database`)
 

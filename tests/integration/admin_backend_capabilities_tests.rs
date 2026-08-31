@@ -200,6 +200,19 @@ fn make_http_probe_proxy(id: &str, backend_port: u16) -> ferrum_edge::config::ty
 async fn start_slow_counting_http_backend(
     response_delay: Duration,
 ) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    start_counting_http_backend(response_delay, None).await
+}
+
+async fn start_holdable_counting_http_backend(
+    release: tokio::sync::watch::Receiver<bool>,
+) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    start_counting_http_backend(Duration::ZERO, Some(release)).await
+}
+
+async fn start_counting_http_backend(
+    response_delay: Duration,
+    release: Option<tokio::sync::watch::Receiver<bool>>,
+) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind counting backend");
@@ -211,11 +224,24 @@ async fn start_slow_counting_http_backend(
         while let Ok((socket, _peer)) = listener.accept().await {
             accepted_for_task.fetch_add(1, Ordering::SeqCst);
             let delay = response_delay;
+            let release = release.clone();
             tokio::spawn(async move {
-                let service = service_fn(move |_req: Request<Incoming>| async move {
-                    if !delay.is_zero() {
-                        tokio::time::sleep(delay).await;
-                    }
+                // HTTP-scheme capability probes are h2c pool handshakes
+                // (`grpc_pool.get_sender_for_capability_probe`). Hyper's
+                // client handshake completes after writing the *client*
+                // preface; establishment then waits for the peer SETTINGS
+                // frame. An HTTP/1.1 `serve_connection` rejects that
+                // preface with a protocol error *before* `service_fn`, so a
+                // hold or delay inside the request handler cannot keep the
+                // probe in flight. Park here — after TCP accept, before any
+                // server bytes — so `accepted > 0` happens-before
+                // `await_peer_settings` is blocked on a silent peer.
+                if let Some(mut rx) = release {
+                    let _ = rx.wait_for(|released| *released).await;
+                } else if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                let service = service_fn(|_req: Request<Incoming>| async {
                     Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from_static(b"ok"))))
                 });
                 let _ = hyper::server::conn::http1::Builder::new()
@@ -593,5 +619,114 @@ async fn concurrent_backend_capabilities_refresh_coalesces_probe_fanout() {
     assert!(
         accepts <= 2,
         "uncoalesced refreshes would multiply probe fan-out; got {accepts} accepts"
+    );
+}
+
+#[tokio::test]
+async fn aborted_coalesced_refresh_allows_a_later_refresh() {
+    let tc = TestConfig::default();
+    let jwt = create_test_jwt_manager(&tc);
+    let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+    let (backend_addr, accepted, _backend_task) =
+        start_holdable_counting_http_backend(release_rx).await;
+    let state = admin_state_with_http_probe_proxy(jwt, backend_addr.port());
+    let proxy_state = state.proxy_state.as_ref().expect("proxy_state").clone();
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let first = tokio::spawn({
+        let proxy_state = proxy_state.clone();
+        async move { proxy_state.refresh_backend_capabilities_coalesced().await }
+    });
+
+    // TCP accept is published before the fixture starts serving, and the
+    // HTTP-scheme probe cannot finish h2c establishment without peer
+    // SETTINGS. `accepted > 0` therefore happens-before the detached
+    // runner is blocked in `await_peer_settings`, so aborting `first`
+    // cannot observe `Ok(Ran)`.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while accepted.load(Ordering::SeqCst) == 0 {
+        if tokio::time::Instant::now() >= deadline {
+            panic!("capability probe never reached the held backend");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(
+        proxy_state.backend_capabilities_refresh.runner_is_active(),
+        "held h2c handshake must keep the detached runner active before abort"
+    );
+
+    first.abort();
+    assert!(
+        first.await.unwrap_err().is_cancelled(),
+        "first coalesced refresh caller must be cancelled mid-probe"
+    );
+    assert!(
+        proxy_state.backend_capabilities_refresh.runner_is_active(),
+        "aborting the caller must not cancel the detached runner"
+    );
+
+    let joined = tokio::spawn({
+        let proxy_state = proxy_state.clone();
+        async move { proxy_state.refresh_backend_capabilities_coalesced().await }
+    });
+
+    // Do not release the probe until the joiner has actually queued its
+    // coalesced rerun. The detached runner consumed the first caller's
+    // `pending` before parking in the handshake, so `has_pending_refresh()`
+    // becoming true is a positive observation that `joined` ran `request()`
+    // and took `RefreshRole::Joined`. Releasing on spawn order alone would
+    // let a fast drain finish first, handing `joined` the runner role and a
+    // `Ran` outcome.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !proxy_state
+        .backend_capabilities_refresh
+        .has_pending_refresh()
+    {
+        if tokio::time::Instant::now() >= deadline {
+            panic!("joiner never queued a coalesced rerun behind the held probe");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    release_tx.send(true).expect("release held probe");
+
+    let joined_outcome = tokio::time::timeout(Duration::from_secs(10), joined)
+        .await
+        .expect("queued joiner hung after detached runner should have drained")
+        .expect("joiner task");
+    assert_eq!(
+        joined_outcome,
+        ferrum_edge::proxy::backend_capabilities::BackendCapabilityRefreshOutcome::Joined
+    );
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        proxy_state.refresh_backend_capabilities_coalesced(),
+    )
+    .await
+    .expect("later coalesced refresh hung — runner role leaked");
+    assert_eq!(
+        outcome,
+        ferrum_edge::proxy::backend_capabilities::BackendCapabilityRefreshOutcome::Ran
+    );
+
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(10),
+        admin_request_with_token(
+            reqwest::Method::POST,
+            &base_url,
+            "/backend-capabilities/refresh",
+            &token,
+        ),
+    )
+    .await
+    .expect("admin refresh after abort hung");
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["status"].as_str(),
+        Some("refreshed"),
+        "HTTP refresh must run after the aborted coalesced pass; body: {body}"
     );
 }

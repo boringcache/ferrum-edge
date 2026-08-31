@@ -65,7 +65,7 @@ If a caller past its own stale window attempts a synchronous refresh and DNS fai
 | `FERRUM_DNS_SLOW_THRESHOLD_MS` | `u64` | Disabled | Threshold in milliseconds above which DNS resolutions are logged as slow (`warn` level). Useful for diagnosing upstream DNS latency. When unset, no timing overhead is added. |
 | `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT` | `u8` | `90` | Percentage of TTL elapsed before the background refresh task proactively re-resolves an entry (1-99). At 90%, a 60s-TTL entry refreshes after 54s. Lower values add safety margin at the cost of more DNS queries. |
 | `FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS` | `u64` | `10` | Interval (seconds) for the background task that retries failed DNS lookups. Error-cached entries whose current (possibly backed-off) error TTL has expired are re-attempted at this interval, subject to age eviction and per-cycle work bounds. Set to `0` to disable. |
-| `FERRUM_DNS_MAX_CONCURRENT_REFRESHES` | `usize` | `64` | Maximum number of concurrent stale-while-revalidate background refresh tasks system-wide, and the per-cycle cap on failed-DNS retries (selection count and resolve concurrency). Prevents unbounded task spawning when many distinct stale or failed hostnames are hit simultaneously. When all SWR permits are taken, additional refresh requests are skipped and the stale entry is served as-is until a permit frees up. Range: 1-1000. |
+| `FERRUM_DNS_MAX_CONCURRENT_REFRESHES` | `usize` | `64` | Maximum number of concurrent stale-while-revalidate background refresh tasks system-wide, the per-cycle cap on proactive background refreshes (soonest-expiry selection and resolve concurrency), and the per-cycle cap on failed-DNS retries. Prevents unbounded task spawning when many distinct stale, near-expiry, or failed hostnames are hit simultaneously. When all SWR/proactive permits are taken, additional SWR refresh requests are skipped and the stale entry is served as-is until a permit frees up; the next proactive cycle retries leftover near-expiry hostnames. The proactive per-cycle cap is also a *selection* cap: refresh sustains at most this many hostnames every 5s (default 64/5s ≈ 12.8/s). Raise it when `cache_size / shortest_TTL` exceeds that rate, or accept SWR fallback for rows that slip past `expires_at`. Range: 1-1000. |
 
 ### System-Level DNS Settings
 
@@ -96,6 +96,69 @@ Valid values (case-insensitive):
 
 This means: first try the record type that worked last time (for speed), then try SRV, then A, then CNAME.
 
+## DNS-SD SRV selection (RFC 2782)
+
+The DNS-SD provider (`service_discovery.provider: dns_sd`) uses `DnsCache::resolve_srv` on the configured `service_name`. That lookup is **not** on the request path: the discovery poller runs in the background and publishes an atomic target snapshot into the load-balancer cache.
+
+RFC 2782 requires a client to contact "the target host with the lowest-numbered priority it **can reach**", falling back when it cannot. Reachability is a runtime property, so Ferrum splits the rule across two stages.
+
+### Stage 1 — ingest (`resolve_srv` + `dns_sd`)
+
+`resolve_srv` returns `SrvAnswer` values (`host`, `port`, `weight`, `priority`) and **discards** the RFC 2782 unavailability signals before callers see them:
+
+- Target `.` (the DNS root; also the empty name after stripping the trailing root label, and dotted-only names)
+- Port `0`
+
+Surviving hosts are ASCII-lowercased so they match `UpstreamTarget` admission (`validate_host_entry` requires lowercase). DNS-SD then:
+
+1. admits every surviving port through the same `admit_registry_port` helper Kubernetes and Consul use (`1..=65535`, never wrap);
+2. deduplicates on the dial identity `host:port`, keeping the **lowest** priority, so a zone that lists one endpoint in two tiers neither doubles its share nor gets pinned to the DR tier by record order;
+3. keeps the eight numerically-smallest remaining priorities (`MAX_SRV_PRIORITY_TIERS`) and **publishes all of them**, stamping each target with the reserved tag `ferrum.srv.priority`;
+4. preserves per-record SRV weights (weight `0` becomes `default_weight` so published targets match the static `1..=MAX_TARGET_WEIGHT` contract).
+
+Output tiers are ordered numerically by priority; within each tier, first-seen resolver order is preserved. Dedup on `host:port` keeps the first equal-priority record and replaces it only when a later record has a lower numeric priority; equal-priority duplicates also keep the first record's weight. The published snapshot is deterministic for a given answer ordering but not invariant under permuting same-tier answers — same-tier weighted selection is not independent of resolver order. Invalid records are filtered **before** tiers are formed, so a poisoned tier (every RR at that priority is `.` or port 0) never occupies a tier: the next dialable priority simply becomes the best tier. If nothing admissible remains at any priority the snapshot is empty (fail-closed) and the manager's existing empty-after-filter policy applies. Dropped-record diagnostics are counts plus the configured service name — never a dump of every RR.
+
+### Stage 2 — selection (load balancer)
+
+The load balancer precomputes a per-target priority map at cache-build time and applies it inside the **shared candidate (health) filter**, so every selection entry point sees the same decision: HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, raw TCP and UDP dispatch, plus subset, per-port, retry-exclusion and sticky-session eligibility. Per selection it keeps:
+
+- every healthy target in the lowest-numbered priority tier that still has a healthy member, **and**
+- every healthy target with no SRV tier at all.
+
+Consequences:
+
+- A healthy DR tier is never mixed with a healthy primary tier.
+- The next tier becomes eligible exactly when no target in any lower tier is healthy, and stops being eligible as soon as a lower tier recovers. Nothing is latched, so there is no flap hysteresis to tune.
+- Same-tier weights and the configured load-balancing algorithm (round-robin, WRR, least-connections, least-latency, consistent hashing, random, passthrough) behave normally **within** the selected tier.
+- The filter runs *before* locality LB, so it cannot be bypassed by `localityLbSetting.enabled: false`, `distribute`, `failoverPriority`, a missing source locality, or strict local-first mode. It is an additive mechanism, not an overload of Istio locality tiers.
+- It does **not** apply to the all-unhealthy degraded fallback, or to strict mode's fail-closed widening to unhealthy local endpoints. Once nothing is healthy there is no reachable tier to prefer, and narrowing the last-resort pool would reduce availability rather than direct it.
+
+Hot-path cost is one `is_empty()` branch for every upstream that has no SRV tiers (that is, every non-DNS-SD upstream and every single-tier DNS-SD upstream). When tiers are active it is two passes over a stack `u128` bitset — no allocation, no locks, no string work — or an in-place `Vec::retain` on the >128-target fallback path.
+
+### Static and unprioritized targets
+
+`ferrum.srv.priority` is present only on DNS-SD-discovered targets. A target without it is **unprioritized** and eligible in every tier. That covers statically configured `targets`, targets from Kubernetes/Consul/mesh discovery, and any discovered target that a static entry shadowed during `merge_targets` (static wins on an identical `host:port`). Demoting explicitly configured capacity behind a DNS tier would silently withdraw it, so the two rules are deliberately aligned: static capacity always serves, and the SRV tiers fail over around it.
+
+### The reserved `ferrum.srv.*` tag namespace
+
+`ferrum.srv.*` is an internal contract between the DNS-SD discoverer (its only writer) and the load balancer (its only reader), not an operator-authored label:
+
+- Operator-provided config loads — admin API `POST`/`PUT`/import/restore and the file-mode loader — reject any `targets[].tags` key or `subsets[].labels` key in the namespace, exactly as they already reject reserved `mesh.*` tags.
+- Target builders that copy workload/operator labels wholesale (mesh east-west, egress `ServiceEntry`) strip the namespace first.
+- The balancer accepts only a canonical decimal `u16`: ASCII digits, no sign, no leading zeros except the literal `0`. A malformed value, or more distinct tiers than `MAX_SRV_PRIORITY_TIERS`, disables SRV tier selection for that upstream and logs a warning.
+
+That last rule sets the direction of the failure mode. A bad tag can only turn tiering **off** (restoring flat health/locality selection); there is no value that manufactures a preference promoting or demoting a target relative to what the DNS zone published.
+
+## Address-only SRV mode
+
+`FERRUM_DNS_ORDER` may include `SRV`, which is a different feature from DNS-SD discovery. There, an SRV lookup answers "what IP addresses back this hostname"; the caller dials the proxy's own configured backend port. That mode therefore:
+
+- **ignores the RR's `port` entirely, including port `0`** — it does not apply the `admit_registry_port` rejection `resolve_srv` uses, because a port-0 RR still carries a perfectly usable target address and dropping it would blackhole a resolvable host over a field this mode never reads;
+- **honors the `.` root target**, which is a genuine availability signal rather than a port question, and skips it;
+- **walks answers in ascending `priority`**, so the lowest reachable tier wins and the chosen address does not depend on the order the resolver returned records in.
+
+The distinction is deliberate: port/priority semantics that gate *service availability* belong to DNS-SD, while address-only resolution inherits only the signals that are actually about availability.
+
 ## Stale-While-Revalidate
 
 When a cached DNS entry expires (past its TTL), Ferrum Edge doesn't block the request waiting for a fresh DNS lookup. Instead:
@@ -108,7 +171,7 @@ When multiple proxies share a hostname with different `dns_cache_ttl_seconds`, e
 
 This ensures that DNS resolution almost never blocks the hot request path, even when entries expire.
 
-Background refresh tasks are bounded by a system-wide semaphore (`FERRUM_DNS_MAX_CONCURRENT_REFRESHES`, default 64). When many distinct stale hostnames are hit simultaneously (e.g., after a prolonged DNS outage), at most this many refresh tasks run concurrently. Excess refresh requests are skipped -- the stale entry is served and the next request retries the semaphore. Per-hostname deduplication prevents duplicate refresh tasks for the same hostname.
+Background refresh tasks (stale-while-revalidate *and* proactive near-expiry refresh) share a system-wide semaphore (`FERRUM_DNS_MAX_CONCURRENT_REFRESHES`, default 64) and a per-hostname dedup map, so background SWR/proactive work for a hostname is deduplicated and total in-flight background refresh work cannot exceed the configured ceiling. When many distinct stale hostnames are hit simultaneously (e.g., after a prolonged DNS outage), at most this many refresh tasks run concurrently. Excess SWR refresh requests are skipped -- the stale entry is served and the next request retries the semaphore. The `refreshing` marker does not serialize a caller that is already past its own stale window: that caller performs a foreground synchronous lookup. SWR and proactive publication both require the selected success generation to still be live, so a slower in-flight SWR result cannot overwrite that newer answer or resurrect a hostname `evict_expired` already removed.
 
 **Example:** With a DNS record that has a native 60s TTL and `FERRUM_DNS_STALE_TTL=3600`:
 - For the first 60 seconds: cached result served directly.
@@ -151,6 +214,15 @@ On successful retry, the entry is promoted from error to a healthy cached entry 
 A background task proactively refreshes cache entries before they expire. By default, entries are refreshed when 90% of their TTL has elapsed (configurable via `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT`). This keeps the cache warm and prevents any request from hitting DNS directly.
 
 Since each record has its own native TTL, the background refresh task uses each entry's refresh TTL — the shortest effective TTL among policies actually observed for that hostname (default/global/native only when a `None` consumer was observed) — for threshold computation, not a single global value. The scan runs every 5 seconds to handle short-TTL records promptly.
+
+Hardening for a large cache and a slow or dead resolver (issue #4270):
+
+- **No catch-up bursts**: missed interval ticks use delayed behavior, matching the failed-retry task. A slow cycle does not fire back-to-back sweeps.
+- **Soonest-expiry cap**: each cycle selects at most `FERRUM_DNS_MAX_CONCURRENT_REFRESHES` eligible success rows, soonest logical expiry first. Error rows stay owned by the [failed-retry task](#failed-dns-retry-task). This is a *selection* cap, not only a concurrency cap: proactive refresh sustains at most `FERRUM_DNS_MAX_CONCURRENT_REFRESHES / 5s` hostnames (default 64/5s ≈ 12.8/s). Raise the cap when `cache_size / shortest_TTL` exceeds that throughput, or accept that leftover rows fall through to stale-while-revalidate on the next request.
+- **Shared concurrency ceiling**: selected hostnames resolve concurrently through the same `refresh_semaphore` and `refreshing` dedup map as stale-while-revalidate, so proactive and SWR background work share one global cap and are deduplicated per hostname. Foreground synchronous lookup is not serialized.
+- **Per-lookup timeout**: every stale-while-revalidate and proactive background resolution is bounded by a 15-second wall-clock timeout (Hickory's default per-query timeout is 5s with 2 attempts; 15s covers one record type with margin and cuts off a sequential `FERRUM_DNS_ORDER` walk). A timeout is a failed refresh: the last known good success row is preserved and never rewritten or TTL-extended, and the shared refresh permit is released so a hung SWR lookup cannot starve proactive work.
+- **Independent eviction**: `FERRUM_DNS_CACHE_MAX_SIZE` / age enforcement (`evict_expired`) runs on its own 5-second delayed cadence concurrently with refresh resolution, so a hung resolver cannot starve capacity enforcement.
+- **Shutdown and generation safety**: the proactive refresh and eviction loops observe the process shutdown watch and cancel in-flight proactive work with RAII release of permits and dedup markers. Detached stale-while-revalidate `tokio::spawn` tasks are not joined on shutdown; they keep their permits until the lookup finishes, times out (15s), or the runtime tears down. Stale-while-revalidate and proactive refresh publish through the same generation check: if eviction, a foreground lookup, or another refresh winner changes or removes the selected row while DNS is in flight, the stale result is abandoned — it cannot overwrite the new generation or resurrect an evicted hostname.
 
 ## DNS Warmup
 

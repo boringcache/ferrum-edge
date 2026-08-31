@@ -16,6 +16,7 @@ mod mesh_config;
 // instead of a binary-unused `pub use` re-export.
 pub mod udp_amplification_policy;
 
+pub use core::NodeWaypointInventory;
 pub(crate) use core::secret_object_is_valid_tls_certificate;
 pub(crate) use gateway_api::{
     allowed_route_namespaces as parse_gateway_listener_allowed_route_namespaces,
@@ -176,6 +177,18 @@ pub struct K8sTranslationOptions {
     /// flag exists to fix. Defaults to `false` so a caller that has not thought
     /// about ownership cannot widen Kubernetes authority by accident.
     pub mesh_overlay_authority: bool,
+    /// Process-lifetime last Ready NodeWaypoint endpoint per node. Shared
+    /// across reconciles so a same-node rolling restart does not publish a
+    /// metadata-stripped mesh under an unchanged Kubernetes revision.
+    /// Restore is node-scoped: only a trusted not-Ready or terminating
+    /// replacement on that node may reattach the remembered endpoint.
+    pub node_waypoint_inventory: NodeWaypointInventory,
+    /// Namespaces excluded from ambient enrollment. Matches the node-agent
+    /// capture skip set: `pod_watcher::DEFAULT_EXCLUDED_NAMESPACES` plus
+    /// `FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES`. Identity-only NodeWaypoint
+    /// assertion grants reuse this so a namespace the node agent will not
+    /// capture cannot enter the HBONE assertion inventory.
+    pub excluded_namespaces: HashSet<String>,
     source_namespaces: Option<HashSet<String>>,
     pod_source_namespaces: Option<HashSet<String>>,
 }
@@ -247,6 +260,8 @@ impl K8sTranslationOptions {
             pod_discovery_enabled: false,
             mesh_sidecar_ingress_enforced: false,
             mesh_overlay_authority: false,
+            node_waypoint_inventory: NodeWaypointInventory::new(),
+            excluded_namespaces: excluded_namespaces_from_node_agent_env(),
             source_namespaces: Some(source_namespaces),
             pod_source_namespaces: Some(pod_source_namespaces),
         }
@@ -285,6 +300,19 @@ impl K8sTranslationOptions {
         if !namespace.trim().is_empty() {
             self.node_waypoint_namespace = namespace;
         }
+        self
+    }
+
+    /// Share a process-lifetime NodeWaypoint inventory across translations.
+    pub fn with_node_waypoint_inventory(mut self, inventory: NodeWaypointInventory) -> Self {
+        self.node_waypoint_inventory = inventory;
+        self
+    }
+
+    /// Override the ambient-enrollment skip set. Production callers should
+    /// keep the `new()` default, which is the same set the node agent builds.
+    pub fn with_excluded_namespaces(mut self, namespaces: HashSet<String>) -> Self {
+        self.excluded_namespaces = namespaces;
         self
     }
 
@@ -328,6 +356,22 @@ impl K8sTranslationOptions {
             .as_ref()
             .is_none_or(|namespaces| namespaces.contains(namespace))
     }
+}
+
+/// Same extra-namespace parse as `modes::node_agent` so K8s translation and
+/// capture enrollment cannot disagree on `FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES`.
+fn excluded_namespaces_from_node_agent_env() -> HashSet<String> {
+    let extra: Vec<String> = crate::config::conf_file::resolve_ferrum_var(
+        "FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES",
+    )
+    .map(|raw| {
+        raw.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
+    .unwrap_or_default();
+    crate::ebpf::pod_watcher::build_excluded_namespaces(&extra)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3375,8 +3419,31 @@ fn uri_match_for_listen_path(listen_path: &str) -> Option<Value> {
 /// shape the `request_transformer` / `response_transformer` plugins accept).
 /// `direction` is `"request"` or `"response"`.
 pub(crate) fn vs_route_header_transform_rules(http: &Value, direction: &str) -> Vec<Value> {
-    let Some(headers) = http
-        .get("headers")
+    let mut rules = Vec::new();
+    // Per-destination `http[].route[].headers` (issue #4304). Istio applies it
+    // to the selected destination, which Ferrum's per-route dispatch rule can
+    // reproduce EXACTLY when the route has a single destination. A weighted
+    // split materializes one upstream with weighted targets, so there is no
+    // per-destination rule to hang the transform on — that shape is reported as
+    // a deferred field (`virtual_service_deferred_fields`) instead of being
+    // applied to the wrong share of traffic. Envoy applies weighted-cluster
+    // mutations BEFORE enclosing route mutations, so route-level `set` wins.
+    if let Some(destinations) = http.get("route").and_then(Value::as_array)
+        && destinations.len() == 1
+    {
+        rules.extend(header_block_transform_rules(
+            destinations[0].get("headers"),
+            direction,
+        ));
+    }
+    rules.extend(header_block_transform_rules(http.get("headers"), direction));
+    rules
+}
+
+/// Convert one Istio `headers.{direction}.{set,add,remove}` block into the
+/// canonical transformer rule JSON shape.
+fn header_block_transform_rules(headers: Option<&Value>, direction: &str) -> Vec<Value> {
+    let Some(headers) = headers
         .and_then(Value::as_object)
         .and_then(|h| h.get(direction))
         .and_then(Value::as_object)
@@ -3384,6 +3451,25 @@ pub(crate) fn vs_route_header_transform_rules(http: &Value, direction: &str) -> 
         return Vec::new();
     };
     let set = headers.get("set").and_then(Value::as_object);
+    // `Host` / `:authority` request `set` is projected onto the dispatch
+    // rule's typed authority rewrite instead of the generic transformer. It
+    // must never also appear here as an ordinary header mutation.
+    let request_set_without_authority = if direction == "request" {
+        set.map(|entries| {
+            entries
+                .iter()
+                .filter(|(name, _)| !is_vs_authority_header(name))
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect::<serde_json::Map<_, _>>()
+        })
+    } else {
+        None
+    };
+    let set = if direction == "request" {
+        request_set_without_authority.as_ref()
+    } else {
+        set
+    };
     let add = headers.get("add").and_then(Value::as_object);
 
     // Warn (don't silently drop) when set/add contain non-string values.
@@ -3398,7 +3484,7 @@ pub(crate) fn vs_route_header_transform_rules(http: &Value, direction: &str) -> 
                 tracing::warn!(
                     direction = direction,
                     header = %key,
-                    value_kind = ?value,
+                    value_kind = json_value_kind(value),
                     "VirtualService headers.{}.set entry has non-string value; entry will be dropped",
                     direction,
                 );
@@ -3411,7 +3497,7 @@ pub(crate) fn vs_route_header_transform_rules(http: &Value, direction: &str) -> 
                 tracing::warn!(
                     direction = direction,
                     header = %key,
-                    value_kind = ?value,
+                    value_kind = json_value_kind(value),
                     "VirtualService headers.{}.add entry has non-string value; entry will be dropped",
                     direction,
                 );
@@ -3427,7 +3513,7 @@ pub(crate) fn vs_route_header_transform_rules(http: &Value, direction: &str) -> 
                 None => {
                     tracing::warn!(
                         direction = direction,
-                        value_kind = ?entry,
+                        value_kind = json_value_kind(entry),
                         "VirtualService headers.{}.remove entry is not a string; entry will be dropped",
                         direction,
                     );
@@ -3441,6 +3527,21 @@ pub(crate) fn vs_route_header_transform_rules(http: &Value, direction: &str) -> 
         add,
         remove.as_deref(),
     )
+}
+
+pub(crate) fn is_vs_authority_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("host") || name.eq_ignore_ascii_case(":authority")
+}
+
+fn json_value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 pub(crate) fn mesh_route_dispatch_plugin_from_rules(

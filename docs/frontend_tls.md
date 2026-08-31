@@ -558,7 +558,7 @@ Frontend proxy, Admin API, and frontend DTLS cert/key/client-CA/OCSP/CRL sources
 | **Loaded but static** | Inline frontend/admin/DTLS/backend/database/CP-gRPC/DP-gRPC sources |
 | **Gateway SVID rotation** | `FERRUM_GATEWAY_SVID_*_PATH` / `_SOURCE`: file-backed sources are re-read once per second, provider URIs are re-fetched on `FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` or the source's `?poll=`, and inline PEM stays static until config reload |
 
-All TLS sources are validated at startup and config load time when their owning runtime is built. Certificate and CA bundles are atomic: Ferrum rejects the complete candidate if any declared `CERTIFICATE` record is malformed or any CA record cannot be admitted as a trust root; it never installs a usable subset. CRL sources are atomic on the same terms and are additionally checked against their own declared validity window — see [CRL Policy](#crl-policy). If any configured certificate, key, CA bundle, OCSP response, or CRL source is missing, unreadable, expired, not-yet-valid, mismatched, or contains invalid PEM data where PEM is expected, the gateway refuses to start or rejects the config reload. OCSP response sources must resolve to non-empty DER bytes. There is no silent fallback to unauthenticated or unencrypted connections. Client cert and key sources must always be configured as a pair.
+All TLS sources are validated at startup and config load time when their owning runtime is built. Certificate and CA bundles are atomic: Ferrum rejects the complete candidate if any declared `CERTIFICATE` record is malformed or any CA record cannot be admitted as a trust root; it never installs a usable subset. CRL sources are atomic on the same terms and are additionally checked against their own declared validity window — see [CRL Policy](#crl-policy). If any configured certificate, key, CA bundle, OCSP response, or CRL source is missing, unreadable, expired, not-yet-valid, mismatched, or contains invalid PEM data where PEM is expected, the gateway refuses to start or rejects the config reload. OCSP response sources must resolve to a DER response that passes the certificate-bound validation described in [Stapled OCSP Responses](#stapled-ocsp-responses). There is no silent fallback to unauthenticated or unencrypted connections. Client cert and key sources must always be configured as a pair.
 
 Certificate/key PEM parsing is capped at 4 MiB per source and certificate
 bundles at 4096 records. A configured client-CA is still fully admitted when a
@@ -570,6 +570,98 @@ key, and transmits the complete chain; it never publishes only a usable prefix.
 The frontend/admin live-reload poller atomically swaps a validated `rustls::ServerConfig` for new handshakes. The frontend DTLS poller validates cert/key/optional client-CA/CRL inputs as one immutable generation, publishes that generation into shared reconcile state, and live-swaps it into every active DTLS server without rebinding the UDP socket. Cert/key-only rotation and additive client-trust changes leave established TLS/DTLS sessions on the config they negotiated with; an accepted client-trust narrowing retires the affected scope's client-certificate-authenticated sessions as described below. Subsequent sessions use the accepted generation. A failed candidate keeps the complete previous generation in service on every listener and logs a warning without exposing PEM contents, secret URIs, or private material. Disabling `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` preserves static-until-restart behavior for all of these surfaces.
 
 For backend HTTP-family TLS, keep `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true` to pick up in-place cert/key/CA/CRL source changes and to watch backend TLS sources added by later config reloads. Database TLS can opt in with `FERRUM_DB_TLS_LIVE_RELOAD_ENABLED=true` in database and CP modes. CP gRPC TLS swaps the server TLS slot for new handshakes when watched source bytes change; DP gRPC TLS reconnects the CP stream with fresh client-side TLS material.
+
+### Stapled OCSP Responses
+
+`FERRUM_FRONTEND_TLS_OCSP_RESPONSE_SOURCE` and
+`FERRUM_ADMIN_TLS_OCSP_RESPONSE_SOURCE` supply DER bytes that Ferrum staples to
+the served certificate. Those bytes are **validated against the certificate they
+will be stapled to** before they are attached — for file, `file://`, inline,
+provider URI, Kubernetes Secret, and `managed://` sources alike, and for both
+the single-certificate frontend and the Gateway API multi-certificate frontend.
+An invalid response fails the whole TLS load: the gateway refuses to start, or
+the reload is rejected and the previous known-good `ServerConfig` keeps serving.
+Ferrum never staples a response it could not validate and never serves a
+partially applied generation.
+
+A response is admitted only when all of the following hold.
+
+| Check | Rejected when |
+|---|---|
+| Size | The DER exceeds 64 KiB. The bound is enforced before parsing. |
+| Envelope | `responseStatus` is not `successful(0)`, or `responseType` is not `id-pkix-ocsp-basic`. |
+| Encoding | The `BasicOCSPResponse`, `ResponseData`, `SingleResponse`, or `CertID` is malformed, carries trailing bytes, uses non-minimal DER length octets at an OCSP grammar boundary, explicitly encodes the `ResponseData.version` DEFAULT `v1` (DER omits a `DEFAULT` value) or declares any other version, contains no `SingleResponse`, or contains more than 64 `SingleResponse` entries. `ResponseData` and `SingleResponse` are consumed to their last byte: every `GeneralizedTime` (including `producedAt` and `revocationTime`) must use DER's exact `YYYYMMDDHHMMSSZ` form and decode successfully; timezone-less, explicit-offset, and fractional-second forms are refused. `nextUpdate [0]` and `singleExtensions [1]` may each appear at most once and only in that order, `responseExtensions [1]` at most once after `responses`, and any unknown, duplicate, misordered, or trailing element is refused. The `certStatus` CHOICE is checked as an encoding, not just a tag: `good [0]` and `unknown [2]` must be primitive and empty, and `revoked [1]` must be a well-formed `RevokedInfo`. Every field boundary is checked for ASN.1 class and primitive/constructed form as well as tag number, so a context-specific element reusing a universal tag number, a primitive `SEQUENCE`, or a constructed `OCTET STRING` is refused rather than decoded as the field it imitates. Primitive contents are then checked against their type-specific DER rules: OBJECT IDENTIFIER values (including ignored extension OIDs) must be a complete canonical encoding (nonempty, terminated base-128, no redundant leading `0x80` group); INTEGER and ENUMERATED values must be nonempty and minimal (one sign-protection `0x00` only when the next byte has its high bit set); a CertID serial must be nonnegative; `successful(0)` is the single content octet `0x00`; the signature BIT STRING must be octet-aligned (`unused_bits == 0`) and nonempty; and `AlgorithmIdentifier` parameters follow a field- and algorithm-specific profile. `CertID.hashAlgorithm` accepts absent or canonical NULL for digest identifiers (the two encodings RFC 4055 / RFC 5754 require receivers to handle), including unknown hash OIDs at the certificate-independent admin boundary — full certificate-bound validation still refuses an unsupported hash. `BasicOCSPResponse.signatureAlgorithm` applies the verifier-supported family instead of that digest rule: `ecdsa-with-SHA256` / `ecdsa-with-SHA384` and Ed25519 require absent parameters (RFC 5758 / RFC 8410), so a NULL that `x509_parser::verify_signature` would ignore is refused; RSA PKCS#1 (`sha*WithRSAEncryption`) requires the canonical NULL RFC 3279 and RFC 5754 specify when generating, so this strict-stapling policy rejects an omitted NULL that some receivers still accept; `rsassa-pss` requires present parameters parseable on the verification path (SHA-256/384/512, MGF1 with the same hash, saltLength equal to the hash output length, trailerField omitted, no trailing fields). This is not a complete RFC 4055 strictness claim. An unknown signature OID is refused at this grammar so it cannot be stored or served. |
+| Extensions | An `Extensions` container is not a non-empty `SEQUENCE` of at most 32 well-formed `Extension`s (DER omits `critical` when `FALSE`), it repeats one extension OID (X.509 forbids a duplicate extension type, and Ferrum ignores supported non-critical extensions), or it carries a **critical** extension. Ferrum implements no OCSP response extension, so RFC 6960 §4.4 does not let it ignore a critical one; non-critical extensions are ignored after that strict parse. |
+| Certificate binding | No `SingleResponse` `CertID` matches the served leaf's serial number together with the `issuerNameHash` and `issuerKeyHash` of the configured issuer, recomputed under the `CertID` hash algorithm (SHA-1, SHA-256, SHA-384, or SHA-512); a serial-matching entry uses an unsupported hash algorithm (the whole response fails closed even when another entry would match); or **more than one** entry matches, including duplicates that use different supported hash algorithms, because the status a strict client would select is then ambiguous. |
+| Issuer availability | No certificate in the served chain is proven to have signed the leaf. A matching subject name is not enough: same-name candidates are scanned until one verifies the leaf's signature, and a self-issued leaf is accepted as its own issuer only when it is genuinely self-signed. |
+| Carried certificates | The optional `certs` field carries more than 16 certificates or an entry that is not one complete, parseable X.509 `Certificate`. A malformed entry is refused even when it is unused — that is, even when the issuing CA signed the response directly or another carried certificate would authorize it. |
+| Responder authorization | The signature does not verify against the issuing CA, and no certificate carried in the response is simultaneously named by the `ResponderID`, issued by that CA, currently valid, marked specifically with the `id-kp-OCSPSigning` extended key usage (`anyExtendedKeyUsage` does not substitute), permitted to sign by any `KeyUsage` it carries (an absent `KeyUsage` is accepted; a present one must include `digitalSignature`), and able to verify the signature. |
+| Signature | `tbsResponseData` does not verify under the authorized responder's public key. |
+| Validity window | `nextUpdate` is absent, `nextUpdate` is not after `thisUpdate`, `thisUpdate` is in the future, or `nextUpdate` is in the past. |
+| Status | `certStatus` is `revoked` or `unknown`. |
+
+**Clock-skew policy.** The two time bounds are widened by a fixed **5 minutes**
+in the permissive direction, so the accepted window is
+`thisUpdate - 5m <= now <= nextUpdate + 5m`. The allowance is not configurable:
+it exists to absorb ordinary NTP drift between the responder and the gateway,
+not to extend the life of a stale staple.
+
+**`nextUpdate` is required.** RFC 6960 §2.4 makes an absent `nextUpdate` mean
+"newer information is available at all times", which a cached, re-served staple
+cannot satisfy, so such a response has no usable validity window and is refused.
+
+**Revoked and unknown fail closed.** Ferrum refuses to serve them rather than
+stapling them. A client that honours the staple would refuse the connection
+anyway, and a reload must not be able to publish that state silently.
+
+**Admin-managed records.** `POST`/`PUT /admin/tls/ocsp-responses` stores a
+record before any certificate context exists, so it performs the
+certificate-independent half only: the size bound, a successful
+`id-pkix-ocsp-basic` envelope, and a well-formed `BasicOCSPResponse`. Storing a
+record is therefore not a promise it can be served. The certificate-bound half
+above runs when a frontend TLS configuration referencing
+`managed://ocsp-responses/<id>#ocsp` is built, and a mismatch is refused there.
+
+**Multi-certificate frontends.** A stapled response is bound to one
+certificate, so a Gateway data plane staples it only when it serves exactly one
+certificate; with several it is stapled to none and a warning is logged.
+
+**Serving.** An accepted response is attached to the `CertifiedKey` the
+listener serves, so a client receives it in the certificate message. The
+single-certificate frontend and the single-entry SNI frontend share one
+`rustls::ServerConfig` for HTTP/1.1 and HTTP/2, and the HTTP/3 listener rebuilds
+a TLS 1.3-only config around **the same certificate resolver** rather than
+reloading the material, so all three protocols serve the same validated bytes.
+An `admin` HTTPS listener behaves identically.
+
+**FIPS mode.** With `FERRUM_FIPS_MODE=enforce`, admission is narrower: the
+`BasicOCSPResponse` signature, the served leaf's own signature, and every
+certificate carried in `certs` must use `sha256/384/512WithRSAEncryption`,
+`rsassa-pss` with SHA-256/384/512, `ecdsa-with-SHA256`, or `ecdsa-with-SHA384`
+— `sha1WithRSAEncryption` and Ed25519 are refused — and every carried responder
+certificate plus the issuer selected from the served chain must carry an
+approved key (RSA 2048–8192, or ECDSA over P-256/P-384/P-521). The refusal is at
+the response grammar, so a non-approved response cannot be stored through the
+admin API either. `CertID` and `ResponderID` **key identifier** digests are
+unaffected: RFC 6960 defines them over public issuer/responder material as a
+selection key, and SHA-1 remains admitted there. See
+[`docs/fips.md`](fips.md). Outside enforcement nothing changes, so ordinary
+deployments keep interoperating with responders that still sign with SHA-1.
+
+**Freshness is checked when the material is loaded, not per handshake.** The
+validity window above is evaluated while the `ServerConfig` candidate is being
+built — at startup, at config reload, and when a watched OCSP source's bytes
+change. An accepted staple is then served unchanged until one of those events
+happens again, so a response that passes `nextUpdate` while the gateway is
+running keeps being stapled. Refresh the OCSP source before `nextUpdate`
+elapses: with `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true` a file or provider
+source is re-read and re-validated as soon as its bytes change, and rewriting
+the source with a stale or otherwise invalid response is rejected while the
+previous known-good material keeps serving.
+
+**Diagnostics.** Rejections name the redacted source identifier and the
+structural reason. They never contain certificate bytes, response bytes, private
+material, or a secret source reference.
 
 ### Client-Trust Generations and Established-Transport Retirement
 

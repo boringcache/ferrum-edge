@@ -131,6 +131,22 @@ async fn test_ws_logging_plugin_creation() {
     assert_eq!(plugin.warmup_hostnames(), vec!["localhost".to_string()]);
 }
 
+#[test]
+fn test_ws_logging_rejects_unknown_endpont_url_key() {
+    let err = WsLogging::new(
+        &json!({
+            "endpoint_url": "ws://localhost:9300/logs",
+            "endpont_url": "ws://localhost:9300/typo"
+        }),
+        default_client(),
+    )
+    .err()
+    .expect("typo endpont_url must fail construction");
+    assert!(err.contains("unknown configuration key"), "{err}");
+    assert!(err.contains("endpont_url"), "{err}");
+    assert!(err.contains("did you mean 'endpoint_url'?"), "{err}");
+}
+
 #[tokio::test]
 async fn test_ws_logging_ipv6_endpoint_warmup_hostname_is_unbracketed() {
     let plugin = WsLogging::new(

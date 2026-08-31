@@ -1,8 +1,10 @@
 # Minimal distroless runtime image for pre-built binaries (used by CI/CD)
 # For local builds from source, use: docker build -f Dockerfile .
 #
-# Debian 13 (trixie) distroless has glibc 2.40, compatible with binaries
-# built on ubuntu-latest (glibc 2.39) and cross containers (glibc 2.31).
+# Debian 13 (trixie) distroless has glibc 2.40. Published GNU binaries are
+# built to the declared GLIBC_2.34 runtime floor (x86_64 from a digest-pinned
+# AlmaLinux 8.10 sysroot; ARM64 from the isolated Xenial Cross image) and
+# remain forward-compatible with this newer distroless libc.
 FROM gcr.io/distroless/cc-debian13:nonroot
 
 ARG TARGETARCH
