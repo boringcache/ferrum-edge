@@ -1024,7 +1024,11 @@ async fn functional_protocol_validation_normal_h1_request_unaffected() {
     let resp = send_raw_h1(h.proxy_port, req).await;
 
     assert_eq!(resp.status_code, 200, "body={}", resp.body);
-    assert_eq!(raw_header(&resp, "content-type"), Some("text/plain"));
+    // The header-echo backend answers `text/plain` only for `/large-response`;
+    // every other path echoes the request headers as JSON. The point of this
+    // test is that an admitted request still reaches the backend and carries no
+    // gateway envelope, so assert the backend's own content type.
+    assert_eq!(raw_header(&resp, "content-type"), Some("application/json"));
     assert!(raw_header(&resp, "x-gateway-error").is_none());
 
     h.cleanup();
