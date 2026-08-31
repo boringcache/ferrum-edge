@@ -105,6 +105,52 @@ stale hand-authored pod-registry artifacts and let the node-agent regenerate
 every pod entry. Any external publisher must use only the documented leaf and
 body grammar; otherwise cleanup/finalize remains fail-closed.
 
+### Ferrum-owned UDP policy CRD now upgrades with the mesh chart (issue [#4443](https://github.com/ferrum-edge/ferrum-edge/issues/4443))
+
+`UDPResponseAmplificationPolicy` moved out of Helm's install-once `crds/`
+directory into `charts/ferrum-mesh/templates/crds-udpresponseamplificationpolicy.yaml`
+gated by `crds.install` (default `true`). A cluster installed at an older chart
+version kept the obsolete schema through every successful `helm upgrade`
+because Helm never updates `crds/`. The live CRD is stamped with
+`gateway.ferrum.io/crd-schema-version: v1alpha1-1`. Compare:
+
+```bash
+kubectl get crd udpresponseamplificationpolicies.gateway.ferrum.io \
+  -o jsonpath='{.metadata.annotations.gateway\.ferrum\.io/crd-schema-version}'
+```
+
+Uninstall keeps the CRD (`helm.sh/resource-policy: keep`) so policy objects are
+not cascade-deleted. `crds.install=false` without
+`crds.skipInstallAcknowledged=true` fails render.
+
+A CRD that already exists from the former `crds/` directory is not in the Helm
+release. The first upgrade to this chart fails closed unless you adopt it.
+
+**Operator action:** before the first `helm upgrade` to this chart version on a
+cluster that already has `udpresponseamplificationpolicies.gateway.ferrum.io`:
+
+```bash
+helm upgrade <release> ./charts/ferrum-mesh -n <namespace> \
+  --take-ownership --set crds.adoptExisting=true
+```
+
+Helm 3.14+ is required for `--take-ownership`. After adoption, leave
+`crds.install=true` and drop `crds.adoptExisting`. Do not set
+`crds.install=false` to silence the error.
+
+### Enabled mesh injector requires a webhook CA trust source (issue [#4433](https://github.com/ferrum-edge/ferrum-edge/issues/4433))
+
+`injector.enabled=true` with empty `injector.caBundle` previously omitted
+`clientConfig.caBundle` while keeping `failurePolicy: Fail`. Kubernetes could
+not authenticate the webhook, so admission for the matched scope failed closed.
+Helm now requires exactly one of `injector.caBundle` (base64 PEM) or
+`injector.certManager.injectCaFrom` (`namespace/certificate-name`). The chart
+never changes `failurePolicy` to `Ignore` to make a broken webhook render.
+
+**Operator action:** set `injector.caBundle` or
+`injector.certManager.injectCaFrom` before enabling the injector. `helm
+template` / `helm upgrade` fail until one trust source is set.
+
 ### HTTP/1.1 requests without a Host header are rejected with 400 (issue [#4390](https://github.com/ferrum-edge/ferrum-edge/issues/4390))
 
 RFC 9112 §3.2.2 requires a 400 when an HTTP/1.1 request lacks a Host field. Ferrum previously only rejected multiple Host fields, so a Host-less origin-form request skipped exact/wildcard host tiers and could fall through to a catch-all (empty `hosts`) route. `check_protocol_headers()` now rejects HTTP/1.1 when both the Host field and the URI authority are absent. HTTP/1.0 still does not require Host. Absolute-form request-targets that already carry an authority are accepted without a Host field. An empty Host value (`Host:` with no tokens) is treated as present-but-invalid and also returns 400 on HTTP/1.1. HTTP/2 and HTTP/3 are unchanged.
