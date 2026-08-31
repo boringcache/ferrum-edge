@@ -135,6 +135,13 @@ never changes `failurePolicy` to `Ignore` to make a broken webhook render.
 **Operator action:** set `injector.caBundle` or
 `injector.certManager.injectCaFrom` before enabling the injector. `helm
 template` / `helm upgrade` fail until one trust source is set.
+### `preserve_host_header` now sets `:authority` on direct-H2 and gRPC backends (issue [#4410](https://github.com/ferrum-edge/ferrum-edge/issues/4410))
+
+Ferrum's outbound direct-H2 and native-gRPC dispatch previously sent a hostname-only `Host` while Hyper derived `:authority` from the full backend URI including a non-default port. RFC 9113 §8.3.1 forbids that disagreement, so RFC-compliant HTTP/2 origins reset the stream and the client saw `502 backend_error` or gRPC `UNAVAILABLE`. Both fields now carry the same authority.
+
+Closing that gap changes what a backend observes when `preserve_host_header: true` on the direct-H2 pool and native-gRPC Direct transport. Previously `Host` carried the client's authority while `:authority` carried the backend's; now both carry the client's — but only when that Host is a valid request authority (`split_request_authority`: no userinfo, no path, bracketed IPv6, non-empty). An invalid client Host is ignored and both fields keep the backend URI authority. Native-gRPC mesh-mTLS dispatch does not let `preserve_host_header` override a pinned `mesh.mtls_authority_host`: the mesh service host and port stay in both `Host` and `:authority`.
+
+**Operator action:** on direct-H2 or native-gRPC Direct routes that set `preserve_host_header: true`, confirm the backend's virtual-host routing still selects the intended vhost now that `:authority` carries the client's Host. A client `Host` that is not a valid authority (userinfo, path, empty, unbracketed IPv6, opaque IP-literal) is ignored. Set `preserve_host_header: false` on those routes to keep the backend authority in both fields. Routes with `preserve_host_header` unset or false are unaffected, default-port backends (80 for `http`/`ws`, 443 for `https`/`wss`) still omit the port from both fields, and mesh-mTLS routes with a pinned service authority keep that authority.
 
 ### HTTP/1.1 requests without a Host header are rejected with 400 (issue [#4390](https://github.com/ferrum-edge/ferrum-edge/issues/4390))
 
@@ -261,6 +268,12 @@ Entries may be plain service-name strings — a published A2A name resolves to t
 TLS handshake offload is not implemented. A nonzero `FERRUM_TLS_OFFLOAD_THREADS` was parsed, documented in five places, and then silently ignored, so operators who set it believed handshakes were being offloaded when nothing had changed. `EnvConfig::validate()` now rejects any value other than `0` before mode dispatch, which turns a previously accepted configuration into a refused start.
 
 **Operator action:** leave `FERRUM_TLS_OFFLOAD_THREADS` unset, or set it to `0`. There is no configuration that enables offload; removing the variable is equivalent to the behaviour every prior release actually had.
+
+### `FERRUM_GRPC_POOL_READY_WAIT_MS` removed (issue [#4427](https://github.com/ferrum-edge/ferrum-edge/issues/4427))
+
+`FERRUM_GRPC_POOL_READY_WAIT_MS` was parsed, documented, and accepted by `run`/`validate`, but the gRPC pool selection path never read it. Ferrum uses an immediate `now_or_never` readiness probe when choosing among shard senders — there is no configurable wait, and reintroducing one would regress gRPC tail latency under burst concurrency.
+
+**Operator action:** remove `FERRUM_GRPC_POOL_READY_WAIT_MS` from your configuration; it never had a runtime effect. There is no replacement knob.
 
 ## Database Mode (`FERRUM_MODE=database`)
 
