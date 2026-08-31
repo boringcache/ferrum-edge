@@ -2912,11 +2912,8 @@ fn inbound_relay_ambient_registry_refuses_uidless_record_contesting_enrolled_add
         protocol: AppProtocol::Http,
         name: Some("vm-http".to_string()),
     }];
-    let (slice, runtime) = ambient_relay_fixture(vec![
-        enrolled_pod,
-        uidless_record,
-        lone_uidless_record,
-    ]);
+    let (slice, runtime) =
+        ambient_relay_fixture(vec![enrolled_pod, uidless_record, lone_uidless_record]);
 
     let mut mesh = prepared_mesh(&slice, &runtime);
     let node = Some(ip("10.244.0.1"));
@@ -3777,8 +3774,7 @@ fn inbound_relay_own_address_without_identity_does_not_union_a_shared_address() 
     let shared_a = reviews_replica_declaring("10.244.5.5", Some(LOCAL_POD_UID), &[8080]);
     let shared_b = reviews_replica_declaring("10.244.5.5", Some(OTHER_POD_UID), &[9443]);
     let lone = reviews_replica_declaring("10.244.5.6", Some(LOCAL_POD_UID), &[7070]);
-    let mut remote_overlap =
-        reviews_replica_declaring("10.244.5.6", Some(OTHER_POD_UID), &[7443]);
+    let mut remote_overlap = reviews_replica_declaring("10.244.5.6", Some(OTHER_POD_UID), &[7443]);
     remote_overlap.remote_provenance = true;
     let (slice, mut runtime) = own_pod_relay_fixture(
         MeshTopology::Sidecar,

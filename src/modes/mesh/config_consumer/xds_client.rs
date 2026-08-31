@@ -2573,9 +2573,11 @@ fn apply_recovered_carrier(
         }
         MeshSliceCarrier::ServiceWaypointBoundServices(value) => {
             if recovered.service_waypoint_bound_services_seen {
-                return Err("xDS ServiceWaypointBoundServices carrier appeared more than once; \
+                return Err(
+                    "xDS ServiceWaypointBoundServices carrier appeared more than once; \
                      exactly one authoritative bound-service value is required"
-                    .to_string());
+                        .to_string(),
+                );
             }
             recovered.service_waypoint_bound_services_seen = true;
             recovered.service_waypoint_bound_services = value;

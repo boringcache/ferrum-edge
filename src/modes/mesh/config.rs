@@ -5062,9 +5062,7 @@ pub fn inbound_relay_destinations_from_workloads<'a>(
                 .position(|existing| existing.host == host && existing.enrollment == enrollment);
             let Some(index) = existing else {
                 let registry_uncontested = match &host {
-                    MeshInboundRelayHost::Ip(address) => {
-                        !contested_addresses.contains(address)
-                    }
+                    MeshInboundRelayHost::Ip(address) => !contested_addresses.contains(address),
                     MeshInboundRelayHost::Name(_) => true,
                 };
                 destinations.push(MeshInboundRelayDestination {

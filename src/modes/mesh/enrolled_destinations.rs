@@ -209,11 +209,7 @@ pub(crate) struct NodeLocalEnrolledDestinationOwner<'a> {
 
 impl NodeLocalEnrolledDestinationOwner<'_> {
     /// Whether this enrolled owner satisfies the slice record's evidence.
-    pub(crate) fn terminates_for(
-        self,
-        identity: Option<&str>,
-        pod_uid: Option<&str>,
-    ) -> bool {
+    pub(crate) fn terminates_for(self, identity: Option<&str>, pod_uid: Option<&str>) -> bool {
         if let Some(pod_uid) = pod_uid
             && self.owner.pod_uid != pod_uid
         {
