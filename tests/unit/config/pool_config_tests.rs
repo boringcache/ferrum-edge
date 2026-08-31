@@ -1,6 +1,7 @@
 //! Tests for connection pool configuration
 
 use chrono::Utc;
+use ferrum_edge::config::EnvConfig;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::conf_file::ConfFile;
 use ferrum_edge::config::pool_config::{MAX_IDLE_PER_HOST, MIN_IDLE_PER_HOST};
@@ -8,7 +9,6 @@ use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, MAX_HTTP2_MAX_FRAME_SIZE, MAX_HTTP2_WINDOW_SIZE,
     MIN_HTTP2_MAX_FRAME_SIZE, MIN_HTTP2_WINDOW_SIZE, Proxy,
 };
-use ferrum_edge::config::EnvConfig;
 
 use crate::unit::env_lock::ENV_LOCK;
 

@@ -130,11 +130,7 @@ fn invalid_pool_value(key: &str, raw: &str, expected: &str) -> String {
     format!("Invalid {key} value '{raw}'. Expected {expected}")
 }
 
-fn parse_pool_int<T: std::str::FromStr>(
-    key: &str,
-    raw: &str,
-    expected: &str,
-) -> Result<T, String> {
+fn parse_pool_int<T: std::str::FromStr>(key: &str, raw: &str, expected: &str) -> Result<T, String> {
     raw.trim()
         .parse::<T>()
         .map_err(|_| invalid_pool_value(key, raw, expected))
@@ -207,7 +203,7 @@ impl PoolConfig {
             "FERRUM_POOL_MAX_IDLE_PER_HOST",
             "a valid usize integer",
         )? {
-            if parsed < MIN_IDLE_PER_HOST || parsed > MAX_IDLE_PER_HOST {
+            if !(MIN_IDLE_PER_HOST..=MAX_IDLE_PER_HOST).contains(&parsed) {
                 return Err(range_err(
                     "FERRUM_POOL_MAX_IDLE_PER_HOST",
                     parsed,
@@ -278,7 +274,7 @@ impl PoolConfig {
             "FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE",
             "a valid u32 integer",
         )? {
-            if parsed < MIN_HTTP2_WINDOW_SIZE || parsed > MAX_HTTP2_WINDOW_SIZE {
+            if !(MIN_HTTP2_WINDOW_SIZE..=MAX_HTTP2_WINDOW_SIZE).contains(&parsed) {
                 return Err(range_err(
                     "FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE",
                     parsed,
@@ -295,7 +291,7 @@ impl PoolConfig {
             "FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE",
             "a valid u32 integer",
         )? {
-            if parsed < MIN_HTTP2_WINDOW_SIZE || parsed > MAX_HTTP2_WINDOW_SIZE {
+            if !(MIN_HTTP2_WINDOW_SIZE..=MAX_HTTP2_WINDOW_SIZE).contains(&parsed) {
                 return Err(range_err(
                     "FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE",
                     parsed,
@@ -317,7 +313,7 @@ impl PoolConfig {
             "FERRUM_POOL_HTTP2_MAX_FRAME_SIZE",
             "a valid u32 integer",
         )? {
-            if parsed < MIN_HTTP2_MAX_FRAME_SIZE || parsed > MAX_HTTP2_MAX_FRAME_SIZE {
+            if !(MIN_HTTP2_MAX_FRAME_SIZE..=MAX_HTTP2_MAX_FRAME_SIZE).contains(&parsed) {
                 return Err(range_err(
                     "FERRUM_POOL_HTTP2_MAX_FRAME_SIZE",
                     parsed,
