@@ -654,9 +654,9 @@ impl ConnectUdpDestinationRefusal {
 ///
 /// Two properties are deliberate:
 ///
-/// * No load-balancer selection is consulted. A CONNECT-UDP tunnel is admitted,
-///   never balanced, so an unrelated member's health, circuit-breaker state, or
-///   transport tags can neither authorize nor refuse the requested destination.
+/// * No load-balancer selection is performed and no selection cursor advances.
+///   Admission does reuse the balancer's health-aware SRV priority boundary so
+///   a client cannot name a standby tier before it becomes reachable.
 /// * The screening runs over EVERY matching target, not the first one. An
 ///   upstream may legitimately list one `host:port` more than once (differing
 ///   weights, localities, or subsets), and a direct duplicate must not launder a
@@ -666,6 +666,17 @@ pub fn admit_connect_udp_destination(
     lb_snapshot: &crate::load_balancer::LoadBalancerCacheInner,
     host: &str,
     port: u16,
+) -> Result<AdmittedConnectUdpDestination, ConnectUdpDestinationRefusal> {
+    admit_connect_udp_destination_with_health(proxy, lb_snapshot, host, port, None)
+}
+
+/// Health-aware CONNECT-UDP admission used by the live request path.
+pub fn admit_connect_udp_destination_with_health(
+    proxy: &Proxy,
+    lb_snapshot: &crate::load_balancer::LoadBalancerCacheInner,
+    host: &str,
+    port: u16,
+    health: Option<&crate::load_balancer::HealthContext<'_>>,
 ) -> Result<AdmittedConnectUdpDestination, ConnectUdpDestinationRefusal> {
     let Some(upstream_id) = proxy.upstream_id.as_deref() else {
         return if proxy.backend_port == port && proxy.backend_host.eq_ignore_ascii_case(host) {
@@ -679,6 +690,16 @@ pub fn admit_connect_udp_destination(
     else {
         return Err(ConnectUdpDestinationRefusal::NotConfigured);
     };
+    if !LoadBalancerCache::is_srv_priority_eligible_from(
+        lb_snapshot,
+        &proxy.namespace,
+        upstream_id,
+        host,
+        port,
+        health,
+    ) {
+        return Err(ConnectUdpDestinationRefusal::NotConfigured);
+    }
 
     let mut admitted: Option<&UpstreamTarget> = None;
     for target in &upstream.targets {
@@ -721,6 +742,16 @@ pub fn destination_is_configured(
     port: u16,
 ) -> bool {
     admit_connect_udp_destination(proxy, lb_snapshot, host, port).is_ok()
+}
+
+fn destination_is_configured_with_health(
+    proxy: &Proxy,
+    lb_snapshot: &crate::load_balancer::LoadBalancerCacheInner,
+    host: &str,
+    port: u16,
+    health: Option<&crate::load_balancer::HealthContext<'_>>,
+) -> bool {
+    admit_connect_udp_destination_with_health(proxy, lb_snapshot, host, port, health).is_ok()
 }
 
 /// Whether a live route still pins the tunnel's destination address the way the
@@ -1877,8 +1908,23 @@ pub(crate) async fn handle_h3_connect_udp(
     // target's own transport requirement is screened, so a destination that
     // must ride HBONE, sidecar mTLS, an east-west cross-cluster leg, or a Unix
     // socket is never tunnelled over a direct UDP dial.
-    let destination =
-        admit_connect_udp_destination(&proxy, &epoch.load_balancer, &target.host, target.port);
+    let upstream_id = proxy.upstream_id.as_deref();
+    let health_ctx = upstream_id.map(|upstream_id| {
+        crate::proxy::backend_dispatch::health_context_for_selection(
+            &proxy,
+            &state.health_checker,
+            &epoch.load_balancer,
+            upstream_id,
+            None,
+        )
+    });
+    let destination = admit_connect_udp_destination_with_health(
+        &proxy,
+        &epoch.load_balancer,
+        &target.host,
+        target.port,
+        health_ctx.as_ref(),
+    );
     let admitted = match destination {
         Ok(admitted) => admitted,
         Err(refusal) => {
@@ -2889,11 +2935,21 @@ async fn relay(
                     // cross-cluster / Unix dispatch for this destination
                     // withdraws the live direct-UDP tunnel instead of letting it
                     // outlive the policy that would now refuse it.
-                    if !destination_is_configured(
+                    let live_health_ctx = live.upstream_id.as_deref().map(|upstream_id| {
+                        crate::proxy::backend_dispatch::health_context_for_selection(
+                            live,
+                            &state.health_checker,
+                            &current.load_balancer,
+                            upstream_id,
+                            None,
+                        )
+                    });
+                    if !destination_is_configured_with_health(
                         live,
                         &current.load_balancer,
                         &target.host,
                         target.port,
+                        live_health_ctx.as_ref(),
                     ) {
                         break SessionEnd::RouteWithdrawn;
                     }

@@ -19,10 +19,11 @@ use ferrum_edge::http3::connect_udp::{
     CONNECT_UDP_NON_FRAGMENTATION_ENFORCEABLE, CapsuleDecodeError, CapsuleDecoder, CapsuleEvent,
     ConnectUdpDestinationRefusal, ConnectUdpRequestRejection, ConnectUdpTargetRejection,
     H3ExtendedConnect, RelayDirection, SendHalfTeardownJoin, SessionEnd, StreamCloseKind,
-    UdpRecvFault, UdpSendFault, admit_connect_udp_destination, classify_h3_extended_connect,
-    classify_relay_join, classify_send_half_teardown, classify_udp_recv_error,
-    classify_udp_send_error, destination_is_configured, dns_override_pin_unchanged,
-    encode_udp_datagram_capsule, first_forbidden_capsule_protocol_field, parse_connect_udp_target,
+    UdpRecvFault, UdpSendFault, admit_connect_udp_destination,
+    admit_connect_udp_destination_with_health, classify_h3_extended_connect, classify_relay_join,
+    classify_send_half_teardown, classify_udp_recv_error, classify_udp_send_error,
+    destination_is_configured, dns_override_pin_unchanged, encode_udp_datagram_capsule,
+    first_forbidden_capsule_protocol_field, parse_connect_udp_target,
     reconcile_authorization_teardown, resolve_send_half_close_command,
     strip_forbidden_capsule_protocol_response_fields, validate_connect_udp_request_shape,
 };
@@ -460,6 +461,39 @@ fn admission_returns_the_requested_member_never_a_balanced_one() {
             }
         }
     }
+}
+
+#[test]
+fn dns_sd_standby_tier_is_not_admitted_while_primary_is_healthy() {
+    let priority_tag = ferrum_edge::_test_support::srv_priority_tag_for_test();
+    let upstream = upstream_from_json(serde_json::json!({
+        "id": "dns-sd-pool",
+        "targets": [
+            {
+                "host": "primary.internal",
+                "port": 5353,
+                "tags": { (priority_tag): "10" }
+            },
+            {
+                "host": "standby.internal",
+                "port": 5353,
+                "tags": { (priority_tag): "20" }
+            }
+        ]
+    }));
+    let cache = lb_cache(vec![upstream]);
+    let guard = cache.load();
+    let proxy = upstream_proxy("dns-sd-pool");
+
+    assert!(
+        admit_connect_udp_destination_with_health(&proxy, &guard, "primary.internal", 5353, None,)
+            .is_ok()
+    );
+    assert_eq!(
+        admit_connect_udp_destination_with_health(&proxy, &guard, "standby.internal", 5353, None,)
+            .unwrap_err(),
+        ConnectUdpDestinationRefusal::NotConfigured,
+    );
 }
 
 #[test]
