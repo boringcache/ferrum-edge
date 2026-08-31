@@ -534,14 +534,8 @@ fn test_from_env_explicit_defaults_match_today() {
         || {
             let parsed = parse_pool().expect("documented defaults must parse");
             let default = PoolConfig::default();
-            assert_eq!(
-                parsed.max_idle_per_host,
-                default.max_idle_per_host
-            );
-            assert_eq!(
-                parsed.idle_timeout_seconds,
-                default.idle_timeout_seconds
-            );
+            assert_eq!(parsed.max_idle_per_host, default.max_idle_per_host);
+            assert_eq!(parsed.idle_timeout_seconds, default.idle_timeout_seconds);
             assert_eq!(
                 parsed.enable_http_keep_alive,
                 default.enable_http_keep_alive
@@ -551,10 +545,7 @@ fn test_from_env_explicit_defaults_match_today() {
                 parsed.http2_connections_per_host,
                 default.http2_connections_per_host
             );
-            assert_eq!(
-                parsed.tcp_keepalive_seconds,
-                default.tcp_keepalive_seconds
-            );
+            assert_eq!(parsed.tcp_keepalive_seconds, default.tcp_keepalive_seconds);
             assert_eq!(
                 parsed.http2_keep_alive_interval_seconds,
                 default.http2_keep_alive_interval_seconds
@@ -571,14 +562,8 @@ fn test_from_env_explicit_defaults_match_today() {
                 parsed.http2_initial_connection_window_size,
                 default.http2_initial_connection_window_size
             );
-            assert_eq!(
-                parsed.http2_adaptive_window,
-                default.http2_adaptive_window
-            );
-            assert_eq!(
-                parsed.http2_max_frame_size,
-                default.http2_max_frame_size
-            );
+            assert_eq!(parsed.http2_adaptive_window, default.http2_adaptive_window);
+            assert_eq!(parsed.http2_max_frame_size, default.http2_max_frame_size);
             assert_eq!(
                 parsed.http2_max_concurrent_streams,
                 default.http2_max_concurrent_streams
@@ -600,10 +585,7 @@ fn test_from_env_valid_non_default_overlay() {
             ("FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS", "15"),
             ("FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS", "20"),
             ("FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE", "65535"),
-            (
-                "FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE",
-                "65535",
-            ),
+            ("FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE", "65535"),
             ("FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW", "false"),
             ("FERRUM_POOL_HTTP2_MAX_FRAME_SIZE", "16384"),
             ("FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS", "1"),
@@ -657,10 +639,7 @@ fn test_from_env_malformed_values_name_the_variable() {
         ("FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS", "1.5"),
         ("FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS", "abc"),
         ("FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE", "8MiB"),
-        (
-            "FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE",
-            "none",
-        ),
+        ("FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE", "none"),
         ("FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW", "yes"),
         ("FERRUM_POOL_HTTP2_MAX_FRAME_SIZE", "1MB"),
         ("FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS", "unlimited"),
@@ -691,10 +670,7 @@ fn test_from_env_range_boundaries() {
         ("FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS", "1"),
         ("FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE", "65535"),
         ("FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE", "65535"),
-        (
-            "FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE",
-            "134217728",
-        ),
+        ("FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE", "134217728"),
         (
             "FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE",
             "134217728",
@@ -709,9 +685,8 @@ fn test_from_env_range_boundaries() {
     ];
     for (key, value) in accept {
         with_env_vars(&[(*key, *value)], || {
-            parse_pool().unwrap_or_else(|err| {
-                panic!("boundary {key}={value} must be accepted: {err}")
-            });
+            parse_pool()
+                .unwrap_or_else(|err| panic!("boundary {key}={value} must be accepted: {err}"));
         });
     }
 
@@ -720,7 +695,11 @@ fn test_from_env_range_boundaries() {
         ("FERRUM_POOL_MAX_IDLE_PER_HOST", "1025", "1025"),
         ("FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST", "0", "0"),
         ("FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS", "0", "0"),
-        ("FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE", "65534", "65534"),
+        (
+            "FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE",
+            "65534",
+            "65534",
+        ),
         (
             "FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE",
             "65534",
@@ -780,30 +759,23 @@ fn test_from_env_range_boundaries() {
             );
         },
     );
-    with_env_vars(
-        &[("FERRUM_POOL_HTTP2_MAX_FRAME_SIZE", "16384")],
-        || {
-            assert_eq!(
-                parse_pool().expect("min frame").http2_max_frame_size,
-                MIN_HTTP2_MAX_FRAME_SIZE
-            );
-        },
-    );
-    with_env_vars(
-        &[("FERRUM_POOL_HTTP2_MAX_FRAME_SIZE", "1048576")],
-        || {
-            assert_eq!(
-                parse_pool().expect("max frame").http2_max_frame_size,
-                MAX_HTTP2_MAX_FRAME_SIZE
-            );
-        },
-    );
+    with_env_vars(&[("FERRUM_POOL_HTTP2_MAX_FRAME_SIZE", "16384")], || {
+        assert_eq!(
+            parse_pool().expect("min frame").http2_max_frame_size,
+            MIN_HTTP2_MAX_FRAME_SIZE
+        );
+    });
+    with_env_vars(&[("FERRUM_POOL_HTTP2_MAX_FRAME_SIZE", "1048576")], || {
+        assert_eq!(
+            parse_pool().expect("max frame").http2_max_frame_size,
+            MAX_HTTP2_MAX_FRAME_SIZE
+        );
+    });
 }
 
 #[test]
 fn test_from_env_conf_file_value_is_honored() {
-    let conf = ConfFile::parse("FERRUM_POOL_MAX_IDLE_PER_HOST = 32\n")
-        .expect("conf parses");
+    let conf = ConfFile::parse("FERRUM_POOL_MAX_IDLE_PER_HOST = 32\n").expect("conf parses");
     with_env_vars(&[], || {
         let config = PoolConfig::from_env_with_conf(&conf).expect("conf pool");
         assert_eq!(config.max_idle_per_host, 32);
@@ -812,8 +784,7 @@ fn test_from_env_conf_file_value_is_honored() {
 
 #[test]
 fn test_from_env_env_overrides_conf_file() {
-    let conf = ConfFile::parse("FERRUM_POOL_MAX_IDLE_PER_HOST = 32\n")
-        .expect("conf parses");
+    let conf = ConfFile::parse("FERRUM_POOL_MAX_IDLE_PER_HOST = 32\n").expect("conf parses");
     with_env_vars(&[("FERRUM_POOL_MAX_IDLE_PER_HOST", "16")], || {
         let config = PoolConfig::from_env_with_conf(&conf).expect("env wins");
         assert_eq!(config.max_idle_per_host, 16);
@@ -824,13 +795,12 @@ fn test_from_env_env_overrides_conf_file() {
 fn test_env_config_rejects_flase_http2_flag() {
     // Regression for the issue #4428 reproduction: a typo used to silently
     // enable HTTP/2 and `ferrum-edge validate` still exited 0.
-    let conf = ConfFile::parse(
-        "FERRUM_MODE = file\nFERRUM_FILE_CONFIG_PATH = /tmp/ferrum-test.yaml\n",
-    )
-    .expect("conf parses");
+    let conf =
+        ConfFile::parse("FERRUM_MODE = file\nFERRUM_FILE_CONFIG_PATH = /tmp/ferrum-test.yaml\n")
+            .expect("conf parses");
     with_env_vars(&[("FERRUM_POOL_ENABLE_HTTP2", "flase")], || {
-        let err = EnvConfig::from_env_with_conf(&conf)
-            .expect_err("flase must fail settings validation");
+        let err =
+            EnvConfig::from_env_with_conf(&conf).expect_err("flase must fail settings validation");
         assert!(
             err.contains("FERRUM_POOL_ENABLE_HTTP2"),
             "validate error must name the variable: {err}"
