@@ -6,6 +6,12 @@ This document describes how to safely upgrade Ferrum Edge between versions with 
 
 Every current `[Unreleased]` `BREAKING` changelog entry is listed here exactly once, with its issue number and the operator action that entry already states. Several of these fail **silently** at cutover (HMAC clients get `401`, WAF `literal` rules stop matching folded spellings, backends stop seeing client-supplied XFF hops) rather than refusing config load. Read this section before the per-mode procedures below.
 
+### Opaque-TLS SNI admission refusals classify as `dispatch_policy_rejected` / `gateway_policy` (issue [#4407](https://github.com/ferrum-edge/ferrum-edge/issues/4407))
+
+Fail-closed opaque-TLS SNI admission (plaintext on an SNI port, ClientHello timeout / incomplete / malformed hello, unmatched SNI with no catch-all) still RSTs the client and still does not dial or charge a backend. The `StreamTransactionSummary` taxonomy is what changed: those refusals previously logged `error_class=connection_refused` with `disconnect_cause=backend_error` / `disconnect_direction=backend_to_client` (or unmatched SNI as `request_error` / `recv_error`) even though `backend_target` was empty. They now log `error_class=dispatch_policy_rejected`, `disconnect_cause=gateway_policy`, and `disconnect_direction=unknown`. Real backend connect refusals remain `connection_refused`.
+
+**Operator action:** retarget alerts and dashboards that keyed opaque-TLS SNI scanner/plaintext/slow-hello noise on `connection_refused` or `backend_error` to `dispatch_policy_rejected` / `gateway_policy`.
+
 ### Injected Ferrum is a Kubernetes native sidecar (issue [#4430](https://github.com/ferrum-edge/ferrum-edge/issues/4430))
 
 The injector no longer appends Ferrum as an ordinary `spec.containers` entry. New pods receive a native sidecar (`spec.initContainers` with `restartPolicy: Always`) and exec probes against loopback `/health`. That is also what unblocks Kubernetes Job completion. **Minimum Kubernetes version is 1.29** (native sidecars enabled by default; 1.28 needs `SidecarContainers=true`). There is no ordinary-container fallback: the webhook always emits the native-sidecar shape, and a cluster older than that will reject the patched Pod.
