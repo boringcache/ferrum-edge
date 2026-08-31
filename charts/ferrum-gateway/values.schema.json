@@ -283,7 +283,7 @@
           "description": "Maximum applied-snapshot age while every CP is unreachable (FERRUM_DP_CONFIG_MAX_STALE_SECONDS). 0 disables the bound (unsafe). Empty string or null omits the env and uses the binary default (3600).",
           "oneOf": [
             { "type": "integer", "minimum": 0 },
-            { "type": "string", "pattern": "^[0-9]+$" },
+            { "type": "string", "pattern": "^([0-9]+)?$" },
             { "type": "null" }
           ]
         },
