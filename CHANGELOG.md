@@ -121,6 +121,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   admission rather than leaving the probe captured. Explicit
   `excludeInboundPorts` annotations and `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS`
   still win.
+- **Outbound direct-H2 and native-gRPC `Host` now matches `:authority` on
+  non-default ports** (issue #4410). Ferrum previously stamped a hostname-only
+  `Host` (`127.0.0.1`) while Hyper derived `:authority` from the backend URI
+  including the port (`127.0.0.1:21212`). RFC 9113 §8.3.1 forbids that
+  disagreement; RFC-compliant H2 origins reset the stream and the client saw
+  502 `backend_error` or gRPC UNAVAILABLE(14). Default ports (80 for
+  `http`/`ws`, 443 for `https`/`wss`) are still omitted from both. When
+  `preserve_host_header` is true on the direct-H2 pool (and native-gRPC Direct
+  transport), the client Host is honoured by rewriting the outbound URI
+  authority so `:authority` agrees, but only after `split_request_authority`
+  admits it: userinfo (`user@host`, `user:pass@host:8443`), paths, empty or
+  whitespace-only values, unbracketed IPv6, and opaque `[not-an-ip]`
+  literals are ignored and both fields fall back to the backend URI
+  authority. Native-gRPC mesh-mTLS / HBONE dispatch keeps authority
+  resolution in `resolve_backend_uri`: a pinned `mesh.mtls_authority_host`
+  (and its mesh service port) wins over `preserve_host_header`, and Host is
+  then synced from that URI without a second preserve rewrite.
+  **Operator action**: on direct-H2 and native-gRPC Direct routes with
+  `preserve_host_header: true`, the backend's `:authority` changes from the
+  backend authority to the client's Host when that Host is a valid
+  authority; an invalid client Host is ignored. Many HTTP/2 servers
+  synthesize their `Host`/virtual-host decision from `:authority` and ignore
+  a separate `Host` header, so such a backend was previously routing on the
+  backend authority despite `preserve_host_header` being on, and will now
+  route on the client's Host — which is what the setting asks for. Re-check
+  backend virtual-host routing on those routes, or set
+  `preserve_host_header: false` to keep the backend authority in both
+  fields. Mesh-mTLS routes with a pinned service authority are unchanged:
+  the peer still sees the mesh service host and port.
 
 - **Linux GNU release ABI floor is now GLIBC_2.34** (issue #4301). Generic
   `ferrum-edge-linux-{x86_64,aarch64}` and `ferrum-cni-linux-{x86_64,aarch64}`
