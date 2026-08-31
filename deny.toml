@@ -152,4 +152,13 @@ allow = [
     "Unlicense",
     "OpenSSL",
     "BSL-1.0",
+    # MIT No Attribution: MIT without the attribution clause, so strictly more
+    # permissive than the "MIT" already allowed above. OSI approved.
+    # Reached through borrow-or-share -> fluent-uri -> referencing.
+    "MIT-0",
+    # Community Data License Agreement Permissive 2.0. The license Mozilla's CA
+    # root store data ships under; it is a permissive DATA license with no
+    # copyleft and no attribution requirement, and it reaches us only as the
+    # baked-in root certificates in webpki-roots / webpki-root-certs.
+    "CDLA-Permissive-2.0",
 ]
