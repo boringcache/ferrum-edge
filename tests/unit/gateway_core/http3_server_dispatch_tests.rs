@@ -5034,7 +5034,8 @@ fn h3_backend_response_field_section_size_is_finite_and_distinct() {
         h3_backend_response_max_field_section_size(usize::MAX),
         H3_BACKEND_RESPONSE_FIELD_SECTION_SIZE_CAP
     );
-    assert!(H3_BACKEND_RESPONSE_FIELD_SECTION_SIZE_CAP < 32 * 32_768);
+    let max_fields = h3_backend_response_max_field_section_size(usize::MAX) / 32;
+    assert!(max_fields < 32_768);
 }
 
 /// A header policy whose derived H3 limits could not be represented as QUIC

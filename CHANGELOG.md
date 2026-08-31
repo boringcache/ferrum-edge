@@ -41,6 +41,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Security — hostile H3 backend responses cannot panic the gateway via QPACK
+  expansion** (issue #4261 follow-up). Pooled H3 backend clients inherited the
+  vendored `h3::client` default `max_field_section_size` of `VarInt::MAX`, so a
+  compact encoded HEADERS block of 1-byte static-table references could expand
+  into enough decoded fields to panic `http::HeaderMap` at its fixed
+  32,768-entry limit (QPACK accounts 32 bytes per decoded field). Backend
+  clients now set a distinct decoded response ceiling of
+  `min(2× the frontend field-section policy, 1 MiB − 1)` alongside the
+  existing encoded non-`DATA` frame ceiling.
+
 - **Injector inbound capture excludes kubelet HTTP and TCP probe ports**
   (issue #4431). `startupProbe` / `readinessProbe` / `livenessProbe` `httpGet`
   and `tcpSocket` ports on every container in the pod are unioned into the
