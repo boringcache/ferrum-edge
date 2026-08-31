@@ -41,6 +41,37 @@ RFC 9113 §8.3.1 and RFC 9114 §4.3.1 require either `:authority` or Host. Ferru
 
 **Operator action:** any HTTP/2 or HTTP/3 client that omitted both `:authority` and Host will start seeing `400` `{"error":"Request is missing both :authority and Host"}` instead of being routed. Send `:authority` or Host.
 
+### Configured `jwks_auth` audiences and issuer require the claim to be present (issue [#4264](https://github.com/ferrum-edge/ferrum-edge/issues/4264))
+
+The shared JWT verifier used by `jwks_auth`, OIDC, and mesh `RequestAuthentication` translation now adds `iss` and `aud` to `required_spec_claims` whenever those restrictions are configured. `jsonwebtoken` previously rejected only a *mismatching* claim, so a correctly signed token with no `aud` (or no `iss`) authenticated against every provider fronting the same IdP regardless of the configured audience — a silent `401` at cutover for existing clients. Mesh rules with `audiences` now refuse aud-less tokens before staging `mesh.request_principal` or `request.auth.audiences`. `jwks_auth` and CP/DP gRPC also enable `validate_nbf`; a present future `nbf` is rejected under each surface's leeway. Unconfigured audiences are unchanged: tokens without `aud` still pass; a token that carries `aud` is still rejected when no acceptable audience is configured.
+
+**Operator action:** ensure every client mints an `aud` (and `iss` when the provider pins one) that matches the configured restriction, or remove the restriction if aud-less tokens are intentional.
+
+### Credentialed CORS refuses effectively universal prefix/regex matchers at config load (issue [#4269](https://github.com/ferrum-edge/ferrum-edge/issues/4269))
+
+The wildcard-plus-credentials interlock previously inspected only the `AllowedOrigins::Wildcard` variant, so Istio-style matchers such as `{"prefix": "https://"}`, `{"regex": ".*"}`, or `{"prefix": "h"}` with `allow_credentials: true` reflected any matching origin with `Access-Control-Allow-Credentials: true`. Breadth is now classified once at construction and the same predicate drives the credentials interlock, `uses_strict_origin_policy()`, and Istio/mesh admission; universal prefix/regex plus credentials is refused rather than silently weakened. In file mode this is refuse-to-start. Exact `*` still drops credentials per the documented contract.
+
+**Operator action:** narrow `allowed_origins` to a host-constraining prefix or regex, or set `allow_credentials: false` if a universal matcher is required.
+
+### CRL validity windows and full-chain revocation are enforced (issues [#4297](https://github.com/ferrum-edge/ferrum-edge/issues/4297) / [#4298](https://github.com/ferrum-edge/ferrum-edge/issues/4298))
+
+Every CRL-enabled verifier now routes through a shared policy module. Admission refuses CRLs whose `thisUpdate` is in the future, whose `nextUpdate` is absent, or whose `nextUpdate` has passed; there is no `allow_expired` escape. Handshake verification enables rustls's default full-chain revocation depth (leaf-only checking removed) and `enforce_revocation_expiration()`, so a revoked intermediate stops authenticating the certificates it issued and an expired CRL stops authorizing new handshakes. `allow_unknown_revocation_status()` is retained: a chain with no applicable configured CRL is still accepted.
+
+**Operator action:** publish fresh CRLs with a valid `nextUpdate` before expiry, and expect clients signed by a revoked intermediate to be rejected even when the leaf is not listed.
+
+### `trusted_hbone_assertors` entries carry an `AssertionGrant` (issue [#4274](https://github.com/ferrum-edge/ferrum-edge/issues/4274))
+
+Bare service-account matchers (`"ztunnel"`, `"waypoint"`) now default to `SameNamespace`, so an Istio ambient `ztunnel` in `istio-system` can no longer assert application-namespace identities. Object forms support an exact `asserts` inventory or explicit `scope: same_namespace` / `scope: mesh_wide` (the latter requires an exact SPIFFE assertor pin and logs a construction warning). `mesh_authz` and `workload_metrics` share the same compiled relation; there is no global compatibility switch restoring namespace-blind behavior.
+
+**Operator action:** pin the exact assertor SPIFFE ID and either the exact fronted identities or `scope: mesh_wide` when a ztunnel/waypoint must assert cross-namespace workloads. Example:
+
+```yaml
+trusted_hbone_assertors:
+  - assertor: "spiffe://cluster.local/ns/istio-system/sa/ztunnel"
+    asserts:
+      - "spiffe://cluster.local/ns/prod/sa/payments"
+```
+
 ### Ambient pod-registry migration proofs require canonical entries (issue [#4249](https://github.com/ferrum-edge/ferrum-edge/issues/4249))
 
 Durable Ambient UDP placement cleanup now reads the same strict, bounded,
@@ -59,6 +90,51 @@ stale hand-authored pod-registry artifacts and let the node-agent regenerate
 every pod entry. Any external publisher must use only the documented leaf and
 body grammar; otherwise cleanup/finalize remains fail-closed.
 
+### Ferrum-owned UDP policy CRD now upgrades with the mesh chart (issue [#4443](https://github.com/ferrum-edge/ferrum-edge/issues/4443))
+
+`UDPResponseAmplificationPolicy` moved out of Helm's install-once `crds/`
+directory into `charts/ferrum-mesh/templates/crds-udpresponseamplificationpolicy.yaml`
+gated by `crds.install` (default `true`). A cluster installed at an older chart
+version kept the obsolete schema through every successful `helm upgrade`
+because Helm never updates `crds/`. The live CRD is stamped with
+`gateway.ferrum.io/crd-schema-version: v1alpha1-1`. Compare:
+
+```bash
+kubectl get crd udpresponseamplificationpolicies.gateway.ferrum.io \
+  -o jsonpath='{.metadata.annotations.gateway\.ferrum\.io/crd-schema-version}'
+```
+
+Uninstall keeps the CRD (`helm.sh/resource-policy: keep`) so policy objects are
+not cascade-deleted. `crds.install=false` without
+`crds.skipInstallAcknowledged=true` fails render.
+
+A CRD that already exists from the former `crds/` directory is not in the Helm
+release. The first upgrade to this chart fails closed unless you adopt it.
+
+**Operator action:** before the first `helm upgrade` to this chart version on a
+cluster that already has `udpresponseamplificationpolicies.gateway.ferrum.io`:
+
+```bash
+helm upgrade <release> ./charts/ferrum-mesh -n <namespace> \
+  --take-ownership --set crds.adoptExisting=true
+```
+
+Helm 3.14+ is required for `--take-ownership`. After adoption, leave
+`crds.install=true` and drop `crds.adoptExisting`. Do not set
+`crds.install=false` to silence the error.
+
+### Enabled mesh injector requires a webhook CA trust source (issue [#4433](https://github.com/ferrum-edge/ferrum-edge/issues/4433))
+
+`injector.enabled=true` with empty `injector.caBundle` previously omitted
+`clientConfig.caBundle` while keeping `failurePolicy: Fail`. Kubernetes could
+not authenticate the webhook, so admission for the matched scope failed closed.
+Helm now requires exactly one of `injector.caBundle` (base64 PEM) or
+`injector.certManager.injectCaFrom` (`namespace/certificate-name`). The chart
+never changes `failurePolicy` to `Ignore` to make a broken webhook render.
+
+**Operator action:** set `injector.caBundle` or
+`injector.certManager.injectCaFrom` before enabling the injector. `helm
+template` / `helm upgrade` fail until one trust source is set.
 ### `preserve_host_header` now sets `:authority` on direct-H2 and gRPC backends (issue [#4410](https://github.com/ferrum-edge/ferrum-edge/issues/4410))
 
 Ferrum's outbound direct-H2 and native-gRPC dispatch previously sent a hostname-only `Host` while Hyper derived `:authority` from the full backend URI including a non-default port. RFC 9113 §8.3.1 forbids that disagreement, so RFC-compliant HTTP/2 origins reset the stream and the client saw `502 backend_error` or gRPC `UNAVAILABLE`. Both fields now carry the same authority.
