@@ -41,6 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Injector inbound capture excludes kubelet HTTP and TCP probe ports**
+  (issue #4431). `startupProbe` / `readinessProbe` / `livenessProbe` `httpGet`
+  and `tcpSocket` ports on every container in the pod are unioned into the
+  inbound exclusion set (named ports resolve against that container's
+  `ports`). `exec` and `grpc` probes are skipped. Unresolved named ports fail
+  admission rather than leaving the probe captured. Explicit
+  `excludeInboundPorts` annotations and `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS`
+  still win.
 - **Outbound direct-H2 and native-gRPC `Host` now matches `:authority` on
   non-default ports** (issue #4410). Ferrum previously stamped a hostname-only
   `Host` (`127.0.0.1`) while Hyper derived `:authority` from the backend URI
@@ -88,6 +96,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `libz.so.1`.
 
 ### Changed
+
+- **BREAKING — injected Ferrum is a Kubernetes native sidecar**
+  (issue #4430). The webhook now emits `ferrum-edge` under `spec.initContainers`
+  with `restartPolicy: Always`, plus exec startup and readiness probes against
+  loopback `/health` (not `/live`). Capture rules (`ferrum-edge-init`) run
+  after that startup probe succeeds, so application traffic is not redirected
+  at a proxy that is not listening, and injected Jobs can complete. **Minimum
+  Kubernetes version is 1.29** (native sidecars enabled by default; 1.28
+  requires the `SidecarContainers` feature gate). There is no
+  ordinary-container fallback. **Operator action**: run the injector only on
+  Kubernetes 1.29+ (or 1.28 with the feature gate), then roll injected
+  workloads so new pods pick up the native-sidecar shape; pods that still
+  carry Ferrum in `spec.containers` must be recreated.
 
 - **BREAKING — `ferrum-gateway` `mode=cp` disables the in-cluster K8s controller**
   (issue #4384). The binary still defaults `FERRUM_K8S_CONTROLLER_ENABLED` and
