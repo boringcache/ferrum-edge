@@ -33,6 +33,22 @@ RFC 9113 §8.3.1 and RFC 9114 §4.3.1 require either `:authority` or Host. Ferru
 
 **Operator action:** any HTTP/2 or HTTP/3 client that omitted both `:authority` and Host will start seeing `400` `{"error":"Request is missing both :authority and Host"}` instead of being routed. Send `:authority` or Host.
 
+### HTTP 5xx log `error_class` matches `X-Gateway-Error` (issue [#4397](https://github.com/ferrum-edge/ferrum-edge/issues/4397))
+
+HTTP-family 5xx access logs now emit the closed `X-Gateway-Error` token
+instead of the granular `ErrorClass::as_str` spelling. A refused connect that
+used to log `error_class=connection_refused` logs `connection_failure`.
+Gateway-authored 503s log `overload`, `config_stale`, `concurrency_limit`, or
+`circuit_breaker_open`. `ferrum_requests_total` adds that same optional label
+on 5xx only (omitted on 2xx). Stream logs and `ferrum_stream_disconnects_total`
+keep `ErrorClass::as_str` (`dns_lookup_error`, and so on).
+
+**Operator action:** rewrite HTTP 5xx log alerts that match granular classes
+(`connection_refused`, `dns_lookup_error`, `tls_error`, `connection_timeout`,
+`connection_reset`, `connection_pool_error`, `port_exhaustion`) to
+`connection_failure`. Update PromQL on 5xx `ferrum_requests_total` to allow or
+ignore the new `error_class` label; 2xx series are unchanged.
+
 ### HTTP/1.1 requests without a Host header are rejected with 400 (issue [#4390](https://github.com/ferrum-edge/ferrum-edge/issues/4390))
 
 RFC 9112 §3.2.2 requires a 400 when an HTTP/1.1 request lacks a Host field. Ferrum previously only rejected multiple Host fields, so a Host-less origin-form request skipped exact/wildcard host tiers and could fall through to a catch-all (empty `hosts`) route. `check_protocol_headers()` now rejects HTTP/1.1 when both the Host field and the URI authority are absent. HTTP/1.0 still does not require Host. Absolute-form request-targets that already carry an authority are accepted without a Host field. An empty Host value (`Host:` with no tokens) is treated as present-but-invalid and also returns 400 on HTTP/1.1. HTTP/2 and HTTP/3 are unchanged.

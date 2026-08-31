@@ -384,6 +384,39 @@ fn test_summary_json_contains_error_class_when_present() {
 }
 
 #[test]
+fn test_summary_json_http_5xx_uses_x_gateway_error_token() {
+    use ferrum_edge::retry::ErrorClass;
+
+    let mut summary = make_full_summary();
+    summary.response_status_code = 502;
+    summary.error_class = Some(ErrorClass::ConnectionRefused);
+    let json = serde_json::to_string(&summary).unwrap();
+    assert!(
+        json.contains(r#""error_class":"connection_failure""#),
+        "HTTP 5xx logs must emit the X-Gateway-Error token, got: {}",
+        json
+    );
+    assert!(
+        !json.contains(r#""error_class":"connection_refused""#),
+        "HTTP 5xx must not keep the granular ErrorClass spelling, got: {}",
+        json
+    );
+
+    summary.response_status_code = 503;
+    summary.error_class = None;
+    summary.metadata.insert(
+        "rejection_phase".to_string(),
+        "overload".to_string(),
+    );
+    let json = serde_json::to_string(&summary).unwrap();
+    assert!(
+        json.contains(r#""error_class":"overload""#),
+        "overload 503 logs must match the header token, got: {}",
+        json
+    );
+}
+
+#[test]
 fn test_error_class_serializes_all_variants() {
     use ferrum_edge::retry::ErrorClass;
 

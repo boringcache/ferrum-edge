@@ -1690,7 +1690,13 @@ Unknown top-level keys are rejected at construction (for example a misspelled `r
 extension/unknown method to `method="OTHER"`, keeping request-controlled method
 cardinality bounded. gRPC transactions retain the HTTP transport status and add
 the terminal numeric `grpc_status` (`0`–`16`, or `OTHER` for malformed/future
-codes), so application failures under HTTP 200 are distinguishable. The
+codes), so application failures under HTTP 200 are distinguishable. HTTP 5xx
+rows add an optional `error_class` label using the closed seven-token
+`X-Gateway-Error` vocabulary (`connection_failure`, `backend_timeout`,
+`backend_error`, `circuit_breaker_open`, `overload`, `config_stale`,
+`concurrency_limit`); 2xx omit the label so the common series is not
+multiplied. `ferrum_stream_disconnects_total` adds the same optional
+`error_class` from `ErrorClass::as_str` (omitted when unset). The
 `ferrum_rate_limit_exceeded_total` process counter aggregates each rejection,
 UDP drop, and WebSocket policy close produced by `rate_limiting`,
 `ai_rate_limiter`, `ws_rate_limiting`, and `udp_rate_limiting`. Process-wide

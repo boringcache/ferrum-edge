@@ -7426,8 +7426,8 @@ impl Serialize for TransactionSummary {
         if self.client_disconnected {
             map.serialize_entry("client_disconnected", &true)?;
         }
-        if let Some(error_class) = self.error_class {
-            map.serialize_entry("error_class", &error_class)?;
+        if let Some(error_class) = self.serialized_error_class() {
+            map.serialize_entry("error_class", error_class)?;
         }
         if let Some(body_error_class) = self.body_error_class {
             map.serialize_entry("body_error_class", &body_error_class)?;
@@ -7475,6 +7475,34 @@ impl TransactionSummary {
             }
             None => None,
         }
+    }
+
+    /// Gateway-authored rejection phase (`circuit_breaker_open`,
+    /// `adaptive_concurrency`, …) when a plugin/fence stamped one. Used to
+    /// intern the HTTP observability token so logs and metrics agree with
+    /// `X-Gateway-Error`.
+    pub fn rejection_phase(&self) -> Option<&str> {
+        self.metadata.get("rejection_phase").map(String::as_str)
+    }
+
+    /// Closed `ferrum_requests_total{error_class}` / `X-Gateway-Error` token.
+    /// `None` on 2xx so the common series is not multiplied.
+    pub fn metrics_error_class_label(&self) -> Option<&'static str> {
+        crate::retry::http_metrics_error_class(
+            self.error_class,
+            self.response_status_code,
+            self.rejection_phase(),
+        )
+    }
+
+    /// Access-log `error_class`: the HTTP observability token on 5xx, else
+    /// the granular [`crate::retry::ErrorClass::as_str`] when present.
+    pub fn serialized_error_class(&self) -> Option<&'static str> {
+        crate::retry::http_log_error_class(
+            self.error_class,
+            self.response_status_code,
+            self.rejection_phase(),
+        )
     }
 
     /// One authoritative terminal-failure predicate for transaction loggers.

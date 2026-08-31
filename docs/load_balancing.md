@@ -638,7 +638,9 @@ When proxying to upstream targets, the gateway adds response headers that help c
 
 ### `X-Gateway-Error`
 
-Set on 5xx responses to categorize the failure:
+Set on 5xx responses to categorize the failure. The same spelling is used as
+the HTTP access-log `error_class` and as `ferrum_requests_total{error_class}`
+(omitted on 2xx). Cardinality is a closed set of seven `&'static str` tokens:
 
 | Value | Meaning |
 |-------|---------|
@@ -646,8 +648,17 @@ Set on 5xx responses to categorize the failure:
 | `backend_timeout` | The backend accepted the connection but did not respond in time (504 Gateway Timeout) |
 | `backend_error` | The backend returned a 5xx error response (500, 502, 503, etc.) |
 | `circuit_breaker_open` | The circuit breaker is open; the gateway returned 503 without contacting a backend |
+| `overload` | Overload manager or drain `reject_new_requests`; the gateway returned 503 without contacting a backend |
+| `config_stale` | Data-plane stale-config fence; the gateway returned 503 without contacting a backend |
+| `concurrency_limit` | `adaptive_concurrency` admission shed; the gateway returned 503 without contacting a backend |
 
-`circuit_breaker_open` is distinct from `backend_error`. An open-breaker 503 never reached a backend, so reusing `backend_error` would make alert rules unable to tell a tripped breaker from a backend that actually returned 5xx. HTTP/1.1, HTTP/2, HTTP/3 (native and H3→HTTP cross-protocol), and HBONE all emit the same vocabulary.
+`circuit_breaker_open`, `overload`, `config_stale`, and `concurrency_limit` are
+distinct from `backend_error`. Those 503s never reached a backend, so reusing
+`backend_error` would make alert rules unable to tell a local shed from a
+backend that actually returned 5xx. HTTP/1.1, HTTP/2, HTTP/3 (native and
+H3→HTTP cross-protocol), and HBONE all emit the same vocabulary on HTTP-family
+JSON 5xx. gRPC H1/H2 UNAVAILABLE trailers-only siblings of the overload and
+stale-config fences are unchanged (they do not carry `X-Gateway-Error`).
 
 ### `X-Gateway-Upstream-Status`
 
@@ -674,6 +685,24 @@ HTTP/1.1 503 Service Unavailable
 X-Gateway-Error: circuit_breaker_open
 ```
 
+**Example: overload / drain reject**
+```
+HTTP/1.1 503 Service Unavailable
+X-Gateway-Error: overload
+```
+
+**Example: stale configuration**
+```
+HTTP/1.1 503 Service Unavailable
+X-Gateway-Error: config_stale
+```
+
+**Example: adaptive concurrency shed**
+```
+HTTP/1.1 503 Service Unavailable
+X-Gateway-Error: concurrency_limit
+```
+
 **Example: successful response (no error headers)**
 ```
 HTTP/1.1 200 OK
@@ -681,10 +710,10 @@ HTTP/1.1 200 OK
 
 ### Use Cases
 
-- **Alerting**: Alert on `X-Gateway-Error: connection_failure` to detect backends that are completely down vs. backends that are slow (`backend_timeout`). Alert on `circuit_breaker_open` to detect a tripped breaker rather than a live backend 5xx (`backend_error`).
+- **Alerting**: Alert on `X-Gateway-Error: connection_failure` to detect backends that are completely down vs. backends that are slow (`backend_timeout`). Alert on `circuit_breaker_open` to detect a tripped breaker rather than a live backend 5xx (`backend_error`). Alert on `overload`, `config_stale`, and `concurrency_limit` to distinguish gateway-authored sheds from backend 503s. The same tokens appear on `ferrum_requests_total{error_class}` for HTTP 5xx.
 - **Client-side retry**: Clients can decide whether to retry based on the error type — connection failures may resolve quickly, while backend errors suggest the service itself is unhealthy.
 - **Dashboards**: Track `X-Gateway-Upstream-Status: degraded` to monitor when upstreams are operating in fallback mode.
-- **Distinguishing gateway vs. backend issues**: A `backend_error` means the backend returned a 5xx — the issue is with the backend. A `connection_failure` means the gateway couldn't reach the backend — the issue may be network, DNS, or the backend process is down. A `circuit_breaker_open` means the gateway short-circuited the request locally.
+- **Distinguishing gateway vs. backend issues**: A `backend_error` means the backend returned a 5xx — the issue is with the backend. A `connection_failure` means the gateway couldn't reach the backend — the issue may be network, DNS, or the backend process is down. A `circuit_breaker_open`, `overload`, `config_stale`, or `concurrency_limit` means the gateway short-circuited the request locally.
 
 ## Retry Logic
 

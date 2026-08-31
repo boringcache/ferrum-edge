@@ -573,7 +573,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_request_mirror_drain_truncations_total` | counter | `namespace` | `request_mirror` | `documented_only` | `always` | request_mirror responses truncated at max_response_body_bytes during bounded drain. |
 | `ferrum_request_mirror_request_failures_total` | counter | `namespace` | `request_mirror` | `documented_only` | `always` | request_mirror pre-response transport failures (DNS, refused, reset, TLS, …). |
 | `ferrum_request_mirror_request_timeouts_total` | counter | `namespace` | `request_mirror` | `documented_only` | `always` | request_mirror request-phase deadline expiries (connect/headers/body). |
-| `ferrum_requests_total` | counter | `proxy_id`, `method`, `status_code`, `grpc_status`, `namespace` | `prometheus_metrics` | `dashboard` | `always` | Total number of requests processed. |
+| `ferrum_requests_total` | counter | `proxy_id`, `method`, `status_code`, `grpc_status`, `error_class`, `namespace` | `prometheus_metrics` | `dashboard` | `always` | Total number of requests processed. |
 | `ferrum_service_discovery_body_budget_rejected_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery HTTP responses rejected because the concurrent body budget was exhausted. |
 | `ferrum_service_discovery_cursor_advance_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery blocking-query cursor advances after an admitted higher-index snapshot. |
 | `ferrum_service_discovery_cursor_rollback_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery blocking-query cursor rollbacks after an admitted lower-index snapshot. |
@@ -600,7 +600,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_service_discovery_tasks_stopped_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery tasks stopped because their upstream no longer configures service discovery. |
 | `ferrum_service_discovery_tasks_withdrawn` | gauge | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery tasks whose discovered targets are currently withdrawn by the staleness policy. |
 | `ferrum_stream_connections_total` | counter | `proxy_id`, `protocol`, `namespace` | `stream` | `dashboard` | `conditional` | Total stream connections (TCP/UDP). |
-| `ferrum_stream_disconnects_total` | counter | `proxy_id`, `protocol`, `cause`, `direction`, `namespace` | `stream` | `dashboard` | `conditional` | Stream disconnects (TCP/UDP) by cause and direction. |
+| `ferrum_stream_disconnects_total` | counter | `proxy_id`, `protocol`, `cause`, `direction`, `error_class`, `namespace` | `stream` | `dashboard` | `conditional` | Stream disconnects (TCP/UDP) by cause, direction, and optional error_class. |
 | `ferrum_stream_duration_ms` | histogram | `proxy_id`, `le`, `namespace` | `stream` | `documented_only` | `conditional` | Stream connection duration in milliseconds. |
 | `ferrum_tls_cert_expiry_seconds` | gauge | `cert_id`, `surface`, `source_kind`, `namespace` | `tls` | `alert` | `conditional` | Seconds until the certificate leaf not_after timestamp. Negative means expired. |
 | `ferrum_tls_cert_not_before_seconds` | gauge | `cert_id`, `surface`, `source_kind`, `namespace` | `tls` | `documented_only` | `conditional` | Certificate leaf not_before timestamp as Unix seconds. |

@@ -41,6 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Gateway-authored HTTP 503s now set `X-Gateway-Error`** (issues #4396,
+  #4399). The DP stale-config fence (`config_stale`), overload/drain
+  `reject_new_requests` (`overload`), and `adaptive_concurrency` admission
+  shed (`concurrency_limit`) were using `build_response()` / empty header
+  maps and omitted the header that backend-failure 5xx already set. Existing
+  tokens `backend_error` / `connection_failure` / `backend_timeout` /
+  `circuit_breaker_open` keep their spellings.
+
 - **Linux GNU release ABI floor is now GLIBC_2.34** (issue #4301). Generic
   `ferrum-edge-linux-{x86_64,aarch64}` and `ferrum-cni-linux-{x86_64,aarch64}`
   artifacts previously linked against whatever glibc `ubuntu-latest` shipped
@@ -68,6 +76,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `libz.so.1`.
 
 ### Changed
+
+- **BREAKING — HTTP 5xx access-log `error_class` matches `X-Gateway-Error`**
+  (issue #4397). A 502 from `ConnectionRefused` now logs
+  `error_class=connection_failure` (the same token as the header and as
+  `ferrum_requests_total{error_class}`), not the granular
+  `connection_refused`. Gateway-authored 503s log `overload`,
+  `config_stale`, `concurrency_limit`, or `circuit_breaker_open`. Non-5xx
+  HTTP logs and stream logs still emit `ErrorClass::as_str`.
+  **Operator action**: rewrite HTTP 5xx log alerts that match
+  `connection_refused` / `dns_lookup_error` / `tls_error` /
+  `connection_timeout` / `connection_reset` / `connection_pool_error` /
+  `port_exhaustion` to `connection_failure`; keep those granular spellings
+  for stream logs and for non-5xx HTTP rows.
+
+- **`ferrum_requests_total` and `ferrum_stream_disconnects_total` gain
+  optional `error_class`** (issue #4397). HTTP 5xx use the seven-token
+  `X-Gateway-Error` set; 2xx omit the label. Stream disconnects use
+  `ErrorClass::as_str` (19 variants) and omit the label when unset. Values
+  are interned `&'static str` — never an error message.
+  **Operator action**: PromQL on 5xx `ferrum_requests_total` must allow or
+  ignore the new `error_class` label; 2xx series are unchanged. Helm
+  dashboards under `charts/` are not updated in this change.
 
 - **BREAKING — `ferrum-gateway` `mode=cp` disables the in-cluster K8s controller**
   (issue #4384). The binary still defaults `FERRUM_K8S_CONTROLLER_ENABLED` and

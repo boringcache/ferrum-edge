@@ -205,6 +205,33 @@ Two summary types in [`src/plugins/mod.rs`](../src/plugins/mod.rs) carry classif
 
 `disconnect_cause` and `disconnect_direction` agree by construction: both consult the same typed kind (when present) and apply the same class-driven fallback (when absent). Adding a new `ErrorClass` variant requires updating both class-fallback arms in lockstep — the exhaustive `match` on `ErrorClass` makes this a compile error rather than a silent miscategorisation.
 
+## HTTP observability vocabulary (`X-Gateway-Error`)
+
+HTTP-family 5xx use one closed seven-token spelling on three surfaces:
+`X-Gateway-Error`, the access-log `error_class`, and
+`ferrum_requests_total{error_class}`:
+
+| Token | When |
+|---|---|
+| `connection_failure` | Pre-wire connect/DNS/TLS failure (502) |
+| `backend_timeout` | Backend accepted the connection but timed out (504) |
+| `backend_error` | Backend returned 5xx, or a post-wire 5xx without a more specific token |
+| `circuit_breaker_open` | Open-breaker 503; never reached a backend |
+| `overload` | Overload/drain `reject_new_requests` 503 |
+| `config_stale` | DP stale-config fence 503 |
+| `concurrency_limit` | `adaptive_concurrency` admission 503 |
+
+Do not reuse `backend_error` for a response that never reached a backend.
+2xx omit the metrics label. Stream disconnects keep the granular
+`ErrorClass::as_str` values (19 compiled-in variants) and add that optional
+label on `ferrum_stream_disconnects_total`.
+
+HTTP 5xx logs collapse the in-memory `ErrorClass` (for example
+`connection_refused`) onto the matching `X-Gateway-Error` token
+(`connection_failure`). Non-5xx logs still emit `ErrorClass::as_str`
+(`client_disconnect`, `connection_timeout` on a synthetic 2xx, and so on).
+Stream logs are unchanged.
+
 ## Adding a new error path
 
 When you add a dispatcher or a new failure mode:
@@ -216,7 +243,7 @@ When you add a dispatcher or a new failure mode:
 
 ## Example log output
 
-When a backend connection times out, the `TransactionSummary` JSON includes the proxy identity (so dashboards can attribute the failure to the right route) plus the typed `error_class`. `proxy_id` / `proxy_name` use the same JSON keys here as on `StreamTransactionSummary`, so log queries don't need to branch on protocol family:
+When a backend connection is refused, the `TransactionSummary` JSON includes the proxy identity (so dashboards can attribute the failure to the right route) plus the HTTP observability `error_class`. `proxy_id` / `proxy_name` use the same JSON keys here as on `StreamTransactionSummary`, so log queries don't need to branch on protocol family:
 
 ```json
 {
@@ -229,7 +256,7 @@ When a backend connection times out, the `TransactionSummary` JSON includes the 
   "backend_target": "https://upstream.internal:8443/api/v1/users",
   "backend_resolved_ip": "10.0.2.10",
   "response_status_code": 502,
-  "error_class": "connection_timeout",
+  "error_class": "connection_failure",
   "latency_total_ms": 30000.0
 }
 ```

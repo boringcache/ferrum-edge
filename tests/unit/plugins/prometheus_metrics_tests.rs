@@ -6,7 +6,7 @@ use ferrum_edge::plugins::mesh::prometheus_helpers;
 use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
 use ferrum_edge::plugins::prometheus_metrics::{
     ClientDisconnectKey, CounterKey, HboneRelayFailureKey, MeshTcpEgressConnKey, MetricsRegistry,
-    PrometheusMetrics, global_registry,
+    PrometheusMetrics, StreamDisconnectKey, global_registry,
 };
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, AiCost, AiUsageExport, Direction, Plugin, RequestContext,
@@ -14,7 +14,11 @@ use ferrum_edge::plugins::{
     ai_token_metrics::AiTokenMetrics,
 };
 use ferrum_edge::proxy::tcp_proxy::StreamIoSide;
-use ferrum_edge::retry::ErrorClass;
+use ferrum_edge::retry::{
+    ErrorClass, HTTP_OBSERVABILITY_ERROR_CLASSES, OBS_BACKEND_ERROR, OBS_BACKEND_TIMEOUT,
+    OBS_CIRCUIT_BREAKER_OPEN, OBS_CONCURRENCY_LIMIT, OBS_CONFIG_STALE, OBS_CONNECTION_FAILURE,
+    OBS_OVERLOAD, intern_http_observability_error_class,
+};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -232,6 +236,7 @@ async fn test_registry_records_request_counter() {
         method: "GET",
         status_code: 200,
         grpc_status: None,
+        error_class: None,
     };
     assert!(registry.request_counter.contains_key(&key));
     let count = registry.request_counter.get(&key).unwrap();
@@ -251,6 +256,7 @@ fn test_registry_bounds_hostile_http_methods_to_other() {
         method: "OTHER",
         status_code: 200,
         grpc_status: None,
+        error_class: None,
     };
     assert_eq!(registry.request_counter.len(), 1);
     assert_eq!(
@@ -292,6 +298,7 @@ fn test_registry_distinguishes_bounded_grpc_terminal_statuses() {
         method: "POST",
         status_code: 200,
         grpc_status: Some("OTHER"),
+        error_class: None,
     };
     assert_eq!(
         registry
@@ -375,6 +382,7 @@ async fn test_registry_ignores_mirror_summary() {
         method: "GET",
         status_code: 503,
         grpc_status: None,
+        error_class: None,
     };
     assert!(!registry.request_counter.contains_key(&key));
     assert!(registry.request_duration_buckets.is_empty());
@@ -820,6 +828,7 @@ async fn test_registry_increments_counter_on_repeated_requests() {
         method: "POST",
         status_code: 201,
         grpc_status: None,
+        error_class: None,
     };
     let count = registry.request_counter.get(&key).unwrap();
     assert_eq!(count.value.load(Ordering::Relaxed), 5);
@@ -985,6 +994,7 @@ async fn test_registry_separate_counters_per_proxy_method_status() {
                 method: "GET",
                 status_code: 200,
                 grpc_status: None,
+                error_class: None,
             })
             .unwrap()
             .value
@@ -999,6 +1009,7 @@ async fn test_registry_separate_counters_per_proxy_method_status() {
                 method: "POST",
                 status_code: 200,
                 grpc_status: None,
+                error_class: None,
             })
             .unwrap()
             .value
@@ -1013,6 +1024,7 @@ async fn test_registry_separate_counters_per_proxy_method_status() {
                 method: "GET",
                 status_code: 200,
                 grpc_status: None,
+                error_class: None,
             })
             .unwrap()
             .value
@@ -1027,6 +1039,7 @@ async fn test_registry_separate_counters_per_proxy_method_status() {
                 method: "GET",
                 status_code: 500,
                 grpc_status: None,
+                error_class: Some("backend_error"),
             })
             .unwrap()
             .value
@@ -1117,6 +1130,7 @@ async fn test_registry_unknown_proxy_uses_default_key() {
         method: "GET",
         status_code: 200,
         grpc_status: None,
+        error_class: None,
     }));
 }
 
@@ -1445,6 +1459,7 @@ async fn test_plugin_log_hook_records_metrics() {
         method: "DELETE",
         status_code: 204,
         grpc_status: None,
+        error_class: None,
     }));
 }
 
@@ -2644,4 +2659,178 @@ async fn unchanged_tls_inventory_freshness_preserves_the_render_cache() {
         refreshed.contains("freshness-hidden"),
         "the invalidated cache must also expose the recorded series:\n{refreshed}"
     );
+}
+
+#[tokio::test]
+async fn http_error_class_label_matches_x_gateway_error_vocabulary() {
+    let registry = MetricsRegistry::new();
+
+    let mut connection = make_summary("obs-http", "GET", 502, 10.0, 8.0);
+    connection.error_class = Some(ErrorClass::ConnectionRefused);
+    registry.record(&connection);
+
+    let mut timeout = make_summary("obs-http", "GET", 504, 10.0, 8.0);
+    timeout.error_class = Some(ErrorClass::ReadWriteTimeout);
+    registry.record(&timeout);
+
+    let backend = make_summary("obs-http", "GET", 503, 10.0, 8.0);
+    registry.record(&backend);
+
+    let mut breaker = make_summary("obs-http", "GET", 503, 10.0, 8.0);
+    breaker.metadata.insert(
+        "rejection_phase".to_string(),
+        "circuit_breaker_open".to_string(),
+    );
+    registry.record(&breaker);
+
+    let mut overload = make_summary("obs-http", "GET", 503, 10.0, 8.0);
+    overload.metadata.insert(
+        "rejection_phase".to_string(),
+        "overload".to_string(),
+    );
+    registry.record(&overload);
+
+    let mut stale = make_summary("obs-http", "GET", 503, 10.0, 8.0);
+    stale.metadata.insert(
+        "rejection_phase".to_string(),
+        "config_stale".to_string(),
+    );
+    registry.record(&stale);
+
+    let mut concurrency = make_summary("obs-http", "GET", 503, 10.0, 8.0);
+    concurrency.metadata.insert(
+        "rejection_phase".to_string(),
+        "adaptive_concurrency".to_string(),
+    );
+    registry.record(&concurrency);
+
+    let ok = make_summary("obs-http", "GET", 200, 10.0, 8.0);
+    registry.record(&ok);
+
+    for (status, token) in [
+        (502, OBS_CONNECTION_FAILURE),
+        (504, OBS_BACKEND_TIMEOUT),
+    ] {
+        assert!(
+            registry.request_counter.contains_key(&CounterKey {
+                proxy_id: Arc::from("obs-http"),
+                method: "GET",
+                status_code: status,
+                grpc_status: None,
+                error_class: Some(token),
+            }),
+            "status {status} must carry error_class={token}"
+        );
+    }
+    assert!(registry.request_counter.contains_key(&CounterKey {
+        proxy_id: Arc::from("obs-http"),
+        method: "GET",
+        status_code: 503,
+        grpc_status: None,
+        error_class: Some(OBS_BACKEND_ERROR),
+    }));
+    assert!(registry.request_counter.contains_key(&CounterKey {
+        proxy_id: Arc::from("obs-http"),
+        method: "GET",
+        status_code: 503,
+        grpc_status: None,
+        error_class: Some(OBS_CIRCUIT_BREAKER_OPEN),
+    }));
+    assert!(registry.request_counter.contains_key(&CounterKey {
+        proxy_id: Arc::from("obs-http"),
+        method: "GET",
+        status_code: 503,
+        grpc_status: None,
+        error_class: Some(OBS_OVERLOAD),
+    }));
+    assert!(registry.request_counter.contains_key(&CounterKey {
+        proxy_id: Arc::from("obs-http"),
+        method: "GET",
+        status_code: 503,
+        grpc_status: None,
+        error_class: Some(OBS_CONFIG_STALE),
+    }));
+    assert!(registry.request_counter.contains_key(&CounterKey {
+        proxy_id: Arc::from("obs-http"),
+        method: "GET",
+        status_code: 503,
+        grpc_status: None,
+        error_class: Some(OBS_CONCURRENCY_LIMIT),
+    }));
+    assert!(registry.request_counter.contains_key(&CounterKey {
+        proxy_id: Arc::from("obs-http"),
+        method: "GET",
+        status_code: 200,
+        grpc_status: None,
+        error_class: None,
+    }));
+
+    let output = registry.render_uncached();
+    assert!(
+        output.contains(
+            r#"ferrum_requests_total{proxy_id="obs-http",method="GET",status_code="200"} 1"#
+        ),
+        "2xx must omit error_class: {output}"
+    );
+    assert!(
+        !output.contains(r#"status_code="200",error_class="#),
+        "2xx must not grow an error_class label: {output}"
+    );
+    assert!(output.contains(
+        r#"ferrum_requests_total{proxy_id="obs-http",method="GET",status_code="503",error_class="overload"} 1"#
+    ));
+    assert!(output.contains(
+        r#"ferrum_requests_total{proxy_id="obs-http",method="GET",status_code="503",error_class="config_stale"} 1"#
+    ));
+    assert!(output.contains(
+        r#"ferrum_requests_total{proxy_id="obs-http",method="GET",status_code="503",error_class="concurrency_limit"} 1"#
+    ));
+}
+
+#[test]
+fn http_observability_error_class_set_is_closed() {
+    assert_eq!(HTTP_OBSERVABILITY_ERROR_CLASSES.len(), 7);
+    let mut seen = std::collections::HashSet::new();
+    for token in HTTP_OBSERVABILITY_ERROR_CLASSES {
+        assert!(
+            seen.insert(*token),
+            "HTTP observability tokens must be unique: {token}"
+        );
+        assert_eq!(intern_http_observability_error_class(token), Some(*token));
+    }
+    assert!(intern_http_observability_error_class("backend_down").is_none());
+    assert!(intern_http_observability_error_class("connection_timeout").is_none());
+    assert_eq!(ErrorClass::ALL.len(), 19);
+    let mut class_seen = std::collections::HashSet::new();
+    for class in ErrorClass::ALL {
+        assert!(
+            class_seen.insert(class.as_str()),
+            "ErrorClass::as_str must be unique: {}",
+            class.as_str()
+        );
+    }
+}
+
+#[tokio::test]
+async fn stream_disconnects_label_error_class_when_present() {
+    let registry = MetricsRegistry::new();
+    let mut summary = make_stream_summary("obs-stream", "tcp");
+    summary.error_class = Some(ErrorClass::DnsLookupError);
+    registry.record_stream(&summary);
+
+    assert!(
+        registry
+            .stream_disconnect_counter
+            .contains_key(&StreamDisconnectKey {
+                proxy_id: Arc::from("obs-stream"),
+                protocol: Arc::from("tcp"),
+                cause: "unknown",
+                direction: "unknown",
+                error_class: Some("dns_lookup_error"),
+            })
+    );
+    let output = registry.render_uncached();
+    assert!(output.contains(
+        r#"ferrum_stream_disconnects_total{proxy_id="obs-stream",protocol="tcp",cause="unknown",direction="unknown",error_class="dns_lookup_error"} 1"#
+    ));
 }

@@ -161,12 +161,143 @@ impl ErrorClass {
             Self::RequestError => "request_error",
         }
     }
+
+    /// Every compiled-in [`ErrorClass`] variant. Stream `error_class` metrics
+    /// labels are drawn only from [`Self::as_str`] of this set (or omitted).
+    pub const ALL: &'static [ErrorClass] = &[
+        Self::ConnectionTimeout,
+        Self::ConnectionRefused,
+        Self::ConnectionReset,
+        Self::ConnectionClosed,
+        Self::DnsLookupError,
+        Self::TlsError,
+        Self::ReadWriteTimeout,
+        Self::ClientDisconnect,
+        Self::ProtocolError,
+        Self::ResponseBodyTooLarge,
+        Self::GatewayBufferCapacity,
+        Self::RequestBodyTooLarge,
+        Self::ConnectionPoolError,
+        Self::PortExhaustion,
+        Self::GracefulRemoteClose,
+        Self::DispatchPolicyRejected,
+        Self::BackendConnectionLimit,
+        Self::TrustWithdrawn,
+        Self::RequestError,
+    ];
 }
 
 impl std::fmt::Display for ErrorClass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// Client-visible HTTP-family failure class (`X-Gateway-Error`), HTTP access-log
+/// `error_class` for 5xx, and `ferrum_requests_total{error_class=…}` share these
+/// spellings. Additive: do not rename the four backend/CB tokens.
+pub const OBS_CONNECTION_FAILURE: &str = "connection_failure";
+pub const OBS_BACKEND_TIMEOUT: &str = "backend_timeout";
+pub const OBS_BACKEND_ERROR: &str = "backend_error";
+pub const OBS_CIRCUIT_BREAKER_OPEN: &str = "circuit_breaker_open";
+pub const OBS_OVERLOAD: &str = "overload";
+pub const OBS_CONFIG_STALE: &str = "config_stale";
+pub const OBS_CONCURRENCY_LIMIT: &str = "concurrency_limit";
+
+/// Closed HTTP observability vocabulary. Cardinality bound: **7**.
+pub const HTTP_OBSERVABILITY_ERROR_CLASSES: &[&str] = &[
+    OBS_CONNECTION_FAILURE,
+    OBS_BACKEND_TIMEOUT,
+    OBS_BACKEND_ERROR,
+    OBS_CIRCUIT_BREAKER_OPEN,
+    OBS_OVERLOAD,
+    OBS_CONFIG_STALE,
+    OBS_CONCURRENCY_LIMIT,
+];
+
+/// Map a backend-path HTTP status plus the pre-wire flag onto the closed
+/// `X-Gateway-Error` vocabulary. `None` for non-5xx without a connection
+/// failure so 2xx series do not gain a label.
+#[inline]
+pub fn http_observability_error_class(
+    connection_error: bool,
+    status: u16,
+) -> Option<&'static str> {
+    if connection_error {
+        Some(OBS_CONNECTION_FAILURE)
+    } else if status == 504 {
+        Some(OBS_BACKEND_TIMEOUT)
+    } else if status >= 500 {
+        Some(OBS_BACKEND_ERROR)
+    } else {
+        None
+    }
+}
+
+/// Intern a gateway-authored rejection-phase name onto the HTTP vocabulary.
+/// Unknown phases return `None` so attacker-controlled strings cannot become
+/// metrics labels.
+#[inline]
+pub fn token_for_rejection_phase(phase: &str) -> Option<&'static str> {
+    match phase {
+        "circuit_breaker_open" | "circuit_breaker" => Some(OBS_CIRCUIT_BREAKER_OPEN),
+        "adaptive_concurrency" => Some(OBS_CONCURRENCY_LIMIT),
+        "overload" => Some(OBS_OVERLOAD),
+        "config_stale" => Some(OBS_CONFIG_STALE),
+        _ => None,
+    }
+}
+
+/// Intern a candidate HTTP observability token. Values outside the closed
+/// set are rejected rather than forwarded as labels.
+#[inline]
+pub fn intern_http_observability_error_class(value: &str) -> Option<&'static str> {
+    HTTP_OBSERVABILITY_ERROR_CLASSES
+        .iter()
+        .copied()
+        .find(|&token| token == value)
+}
+
+/// HTTP metrics / 5xx log token for one transaction.
+///
+/// Gateway-authored rejects (`rejection_phase`) win so overload / stale-config
+/// / adaptive-concurrency / open-breaker 503s are never collapsed into
+/// `backend_error`. Otherwise the backend-path `X-Gateway-Error` mapping
+/// applies. Status below 500 returns `None` after the phase check so 2xx
+/// series are not multiplied.
+#[inline]
+pub fn http_metrics_error_class(
+    error_class: Option<ErrorClass>,
+    status: u16,
+    rejection_phase: Option<&str>,
+) -> Option<&'static str> {
+    if let Some(phase) = rejection_phase
+        && let Some(token) = token_for_rejection_phase(phase)
+    {
+        return Some(token);
+    }
+    // 2xx/3xx/4xx must not grow a label on the common `ferrum_requests_total`
+    // series. Connection-class 5xx still map through the header vocabulary.
+    if status < 500 {
+        return None;
+    }
+    http_observability_error_class(
+        error_class.is_some_and(|class| !request_reached_wire(class)),
+        status,
+    )
+}
+
+/// Access-log `error_class` for an HTTP-family summary: the metrics token
+/// when one exists, otherwise the granular [`ErrorClass::as_str`] so
+/// non-5xx classes such as `client_disconnect` stay visible in logs.
+#[inline]
+pub fn http_log_error_class(
+    error_class: Option<ErrorClass>,
+    status: u16,
+    rejection_phase: Option<&str>,
+) -> Option<&'static str> {
+    http_metrics_error_class(error_class, status, rejection_phase)
+        .or_else(|| error_class.map(|class| class.as_str()))
 }
 
 /// Returns `true` if the error class implies the request was committed to the
