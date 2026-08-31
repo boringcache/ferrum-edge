@@ -2921,8 +2921,7 @@ mod tests {
         let config = test_config(true, CaptureMode::Iptables);
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch_named_container(&patch, "ferrum-edge-init")
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -2957,8 +2956,7 @@ mod tests {
         let config = test_config(true, CaptureMode::Iptables);
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch_named_container(&patch, "ferrum-edge-init")
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -2992,8 +2990,7 @@ mod tests {
         let config = test_config(true, CaptureMode::Iptables);
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch_named_container(&patch, "ferrum-edge-init")
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -3024,8 +3021,7 @@ mod tests {
         let config = test_config(true, CaptureMode::Iptables);
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch_named_container(&patch, "ferrum-edge-init")
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -4506,8 +4502,7 @@ mod tests {
         let config = test_config(true, CaptureMode::Iptables);
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch_named_container(&patch, "ferrum-edge-init")
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
