@@ -6,6 +6,14 @@ This document describes how to safely upgrade Ferrum Edge between versions with 
 
 Every current `[Unreleased]` `BREAKING` changelog entry is listed here exactly once, with its issue number and the operator action that entry already states. Several of these fail **silently** at cutover (HMAC clients get `401`, WAF `literal` rules stop matching folded spellings, backends stop seeing client-supplied XFF hops) rather than refusing config load. Read this section before the per-mode procedures below.
 
+### `preserve_host_header` now sets `:authority` on direct-H2 and gRPC backends (issue [#4410](https://github.com/ferrum-edge/ferrum-edge/issues/4410))
+
+Ferrum's outbound direct-H2 and native-gRPC dispatch previously sent a hostname-only `Host` while Hyper derived `:authority` from the full backend URI including a non-default port. RFC 9113 §8.3.1 forbids that disagreement, so RFC-compliant HTTP/2 origins reset the stream and the client saw `502 backend_error` or gRPC `UNAVAILABLE`. Both fields now carry the same authority.
+
+Closing that gap changes what a backend observes when `preserve_host_header: true`. Previously `Host` carried the client's authority while `:authority` carried the backend's; now both carry the client's. Many HTTP/2 servers derive their virtual-host decision from `:authority` and ignore a separate `Host` header, so those backends were routing on the backend authority even with `preserve_host_header` enabled, and will now route on the client's Host — the behaviour the setting asks for.
+
+**Operator action:** on direct-H2 or native-gRPC routes that set `preserve_host_header: true`, confirm the backend's virtual-host routing still selects the intended vhost now that `:authority` carries the client's Host. Set `preserve_host_header: false` on those routes to keep the backend authority in both fields. Routes with `preserve_host_header` unset or false are unaffected, and default-port backends (80 for `http`/`ws`, 443 for `https`/`wss`) still omit the port from both fields.
+
 ### HTTP/1.1 requests without a Host header are rejected with 400 (issue [#4390](https://github.com/ferrum-edge/ferrum-edge/issues/4390))
 
 RFC 9112 §3.2.2 requires a 400 when an HTTP/1.1 request lacks a Host field. Ferrum previously only rejected multiple Host fields, so a Host-less origin-form request skipped exact/wildcard host tiers and could fall through to a catch-all (empty `hosts`) route. `check_protocol_headers()` now rejects HTTP/1.1 when both the Host field and the URI authority are absent. HTTP/1.0 still does not require Host. Absolute-form request-targets that already carry an authority are accepted without a Host field. An empty Host value (`Host:` with no tokens) is treated as present-but-invalid and also returns 400 on HTTP/1.1. HTTP/2 and HTTP/3 are unchanged.

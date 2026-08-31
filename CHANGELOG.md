@@ -35,6 +35,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `preserve_host_header` is true, the client Host is honoured by rewriting
   the outbound URI authority so `:authority` agrees; if that Host is not a
   valid URI authority, both fields fall back to the backend URI authority.
+  **Operator action**: on direct-H2 and native-gRPC routes with
+  `preserve_host_header: true`, the backend's `:authority` changes from the
+  backend authority to the client's Host. Many HTTP/2 servers synthesize their
+  `Host`/virtual-host decision from `:authority` and ignore a separate `Host`
+  header, so such a backend was previously routing on the backend authority
+  despite `preserve_host_header` being on, and will now route on the client's
+  Host — which is what the setting asks for. Re-check backend virtual-host
+  routing on those routes, or set `preserve_host_header: false` to keep the
+  backend authority in both fields.
 
 - **Linux GNU release ABI floor is now GLIBC_2.34** (issue #4301). Generic
   `ferrum-edge-linux-{x86_64,aarch64}` and `ferrum-cni-linux-{x86_64,aarch64}`
