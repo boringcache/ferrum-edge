@@ -809,11 +809,7 @@ async fn run_material_set_reload_loop(
         Err(error) => {
             record_refresh_for_sources(surface, &sources, "load_error");
             load_failures.observe_failure(error.failure_class());
-            crate::tls::events::record_load_error(
-                surface,
-                &sources,
-                &error.event_detail(),
-            );
+            crate::tls::events::record_load_error(surface, &sources, &error.event_detail());
             warn!(
                 surface,
                 error = %error,
@@ -887,11 +883,7 @@ async fn run_material_set_reload_loop(
             Err(error) => {
                 record_refresh_for_sources(surface, &sources, "load_error");
                 if load_failures.observe_failure(error.failure_class()) {
-                    crate::tls::events::record_load_error(
-                        surface,
-                        &sources,
-                        &error.event_detail(),
-                    );
+                    crate::tls::events::record_load_error(surface, &sources, &error.event_detail());
                     warn!(
                         surface,
                         error = %error,
@@ -986,11 +978,7 @@ async fn run_async_material_set_reload_loop(
         Err(error) => {
             record_refresh_for_sources(surface, &sources, "load_error");
             load_failures.observe_failure(error.failure_class());
-            crate::tls::events::record_load_error(
-                surface,
-                &sources,
-                &error.event_detail(),
-            );
+            crate::tls::events::record_load_error(surface, &sources, &error.event_detail());
             warn!(
                 surface,
                 error = %error,
@@ -1091,11 +1079,7 @@ async fn run_async_material_set_reload_loop(
             Err(error) => {
                 record_refresh_for_sources(surface, &sources, "load_error");
                 if load_failures.observe_failure(error.failure_class()) {
-                    crate::tls::events::record_load_error(
-                        surface,
-                        &sources,
-                        &error.event_detail(),
-                    );
+                    crate::tls::events::record_load_error(surface, &sources, &error.event_detail());
                     warn!(
                         surface,
                         error = %error,
@@ -1228,11 +1212,7 @@ async fn run_dynamic_material_set_reload_loop(
             Err(error) => {
                 record_refresh_for_sources(surface, &sources, "load_error");
                 if load_failures.observe_failure(error.failure_class()) {
-                    crate::tls::events::record_load_error(
-                        surface,
-                        &sources,
-                        &error.event_detail(),
-                    );
+                    crate::tls::events::record_load_error(surface, &sources, &error.event_detail());
                     warn!(
                         surface,
                         error = %error,

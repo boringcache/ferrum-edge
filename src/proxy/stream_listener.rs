@@ -4342,11 +4342,11 @@ mod tests {
             .to_str()
             .expect("test temp path must be utf-8 for proxy config");
 
-        let first = BackendTlsMaterialReloadKey::from_source_value(ca_path, MaterialKind::CaBundle)
-            .await;
+        let first =
+            BackendTlsMaterialReloadKey::from_source_value(ca_path, MaterialKind::CaBundle).await;
         std::fs::write(ca_path, b"second-ca").expect("write second ca");
-        let second = BackendTlsMaterialReloadKey::from_source_value(ca_path, MaterialKind::CaBundle)
-            .await;
+        let second =
+            BackendTlsMaterialReloadKey::from_source_value(ca_path, MaterialKind::CaBundle).await;
 
         assert_eq!(first.source, second.source);
         assert_ne!(
@@ -4393,11 +4393,11 @@ mod tests {
                 .expect("test temp path must be utf-8 for proxy config")
         );
 
-        let first = BackendTlsMaterialReloadKey::from_source_value(&ca_uri, MaterialKind::CaBundle)
-            .await;
+        let first =
+            BackendTlsMaterialReloadKey::from_source_value(&ca_uri, MaterialKind::CaBundle).await;
         std::fs::write(&ca_path, b"second-ca").expect("write second ca");
-        let second = BackendTlsMaterialReloadKey::from_source_value(&ca_uri, MaterialKind::CaBundle)
-            .await;
+        let second =
+            BackendTlsMaterialReloadKey::from_source_value(&ca_uri, MaterialKind::CaBundle).await;
 
         assert_eq!(first.source, second.source);
         assert!(
@@ -4416,8 +4416,8 @@ mod tests {
     async fn backend_tls_material_reload_key_digests_inline_pem_without_leaking_it() {
         let inline_pem = "-----BEGIN CERTIFICATE-----\nMIIBsecret\n-----END CERTIFICATE-----\n";
 
-        let key = BackendTlsMaterialReloadKey::from_source_value(inline_pem, MaterialKind::Cert)
-            .await;
+        let key =
+            BackendTlsMaterialReloadKey::from_source_value(inline_pem, MaterialKind::Cert).await;
 
         assert!(
             !key.source.contains("MIIBsecret"),
