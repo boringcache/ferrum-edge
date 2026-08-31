@@ -1092,9 +1092,12 @@ FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRE
 {{- end -}}
 
 {{/* Effective DP stale-config bound for NOTES and operator messaging. */}}
+{{/* Presence, not truthiness: `default ""` would rewrite an explicit 0 (the
+     unsafe "no bound" opt-in) back to the 3600 default and make NOTES disagree
+     with the env var the deployment actually renders. */}}
 {{- define "ferrum-gateway.dpConfigMaxStaleSecondsEffective" -}}
-{{- $v := (.Values.dp | default dict).configMaxStaleSeconds | default "" -}}
-{{- if or (eq ($v | toString) "") (kindIs "invalid" $v) -}}
+{{- $v := (.Values.dp | default dict).configMaxStaleSeconds -}}
+{{- if or (kindIs "invalid" $v) (eq ($v | toString) "") -}}
 3600
 {{- else -}}
 {{- $v -}}
