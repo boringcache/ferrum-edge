@@ -45,6 +45,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `{"error":"Request is missing both :authority and Host"}` instead of being
   routed. Send `:authority` or Host.
 
+- **BREAKING — Enabled mesh injector cannot render an unauthenticatable fail-closed webhook**
+  (issue #4433). `injector.enabled=true` still defaults to `failurePolicy: Fail`,
+  but Helm now requires exactly one trust source: `injector.caBundle` (base64
+  PEM) or `injector.certManager.injectCaFrom` (`cert-manager.io/inject-ca-from`).
+  Neither, both, or a non-PEM `caBundle` fail render with an actionable message.
+  The chart never changes `failurePolicy` to `Ignore` to make a broken webhook
+  render. **Operator action:** set `injector.caBundle` or
+  `injector.certManager.injectCaFrom` before enabling the injector.
+
 - **`request_mirror` denies cross-origin query credentials by default**
   (issue #4295). Sensitive query pairs (`access_token`, `api_key`,
   delimiter-bounded `token`/`sig`/`signature` including `oauth_token` and
@@ -58,6 +67,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Forwarding a denied name requires the
   fail-closed pair `forward_sensitive_query=true` plus an exact decoded-name
   `forward_sensitive_query_allowlist`. Mirror logs still omit the entire query.
+
+- **BREAKING — configured `jwks_auth` audiences and issuer require the claim to
+  be present** (issue #4264). The shared JWT verifier used by `jwks_auth`, OIDC,
+  and mesh `RequestAuthentication` translation now adds `iss` and `aud` to
+  `required_spec_claims` whenever those restrictions are configured.
+  `jsonwebtoken` previously rejected only a *mismatching* claim, so a
+  correctly signed token with no `aud` (or no `iss`) authenticated against
+  every provider fronting the same IdP regardless of the configured audience.
+  Mesh rules with `audiences` now refuse aud-less tokens before staging
+  `mesh.request_principal` or `request.auth.audiences`. `jwks_auth` and
+  CP/DP gRPC also enable `validate_nbf`; a present future `nbf` is rejected
+  under each surface's leeway. Unconfigured audiences are unchanged: tokens
+  without `aud` still pass; a token that carries `aud` is still rejected when
+  no acceptable audience is configured. **Operator action**: ensure every
+  client mints an `aud` (and `iss` when the provider pins one) that matches
+  the configured restriction, or remove the restriction if aud-less tokens are
+  intentional.
+
+- **BREAKING — credentialed CORS refuses effectively universal prefix/regex
+  matchers at config load** (issue #4269). The wildcard-plus-credentials
+  interlock previously inspected only the `AllowedOrigins::Wildcard` variant,
+  so Istio-style matchers such as `{"prefix": "https://"}`, `{"regex": ".*"}`,
+  or `{"prefix": "h"}` with `allow_credentials: true` reflected any matching
+  origin with `Access-Control-Allow-Credentials: true`. Breadth is now
+  classified once at construction and the same predicate drives the credentials
+  interlock, `uses_strict_origin_policy()`, and Istio/mesh admission; universal
+  prefix/regex plus credentials is refused rather than silently weakened. In
+  file mode this is refuse-to-start. Exact `*` still drops credentials per the
+  documented contract. **Operator action**: narrow `allowed_origins` to a
+  host-constraining prefix or regex, or set `allow_credentials: false` if a
+  universal matcher is required.
+
+- **BREAKING — CRL validity windows and full-chain revocation are enforced**
+  (issues #4297 / #4298). Every CRL-enabled verifier now routes through a
+  shared policy module. Admission refuses CRLs whose `thisUpdate` is in the
+  future, whose `nextUpdate` is absent, or whose `nextUpdate` has passed; there
+  is no `allow_expired` escape. Handshake verification enables rustls's default
+  full-chain revocation depth (leaf-only checking removed) and
+  `enforce_revocation_expiration()`, so a revoked intermediate stops
+  authenticating the certificates it issued and an expired CRL stops authorizing
+  new handshakes. `allow_unknown_revocation_status()` is retained: a chain with
+  no applicable configured CRL is still accepted. **Operator action**: publish
+  fresh CRLs with a valid `nextUpdate` before expiry, and expect clients signed
+  by a revoked intermediate to be rejected even when the leaf is not listed.
+
+- **BREAKING — `trusted_hbone_assertors` entries carry an `AssertionGrant`**
+  (issue #4274). Bare service-account matchers (`"ztunnel"`, `"waypoint"`) now
+  default to `SameNamespace`, so an Istio ambient `ztunnel` in `istio-system`
+  can no longer assert application-namespace identities. Object forms support
+  an exact `asserts` inventory or explicit `scope: same_namespace` /
+  `scope: mesh_wide` (the latter requires an exact SPIFFE assertor pin and logs
+  a construction warning). `mesh_authz` and `workload_metrics` share the same
+  compiled relation; there is no global compatibility switch restoring
+  namespace-blind behavior. **Operator action**: pin the exact assertor SPIFFE
+  ID and either the exact fronted identities or `scope: mesh_wide` when a
+  ztunnel/waypoint must assert cross-namespace workloads.
 
 ### Fixed
 
@@ -140,6 +205,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authored registry artifacts and let the node-agent regenerate every pod
   entry; do not publish custom leaf names or body lines outside the documented
   grammar.
+
+- **BREAKING — Ferrum-owned UDP policy CRD upgrades with the mesh chart**
+  (issue #4443). `UDPResponseAmplificationPolicy` moved from Helm's install-once
+  `charts/ferrum-mesh/crds/` directory to
+  `templates/crds-udpresponseamplificationpolicy.yaml` behind `crds.install`
+  (default `true`). `helm upgrade` now applies schema changes. The CRD is stamped
+  with `gateway.ferrum.io/crd-schema-version: v1alpha1-1`; compare that live
+  annotation to `crds.udpResponseAmplificationPolicy.schemaVersion`. Uninstall
+  keeps the CRD (`helm.sh/resource-policy: keep`). `crds.install=false` fails
+  render unless `crds.skipInstallAcknowledged=true`. **Operator action (existing
+  clusters that already have this CRD from `crds/`):** adopt it once with
+  `helm upgrade --take-ownership --set crds.adoptExisting=true`. Do not set
+  `crds.install=false` to skip the error — that leaves the cluster on a stale
+  schema.
 
 - **BREAKING — `FERRUM_TLS_OFFLOAD_THREADS` nonzero values fail startup**
   (issue #4294). TLS handshake offload is not implemented; a nonzero setting
