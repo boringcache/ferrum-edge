@@ -3188,7 +3188,10 @@ fn least_latency_passive_recovery_does_not_restore_warmup_bias() {
 
     {
         let ps = checker.passive_health.get("ferrum|p1").unwrap();
-        ps.unhealthy.get_mut("host1:8080").unwrap().recover_at_tick_ms = 0;
+        ps.unhealthy
+            .get_mut("host1:8080")
+            .unwrap()
+            .recover_at_tick_ms = 0;
     }
     checker.recover_due_passive_ejections();
     assert!(
