@@ -78,11 +78,25 @@ last stream ID is the last request already accepted. The peer therefore:
   WebSocket close frames, and RFC 9298 CONNECT-UDP capsule relays
 
 The accept loop keeps polling after GOAWAY until `accept()` returns `Ok(None)`
-(all in-flight streams done) or `FERRUM_SHUTDOWN_DRAIN_SECONDS` expires. Only
-then does the listener close remaining QUIC connections with the canonical
-HTTP/3 no-error code `H3_NO_ERROR` (`0x0100`) and reason `shutdown`. The
-previous `CONNECTION_CLOSE` with application code `0` is gone: that QUIC
-transport close reset remaining work instead of completing GOAWAY.
+or `FERRUM_SHUTDOWN_DRAIN_SECONDS` expires. Only then does the listener close
+remaining QUIC connections with the canonical HTTP/3 no-error code
+`H3_NO_ERROR` (`0x0100`) and reason `shutdown`. The previous
+`CONNECTION_CLOSE` with application code `0` is gone: that QUIC transport
+close reset remaining work instead of completing GOAWAY.
+
+Which of those two terminals a connection takes depends on the peer:
+
+- A peer that reacts to GOAWAY — by closing, sending its own GOAWAY, or trying
+  to open a stream past `max_id` — lets `accept()` return `Ok(None)` as soon as
+  its in-flight streams finish. The connection task ends, quinn's
+  `open_connections()` falls, and drain completes early.
+- A peer that simply goes idle after GOAWAY leaves `accept()` pending. The
+  vendored `h3` server gates its `Ok(None)` on having *received* a GOAWAY, not
+  on having sent one, so an in-flight-free but silent connection is not
+  self-terminating. It is bounded by the drain deadline rather than leaked:
+  the listener logs `HTTP/3 drain timeout — forcing endpoint close` and closes
+  the endpoint with `H3_NO_ERROR`. Expect planned restarts to spend the full
+  `FERRUM_SHUTDOWN_DRAIN_SECONDS` when such peers are connected.
 
 `FERRUM_SHUTDOWN_DRAIN_SECONDS` semantics are unchanged. The H3 listener still
 bounds its own `endpoint.open_connections()` wait with that budget, then the

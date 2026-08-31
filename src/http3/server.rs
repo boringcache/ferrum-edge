@@ -1527,7 +1527,18 @@ async fn complete_h3_handshake(
 /// The vendored API (`h3::server::Connection::shutdown`) writes GOAWAY with
 /// `max_id = last_accepted_stream` (or the first request stream id when none
 /// have been accepted). Subsequent `accept()` calls reject newer streams with
-/// `H3_REQUEST_REJECTED` and return `Ok(None)` once in-flight work completes.
+/// `H3_REQUEST_REJECTED`.
+///
+/// `accept()` yields `Ok(None)` — ending this connection task early — only
+/// once in-flight streams have completed **and** the peer has either sent its
+/// own GOAWAY or tried to open a stream past `max_id`. A peer that goes idle
+/// after receiving GOAWAY leaves `accept()` pending: the vendored
+/// `poll_accept_request_stream_internal` gates its `Ok(None)` on
+/// `recv_closing` (the peer's GOAWAY), not on `sent_closing` (ours). That case
+/// is terminated by the listener's `FERRUM_SHUTDOWN_DRAIN_SECONDS` deadline,
+/// which force-closes the endpoint with `H3_NO_ERROR` — so idle-after-GOAWAY
+/// connections are bounded, not leaked, but they do consume the full drain
+/// budget and log the `HTTP/3 drain timeout` warning.
 async fn send_h3_goaway(
     h3_conn: &mut h3::server::Connection<h3_quinn::Connection, Bytes>,
     peer: SocketAddr,
