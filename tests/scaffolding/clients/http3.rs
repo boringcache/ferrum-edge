@@ -1212,15 +1212,10 @@ impl Http3ConnectionStream {
     }
 
     /// Drain remaining DATA frames into one buffer.
-    pub async fn recv_body(
-        &mut self,
-    ) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn recv_body(&mut self) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
         let mut body = Vec::new();
-        loop {
-            match self.recv_data().await? {
-                Some(chunk) => body.extend_from_slice(&chunk),
-                None => break,
-            }
+        while let Some(chunk) = self.recv_data().await? {
+            body.extend_from_slice(&chunk);
         }
         Ok(Bytes::from(body))
     }
@@ -1285,12 +1280,10 @@ impl Http3ResponseStream {
     /// Drain remaining DATA frames to EOF.
     pub async fn drain_body(&mut self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let mut total = 0usize;
-        loop {
-            match self.recv_data().await? {
-                Some(chunk) => total = total.saturating_add(chunk.len()),
-                None => return Ok(total),
-            }
+        while let Some(chunk) = self.recv_data().await? {
+            total = total.saturating_add(chunk.len());
         }
+        Ok(total)
     }
 }
 

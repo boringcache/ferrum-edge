@@ -1698,12 +1698,7 @@ async fn handle_h3_connection(
             }
             Err(connecting) => {
                 // No 0-RTT — fall back to full handshake.
-                complete_h3_handshake(
-                    connecting,
-                    handshake_timeout,
-                    &mut shutdown_rx,
-                )
-                .await?
+                complete_h3_handshake(connecting, handshake_timeout, &mut shutdown_rx).await?
             }
         }
     } else {
@@ -1716,12 +1711,7 @@ async fn handle_h3_connection(
                 "HTTP/3 listener was disabled before the queued handshake was admitted"
             ));
         };
-        complete_h3_handshake(
-            connecting,
-            handshake_timeout,
-            &mut shutdown_rx,
-        )
-        .await?
+        complete_h3_handshake(connecting, handshake_timeout, &mut shutdown_rx).await?
     };
 
     let remote_addr = connection.remote_address();

@@ -213,10 +213,7 @@ async fn spawn_h3_drain_gateway(backend_port: u16, drain_seconds: u64) -> (TestG
             .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
             .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
             .env("FERRUM_POOL_WARMUP_ENABLED", "false")
-            .env(
-                "FERRUM_SHUTDOWN_DRAIN_SECONDS",
-                drain_seconds.to_string(),
-            )
+            .env("FERRUM_SHUTDOWN_DRAIN_SECONDS", drain_seconds.to_string())
             .spawn()
             .await;
         match result {
@@ -228,9 +225,7 @@ async fn spawn_h3_drain_gateway(backend_port: u16, drain_seconds: u64) -> (TestG
         }
     }
 
-    panic!(
-        "failed to spawn H3 drain gateway after {MAX_ATTEMPTS} attempts: {last_error}"
-    );
+    panic!("failed to spawn H3 drain gateway after {MAX_ATTEMPTS} attempts: {last_error}");
 }
 
 async fn start_slow_http_backend(

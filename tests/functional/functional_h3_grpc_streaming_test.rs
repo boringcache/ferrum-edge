@@ -1135,7 +1135,9 @@ async fn h3_grpc_shutdown_completes_trailers_after_goaway() {
         .expect("backend tls")
         .step(GrpcStep::AcceptRpc(MatchRpc::any()))
         .step(GrpcStep::SendInitialHeaders)
-        .step(GrpcStep::RespondMessage(Bytes::from_static(b"before-goaway")))
+        .step(GrpcStep::RespondMessage(Bytes::from_static(
+            b"before-goaway",
+        )))
         .step(GrpcStep::Sleep(Duration::from_millis(1500)))
         .step(GrpcStep::RespondStatus {
             code: 0,
@@ -1173,9 +1175,7 @@ async fn h3_grpc_shutdown_completes_trailers_after_goaway() {
         !body.is_empty(),
         "in-flight gRPC DATA must not be truncated by drain"
     );
-    let grpc_status = trailers
-        .get("grpc-status")
-        .and_then(|v| v.to_str().ok());
+    let grpc_status = trailers.get("grpc-status").and_then(|v| v.to_str().ok());
     assert_eq!(
         grpc_status,
         Some("0"),
