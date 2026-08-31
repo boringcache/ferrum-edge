@@ -209,6 +209,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   advisories, bans, and sources (issue #4439). The `[licenses]` allowlist and
   confidence threshold in `deny.toml` are blocking on every PR and in the weekly
   `dependency-audit` workflow.
+- Document build-out database upgrades as export → fresh `V001` baseline →
+  `POST /restore`, not in-place schema migration (issue #4437). The upgrade guide
+  previously described cloning the production database and applying pending core
+  migrations, which contradicts the baseline-only build-out policy and checksum
+  refusal for changed `V001` digests. **Operator action**: during build-out,
+  follow
+  [upgrade_guide.md → Build-Out Database Upgrade](docs/upgrade_guide.md#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb),
+  keep the old database for rollback, and do not rely on binary-only rollback
+  against a database that received a new baseline.
 
 - **BREAKING — injected Ferrum is a Kubernetes native sidecar**
   (issue #4430). The webhook now emits `ferrum-edge` under `spec.initContainers`
