@@ -7426,8 +7426,8 @@ impl Serialize for TransactionSummary {
         if self.client_disconnected {
             map.serialize_entry("client_disconnected", &true)?;
         }
-        if let Some(error_class) = self.serialized_error_class() {
-            map.serialize_entry("error_class", error_class)?;
+        if let Some(error_class) = self.error_class {
+            map.serialize_entry("error_class", &error_class)?;
         }
         if let Some(body_error_class) = self.body_error_class {
             map.serialize_entry("body_error_class", &body_error_class)?;
@@ -7479,14 +7479,15 @@ impl TransactionSummary {
 
     /// Gateway-authored rejection phase (`circuit_breaker_open`,
     /// `adaptive_concurrency`, …) when a plugin/fence stamped one. Used to
-    /// intern the HTTP observability token so logs and metrics agree with
-    /// `X-Gateway-Error`.
+    /// intern the HTTP metrics `error_class` token when there is no
+    /// [`crate::retry::ErrorClass`].
     pub fn rejection_phase(&self) -> Option<&str> {
         self.metadata.get("rejection_phase").map(String::as_str)
     }
 
-    /// Closed `ferrum_requests_total{error_class}` / `X-Gateway-Error` token.
-    /// `None` on 2xx so the common series is not multiplied.
+    /// Closed `ferrum_requests_total{error_class}` label: granular
+    /// [`crate::retry::ErrorClass::as_str`] on 5xx when a class exists,
+    /// otherwise a gateway-authored token. `None` on 2xx/3xx/4xx.
     pub fn metrics_error_class_label(&self) -> Option<&'static str> {
         crate::retry::http_metrics_error_class(
             self.error_class,
@@ -7495,14 +7496,10 @@ impl TransactionSummary {
         )
     }
 
-    /// Access-log `error_class`: the HTTP observability token on 5xx, else
-    /// the granular [`crate::retry::ErrorClass::as_str`] when present.
+    /// Access-log `error_class`: always the granular
+    /// [`crate::retry::ErrorClass::as_str`]. Omitted when unset.
     pub fn serialized_error_class(&self) -> Option<&'static str> {
-        crate::retry::http_log_error_class(
-            self.error_class,
-            self.response_status_code,
-            self.rejection_phase(),
-        )
+        crate::retry::http_log_error_class(self.error_class)
     }
 
     /// One authoritative terminal-failure predicate for transaction loggers.

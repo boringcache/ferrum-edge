@@ -328,7 +328,7 @@ impl SchemaSerializable for TransactionSummary {
                     Ok(())
                 }
             }
-            "error_class" => match self.serialized_error_class() {
+            "error_class" => match &self.error_class {
                 Some(v) => map.serialize_entry(out_key, v),
                 None => Ok(()),
             },

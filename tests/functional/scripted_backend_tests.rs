@@ -1583,7 +1583,7 @@ async fn a2a_retry_configured_json_agent_card_is_still_rewritten() {
 // ────────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn https_backend_plaintext_origin_logs_connection_failure() {
+async fn https_backend_plaintext_origin_classifies_as_tls_error() {
     let reservation = reserve_port().await.expect("reserve port");
     let backend_port = reservation.port;
     let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
@@ -1620,13 +1620,13 @@ async fn https_backend_plaintext_origin_logs_connection_failure() {
 
     let logs = harness
         .wait_for_log_contains(
-            |logs| has_json_error_class(logs, "connection_failure"),
+            |logs| has_json_error_class(logs, "tls_error"),
             Duration::from_secs(8),
         )
         .await;
     assert!(
-        has_json_error_class(&logs, "connection_failure"),
-        "HTTPS to a plaintext origin is a 502 connection_failure (X-Gateway-Error vocabulary); got:\n{logs}"
+        has_json_error_class(&logs, "tls_error"),
+        "HTTPS to a plaintext origin must classify as tls_error; got:\n{logs}"
     );
     assert!(
         !has_json_error_class(&logs, "connection_refused"),

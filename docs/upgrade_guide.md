@@ -58,21 +58,6 @@ alphanumeric first, then ASCII alphanumeric, hyphen, or underscore.
 stale hand-authored pod-registry artifacts and let the node-agent regenerate
 every pod entry. Any external publisher must use only the documented leaf and
 body grammar; otherwise cleanup/finalize remains fail-closed.
-### HTTP 5xx log `error_class` matches `X-Gateway-Error` (issue [#4397](https://github.com/ferrum-edge/ferrum-edge/issues/4397))
-
-HTTP-family 5xx access logs now emit the closed `X-Gateway-Error` token
-instead of the granular `ErrorClass::as_str` spelling. A refused connect that
-used to log `error_class=connection_refused` logs `connection_failure`.
-Gateway-authored 503s log `overload`, `config_stale`, `concurrency_limit`, or
-`circuit_breaker_open`. `ferrum_requests_total` adds that same optional label
-on 5xx only (omitted on 2xx). Stream logs and `ferrum_stream_disconnects_total`
-keep `ErrorClass::as_str` (`dns_lookup_error`, and so on).
-
-**Operator action:** rewrite HTTP 5xx log alerts that match granular classes
-(`connection_refused`, `dns_lookup_error`, `tls_error`, `connection_timeout`,
-`connection_reset`, `connection_pool_error`, `port_exhaustion`) to
-`connection_failure`. Update PromQL on 5xx `ferrum_requests_total` to allow or
-ignore the new `error_class` label; 2xx series are unchanged.
 
 ### HTTP/1.1 requests without a Host header are rejected with 400 (issue [#4390](https://github.com/ferrum-edge/ferrum-edge/issues/4390))
 

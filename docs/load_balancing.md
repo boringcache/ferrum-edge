@@ -638,9 +638,15 @@ When proxying to upstream targets, the gateway adds response headers that help c
 
 ### `X-Gateway-Error`
 
-Set on 5xx responses to categorize the failure. The same spelling is used as
-the HTTP access-log `error_class` and as `ferrum_requests_total{error_class}`
-(omitted on 2xx). Cardinality is a closed set of seven `&'static str` tokens:
+Set on 5xx responses to categorize the failure. This is the **stable
+client-facing contract** — a closed set of seven `&'static str` tokens.
+Access-log `error_class` and `ferrum_requests_total{error_class}` use the
+**granular** `ErrorClass::as_str` spelling when a class exists
+(`dns_lookup_error`, `connection_refused`, `tls_error`, …) plus the four
+gateway-authored tokens below when the rejection has no `ErrorClass`. Map
+each granular class to its header token in
+[error_classification.md](error_classification.md#http-observability-vocabulary-x-gateway-error).
+The header is omitted on 2xx/3xx/4xx.
 
 | Value | Meaning |
 |-------|---------|
@@ -710,7 +716,7 @@ HTTP/1.1 200 OK
 
 ### Use Cases
 
-- **Alerting**: Alert on `X-Gateway-Error: connection_failure` to detect backends that are completely down vs. backends that are slow (`backend_timeout`). Alert on `circuit_breaker_open` to detect a tripped breaker rather than a live backend 5xx (`backend_error`). Alert on `overload`, `config_stale`, and `concurrency_limit` to distinguish gateway-authored sheds from backend 503s. The same tokens appear on `ferrum_requests_total{error_class}` for HTTP 5xx.
+- **Alerting**: Alert on `X-Gateway-Error: connection_failure` to detect backends that are completely down vs. backends that are slow (`backend_timeout`). Alert on `circuit_breaker_open` to detect a tripped breaker rather than a live backend 5xx (`backend_error`). Alert on `overload`, `config_stale`, and `concurrency_limit` to distinguish gateway-authored sheds from backend 503s. PromQL on `ferrum_requests_total{error_class}` uses the granular spelling (`dns_lookup_error` vs `connection_refused` vs `read_write_timeout`) and the same four gateway-authored tokens; it does **not** emit `connection_failure` / `backend_timeout` / `backend_error`.
 - **Client-side retry**: Clients can decide whether to retry based on the error type — connection failures may resolve quickly, while backend errors suggest the service itself is unhealthy.
 - **Dashboards**: Track `X-Gateway-Upstream-Status: degraded` to monitor when upstreams are operating in fallback mode.
 - **Distinguishing gateway vs. backend issues**: A `backend_error` means the backend returned a 5xx — the issue is with the backend. A `connection_failure` means the gateway couldn't reach the backend — the issue may be network, DNS, or the backend process is down. A `circuit_breaker_open`, `overload`, `config_stale`, or `concurrency_limit` means the gateway short-circuited the request locally.

@@ -63,15 +63,16 @@ pub(crate) fn escape_label_value(value: &str) -> String {
 /// static label sets before insertion. Request-controlled extension methods,
 /// malformed gRPC status values, and error messages can therefore never
 /// create unbounded registry keys. `error_class` is omitted (`None`) on
-/// non-5xx so the common 2xx series is not multiplied.
+/// 2xx/3xx/4xx so the common success series is not multiplied.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CounterKey {
     pub proxy_id: Arc<str>,
     pub method: &'static str,
     pub status_code: u16,
     pub grpc_status: Option<&'static str>,
-    /// Closed HTTP observability token (`X-Gateway-Error` spelling). `None`
-    /// on 2xx/3xx/4xx.
+    /// Closed HTTP metrics token: [`ErrorClass::as_str`] or a
+    /// gateway-authored token (`circuit_breaker_open` / `overload` /
+    /// `config_stale` / `concurrency_limit`). `None` on 2xx/3xx/4xx.
     pub error_class: Option<&'static str>,
 }
 

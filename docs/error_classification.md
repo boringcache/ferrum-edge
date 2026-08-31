@@ -207,9 +207,21 @@ Two summary types in [`src/plugins/mod.rs`](../src/plugins/mod.rs) carry classif
 
 ## HTTP observability vocabulary (`X-Gateway-Error`)
 
-HTTP-family 5xx use one closed seven-token spelling on three surfaces:
-`X-Gateway-Error`, the access-log `error_class`, and
-`ferrum_requests_total{error_class}`:
+HTTP-family 5xx use **two** closed vocabularies across three surfaces:
+
+| Surface | Closed set | Cardinality |
+|---|---|---|
+| `X-Gateway-Error` (client header) | seven coarse tokens below | **7** |
+| Access-log `error_class` | [`ErrorClass::as_str`](../src/retry.rs) | **19** (omitted when unset) |
+| `ferrum_requests_total{error_class}` | `ErrorClass::as_str` plus four gateway-authored tokens | **23** (omitted on 2xx/3xx/4xx and on backend 5xx with no class) |
+
+The header is the stable client-facing contract and must not change spelling.
+Metrics and logs keep the granular class so PromQL and log alerts can split
+`dns_lookup_error` from `connection_refused` from `tls_error` from
+`port_exhaustion`. Values on every surface are compiled-in `&'static str` —
+never an error message, never a client- or backend-influenced string.
+
+### Header tokens (`X-Gateway-Error`)
 
 | Token | When |
 |---|---|
@@ -222,15 +234,40 @@ HTTP-family 5xx use one closed seven-token spelling on three surfaces:
 | `concurrency_limit` | `adaptive_concurrency` admission 503 |
 
 Do not reuse `backend_error` for a response that never reached a backend.
-2xx omit the metrics label. Stream disconnects keep the granular
-`ErrorClass::as_str` values (19 compiled-in variants) and add that optional
-label on `ferrum_stream_disconnects_total`.
 
-HTTP 5xx logs collapse the in-memory `ErrorClass` (for example
-`connection_refused`) onto the matching `X-Gateway-Error` token
-(`connection_failure`). Non-5xx logs still emit `ErrorClass::as_str`
-(`client_disconnect`, `connection_timeout` on a synthetic 2xx, and so on).
-Stream logs are unchanged.
+### Granular class → header token
+
+| `ErrorClass::as_str` (log + HTTP metric) | `X-Gateway-Error` |
+|---|---|
+| `connection_timeout` | `connection_failure` |
+| `connection_refused` | `connection_failure` |
+| `dns_lookup_error` | `connection_failure` |
+| `tls_error` | `connection_failure` |
+| `port_exhaustion` | `connection_failure` |
+| `connection_pool_error` | `connection_failure` |
+| `backend_connection_limit` | `connection_failure` |
+| `trust_withdrawn` | `connection_failure` |
+| `read_write_timeout` | `backend_timeout` |
+| `connection_reset` | `backend_error` |
+| `connection_closed` | `backend_error` |
+| `client_disconnect` | `backend_error` (only if the public status is 5xx) |
+| `protocol_error` | `backend_error` |
+| `response_body_too_large` | `backend_error` |
+| `gateway_buffer_capacity` | `backend_error` |
+| `request_body_too_large` | `backend_error` |
+| `graceful_remote_close` | `backend_error` |
+| `dispatch_policy_rejected` | `backend_error` |
+| `request_error` | `backend_error` |
+| *(no `ErrorClass`; `rejection_phase=circuit_breaker_open`)* | `circuit_breaker_open` |
+| *(no `ErrorClass`; `rejection_phase=overload`)* | `overload` |
+| *(no `ErrorClass`; `rejection_phase=config_stale`)* | `config_stale` |
+| *(no `ErrorClass`; `rejection_phase=adaptive_concurrency`)* | `concurrency_limit` |
+
+The four gateway-authored tokens appear on the metric (and the header) when
+there is no `ErrorClass`. They are omitted from the access log in that case;
+`metadata.rejection_phase` still names the fence. Stream disconnects keep
+the granular `ErrorClass::as_str` values (19 compiled-in variants) and add
+that optional label on `ferrum_stream_disconnects_total`.
 
 ## Adding a new error path
 
@@ -243,7 +280,7 @@ When you add a dispatcher or a new failure mode:
 
 ## Example log output
 
-When a backend connection is refused, the `TransactionSummary` JSON includes the proxy identity (so dashboards can attribute the failure to the right route) plus the HTTP observability `error_class`. `proxy_id` / `proxy_name` use the same JSON keys here as on `StreamTransactionSummary`, so log queries don't need to branch on protocol family:
+When a backend connection times out, the `TransactionSummary` JSON includes the proxy identity (so dashboards can attribute the failure to the right route) plus the granular `error_class`. `proxy_id` / `proxy_name` use the same JSON keys here as on `StreamTransactionSummary`, so log queries don't need to branch on protocol family:
 
 ```json
 {
@@ -256,7 +293,7 @@ When a backend connection is refused, the `TransactionSummary` JSON includes the
   "backend_target": "https://upstream.internal:8443/api/v1/users",
   "backend_resolved_ip": "10.0.2.10",
   "response_status_code": 502,
-  "error_class": "connection_failure",
+  "error_class": "connection_timeout",
   "latency_total_ms": 30000.0
 }
 ```

@@ -164,6 +164,9 @@ impl ErrorClass {
 
     /// Every compiled-in [`ErrorClass`] variant. Stream `error_class` metrics
     /// labels are drawn only from [`Self::as_str`] of this set (or omitted).
+    /// HTTP `ferrum_requests_total{error_class}` uses the same strings plus
+    /// the four gateway-authored tokens in
+    /// [`HTTP_METRICS_GATEWAY_ERROR_CLASSES`].
     pub const ALL: &'static [ErrorClass] = &[
         Self::ConnectionTimeout,
         Self::ConnectionRefused,
@@ -193,9 +196,9 @@ impl std::fmt::Display for ErrorClass {
     }
 }
 
-/// Client-visible HTTP-family failure class (`X-Gateway-Error`), HTTP access-log
-/// `error_class` for 5xx, and `ferrum_requests_total{error_class=…}` share these
-/// spellings. Additive: do not rename the four backend/CB tokens.
+/// Client-visible HTTP-family failure class (`X-Gateway-Error`). Additive:
+/// do not rename the four backend/CB tokens. This is the stable header
+/// contract and is coarser than the metrics/log `error_class` label.
 pub const OBS_CONNECTION_FAILURE: &str = "connection_failure";
 pub const OBS_BACKEND_TIMEOUT: &str = "backend_timeout";
 pub const OBS_BACKEND_ERROR: &str = "backend_error";
@@ -204,7 +207,10 @@ pub const OBS_OVERLOAD: &str = "overload";
 pub const OBS_CONFIG_STALE: &str = "config_stale";
 pub const OBS_CONCURRENCY_LIMIT: &str = "concurrency_limit";
 
-/// Closed HTTP observability vocabulary. Cardinality bound: **7**.
+/// Closed `X-Gateway-Error` vocabulary. Cardinality bound: **7**.
+/// Header spelling is independent of `ferrum_requests_total{error_class}`
+/// and of access-log `error_class` (those use [`ErrorClass::as_str`] plus
+/// [`HTTP_METRICS_GATEWAY_ERROR_CLASSES`]).
 pub const HTTP_OBSERVABILITY_ERROR_CLASSES: &[&str] = &[
     OBS_CONNECTION_FAILURE,
     OBS_BACKEND_TIMEOUT,
@@ -215,9 +221,31 @@ pub const HTTP_OBSERVABILITY_ERROR_CLASSES: &[&str] = &[
     OBS_CONCURRENCY_LIMIT,
 ];
 
+/// Gateway-authored `ferrum_requests_total{error_class}` tokens that have
+/// no [`ErrorClass`] variant. Combined with [`ErrorClass::ALL`] they are
+/// the closed HTTP metrics label set (bound:
+/// [`HTTP_METRICS_ERROR_CLASS_BOUND`]).
+pub const HTTP_METRICS_GATEWAY_ERROR_CLASSES: &[&str] = &[
+    OBS_CIRCUIT_BREAKER_OPEN,
+    OBS_OVERLOAD,
+    OBS_CONFIG_STALE,
+    OBS_CONCURRENCY_LIMIT,
+];
+
+/// Closed `ferrum_requests_total{error_class}` vocabulary.
+///
+/// Cardinality bound: **23** = [`ErrorClass::ALL`] (19) plus the four
+/// gateway-authored tokens in [`HTTP_METRICS_GATEWAY_ERROR_CLASSES`].
+/// Values are compiled-in `&'static str` only — never an error message,
+/// never a client- or backend-influenced string. `X-Gateway-Error` stays
+/// on the coarser seven-token [`HTTP_OBSERVABILITY_ERROR_CLASSES`] set;
+/// map each granular class to its header token with
+/// [`x_gateway_error_token_for_class`].
+pub const HTTP_METRICS_ERROR_CLASS_BOUND: usize = 23;
+
 /// Map a backend-path HTTP status plus the pre-wire flag onto the closed
 /// `X-Gateway-Error` vocabulary. `None` for non-5xx without a connection
-/// failure so 2xx series do not gain a label.
+/// failure so 2xx responses do not carry the header.
 #[inline]
 pub fn http_observability_error_class(
     connection_error: bool,
@@ -234,9 +262,24 @@ pub fn http_observability_error_class(
     }
 }
 
-/// Intern a gateway-authored rejection-phase name onto the HTTP vocabulary.
-/// Unknown phases return `None` so attacker-controlled strings cannot become
-/// metrics labels.
+/// Coarse `X-Gateway-Error` token for a typical HTTP-family 5xx of this
+/// granular [`ErrorClass`]. Pre-wire classes collapse to
+/// `connection_failure`; `ReadWriteTimeout` is `backend_timeout`; every
+/// other class is `backend_error`.
+#[inline]
+pub fn x_gateway_error_token_for_class(class: ErrorClass) -> &'static str {
+    if !request_reached_wire(class) {
+        OBS_CONNECTION_FAILURE
+    } else if matches!(class, ErrorClass::ReadWriteTimeout) {
+        OBS_BACKEND_TIMEOUT
+    } else {
+        OBS_BACKEND_ERROR
+    }
+}
+
+/// Intern a gateway-authored rejection-phase name onto the four metrics
+/// tokens that have no [`ErrorClass`]. Unknown phases return `None` so
+/// attacker-controlled strings cannot become metrics labels.
 #[inline]
 pub fn token_for_rejection_phase(phase: &str) -> Option<&'static str> {
     match phase {
@@ -248,8 +291,8 @@ pub fn token_for_rejection_phase(phase: &str) -> Option<&'static str> {
     }
 }
 
-/// Intern a candidate HTTP observability token. Values outside the closed
-/// set are rejected rather than forwarded as labels.
+/// Intern a candidate `X-Gateway-Error` token. Values outside the closed
+/// seven-token header set are rejected rather than forwarded.
 #[inline]
 pub fn intern_http_observability_error_class(value: &str) -> Option<&'static str> {
     HTTP_OBSERVABILITY_ERROR_CLASSES
@@ -258,46 +301,56 @@ pub fn intern_http_observability_error_class(value: &str) -> Option<&'static str
         .find(|&token| token == value)
 }
 
-/// HTTP metrics / 5xx log token for one transaction.
+/// Intern a candidate HTTP metrics `error_class` label. Membership is
+/// [`ErrorClass::as_str`] of [`ErrorClass::ALL`] plus
+/// [`HTTP_METRICS_GATEWAY_ERROR_CLASSES`]. Header-only tokens such as
+/// `connection_failure` are rejected.
+#[inline]
+pub fn intern_http_metrics_error_class(value: &str) -> Option<&'static str> {
+    for class in ErrorClass::ALL {
+        if class.as_str() == value {
+            return Some(class.as_str());
+        }
+    }
+    HTTP_METRICS_GATEWAY_ERROR_CLASSES
+        .iter()
+        .copied()
+        .find(|&token| token == value)
+}
+
+/// HTTP `ferrum_requests_total{error_class}` label for one transaction.
 ///
-/// Gateway-authored rejects (`rejection_phase`) win so overload / stale-config
-/// / adaptive-concurrency / open-breaker 503s are never collapsed into
-/// `backend_error`. Otherwise the backend-path `X-Gateway-Error` mapping
-/// applies. Status below 500 returns `None` after the phase check so 2xx
-/// series are not multiplied.
+/// Closed set: [`ErrorClass::ALL`] (`as_str`) plus the four gateway-authored
+/// tokens. Cardinality bound: [`HTTP_METRICS_ERROR_CLASS_BOUND`] (23).
+///
+/// When an [`ErrorClass`] is present on a 5xx, the label is that class's
+/// `as_str` so `dns_lookup_error` stays distinguishable from
+/// `connection_refused`. When the rejection was gateway-authored and there
+/// is no `ErrorClass`, the matching gateway token is used. 2xx/3xx/4xx
+/// omit the label, as do backend 5xx with neither a class nor a gateway
+/// phase (select those by `status_code` alone).
 #[inline]
 pub fn http_metrics_error_class(
     error_class: Option<ErrorClass>,
     status: u16,
     rejection_phase: Option<&str>,
 ) -> Option<&'static str> {
-    if let Some(phase) = rejection_phase
-        && let Some(token) = token_for_rejection_phase(phase)
-    {
-        return Some(token);
-    }
-    // 2xx/3xx/4xx must not grow a label on the common `ferrum_requests_total`
-    // series. Connection-class 5xx still map through the header vocabulary.
     if status < 500 {
         return None;
     }
-    http_observability_error_class(
-        error_class.is_some_and(|class| !request_reached_wire(class)),
-        status,
-    )
+    if let Some(class) = error_class {
+        return Some(class.as_str());
+    }
+    rejection_phase.and_then(token_for_rejection_phase)
 }
 
-/// Access-log `error_class` for an HTTP-family summary: the metrics token
-/// when one exists, otherwise the granular [`ErrorClass::as_str`] so
-/// non-5xx classes such as `client_disconnect` stay visible in logs.
+/// Access-log `error_class` for an HTTP-family summary: always the granular
+/// [`ErrorClass::as_str`]. Gateway-authored 503s with no `ErrorClass` omit
+/// the field (same as `main`); join to `X-Gateway-Error` via
+/// [`x_gateway_error_token_for_class`].
 #[inline]
-pub fn http_log_error_class(
-    error_class: Option<ErrorClass>,
-    status: u16,
-    rejection_phase: Option<&str>,
-) -> Option<&'static str> {
-    http_metrics_error_class(error_class, status, rejection_phase)
-        .or_else(|| error_class.map(|class| class.as_str()))
+pub fn http_log_error_class(error_class: Option<ErrorClass>) -> Option<&'static str> {
+    error_class.map(|class| class.as_str())
 }
 
 /// Returns `true` if the error class implies the request was committed to the

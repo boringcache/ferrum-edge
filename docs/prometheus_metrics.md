@@ -236,6 +236,24 @@ Label sets are bounded by *configuration*, never by traffic or endpoint churn:
 - `upstream_id` and `proxy_id` are configured resource identities — the same cardinality tier `ferrum_requests_total` already uses.
 - Per-target health and per-target breaker state are reduced to a **count** per upstream / per proxy. A resolved endpoint address is never a label, so pod churn cannot grow the series count. Per-target detail stays on authenticated `GET /admin/metrics`.
 
+### `error_class` on request and stream counters
+
+`ferrum_requests_total{error_class}` is optional and closed. When an
+`ErrorClass` exists on a 5xx, the label is that class's `as_str`
+(`dns_lookup_error`, `connection_refused`, `tls_error`, `read_write_timeout`,
+…). When a gateway-authored 503 has no `ErrorClass`, the label is one of
+`circuit_breaker_open` / `overload` / `config_stale` / `concurrency_limit`.
+2xx/3xx/4xx omit the label, as do backend 5xx with neither a class nor a
+gateway phase. Cardinality bound is **23** compiled-in tokens.
+
+`X-Gateway-Error` stays on the coarser seven-token header vocabulary
+(`connection_failure` / `backend_timeout` / `backend_error` plus the four
+gateway tokens). Access-log `error_class` stays granular `ErrorClass::as_str`
+on every status. Mapping: [error_classification.md](error_classification.md#http-observability-vocabulary-x-gateway-error).
+
+`ferrum_stream_disconnects_total{error_class}` uses the same 19
+`ErrorClass::as_str` values as stream logs and omits the label when unset.
+
 ## Complete family inventory
 
 Sorted by family name. Optional namespace labels are listed when the emitter supports them.

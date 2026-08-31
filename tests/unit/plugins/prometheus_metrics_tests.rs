@@ -15,9 +15,10 @@ use ferrum_edge::plugins::{
 };
 use ferrum_edge::proxy::tcp_proxy::StreamIoSide;
 use ferrum_edge::retry::{
-    ErrorClass, HTTP_OBSERVABILITY_ERROR_CLASSES, OBS_BACKEND_ERROR, OBS_BACKEND_TIMEOUT,
-    OBS_CIRCUIT_BREAKER_OPEN, OBS_CONCURRENCY_LIMIT, OBS_CONFIG_STALE, OBS_CONNECTION_FAILURE,
-    OBS_OVERLOAD, intern_http_observability_error_class,
+    ErrorClass, HTTP_METRICS_ERROR_CLASS_BOUND, HTTP_METRICS_GATEWAY_ERROR_CLASSES,
+    HTTP_OBSERVABILITY_ERROR_CLASSES, OBS_CIRCUIT_BREAKER_OPEN, OBS_CONCURRENCY_LIMIT,
+    OBS_CONFIG_STALE, OBS_OVERLOAD, intern_http_metrics_error_class,
+    intern_http_observability_error_class,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -2662,12 +2663,16 @@ async fn unchanged_tls_inventory_freshness_preserves_the_render_cache() {
 }
 
 #[tokio::test]
-async fn http_error_class_label_matches_x_gateway_error_vocabulary() {
+async fn http_error_class_label_is_granular_error_class() {
     let registry = MetricsRegistry::new();
 
-    let mut connection = make_summary("obs-http", "GET", 502, 10.0, 8.0);
-    connection.error_class = Some(ErrorClass::ConnectionRefused);
-    registry.record(&connection);
+    let mut refused = make_summary("obs-http", "GET", 502, 10.0, 8.0);
+    refused.error_class = Some(ErrorClass::ConnectionRefused);
+    registry.record(&refused);
+
+    let mut dns = make_summary("obs-http", "GET", 502, 10.0, 8.0);
+    dns.error_class = Some(ErrorClass::DnsLookupError);
+    registry.record(&dns);
 
     let mut timeout = make_summary("obs-http", "GET", 504, 10.0, 8.0);
     timeout.error_class = Some(ErrorClass::ReadWriteTimeout);
@@ -2684,17 +2689,15 @@ async fn http_error_class_label_matches_x_gateway_error_vocabulary() {
     registry.record(&breaker);
 
     let mut overload = make_summary("obs-http", "GET", 503, 10.0, 8.0);
-    overload.metadata.insert(
-        "rejection_phase".to_string(),
-        "overload".to_string(),
-    );
+    overload
+        .metadata
+        .insert("rejection_phase".to_string(), "overload".to_string());
     registry.record(&overload);
 
     let mut stale = make_summary("obs-http", "GET", 503, 10.0, 8.0);
-    stale.metadata.insert(
-        "rejection_phase".to_string(),
-        "config_stale".to_string(),
-    );
+    stale
+        .metadata
+        .insert("rejection_phase".to_string(), "config_stale".to_string());
     registry.record(&stale);
 
     let mut concurrency = make_summary("obs-http", "GET", 503, 10.0, 8.0);
@@ -2708,8 +2711,9 @@ async fn http_error_class_label_matches_x_gateway_error_vocabulary() {
     registry.record(&ok);
 
     for (status, token) in [
-        (502, OBS_CONNECTION_FAILURE),
-        (504, OBS_BACKEND_TIMEOUT),
+        (502, "connection_refused"),
+        (502, "dns_lookup_error"),
+        (504, "read_write_timeout"),
     ] {
         assert!(
             registry.request_counter.contains_key(&CounterKey {
@@ -2727,7 +2731,7 @@ async fn http_error_class_label_matches_x_gateway_error_vocabulary() {
         method: "GET",
         status_code: 503,
         grpc_status: None,
-        error_class: Some(OBS_BACKEND_ERROR),
+        error_class: None,
     }));
     assert!(registry.request_counter.contains_key(&CounterKey {
         proxy_id: Arc::from("obs-http"),
@@ -2777,14 +2781,18 @@ async fn http_error_class_label_matches_x_gateway_error_vocabulary() {
         "2xx must not grow an error_class label: {output}"
     );
     assert!(output.contains(
+        r#"ferrum_requests_total{proxy_id="obs-http",method="GET",status_code="502",error_class="dns_lookup_error"} 1"#
+    ));
+    assert!(output.contains(
+        r#"ferrum_requests_total{proxy_id="obs-http",method="GET",status_code="502",error_class="connection_refused"} 1"#
+    ));
+    assert!(output.contains(
         r#"ferrum_requests_total{proxy_id="obs-http",method="GET",status_code="503",error_class="overload"} 1"#
     ));
-    assert!(output.contains(
-        r#"ferrum_requests_total{proxy_id="obs-http",method="GET",status_code="503",error_class="config_stale"} 1"#
-    ));
-    assert!(output.contains(
-        r#"ferrum_requests_total{proxy_id="obs-http",method="GET",status_code="503",error_class="concurrency_limit"} 1"#
-    ));
+    assert!(
+        !output.contains(r#"error_class="connection_failure""#),
+        "HTTP metrics must not emit the coarse header token: {output}"
+    );
 }
 
 #[test]
@@ -2801,6 +2809,11 @@ fn http_observability_error_class_set_is_closed() {
     assert!(intern_http_observability_error_class("backend_down").is_none());
     assert!(intern_http_observability_error_class("connection_timeout").is_none());
     assert_eq!(ErrorClass::ALL.len(), 19);
+    assert_eq!(HTTP_METRICS_GATEWAY_ERROR_CLASSES.len(), 4);
+    assert_eq!(
+        ErrorClass::ALL.len() + HTTP_METRICS_GATEWAY_ERROR_CLASSES.len(),
+        HTTP_METRICS_ERROR_CLASS_BOUND
+    );
     let mut class_seen = std::collections::HashSet::new();
     for class in ErrorClass::ALL {
         assert!(
@@ -2808,7 +2821,15 @@ fn http_observability_error_class_set_is_closed() {
             "ErrorClass::as_str must be unique: {}",
             class.as_str()
         );
+        assert_eq!(
+            intern_http_metrics_error_class(class.as_str()),
+            Some(class.as_str())
+        );
     }
+    for token in HTTP_METRICS_GATEWAY_ERROR_CLASSES {
+        assert_eq!(intern_http_metrics_error_class(token), Some(*token));
+    }
+    assert!(intern_http_metrics_error_class("connection_failure").is_none());
 }
 
 #[tokio::test]
