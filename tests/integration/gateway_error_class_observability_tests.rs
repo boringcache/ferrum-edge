@@ -153,10 +153,7 @@ fn header_stays_coarse_while_metrics_and_logs_stay_granular() {
     // A backend 5xx the gateway never classified still carries the metrics
     // label its header advertises, so PromQL can select the series; the
     // access log stays granular and simply has nothing to report here.
-    assert_eq!(
-        backend.metrics_error_class_label(),
-        Some(OBS_BACKEND_ERROR)
-    );
+    assert_eq!(backend.metrics_error_class_label(), Some(OBS_BACKEND_ERROR));
     assert_eq!(backend.serialized_error_class(), None);
     registry.record(&backend);
     assert!(
@@ -228,11 +225,7 @@ fn http_metrics_cardinality_is_error_class_all_plus_five_gateway_tokens() {
     let mut metrics_seen = std::collections::HashSet::new();
     for class in ErrorClass::ALL {
         let token = class.as_str();
-        assert!(
-            metrics_seen.insert(token),
-            "duplicate ErrorClass {}",
-            token
-        );
+        assert!(metrics_seen.insert(token), "duplicate ErrorClass {}", token);
         assert_eq!(intern_http_metrics_error_class(token), Some(token));
         assert!(
             !HTTP_METRICS_GATEWAY_ERROR_CLASSES.contains(&token),
@@ -249,7 +242,9 @@ fn http_metrics_cardinality_is_error_class_all_plus_five_gateway_tokens() {
     assert_eq!(metrics_seen.len(), HTTP_METRICS_ERROR_CLASS_BOUND);
     assert!(intern_http_metrics_error_class("connection_failure").is_none());
     assert!(intern_http_metrics_error_class("backend_timeout").is_none());
-    assert!(intern_http_metrics_error_class("backend_error").is_none());
+    // `backend_error` IS a metrics token now: it is the label an unclassified
+    // backend 5xx carries so the series matches its `X-Gateway-Error` header.
+    assert!(intern_http_metrics_error_class("backend_error").is_some());
     assert!(intern_http_metrics_error_class("dns_lookup_error").is_some());
 }
 
