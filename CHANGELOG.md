@@ -106,6 +106,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Identity-only NodeWaypoint assertion grants require ambient enrollment.**
+  Kubernetes pod discovery no longer lets a same-node identity-only pod
+  enter a NodeWaypoint's HBONE assertion inventory merely by sharing that
+  node. The pod must pass the node-agent ambient enrollment predicate
+  (`ferrum.io/mesh: enabled` or `ferrum.io/inject: true`, and not
+  host-network, sidecar-injected, or an excluded namespace).
 - **Security — hostile H3 backend responses cannot panic the gateway via QPACK
   expansion** (issue #4261 follow-up). Pooled H3 backend clients inherited the
   vendored `h3::client` default `max_field_section_size` of `VarInt::MAX`, so a
