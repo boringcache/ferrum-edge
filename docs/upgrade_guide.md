@@ -6,6 +6,21 @@ This document describes how to safely upgrade Ferrum Edge between versions with 
 
 Every current `[Unreleased]` `BREAKING` changelog entry is listed here exactly once, with its issue number and the operator action that entry already states. Several of these fail **silently** at cutover (HMAC clients get `401`, WAF `literal` rules stop matching folded spellings, backends stop seeing client-supplied XFF hops) rather than refusing config load. Read this section before the per-mode procedures below.
 
+### TLS event source IDs are opaque digests (issue [#4435](https://github.com/ferrum-edge/ferrum-edge/issues/4435))
+
+`GET /admin/tls/events` no longer returns configured source paths or URIs in
+`sources[].source_id`. The field is a fixed-size non-reversible digest, and the
+event log records only first/changed failure-class, recovery, and later
+regression transitions while Prometheus counters continue counting every poll.
+Recovery is now represented by the `recovered` outcome. Existing persisted
+events are normalized when the bounded store is opened, so raw legacy source
+identifiers and error strings do not remain in snapshots.
+
+**Operator action:** consumers of `GET /admin/tls/events` must treat
+`sources[].source_id` as an opaque returned digest and use that value, rather
+than a configured URI/path, in the `source_id` query filter; accept the new
+`recovered` outcome.
+
 ### Injected Ferrum is a Kubernetes native sidecar (issue [#4430](https://github.com/ferrum-edge/ferrum-edge/issues/4430))
 
 The injector no longer appends Ferrum as an ordinary `spec.containers` entry. New pods receive a native sidecar (`spec.initContainers` with `restartPolicy: Always`) and exec probes against loopback `/health`. That is also what unblocks Kubernetes Job completion. **Minimum Kubernetes version is 1.29** (native sidecars enabled by default; 1.28 needs `SidecarContainers=true`). There is no ordinary-container fallback: the webhook always emits the native-sidecar shape, and a cluster older than that will reject the patched Pod.

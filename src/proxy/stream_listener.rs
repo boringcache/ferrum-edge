@@ -21,7 +21,7 @@ use crate::health_check::HealthChecker;
 use crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver;
 use crate::request_epoch::RequestEpochStore;
 use crate::tls::TlsPolicy;
-use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
+use crate::tls::source::{CertSource, MaterialKind, load_material};
 
 use super::tcp_proxy::{TcpListenerConfig, TcpProxyMetrics};
 use super::udp_proxy::{UdpListenerConfig, UdpProxyMetrics};
@@ -439,7 +439,7 @@ impl BackendTlsReloadKey {
             && source_matches(&self.client_key, &other.client_key)
     }
 
-    fn from_proxy(
+    async fn from_proxy(
         proxy: &Proxy,
         global_tls_ca_bundle_path: Option<&str>,
         crl_fingerprint: Option<&str>,
@@ -457,19 +457,30 @@ impl BackendTlsReloadKey {
 
         Self {
             verify_server_cert: proxy.resolved_tls.verify_server_cert,
-            server_ca_cert: server_ca_cert_source.map(|source| {
-                BackendTlsMaterialReloadKey::from_source_value(source, MaterialKind::CaBundle)
-            }),
-            client_cert: proxy
-                .resolved_tls
-                .client_cert_path
-                .as_deref()
-                .map(|source| {
+            server_ca_cert: match server_ca_cert_source {
+                Some(source) => Some(
+                    BackendTlsMaterialReloadKey::from_source_value(
+                        source,
+                        MaterialKind::CaBundle,
+                    )
+                    .await,
+                ),
+                None => None,
+            },
+            client_cert: match proxy.resolved_tls.client_cert_path.as_deref() {
+                Some(source) => Some(
                     BackendTlsMaterialReloadKey::from_source_value(source, MaterialKind::Cert)
-                }),
-            client_key: proxy.resolved_tls.client_key_path.as_deref().map(|source| {
-                BackendTlsMaterialReloadKey::from_source_value(source, MaterialKind::Key)
-            }),
+                        .await,
+                ),
+                None => None,
+            },
+            client_key: match proxy.resolved_tls.client_key_path.as_deref() {
+                Some(source) => Some(
+                    BackendTlsMaterialReloadKey::from_source_value(source, MaterialKind::Key)
+                        .await,
+                ),
+                None => None,
+            },
             san_allow_list: proxy.resolved_tls.san_allow_list.clone(),
             crl_fingerprint: crl_fingerprint.map(str::to_owned),
         }
@@ -498,7 +509,7 @@ impl BackendTlsMaterialReloadKey {
     /// Fingerprint a backend TLS material source by the bytes the TLS builder
     /// actually consumes.
     ///
-    /// Resolves through the same [`CertSource`] / [`load_material_blocking`]
+    /// Resolves through the same [`CertSource`] / [`load_material`]
     /// abstraction as `load_backend_material` in `src/tls/backend.rs`, so
     /// every supported source kind (plain path, inline PEM, `file://`,
     /// vault/aws/azure/gcp/k8s/acme/managed URIs) is fingerprinted by content.
@@ -506,11 +517,11 @@ impl BackendTlsMaterialReloadKey {
     /// non-path sources: a `file:///x.pem` or stable secret URI rotation
     /// would never change the key and the cached config would go stale
     /// forever. Cold path only — runs during reconcile, never per connection.
-    fn from_source_value(value: &str, kind: MaterialKind) -> Self {
+    async fn from_source_value(value: &str, kind: MaterialKind) -> Self {
         let source = CertSource::parse(value, kind);
-        let fingerprint = match load_material_blocking(&source, kind) {
+        let fingerprint = match load_material(&source, kind).await {
             Ok(material) => format!("sha256:{}", hex::encode(material.fingerprint)),
-            Err(err) => format!("error:{}", err),
+            Err(err) => format!("error:{}", err.failure_class()),
         };
 
         Self {
@@ -927,6 +938,7 @@ struct DesiredStreamProxy {
     /// drift detection. `None` is the explicit unlimited posture.
     udp_amplification_factor_bits: Option<u32>,
     backend_tls_reload_key: Option<BackendTlsReloadKey>,
+    backend_tls_validation_error: Option<String>,
 }
 
 impl DesiredStreamProxy {
@@ -997,6 +1009,9 @@ struct DesiredStreamListener {
     /// out of the restart key and republishes the destination table in place.
     udp_amplification_restart_key: Vec<(NamespacedResourceId, Option<u32>)>,
     backend_tls_reload_key: Option<BackendTlsReloadKey>,
+    /// Result of building the complete cached backend TLS config before the
+    /// listener-map guard is acquired. `None` means accepted.
+    backend_tls_validation_error: Option<String>,
     sni_ids: Option<Vec<NamespacedResourceId>>,
     /// Members of a shared `__nwudp_{port}` NodeWaypoint UDP destination group
     /// (issue #3861), sorted for determinism. `None` for every other listener,
@@ -1099,6 +1114,9 @@ enum StreamBackendMetricEntry {
 /// All state is behind a tokio `Mutex` to serialize reconciliation calls.
 /// Reconciliation happens only on config reload — not on the hot request path.
 pub struct StreamListenerManager {
+    /// Serializes whole reconcile transactions without making the listener-map
+    /// guard span asynchronous preparation, socket probes, or task shutdown.
+    reconcile_serial: tokio::sync::Mutex<()>,
     listeners: Arc<tokio::sync::Mutex<std::collections::HashMap<String, ListenerHandle>>>,
     dtls_metrics: arc_swap::ArcSwap<Vec<DtlsDemuxMetricEntry>>,
     stream_backend_metrics: arc_swap::ArcSwap<Vec<StreamBackendMetricEntry>>,
@@ -1530,6 +1548,7 @@ impl StreamListenerManager {
         trusted_proxies: Arc<crate::proxy::client_ip::TrustedProxies>,
     ) -> Self {
         Self {
+            reconcile_serial: tokio::sync::Mutex::new(()),
             listeners: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             dtls_metrics: arc_swap::ArcSwap::new(Arc::new(Vec::new())),
             stream_backend_metrics: arc_swap::ArcSwap::new(Arc::new(Vec::new())),
@@ -1752,12 +1771,8 @@ impl StreamListenerManager {
     /// listeners that are actually bound. Safe to call without a prior
     /// `reconcile()` — an empty listener set publishes nothing.
     pub async fn sync_node_waypoint_udp_steering(&self) {
-        let listeners = self.listeners.lock().await;
-        self.publish_serving_node_waypoint_udp_steering(
-            &listeners,
-            &std::collections::HashSet::new(),
-        )
-        .await;
+        self.publish_serving_node_waypoint_udp_steering(&std::collections::HashSet::new())
+            .await;
     }
 
     /// Test seam: pause bind-watch after `started` (before the map lock) and/or
@@ -2243,6 +2258,7 @@ impl StreamListenerManager {
     /// that failed to start due to port binding errors. An empty vec means all
     /// listeners started successfully.
     pub async fn reconcile(&self) -> Vec<(String, u16, String)> {
+        let _reconcile_guard = self.reconcile_serial.lock().await;
         // Every configured stream listener that is not serving after this
         // reconcile — hard bind failures AND deferred/degraded skips — is
         // accumulated here and published to the `/overload` snapshot. The
@@ -2257,74 +2273,78 @@ impl StreamListenerManager {
         // remain visible without requiring another config update.
         let (async_failure_tx, mut async_failure_rx) =
             tokio::sync::mpsc::unbounded_channel::<StreamBindFailure>();
-        let current_config = self.config.load();
+        let current_config = self.config.load_full();
         // Fingerprint the active CRL list once per reconcile: it is folded
         // into every TCP+TLS reload key so a CRL rotation (published via
         // `set_crls`) registers as backend-TLS drift.
         let active_crl_fingerprint = crl_list_fingerprint(&self.crls.load_full());
-        let mut listeners = self.listeners.lock().await;
-
         // Collect all desired stream proxies from config, keyed by the full
         // `(namespace, id)` identity. Two namespaces may reuse one proxy ID (IDs
         // are unique only per namespace), so a bare-ID key would silently drop
         // one tenant's listener and attach the survivor's runtime state to the
         // wrong namespace (issue #3094).
-        let desired: std::collections::HashMap<NamespacedResourceId, DesiredStreamProxy> =
-            current_config
-                .proxies
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| p.dispatch_kind.is_stream())
-                .filter_map(|(declaration_order, p)| {
-                    p.listen_port.map(|port| {
-                        // Passthrough proxies relay raw bytes and never build the
-                        // cached backend TLS config, so they carry no reload key:
-                        // backend TLS material (or its absence) must neither
-                        // restart them nor block them from starting.
-                        let backend_tls_reload_key = if p.dispatch_kind
-                            == crate::config::types::DispatchKind::TcpTls
-                            && !p.passthrough
-                        {
-                            Some(BackendTlsReloadKey::from_proxy(
-                                p,
-                                self.tls_ca_bundle_path.as_deref(),
-                                active_crl_fingerprint.as_deref(),
-                            ))
-                        } else {
-                            None
-                        };
-                        (
-                            NamespacedResourceId::new(p.namespace.clone(), p.id.clone()),
-                            DesiredStreamProxy {
-                                declaration_order,
-                                port,
-                                scheme: p.effective_scheme(),
-                                frontend_tls: p.frontend_tls,
-                                passthrough: p.passthrough,
-                                stream_proxy_protocol: p.stream_proxy_protocol.unwrap_or(false),
-                                has_hosts: !p.hosts.is_empty(),
-                                has_stream_match: p
-                                    .stream_match
-                                    .as_ref()
-                                    .is_some_and(|m| !m.is_empty()),
-                                node_waypoint_udp_destination_member: p
-                                    .joins_node_waypoint_udp_destination_plane(),
-                                node_waypoint_udp_has_destination_route: current_config
-                                    .node_waypoint_udp_destination_routes
-                                    .iter()
-                                    .any(|route| {
-                                        route.proxy.namespace == p.namespace
-                                            && route.proxy.id == p.id
-                                    }),
-                                udp_amplification_factor_bits: p
-                                    .udp_max_response_amplification_factor
-                                    .map(f32::to_bits),
-                                backend_tls_reload_key,
-                            },
-                        )
-                    })
-                })
-                .collect();
+        let mut desired = std::collections::HashMap::new();
+        for (declaration_order, proxy) in current_config.proxies.iter().enumerate() {
+            if !proxy.dispatch_kind.is_stream() {
+                continue;
+            }
+            let Some(port) = proxy.listen_port else {
+                continue;
+            };
+            let prepares_backend_tls = proxy.dispatch_kind
+                == crate::config::types::DispatchKind::TcpTls
+                && !proxy.passthrough;
+            let backend_tls_reload_key = if prepares_backend_tls {
+                Some(
+                    BackendTlsReloadKey::from_proxy(
+                        proxy,
+                        self.tls_ca_bundle_path.as_deref(),
+                        active_crl_fingerprint.as_deref(),
+                    )
+                    .await,
+                )
+            } else {
+                None
+            };
+            let backend_tls_validation_error = if prepares_backend_tls {
+                self.prepare_backend_tls_config(proxy, port).await.err()
+            } else {
+                None
+            };
+            desired.insert(
+                NamespacedResourceId::new(proxy.namespace.clone(), proxy.id.clone()),
+                DesiredStreamProxy {
+                    declaration_order,
+                    port,
+                    scheme: proxy.effective_scheme(),
+                    frontend_tls: proxy.frontend_tls,
+                    passthrough: proxy.passthrough,
+                    stream_proxy_protocol: proxy.stream_proxy_protocol.unwrap_or(false),
+                    has_hosts: !proxy.hosts.is_empty(),
+                    has_stream_match: proxy
+                        .stream_match
+                        .as_ref()
+                        .is_some_and(|matcher| !matcher.is_empty()),
+                    node_waypoint_udp_destination_member: proxy
+                        .joins_node_waypoint_udp_destination_plane(),
+                    node_waypoint_udp_has_destination_route: current_config
+                        .node_waypoint_udp_destination_routes
+                        .iter()
+                        .any(|route| {
+                            route.proxy.namespace == proxy.namespace
+                                && route.proxy.id == proxy.id
+                        }),
+                    udp_amplification_factor_bits: proxy
+                        .udp_max_response_amplification_factor
+                        .map(f32::to_bits),
+                    backend_tls_reload_key,
+                    backend_tls_validation_error,
+                },
+            );
+        }
+        // `OwnedMutexGuard` is never used: this ordinary Tokio `MutexGuard` is
+        // acquired only after every source await and prepared-config build.
+        let mut listeners = self.listeners.lock().await;
         let listener_candidates_compatible = |ids: &[NamespacedResourceId]| {
             let Some(first) = ids.first().and_then(|id| desired.get(id)) else {
                 return false;
@@ -2565,6 +2585,7 @@ impl StreamListenerManager {
                     datagram_client_address: entry.runs_datagram_client_address_gate(),
                     udp_amplification_restart_key,
                     backend_tls_reload_key: entry.backend_tls_reload_key.clone(),
+                    backend_tls_validation_error: entry.backend_tls_validation_error.clone(),
                     sni_ids: None,
                     node_waypoint_udp_ids: None,
                 },
@@ -2590,6 +2611,7 @@ impl StreamListenerManager {
                         datagram_client_address: entry.runs_datagram_client_address_gate(),
                         udp_amplification_restart_key,
                         backend_tls_reload_key: entry.backend_tls_reload_key.clone(),
+                        backend_tls_validation_error: entry.backend_tls_validation_error.clone(),
                         sni_ids: None,
                         // Deliberately NOT part of the restart key: membership
                         // changes republish the destination table in place, so
@@ -2626,6 +2648,7 @@ impl StreamListenerManager {
                         datagram_client_address: entry.runs_datagram_client_address_gate(),
                         udp_amplification_restart_key,
                         backend_tls_reload_key: entry.backend_tls_reload_key.clone(),
+                        backend_tls_validation_error: entry.backend_tls_validation_error.clone(),
                         sni_ids: Some(ids.clone()),
                         node_waypoint_udp_ids: None,
                     },
@@ -2650,6 +2673,7 @@ impl StreamListenerManager {
                         datagram_client_address: entry.runs_datagram_client_address_gate(),
                         udp_amplification_restart_key: Vec::new(),
                         backend_tls_reload_key: entry.backend_tls_reload_key.clone(),
+                        backend_tls_validation_error: entry.backend_tls_validation_error.clone(),
                         // Reuse the candidate-id channel. `tcp_proxy`
                         // distinguishes an L4 match group from an SNI group by
                         // inspecting the candidates themselves: an L4 group is
@@ -2742,6 +2766,7 @@ impl StreamListenerManager {
                 datagram_client_address,
                 udp_amplification_restart_key,
                 backend_tls_reload_key,
+                backend_tls_validation_error,
                 sni_ids,
                 // Membership of a shared NodeWaypoint UDP destination group is
                 // NOT part of the restart key (issue #3861): adding or removing
@@ -2835,8 +2860,7 @@ impl StreamListenerManager {
                     && handle.backend_routing_key == current_routing_key;
                 if content_only_rotation
                     && routing_unchanged
-                    && let Err(msg) =
-                        self.validate_backend_tls_config(&current_config, identity, *port)
+                    && let Some(msg) = backend_tls_validation_error.as_ref()
                 {
                     error!(
                         namespace = %identity.namespace,
@@ -2862,22 +2886,27 @@ impl StreamListenerManager {
         // away, so an old rule cannot outlive its listener. New destinations
         // are not added here — they wait until bind succeeds below.
         let exclude: std::collections::HashSet<String> = to_remove.iter().cloned().collect();
-        self.publish_serving_node_waypoint_udp_steering(&listeners, &exclude)
+        drop(listeners);
+        self.publish_serving_node_waypoint_udp_steering(&exclude)
             .await;
 
-        let mut removed_listeners = Vec::new();
-        for key in &to_remove {
-            if let Some(handle) = listeners.remove(key) {
-                info!(
-                    listener_key = %key,
-                    port = handle.listen_port,
-                    scheme = %handle.scheme,
-                    "Stopping stream listener"
-                );
-                let _ = handle.shutdown_tx.send(true);
-                removed_listeners.push((key.clone(), handle));
+        let removed_listeners = {
+            let mut listeners = self.listeners.lock().await;
+            let mut removed = Vec::new();
+            for key in &to_remove {
+                if let Some(handle) = listeners.remove(key) {
+                    info!(
+                        listener_key = %key,
+                        port = handle.listen_port,
+                        scheme = %handle.scheme,
+                        "Stopping stream listener"
+                    );
+                    let _ = handle.shutdown_tx.send(true);
+                    removed.push((key.clone(), handle));
+                }
             }
-        }
+            removed
+        };
         for (key, handle) in removed_listeners {
             await_stream_listener_shutdown(&key, handle).await;
         }
@@ -2885,7 +2914,7 @@ impl StreamListenerManager {
         // Start listeners for new or restarted entries
         let mut newly_started_nw_udp: Vec<String> = Vec::new();
         for (key, desired_listener) in &effective_desired {
-            if listeners.contains_key(key) {
+            if self.listeners.lock().await.contains_key(key) {
                 continue;
             }
             let DesiredStreamListener {
@@ -2898,6 +2927,7 @@ impl StreamListenerManager {
                 datagram_client_address,
                 udp_amplification_restart_key,
                 backend_tls_reload_key,
+                backend_tls_validation_error,
                 sni_ids,
                 node_waypoint_udp_ids,
             } = desired_listener;
@@ -2982,7 +3012,7 @@ impl StreamListenerManager {
             // upstream-supplied, or the global CA bundle) must not block them.
             if *scheme == BackendScheme::Tcps
                 && !*passthrough
-                && let Err(msg) = self.validate_backend_tls_config(&current_config, identity, *port)
+                && let Some(msg) = backend_tls_validation_error.as_ref()
             {
                 error!(
                     namespace = %identity.namespace,
@@ -3567,7 +3597,7 @@ impl StreamListenerManager {
                 newly_started_nw_udp.push(key.clone());
             }
 
-            listeners.insert(
+            self.listeners.lock().await.insert(
                 key.clone(),
                 ListenerHandle {
                     shutdown_tx,
@@ -3608,15 +3638,20 @@ impl StreamListenerManager {
         }
 
         for key in &newly_started_nw_udp {
-            if let Some(handle) = listeners.get(key) {
-                wait_for_listener_started(handle, NODE_WAYPOINT_UDP_STEER_BIND_WAIT).await;
+            let started = self
+                .listeners
+                .lock()
+                .await
+                .get(key)
+                .map(|handle| Arc::clone(&handle.started));
+            if let Some(started) = started {
+                wait_for_listener_started(started, NODE_WAYPOINT_UDP_STEER_BIND_WAIT).await;
             }
         }
-        self.publish_serving_node_waypoint_udp_steering(
-            &listeners,
-            &std::collections::HashSet::new(),
-        )
-        .await;
+        self.publish_serving_node_waypoint_udp_steering(&std::collections::HashSet::new())
+            .await;
+
+        let listeners = self.listeners.lock().await;
 
         let mut dtls_entries: Vec<DtlsDemuxMetricEntry> = listeners
             .iter()
@@ -3648,6 +3683,7 @@ impl StreamListenerManager {
             .collect();
         self.stream_backend_metrics
             .store(Arc::new(stream_backend_entries));
+        drop(listeners);
 
         // Derive the hard bind-failure list returned to callers from the
         // degraded set. Only hard failures (port bind, backend TLS validation,
@@ -3778,7 +3814,6 @@ impl StreamListenerManager {
     /// do not keep serving state live.
     async fn publish_serving_node_waypoint_udp_steering(
         &self,
-        listeners: &std::collections::HashMap<String, ListenerHandle>,
         exclude: &std::collections::HashSet<String>,
     ) {
         if !self.node_waypoint_udp_steering_open.load(Ordering::Acquire) {
@@ -3797,11 +3832,12 @@ impl StreamListenerManager {
         let Some(steering) = self.node_waypoint_udp_steering.load_full().as_ref().clone() else {
             return;
         };
+        let listeners = self.listeners.lock().await;
         publish_bound_node_waypoint_udp_destinations(
             &steering,
             &self.config.load().node_waypoint_udp_steer_destinations,
             self.node_waypoint_udp_source_index.load_full().as_ref(),
-            listeners,
+            &listeners,
             exclude,
         );
     }
@@ -3815,32 +3851,40 @@ impl StreamListenerManager {
     /// new listener, so an invalid config never installs a listener that
     /// would fail every backend handshake. Returns the message to surface in
     /// `bind_failures` on failure.
-    fn validate_backend_tls_config(
+    async fn prepare_backend_tls_config(
         &self,
-        current_config: &GatewayConfig,
-        identity: &NamespacedResourceId,
+        proxy: &Proxy,
         port: u16,
     ) -> Result<(), String> {
-        let Some(proxy) = find_proxy_by_identity(current_config, identity) else {
-            return Err(format!(
-                "Backend TLS config failed for stream listener on port {}: proxy {}/{} not found",
-                port, identity.namespace, identity.id
-            ));
-        };
-        super::tcp_proxy::build_cached_backend_tls_config(
-            proxy,
-            self.tls_no_verify,
-            self.tls_ca_bundle_path.as_deref(),
-            self.tls_policy.as_deref(),
-            &self.crls.load_full(),
-        )
-        .map(drop)
-        .map_err(|err| {
-            format!(
-                "Backend TLS config failed for stream listener on port {}: {}",
-                port, err
+        let proxy = proxy.clone();
+        let tls_no_verify = self.tls_no_verify;
+        let tls_ca_bundle_path = self.tls_ca_bundle_path.clone();
+        let tls_policy = self.tls_policy.clone();
+        let crls = self.crls.load_full();
+        match crate::tls::source::run_tls_source_blocking_result(move || {
+            super::tcp_proxy::build_cached_backend_tls_config(
+                &proxy,
+                tls_no_verify,
+                tls_ca_bundle_path.as_deref(),
+                tls_policy.as_deref(),
+                &crls,
             )
+            .map(drop)
+            .map_err(|error| error.to_string())
         })
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(format!(
+                "Backend TLS config failed for stream listener on port {}: {}",
+                port, error
+            )),
+            Err(error) => Err(format!(
+                "Backend TLS config preparation failed for stream listener on port {}: {}",
+                port,
+                error.failure_class()
+            )),
+        }
     }
 
     /// Lightweight stream-listener diagnostics included in the admin `/overload`
@@ -4192,10 +4236,10 @@ fn spawn_node_waypoint_udp_steer_bind_watch(
     });
 }
 
-async fn wait_for_listener_started(handle: &ListenerHandle, timeout: Duration) {
+async fn wait_for_listener_started(started: Arc<AtomicBool>, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if handle.started.load(Ordering::Acquire) || handle.join_handle.is_finished() {
+        if started.load(Ordering::Acquire) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(2)).await;
