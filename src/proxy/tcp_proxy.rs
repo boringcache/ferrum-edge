@@ -3576,10 +3576,7 @@ async fn handle_tcp_connection_inner(
                     reason = reason.as_str(),
                     "Refused connection on SNI-routed stream listener"
                 );
-                return Err(sni_admission_refused_error(
-                    stream_ctx.listen_port,
-                    reason,
-                ));
+                return Err(sni_admission_refused_error(stream_ctx.listen_port, reason));
             }
         }
     } else {

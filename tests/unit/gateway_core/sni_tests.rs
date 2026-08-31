@@ -2071,8 +2071,7 @@ use std::collections::HashMap;
 fn sni_admission_summary(error: &anyhow::Error) -> StreamTransactionSummary {
     let error_class = classify_stream_error(error);
     let disconnect_cause = pre_copy_disconnect_cause_for_test(error, &error_class);
-    let disconnect_direction =
-        pre_copy_disconnect_direction_for_test(error, &error_class);
+    let disconnect_direction = pre_copy_disconnect_direction_for_test(error, &error_class);
     StreamTransactionSummary {
         plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".into(),
@@ -2159,10 +2158,8 @@ fn sni_admission_oversized_classifies_as_dispatch_policy_rejected() {
 
 #[test]
 fn sni_admission_eof_classifies_as_dispatch_policy_rejected() {
-    let error = sni_admission_refused_error_for_test(
-        21582,
-        SniRefusal::Indeterminate(SniPeekFailure::Eof),
-    );
+    let error =
+        sni_admission_refused_error_for_test(21582, SniRefusal::Indeterminate(SniPeekFailure::Eof));
     assert_sni_admission_taxonomy(
         &error,
         "SNI-routed stream listener on port 21582 refused connection (eof)",
@@ -2207,10 +2204,8 @@ fn sni_admission_unrepresentable_name_classifies_as_dispatch_policy_rejected() {
 
 #[test]
 fn sni_admission_io_error_classifies_as_dispatch_policy_rejected() {
-    let error = sni_admission_refused_error_for_test(
-        21582,
-        SniRefusal::Indeterminate(SniPeekFailure::Io),
-    );
+    let error =
+        sni_admission_refused_error_for_test(21582, SniRefusal::Indeterminate(SniPeekFailure::Io));
     assert_sni_admission_taxonomy(
         &error,
         "SNI-routed stream listener on port 21582 refused connection (io_error)",
@@ -2220,19 +2215,15 @@ fn sni_admission_io_error_classifies_as_dispatch_policy_rejected() {
 #[test]
 fn unmatched_sni_route_classifies_as_dispatch_policy_rejected() {
     let error = no_matching_sni_route_error_for_test(21582);
-    assert_sni_admission_taxonomy(
-        &error,
-        "No matching SNI route for connection on port 21582",
-    );
+    assert_sni_admission_taxonomy(&error, "No matching SNI route for connection on port 21582");
 }
 
 #[test]
 fn untyped_refused_substring_still_classifies_as_connection_refused() {
     // Defence: a bare anyhow whose Display contains "refused" is still a
     // backend connect refusal. The typed SNI kind is what escapes that trap.
-    let untyped = anyhow::anyhow!(
-        "SNI-routed stream listener on port 21582 refused connection (not_tls)"
-    );
+    let untyped =
+        anyhow::anyhow!("SNI-routed stream listener on port 21582 refused connection (not_tls)");
     assert_eq!(
         classify_stream_error(&untyped),
         ErrorClass::ConnectionRefused
