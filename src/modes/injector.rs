@@ -3334,7 +3334,7 @@ mod tests {
                 "resource": {"group": "", "version": "v1", "resource": "pods"},
                 "object": {
                     "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
-                    "spec": {"containers": []}
+                    "spec": {"containers": [{"name": "app", "image": "app:1"}]}
                 }
             }
         });
@@ -3393,7 +3393,7 @@ mod tests {
                 "resource": {"group": "", "version": "v1", "resource": "pods"},
                 "object": {
                     "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
-                    "spec": {"containers": []}
+                    "spec": {"containers": [{"name": "app", "image": "app:1"}]}
                 }
             }
         });
@@ -3467,7 +3467,7 @@ mod tests {
                 "resource": {"group": "", "version": "v1", "resource": "pods"},
                 "object": {
                     "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
-                    "spec": {"containers": []}
+                    "spec": {"containers": [{"name": "app", "image": "app:1"}]}
                 }
             }
         });
