@@ -349,6 +349,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a missing native key still silently defaults its column — that drift is
   what the static test rejects. Operators who rename or omit keys must keep
   the destination table in sync.
+- **Production Dockerfiles pin container bases by manifest-list digest** (issue
+  #4444). `Dockerfile`, `Dockerfile.release`, and `Dockerfile.test` now record
+  `@sha256:` pins for distroless and Rust builder bases, with the mutable tag
+  preserved in a trailing comment. A unit policy test rejects unpinned external
+  `FROM` lines and unapproved floating Rust channels. SBOM/provenance recording,
+  scheduled digest-bump automation, and `rust-toolchain.toml` pinning remain
+  follow-up work.
 
 - **BREAKING — injected Ferrum is a Kubernetes native sidecar**
   (issue #4430). The webhook now emits `ferrum-edge` under `spec.initContainers`
