@@ -265,6 +265,22 @@ static CIRCUIT_BREAKER_OPEN_HEADERS: std::sync::LazyLock<HashMap<String, String>
         )])
     });
 
+static OVERLOAD_REJECT_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
+    std::sync::LazyLock::new(|| {
+        HashMap::from([(
+            X_GATEWAY_ERROR_HEADER.to_string(),
+            X_GATEWAY_ERROR_OVERLOAD.to_string(),
+        )])
+    });
+
+static CONFIG_STALE_REJECT_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
+    std::sync::LazyLock::new(|| {
+        HashMap::from([(
+            X_GATEWAY_ERROR_HEADER.to_string(),
+            X_GATEWAY_ERROR_CONFIG_STALE.to_string(),
+        )])
+    });
+
 /// Hyper's HTTP/1 parser panics when `max_buf_size` is below 8 KiB. Ferrum's
 /// configured logical header limit may be lower; keep the parser floor safe
 /// and enforce the operator's lower limit in `check_protocol_headers`.
@@ -24144,13 +24160,17 @@ pub(crate) fn restore_authoritative_allow_header(
 /// historical `X-Gateway-Error` casing. HTTP header names are
 /// case-insensitive either way.
 pub(crate) const X_GATEWAY_ERROR_HEADER: &str = "x-gateway-error";
-pub(crate) const X_GATEWAY_ERROR_CONNECTION_FAILURE: &str = "connection_failure";
-pub(crate) const X_GATEWAY_ERROR_BACKEND_TIMEOUT: &str = "backend_timeout";
-pub(crate) const X_GATEWAY_ERROR_BACKEND_ERROR: &str = "backend_error";
+// The backend-path tokens (`connection_failure` / `backend_timeout` /
+// `backend_error`) have no alias here: those paths now take them straight from
+// `crate::retry::OBS_*` through `http_observability_error_class`, so a second
+// spelling would only be a place for the two to drift.
 /// Distinct from `backend_error`: the gateway never contacted a backend on
 /// this request, so reusing that bucket would make open-breaker 503s
 /// indistinguishable from a backend that actually returned 5xx.
-pub(crate) const X_GATEWAY_ERROR_CIRCUIT_BREAKER_OPEN: &str = "circuit_breaker_open";
+pub(crate) const X_GATEWAY_ERROR_CIRCUIT_BREAKER_OPEN: &str =
+    crate::retry::OBS_CIRCUIT_BREAKER_OPEN;
+pub(crate) const X_GATEWAY_ERROR_OVERLOAD: &str = crate::retry::OBS_OVERLOAD;
+pub(crate) const X_GATEWAY_ERROR_CONFIG_STALE: &str = crate::retry::OBS_CONFIG_STALE;
 
 /// RFC 9110 `Allow` for protocol-level 405s (TRACE and non-WebSocket CONNECT)
 /// that run before a proxy is matched, so no per-route `allowed_methods`
@@ -24166,15 +24186,7 @@ pub(crate) fn x_gateway_error_for_backend_failure(
     connection_error: bool,
     status: u16,
 ) -> Option<&'static str> {
-    if connection_error {
-        Some(X_GATEWAY_ERROR_CONNECTION_FAILURE)
-    } else if status == 504 {
-        Some(X_GATEWAY_ERROR_BACKEND_TIMEOUT)
-    } else if status >= 500 {
-        Some(X_GATEWAY_ERROR_BACKEND_ERROR)
-    } else {
-        None
-    }
+    crate::retry::http_observability_error_class(connection_error, status)
 }
 
 /// Insert or replace the gateway-owned `X-Gateway-Error` value after generic
@@ -24227,6 +24239,14 @@ pub(crate) fn insert_x_gateway_error_for_backend_failure(
 /// reject builder so the token is not assembled per request.
 pub(crate) fn circuit_breaker_open_reject_headers() -> HashMap<String, String> {
     CIRCUIT_BREAKER_OPEN_HEADERS.clone()
+}
+
+pub(crate) fn overload_reject_headers() -> HashMap<String, String> {
+    OVERLOAD_REJECT_HEADERS.clone()
+}
+
+pub(crate) fn config_stale_reject_headers() -> HashMap<String, String> {
+    CONFIG_STALE_REJECT_HEADERS.clone()
 }
 
 /// Whether `method` is in the route's configured `allowed_methods`.
@@ -29045,9 +29065,10 @@ async fn handle_proxy_request_on_frontend_port(
                 "Gateway configuration stale",
             ));
         }
-        return Ok(build_response(
+        return Ok(build_response_with_gateway_error(
             StatusCode::SERVICE_UNAVAILABLE,
             r#"{"error":"Gateway configuration stale"}"#,
+            X_GATEWAY_ERROR_CONFIG_STALE,
         ));
     }
 
@@ -29124,9 +29145,10 @@ async fn handle_proxy_request_on_frontend_port(
                 "Service overloaded",
             ));
         }
-        return Ok(build_response(
+        return Ok(build_response_with_gateway_error(
             StatusCode::SERVICE_UNAVAILABLE,
             r#"{"error":"Service overloaded"}"#,
+            X_GATEWAY_ERROR_OVERLOAD,
         ));
     }
 
@@ -38543,7 +38565,8 @@ async fn handle_proxy_request_inner(
     // Add gateway error categorization headers so clients and ops teams
     // can distinguish different failure modes:
     //   X-Gateway-Error: connection_failure | backend_timeout | backend_error
-    //     | circuit_breaker_open (open-breaker 503s use the reject path)
+    //     | circuit_breaker_open | overload | config_stale | concurrency_limit
+    //     (open-breaker / overload / stale / concurrency 503s use reject paths)
     //   X-Gateway-Upstream-Status: degraded (when routing via all-unhealthy fallback)
     if let Some(value) = gateway_error_token {
         resp_builder = resp_builder.header("X-Gateway-Error", value);
@@ -46102,6 +46125,23 @@ fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
+        .body(ProxyBody::from_string(body))
+        .unwrap_or_else(|_| {
+            Response::new(ProxyBody::from_string(
+                r#"{"error":"Internal server error"}"#,
+            ))
+        })
+}
+
+fn build_response_with_gateway_error(
+    status: StatusCode,
+    body: &str,
+    error: &'static str,
+) -> Response<ProxyBody> {
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .header("X-Gateway-Error", error)
         .body(ProxyBody::from_string(body))
         .unwrap_or_else(|_| {
             Response::new(ProxyBody::from_string(
