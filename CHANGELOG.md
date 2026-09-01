@@ -265,6 +265,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clients now set a distinct decoded response ceiling of
   `min(2× the frontend field-section policy, 1 MiB − 1)` alongside the
   existing encoded non-`DATA` frame ceiling.
+- **CONNECT-UDP admission respects DNS-SD SRV priority tiers**. A client that
+  names a standby-tier `host:port` while a lower-numbered RFC 2782 tier is
+  healthy is refused with the same 403 as an unconfigured destination; the
+  gateway-side reason is `connect_udp_target_srv_tier_standby`. The live
+  generation re-check stays configuration-only, so a health flap or a
+  recovered primary cannot tear down an established tunnel.
 - **Mesh chart image tag defaults from `Chart.appVersion` instead of a hard-coded
   version** (issue #4440). `charts/ferrum-mesh` now matches
   `charts/ferrum-gateway` by deriving the default tag from `Chart.appVersion`
