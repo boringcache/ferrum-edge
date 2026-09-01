@@ -35,6 +35,20 @@ Every current `[Unreleased]` `BREAKING` changelog entry is listed here exactly o
 An HTTPS origin that requires a client certificate previously logged `error_class=connection_reset` (or the `request_error` catch-all) and `X-Gateway-Error: backend_error` when the gateway presented none. That failure never reached HTTP. Typed rustls handshake errors still log `error_class=tls_error`. On the reqwest HTTP/1 path the rustls error is not in the request chain (hyper `is_canceled`), so the class is `connection_pool_error`. Both are pre-wire; `X-Gateway-Error` is `connection_failure`. `retry_on_connect_failure` replays regardless of method. The circuit breaker uses the connect-error path (`trip_on_connection_errors`) instead of a 502-status / post-wire reset charge. Plugin outbound HTTP (`FERRUM_PLUGIN_HTTP_MAX_RETRIES`) also retries `connection_pool_error` on GET/HEAD/OPTIONS; that list is not identical to `request_reached_wire`.
 
 **Operator action:** retarget alerts keyed on `connection_reset` / `backend_error` for this misconfig onto `tls_error` / `connection_pool_error` / `connection_failure`. If you set `trip_on_connection_errors: false` to ignore connect failures, this handshake will no longer trip the breaker via 502 in `failure_status_codes`. Configure `backend_tls_client_cert_path` / `backend_tls_client_key_path` (or stop requiring client certs on the origin).
+### TLS event source IDs are opaque digests (issue [#4435](https://github.com/ferrum-edge/ferrum-edge/issues/4435))
+
+`GET /admin/tls/events` no longer returns configured source paths or URIs in
+`sources[].source_id`. The field is a fixed-size non-reversible digest, and the
+event log records only first/changed failure-class, recovery, and later
+regression transitions while Prometheus counters continue counting every poll.
+Recovery is now represented by the `recovered` outcome. Existing persisted
+events are normalized when the bounded store is opened, so raw legacy source
+identifiers and error strings do not remain in snapshots.
+
+**Operator action:** consumers of `GET /admin/tls/events` must treat
+`sources[].source_id` as an opaque returned digest and use that value, rather
+than a configured URI/path, in the `source_id` query filter; accept the new
+`recovered` outcome.
 ### Opaque-TLS SNI admission refusals classify as `dispatch_policy_rejected` / `gateway_policy` (issue [#4407](https://github.com/ferrum-edge/ferrum-edge/issues/4407))
 
 Fail-closed opaque-TLS SNI admission (plaintext on an SNI port, ClientHello timeout / incomplete / malformed hello, unmatched SNI with no catch-all) still RSTs the client and still does not dial or charge a backend. The `StreamTransactionSummary` taxonomy is what changed: those refusals previously logged `error_class=connection_refused` with `disconnect_cause=backend_error` / `disconnect_direction=backend_to_client` (or unmatched SNI as `request_error` / `recv_error`) even though `backend_target` was empty. They now log `error_class=dispatch_policy_rejected`, `disconnect_cause=gateway_policy`, and `disconnect_direction=unknown`. Real backend connect refusals remain `connection_refused`.
