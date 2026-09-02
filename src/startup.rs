@@ -169,3 +169,64 @@ pub async fn wait_for_start_signals(
 
     Ok(())
 }
+
+/// What SIGHUP means for a given operating mode.
+///
+/// Only file mode (and mesh mode when its config source is a local file/xDS
+/// consumer) installs a real reload handler. Every other mode used to leave
+/// SIGHUP at its POSIX default disposition, so a stray HUP — `ferrum-edge
+/// reload` against a `pgrep`-resolved PID, a logrotate script, orchestration —
+/// terminated the gateway with no drain. The process-wide handler in `main.rs`
+/// registers a stream for every mode and logs this disposition instead.
+///
+/// Mode-gated so it is covered by external tests rather than an inline
+/// `main.rs` test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SighupDisposition {
+    /// The mode owns a real SIGHUP reload handler; the process-wide task must
+    /// stay silent beyond a debug record.
+    ReloadsConfig,
+    /// The mode has no SIGHUP reload path. The process-wide task logs this
+    /// notice and keeps running.
+    IgnoredWithNotice(&'static str),
+}
+
+/// Map an operating mode to its SIGHUP disposition.
+///
+/// Every non-`File` notice ends with the operationally load-bearing fact: the
+/// process is ignoring the signal and will not terminate.
+pub fn sighup_disposition(mode: &crate::config::env_config::OperatingMode) -> SighupDisposition {
+    use crate::config::env_config::OperatingMode;
+
+    match mode {
+        OperatingMode::File => SighupDisposition::ReloadsConfig,
+        OperatingMode::Mesh => SighupDisposition::IgnoredWithNotice(
+            "SIGHUP received: mesh config reload is driven by the configured config source \
+             (a local file or xDS source reloads on SIGHUP; native MeshSubscribe does not). \
+             This process is ignoring the signal and will not terminate",
+        ),
+        OperatingMode::Database => SighupDisposition::IgnoredWithNotice(
+            "SIGHUP received: this mode reloads via database polling \
+             (`FERRUM_DB_POLL_INTERVAL`). This process is ignoring the signal and will not \
+             terminate",
+        ),
+        OperatingMode::ControlPlane => SighupDisposition::IgnoredWithNotice(
+            "SIGHUP received: this mode reloads via database polling \
+             (`FERRUM_DB_POLL_INTERVAL`) and distributes config to data planes over gRPC. \
+             This process is ignoring the signal and will not terminate",
+        ),
+        OperatingMode::DataPlane => SighupDisposition::IgnoredWithNotice(
+            "SIGHUP received: this mode receives config from the control plane over gRPC. \
+             This process is ignoring the signal and will not terminate",
+        ),
+        OperatingMode::Injector | OperatingMode::NodeAgent => SighupDisposition::IgnoredWithNotice(
+            "SIGHUP received: this mode has no hot-reloadable config source; restart the \
+             pod to pick up new settings. This process is ignoring the signal and will not \
+             terminate",
+        ),
+        OperatingMode::Migrate => SighupDisposition::IgnoredWithNotice(
+            "SIGHUP received: this mode is a one-shot command. This process is ignoring the \
+             signal and will not terminate",
+        ),
+    }
+}

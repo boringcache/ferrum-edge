@@ -232,3 +232,103 @@ fn healthy_mesh_listener_set_keeps_ready_and_has_no_failure_snapshot() {
     assert_eq!(snapshot.failures_total, 0);
     assert!(snapshot.failures.is_empty());
 }
+
+// ── SIGHUP disposition (issue #4548) ────────────────────────────────────────
+
+use ferrum_edge::config::env_config::OperatingMode;
+use ferrum_edge::startup::{SighupDisposition, sighup_disposition};
+
+/// Every operating mode, matched exhaustively so a newly added variant forces
+/// this file to be updated rather than silently inheriting a default.
+fn all_modes() -> Vec<OperatingMode> {
+    let all = vec![
+        OperatingMode::Database,
+        OperatingMode::File,
+        OperatingMode::ControlPlane,
+        OperatingMode::DataPlane,
+        OperatingMode::Mesh,
+        OperatingMode::Injector,
+        OperatingMode::NodeAgent,
+        OperatingMode::Migrate,
+    ];
+    for mode in &all {
+        // Exhaustive match: adding a variant breaks the build here.
+        match mode {
+            OperatingMode::Database
+            | OperatingMode::File
+            | OperatingMode::ControlPlane
+            | OperatingMode::DataPlane
+            | OperatingMode::Mesh
+            | OperatingMode::Injector
+            | OperatingMode::NodeAgent
+            | OperatingMode::Migrate => {}
+        }
+    }
+    all
+}
+
+#[test]
+fn sighup_reloads_config_only_in_file_mode() {
+    for mode in all_modes() {
+        let disposition = sighup_disposition(&mode);
+        if mode == OperatingMode::File {
+            assert_eq!(
+                disposition,
+                SighupDisposition::ReloadsConfig,
+                "file mode owns the real SIGHUP reload handler"
+            );
+        } else {
+            assert!(
+                matches!(disposition, SighupDisposition::IgnoredWithNotice(_)),
+                "{mode:?} has no SIGHUP reload path and must be a logged no-op"
+            );
+        }
+    }
+}
+
+#[test]
+fn sighup_notices_name_the_real_reload_mechanism_and_promise_survival() {
+    let expectations: &[(OperatingMode, &str)] = &[
+        (OperatingMode::Database, "FERRUM_DB_POLL_INTERVAL"),
+        (OperatingMode::ControlPlane, "gRPC"),
+        (OperatingMode::DataPlane, "control plane"),
+        (OperatingMode::Mesh, "config source"),
+        (OperatingMode::Injector, "restart the"),
+        (OperatingMode::NodeAgent, "restart the"),
+        (OperatingMode::Migrate, "one-shot"),
+    ];
+
+    for (mode, needle) in expectations {
+        let SighupDisposition::IgnoredWithNotice(text) = sighup_disposition(mode) else {
+            panic!("{mode:?} must carry an ignored-with-notice disposition");
+        };
+        assert!(
+            text.contains(needle),
+            "{mode:?} notice must name its reload mechanism ({needle}): {text}"
+        );
+        // The operationally load-bearing half: the operator must be told the
+        // process survived the signal.
+        assert!(
+            text.contains("will not terminate"),
+            "{mode:?} notice must say the process is not terminating: {text}"
+        );
+        assert!(
+            text.starts_with("SIGHUP received"),
+            "{mode:?} notice must identify the signal: {text}"
+        );
+    }
+}
+
+/// The CLI's second `reload` line must match the disposition table: file mode
+/// (and mesh with a local config source) reload, everything else ignores.
+#[test]
+fn reload_scope_notice_scopes_sighup_to_file_and_local_mesh_sources() {
+    let notice = ferrum_edge::cli::RELOAD_SCOPE_NOTICE;
+    assert!(notice.contains("file mode"), "{notice}");
+    assert!(notice.contains("mesh mode"), "{notice}");
+    assert!(notice.contains("xDS"), "{notice}");
+    assert!(
+        notice.contains("log the signal and ignore it"),
+        "the notice must state the no-op outcome: {notice}"
+    );
+}
