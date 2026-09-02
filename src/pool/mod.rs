@@ -16,11 +16,28 @@ thread_local! {
     static KEY_BUF: RefCell<String> = RefCell::new(String::with_capacity(192));
 }
 
-fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+/// Process-monotonic tick used for every pool idle deadline.
+///
+/// Deliberately NOT wall clock: idle eviction is an elapsed-time decision, and
+/// `saturating_sub` over two `SystemTime` samples pins the elapsed duration at
+/// 0 after a backward NTP step (eviction stalls) and reports every entry as
+/// idle after a forward step (all four production pools evict at once, a
+/// synchronised reconnect/handshake storm against every backend).
+#[inline]
+fn now_tick_ms() -> u64 {
+    crate::socket_opts::monotonic_now_ms()
+}
+
+/// Whether a pooled entry has been idle longer than `idle_timeout_ms`.
+///
+/// Both arguments are samples of [`now_tick_ms`]. Pure so the eviction
+/// decision is testable without a clock. `saturating_sub` clamps a
+/// `last_used_tick_ms > now_tick_ms` sample to 0 idle (never evict), which the
+/// monotonic tick makes unreachable in practice; the comparison is strict `>`
+/// so an entry idle for exactly the timeout survives one more sweep.
+#[inline]
+fn pool_entry_is_idle(now_tick_ms: u64, last_used_tick_ms: u64, idle_timeout_ms: u64) -> bool {
+    now_tick_ms.saturating_sub(last_used_tick_ms) > idle_timeout_ms
 }
 
 /// Structural + classification tag retained when a pool create failure is
@@ -309,14 +326,18 @@ pub trait PoolManager: Send + Sync + 'static {
 
 pub struct PoolEntry<C> {
     pub conn: C,
-    pub last_used_epoch_ms: AtomicU64,
+    /// Last checkout on a process-monotonic clock (coarse millis, see
+    /// [`now_tick_ms`]). Never derived from wall/UTC time — NTP corrections
+    /// must not freeze or prematurely fire idle eviction. The value has no
+    /// meaningful zero; only differences between two samples are defined.
+    pub last_used_tick_ms: AtomicU64,
 }
 
 impl<C> PoolEntry<C> {
     fn new(conn: C) -> Self {
         Self {
             conn,
-            last_used_epoch_ms: AtomicU64::new(now_epoch_ms()),
+            last_used_tick_ms: AtomicU64::new(now_tick_ms()),
         }
     }
 }
@@ -668,8 +689,8 @@ impl<M: PoolManager> GenericPool<M> {
             let conn = entry.conn.clone();
             if self.manager.is_healthy(&conn) {
                 entry
-                    .last_used_epoch_ms
-                    .store(now_epoch_ms(), Ordering::Relaxed);
+                    .last_used_tick_ms
+                    .store(now_tick_ms(), Ordering::Relaxed);
                 Some(conn)
             } else {
                 drop(entry);
@@ -885,13 +906,13 @@ impl<M: PoolManager> GenericPool<M> {
                 return Err(err);
             }
         };
-        let now = now_epoch_ms();
+        let now = now_tick_ms();
 
         match self.entries.entry(key) {
             dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
                 let entry = occupied.get_mut();
                 if self.manager.is_healthy(&entry.conn) {
-                    entry.last_used_epoch_ms.store(now, Ordering::Relaxed);
+                    entry.last_used_tick_ms.store(now, Ordering::Relaxed);
                     let existing = entry.conn.clone();
                     if let Some(kind) = self.manager.runtime_metrics_kind() {
                         crate::runtime_metrics::global_ref().record_pool_eviction(kind);
@@ -900,7 +921,7 @@ impl<M: PoolManager> GenericPool<M> {
                     Ok(existing)
                 } else {
                     let old = std::mem::replace(&mut entry.conn, created.clone());
-                    entry.last_used_epoch_ms.store(now, Ordering::Relaxed);
+                    entry.last_used_tick_ms.store(now, Ordering::Relaxed);
                     if let Some(kind) = self.manager.runtime_metrics_kind() {
                         crate::runtime_metrics::global_ref().record_pool_eviction(kind);
                     }
@@ -928,8 +949,8 @@ impl<M: PoolManager> GenericPool<M> {
                 let conn = entry.conn.clone();
                 if self.manager.is_healthy(&conn) {
                     entry
-                        .last_used_epoch_ms
-                        .store(now_epoch_ms(), Ordering::Relaxed);
+                        .last_used_tick_ms
+                        .store(now_tick_ms(), Ordering::Relaxed);
                     LookupOutcome::Hit(conn)
                 } else {
                     LookupOutcome::Unhealthy(buf.to_string())
@@ -948,17 +969,21 @@ impl<M: PoolManager> GenericPool<M> {
 
         tokio::spawn(async move {
             let mut cleanup_timer = tokio::time::interval(interval);
+            // A sweep that outruns the interval must not hand back every missed
+            // tick back to back; re-anchor on completion instead.
+            cleanup_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             loop {
                 cleanup_timer.tick().await;
 
-                let now = now_epoch_ms();
+                let now = now_tick_ms();
                 let mut keys_to_remove = Vec::new();
 
                 for entry in entries.iter() {
-                    let last_used = entry.last_used_epoch_ms.load(Ordering::Relaxed);
-                    let idle_ms = now.saturating_sub(last_used);
-                    if idle_ms > idle_timeout_ms || !manager.is_healthy(&entry.conn) {
+                    let last_used = entry.last_used_tick_ms.load(Ordering::Relaxed);
+                    if pool_entry_is_idle(now, last_used, idle_timeout_ms)
+                        || !manager.is_healthy(&entry.conn)
+                    {
                         keys_to_remove.push(entry.key().clone());
                     }
                 }
@@ -1510,5 +1535,53 @@ mod tests {
 
         assert_eq!(pool.pool_size(), 0);
         assert_eq!(manager.destroys.load(Ordering::Relaxed), 1);
+    }
+
+    // ── Idle-eviction clock contract (issue #4517) ──────────────────────────
+    //
+    // `pool_entry_is_idle` is the whole eviction decision, extracted so the
+    // clock semantics are provable without one. The samples fed to it come
+    // from `now_tick_ms` (process-monotonic), so the two halves below have
+    // different standing: the forward-jump case is a real regression guard —
+    // under the previous `SystemTime` clock a forward wall step inflated
+    // `now - last_used` and mass-evicted every entry in all four production
+    // pools in one sweep — while the backward-jump case documents intent, since
+    // a monotonic tick cannot produce `last_used > now` at all.
+
+    #[test]
+    fn pool_entry_idle_decision_tracks_true_elapsed_ticks_not_a_clock_jump() {
+        let timeout_ms = 60_000;
+        // An entry stamped long ago in tick terms is idle...
+        assert!(pool_entry_is_idle(500_000, 100_000, timeout_ms));
+        // ...and one whose true elapsed tick is under the timeout is not,
+        // however large the absolute tick values are. A forward wall-clock step
+        // used to move `now` alone and evict this entry.
+        assert!(!pool_entry_is_idle(500_000, 490_000, timeout_ms));
+        // Strict `>`: exactly the timeout survives one more sweep.
+        assert!(!pool_entry_is_idle(160_000, 100_000, timeout_ms));
+        assert!(pool_entry_is_idle(160_001, 100_000, timeout_ms));
+    }
+
+    #[test]
+    fn pool_entry_idle_decision_clamps_a_future_stamp_to_zero_idle() {
+        // Unreachable on the monotonic tick; asserted so the conservative
+        // never-evict branch stays the documented behaviour if a sample ever
+        // reads ahead of `now`.
+        assert!(!pool_entry_is_idle(100_000, 500_000, 60_000));
+        assert!(!pool_entry_is_idle(100_000, 100_001, 0));
+    }
+
+    #[test]
+    fn pool_entry_new_stamps_the_monotonic_tick_not_wall_time() {
+        let entry = PoolEntry::new(String::from("conn"));
+        let stamped = entry.last_used_tick_ms.load(Ordering::Relaxed);
+        // Wall-clock epoch millis are ~1.7e12; a process tick is small and
+        // never ahead of a later sample of the same clock.
+        let now = now_tick_ms();
+        assert!(stamped <= now, "tick stamp {stamped} ran ahead of {now}");
+        assert!(
+            now < 1_000_000_000_000,
+            "pool tick {now} looks like wall-clock epoch millis"
+        );
     }
 }

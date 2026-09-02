@@ -2281,6 +2281,9 @@ impl HealthChecker {
 
         tokio::spawn(async move {
             let mut timer = tokio::time::interval(check_interval);
+            // A scan that outruns the 1s tick must not hand back every missed
+            // tick back to back; re-anchor on completion instead.
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // Skip the immediate first tick so a brand-new ejection is not
             // scanned before its deadline can possibly be due.
             timer.tick().await;
@@ -2488,7 +2491,7 @@ impl HealthChecker {
                     upstream_generation,
                 )
             };
-            let mut timer = tokio::time::interval(interval);
+            let mut timer = active_probe_timer(&key, interval);
 
             loop {
                 if is_retired() {
@@ -4330,6 +4333,66 @@ fn wall_now_epoch_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+/// Deterministic per-target start offset for an active health-check probe.
+///
+/// One probe task is spawned per `(upstream, target)`, so an unjittered
+/// `interval` puts every discovered target on the same grid: with ~300 targets
+/// at the default `interval_seconds: 10`, all 300 probe at `t=0` and every 10s
+/// — a synchronised burst against the backend fleet and against the gateway's
+/// own probe clients and blocking pool, re-formed on every reload.
+///
+/// The offset is FNV-1a 64-bit over the target key (`namespace|upstream::host:port`)
+/// modulo the interval: stable across Rust versions, and DELIBERATELY not drawn
+/// from a random source, because a reload must re-derive the SAME offset for a
+/// given target rather than re-scatter the whole fleet. It only shifts a
+/// probe's phase — the interval, timeout, and threshold semantics are unchanged.
+fn probe_start_offset(target_key: &str, interval: Duration) -> Duration {
+    let interval_ms = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX);
+    if interval_ms == 0 {
+        return Duration::ZERO;
+    }
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+    let mut hash = FNV_OFFSET;
+    for byte in target_key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    Duration::from_millis(hash % interval_ms)
+}
+
+/// Build the tick source for one target's active probe loop.
+///
+/// Phase-shifted by [`probe_start_offset`] so targets do not probe in lockstep,
+/// and `Delay` rather than the default `Burst` so a probe that outlives its
+/// interval (an operator setting `timeout_seconds > interval_seconds`, or a
+/// stalled runtime under overload) yields ONE follow-up tick instead of every
+/// missed tick back to back. Under `Burst`, `consecutive_failures` could reach
+/// `unhealthy_threshold` in far less than `threshold x interval`, making the
+/// ejection window non-deterministic exactly when the fleet is degraded.
+fn active_probe_timer(target_key: &str, interval: Duration) -> tokio::time::Interval {
+    let start = tokio::time::Instant::now() + probe_start_offset(target_key, interval);
+    let mut timer = tokio::time::interval_at(start, interval);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    timer
+}
+
+/// Test-only accessors for the active-probe tick source (issue #4518).
+#[doc(hidden)]
+pub mod probe_timer_for_test {
+    use std::time::Duration;
+
+    /// Deterministic per-target probe start offset.
+    pub fn start_offset(target_key: &str, interval: Duration) -> Duration {
+        super::probe_start_offset(target_key, interval)
+    }
+
+    /// The jittered, `Delay`-behaved probe timer as the probe task builds it.
+    pub fn timer(target_key: &str, interval: Duration) -> tokio::time::Interval {
+        super::active_probe_timer(target_key, interval)
+    }
 }
 
 /// Public wrapper around [`grpc_probe`] for use in unit/integration tests.

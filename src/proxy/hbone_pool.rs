@@ -2976,17 +2976,18 @@ fn evict_hbone_entry_for_gate(
     record_hbone_evictions(removed);
 }
 
-// `last_used_secs`/`now_secs` are wall-clock `unix_secs()`, matching the
-// connection-pool idle convention in `GenericPool` (`last_used_epoch_ms`) so
-// the two pools age idle entries the same way. A backward wall-clock step
-// (NTP correction, VM resume) makes `saturating_sub` under-count idle time, so
-// an idle entry may survive a few extra prune cycles until the clock catches
-// up — never unbounded, since dead senders are still culled by the `ready()`
-// health probe on both the read and write paths. A forward step larger than
-// the timeout can evict one fresh entry, after which it self-heals. A repo-wide
-// migration to a monotonic clock (this pool's prune scheduler + `GenericPool`
-// together) is the right place to remove that residual, not a piecemeal switch
-// of this one field that would desync it from the rest of the pool's timing.
+// `last_used_secs`/`now_secs` are wall-clock `unix_secs()`. `GenericPool` no
+// longer shares that convention: issue #4517 moved `PoolEntry.last_used_tick_ms`
+// onto the process-monotonic tick, and this pool is the remaining wall-clock
+// idle scheduler. A backward wall-clock step (NTP correction, VM resume) makes
+// `saturating_sub` under-count idle time, so an idle entry may survive a few
+// extra prune cycles until the clock catches up — never unbounded, since dead
+// senders are still culled by the `ready()` health probe on both the read and
+// write paths. A forward step larger than the timeout can evict one fresh
+// entry, after which it self-heals. Migrating this pool's prune scheduler and
+// this field together is the right place to remove that residual, not a
+// piecemeal switch of this one field that would desync it from the rest of the
+// pool's timing.
 pub(crate) fn entry_idle_expired(
     last_used_secs: u64,
     idle_timeout_seconds: u64,
