@@ -13,8 +13,9 @@ use std::time::Duration;
 use crate::tls::acme::{
     AcmeCertificateRecord, AcmeCertificateStore, AcmeError, AcmeHttp01ChallengeRecord,
     AcmeHttp01OrderInput, AcmeIssuedCertificateInput, AcmeOrderFinalization, AcmeOrderRecord,
-    AcmeOrderStatus, AcmeOrderStore, FinalRenewalPublication, commit_final_renewal_publication,
-    has_active_renewal_order, inject_final_publication_certificate_write_fault_for_tests,
+    AcmeOrderStatus, AcmeOrderStore, FinalRenewalPublication, RenewalReloadReach,
+    classify_renewal_reload_reach, commit_final_renewal_publication, has_active_renewal_order,
+    inject_final_publication_certificate_write_fault_for_tests,
     inject_final_publication_order_write_fault_for_tests, map_final_renewal_publication_outcome,
 };
 use crate::tls::lease::{RenewalLeaseKeeper, TlsLeaseStore, acme_renewal_lease_name};
@@ -947,5 +948,42 @@ fn finalization_preflight_rejects_malformed_and_mismatched_packages() {
         &wild
             .validate(&["example.com".to_string()])
             .expect_err("wildcard is not equivalent to the apex"),
+    );
+}
+
+/// Issue #4506: a renewal that publishes new material while no TLS surface has
+/// a registered force-reload sender is a silent no-op — the store advances and
+/// every listener keeps serving the previous leaf. The reload side effect is
+/// injected here (the same seam `map_final_renewal_publication_outcome` exists
+/// for) so the empty-surface case is observable without touching the
+/// process-global registry that parallel lib tests also broadcast to.
+#[test]
+fn complete_publication_with_no_registered_surface_takes_the_warn_path() {
+    let result = map_final_renewal_publication_outcome(FinalRenewalPublication::Complete, Vec::new);
+    let surfaces = result.expect("complete publication is still a successful renewal");
+    assert!(
+        surfaces.is_empty(),
+        "no surface registered a force-reload sender: {surfaces:?}"
+    );
+    assert_eq!(
+        classify_renewal_reload_reach(&surfaces),
+        RenewalReloadReach::NoSurfaceAccepted,
+        "an empty surface list must be reported as an unserved renewal"
+    );
+}
+
+/// The converse: at least one surface accepted, so the renewal reached a
+/// listener and must not be reported as a no-op.
+#[test]
+fn complete_publication_with_a_registered_surface_does_not_take_the_warn_path() {
+    let result = map_final_renewal_publication_outcome(FinalRenewalPublication::Complete, || {
+        vec![TEST_RELOAD_SURFACE]
+    });
+    let surfaces = result.expect("complete publication is a successful renewal");
+    assert_eq!(surfaces, vec![TEST_RELOAD_SURFACE]);
+    assert_eq!(
+        classify_renewal_reload_reach(&surfaces),
+        RenewalReloadReach::Accepted,
+        "a non-empty surface list must not be reported as an unserved renewal"
     );
 }

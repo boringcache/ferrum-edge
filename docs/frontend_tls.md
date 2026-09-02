@@ -1441,6 +1441,50 @@ When using load balancers:
 4. Update client applications to present certificates
 5. Gradually enforce mTLS (start with optional, then required)
 
+## ACME Auto-Renewal Requires Frontend TLS Live Reload
+
+`FERRUM_ACME_AUTO_RENEW_ENABLED=true` renews certificates **into the ACME
+certificate store**. Getting the renewed leaf in front of clients is a separate
+step, and it is not automatic:
+
+1. A successful renewal commits the new material under the lease fence and then
+   asks every TLS surface that registered a *force-reload sender* to rebuild.
+2. Only surfaces with a registered sender are notified; an unregistered surface
+   is silently skipped.
+3. The proxy HTTPS/H2/H3 and admin HTTPS surfaces register their sender
+   **exclusively from inside the frontend live-reload watcher**, and that watcher
+   is not built at all when `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` is `false`
+   (its default).
+
+With auto-renew on and live reload off, renewals therefore succeed in the logs
+and in `acme-certificates.json` while every client keeps receiving the previous
+leaf — until it expires and HTTPS fails with the correct certificate already on
+disk.
+
+Ferrum **refuses to start** in that configuration rather than serving it. When
+`FERRUM_ACME_AUTO_RENEW_ENABLED=true` and any of `FERRUM_FRONTEND_TLS_CERT_SOURCE`,
+`FERRUM_FRONTEND_TLS_KEY_SOURCE`, `FERRUM_ADMIN_TLS_CERT_SOURCE`, or
+`FERRUM_ADMIN_TLS_KEY_SOURCE` resolves to an `acme://` URI, startup and
+`ferrum-edge validate` fail unless `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`.
+The message names both variables and the offending source. Either set the
+live-reload flag, or turn auto-renew off and renew out of band. The admin HTTPS
+listener has no live-reload flag of its own: it shares
+`FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` with the proxy frontend.
+
+A file-backed, `managed://`, or provider-URI serving source is unaffected — the
+ACME scheduler does not renew it — and so is a deployment that simply leaves
+`FERRUM_ACME_AUTO_RENEW_ENABLED=false`.
+
+Gateway-API multi-certificate listeners are outside this check: their
+certificates arrive in the control-plane config snapshot and the data plane
+rebuilds the whole SNI resolver on each delivery, so they never depend on the
+force-reload registry.
+
+As a residual safety net for anything the startup check cannot see (a surface
+registered later, or a sender that has since closed), a renewal that commits new
+material but reaches no surface logs a `warn!` naming the certificate; a renewal
+that does reach one logs the accepted surfaces at `info!`.
+
 ## Managed TLS And ACME Across Multiple Replicas
 
 Admin-managed TLS records (`managed://`), ACME certificates/orders/accounts

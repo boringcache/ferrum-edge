@@ -2868,6 +2868,59 @@ pub(crate) fn map_final_renewal_publication_outcome(
     }
 }
 
+/// Whether a completed renewal actually reached a serving TLS surface.
+///
+/// [`apply_final_renewal_publication`] returns the surfaces that accepted the
+/// force-reload request, and an empty list is not an error anywhere below it:
+/// `request_material_set_reload` answers `false` for a surface that never
+/// registered a sender, and `request_all_material_set_reloads` simply iterates
+/// the surfaces that did. That is correct for its other callers, so the fact
+/// that *this* renewal published new material nobody will serve has to be
+/// recognised here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RenewalReloadReach {
+    /// No registered surface accepted the request. The renewal committed new
+    /// material into the store, but every listener is still serving the
+    /// previous certificate.
+    NoSurfaceAccepted,
+    /// At least one surface accepted the force-reload request.
+    Accepted,
+}
+
+/// Classify the surface list [`apply_final_renewal_publication`] returned.
+pub(crate) fn classify_renewal_reload_reach(surfaces: &[&'static str]) -> RenewalReloadReach {
+    if surfaces.is_empty() {
+        RenewalReloadReach::NoSurfaceAccepted
+    } else {
+        RenewalReloadReach::Accepted
+    }
+}
+
+/// Report whether a successful renewal reached a serving listener.
+///
+/// The startup check
+/// (`EnvConfig::validate_acme_renewal_reachability`) refuses the
+/// statically detectable form of this (auto-renew on, an `acme://` serving
+/// source, frontend TLS live reload off). This is the residual safety net for
+/// everything it cannot see: a surface registered later, a sender that has
+/// since closed, or a source that only becomes `acme://` at runtime. Without
+/// it the renewal logs pure success while clients keep receiving the old leaf.
+pub(crate) fn log_renewal_reload_reach(certificate_id: &str, surfaces: &[&'static str]) {
+    match classify_renewal_reload_reach(surfaces) {
+        RenewalReloadReach::NoSurfaceAccepted => tracing::warn!(
+            certificate_id = %certificate_id,
+            "ACME renewal committed new material but no TLS surface accepted a reload request; \
+             the listener is still serving the previous certificate. Enable \
+             FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED so the renewed certificate is served."
+        ),
+        RenewalReloadReach::Accepted => tracing::info!(
+            certificate_id = %certificate_id,
+            surfaces = %surfaces.join(","),
+            "ACME renewal committed new material and TLS surfaces accepted a reload request"
+        ),
+    }
+}
+
 /// Arms a private-file fault that fires only on the order-store write inside
 /// [`commit_final_renewal_publication`]. The certificate write is still
 /// attempted afterwards (and may succeed or fail independently).
@@ -3339,7 +3392,8 @@ async fn finish_renewal_order(
         Ok(outcome) => outcome,
         Err(_) => return Ok(abandon_renewal(&certificate.id)),
     };
-    apply_final_renewal_publication(publication)?;
+    let reloaded_surfaces = apply_final_renewal_publication(publication)?;
+    log_renewal_reload_reach(&certificate.id, &reloaded_surfaces);
     Ok(true)
 }
 

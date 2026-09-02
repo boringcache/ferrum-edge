@@ -7550,6 +7550,109 @@ impl EnvConfig {
         // The datagram client-address envelope's MAC key (issue #3289).
         self.validate_datagram_proxy_protocol_secret()?;
 
+        // ACME auto-renewal that can never reach the listener (issue #4506).
+        self.validate_acme_renewal_reachability()?;
+
+        Ok(())
+    }
+
+    /// Refuse an ACME auto-renewal configuration whose renewed material can
+    /// never reach the serving listener.
+    ///
+    /// A successful renewal publishes new material into the ACME certificate
+    /// store and then calls
+    /// [`crate::tls::source::subscription::request_all_material_set_reloads`],
+    /// which notifies only the surfaces that registered a force-reload sender.
+    /// The frontend and admin HTTPS surfaces register theirs exclusively from
+    /// inside the live-reload watcher, and
+    /// [`crate::modes::tls_reload::prepare_proxy_frontend_tls`] does not build
+    /// that watcher when `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` is `false`
+    /// (its default). With auto-renew on and live reload off, renewals
+    /// therefore succeed in the store while every client keeps receiving the
+    /// previous leaf until it expires — HTTPS then fails with the correct
+    /// certificate already on disk.
+    ///
+    /// Fail closed rather than warn, consistent with the rest of the TLS
+    /// surface: automation that does not renew what clients see removes the
+    /// operator's reason to monitor expiry, so it must not start silently. The
+    /// condition is deliberately narrow — it fires only when auto-renew is on
+    /// **and** a served frontend/admin certificate or key source is actually an
+    /// `acme://` URI **and** the reload path for that surface is off. A
+    /// file-backed or externally-managed source is untouched, and so is a
+    /// deployment that simply leaves `FERRUM_ACME_AUTO_RENEW_ENABLED=false`.
+    ///
+    /// The admin HTTPS listener has no live-reload flag of its own: it shares
+    /// `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`
+    /// (`crate::modes::tls_reload::admin_frontend_live_reload_can_arm`), so
+    /// both surfaces are tested against the same flag.
+    ///
+    /// Gateway-API multi-certificate sources (`crate::tls::multi_cert`) are out
+    /// of scope here: they arrive in the CP config snapshot rather than in
+    /// `EnvConfig`, and the DP rebuilds the whole resolver on each delivery, so
+    /// they do not depend on the force-reload registry at all.
+    ///
+    /// The offending source is named in its redacted form
+    /// ([`crate::tls::source::CertSource::redacted_source_id`]); the raw
+    /// configured value never reaches the message.
+    pub fn validate_acme_renewal_reachability(&self) -> Result<(), String> {
+        use crate::tls::source::{CertSource, MaterialKind, SourceScheme};
+
+        if !self.acme_auto_renew_enabled {
+            return Ok(());
+        }
+        // Both surfaces gate on the same flag today. Kept as a per-surface
+        // tuple so a future admin-specific flag has one place to land.
+        let candidates: [(&str, Option<&String>, MaterialKind, bool); 4] = [
+            (
+                "FERRUM_FRONTEND_TLS_CERT_SOURCE",
+                self.frontend_tls_cert_path.as_ref(),
+                MaterialKind::Cert,
+                self.frontend_tls_live_reload_enabled,
+            ),
+            (
+                "FERRUM_FRONTEND_TLS_KEY_SOURCE",
+                self.frontend_tls_key_path.as_ref(),
+                MaterialKind::Key,
+                self.frontend_tls_live_reload_enabled,
+            ),
+            (
+                "FERRUM_ADMIN_TLS_CERT_SOURCE",
+                self.admin_tls_cert_path.as_ref(),
+                MaterialKind::Cert,
+                self.frontend_tls_live_reload_enabled,
+            ),
+            (
+                "FERRUM_ADMIN_TLS_KEY_SOURCE",
+                self.admin_tls_key_path.as_ref(),
+                MaterialKind::Key,
+                self.frontend_tls_live_reload_enabled,
+            ),
+        ];
+        for (variable, configured, kind, reload_enabled) in candidates {
+            if reload_enabled {
+                continue;
+            }
+            let Some(configured) = configured else {
+                continue;
+            };
+            let source = CertSource::parse(configured.as_str(), kind);
+            let is_acme =
+                matches!(&source, CertSource::Uri(uri) if uri.scheme == SourceScheme::Acme);
+            if !is_acme {
+                continue;
+            }
+            return Err(format!(
+                "FERRUM_ACME_AUTO_RENEW_ENABLED=true with {variable}={} requires \
+                 FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true. Renewed ACME material is \
+                 published into the certificate store and then offered to the TLS surfaces \
+                 that registered a force-reload sender; only the live-reload watcher \
+                 registers one, so with live reload disabled the listener would keep serving \
+                 the previous certificate until it expires. Set \
+                 FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true, or disable \
+                 FERRUM_ACME_AUTO_RENEW_ENABLED and renew out of band.",
+                source.redacted_source_id()
+            ));
+        }
         Ok(())
     }
 
