@@ -2172,6 +2172,40 @@ async fn oidc_callback_rejects_known_kid_signed_by_a_different_published_key() {
     assert_invalid_id_token(complete_callback(&plugin, &challenge, "authorization-code").await);
 }
 
+/// The relying party has no JWKS knob of its own: it consumes the shared
+/// store, so an ID token naming an unknown `kid` reaches the same rate-limited
+/// on-demand refetch trigger `jwks_auth` uses (issue #4508).
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test]
+async fn oidc_unknown_kid_reaches_the_shared_store_on_demand_refetch() {
+    let server = MockServer::start().await;
+    let (_, plugin, _) = plugin_pair_for_server(&server);
+    let jwks_uri = format!("{}/jwks", server.uri());
+    let store = ferrum_edge::plugins::utils::jwks_cache::cached_store(&jwks_uri)
+        .expect("the relying party shares the process-wide JWKS store");
+    assert_eq!(store.kid_miss_refresh_requests(), 0);
+    assert_ne!(
+        store.kid_miss_cooldown(),
+        std::time::Duration::ZERO,
+        "the inherited shared-store cooldown must leave the refetch enabled"
+    );
+
+    let challenge = issue_browser_challenge(&plugin).await;
+    let id_token = create_rs256_token_with_kid(
+        &oidc_id_token_claims(&challenge),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+        "rotated-kid",
+    );
+    mount_token_and_jwks_document(&server, two_key_oidc_jwks(), &id_token).await;
+    assert_invalid_id_token(complete_callback(&plugin, &challenge, "authorization-code").await);
+
+    assert_eq!(
+        store.kid_miss_refresh_requests(),
+        1,
+        "an unknown kid on the OIDC path must request one out-of-band refresh"
+    );
+}
+
 #[tokio::test]
 async fn oidc_callback_accepts_id_token_with_matching_kid() {
     let server = MockServer::start().await;

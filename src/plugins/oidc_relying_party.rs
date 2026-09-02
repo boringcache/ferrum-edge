@@ -153,6 +153,11 @@ pub struct OidcRelyingParty {
 
 /// Fixed shared-store requirement contributed by every `oidc_relying_party`
 /// consumer of a discovered or configured JWKS endpoint.
+///
+/// The unknown-`kid` on-demand refetch is inherited from the shared store at
+/// its default cooldown: this plugin has no knob of its own, and when it shares
+/// an endpoint with a `jwks_auth` provider the shared store honours the
+/// strictest cooldown among the active consumers.
 fn oidc_jwks_requirement() -> JwksRefreshRequirement {
     JwksRefreshRequirement::new(
         DEFAULT_JWKS_REFRESH_INTERVAL,
@@ -792,14 +797,9 @@ impl OidcRelyingParty {
                 .map(|url| validate_url_string(&url, "provider[0].post_logout_redirect_uri"))
                 .transpose()?;
         let initial_jwks_store = if start_background_tasks {
-            jwks_uri.as_ref().map(|uri| {
-                get_or_create_jwks_store(
-                    uri,
-                    &http_client,
-                    DEFAULT_JWKS_REFRESH_INTERVAL,
-                    Duration::from_secs(DEFAULT_JWKS_MAX_STALE_SECONDS),
-                )
-            })
+            jwks_uri
+                .as_ref()
+                .map(|uri| get_or_create_jwks_store(uri, &http_client, oidc_jwks_requirement()))
         } else {
             None
         };
@@ -3359,8 +3359,7 @@ fn spawn_oidc_discovery(
                     let store = get_or_create_jwks_store(
                         &doc.jwks_uri,
                         &http_client,
-                        DEFAULT_JWKS_REFRESH_INTERVAL,
-                        Duration::from_secs(DEFAULT_JWKS_MAX_STALE_SECONDS),
+                        oidc_jwks_requirement(),
                     );
                     let resolved_jwks_uri = store.jwks_uri().to_string();
                     let refreshable = store.is_refreshable();

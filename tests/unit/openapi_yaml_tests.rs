@@ -3236,6 +3236,20 @@ fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
         json!(ferrum_edge::plugins::jwks_auth::MAX_JWKS_MAX_STALE_SECONDS)
     );
     assert_eq!(
+        schema["properties"]["kid_miss_refresh_cooldown_seconds"]["default"],
+        json!(ferrum_edge::plugins::jwks_auth::DEFAULT_KID_MISS_REFRESH_COOLDOWN_SECONDS)
+    );
+    assert_eq!(
+        schema["properties"]["kid_miss_refresh_cooldown_seconds"]["maximum"],
+        json!(ferrum_edge::plugins::jwks_auth::MAX_KID_MISS_REFRESH_COOLDOWN_SECONDS)
+    );
+    // Zero must stay admissible: it is the documented way to disable the
+    // on-demand refetch, not an invalid value.
+    assert_eq!(
+        schema["properties"]["kid_miss_refresh_cooldown_seconds"]["minimum"],
+        json!(0)
+    );
+    assert_eq!(
         schema["properties"]["providers"]["items"]["properties"]["dpop_replay_max_entries"]["default"],
         json!(ferrum_edge::plugins::jwks_auth::DEFAULT_DPOP_REPLAY_MAX_ENTRIES)
     );
@@ -3271,6 +3285,7 @@ fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
     assert!(guide.contains("maximum `86400`"));
     assert!(guide.contains("`0` is invalid"));
     assert!(guide.contains("| `jwks_auth` | `jwks_max_stale_seconds` | `3600` |"));
+    assert!(guide.contains("| `jwks_auth` | `kid_miss_refresh_cooldown_seconds` | `30` |"));
     assert!(!guide.contains("| `jwks_auth` | `cache_ttl_seconds`"));
 }
 

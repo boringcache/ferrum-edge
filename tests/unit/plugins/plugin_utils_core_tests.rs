@@ -499,6 +499,95 @@ async fn jwt_verifier_rejects_known_kid_signed_by_a_different_published_key() {
     );
 }
 
+/// A remote, refreshable two-key store. Unlike [`two_key_store`] this one can
+/// admit an unknown-`kid` refetch trigger, so the verifier's rate-limited
+/// signalling is observable (issue #4508).
+async fn remote_two_key_store(server: &wiremock::MockServer) -> JwksKeyStore {
+    let key1 = super::jwks_auth_support::build_rsa_jwks_from_pem_with_kid(
+        include_bytes!("../../../tests/fixtures/test_rsa_public.pem"),
+        "key-1",
+    );
+    let key2 = super::jwks_auth_support::build_rsa_jwks_from_pem_with_kid(
+        include_bytes!("../../../tests/fixtures/test_rsa_public_other.pem"),
+        "key-2",
+    );
+    let jwks = json!({"keys": [key1["keys"][0].clone(), key2["keys"][0].clone()]});
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/jwks"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(jwks))
+        .mount(server)
+        .await;
+    let store = JwksKeyStore::new(
+        format!("{}/jwks", server.uri()),
+        ferrum_edge::plugins::PluginHttpClient::default(),
+    );
+    store.fetch_keys().await.expect("initial JWKS fetch");
+    store
+}
+
+/// A non-empty unknown `kid` is the observable shape of an IdP key rotation,
+/// so it asks the store for one out-of-band refresh — and the request that
+/// observed the miss still fails closed.
+#[tokio::test]
+async fn jwt_verifier_unknown_kid_requests_one_rate_limited_refetch() {
+    let server = wiremock::MockServer::start().await;
+    let store = remote_two_key_store(&server).await;
+    let token = super::jwks_auth_support::create_rs256_token_with_kid(
+        &json!({"sub": "user"}),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+        "rotated-kid",
+    );
+
+    assert!(
+        verify_jwt_with_jwks(&token, &store, &jwt_verify_params())
+            .await
+            .is_none(),
+        "the triggering request must still fail closed"
+    );
+    assert_eq!(store.kid_miss_refresh_requests(), 1);
+
+    // A second unknown identifier inside the same cooldown window adds no
+    // further trigger: random-`kid` spraying cannot become a fetch storm.
+    for identifier in ["another-kid", "yet-another-kid"] {
+        let sprayed = super::jwks_auth_support::create_rs256_token_with_kid(
+            &json!({"sub": "user"}),
+            include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+            identifier,
+        );
+        assert!(
+            verify_jwt_with_jwks(&sprayed, &store, &jwt_verify_params())
+                .await
+                .is_none()
+        );
+    }
+    assert_eq!(store.kid_miss_refresh_requests(), 1);
+}
+
+/// A missing or empty `kid` names no rotation, so it must trigger nothing.
+#[tokio::test]
+async fn jwt_verifier_missing_or_empty_kid_requests_no_refetch() {
+    let server = wiremock::MockServer::start().await;
+    let store = remote_two_key_store(&server).await;
+
+    let no_kid = super::jwks_auth_support::create_rs256_token_no_kid(
+        &json!({"sub": "user"}),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+    );
+    let empty_kid = super::jwks_auth_support::create_rs256_token_with_kid(
+        &json!({"sub": "user"}),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+        "",
+    );
+    for token in [no_kid, empty_kid] {
+        assert!(
+            verify_jwt_with_jwks(&token, &store, &jwt_verify_params())
+                .await
+                .is_none()
+        );
+    }
+    assert_eq!(store.kid_miss_refresh_requests(), 0);
+}
+
 #[tokio::test]
 async fn jwt_verifier_accepts_matching_kid_and_key() {
     let token = super::jwks_auth_support::create_rs256_token_with_kid(

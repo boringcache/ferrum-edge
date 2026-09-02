@@ -39,7 +39,10 @@ use super::utils::jwks_cache::{
     publish_late_active_requirement, remember_discovered_jwks_uri,
     retire_jwks_store_if_unreferenced,
 };
-pub use super::utils::jwks_store::{DEFAULT_JWKS_MAX_STALE_SECONDS, MAX_JWKS_MAX_STALE_SECONDS};
+pub use super::utils::jwks_store::{
+    DEFAULT_JWKS_MAX_STALE_SECONDS, DEFAULT_KID_MISS_REFRESH_COOLDOWN_SECONDS,
+    MAX_JWKS_MAX_STALE_SECONDS, MAX_KID_MISS_REFRESH_COOLDOWN_SECONDS,
+};
 use super::utils::jwks_store::{JwksKeyStore, redacted_jwks_uri};
 use super::utils::jwt_verifier::{JwtVerifyParams, peek_unverified_issuer, verify_jwt_with_jwks};
 use super::utils::redis_rate_limiter::{
@@ -148,6 +151,9 @@ pub struct JwksAuth {
     emit_mesh_request_principal_metadata: bool,
     http_client: PluginHttpClient,
     refresh_interval: Duration,
+    /// Minimum spacing between on-demand JWKS refetches triggered by a token
+    /// naming an unknown `kid`. `Duration::ZERO` disables the behaviour.
+    kid_miss_cooldown: Duration,
     discovery_tasks: Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
     discovery_owner_live: Arc<AtomicBool>,
     /// Set by `commit_background_tasks` once this generation is published.
@@ -248,6 +254,7 @@ const CONFIG_FIELDS: &[&str] = &[
     "require_exp",
     "jwks_refresh_interval_secs",
     "jwks_max_stale_seconds",
+    "kid_miss_refresh_cooldown_seconds",
 ];
 
 /// Complete root allowlist: the plugin's own fields plus the shared Redis
@@ -435,6 +442,21 @@ impl JwksAuth {
             ));
         }
         let refresh_interval = Duration::from_secs(refresh_interval_secs);
+        // An unknown `kid` is the observable shape of an identity-provider key
+        // rotation, so the store refetches out of band at most once per this
+        // window. `0` disables the behaviour and restores the previous
+        // refresh-interval-only recovery latency.
+        let kid_miss_refresh_cooldown_seconds = optional_u64(
+            config_obj,
+            "kid_miss_refresh_cooldown_seconds",
+            DEFAULT_KID_MISS_REFRESH_COOLDOWN_SECONDS,
+        )?;
+        if kid_miss_refresh_cooldown_seconds > MAX_KID_MISS_REFRESH_COOLDOWN_SECONDS {
+            return Err(format!(
+                "jwks_auth: 'kid_miss_refresh_cooldown_seconds' must be <= {MAX_KID_MISS_REFRESH_COOLDOWN_SECONDS}"
+            ));
+        }
+        let kid_miss_cooldown = Duration::from_secs(kid_miss_refresh_cooldown_seconds);
         let default_max_stale_seconds = optional_u64(
             config_obj,
             "jwks_max_stale_seconds",
@@ -735,6 +757,7 @@ impl JwksAuth {
                 // replaces it with the process-wide shared store.
                 let store = JwksKeyStore::new(uri.clone(), http_client.clone());
                 store.configure_trust_policy(refresh_interval, provider_max_stale);
+                store.configure_kid_miss_cooldown(kid_miss_cooldown);
                 jwks_store_slot.store(Arc::new(Some(Arc::new(store))));
                 JwksSource::Direct(uri.clone())
             } else if let Some(ref disc_url) = discovery_url {
@@ -858,6 +881,7 @@ impl JwksAuth {
             emit_mesh_request_principal_metadata,
             http_client,
             refresh_interval,
+            kid_miss_cooldown,
             discovery_tasks: Mutex::new(None),
             discovery_owner_live: Arc::new(AtomicBool::new(true)),
             discovery_owner_committed: Arc::new(AtomicBool::new(false)),
@@ -880,6 +904,32 @@ impl JwksAuth {
                 }
             }
         }
+    }
+
+    /// This generation's contribution to a shared JWKS store's effective
+    /// policy, including the unknown-`kid` on-demand refetch cooldown.
+    fn shared_store_requirement(&self, max_stale: Duration) -> JwksRefreshRequirement {
+        JwksRefreshRequirement::new(self.refresh_interval, max_stale)
+            .with_kid_miss_cooldown(self.kid_miss_cooldown)
+    }
+
+    /// Live remote JWKS stores backing this plugin's providers. Test-only
+    /// visibility for the unknown-`kid` on-demand refetch contracts.
+    #[doc(hidden)]
+    #[allow(dead_code)] // exercised by external unit tests
+    pub fn remote_jwks_stores_for_test(&self) -> Vec<Arc<JwksKeyStore>> {
+        self.providers
+            .iter()
+            .filter_map(|provider| {
+                provider
+                    .jwks_store
+                    .load()
+                    .as_ref()
+                    .as_ref()
+                    .filter(|store| store.is_refreshable())
+                    .cloned()
+            })
+            .collect()
     }
 
     /// Per-provider process replay-lane capacities (`None` when DPoP is not
@@ -1533,8 +1583,7 @@ impl super::Plugin for JwksAuth {
                     let store = get_or_create_jwks_store(
                         uri,
                         &self.http_client,
-                        self.refresh_interval,
-                        provider.max_stale,
+                        self.shared_store_requirement(provider.max_stale),
                     );
                     provider.jwks_store.store(Arc::new(Some(store)));
                 }
@@ -1546,8 +1595,7 @@ impl super::Plugin for JwksAuth {
                         let store = get_or_create_jwks_store(
                             &uri,
                             &self.http_client,
-                            self.refresh_interval,
-                            provider.max_stale,
+                            self.shared_store_requirement(provider.max_stale),
                         );
                         provider.jwks_store.store(Arc::new(Some(store)));
                     }
@@ -1557,8 +1605,7 @@ impl super::Plugin for JwksAuth {
                         Arc::clone(&provider.late_active),
                         self.http_client.clone(),
                         discovery_url.clone(),
-                        self.refresh_interval,
-                        provider.max_stale,
+                        self.shared_store_requirement(provider.max_stale),
                         Arc::clone(&self.discovery_owner_live),
                         Arc::clone(&self.discovery_owner_committed),
                         Arc::clone(&self.discovery_publication_gate),
@@ -1604,7 +1651,7 @@ impl super::Plugin for JwksAuth {
             publish_late_active_requirement(
                 &provider.late_active,
                 store.jwks_uri(),
-                JwksRefreshRequirement::new(self.refresh_interval, provider.max_stale),
+                self.shared_store_requirement(provider.max_stale),
             );
         }
     }
@@ -1720,7 +1767,7 @@ impl super::Plugin for JwksAuth {
                     .map(|store| {
                         (
                             store.jwks_uri().to_string(),
-                            JwksRefreshRequirement::new(self.refresh_interval, provider.max_stale),
+                            self.shared_store_requirement(provider.max_stale),
                         )
                     })
             })
@@ -1743,8 +1790,7 @@ fn spawn_discovery_task(
     late_active: Arc<Mutex<Option<LateActiveRequirement>>>,
     client: PluginHttpClient,
     discovery_url: String,
-    refresh_interval: Duration,
-    max_stale: Duration,
+    requirement: JwksRefreshRequirement,
     owner_live: Arc<AtomicBool>,
     owner_committed: Arc<AtomicBool>,
     publication_gate: Arc<Mutex<()>>,
@@ -1773,12 +1819,8 @@ fn spawn_discovery_task(
                         "jwks_auth OIDC discovery resolved a JWKS endpoint at {}",
                         redacted_jwks_uri(&uri)
                     );
-                    let mut candidate = DiscoveryStoreCandidate::acquire(
-                        &uri,
-                        &client,
-                        refresh_interval,
-                        max_stale,
-                    );
+                    let mut candidate =
+                        DiscoveryStoreCandidate::acquire(&uri, &client, requirement);
                     let Some(store) = candidate.store().cloned() else {
                         warn!(
                             "jwks_auth OIDC: discovery candidate disappeared before publication"
@@ -1803,7 +1845,7 @@ fn spawn_discovery_task(
                             publish_late_active_requirement(
                                 &late_active,
                                 &uri,
-                                JwksRefreshRequirement::new(refresh_interval, max_stale),
+                                requirement,
                             );
                         }
                         candidate.publish();
@@ -1856,7 +1898,7 @@ fn spawn_discovery_task(
                             publish_late_active_requirement(
                                 &late_active,
                                 &uri,
-                                JwksRefreshRequirement::new(refresh_interval, max_stale),
+                                requirement,
                             );
                         }
                     }

@@ -19635,6 +19635,24 @@ components:
             Maximum monotonic age of the last validated non-empty remote JWKS.
             Cached keys fail closed at this deadline even if refreshes keep
             failing or return empty. Zero is invalid and cannot disable expiry.
+        kid_miss_refresh_cooldown_seconds:
+          type: integer
+          format: uint64
+          minimum: 0
+          maximum: 3600
+          default: 30
+          description: >-
+            Minimum spacing between out-of-band JWKS refetches triggered by a
+            token naming a kid the trusted key set does not contain — the
+            observable shape of an identity-provider key rotation. At most one
+            fetch is issued per window, so tokens carrying random identifiers
+            cannot become a fetch storm. The triggering request is never
+            blocked on the fetch and still fails closed; a later request
+            verifies once the refreshed key set is published. A token with a
+            missing or empty kid triggers nothing. Zero disables the on-demand
+            refetch, leaving jwks_refresh_interval_secs as the only recovery
+            path. Shared stores use the most restrictive value requested by
+            active consumers (disabled wins, otherwise the longest cooldown).
         sync_mode:
           type: string
           enum: [local, redis]
