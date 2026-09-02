@@ -948,6 +948,20 @@ pub(crate) async fn run_watcher_generations<S, F>(
                     match item {
                         Ok(Some(event)) => {
                             last_event = tokio::time::Instant::now();
+                            // Issue #4491: a black-box "the withdrawn route is
+                            // still served" failure cannot tell a stalled watch
+                            // from a reconcile that ran and published. Count
+                            // every observed withdrawal here, before any
+                            // buffering decision, so the first half of that
+                            // question has an answer on `/metrics`. A relist
+                            // that drops an object delivers no `Delete`, so a
+                            // flat counter alongside a rising
+                            // `watch_idle_relists` is the stalled-stream shape.
+                            if matches!(event, watcher::Event::Delete(_)) {
+                                metrics
+                                    .watch_deletes
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             // Convergence evidence for the revision watermark
                             // (issue #3611). Listed objects are buffered until
                             // the matching `InitDone` because the reflector

@@ -24,6 +24,24 @@ pub struct ControllerMetrics {
     /// this counter measures relist *rate*, not error rate. What is diagnostic
     /// is a scope that relists while the cluster is known to be changing.
     pub watch_idle_relists: AtomicU64,
+    /// Watch `Delete` events observed across every watched scope (issue #4491).
+    ///
+    /// A withdrawn object reaches the reconciler either as a `Delete` event or,
+    /// if the stream missed it, only when a relist rebuilds the scope's store.
+    /// This counter is the first of those two paths, so it answers the question
+    /// a black-box "deleted route kept serving" failure cannot: whether the
+    /// control plane ever *observed* the withdrawal. Unlabeled and
+    /// scope-agnostic — object identity stays out of metric series.
+    pub watch_deletes: AtomicU64,
+    /// Reconciles that committed a changed gateway configuration snapshot
+    /// (issue #4491).
+    ///
+    /// [`Self::reconciliations`] counts passes started, including the ones that
+    /// find nothing to swap; only a publication proves the reconciler turned an
+    /// observed cluster change into new served config. The pair separates "the
+    /// controller never saw it" from "the controller published and the data
+    /// plane still serves the old route".
+    pub config_publications: AtomicU64,
     /// Successful Gateway API route parent-status patches.
     pub route_status_publications: AtomicU64,
     /// Milliseconds from the patched route's Kubernetes `creationTimestamp` to
@@ -88,6 +106,8 @@ impl ControllerMetrics {
             last_reconcile_duration_ms: AtomicU64::new(0),
             gateway_api_status_plan_cursor: AtomicU64::new(0),
             watch_idle_relists: AtomicU64::new(0),
+            watch_deletes: AtomicU64::new(0),
+            config_publications: AtomicU64::new(0),
             route_status_publications: AtomicU64::new(0),
             last_route_status_publish_latency_ms: AtomicU64::new(0),
             status_request_timeouts: AtomicU64::new(0),
@@ -109,6 +129,8 @@ impl ControllerMetrics {
             errors: self.errors.load(Ordering::Relaxed),
             last_reconcile_duration_ms: self.last_reconcile_duration_ms.load(Ordering::Relaxed),
             watch_idle_relists: self.watch_idle_relists.load(Ordering::Relaxed),
+            watch_deletes: self.watch_deletes.load(Ordering::Relaxed),
+            config_publications: self.config_publications.load(Ordering::Relaxed),
             route_status_publications: self.route_status_publications.load(Ordering::Relaxed),
             last_route_status_publish_latency_ms: self
                 .last_route_status_publish_latency_ms
@@ -133,6 +155,8 @@ pub struct MetricsSnapshot {
     pub errors: u64,
     pub last_reconcile_duration_ms: u64,
     pub watch_idle_relists: u64,
+    pub watch_deletes: u64,
+    pub config_publications: u64,
     pub route_status_publications: u64,
     pub last_route_status_publish_latency_ms: u64,
     pub status_request_timeouts: u64,

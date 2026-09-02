@@ -2946,6 +2946,26 @@ impl MetricsRegistry {
             "",
         );
         output.push_str(
+            "# HELP ferrum_k8s_controller_config_publications_total Kubernetes reconciles that committed a changed gateway configuration snapshot.\n",
+        );
+        output.push_str("# TYPE ferrum_k8s_controller_config_publications_total counter\n");
+        render_process_counter(
+            output,
+            "ferrum_k8s_controller_config_publications_total",
+            snapshot.config_publications,
+            "",
+        );
+        output.push_str(
+            "# HELP ferrum_k8s_controller_watch_deletes_total Kubernetes watch Delete events observed across every watched scope.\n",
+        );
+        output.push_str("# TYPE ferrum_k8s_controller_watch_deletes_total counter\n");
+        render_process_counter(
+            output,
+            "ferrum_k8s_controller_watch_deletes_total",
+            snapshot.watch_deletes,
+            "",
+        );
+        output.push_str(
             "# HELP ferrum_k8s_controller_watch_idle_relists_total Watch-scope reflector rebuilds triggered because a scope delivered no event for the configured idle window, or because a replacement generation never finished its initial list.\n",
         );
         output.push_str("# TYPE ferrum_k8s_controller_watch_idle_relists_total counter\n");
