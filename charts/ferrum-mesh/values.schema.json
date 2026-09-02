@@ -24,6 +24,14 @@
             "IfNotPresent",
             "Never"
           ]
+        },
+        "pullSecrets": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Names of imagePullSecrets to attach to the pod. Each entry is the name of an existing Secret of type kubernetes.io/dockerconfigjson in the release namespace."
         }
       }
     },

@@ -247,6 +247,7 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: ferrum-node-agent
+      {{- include "ferrum-mesh.imagePullSecrets" . }}
       terminationGracePeriodSeconds: {{ .Values.nodeAgent.terminationGracePeriodSeconds }}
       {{- with .Values.nodeAgent.priorityClassName }}
       priorityClassName: {{ . | quote }}

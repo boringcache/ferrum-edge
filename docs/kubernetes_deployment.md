@@ -78,6 +78,28 @@ registry before install. Override with a published tag on the command line or in
 your values file (for example `--set image.tag=<published-tag>`). The mutable
 `latest` tag exists for evaluation but must not be used in production.
 
+Because that override is mandatory, a mirrored or private registry is the
+common case. Both charts expose `image.pullSecrets` as a list of Secret
+**names** in the release namespace; each Secret must already exist (type
+`kubernetes.io/dockerconfigjson`) — neither chart creates one:
+
+```bash
+kubectl -n ferrum create secret docker-registry regcred \
+  --docker-server=registry.internal.example \
+  --docker-username=<user> --docker-password=<token>
+
+helm install ferrum ./charts/ferrum-gateway -n ferrum \
+  --set image.repository=registry.internal.example/ferrum-edge \
+  --set image.tag=<published-tag> \
+  --set 'image.pullSecrets[0]=regcred'
+```
+
+The names are rendered as `imagePullSecrets` on every pod spec the chart owns —
+for `charts/ferrum-mesh` that includes both CNI uninstall-hook pods, which run
+the Ferrum image and would otherwise strand `helm uninstall` in
+`ImagePullBackOff`. The default is `[]`, which renders no `imagePullSecrets`
+key at all.
+
 Per-mode quickstarts:
 
 ```bash

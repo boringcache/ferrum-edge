@@ -12,6 +12,24 @@ invalid CP settings so an unusable control-plane pod is not rendered.
 {{- printf "%s:%s" .Values.image.repository (include "ferrum-mesh.imageTag" .) -}}
 {{- end -}}
 
+{{/*
+Chart-level imagePullSecrets block for a mesh pod spec. Emits nothing when
+image.pullSecrets is empty, so the default install renders no key at all. The
+six-space indentation is baked in because every mesh pod spec places this at
+podSpec depth, immediately after serviceAccountName; the rendered shape is
+identical to charts/ferrum-gateway/templates/deployment.yaml. Entries are
+Secret names (strings), matching the gateway chart and values.schema.json.
+Context: root.
+*/}}
+{{- define "ferrum-mesh.imagePullSecrets" -}}
+{{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ . }}
+        {{- end }}
+{{- end }}
+{{- end -}}
+
 {{- define "ferrum-mesh.resolveImageTag" -}}
 {{- $override := trim (toString (.override | default "")) -}}
 {{- if $override -}}

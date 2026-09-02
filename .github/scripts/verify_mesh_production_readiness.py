@@ -25,6 +25,22 @@ RESTRICTED = (
     "ferrum-mesh-east-west",
 )
 
+# Every workload that runs a Ferrum image and therefore needs the chart-level
+# image.pullSecrets on a private registry (#4510). Both CNI uninstall-hook pods
+# are included on purpose: they run the Ferrum image, so a missing pull secret
+# hangs `helm uninstall` behind an ImagePullBackOff on the node whose CNI chain
+# is being removed.
+PULL_SECRET_WORKLOADS = (
+    ("ferrum-mesh-control-plane", "Deployment"),
+    ("ferrum-mesh-ca", "Deployment"),
+    ("ferrum-mesh-east-west", "Deployment"),
+    ("ferrum-mesh-injector", "Deployment"),
+    ("ferrum-mesh-ambient", "DaemonSet"),
+    ("ferrum-mesh-node-agent", "DaemonSet"),
+    ("ferrum-mesh-cni-cleanup", "DaemonSet"),
+    ("ferrum-mesh-cni-cleanup-wait", "Job"),
+)
+
 
 def fail(title: str, detail: str) -> None:
     print(f"::error title={title}::{detail}")
@@ -1027,6 +1043,40 @@ def validate_udp_cleanup_upgrade(results_dir: Path) -> None:
     print("mesh UDP cleanup upgrade capabilities ok")
 
 
+def validate_image_pull_secrets(results_dir: Path) -> None:
+    """Chart-level image.pullSecrets must reach every Ferrum pod spec.
+
+    The value is a list of Secret NAMES (strings), matching the gateway chart
+    and values.schema.json. The chart default is [], so this render is the only
+    thing that exercises either surface; a workload that quietly dropped the
+    block would ImagePullBackOff on the first private-registry install.
+    """
+    rendered = require_capture(
+        results_dir, "mesh-image-pull-secrets.yaml"
+    ).read_text(encoding="utf-8")
+    for name, kind in PULL_SECRET_WORKLOADS:
+        doc = resource_document(rendered, name, kind)
+        require_text(
+            doc,
+            "      imagePullSecrets:\n        - name: regcred\n",
+            "Mesh workload missing imagePullSecrets",
+            f"{kind}/{name} must render image.pullSecrets as `- name: regcred`",
+        )
+        entries = len(re.findall(r"(?m)^\s*- name: regcred\s*$", doc))
+        if entries != 1:
+            fail(
+                "Mesh workload imagePullSecrets count wrong",
+                f"{kind}/{name} rendered regcred {entries} times; expected exactly 1",
+            )
+        forbid_text(
+            doc,
+            "map[name:",
+            "Mesh imagePullSecrets rendered a Go map",
+            f"{kind}/{name} stringified an object entry; items are Secret names",
+        )
+    print("mesh image pull secrets ok")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1052,6 +1102,7 @@ def main() -> int:
     validate_admin_env_override(results_dir)
     validate_node_waypoint_ebpf_caps(results_dir)
     validate_udp_cleanup_upgrade(results_dir)
+    validate_image_pull_secrets(results_dir)
     print("mesh production-readiness ok")
     return 0
 
