@@ -440,9 +440,10 @@ async fn zero_disables_the_header_arrival_deadline() {
 #[test]
 fn h3_header_arrival_elapse_logs_at_debug_and_never_unwraps() {
     let src = server_src();
+    let no_ws: String = src.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        compact(src).contains(
-            "letSome(resolved)=await_h3_request_headers(resolver.resolve_request(),             header_deadline_seconds,)"
+        no_ws.contains(
+            "letSome(resolved)=await_h3_request_headers(resolver.resolve_request(),header_deadline_seconds,)"
         ),
         "the per-stream resolve must be bounded by the hoisted deadline (issue #4537)"
     );
