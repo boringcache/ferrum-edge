@@ -590,6 +590,8 @@ HELM_PATTERNS = [
         r"^\.github/workflows/ci\.yml$",
         r"^\.github/scripts/extract_rendered_prometheus_rules\.py$",
         r"^\.github/scripts/validate_prometheus_metric_contract\.py$",
+        r"^\.github/scripts/verify_mesh_production_readiness\.py$",
+        r"^scripts/check_helm_values_schema_parity\.py$",
         r"^\.github/actions/",
         r"^docs/prometheus_metric_contract\.json$",
         r"^docs/prometheus_metrics\.md$",

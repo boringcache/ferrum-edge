@@ -632,6 +632,31 @@ logged; inline value is for lab installs only.
 {{- end -}}
 
 {{/*
+SleepAction preStop support gate. lifecycle.preStop.sleep is Kubernetes 1.29+
+(GA in 1.30) and is silently pruned by older API servers, so every workload
+that renders it shares this one guard rather than copying the version parse.
+Dict: root, component (string), preStop (seconds).
+*/}}
+{{- define "ferrum-mesh.validateSleepActionSupported" -}}
+{{- $root := .root -}}
+{{- $component := .component -}}
+{{- $preStop := int (.preStop | default 0) -}}
+{{- if gt $preStop 0 -}}
+{{- $major := atoi (regexReplaceAll "[^0-9].*$" ($root.Capabilities.KubeVersion.Major | toString) "") -}}
+{{- $minor := atoi (regexReplaceAll "[^0-9].*$" ($root.Capabilities.KubeVersion.Minor | toString) "") -}}
+{{- /* helm template without --kube-version advertises 1.20.0. That sentinel is
+     not a real cluster; skip so GitOps/client renders still emit the 1.29+
+     SleepAction default. --kube-version 1.28.0 and real <1.29 clusters fail. */ -}}
+{{- $helmTemplateDefault := and (eq $major 1) (eq $minor 20) -}}
+{{- $sleepUnsupported := and (not $helmTemplateDefault) (or (lt $major 1) (and (eq $major 1) (lt $minor 29))) -}}
+{{- if $sleepUnsupported -}}
+{{- $kube := $root.Capabilities.KubeVersion.Version | default (printf "v%d.%d" $major $minor) -}}
+{{- fail (printf "%s.shutdownPreStopSeconds=%d renders lifecycle.preStop.sleep (SleepAction), which requires Kubernetes 1.29+ (GA in 1.30). This cluster reports %s. Set %s.shutdownPreStopSeconds=0 to omit the hook and raise %s.shutdownPreDrainSeconds to at least readiness failureThreshold × periodSeconds so kube-proxy endpoint removal can finish after SIGTERM while /health already reports not-ready." $component $preStop $kube $component $component) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Full additive post-SIGTERM shutdown budget (docs/graceful_shutdown.md):
   drain + 6s transport pool + 5s background + clamp(drain,5,60)s audit
   + 2s observability + 5s finalizer slack.
@@ -659,17 +684,79 @@ clock. Dict: root, component (string), values (component values).
 {{- if lt (int $grace) $minGrace -}}
 {{- fail (printf "%s.terminationGracePeriodSeconds (%d) must be at least %d (preStop %ds + preDrain %ds + shutdown budget %ds, where the shutdown budget is drain %ds + transport pool 6s + background 5s + audit %ds + observability 2s + finalizer slack 5s); a null shutdownDrainSeconds uses the binary's 30s default" $component (int $grace) $minGrace $preStop $preDrain $shutdownBudget $effectiveDrain $auditBudget) -}}
 {{- end -}}
-{{- if gt $preStop 0 -}}
-{{- $major := atoi (regexReplaceAll "[^0-9].*$" ($root.Capabilities.KubeVersion.Major | toString) "") -}}
-{{- $minor := atoi (regexReplaceAll "[^0-9].*$" ($root.Capabilities.KubeVersion.Minor | toString) "") -}}
+{{- include "ferrum-mesh.validateSleepActionSupported" (dict "root" $root "component" $component "preStop" $preStop) -}}
+{{- end -}}
+
+{{/*
+Webhook (injector) shutdown budget. FERRUM_MODE=injector runs none of the
+serving shutdown stages: run() reads FERRUM_SHUTDOWN_DRAIN_SECONDS and, on the
+shutdown broadcast, waits up to that long for in-flight admission connections
+before aborting the accept tasks and returning (src/modes/injector.rs). So the
+budget is preStop + drain + a small process-exit slack, NOT the additive
+serving budget. Dict: root, component (string), values (component values).
+*/}}
+{{- define "ferrum-mesh.validateWebhookShutdown" -}}
+{{- $root := .root -}}
+{{- $component := .component -}}
+{{- $v := .values | default dict -}}
+{{- $drain := $v.shutdownDrainSeconds -}}
+{{- $effectiveDrain := 30 -}}
+{{- if not (kindIs "invalid" $drain) -}}{{- $effectiveDrain = int $drain -}}{{- end -}}
+{{- $preStop := int ($v.shutdownPreStopSeconds | default 0) -}}
+{{- $exitSlack := 5 -}}
+{{- $minGrace := add $preStop (add $effectiveDrain $exitSlack) -}}
+{{- $grace := $v.terminationGracePeriodSeconds -}}
+{{- if kindIs "invalid" $grace -}}
+{{- fail (printf "%s.terminationGracePeriodSeconds is required when the workload is enabled (minimum %d = preStop %ds + drain %ds + process-exit slack %ds)" $component $minGrace $preStop $effectiveDrain $exitSlack) -}}
+{{- end -}}
+{{- if lt (int $grace) $minGrace -}}
+{{- fail (printf "%s.terminationGracePeriodSeconds (%d) must be at least %d (preStop %ds + drain %ds + process-exit slack %ds); the injector is a failurePolicy=Fail webhook, so a replica that stops accepting /mutate while it is still a live Endpoint makes the apiserver reject pod CREATE in every selected namespace. A null %s.shutdownDrainSeconds uses the binary's 30s default" $component (int $grace) $minGrace $preStop $effectiveDrain $exitSlack $component) -}}
+{{- end -}}
+{{- include "ferrum-mesh.validateSleepActionSupported" (dict "root" $root "component" $component "preStop" $preStop) -}}
+{{- end -}}
+
+{{/*
+Node-agent shutdown floor. node_agent mode never reads
+FERRUM_SHUTDOWN_DRAIN_SECONDS and the DaemonSet sits behind no Service, so
+there is no drain stage or endpoint-propagation window to budget for; the only
+honest requirement is a non-zero grace period so teardown is not SIGKILLed
+immediately. Dict: component (string), values (component values).
+*/}}
+{{- define "ferrum-mesh.validateNodeAgentShutdown" -}}
+{{- $component := .component -}}
+{{- $v := .values | default dict -}}
+{{- $grace := $v.terminationGracePeriodSeconds -}}
+{{- if kindIs "invalid" $grace -}}
+{{- fail (printf "%s.terminationGracePeriodSeconds is required when the workload is enabled (minimum 1; node_agent has no drain stage, so this is only the SIGTERM-to-SIGKILL floor)" $component) -}}
+{{- end -}}
+{{- if lt (int $grace) 1 -}}
+{{- fail (printf "%s.terminationGracePeriodSeconds (%d) must be at least 1; node_agent has no drain stage, but 0 SIGKILLs the pod immediately and abandons capture teardown" $component (int $grace)) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Native-sidecar Kubernetes floor for the injector (issue #4534). The webhook
+emits Ferrum only as a Kubernetes native sidecar --
+spec.initContainers[].restartPolicy: Always -- with no ordinary-container
+fallback (src/modes/injector.rs). Kubernetes <=1.27 rejects that field outright
+and 1.28 requires the SidecarContainers feature gate, so with
+failurePolicy: Fail the webhook mutates the pod, the apiserver then rejects it,
+and every pod CREATE in a selected namespace fails. Deliberately NOT a
+Chart.yaml kubeVersion: constraint -- the rest of the chart still installs on
+older clusters with injector.enabled=false.
+*/}}
+{{- define "ferrum-mesh.validateInjectorKubeVersion" -}}
+{{- if .Values.injector.enabled -}}
+{{- $major := atoi (regexReplaceAll "[^0-9].*$" (.Capabilities.KubeVersion.Major | toString) "") -}}
+{{- $minor := atoi (regexReplaceAll "[^0-9].*$" (.Capabilities.KubeVersion.Minor | toString) "") -}}
 {{- /* helm template without --kube-version advertises 1.20.0. That sentinel is
-     not a real cluster; skip so GitOps/client renders still emit the 1.29+
-     SleepAction default. --kube-version 1.28.0 and real <1.29 clusters fail. */ -}}
+     not a real cluster; skip it so GitOps/client-side renders still work.
+     --kube-version 1.27.0 and real <1.29 clusters fail. */ -}}
 {{- $helmTemplateDefault := and (eq $major 1) (eq $minor 20) -}}
-{{- $sleepUnsupported := and (not $helmTemplateDefault) (or (lt $major 1) (and (eq $major 1) (lt $minor 29))) -}}
-{{- if $sleepUnsupported -}}
-{{- $kube := $root.Capabilities.KubeVersion.Version | default (printf "v%d.%d" $major $minor) -}}
-{{- fail (printf "%s.shutdownPreStopSeconds=%d renders lifecycle.preStop.sleep (SleepAction), which requires Kubernetes 1.29+ (GA in 1.30). This cluster reports %s. Set %s.shutdownPreStopSeconds=0 to omit the hook and raise %s.shutdownPreDrainSeconds to at least readiness failureThreshold × periodSeconds so kube-proxy endpoint removal can finish after SIGTERM while /health already reports not-ready." $component $preStop $kube $component $component) -}}
+{{- $sidecarUnsupported := and (not $helmTemplateDefault) (or (lt $major 1) (and (eq $major 1) (lt $minor 29))) -}}
+{{- if $sidecarUnsupported -}}
+{{- $kube := .Capabilities.KubeVersion.Version | default (printf "v%d.%d" $major $minor) -}}
+{{- fail (printf "injector.enabled=true requires Kubernetes 1.29+. The webhook injects Ferrum as a native sidecar (spec.initContainers[].restartPolicy: Always) and there is no ordinary-container fallback; 1.27 and earlier reject that field and 1.28 needs the SidecarContainers feature gate. This cluster reports %s. With injector.failurePolicy=Fail the apiserver would reject every pod CREATE in a selected namespace, so set injector.enabled=false on this cluster (the rest of the chart installs unchanged) or upgrade the cluster to 1.29+" $kube) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -686,6 +773,12 @@ clock. Dict: root, component (string), values (component values).
 {{- end -}}
 {{- if .Values.ambient.enabled -}}
 {{- include "ferrum-mesh.validateShutdown" (dict "root" . "component" "ambient" "values" .Values.ambient) -}}
+{{- end -}}
+{{- if .Values.injector.enabled -}}
+{{- include "ferrum-mesh.validateWebhookShutdown" (dict "root" . "component" "injector" "values" .Values.injector) -}}
+{{- end -}}
+{{- if .Values.nodeAgent.enabled -}}
+{{- include "ferrum-mesh.validateNodeAgentShutdown" (dict "component" "nodeAgent" "values" .Values.nodeAgent) -}}
 {{- end -}}
 {{- end -}}
 

@@ -408,6 +408,109 @@ def validate_zero_drain(results_dir: Path) -> None:
     print("mesh zero-drain render ok")
 
 
+def validate_injector_shutdown(results_dir: Path) -> None:
+    rendered = require_capture(results_dir, "mesh-prod-injector.yaml").read_text(
+        encoding="utf-8"
+    )
+    injector = resource_document(rendered, "ferrum-mesh-injector", "Deployment")
+    require_scalar(
+        injector,
+        "terminationGracePeriodSeconds",
+        "65",
+        "Injector grace period missing",
+        "ferrum-mesh-injector must render terminationGracePeriodSeconds: 65 "
+        "(preStop 30 + drain 30 + 5s process-exit slack); it is a "
+        "failurePolicy=Fail webhook, so a terminating replica rejects pod CREATE",
+    )
+    require_text(
+        injector,
+        "preStop:",
+        "Injector preStop missing",
+        "ferrum-mesh-injector must render lifecycle.preStop (SleepAction) so "
+        "kube-proxy endpoint removal finishes before the listener closes",
+    )
+    prestop = re.search(r"(?ms)^\s+preStop:\s*\n(?:\s+.*\n){0,6}", injector)
+    if prestop is None or "sleep:" not in prestop.group(0):
+        fail(
+            "Injector preStop is not a SleepAction",
+            "distroless has no shell; the injector preStop must use sleep",
+        )
+    if not re.search(r"seconds:\s*30", prestop.group(0)):
+        fail(
+            "Injector preStop seconds missing",
+            "ferrum-mesh-injector must render injector.shutdownPreStopSeconds (30)",
+        )
+    drain = env_value(injector, "FERRUM_SHUTDOWN_DRAIN_SECONDS")
+    if drain != "30":
+        fail(
+            "Injector drain env missing",
+            f"ferrum-mesh-injector must render FERRUM_SHUTDOWN_DRAIN_SECONDS=30, got {drain!r}",
+        )
+    occurrences = env_occurrences(injector, "FERRUM_SHUTDOWN_DRAIN_SECONDS")
+    if occurrences != 1:
+        fail(
+            "Injector drain env duplicated",
+            "FERRUM_SHUTDOWN_DRAIN_SECONDS must render exactly once "
+            f"(got {occurrences}); injector.env overrides are rejected at render",
+        )
+    node_agent = resource_document(rendered, "ferrum-mesh-node-agent", "DaemonSet")
+    require_scalar(
+        node_agent,
+        "terminationGracePeriodSeconds",
+        "30",
+        "Node-agent grace period missing",
+        "ferrum-mesh-node-agent must render terminationGracePeriodSeconds: 30 "
+        "(the Kubernetes default, made explicit and validated)",
+    )
+    forbid_text(
+        node_agent,
+        "preStop:",
+        "Node-agent preStop rendered",
+        "node_agent mode has no drain stage and sits behind no Service; a "
+        "preStop sleep would only delay node drains",
+    )
+    forbid_text(
+        node_agent,
+        "FERRUM_SHUTDOWN_DRAIN_SECONDS",
+        "Node-agent drain env rendered",
+        "node_agent mode never reads FERRUM_SHUTDOWN_DRAIN_SECONDS",
+    )
+    sentinel = require_capture(
+        results_dir, "mesh-prod-injector-no-kube-version.yaml"
+    ).read_text(encoding="utf-8")
+    resource_document(sentinel, "ferrum-mesh-injector", "Deployment")
+    kube = require_capture(
+        results_dir, "mesh-prod-injector-kube-1.27.err"
+    ).read_text(encoding="utf-8")
+    if "1.29" not in kube or "SidecarContainers" not in kube:
+        fail(
+            "Native-sidecar Kubernetes guard missing",
+            "--kube-version 1.27.0 with injector.enabled=true must refuse render "
+            "and name Kubernetes 1.29 plus the 1.28 SidecarContainers feature gate",
+        )
+    if "injector.enabled=false" not in kube:
+        fail(
+            "Native-sidecar remediation missing",
+            "the <1.29 injector guard must name injector.enabled=false as the "
+            "only option on an older cluster (there is no container fallback)",
+        )
+    low = require_capture(
+        results_dir, "mesh-prod-injector-low-grace.err"
+    ).read_text(encoding="utf-8")
+    if "injector.terminationGracePeriodSeconds" not in low:
+        fail(
+            "Injector low-grace refusal missing",
+            "an under-budget injector grace period must fail render and name "
+            "injector.terminationGracePeriodSeconds",
+        )
+    if "preStop 30s" not in low or "drain 30s" not in low:
+        fail(
+            "Injector budget arithmetic missing",
+            "the injector refusal must spell out preStop + drain + process-exit slack",
+        )
+    print("mesh injector/node-agent shutdown ok")
+
+
 def validate_optional_crds_off(results_dir: Path) -> None:
     rendered = require_capture(results_dir, "default-rendered.yaml").read_text(
         encoding="utf-8"
@@ -869,6 +972,7 @@ def main() -> int:
     validate_cni_no_drain(results_dir)
     validate_refusals(results_dir)
     validate_zero_drain(results_dir)
+    validate_injector_shutdown(results_dir)
     validate_optional_crds_off(results_dir)
     validate_observability(results_dir)
     validate_strict_admin_validation(results_dir)

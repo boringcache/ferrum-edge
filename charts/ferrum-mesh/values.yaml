@@ -311,6 +311,25 @@ injector:
       initialDelaySeconds: 5
       periodSeconds: 10
       override: {}
+  # Graceful shutdown (issue #4512). The injector is the one mesh workload whose
+  # loss is fail-closed cluster-wide: with failurePolicy: Fail a /mutate call
+  # that lands on a terminating replica is connection-refused and the apiserver
+  # rejects the pod CREATE in every namespace the namespaceSelector admits.
+  #
+  # The budget is NOT the additive serving budget. FERRUM_MODE=injector runs no
+  # transport-pool/background/audit/observability stages: it waits up to
+  # FERRUM_SHUTDOWN_DRAIN_SECONDS for in-flight admission connections and then
+  # returns. So terminationGracePeriodSeconds must cover
+  # preStop + drain + a small process-exit slack, and render fails below that.
+  #
+  # shutdownPreStopSeconds is readiness periodSeconds (10) x the Kubernetes
+  # default failureThreshold (3) = the endpoint-removal budget, matching
+  # charts/ferrum-gateway/values.yaml. SleepAction preStop requires Kubernetes
+  # 1.29+ -- which the injector already requires for native-sidecar injection,
+  # so there is no older-cluster remediation here beyond injector.enabled=false.
+  shutdownDrainSeconds: 30
+  shutdownPreStopSeconds: 30
+  terminationGracePeriodSeconds: 65
 
 ambient:
   # Requires nodeAgent.enabled=true. Ambient always shares the node-local
@@ -675,6 +694,12 @@ observability:
 
 nodeAgent:
   enabled: false
+  # SIGTERM-to-SIGKILL floor only, and 30 is the Kubernetes default, so this is
+  # behaviour-preserving. There is deliberately no nodeAgent.shutdownDrainSeconds
+  # and no node-agent preStop: node_agent mode never reads
+  # FERRUM_SHUTDOWN_DRAIN_SECONDS, and the DaemonSet sits behind no Service, so a
+  # preStop sleep would delay node drains for no endpoint-propagation benefit.
+  terminationGracePeriodSeconds: 30
   env: {}
   # Empty repository/tag inherit the top-level image repository/tag. When
   # captureMode=ebpf, the template automatically appends "-ebpf" to the

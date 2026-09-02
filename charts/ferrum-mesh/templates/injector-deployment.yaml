@@ -1,5 +1,6 @@
 {{- if .Values.injector.enabled }}
 {{- include "ferrum-mesh.validateInjectorTrust" . -}}
+{{- include "ferrum-mesh.validateInjectorKubeVersion" . -}}
 {{- $injectorCa := .Values.injector.caBundle | toString | trim -}}
 {{- $injectorCm := .Values.injector.certManager | default dict -}}
 {{- $injectorInjectFrom := index $injectorCm "injectCaFrom" | default "" | toString | trim -}}
@@ -32,6 +33,7 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
       serviceAccountName: ferrum-mesh
+      terminationGracePeriodSeconds: {{ .Values.injector.terminationGracePeriodSeconds }}
 {{- include "ferrum-mesh.renderTopologySpreadConstraints" (dict
   "Release" .Release
   "replicas" .Values.injector.replicas
@@ -54,6 +56,7 @@ spec:
             - name: webhook
               containerPort: {{ .Values.injector.listenPort }}
           env:
+{{- include "ferrum-mesh.shutdownEnv" .Values.injector | nindent 12 }}
             - name: FERRUM_INJECTOR_LISTEN_ADDR
               value: "0.0.0.0:{{ .Values.injector.listenPort }}"
             - name: FERRUM_INJECTOR_SIDECAR_IMAGE
@@ -69,6 +72,7 @@ spec:
               value: {{ $value | quote }}
             {{- end }}
           {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.injector.probes "startupHandler" $startupHandler "liveHandler" $liveHandler "readyHandler" $readyHandler) }}
+          {{- include "ferrum-mesh.preStopLifecycle" .Values.injector | nindent 10 }}
           volumeMounts:
             - name: injector-tls
               mountPath: /etc/ferrum/injector/tls

@@ -3174,6 +3174,46 @@ jobs:
             echo "::error title=SleepAction accepted on Kubernetes 1.28::preStop.sleep requires 1.29+ or shutdownPreStopSeconds=0"
             exit 1
           fi
+          # Injector shutdown + native-sidecar kubeVersion floor (#4512/#4534).
+          # The injector is a failurePolicy=Fail webhook, so both its drain
+          # window and its 1.29 floor are cluster-wide fail-closed surfaces.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --kube-version 1.29.0 \
+            --set injector.enabled=true \
+            --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
+            --set injector.tls.secretName=ferrum-mesh-injector-tls \
+            --set nodeAgent.enabled=true \
+            --set ambient.enabled=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-injector.yaml"
+          # No --kube-version at all: the helm-template 1.20 sentinel must not be
+          # mistaken for a real pre-1.29 cluster, or every client-side/GitOps
+          # render of an injector-enabled release would fail.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set injector.enabled=true \
+            --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
+            --set injector.tls.secretName=ferrum-mesh-injector-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-injector-no-kube-version.yaml"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --kube-version 1.27.0 \
+            --set injector.enabled=true \
+            --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
+            --set injector.tls.secretName=ferrum-mesh-injector-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-injector-kube-1.27.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-injector-kube-1.27.err"; then
+            echo "::error title=Native-sidecar injection accepted on Kubernetes 1.27::initContainers[].restartPolicy needs 1.29+ and has no ordinary-container fallback"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --kube-version 1.29.0 \
+            --set injector.enabled=true \
+            --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
+            --set injector.tls.secretName=ferrum-mesh-injector-tls \
+            --set injector.terminationGracePeriodSeconds=40 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-injector-low-grace.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-injector-low-grace.err"; then
+            echo "::error title=Under-budget injector grace accepted::injector.terminationGracePeriodSeconds must cover preStop + drain + process-exit slack"
+            exit 1
+          fi
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             -f ./charts/ferrum-mesh/examples/development-values.yaml \
             --set controlPlane.shutdownDrainSeconds=0 \
