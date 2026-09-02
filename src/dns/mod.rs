@@ -5670,6 +5670,36 @@ mod tests {
             }
         }
 
+        /// Wait until the refresh path actually holds `expected` in-flight
+        /// slots — both the `refreshing` dedup markers and every permit of a
+        /// `max_concurrent_refreshes == expected` semaphore.
+        ///
+        /// Issue #4485: the hanging hook's `started` notification is keyed on
+        /// a cumulative `in_flight` counter bumped from *inside* the resolve
+        /// future, which is neither of the structures the assertions read.
+        /// Candidate eligibility also reads the real `std::time::Instant`
+        /// clock, which `start_paused` does not freeze, so under `llvm-cov`
+        /// instrumentation a near-expiry row can age out of the selection
+        /// window and the counter can instead reach `expected` across two
+        /// successive cycles that each held a single slot. Synchronizing on
+        /// the observed state removes that gap; the bound makes a genuine
+        /// regression fail with the observed values rather than hang.
+        async fn wait_for_refresh_slots(cache: &DnsCache, expected: usize) {
+            for _ in 0..256 {
+                if cache.refreshing.len() == expected
+                    && cache.refresh_semaphore.available_permits() == 0
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!(
+                "timed out waiting for {expected} in-flight refresh slot(s): refreshing={}, available_permits={}",
+                cache.refreshing.len(),
+                cache.refresh_semaphore.available_permits()
+            );
+        }
+
         #[test]
         fn proactive_refresh_selection_is_soonest_expiry_and_capped() {
             let cache = near_expiry_cache(2, 10_000);
@@ -5742,10 +5772,14 @@ mod tests {
             let cache = cache;
 
             for i in 1..=5 {
+                // Seconds, not milliseconds: selection reads the real
+                // `std::time::Instant` clock, which `start_paused` does not
+                // freeze, so a slow instrumented run must not age these rows
+                // out of the near-expiry window before the cycle runs.
                 seed_near_expiry(
                     &cache,
                     &format!("host-{i}.test"),
-                    Duration::from_millis(100 * i as u64),
+                    Duration::from_secs(i as u64),
                     testnet_addr(i),
                 );
             }
@@ -5754,7 +5788,7 @@ mod tests {
                 let cache = cache.clone();
                 async move { cache.run_proactive_refresh_cycle().await }
             });
-            started.notified().await;
+            wait_for_refresh_slots(&cache, 2).await;
             assert!(
                 max_seen.load(Ordering::SeqCst) <= 2,
                 "in-flight resolves must not exceed max_concurrent_refreshes, saw {}",
@@ -5784,23 +5818,27 @@ mod tests {
             );
             let cache = cache;
 
+            // Seconds, not milliseconds: selection reads the real
+            // `std::time::Instant` clock, which `start_paused` does not
+            // freeze, so a slow instrumented run must not age either row out
+            // of the near-expiry window before the first cycle runs.
             seed_near_expiry(
                 &cache,
                 "hang-1.test",
-                Duration::from_millis(100),
+                Duration::from_secs(2),
                 testnet_addr(1),
             );
             seed_near_expiry(
                 &cache,
                 "hang-2.test",
-                Duration::from_millis(200),
+                Duration::from_secs(3),
                 testnet_addr(2),
             );
             assert_eq!(cache.cache_len(), 2);
 
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             let handle = cache.start_background_refresh_with_shutdown(Some(shutdown_rx));
-            started.notified().await;
+            wait_for_refresh_slots(&cache, 2).await;
             assert_eq!(cache.refreshing.len(), 2);
             assert_eq!(cache.refresh_semaphore.available_permits(), 0);
 

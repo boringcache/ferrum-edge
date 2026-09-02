@@ -2065,6 +2065,16 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_k8s_controller_config_publications_total",
+    "type": "counter",
+    "help": "Kubernetes reconciles that committed a changed gateway configuration snapshot.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_k8s_controller_errors_total",
     "type": "counter",
     "help": "Kubernetes translation skips and hard translation failures observed during reconcile.",
@@ -2208,6 +2218,16 @@
     "name": "ferrum_k8s_controller_status_request_timeouts_total",
     "type": "counter",
     "help": "Kubernetes status reads and writes abandoned because they exceeded their wall-clock budget on the serialized reconcile loop.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_k8s_controller_watch_deletes_total",
+    "type": "counter",
+    "help": "Kubernetes watch Delete events observed across every watched scope.",
     "labels": [],
     "subsystem": "k8s_controller",
     "export_surface": "/metrics",

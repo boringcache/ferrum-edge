@@ -361,6 +361,65 @@ plugin_configs:
 // ai_federation incremental streaming (issue #3298)
 // ============================================================================
 
+/// Largest provider request head + body this fixture will read off one socket
+/// before it stops accumulating. Requests in these tests are a few hundred
+/// bytes; the cap only keeps a hostile/looping peer bounded.
+const SSE_PROVIDER_MAX_REQUEST_BYTES: usize = 65536;
+
+/// Read one whole HTTP request (head plus any `Content-Length` body) off
+/// `stream`, or `None` when the peer never delivered one.
+///
+/// Returning `None` is the load-bearing case: an accepted socket that carries
+/// no request head is NOT a provider exchange (issue #4486). A client-side
+/// connection pool may establish a TCP connection it then abandons without
+/// writing anything, and billing that as an upstream AI call is exactly the
+/// mis-measurement the disconnect test was reporting.
+async fn read_provider_request(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+    let mut request: Vec<u8> = Vec::with_capacity(4096);
+    let mut buf = vec![0u8; 16384];
+    let mut head_end: Option<usize> = None;
+    loop {
+        if head_end.is_none()
+            && let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n")
+        {
+            head_end = Some(position + 4);
+        }
+        if let Some(head_end) = head_end {
+            // Only a `Content-Length` body is possible here: the gateway
+            // buffers this request before dispatch, so it never sends a
+            // chunked provider body.
+            let declared = content_length_of(&request[..head_end]).unwrap_or(0);
+            if request.len() - head_end >= declared {
+                break;
+            }
+        }
+        if request.len() >= SSE_PROVIDER_MAX_REQUEST_BYTES {
+            break;
+        }
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => request.extend_from_slice(&buf[..read]),
+        }
+    }
+    // A half-written head is not an exchange either.
+    if head_end.is_some() && request.starts_with(b"POST ") {
+        Some(request)
+    } else {
+        None
+    }
+}
+
+/// `Content-Length` of an ASCII request head, if it declares one.
+fn content_length_of(head: &[u8]) -> Option<usize> {
+    let head = std::str::from_utf8(head).ok()?;
+    head.lines()
+        .find_map(|line| {
+            line.split_once(':')
+                .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        })
+        .and_then(|(_, value)| value.trim().parse().ok())
+}
+
 /// Serve exactly one SSE response, releasing the tail only after the caller
 /// signals that the FIRST event already reached the downstream client.
 ///
@@ -369,24 +428,38 @@ plugin_configs:
 /// hand the first event to the client, the test would never fire `release`, and
 /// the fixture would never write the tail — the assertion fails by deadlock
 /// avoidance (the bounded request timeout), never by a sleep guess.
+///
+/// `hits` counts COMPLETED PROVIDER EXCHANGES — sockets that delivered a whole
+/// `POST` request — never accepted connections. `completed` publishes how many
+/// of those exchanges have been written out and shut down, so a caller can wait
+/// on the fixture's own observable for an abandoned exchange to tear down
+/// instead of guessing at a sleep (issue #4486).
+///
+/// `release` is claimed by the first socket that actually delivers a request,
+/// not by the first socket accepted, so a stray connection cannot consume the
+/// hold that a test's time-to-first-token assertion depends on.
 async fn start_sse_provider_on(
     listener: TcpListener,
     head: &'static str,
     tail: &'static str,
     hits: Arc<AtomicUsize>,
     release: tokio::sync::oneshot::Receiver<()>,
+    completed: tokio::sync::watch::Sender<usize>,
 ) {
-    let mut release = Some(release);
+    let release = Arc::new(tokio::sync::Mutex::new(Some(release)));
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
             continue;
         };
         let hits = Arc::clone(&hits);
-        let release = release.take();
+        let release = Arc::clone(&release);
+        let completed = completed.clone();
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 16384];
-            let _ = stream.read(&mut buf).await.unwrap_or(0);
+            if read_provider_request(&mut stream).await.is_none() {
+                return;
+            }
             hits.fetch_add(1, Ordering::Relaxed);
+            let release = release.lock().await.take();
             let _ = stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
@@ -401,6 +474,7 @@ async fn start_sse_provider_on(
             }
             let _ = stream.write_all(tail.as_bytes()).await;
             let _ = stream.shutdown().await;
+            completed.send_modify(|count| *count += 1);
         });
     }
 }
@@ -460,6 +534,7 @@ async fn test_ai_federation_streams_first_token_before_provider_completes() {
     let provider_port = provider_listener.local_addr().unwrap().port();
     let provider_hits = Arc::new(AtomicUsize::new(0));
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (provider_completed_tx, _provider_completed_rx) = tokio::sync::watch::channel(0usize);
     let provider_task = tokio::spawn(start_sse_provider_on(
         provider_listener,
         "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"He\"}}]}\n\n",
@@ -470,6 +545,7 @@ async fn test_ai_federation_streams_first_token_before_provider_completes() {
         ),
         Arc::clone(&provider_hits),
         release_rx,
+        provider_completed_tx,
     ));
 
     let gateway = TestGateway::builder()
@@ -581,6 +657,7 @@ async fn test_ai_federation_truncated_provider_stream_fails_closed_without_splic
     let provider_port = provider_listener.local_addr().unwrap().port();
     let provider_hits = Arc::new(AtomicUsize::new(0));
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (provider_completed_tx, _provider_completed_rx) = tokio::sync::watch::channel(0usize);
     // Head only: the provider closes without ever sending `data: [DONE]`.
     let provider_task = tokio::spawn(start_sse_provider_on(
         provider_listener,
@@ -588,6 +665,7 @@ async fn test_ai_federation_truncated_provider_stream_fails_closed_without_splic
         "",
         Arc::clone(&provider_hits),
         release_rx,
+        provider_completed_tx,
     ));
 
     let gateway = TestGateway::builder()
@@ -677,14 +755,18 @@ async fn test_ai_federation_client_disconnect_cancels_without_wedging_the_route(
     let provider_port = provider_listener.local_addr().unwrap().port();
     let provider_hits = Arc::new(AtomicUsize::new(0));
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    // Only the FIRST provider connection waits for the release; every later one
-    // writes head and tail immediately.
+    // Counts COMPLETED provider exchanges that have been fully torn down, so
+    // the hit assertion below waits on the fixture rather than on a sleep.
+    let (provider_completed_tx, mut provider_completed_rx) = tokio::sync::watch::channel(0usize);
+    // Only the FIRST provider connection that actually delivers a request waits
+    // for the release; every later one writes head and tail immediately.
     let provider_task = tokio::spawn(start_sse_provider_on(
         provider_listener,
         "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"He\"}}]}\n\n",
         "data: [DONE]\n\n",
         Arc::clone(&provider_hits),
         release_rx,
+        provider_completed_tx,
     ));
 
     let gateway = TestGateway::builder()
@@ -761,6 +843,21 @@ async fn test_ai_federation_client_disconnect_cancels_without_wedging_the_route(
     );
     assert!(!text.contains("event: error"), "clean follow-up: {text}");
     assert!(!text.contains("test-key"), "credential leaked: {text}");
+
+    // Read the count only once the mock says BOTH exchanges — the abandoned one
+    // and the follow-up — are written out and shut down. Waiting on the
+    // fixture's own observable keeps this behavior-driven; a sleep would just
+    // move the race (issue #4486).
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while *provider_completed_rx.borrow_and_update() < 2 {
+            provider_completed_rx
+                .changed()
+                .await
+                .expect("the provider fixture outlives the assertion");
+        }
+    })
+    .await
+    .expect("both provider exchanges must tear down");
 
     assert_eq!(
         provider_hits.load(Ordering::Relaxed),

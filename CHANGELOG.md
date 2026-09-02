@@ -175,6 +175,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A withdrawn Kubernetes object that keeps being served is now attributable**
+  (issue #4491). The Gateway API TLSRoute black-box lab could report only the
+  symptom (`deleted TLSRoute kept serving TLS echo on :9014`), which is two
+  unrelated faults wearing one message: a watch that stopped delivering without
+  failing, so the controller never observed the withdrawal, or a controller that
+  observed it, reconciled, and published while the data plane kept the listener.
+  `Reconciliation complete` is logged only when a reconcile actually swaps
+  configuration, so logs cannot separate them. Two unlabeled `/metrics` counters
+  now can: `ferrum_k8s_controller_watch_deletes_total` (watch `Delete` events
+  observed across every scope) and `ferrum_k8s_controller_config_publications_total`
+  (reconciles that committed a changed snapshot, as distinct from
+  `ferrum_k8s_controller_reconciliations_total`, which counts passes started).
+  The lab reads both across the deletion and names the fault in its failure
+  message; the data-plane assertion itself is unchanged, and nothing was muted,
+  retried, or given a longer wait.
+
+- **TLS material watchers no longer run an unrequested reload pass at
+  readiness** (issue #4488). `tokio::time::interval` completes its first tick
+  immediately, so both material-set reload loops re-loaded and re-fingerprinted
+  every configured TLS source the instant after they announced readiness —
+  duplicating the startup fingerprint they had just computed, and racing that
+  extra pass against whatever the caller did next. On a source rewritten
+  non-atomically that pass could observe an intermediate file and publish a
+  revision for a rotation nobody requested. Both loops now consume the immediate
+  tick before signalling readiness, which makes the documented readiness
+  contract true and leaves the polling cadence unchanged (the next tick still
+  fires one interval after the ticker is created). Watcher startup only; no
+  proxy hot-path effect.
+
 - **BREAKING — backend mTLS handshake without a client certificate is
   pre-wire, not `connection_reset`** (issue #4406). An HTTPS origin that
   requires a client certificate previously classified as post-wire

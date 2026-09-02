@@ -1043,7 +1043,10 @@ reconciliation under contention from (b) a watch that stopped delivering.
   authenticated `/metrics` (reconciliations, full_syncs, errors, last
   reconcile duration, watch_idle_relists, route-status publication latency,
   and the issue #4239 status budget counters `status_request_timeouts_total` /
-  `status_batch_timeouts_total`).
+  `status_batch_timeouts_total`). For a "deleted object kept serving" failure,
+  `watch_deletes_total` and `config_publications_total` are the issue #4491
+  pair: neither advancing across the deletion means the withdrawal was never
+  observed; both advancing rules the control plane out.
 - `status-budget-warnings.txt`: every controller line about a status operation
   that exceeded its budget or a batch that held the reconcile loop. A reconcile
   whose `elapsed_ms` dwarfs its neighbours next to one of these lines is the

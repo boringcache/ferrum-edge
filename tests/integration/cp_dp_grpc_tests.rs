@@ -6034,31 +6034,110 @@ async fn native_stream_permits_release_on_normal_close_and_transport_reset() {
     assert_eq!(harness.admission.tracked_principals(), 0);
 }
 
+/// The server maximum stream lifetime used by the terminal-release test.
+///
+/// Only one of the two authorization terminals can be made short here. The
+/// authorization lease deadline is derived from the bearer token's `exp`
+/// (`DP_JWT_TTL_SECONDS`, 3540s) plus the mandatory 60s verification leeway, so
+/// a stream minted by the ordinary DP/mesh token helpers cannot reach
+/// `StreamAuthEndReason::Expired` inside a test. The bound this test measures
+/// is therefore the server maximum lifetime, and the lease sits roughly an hour
+/// above it — the wide separation issue #4490 asked for, in the only direction
+/// the two bounds can actually be separated.
+///
+/// The flake in #4490 was consequently not lease-versus-lifetime but
+/// terminal-versus-establishment: at 150ms the bound could elapse before the
+/// initial snapshot reached the client under `cargo llvm-cov`, so the *first*
+/// `message()` returned the terminal `Status` and its `unwrap()` panicked. Three
+/// seconds keeps the test fast while leaving a twenty-fold margin over the
+/// establishment cost that lost that race.
+const NATIVE_STREAM_MAX_LIFETIME: Duration = Duration::from_secs(3);
+
+/// The `UNAUTHENTICATED` message produced by `StreamAuthEndReason::Expired`.
+const AUTHORIZATION_LEASE_TERMINAL: &str = "Stream authorization expired";
+
+/// The `UNAUTHENTICATED` message produced by
+/// `StreamAuthEndReason::ServerMaxLifetime`.
+const SERVER_MAX_LIFETIME_TERMINAL: &str = "Authenticated stream reached server maximum lifetime";
+
+/// Unwrap a native stream's initial snapshot, naming the bound that fired when
+/// a terminal `Status` beat establishment instead (issue #4490).
+fn expect_initial_snapshot<T>(
+    surface: &str,
+    message: Result<Option<T>, tonic::Status>,
+) -> Option<T> {
+    match message {
+        Ok(message) => message,
+        Err(status) => panic!(
+            "{surface} should deliver its initial snapshot before any stream bound fires; \
+             the stream instead terminated with {:?}: {} ({})",
+            status.code(),
+            status.message(),
+            name_stream_terminal(&status),
+        ),
+    }
+}
+
+/// Assert a native stream ended on the specific bound under test. Both
+/// authorization terminals are `UNAUTHENTICATED`, so a code-only assertion
+/// cannot tell them apart and a bound race reads as a pass.
+fn assert_stream_terminal(surface: &str, status: &tonic::Status, expected: &str) {
+    assert_eq!(
+        status.code(),
+        tonic::Code::Unauthenticated,
+        "{surface} should end UNAUTHENTICATED on {expected:?}, got {:?}: {}",
+        status.code(),
+        status.message()
+    );
+    assert_eq!(
+        status.message(),
+        expected,
+        "{surface} ended on the wrong bound: expected {expected:?}, got {} ({})",
+        status.message(),
+        name_stream_terminal(status)
+    );
+}
+
+/// Human-readable name for whichever authorization bound produced `status`.
+fn name_stream_terminal(status: &tonic::Status) -> &'static str {
+    match status.message() {
+        AUTHORIZATION_LEASE_TERMINAL => "the token-derived authorization lease",
+        SERVER_MAX_LIFETIME_TERMINAL => "the server maximum stream lifetime",
+        _ => "an unrelated terminal",
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn native_stream_permits_release_on_authorization_lease_expiry() {
+async fn native_stream_permits_release_on_server_max_lifetime() {
     let harness = start_native_admission_harness(
         ferrum_edge::grpc::admission::CpGrpcAdmissionLimits::default(),
-        Duration::from_millis(150),
+        NATIVE_STREAM_MAX_LIFETIME,
     )
     .await;
 
     let mut config_stream = open_configsync_stream(harness.addr, "config-expiry").await;
-    assert!(config_stream.message().await.unwrap().is_some());
-    let config_status = timeout(Duration::from_secs(5), config_stream.message())
-        .await
-        .expect("ConfigSync authorization lease should expire")
-        .expect_err("ConfigSync expiry should be terminal");
-    assert_eq!(config_status.code(), tonic::Code::Unauthenticated);
+    assert!(expect_initial_snapshot("ConfigSync", config_stream.message().await).is_some());
+    let config_status = timeout(
+        NATIVE_STREAM_MAX_LIFETIME + Duration::from_secs(20),
+        config_stream.message(),
+    )
+    .await
+    .expect("ConfigSync should reach the server maximum stream lifetime")
+    .expect_err("the ConfigSync lifetime bound should be terminal");
+    assert_stream_terminal("ConfigSync", &config_status, SERVER_MAX_LIFETIME_TERMINAL);
     drop(config_stream);
     wait_for_shared_active_streams(&harness.admission, 0).await;
 
     let mut mesh_stream = open_mesh_subscribe_stream(harness.addr, "mesh-expiry").await;
-    assert!(mesh_stream.message().await.unwrap().is_some());
-    let mesh_status = timeout(Duration::from_secs(5), mesh_stream.message())
-        .await
-        .expect("MeshSubscribe authorization lease should expire")
-        .expect_err("MeshSubscribe expiry should be terminal");
-    assert_eq!(mesh_status.code(), tonic::Code::Unauthenticated);
+    assert!(expect_initial_snapshot("MeshSubscribe", mesh_stream.message().await).is_some());
+    let mesh_status = timeout(
+        NATIVE_STREAM_MAX_LIFETIME + Duration::from_secs(20),
+        mesh_stream.message(),
+    )
+    .await
+    .expect("MeshSubscribe should reach the server maximum stream lifetime")
+    .expect_err("the MeshSubscribe lifetime bound should be terminal");
+    assert_stream_terminal("MeshSubscribe", &mesh_status, SERVER_MAX_LIFETIME_TERMINAL);
     drop(mesh_stream);
     wait_for_shared_active_streams(&harness.admission, 0).await;
     assert_eq!(harness.admission.active_nodes(), 0);
