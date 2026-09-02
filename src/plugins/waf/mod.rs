@@ -553,20 +553,16 @@ impl Waf {
             return true;
         }
         if let Some((_, suffix)) = base.rsplit_once('+') {
-            match suffix {
-                "json" => {
-                    if self.content_type_allowed("application/json") {
-                        return true;
-                    }
-                }
+            let family_allowed = match suffix {
+                "json" => self.content_type_allowed("application/json"),
                 "xml" => {
-                    if self.content_type_allowed("application/xml")
+                    self.content_type_allowed("application/xml")
                         || self.content_type_allowed("text/xml")
-                    {
-                        return true;
-                    }
                 }
-                _ => {}
+                _ => false,
+            };
+            if family_allowed {
+                return true;
             }
         }
         self.config.inspect_binary_body
