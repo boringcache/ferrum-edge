@@ -16,6 +16,8 @@ const MULTICLUSTER_RUNBOOK: &str =
 const SCRIPTED_BACKEND_PLAN: &str =
     include_str!("../../../docs/plans/test_framework_scripted_backends.md");
 const PLUGINS_DOC: &str = include_str!("../../../docs/plugins.md");
+const FEATURES: &str = include_str!("../../../FEATURES.md");
+const RATE_LIMITING_SRC: &str = include_str!("../../../src/plugins/rate_limiting.rs");
 
 #[test]
 fn production_readiness_does_not_track_completed_epic_rows_as_open() {
@@ -314,5 +316,70 @@ fn plugins_doc_documents_credential_storage_at_rest() {
     assert!(
         PLUGINS_DOC.contains("stored recoverable"),
         "plugins doc must state that keyauth/jwt/hmac_auth secrets are stored recoverable"
+    );
+}
+
+#[test]
+fn features_plugin_cache_bullet_does_not_claim_configurable_rate_limit_entries() {
+    assert!(
+        !FEATURES.contains("and rate limiting plugins all have configurable"),
+        "FEATURES.md must not claim the rate-limiting plugins take a configurable max_entries; \
+         RATE_LIMITING_CONFIG_KEYS is a closed key set and rejects it as unknown"
+    );
+    assert!(
+        FEATURES.contains("hardcoded entry ceilings"),
+        "FEATURES.md must state that the rate-limiting family uses hardcoded entry ceilings, \
+         matching docs/cache_management.md"
+    );
+}
+
+#[test]
+fn features_secret_timeout_envelope_covers_file_backends() {
+    assert!(
+        !FEATURES.contains("File-based secrets have no timeout"),
+        "FEATURES.md must not claim _FILE secrets are untimed; SecretBackend::resolve_many wraps \
+         every backend, including FileBackend, in the same timeout"
+    );
+    assert!(
+        FEATURES.contains("FERRUM_SECRET_FETCH_TIMEOUT_SECONDS"),
+        "FEATURES.md must name the per-fetch secret timeout knob"
+    );
+}
+
+#[test]
+fn features_ai_federation_records_the_opt_in_streaming_block() {
+    assert!(
+        !FEATURES.contains("provider response streaming are not supported"),
+        "FEATURES.md must not claim AI Federation cannot stream provider responses; the plugin \
+         has an opt-in `streaming` root config block"
+    );
+    assert!(
+        FEATURES.contains("The opt-in `streaming` block (disabled by default)"),
+        "FEATURES.md must describe the AI Federation opt-in streaming block and its default"
+    );
+}
+
+#[test]
+fn features_cli_section_counts_every_shipped_subcommand() {
+    assert!(
+        !FEATURES.contains("Five subcommands"),
+        "FEATURES.md must not undercount the CLI; src/cli.rs Command has six variants"
+    );
+    assert!(
+        FEATURES.contains("Six subcommands"),
+        "FEATURES.md CLI section must say six subcommands"
+    );
+    assert!(
+        FEATURES.contains("ambient-udp-preflight"),
+        "FEATURES.md CLI section must list the ambient-udp-preflight subcommand"
+    );
+}
+
+#[test]
+fn rate_limiting_plugin_still_has_no_configurable_max_entries_key() {
+    assert!(
+        !RATE_LIMITING_SRC.contains("\"max_entries\""),
+        "if rate_limiting ever gains a real `max_entries` config key, FEATURES.md's plugin-cache \
+         bullet and docs/cache_management.md's rate-limiting paragraph must be updated together"
     );
 }
