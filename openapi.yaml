@@ -16228,7 +16228,27 @@ components:
         - forced_full_reloads_total
         - recoveries_total
         - last_resource_category
+        - config_source_connected
+        - poll_failures_by_reason
       properties:
+        config_source_connected:
+          type: boolean
+          description: |
+            Whether the configuration source (the database in `database` mode,
+            the control plane's backing database in `cp` mode) is currently
+            reachable and usable. The same shared flag `/health` reports as
+            `database.available` and the admin API uses to gate writes, and the
+            source of the `ferrum_database_config_source_connected` gauge.
+        poll_failures_by_reason:
+          type: object
+          description: |
+            Poll failures keyed by the closed reason set `connectivity`,
+            `validation_rejected`, `migration_gate`. Every reason is always
+            present. Reasons are compile-time labels, never derived from a
+            backend error string.
+          additionalProperties:
+            type: integer
+            format: int64
         rejected_deltas_total:
           type: integer
           format: int64

@@ -3017,8 +3017,14 @@ pub async fn run(
     // Poll freshness + bounded rejection metrics (CP registers the same type as
     // database mode so authenticated `/health` and `/metrics` can expose
     // `last_poll_completed_at` — issue #2986).
-    let database_delta_poll_metrics =
-        Arc::new(crate::modes::database::DatabaseDeltaPollMetrics::default());
+    // Share the live `db_available` flag so
+    // `ferrum_database_config_source_connected` is the same atomic the admin
+    // API reports, not a second copy that can drift (issue #4528).
+    let database_delta_poll_metrics = Arc::new(
+        crate::modes::database::DatabaseDeltaPollMetrics::with_config_source_flag(
+            db_available.clone(),
+        ),
+    );
     crate::plugins::prometheus_metrics::global_registry()
         .set_database_delta_poll_metrics(database_delta_poll_metrics.clone());
     let database_delta_poll_metrics_for_poll = database_delta_poll_metrics.clone();
@@ -3233,12 +3239,18 @@ pub async fn run(
                                         "full reload after DB DNS reconnect",
                                     )
                                     .await;
+                                    database_delta_poll_metrics_for_poll.record_poll_failure(
+                                        crate::modes::database::DatabasePollFailureReason::ValidationRejected,
+                                    );
                                 } else {
                                     error!(
                                         "Authoritative primary full config reload failed after DB DNS reconnect; keeping existing config and retrying: {}",
                                         e
                                     );
-                                    db_available_poll.store(false, Ordering::Relaxed);
+                                    database_delta_poll_metrics_for_poll
+                                        .record_config_source_unavailable(
+                                            crate::modes::database::DatabasePollFailureReason::Connectivity,
+                                        );
                                 }
                                 database_delta_poll_metrics_for_poll.record_poll_completed();
                                 continue;
@@ -3450,6 +3462,9 @@ pub async fn run(
                                             "incremental validation",
                                         )
                                         .await;
+                                        database_delta_poll_metrics_for_poll.record_poll_failure(
+                                            crate::modes::database::DatabasePollFailureReason::ValidationRejected,
+                                        );
                                     }
                                     if decision.should_escalate {
                                         error!(
@@ -3515,6 +3530,9 @@ pub async fn run(
                                                         "rejected-delta escalation full reload",
                                                     )
                                                     .await;
+                                                    database_delta_poll_metrics_for_poll.record_poll_failure(
+                                                        crate::modes::database::DatabasePollFailureReason::ValidationRejected,
+                                                    );
                                                 } else {
                                                     warn!(
                                                         "Authoritative full reload failed after repeated CP delta rejection; keeping the last accepted cursors and cached config: {}",
@@ -3675,6 +3693,9 @@ pub async fn run(
                                                 "full fallback reload",
                                             )
                                             .await;
+                                            database_delta_poll_metrics_for_poll.record_poll_failure(
+                                                crate::modes::database::DatabasePollFailureReason::ValidationRejected,
+                                            );
                                             database_delta_poll_metrics_for_poll.record_poll_completed();
                                             continue;
                                         }
@@ -3763,8 +3784,14 @@ pub async fn run(
                                                                 "failover full reload",
                                                             )
                                                             .await;
+                                                            database_delta_poll_metrics_for_poll.record_poll_failure(
+                                                                crate::modes::database::DatabasePollFailureReason::ValidationRejected,
+                                                            );
                                                         } else {
-                                                            db_available_poll.store(false, Ordering::Relaxed);
+                                                            database_delta_poll_metrics_for_poll
+                                                                .record_config_source_unavailable(
+                                                                    crate::modes::database::DatabasePollFailureReason::Connectivity,
+                                                                );
                                                             warn!(
                                                                 "Authoritative primary failover reload also failed (serving cached): {}",
                                                                 e3
@@ -3774,7 +3801,10 @@ pub async fn run(
                                                 }
                                             }
                                             Err(_) => {
-                                                db_available_poll.store(false, Ordering::Relaxed);
+                                                database_delta_poll_metrics_for_poll
+                                                    .record_config_source_unavailable(
+                                                        crate::modes::database::DatabasePollFailureReason::Connectivity,
+                                                    );
                                                 warn!(
                                                     "Authoritative primary full config reload also failed (serving cached): {}",
                                                     e2

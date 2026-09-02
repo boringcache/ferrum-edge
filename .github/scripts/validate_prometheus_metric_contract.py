@@ -367,9 +367,16 @@ def validate_bundled(root: Path, items: list[dict]) -> None:
     # not a case to skip: reading unconditionally keeps deletion loud.
     alert_text = "\n".join(path.read_text(encoding="utf-8") for path in alert_paths)
     dash_text = ""
-    dash_dir = root / "charts" / "ferrum-mesh" / "dashboards"
-    for path in sorted(dash_dir.glob("*.json")):
-        dash_text += path.read_text(encoding="utf-8")
+    # Both charts ship dashboards, so both directories are scanned: a family
+    # referenced only by the core-gateway dashboard is still contract-checked
+    # (issue #4547).
+    dash_dirs = [
+        root / "charts" / "ferrum-mesh" / "dashboards",
+        root / "charts" / "ferrum-gateway" / "dashboards",
+    ]
+    for dash_dir in dash_dirs:
+        for path in sorted(dash_dir.glob("*.json")):
+            dash_text += path.read_text(encoding="utf-8")
 
     alert_names = ferrum_names(alert_text, by_name)
     dash_names = ferrum_names(dash_text, by_name)
