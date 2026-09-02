@@ -1513,10 +1513,14 @@ async fn h3_native_pool_synthesizes_host_from_upstream_target_not_proxy_backend_
         .find(|(k, _)| k.eq_ignore_ascii_case("host"))
         .map(|(_, v)| v.as_str())
         .expect("backend must have received a Host header");
+    // Issue #4539: the synthesized Host carries the selected target's FULL
+    // authority; the scripted backend listens on a non-default port, so the
+    // port is appended (a 443 backend would render the bare host).
+    let expected_host = format!("127.0.0.1:{backend_port}");
     assert_eq!(
-        host, "127.0.0.1",
+        host, expected_host,
         "preserve_host_header=false on upstream-backed H3 native-pool dispatch: \
-         synthesized Host MUST equal SELECTED upstream-target host (127.0.0.1), \
+         synthesized Host MUST equal SELECTED upstream-target authority (127.0.0.1:<port>), \
          NOT the proxy's template `backend_host` (\"localhost\"). \
          Without the Codex P1 fix on PR #492, this assertion fails — the H3 \
          connection lands at 127.0.0.1 while the Host header points at the \
