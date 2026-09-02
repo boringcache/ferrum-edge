@@ -2845,8 +2845,6 @@ relaxing the scan, the trusted policy admits exact retired→adopted pairs
 | `ebpf-live` | `b7596b48641c850f797c84710dd5646013414d6ba01c30f4d4b2805737c8c26c` | `9aa3332bff5c4538f797f31133be0ef7dfc9767a72e7212b39be33ed58dcca87` | PR #3915 / issue #3900 |
 | `netns-capture-live` | `db543d5c35bfbd4a7b987a52635b359ea6268669257cd313146324f5ca79f598` | `b71296ba5929c78cd786301cc8ed677905cca82cd605be46880021b88c243e32` | PR #3915 / issue #3900 |
 | `two-cluster-mesh-live` | `0586ab0b5b8b803f2ee3663b608c40caca06f9c92e58d4cb28c2080d68f23f27` | `9c3d5b4dfbc6a209e801a47bceabd31fe8aa7df033d49989ad8f88a3e4ed73e7` | PR #3915 / issue #3900 |
-| `build-binaries` | `14b0890e2693cd0825fcf25ba7f48810b5ae9a33f2cbb5751bdaaf60186b83b1` | `6561ef8614337be946f0a68d8f1f3ef94c2897c5acd266157c15b4d90fdc3240` | PR #4355 / issue #4301 |
-| `build-release-binaries` (`release.yml`) | `678699fb04a2319c5b7b706c8fdf05f0d4b58a30d07e023091499d27a88bbb9f` | `55489ade23f4e15fe047bca88fc18b4a1bd9e000605e99263715df630434b591` | PR #4355 / issue #4301 |
 
 The three `#3915` pairs admit the per-suite planner-gate split (the union
 `run_ebpf_live` output becomes `run_ebpf_kernel_live` /
@@ -2860,32 +2858,14 @@ PR #3916's `build-binaries` pair is retired: its destination is main's live
 value, so the tuple admitted a transition between two states `main` is not in
 and only widened what a pull request could claim.
 
-The two #4355 pairs are the published GNU runtime-floor repair (issue #4301).
-`release.yml` has no separate table: `compare_pr_workflow_job` consults
-`CI_JOB_GENERATION_TRANSITIONS` for both protected workflows, and the binding
-includes the job name, so a `release.yml` job is admitted here by name. Each
-pair moves the ONE matrix cell that produces
-`binary-x86_64-unknown-linux-gnu` / `release-binaries-x86_64-unknown-linux-gnu`
-from a native `ubuntu-latest` `cargo build` — whose moving glibc defined the
-published runtime floor — to the digest-pinned AlmaLinux 8.10 sysroot builder,
-and adds an ABI/oldest-baseline gate over the staged, checksummed assets the
-job is about to upload. No `needs` edge, artifact name, publishing job, or
-other matrix cell moves.
-
-Withholding a digest surface is not enough on its own, so the destination is
-additionally held to `linux_gnu_producer_contract_errors`, an absolute check
-on the proposed revision. Once the repository references
-`.github/scripts/build_linux_gnu_sysroot.sh`, that check requires the producer
-job to run the pinned builder under
-`matrix.target == 'x86_64-unknown-linux-gnu'`, to exclude that target from
-every publishing native compile, to ABI-scan and smoke
-`release-assets/ferrum-{edge,cni}-linux-x86_64` before `Upload artifacts`,
-never to hand the scanner a `target/x86_64-unknown-linux-gnu/...` build-tree
-path, and to be the only job that uploads the canonical artifact name. A
-revision that predates the builder is unaffected, so the trusted-policy
-predecessor can land before the workflow change. Returning either producer to
-its retired native text is refused outright by
-`ci_job_generation_transition_errors`, which is what makes the move one-way.
+PR #4355's `build-binaries` / `build-release-binaries` pairs (issue #4301) are
+retired for the same reason, and more strongly: both destinations landed on
+`main`, and the issue #4423 predecessor has since moved both jobs again on
+`main` directly, so neither end of either pair is a state `main` is in.
+Keeping them would only widen what a pull request may claim. Both producers
+are held to `main`'s own text by the ordinary whole-job surface comparison,
+and absolutely by `linux_gnu_producer_contract_errors` — see the standing
+contract below.
 
 Each digest is the SHA-256 of `extract_job_block` text. Both ends are exact, the
 binding includes the job name, the move is one-way, and only that job's
@@ -2908,6 +2888,81 @@ predecessor; if hosted Cross disagrees after a latest-`main` merge, they need
 their own exact pair rather than a wildcard. Coverage planning (`#3917`) is
 admitted, but in the workflow-directory table below because `coverage.yml` is
 not a protected workflow.
+
+##### Published x86_64 GNU producer contract (standing)
+
+`linux_gnu_producer_contract_errors` is an ABSOLUTE check on the proposed
+revision, not a comparison against the trusted base, and it is permanent
+rather than a transition admission. It binds as soon as the repository
+references `.github/scripts/build_linux_gnu_sysroot.sh`, so a revision that
+predates the builder is unaffected and the trusted-policy predecessor could
+land before the workflow change.
+
+For each of the two producers — `build-binaries` in `ci.yml` and
+`build-release-binaries` in `release.yml` (`release.yml` has no separate table
+or contract of its own: the binding includes the job name, so a `release.yml`
+job is named here directly) — the check requires the job to:
+
+- run the pinned sysroot builder exactly once, under
+  `matrix.target == 'x86_64-unknown-linux-gnu'`;
+- exclude that target from every publishing native compile;
+- ABI-scan and smoke `release-assets/ferrum-{edge,cni}-linux-x86_64` before
+  `Upload artifacts`;
+- never hand the scanner a `target/x86_64-unknown-linux-gnu/...` build-tree
+  path;
+- be the only job that uploads the canonical artifact name;
+- pin the sysroot image, the protoc archive digest, and both baseline smoke
+  images in its job-level `env:`, to the literals the trusted policy hardcodes
+  (issue #4423 — see "GNU sysroot identity pins" below);
+- set `persist-credentials: false` on its `actions/checkout` step (issue
+  #4423): the job bind-mounts the whole workspace read-write into a root
+  container that installs packages and runs every dependency's `build.rs`, so
+  the checkout must not leave `http.https://github.com/.extraheader` in
+  `.git/config`.
+
+##### GNU sysroot identity pins (issue #4423)
+
+`.github/linux-gnu-abi.toml` names the container image that compiles the
+published x86_64 GNU binaries and the protoc archive that image executes as
+`build.rs`'s code generator. That file is pull-request-editable, and
+`verify_linux_gnu_abi.py` — which reads it — runs from the pull request's own
+checkout. Before issue #4423 the only constraint on the image reference was
+that *some* `@sha256:` digest was present, and the only constraint on
+`protoc_url` was that its archive hashed to the 64-character hex string the
+same pull request supplied. A merged change to
+`image = "ghcr.io/<attacker>/almalinux@sha256:…"` would have produced the
+released `ferrum-edge-linux-x86_64` / `ferrum-cni-linux-x86_64` bytes, their
+`.sha256` sidecars, the moving `latest` prerelease, and the default container
+images, with every gate green.
+
+The identity now lives in the trusted base, in two places that must agree:
+
+1. Each producer job pins `LINUX_GNU_SYSROOT_IMAGE`,
+   `LINUX_GNU_PROTOC_SHA256`, `LINUX_GNU_SMOKE_FLOOR_IMAGE`, and
+   `LINUX_GNU_SMOKE_UBUNTU2204_IMAGE` in its own job-level `env:`.
+   `build_linux_gnu_sysroot.sh` and `smoke_linux_gnu_baseline.sh` already
+   refuse to run when those disagree with the TOML, so a pull request that
+   edits the contract file alone breaks the build. The literals themselves are
+   held to the trusted constants by `linux_gnu_producer_contract_errors`, an
+   absolute check — so a pull request that moves the TOML **and** the matching
+   `env:` pin together is refused on the `env:` half.
+2. `linux_gnu_contract_pin_errors` re-validates `.github/linux-gnu-abi.toml`
+   itself against the same constants. It reads the file through
+   `--linux-gnu-contract`, whose default resolves inside the
+   `cross-build-policy.yml` checkout — the pinned trusted base — because
+   asking the contract file to certify itself from the pull request's tree is
+   the defect being closed. The build image, both baseline smoke images, and
+   the protoc archive digest are compared for exact equality (an unqualified
+   Docker Hub reference, so equality also refuses a registry-host prefix and a
+   renamed repository), and `protoc_url` must start with
+   `https://github.com/protocolbuffers/protobuf/releases/download/`.
+
+A deliberate image or protoc bump is consequently a direct-to-`main`
+predecessor: the constants in `verify_cross_build_policy.py`, the two producer
+`env:` blocks, and the TOML all move in one commit. The policy's `--self-test`
+drives both halves with fixtures: a producer missing the pins or the
+credential-free checkout, and a contract file with a substituted digest,
+registry, repository, protoc host, or smoke image.
 
 ##### Admitted workflow-directory job SHA-256 generation transitions (temporary)
 
