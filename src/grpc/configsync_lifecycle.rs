@@ -900,6 +900,15 @@ impl Default for MultiCpBackoffState {
 pub enum ConfigSyncAttemptOutcome {
     /// Transport/RPC failure before this attempt accepted any config.
     ConnectionError,
+    /// The CP answered the Subscribe RPC with `RESOURCE_EXHAUSTED`: a CP gRPC
+    /// stream admission budget (total / per-namespace / per-principal /
+    /// per-node / distinct-node) is saturated (issue #4531).
+    ///
+    /// Failover and backoff are identical to [`Self::ConnectionError`] — a
+    /// refused DP must keep rotating and retrying — but the two are separate
+    /// outcomes because a refusal is *proof the CP is alive and answering*,
+    /// so the caller must not latch the DP's stale-config authority loss on it.
+    AdmissionRefused,
     /// Transport/RPC failure after this attempt already accepted config.
     /// Counts as healthy progress for backoff reset while still reconnecting.
     ConnectionErrorAfterConfig,
@@ -953,6 +962,7 @@ pub fn advance_multi_cp_backoff(
             true
         }
         ConfigSyncAttemptOutcome::ConnectionError
+        | ConfigSyncAttemptOutcome::AdmissionRefused
         | ConfigSyncAttemptOutcome::CleanCloseWithoutConfig
         | ConfigSyncAttemptOutcome::StaleSnapshotFenced
         | ConfigSyncAttemptOutcome::InvalidSubscriptionBase

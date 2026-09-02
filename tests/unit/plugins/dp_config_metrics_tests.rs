@@ -17,7 +17,8 @@ use ferrum_edge::plugins::prometheus_metrics::{
 
 const PROMETHEUS_METRICS_SRC: &str = include_str!("../../../src/plugins/prometheus_metrics.rs");
 
-const FAMILIES: [&str; 9] = [
+const FAMILIES: [&str; 10] = [
+    "ferrum_dp_cp_admission_refused_total",
     "ferrum_dp_config_snapshot_age_seconds",
     "ferrum_dp_config_max_stale_seconds",
     "ferrum_dp_config_stale",

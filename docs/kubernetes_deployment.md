@@ -922,6 +922,59 @@ spec:
           port: 50051
 ```
 
+### CP configuration-stream budgets (size them per workload)
+
+`ConfigSync.Subscribe`, `MeshConfigSync.MeshSubscribe`, and both ADS methods
+draw from one layered CP admission controller. **The sizing unit is one stream
+per DP *or per mesh workload***: every injected sidecar and every ambient node
+proxy holds one `MeshSubscribe` stream for its whole life, so on a mesh install
+these budgets count pods, not control-plane clients.
+
+| Budget | Env var | Default |
+|---|---|---|
+| Total streams per CP process | `FERRUM_XDS_MAX_TOTAL_STREAMS` | `8192` |
+| Streams per namespace/tenant | `FERRUM_XDS_MAX_STREAMS_PER_NAMESPACE` | `4096` |
+| Streams per authenticated principal (JWT `sub`) | `FERRUM_XDS_MAX_STREAMS_PER_PRINCIPAL` | `2048` |
+| Streams per node state key | `FERRUM_XDS_MAX_STREAMS_PER_NODE` | `4` |
+| Distinct active node state keys | `FERRUM_XDS_MAX_ACTIVE_NODES` | `16384` |
+
+Size each at **≥ fleet ÷ CP replicas**, with headroom for reconnect overlap: a
+rolling update surges new pods that take new streams while the pods they replace
+still hold theirs. Two shapes deserve explicit attention:
+
+- **Shared ServiceAccount.** Native mesh subscribers must present
+  `node_id == JWT sub`, so every workload projecting the same ServiceAccount
+  token presents ONE principal to the CP. `FERRUM_XDS_MAX_STREAMS_PER_PRINCIPAL`
+  is then a fleet bound, not a tenancy bound — size it from the fleet.
+- **NAT / `externalTrafficPolicy: Cluster`.** The *connection* caps
+  (`FERRUM_CP_GRPC_MAX_CONNECTIONS`, default `1024`, and
+  `FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP`, default `64`) are separate DoS bounds
+  and are deliberately not raised with the stream budgets. Behind a NAT gateway
+  or a Service that rewrites the source address, every subscriber appears to the
+  CP as one IP, so a fleet larger than `64` is refused at the connection layer
+  before admission is consulted. Preserve the client address
+  (`externalTrafficPolicy: Local`, a direct pod-to-pod CP Service, or per-node
+  egress) rather than raising a per-IP DoS bound by reflex.
+
+Each layer emits a rate-limited `warn!` (at most once per 60s per layer) naming
+the layer, its `FERRUM_XDS_MAX_*` variable, and the current/limit values once
+occupancy reaches 80% of the ceiling; alert on
+`ferrum_cp_grpc_active_streams` / `ferrum_cp_grpc_active_node_ids` approaching
+the configured limits and on
+`ferrum_cp_grpc_stream_admission_rejections_total`.
+
+A refused subscriber is **not** a data-plane outage: a `RESOURCE_EXHAUSTED`
+refusal proves the CP is alive, so the DP records it as *reconnecting*, keeps
+serving last-known-good configuration, keeps retrying, and does not latch
+`FERRUM_DP_CONFIG_MAX_STALE_SECONDS` / trip
+`FERRUM_DP_CONFIG_STALE_ACTION=fail_closed`. Watch
+`ferrum_dp_cp_admission_refused_total` for it. A native sidecar that has never
+received a slice is the exception that still hurts immediately: its
+`startupProbe` cannot pass, and because the sidecar is `initContainers[0]` the
+pod wedges in `Init:0/2` — which is what an undersized per-namespace budget
+looks like during a rollout. See
+[cp_dp_mode.md](cp_dp_mode.md) and [mesh.md](mesh.md#xds-ads-admission-budgets).
+
 ### Mesh config ordering across CP replicas
 
 Mesh data planes list several control planes in `FERRUM_DP_CP_GRPC_URLS` and fail

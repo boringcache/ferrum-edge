@@ -235,10 +235,33 @@ pub async fn start_native_mesh_client_with_shutdown(
                 attempt
             }
             Err(e) => {
+                // A `RESOURCE_EXHAUSTED` subscribe status is the CP's stream
+                // admission controller refusing this workload for
+                // capacity/tenancy reasons (issue #4531). Classified BEFORE the
+                // local-gate check: the CP is alive and answering, and its
+                // status message names the exact budget to raise, so calling it
+                // a transport failure would discard the only actionable detail.
+                let admission_refusal = e
+                    .downcast_ref::<tonic::Status>()
+                    .filter(|status| status.code() == tonic::Code::ResourceExhausted);
+                if let Some(status) = admission_refusal {
+                    error!(
+                        cp_url = %cp_url,
+                        outcome = MeshStreamAttempt::AdmissionRefused.as_metric_label(),
+                        status = %status.message(),
+                        "Control plane REFUSED the native MeshSubscribe stream for \
+                         capacity/tenancy reasons: it is reachable and answering, but a CP gRPC \
+                         stream admission budget is saturated. Raise the budget named in the \
+                         status message (the sizing unit is one stream per DP or per mesh \
+                         workload) or add CP replicas"
+                    );
+                }
                 // A refusal by a fail-closed local gate (subscription binding or
                 // config-revision ordering) is about the CP's CONTENT, not its
                 // transport; both still rotate, but the reason label differs.
-                let attempt = if e.downcast_ref::<MeshApplyError>().is_some() {
+                let attempt = if admission_refusal.is_some() {
+                    MeshStreamAttempt::AdmissionRefused
+                } else if e.downcast_ref::<MeshApplyError>().is_some() {
                     MeshStreamAttempt::PolicyRejected
                 } else {
                     // `after_established` is what lets `/health` tell an
@@ -252,8 +275,11 @@ pub async fn start_native_mesh_client_with_shutdown(
                 };
                 // Keep the live native mTLS classifier's closed-set
                 // `native_tls_class` field and connection-failed message while
-                // still recording the shared stream-lifecycle outcome.
-                match observed_class_from_error(&e) {
+                // still recording the shared stream-lifecycle outcome. An
+                // admission refusal already logged its own operator-actionable
+                // line above and is not a connection failure, so it is not
+                // relabelled as one here.
+                match observed_class_from_error(&e).filter(|_| admission_refusal.is_none()) {
                     Some(class) => {
                         error!(
                             cp_url = %cp_url,
@@ -263,7 +289,7 @@ pub async fn start_native_mesh_client_with_shutdown(
                             "Native MeshSubscribe connection failed"
                         );
                     }
-                    None => {
+                    None if admission_refusal.is_none() => {
                         error!(
                             cp_url = %cp_url,
                             outcome = attempt.as_metric_label(),
@@ -271,6 +297,7 @@ pub async fn start_native_mesh_client_with_shutdown(
                             "Native MeshSubscribe connection failed"
                         );
                     }
+                    None => {}
                 }
                 attempt
             }

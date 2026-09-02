@@ -13,14 +13,16 @@ use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 
 pub use crate::grpc::admission::{
-    CpGrpcAdmissionLimits as XdsAdmissionLimits, CpGrpcAdmissionRejection as XdsAdmissionRejection,
+    CP_GRPC_NEAR_CEILING_PERCENT, CpGrpcAdmissionLimits as XdsAdmissionLimits,
+    CpGrpcAdmissionRejection as XdsAdmissionRejection,
     DEFAULT_CP_GRPC_MAX_ACTIVE_NODES as DEFAULT_XDS_MAX_ACTIVE_NODES,
     DEFAULT_CP_GRPC_MAX_NODE_ID_BYTES as DEFAULT_XDS_MAX_NODE_ID_BYTES,
     DEFAULT_CP_GRPC_MAX_STREAMS_PER_NAMESPACE as DEFAULT_XDS_MAX_STREAMS_PER_NAMESPACE,
     DEFAULT_CP_GRPC_MAX_STREAMS_PER_NODE as DEFAULT_XDS_MAX_STREAMS_PER_NODE,
     DEFAULT_CP_GRPC_MAX_STREAMS_PER_PRINCIPAL as DEFAULT_XDS_MAX_STREAMS_PER_PRINCIPAL,
     DEFAULT_CP_GRPC_MAX_TOTAL_STREAMS as DEFAULT_XDS_MAX_TOTAL_STREAMS,
-    DEFAULT_XDS_FIRST_REQUEST_TIMEOUT_SECS, principal_key, redacted_identifier, validate_node_id,
+    DEFAULT_XDS_FIRST_REQUEST_TIMEOUT_SECS, cp_grpc_budget_is_near_ceiling, principal_key,
+    redacted_identifier, validate_node_id,
 };
 
 use crate::grpc::admission::{CpGrpcAdmissionController, CpGrpcStreamPermit, node_state_key};

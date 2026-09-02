@@ -280,6 +280,12 @@ pub struct DpConfigFreshnessSnapshot {
     pub apply_failed_total: u64,
     /// Transitions into the stale state since process start.
     pub stale_transitions_total: u64,
+    /// ConfigSync subscriptions the CP refused with `RESOURCE_EXHAUSTED`
+    /// because a CP gRPC stream admission budget is saturated, since process
+    /// start. A refusal proves the CP is alive, so it is recorded as a
+    /// reconnect rather than authority loss and never latches the bound
+    /// (issue #4531).
+    pub cp_admission_refused_total: u64,
 }
 
 /// Monotonic freshness accounting for the DP's applied configuration.
@@ -312,6 +318,8 @@ pub struct DpConfigFreshness {
     rejected_total: AtomicU64,
     apply_failed_total: AtomicU64,
     stale_transitions_total: AtomicU64,
+    /// CP gRPC stream admission refusals observed on Subscribe (issue #4531).
+    cp_admission_refused_total: AtomicU64,
     /// Last published admission word (`generation << 1 | blocked`). Mirrors
     /// [`ADMISSION`] for the installed tracker and stands alone for test
     /// instances, so both are installed by the same monotonic CAS.
@@ -356,6 +364,7 @@ impl DpConfigFreshness {
             rejected_total: AtomicU64::new(0),
             apply_failed_total: AtomicU64::new(0),
             stale_transitions_total: AtomicU64::new(0),
+            cp_admission_refused_total: AtomicU64::new(0),
             admission: AtomicU64::new(0),
             wakeup: Notify::new(),
             publishes,
@@ -512,6 +521,20 @@ impl DpConfigFreshness {
     pub fn record_snapshot_rejected(&self) {
         self.rejected_total.fetch_add(1, Ordering::Relaxed);
         self.last_outcome.store(OUTCOME_REJECTED, Ordering::Relaxed);
+    }
+
+    /// The CP refused this DP's ConfigSync subscription with
+    /// `RESOURCE_EXHAUSTED` because a CP gRPC stream admission budget is
+    /// saturated (issue #4531).
+    ///
+    /// Counting only. The authority transition is the caller's, and it is
+    /// deliberately [`Self::record_cp_reconnecting`]: a refusal is evidence the
+    /// CP is *alive*, so it must not latch the max-stale bound the way an
+    /// unreachable CP does. This counter is the compensating signal that keeps
+    /// the suppressed authority loss visible on `/metrics`.
+    pub fn record_cp_admission_refused(&self) {
+        self.cp_admission_refused_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// A CP payload passed admission but failed during apply. Age is
@@ -681,6 +704,7 @@ impl DpConfigFreshness {
             rejected_total: self.rejected_total.load(Ordering::Relaxed),
             apply_failed_total: self.apply_failed_total.load(Ordering::Relaxed),
             stale_transitions_total: self.stale_transitions_total.load(Ordering::Relaxed),
+            cp_admission_refused_total: self.cp_admission_refused_total.load(Ordering::Relaxed),
         }
     }
 
@@ -745,6 +769,13 @@ pub fn record_snapshot_rejected() {
 pub fn record_snapshot_apply_failed() {
     if let Some(freshness) = global() {
         freshness.record_snapshot_apply_failed();
+    }
+}
+
+/// Record a CP admission refusal on the installed tracker, if any.
+pub fn record_cp_admission_refused() {
+    if let Some(freshness) = global() {
+        freshness.record_cp_admission_refused();
     }
 }
 
