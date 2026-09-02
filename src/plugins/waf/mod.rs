@@ -509,6 +509,33 @@ impl Waf {
         self.exemptions.request_short_circuits(ctx)
     }
 
+    /// Whether a body carrying this `Content-Type` is inside the configured
+    /// inspection allowlist.
+    ///
+    /// The rule, in order:
+    ///
+    /// 1. Exact match of the lowercased base media type (parameters stripped)
+    ///    against `body_content_types`.
+    /// 2. A `multipart/` prefix defers to `inspect_multipart`.
+    /// 3. An RFC 6839 structured-syntax suffix maps onto its base family and
+    ///    retries the allowlist: `+json` retries `application/json`, and `+xml`
+    ///    retries `application/xml` and `text/xml` (either configured entry
+    ///    means "XML" to an operator). Any other suffix falls through.
+    /// 4. Otherwise `inspect_binary_body` decides.
+    ///
+    /// The suffix rule REUSES the operator's configured allowlist rather than
+    /// adding hidden types: removing `application/json` from
+    /// `body_content_types` still excludes `application/vnd.api+json`, and a
+    /// plugin allowing only `text/plain` inspects neither. This is matching
+    /// precision inside the existing gate model, not a widening of it — the
+    /// suffixed types are the same JSON/XML categories the gate already admits,
+    /// and mainstream backends (Spring's `MappingJackson2HttpMessageConverter`,
+    /// ASP.NET Core's `SystemTextJsonInputFormatter`) parse `application/*+json`
+    /// as JSON, so an exact-match gate lets one header token defeat every
+    /// `BodyText` rule.
+    ///
+    /// Allocation-free beyond the single `to_ascii_lowercase()` the exact match
+    /// already needs; this runs on the request path.
     fn should_inspect_body_content_type(&self, content_type: Option<&str>) -> bool {
         let Some(content_type) = content_type else {
             return self.config.inspect_binary_body;
@@ -522,15 +549,32 @@ impl Waf {
         if base.starts_with("multipart/") {
             return self.config.inspect_multipart;
         }
-        if self
-            .config
-            .body_content_types
-            .iter()
-            .any(|allowed| allowed == &base)
-        {
+        if self.content_type_allowed(base.as_str()) {
             return true;
         }
+        if let Some((_, suffix)) = base.rsplit_once('+') {
+            let family_allowed = match suffix {
+                "json" => self.content_type_allowed("application/json"),
+                "xml" => {
+                    self.content_type_allowed("application/xml")
+                        || self.content_type_allowed("text/xml")
+                }
+                _ => false,
+            };
+            if family_allowed {
+                return true;
+            }
+        }
         self.config.inspect_binary_body
+    }
+
+    /// Exact membership of an already-lowercased base media type in the
+    /// configured `body_content_types` allowlist.
+    fn content_type_allowed(&self, base: &str) -> bool {
+        self.config
+            .body_content_types
+            .iter()
+            .any(|allowed| allowed == base)
     }
 
     fn request_body_eligible_for_scan(&self, content_type: Option<&str>) -> bool {
@@ -1814,6 +1858,7 @@ fn default_body_methods() -> Vec<String> {
 fn default_body_content_types() -> Vec<String> {
     vec![
         "application/json".into(),
+        "text/json".into(),
         "application/x-www-form-urlencoded".into(),
         "application/xml".into(),
         "text/xml".into(),
