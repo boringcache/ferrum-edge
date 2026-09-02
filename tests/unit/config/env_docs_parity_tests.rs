@@ -263,7 +263,11 @@ fn prose_ferrum_env_tokens(text: &str) -> BTreeSet<&str> {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if !text[i..].starts_with("FERRUM_") {
+        // Compare on the byte slice: `i` walks every byte, and slicing `text`
+        // inside a multi-byte character (an em dash in prose) would panic.
+        // `i` and `end` below always land on ASCII bytes, so the final `&str`
+        // slice is on char boundaries.
+        if !bytes[i..].starts_with(b"FERRUM_") {
             i += 1;
             continue;
         }
