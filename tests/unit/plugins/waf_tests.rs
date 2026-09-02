@@ -3111,8 +3111,11 @@ async fn utf32_transcoding_does_not_change_utf8_or_utf16_body_matches() {
     let (truncated_result, truncated_ctx) =
         scan_body_with_content_type(&plugin, "text/plain; charset=utf-16le", &truncated_utf16)
             .await;
-    assert!(matches!(truncated_result, PluginResult::Continue));
-    assert!(!monitored(&truncated_ctx, "FE-SSRF-001"));
+    // Lossy wide-charset decoding (issue #4519): a truncated trailing code unit
+    // becomes U+FFFD and the rest of the body is still inspected, so the
+    // attack text is seen and rejected instead of skipping the body.
+    assert!(matches!(truncated_result, PluginResult::Reject { .. }));
+    assert!(monitored(&truncated_ctx, "FE-SSRF-001"));
 
     let (binary_result, binary_ctx) = scan_body_with_content_type(
         &plugin,
@@ -3144,8 +3147,11 @@ async fn bare_utf32_charset_without_bom_blocks_both_endians() {
     truncated.pop();
     let (truncated_result, truncated_ctx) =
         scan_body_with_content_type(&plugin, form, &truncated).await;
-    assert!(matches!(truncated_result, PluginResult::Continue));
-    assert!(!monitored(&truncated_ctx, "FE-SQLI-001-B"));
+    // Lossy wide-charset decoding (issue #4519): a truncated trailing code unit
+    // becomes U+FFFD and the rest of the body is still inspected, so the
+    // attack text is seen and rejected instead of skipping the body.
+    assert!(matches!(truncated_result, PluginResult::Reject { .. }));
+    assert!(monitored(&truncated_ctx, "FE-SQLI-001-B"));
 }
 
 #[tokio::test]
@@ -3168,8 +3174,11 @@ async fn bare_utf16_charset_without_bom_blocks_both_endians() {
     truncated.pop();
     let (truncated_result, truncated_ctx) =
         scan_body_with_content_type(&plugin, form, &truncated).await;
-    assert!(matches!(truncated_result, PluginResult::Continue));
-    assert!(!monitored(&truncated_ctx, "FE-SQLI-001-B"));
+    // Lossy wide-charset decoding (issue #4519): a truncated trailing code unit
+    // becomes U+FFFD and the rest of the body is still inspected, so the
+    // attack text is seen and rejected instead of skipping the body.
+    assert!(matches!(truncated_result, PluginResult::Reject { .. }));
+    assert!(monitored(&truncated_ctx, "FE-SQLI-001-B"));
 }
 
 #[tokio::test]
