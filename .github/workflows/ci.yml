@@ -1161,8 +1161,8 @@ jobs:
         # deny.toml` reuses the root policy so the two allowlists cannot drift.
         # Policy: docs/dependency-policy.md.
         run: >-
-          cargo deny --manifest-path ebpf/Cargo.toml --config deny.toml
-          check advisories bans sources licenses
+          cargo deny --manifest-path ebpf/Cargo.toml
+          check --config deny.toml advisories bans sources licenses
 
       - name: Advisory-exception expiry
         # cargo-deny accepts ignores without the repo's [expires:] convention, so
