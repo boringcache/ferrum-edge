@@ -175,13 +175,40 @@ async fn start_body_backend(body: &'static [u8]) -> (u16, tokio::task::JoinHandl
     (port, handle)
 }
 
-/// Reserve an ephemeral port number and release the socket so the gateway can
-/// bind it itself. Whole-startup and reload callers retry on a bind race.
-async fn reserve_free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
+/// Candidates [`reserve_free_port_avoiding`] will hold before giving up on
+/// finding a port number it has not already handed out.
+const PORT_RESERVATION_ATTEMPTS: u32 = 10;
+
+/// Reserve an ephemeral port number on the **same bind scope the gateway
+/// uses**, then release the socket so the gateway can bind it itself.
+///
+/// `GatewayListenerManager` binds the wildcard address, so probing
+/// `127.0.0.1` would not establish what the caller needs: a number the kernel
+/// hands out as free for the loopback address can still be held on `0.0.0.0`
+/// by an unrelated listener, which makes the reservation a guaranteed
+/// `Address already in use` at reconcile time.
+///
+/// Candidates already in `avoid` are held open rather than returned, so the
+/// kernel re-rolls instead of handing back a number a previous attempt already
+/// lost — retrying the same number loses the same race again. Whole-startup
+/// and reload callers retry the surrounding scenario on a bind race.
+async fn reserve_free_port_avoiding(avoid: &[u16]) -> u16 {
+    let mut held = Vec::new();
+    for _ in 0..PORT_RESERVATION_ATTEMPTS {
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        if avoid.contains(&port) {
+            held.push(listener);
+            continue;
+        }
+        drop(listener);
+        drop(held);
+        return port;
+    }
+    panic!(
+        "could not reserve an ephemeral port outside {avoid:?} in \
+         {PORT_RESERVATION_ATTEMPTS} attempts"
+    )
 }
 
 const GATEWAY_LISTENER_STARTUP_ATTEMPTS: u32 = 3;
@@ -241,12 +268,14 @@ async fn start_two_same_protocol_gateway_listeners(
     backend_a: u16,
     backend_b: u16,
 ) -> TwoSameProtocolListenersStartup {
+    // Ports lost to a parallel test are never offered again: a retry on the
+    // same number loses the same race.
+    let mut used_ports: Vec<u16> = Vec::new();
     for attempt in 1..=GATEWAY_LISTENER_STARTUP_ATTEMPTS {
-        let listener_a_port = reserve_free_port().await;
-        let listener_b_port = reserve_free_port().await;
-        if listener_a_port == listener_b_port {
-            continue;
-        }
+        let listener_a_port = reserve_free_port_avoiding(&used_ports).await;
+        used_ports.push(listener_a_port);
+        let listener_b_port = reserve_free_port_avoiding(&used_ports).await;
+        used_ports.push(listener_b_port);
 
         let config = config_with(vec![
             port_scoped_proxy("gw-a", backend_a, Some(listener_a_port)),
@@ -322,7 +351,7 @@ async fn start_two_same_protocol_gateway_listeners(
     }
 
     panic!(
-        "could not reserve two distinct Gateway listener ports in \
+        "the two same-protocol Gateway listeners never both bound in \
          {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts"
     )
 }
@@ -431,12 +460,14 @@ async fn gateway_listener_ports_follow_config_reload_add_and_withdraw() {
     let (backend_a, _ba) = start_body_backend(b"listener-a").await;
     let (backend_b, _bb) = start_body_backend(b"listener-b").await;
 
+    // Ports lost to a parallel test are never offered again: a retry on the
+    // same number loses the same race.
+    let mut used_ports: Vec<u16> = Vec::new();
     for attempt in 1..=GATEWAY_LISTENER_STARTUP_ATTEMPTS {
-        let listener_a_port = reserve_free_port().await;
-        let listener_b_port = reserve_free_port().await;
-        if listener_a_port == listener_b_port {
-            continue;
-        }
+        let listener_a_port = reserve_free_port_avoiding(&used_ports).await;
+        used_ports.push(listener_a_port);
+        let listener_b_port = reserve_free_port_avoiding(&used_ports).await;
+        used_ports.push(listener_b_port);
 
         let proxy_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let admin_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -503,7 +534,30 @@ async fn gateway_listener_ports_follow_config_reload_add_and_withdraw() {
             matches!(outcome, ferrum_edge::proxy::ConfigApplyOutcome::Applied),
             "reload must apply: {outcome:?}"
         );
-        wait_for_listener_ports(&handles, &[listener_a_port, listener_b_port]).await;
+        // The added port was reserved and released long before this reconcile
+        // binds it, so a parallel test can still own it here. That attempt is
+        // void — drain it and retry on a port nobody else holds.
+        if let Err(failure) = try_wait_for_listener_ports_and_withdrawn_failures(
+            &handles,
+            &[listener_a_port, listener_b_port],
+            &[],
+        )
+        .await
+        {
+            if !failure.lost_port_race(&[listener_a_port, listener_b_port]) {
+                panic!("{}", failure.message);
+            }
+            eprintln!(
+                "reload add/withdraw attempt {attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} \
+                 lost the added-listener bind race on port {listener_b_port}"
+            );
+            let _ = shutdown_tx.send(true);
+            let _ = tokio::time::timeout(Duration::from_secs(5), handles.join()).await;
+            if attempt == GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+                panic!("{}", failure.message);
+            }
+            continue;
+        }
 
         let (status_b, body_b) = http_get(listener_b_port, "/api/x").await;
         assert_eq!(status_b, 200, "the added listener must serve: {body_b}");
@@ -542,7 +596,7 @@ async fn gateway_listener_ports_follow_config_reload_add_and_withdraw() {
     }
 
     panic!(
-        "could not reserve two distinct Gateway listener ports in \
+        "the Gateway listener add/withdraw reload never converged in \
          {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts"
     );
 }
@@ -638,11 +692,15 @@ async fn refused_gateway_listener_does_not_poison_sibling_and_recovers() {
     let (backend_refused, _br) = start_body_backend(b"listener-refused").await;
     let (backend_ok, _bo) = start_body_backend(b"listener-ok").await;
 
+    // Ports lost to a parallel test are never offered again: a retry on the
+    // same number loses the same race.
+    let mut used_ports: Vec<u16> = Vec::new();
     for attempt in 1..=GATEWAY_LISTENER_STARTUP_ATTEMPTS {
         let proxy_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let admin_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let admin_port = admin_http.local_addr().unwrap().port();
-        let sibling_port = reserve_free_port().await;
+        let sibling_port = reserve_free_port_avoiding(&used_ports).await;
+        used_ports.push(sibling_port);
 
         let mut refused = port_scoped_proxy("gw-refused", backend_refused, Some(admin_port));
         refused.hosts = vec![HOST.to_string()];
@@ -696,7 +754,8 @@ async fn refused_gateway_listener_does_not_poison_sibling_and_recovers() {
             "the refused route must not be reachable on the sibling listener port"
         );
 
-        let recovered_port = reserve_free_port().await;
+        let recovered_port = reserve_free_port_avoiding(&used_ports).await;
+        used_ports.push(recovered_port);
         if undeclared_port_stolen_externally(&handles, recovered_port).await {
             eprintln!(
                 "refused/sibling recovery attempt {attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} \
@@ -722,27 +781,30 @@ async fn refused_gateway_listener_does_not_poison_sibling_and_recovers() {
             matches!(outcome, ferrum_edge::proxy::ConfigApplyOutcome::Applied),
             "recovery publication must apply: {outcome:?}"
         );
-        let recovery_failures = handles.gateway_listeners.bind_failures();
-        if port_bind_lost_to_external_steal(recovery_failures.as_ref(), recovered_port) {
+        // The recovery port was reserved and released before this reconcile
+        // binds it. Sampling `bind_failures()` here would race the reconcile
+        // itself, so the steal is detected on the convergence poll instead —
+        // that attempt is void and retries on a port nobody else holds.
+        if let Err(failure) = try_wait_for_listener_ports_and_withdrawn_failures(
+            &handles,
+            &[sibling_port, recovered_port],
+            &[admin_port],
+        )
+        .await
+        {
+            if !failure.lost_port_race(&[sibling_port, recovered_port]) {
+                panic!("{}", failure.message);
+            }
             eprintln!(
                 "refused/sibling recovery attempt {attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} \
                  lost recovered-port bind race on port {recovered_port}"
             );
             shutdown_serve_handles_before_retry(&shutdown_tx, handles).await;
             if attempt == GATEWAY_LISTENER_STARTUP_ATTEMPTS {
-                panic!(
-                    "port {recovered_port} was stolen by another test in all \
-                     {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts"
-                );
+                panic!("{}", failure.message);
             }
             continue;
         }
-        wait_for_listener_ports_and_withdrawn_failures(
-            &handles,
-            &[sibling_port, recovered_port],
-            &[admin_port],
-        )
-        .await;
         assert_eq!(
             http_get(recovered_port, "/api/x").await,
             (200, "listener-refused".to_string()),
@@ -782,8 +844,12 @@ async fn a_config_publication_before_the_supervisor_starts_is_not_missed() {
 
     let (backend, _b) = start_body_backend(b"listener-a").await;
 
+    // Ports lost to a parallel test are never offered again: a retry on the
+    // same number loses the same race.
+    let mut used_ports: Vec<u16> = Vec::new();
     for attempt in 1..=GATEWAY_LISTENER_STARTUP_ATTEMPTS {
-        let listener_port = reserve_free_port().await;
+        let listener_port = reserve_free_port_avoiding(&used_ports).await;
+        used_ports.push(listener_port);
 
         let state = ProxyState::new(
             config_with(vec![]),
@@ -1002,8 +1068,12 @@ async fn an_http_to_https_class_flip_retires_the_plaintext_accept_loops_first() 
     let _ = rustls::crypto::ring::default_provider().install_default();
     let (backend, _b) = start_body_backend(b"listener-a").await;
 
+    // Ports lost to a parallel test are never offered again: a retry on the
+    // same number loses the same race.
+    let mut used_ports: Vec<u16> = Vec::new();
     for startup_attempt in 1..=GATEWAY_LISTENER_STARTUP_ATTEMPTS {
-        let listener_port = reserve_free_port().await;
+        let listener_port = reserve_free_port_avoiding(&used_ports).await;
+        used_ports.push(listener_port);
 
         let mut env = test_env_config(0, 0);
         // Several duplicated exclusive-listen accept loops per listener.
@@ -1146,17 +1216,46 @@ async fn wait_for_listener_ports(
     handles: &ferrum_edge::modes::file::ServeHandles,
     expected: &[u16],
 ) {
-    wait_for_listener_ports_and_withdrawn_failures(handles, expected, &[]).await;
+    if let Err(failure) =
+        try_wait_for_listener_ports_and_withdrawn_failures(handles, expected, &[]).await
+    {
+        panic!("{}", failure.message);
+    }
 }
 
-/// Like [`wait_for_listener_ports`], but also waits until the lock-free
-/// `bind_failures` snapshot no longer lists any of `withdrawn_failure_ports`.
-/// Reconcile can insert a socket before it publishes the updated failure set.
-async fn wait_for_listener_ports_and_withdrawn_failures(
+/// Why a listener-state poll never converged, carrying the bind failures from
+/// the last poll so the caller can tell a lost ephemeral-port race apart from
+/// a real reconcile regression.
+struct ListenerConvergenceFailure {
+    message: String,
+    failures: std::sync::Arc<Vec<GatewayListenerBindFailure>>,
+}
+
+impl ListenerConvergenceFailure {
+    /// True when convergence was blocked only because another test bound one
+    /// of `ports` after this test released its reservation. Such an attempt is
+    /// void: the scenario must be retried on a port number nobody else holds,
+    /// never re-asserted on the number that was already lost.
+    fn lost_port_race(&self, ports: &[u16]) -> bool {
+        ports
+            .iter()
+            .any(|port| port_bind_lost_to_external_steal(self.failures.as_ref(), *port))
+    }
+}
+
+/// Poll until the active listener set equals `expected_active` and the
+/// lock-free `bind_failures` snapshot no longer lists any of
+/// `withdrawn_failure_ports` — reconcile can insert a socket before it
+/// publishes the updated failure set.
+///
+/// Fallible so that a caller which reserved-and-released a port the gateway is
+/// about to bind can retry the whole scenario on a fresh port instead of
+/// failing the test on a race it cannot win.
+async fn try_wait_for_listener_ports_and_withdrawn_failures(
     handles: &ferrum_edge::modes::file::ServeHandles,
     expected_active: &[u16],
     withdrawn_failure_ports: &[u16],
-) {
+) -> Result<(), ListenerConvergenceFailure> {
     let mut want = expected_active.to_vec();
     want.sort_unstable();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -1168,13 +1267,17 @@ async fn wait_for_listener_ports_and_withdrawn_failures(
             .iter()
             .all(|port| !failures.iter().any(|failure| failure.port == *port));
         if active == want && withdrawals_ok {
-            return;
+            return Ok(());
         }
         if std::time::Instant::now() >= deadline {
-            panic!(
-                "Gateway listener state never converged: want active {want:?}, actual {active:?}, \
-                 want withdrawn failures {withdrawn_failure_ports:?}, failures {failures:?}"
-            );
+            return Err(ListenerConvergenceFailure {
+                message: format!(
+                    "Gateway listener state never converged: want active {want:?}, \
+                     actual {active:?}, want withdrawn failures \
+                     {withdrawn_failure_ports:?}, failures {failures:?}"
+                ),
+                failures,
+            });
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
