@@ -223,6 +223,13 @@ fn start_gateway_in_file_mode(
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
+        // Every test in this module counts which backend served each request.
+        // Startup pool warmup issues a `HEAD /` to each configured target, so
+        // leaving it at the production default adds one backend hit per target
+        // before any client traffic (`.claude/rules/testing.md`). Every backend
+        // here is plain HTTP/1.1, so no test needs the capability registry
+        // pre-populated by warmup.
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
         .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -446,12 +453,23 @@ plugin_configs: []
         counts
     );
 
-    // Each server should get exactly 10 requests with round-robin
+    // No response went unattributed: the rotation shifted, nothing was lost.
+    assert_eq!(counts.values().sum::<u32>(), 30, "got {counts:?}");
+
+    // Round-robin advances a per-worker selection counter shard
+    // (`wrr_counter_shard` / `selection_counter_ticket` in `src/load_balancer.rs`),
+    // deliberately trading a globally contended counter for per-core ownership.
+    // Each shard walks the full rotation from its own starting phase, so a batch
+    // spread over several tokio workers ends on a few partial rotations even
+    // though every shard preserves the 1:1:1 order — issue #4481 observed
+    // 11/10/9 for exactly this reason. Unit tests cover the exact single-shard
+    // sequence; this end-to-end assertion allows one request of drift per
+    // typical hosted worker, matching `test_weighted_round_robin_three_targets`.
+    const SHARDED_PERIOD_TOLERANCE: u32 = 4;
     for (server, count) in &counts {
-        assert_eq!(
-            *count, 10,
-            "Server {} got {} requests, expected 10",
-            server, count
+        assert!(
+            count.abs_diff(10) <= SHARDED_PERIOD_TOLERANCE,
+            "{server} got {count} of 30 — round-robin should stay near 10 ({counts:?})"
         );
     }
 
@@ -553,9 +571,19 @@ plugin_configs: []
         heavy,
         light
     );
-    // Expected: heavy=50, light=10
-    assert_eq!(heavy, 50, "Heavy server should get exactly 50 requests");
-    assert_eq!(light, 10, "Light server should get exactly 10 requests");
+    // Expected: heavy=50, light=10. Same per-worker sharded schedule caveat as
+    // `test_round_robin_load_balancing` and `test_weighted_round_robin_three_targets`
+    // (issue #4481): a finite batch spread over several tokio workers ends on
+    // partial schedule periods even though every shard preserves 5:1.
+    const SHARDED_PERIOD_TOLERANCE: u32 = 4;
+    assert!(
+        heavy.abs_diff(50) <= SHARDED_PERIOD_TOLERANCE,
+        "Heavy server count {heavy} should remain near 50"
+    );
+    assert!(
+        light.abs_diff(10) <= SHARDED_PERIOD_TOLERANCE,
+        "Light server count {light} should remain near 10"
+    );
 
     let _ = gateway.kill();
     s1.abort();
