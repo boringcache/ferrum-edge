@@ -4627,6 +4627,21 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_tls_revocation_expiry_seconds",
+    "type": "gauge",
+    "help": "Seconds until the revocation material nextUpdate. Negative means expired; expired material is refused at reload and at startup.",
+    "labels": [
+      "material_id",
+      "kind",
+      "source_kind",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "alert",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_tls_source_fetch_duration_seconds",
     "type": "histogram",
     "help": "TLS material source fetch duration in seconds.",

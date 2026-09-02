@@ -452,7 +452,11 @@ async fn proxy_frontend_reload_publishes_one_accepted_candidate_for_http3() {
         ..EnvConfig::default()
     };
     let tls_policy = ferrum_edge::tls::TlsPolicy::from_env_config(&env).expect("tls policy");
-    let crls = ferrum_edge::tls::load_crls(env.tls_crl_file_path.as_deref()).expect("load CRLs");
+    let crls = ferrum_edge::tls::load_crls(
+        env.tls_crl_file_path.as_deref(),
+        env.tls_crl_expiry_warning_days,
+    )
+    .expect("load CRLs");
     assert!(!crls.is_empty(), "the startup CRL must parse");
 
     let candidate = ferrum_edge::modes::startup_security::try_load_frontend_tls_candidate(
@@ -1155,7 +1159,11 @@ async fn proxy_frontend_without_client_auth_stays_unarmed_and_keeps_ktls_eligibi
         ..EnvConfig::default()
     };
     let tls_policy = ferrum_edge::tls::TlsPolicy::from_env_config(&env).expect("tls policy");
-    let crls = ferrum_edge::tls::load_crls(env.tls_crl_file_path.as_deref()).expect("load CRLs");
+    let crls = ferrum_edge::tls::load_crls(
+        env.tls_crl_file_path.as_deref(),
+        env.tls_crl_expiry_warning_days,
+    )
+    .expect("load CRLs");
 
     let candidate = ferrum_edge::modes::startup_security::try_load_frontend_tls_candidate(
         &env,
@@ -1247,7 +1255,11 @@ async fn admin_https_without_client_auth_stays_unarmed() {
         ..EnvConfig::default()
     };
     let tls_policy = ferrum_edge::tls::TlsPolicy::from_env_config(&env).expect("tls policy");
-    let crls = ferrum_edge::tls::load_crls(env.tls_crl_file_path.as_deref()).expect("load CRLs");
+    let crls = ferrum_edge::tls::load_crls(
+        env.tls_crl_file_path.as_deref(),
+        env.tls_crl_expiry_warning_days,
+    )
+    .expect("load CRLs");
 
     let candidate = ferrum_edge::modes::startup_security::load_admin_tls_candidate(
         &env,
@@ -1309,7 +1321,11 @@ async fn proxy_frontend_with_client_auth_arms_its_scope() {
         ..EnvConfig::default()
     };
     let tls_policy = ferrum_edge::tls::TlsPolicy::from_env_config(&env).expect("tls policy");
-    let crls = ferrum_edge::tls::load_crls(env.tls_crl_file_path.as_deref()).expect("load CRLs");
+    let crls = ferrum_edge::tls::load_crls(
+        env.tls_crl_file_path.as_deref(),
+        env.tls_crl_expiry_warning_days,
+    )
+    .expect("load CRLs");
     let candidate = ferrum_edge::modes::startup_security::try_load_frontend_tls_candidate(
         &env,
         &tls_policy,

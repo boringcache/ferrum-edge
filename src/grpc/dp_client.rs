@@ -1848,6 +1848,7 @@ fn stage_frontend_tls_snapshot(
                     false,
                     tls_policy,
                     proxy_state.env_config.tls_cert_expiry_warning_days,
+                    proxy_state.env_config.tls_crl_expiry_warning_days,
                     proxy_state.crls.as_ref().as_slice(),
                     handshake_scope,
                 )

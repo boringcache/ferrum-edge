@@ -8385,6 +8385,17 @@ components:
         days_until_expiry:
           type: integer
           format: int64
+        next_update:
+          type: string
+          format: date-time
+          description: >-
+            nextUpdate of this entry's revocation material: the soonest across a CRL
+            bundle, or the earliest SingleResponse for a stapled OCSP response. Absent
+            for every other material kind.
+        days_until_next_update:
+          type: integer
+          format: int64
+          description: Whole days until `next_update`, computed the same way as `days_until_expiry`.
         fingerprint_sha256:
           type: string
           description: SHA-256 fingerprint of the leaf certificate. Not populated for private keys.

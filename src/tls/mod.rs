@@ -466,11 +466,63 @@ where
     }
 }
 
+/// Seconds in one day, for revocation lead-time arithmetic.
+const SECONDS_PER_DAY: i64 = 86_400;
+
+/// Whole days from `now_unix` until `next_update_unix`, truncated toward zero.
+///
+/// Shared by the startup lead-time warnings and by the TLS inventory's
+/// `days_until_next_update` so the log an operator reads and the field an
+/// alert is built on can never disagree about the same material.
+pub fn days_until_next_update(next_update_unix: i64, now_unix: i64) -> i64 {
+    next_update_unix.saturating_sub(now_unix) / SECONDS_PER_DAY
+}
+
+/// Warn when revocation material is inside its lead-time window (issue #4505).
+///
+/// Expired revocation material is refused outright — at reload and at startup
+/// alike — so this warning is the only advance notice an operator gets that a
+/// refresh loop has stopped. It names the already-redacted source display id
+/// and the remaining days; it never renders CRL or OCSP bytes, issuer names,
+/// or serial numbers.
+///
+/// `warning_days == 0` disables the warning, matching
+/// `FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS`.
+fn warn_if_revocation_material_near_expiry(
+    material_kind: &'static str,
+    display_source_id: &str,
+    next_update_unix: i64,
+    warning_days: u64,
+    now_unix: i64,
+) {
+    if warning_days == 0 {
+        return;
+    }
+    let remaining_days = days_until_next_update(next_update_unix, now_unix);
+    if remaining_days > warning_days as i64 {
+        return;
+    }
+    warn!(
+        revocation_material = material_kind,
+        source = %display_source_id,
+        days_until_next_update = remaining_days,
+        warning_days,
+        "Revocation material expires within the configured warning window. Ferrum refuses \
+         expired revocation material at reload AND at startup, so a pod that restarts after \
+         nextUpdate will not come back: refresh the material before then, or enable live \
+         reload so a refreshed copy is adopted without a restart"
+    );
+}
+
 /// Load Certificate Revocation Lists from a PEM file.
 ///
 /// The file may contain multiple `-----BEGIN X509 CRL-----` blocks.
 /// Returns an empty Vec if `path` is `None`.
-pub fn load_crls(path: Option<&str>) -> Result<CrlList, anyhow::Error> {
+///
+/// `expiry_warning_days` is `FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS`: an accepted
+/// source whose soonest `nextUpdate` falls inside that window is logged as a
+/// warning. It never changes admission — an expired record is still refused.
+pub fn load_crls(path: Option<&str>, expiry_warning_days: u64) -> Result<CrlList, anyhow::Error> {
     let Some(crl_source_raw) = path else {
         return Ok(Arc::new(Vec::new()));
     };
@@ -509,6 +561,19 @@ pub fn load_crls(path: Option<&str>) -> Result<CrlList, anyhow::Error> {
     // verifier, and sessions in service.
     crl_policy::validate_crl_windows(&crls, &material.display_source_id)
         .map_err(|error| anyhow::anyhow!("{}", error))?;
+
+    // Lead-time notice (issue #4505). Admission has already proven every
+    // record carries a `nextUpdate` still in the future, so the earliest one
+    // is this source's refusal deadline.
+    if let Some(next_update) = crl_policy::earliest_next_update_unix(&crls) {
+        warn_if_revocation_material_near_expiry(
+            "crl",
+            &material.display_source_id,
+            next_update,
+            expiry_warning_days,
+            ASN1Time::now().timestamp(),
+        );
+    }
 
     info!(
         "Loaded {} CRL(s) from {} for certificate revocation checking",
@@ -863,6 +928,7 @@ fn parse_kx_groups(
 ///
 /// Checks certificate expiration: expired certs are rejected, certs expiring
 /// within `cert_expiry_warning_days` emit a warning log.
+#[allow(clippy::too_many_arguments)]
 pub fn load_tls_config_with_client_auth(
     cert_path: &str,
     key_path: &str,
@@ -870,6 +936,7 @@ pub fn load_tls_config_with_client_auth(
     no_verify: bool,
     tls_policy: &TlsPolicy,
     cert_expiry_warning_days: u64,
+    revocation_expiry_warning_days: u64,
     crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<Arc<ServerConfig>, anyhow::Error> {
     load_tls_config_with_client_auth_and_ocsp(
@@ -880,6 +947,7 @@ pub fn load_tls_config_with_client_auth(
         no_verify,
         tls_policy,
         cert_expiry_warning_days,
+        revocation_expiry_warning_days,
         crls,
     )
 }
@@ -893,6 +961,7 @@ pub fn load_tls_config_with_client_auth_and_ocsp(
     no_verify: bool,
     tls_policy: &TlsPolicy,
     cert_expiry_warning_days: u64,
+    revocation_expiry_warning_days: u64,
     crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<Arc<ServerConfig>, anyhow::Error> {
     load_frontend_tls_candidate_from_paths(
@@ -903,6 +972,7 @@ pub fn load_tls_config_with_client_auth_and_ocsp(
         no_verify,
         tls_policy,
         cert_expiry_warning_days,
+        revocation_expiry_warning_days,
         crls,
         None,
     )
@@ -926,6 +996,7 @@ pub fn load_frontend_tls_candidate_from_paths(
     no_verify: bool,
     tls_policy: &TlsPolicy,
     cert_expiry_warning_days: u64,
+    revocation_expiry_warning_days: u64,
     crls: &[CertificateRevocationListDer<'static>],
     handshake_scope: Option<client_trust::ClientTrustScope>,
 ) -> Result<FrontendTlsCandidate, anyhow::Error> {
@@ -944,6 +1015,7 @@ pub fn load_frontend_tls_candidate_from_paths(
         no_verify,
         tls_policy,
         cert_expiry_warning_days,
+        revocation_expiry_warning_days,
         crls,
         handshake_scope,
     )
@@ -956,6 +1028,7 @@ pub fn load_frontend_tls_candidate_from_paths(
 /// file loader. Other typed URI schemes parse successfully but are rejected here
 /// until their provider loaders are wired in later phases.
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub fn load_tls_config_with_client_auth_from_sources(
     cert_source: &CertSource,
     key_source: &CertSource,
@@ -963,6 +1036,7 @@ pub fn load_tls_config_with_client_auth_from_sources(
     no_verify: bool,
     tls_policy: &TlsPolicy,
     cert_expiry_warning_days: u64,
+    revocation_expiry_warning_days: u64,
     crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<Arc<ServerConfig>, anyhow::Error> {
     load_tls_config_with_client_auth_from_sources_and_ocsp(
@@ -973,6 +1047,7 @@ pub fn load_tls_config_with_client_auth_from_sources(
         no_verify,
         tls_policy,
         cert_expiry_warning_days,
+        revocation_expiry_warning_days,
         crls,
     )
 }
@@ -990,6 +1065,7 @@ pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
     no_verify: bool,
     tls_policy: &TlsPolicy,
     cert_expiry_warning_days: u64,
+    revocation_expiry_warning_days: u64,
     crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<Arc<ServerConfig>, anyhow::Error> {
     load_frontend_tls_candidate(
@@ -1000,6 +1076,7 @@ pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
         no_verify,
         tls_policy,
         cert_expiry_warning_days,
+        revocation_expiry_warning_days,
         crls,
         None,
     )
@@ -1066,6 +1143,7 @@ pub fn load_frontend_tls_candidate(
     no_verify: bool,
     tls_policy: &TlsPolicy,
     cert_expiry_warning_days: u64,
+    revocation_expiry_warning_days: u64,
     crls: &[CertificateRevocationListDer<'static>],
     handshake_scope: Option<client_trust::ClientTrustScope>,
 ) -> Result<FrontendTlsCandidate, anyhow::Error> {
@@ -1106,6 +1184,18 @@ pub fn load_frontend_tls_candidate(
                 ocsp_next_update = acceptance.next_update,
                 ocsp_delegated_responder = acceptance.delegated_responder,
                 "Validated and stapled OCSP response for server TLS config"
+            );
+            // Lead-time notice (issue #4505). The staple is validated once here
+            // and then served verbatim for the lifetime of this config: Ferrum
+            // has no OCSP responder client, so nothing re-fetches it. This warn
+            // is the operator's cue to refresh before the next restart refuses
+            // the stale bytes outright.
+            warn_if_revocation_material_near_expiry(
+                "ocsp",
+                &material.display_source_id,
+                acceptance.next_update,
+                revocation_expiry_warning_days,
+                ASN1Time::now().timestamp(),
             );
             bytes
         }

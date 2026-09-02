@@ -141,6 +141,29 @@ pub fn classify_crl_window(
     Ok(())
 }
 
+/// The `nextUpdate` instant of one CRL record, as a Unix timestamp.
+///
+/// Sibling of [`classify_crl_window`] rather than a second parser: admission
+/// and the lead-time warning must read the same field out of the same bytes,
+/// so a record this returns `None` for is exactly one `classify_crl_window`
+/// refuses (unparseable, or no declared `nextUpdate`).
+pub fn crl_next_update_unix(crl: &CertificateRevocationListDer<'_>) -> Option<i64> {
+    let (remaining, parsed) = CertificateRevocationList::from_der(crl.as_ref()).ok()?;
+    if !remaining.is_empty() {
+        return None;
+    }
+    parsed.next_update().map(|next| next.timestamp())
+}
+
+/// The soonest `nextUpdate` across a candidate list, as a Unix timestamp.
+///
+/// The whole list is one admission unit, so the operator's deadline is the
+/// earliest record's: once that one expires the entire source is refused, and
+/// the later records buy nothing.
+pub fn earliest_next_update_unix(crls: &[CertificateRevocationListDer<'static>]) -> Option<i64> {
+    crls.iter().filter_map(crl_next_update_unix).min()
+}
+
 /// Validate every CRL in a candidate list against `now_unix`.
 ///
 /// Atomic by construction: the first unusable record refuses the whole

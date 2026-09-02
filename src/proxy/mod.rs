@@ -8649,7 +8649,10 @@ impl ProxyState {
     }
 
     fn reload_backend_tls_material(&self) -> Result<(), anyhow::Error> {
-        let active_crls = crate::tls::load_crls(self.env_config.tls_crl_file_path.as_deref())?;
+        let active_crls = crate::tls::load_crls(
+            self.env_config.tls_crl_file_path.as_deref(),
+            self.env_config.tls_crl_expiry_warning_days,
+        )?;
         let validated = self.validate_backend_tls_material(active_crls.as_ref().as_slice())?;
         // Publish the admitted CRL generation before restarting health probes
         // so replacement tasks snapshot this exact generation. A refused
@@ -8718,8 +8721,10 @@ impl ProxyState {
         // Validate the complete candidate (cert/key/optional client-CA/CRLs)
         // as one generation BEFORE publishing anything. A failure keeps the
         // last accepted generation on every listener.
-        let active_crls = match crate::tls::load_crls(self.env_config.tls_crl_file_path.as_deref())
-        {
+        let active_crls = match crate::tls::load_crls(
+            self.env_config.tls_crl_file_path.as_deref(),
+            self.env_config.tls_crl_expiry_warning_days,
+        ) {
             Ok(crls) => crls,
             Err(err) => {
                 self.stream_listener_manager
@@ -9082,7 +9087,10 @@ impl ProxyState {
         let global_pool_config = PoolConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
         let tls_policy_arc = tls_policy.map(Arc::new);
         warn_if_h3_backend_tls_policy_incompatible(&config, tls_policy_arc.as_deref());
-        let crls = crate::tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
+        let crls = crate::tls::load_crls(
+            env_config.tls_crl_file_path.as_deref(),
+            env_config.tls_crl_expiry_warning_days,
+        )?;
         let shared_crls = crate::tls::shared_crl_list(crls.clone());
         let backend_svid_generation = Arc::new(AtomicU64::new(0));
         let (backend_svid_rotation_tx, backend_svid_rotation_rx) =

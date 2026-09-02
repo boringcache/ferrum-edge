@@ -651,6 +651,11 @@ metrics:
     high5xxRatePerSecond: 1
     p99LatencyMs: 2000
     certExpiringSeconds: 604800
+    # Lead time on CRL / stapled-OCSP `nextUpdate` that fires
+    # FerrumGatewayRevocationMaterialExpiringSoon. Expired revocation material
+    # is refused at reload AND at startup, so this deadline also blocks pod
+    # restarts, not just new handshakes.
+    revocationExpiringSeconds: 604800
     databasePollStaleSeconds: 300
     upstreamUnhealthyRatio: 0.5
     # Frontend TLS handshake error rate (failures/s) that fires

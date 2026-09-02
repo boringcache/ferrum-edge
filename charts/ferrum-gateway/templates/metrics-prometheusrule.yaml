@@ -75,6 +75,14 @@ spec:
           annotations:
             summary: Ferrum gateway TLS certificate is expiring soon
             description: "Certificate {{ "{{ $labels.cert_id }}" }} on surface {{ "{{ $labels.surface }}" }} expires in {{ "{{ $value }}" }} seconds."
+        - alert: FerrumGatewayRevocationMaterialExpiringSoon
+          expr: min by (material_id, kind, namespace) (ferrum_tls_revocation_expiry_seconds) < {{ $alerts.revocationExpiringSeconds | default 604800 }}
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Ferrum gateway TLS revocation material is expiring soon
+            description: "Revocation material {{ "{{ $labels.material_id }}" }} (kind {{ "{{ $labels.kind }}" }}) reaches nextUpdate in {{ "{{ $value }}" }} seconds. Ferrum refuses expired revocation material at reload AND at startup, so a pod that restarts after nextUpdate will not come back."
     - name: ferrum.gateway.config
       rules:
 {{- if or (eq .Values.mode "database") (eq .Values.mode "cp") }}

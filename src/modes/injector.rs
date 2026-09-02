@@ -775,6 +775,7 @@ fn build_tls_acceptor(
         false,
         &tls_policy,
         env_config.tls_cert_expiry_warning_days,
+        env_config.tls_crl_expiry_warning_days,
         &[],
     )
     .map_err(|e| anyhow::anyhow!("Invalid injector TLS configuration: {}", e))?;
