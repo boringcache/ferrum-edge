@@ -4844,6 +4844,36 @@ impl Drop for PerIpWebSocketGuard {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PerIpWebSocketLimitExceeded;
 
+/// Build the synthetic [`UpstreamTarget`] that keys stream load-balancer
+/// accounting for an already-resolved backend (issue #4514).
+///
+/// `LoadBalancer::find_target_key` resolves a target purely by the `host:port`
+/// string `write_target_host_port_key` builds, so a target carrying only the
+/// dialled host/port keys exactly the same active-connection counter and
+/// latency EWMA slot the real selected target does. This is the same
+/// reconstruction `tcp_proxy::try_next_target` already uses for its retry
+/// exclude, and it lets the stream paths account for a connection without
+/// threading the selected target through `resolve_backend_target` (and its
+/// call sites).
+pub(crate) fn stream_lb_accounting_target(
+    host: &str,
+    port: u16,
+    policy_port: u16,
+) -> UpstreamTarget {
+    UpstreamTarget {
+        host: host.to_string(),
+        port,
+        // Stamp the effective policy lane the dial used, matching the retry
+        // exclude. Irrelevant to the `host:port` accounting key, but it keeps
+        // the two reconstructions identical.
+        service_port_policy_key: Some(policy_port),
+        weight: 1,
+        path: None,
+        tags: std::collections::HashMap::new(),
+        locality: None,
+    }
+}
+
 /// RAII guard for load-balancer connection accounting on upgraded sessions.
 ///
 /// WebSocket proxying runs in a spawned task after the HTTP handler returns.
@@ -4870,6 +4900,42 @@ impl Drop for LoadBalancerConnectionGuard {
     fn drop(&mut self) {
         if let (Some(target), Some(balancer)) = (self.target.as_ref(), self.balancer.as_ref()) {
             balancer.record_connection_end(target);
+        }
+    }
+}
+
+/// RAII guard that records a load-balancer failed attempt for a stream target
+/// unless it is explicitly disarmed (issue #4514).
+///
+/// UDP session setup has many `?` early returns after the backend target is
+/// selected (circuit breaker open, socket bind/connect, DTLS handshake,
+/// NodeWaypoint ownership re-checks). Recording the penalty from `Drop` keeps
+/// the accounting exactly-once across all of them without threading an error
+/// path through each one; the committed session disarms it.
+pub(crate) struct StreamLbSetupFailureGuard {
+    target: Option<Arc<UpstreamTarget>>,
+    balancer: Option<Arc<LoadBalancer>>,
+}
+
+impl StreamLbSetupFailureGuard {
+    pub(crate) fn new(
+        target: Option<Arc<UpstreamTarget>>,
+        balancer: Option<Arc<LoadBalancer>>,
+    ) -> Self {
+        Self { target, balancer }
+    }
+
+    /// The session reached a committed state; no failure penalty is owed.
+    pub(crate) fn disarm(&mut self) {
+        self.target = None;
+        self.balancer = None;
+    }
+}
+
+impl Drop for StreamLbSetupFailureGuard {
+    fn drop(&mut self) {
+        if let (Some(target), Some(balancer)) = (self.target.as_ref(), self.balancer.as_ref()) {
+            balancer.record_failed_attempt(target);
         }
     }
 }

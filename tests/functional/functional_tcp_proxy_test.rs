@@ -1484,3 +1484,110 @@ plugin_configs: []
     shutdown_gateway(&mut gateway);
     backend.abort();
 }
+
+/// `least_connections` must distribute TCP connections across every healthy
+/// target (issue #4514).
+///
+/// Before stream load-balancer accounting existed, no TCP path incremented the
+/// balancer's active-connection gauge, so `select_least_connections_*` saw every
+/// target at zero and its strict `<` tie-break returned the first healthy target
+/// for every connection — all 30 landed on backend A.
+///
+/// Each connection is held open and echo-verified before the next is opened, so
+/// the gauge for the chosen target is provably armed before the next selection
+/// runs.
+#[ignore]
+#[tokio::test]
+async fn test_tcp_proxy_least_connections_distributes_across_targets() {
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_a = listener_a.local_addr().unwrap().port();
+    let backend_a = start_tagged_tcp_echo_server_on(listener_a, b"A:").await;
+
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_b = listener_b.local_addr().unwrap().port();
+    let backend_b = start_tagged_tcp_echo_server_on(listener_b, b"B:").await;
+
+    let listener_c = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_c = listener_c.local_addr().unwrap().port();
+    let backend_c = start_tagged_tcp_echo_server_on(listener_c, b"C:").await;
+
+    let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry_extra_env(
+        |proxy_port| {
+            format!(
+                r#"
+version: "1"
+proxies:
+  - id: "tcp-least-conn"
+    listen_port: {proxy_port}
+    backend_scheme: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {port_a}
+    upstream_id: "tcp-least-conn-upstream"
+
+upstreams:
+  - id: "tcp-least-conn-upstream"
+    algorithm: least_connections
+    targets:
+      - host: "127.0.0.1"
+        port: {port_a}
+      - host: "127.0.0.1"
+        port: {port_b}
+      - host: "127.0.0.1"
+        port: {port_c}
+
+consumers: []
+plugin_configs: []
+"#
+            )
+        },
+        None,
+        None,
+        // Warmup dials would land on the balancer before the test's own
+        // connections and skew the accept counts.
+        &[("FERRUM_POOL_WARMUP_ENABLED", "false")],
+    )
+    .await;
+
+    const CONNECTIONS: usize = 30;
+    // Held open for the whole loop: a released connection would decrement the
+    // gauge and let the algorithm re-pin.
+    let mut held = Vec::with_capacity(CONNECTIONS);
+    let mut hits_a = 0u32;
+    let mut hits_b = 0u32;
+    let mut hits_c = 0u32;
+
+    for i in 0..CONNECTIONS {
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
+            .await
+            .unwrap_or_else(|error| panic!("connect {i} failed: {error}"));
+        let payload = format!("conn-{i}");
+        stream
+            .write_all(payload.as_bytes())
+            .await
+            .expect("send payload");
+        let mut buf = vec![0u8; 2 + payload.len()];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("read {i} timed out"))
+            .unwrap_or_else(|error| panic!("read {i} failed: {error}"));
+        match &buf[..2] {
+            b"A:" => hits_a += 1,
+            b"B:" => hits_b += 1,
+            b"C:" => hits_c += 1,
+            other => panic!("unexpected tag for connection {i}: {other:?}"),
+        }
+        held.push(stream);
+    }
+
+    assert_eq!(hits_a + hits_b + hits_c, CONNECTIONS as u32);
+    assert!(
+        hits_a > 0 && hits_b > 0 && hits_c > 0,
+        "least_connections must use every healthy target, got A={hits_a} B={hits_b} C={hits_c}"
+    );
+
+    drop(held);
+    shutdown_gateway(&mut gateway);
+    backend_a.abort();
+    backend_b.abort();
+    backend_c.abort();
+}

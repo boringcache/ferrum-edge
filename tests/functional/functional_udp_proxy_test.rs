@@ -1579,3 +1579,141 @@ fn generate_test_dtls_cert(temp_dir: &TempDir) -> (String, String) {
         key_path.to_str().unwrap().to_string(),
     )
 }
+
+/// Start a UDP echo server that prefixes every reply with `tag`, so a client can
+/// tell which backend served its session.
+async fn start_tagged_udp_echo_server(
+    port: u16,
+    tag: &'static [u8],
+) -> tokio::task::JoinHandle<()> {
+    let handle = tokio::spawn(async move {
+        let socket = UdpSocket::bind(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap_or_else(|_| panic!("Failed to bind tagged UDP echo server on port {}", port));
+
+        let mut buf = vec![0u8; 65535];
+        let mut reply = Vec::with_capacity(65535);
+        while let Ok((len, src)) = socket.recv_from(&mut buf).await {
+            reply.clear();
+            reply.extend_from_slice(tag);
+            reply.extend_from_slice(&buf[..len]);
+            let _ = socket.send_to(&reply, src).await;
+        }
+    });
+    sleep(Duration::from_millis(200)).await;
+    handle
+}
+
+/// `least_connections` must distribute UDP sessions across every healthy target
+/// (issue #4514).
+///
+/// Before stream load-balancer accounting existed, no UDP path incremented the
+/// balancer's active-connection gauge, so `select_least_connections_*` saw every
+/// target at zero and its strict `<` tie-break returned the first healthy target
+/// for every session — all 30 source ports landed on backend A.
+///
+/// Each client socket keeps its session alive (the idle timeout is far longer
+/// than the test), and every session is echo-verified before the next client
+/// starts, so the gauge for the chosen target is provably armed before the next
+/// selection runs.
+#[ignore]
+#[tokio::test]
+async fn test_udp_proxy_least_connections_distributes_across_targets() {
+    let backend_a_port = 19840u16;
+    let backend_b_port = 19841u16;
+    let backend_c_port = 19842u16;
+    let proxy_port = 19843u16;
+    let gateway_http_port = 18230u16;
+
+    let backend_a = start_tagged_udp_echo_server(backend_a_port, b"A:").await;
+    let backend_b = start_tagged_udp_echo_server(backend_b_port, b"B:").await;
+    let backend_c = start_tagged_udp_echo_server(backend_c_port, b"C:").await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    write_config(
+        &config_path,
+        &format!(
+            r#"
+version: "1"
+proxies:
+  - id: "udp-least-conn"
+    listen_port: {proxy_port}
+    backend_scheme: udp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_a_port}
+    upstream_id: "udp-least-conn-upstream"
+    udp_idle_timeout_seconds: 120
+
+upstreams:
+  - id: "udp-least-conn-upstream"
+    algorithm: least_connections
+    targets:
+      - host: "127.0.0.1"
+        port: {backend_a_port}
+      - host: "127.0.0.1"
+        port: {backend_b_port}
+      - host: "127.0.0.1"
+        port: {backend_c_port}
+
+consumers: []
+plugin_configs: []
+"#
+        ),
+    );
+
+    // Warmup dials would land on the balancer before the test's own sessions
+    // and skew the distribution.
+    let mut gateway = start_gateway_with_extra_env(
+        config_path.to_str().unwrap(),
+        gateway_http_port,
+        &[("FERRUM_POOL_WARMUP_ENABLED", "false")],
+    )
+    .expect("Failed to start");
+    sleep(Duration::from_secs(3)).await;
+
+    const SESSIONS: usize = 30;
+    // Held open for the whole loop: a released session would decrement the gauge
+    // and let the algorithm re-pin.
+    let mut held = Vec::with_capacity(SESSIONS);
+    let mut hits_a = 0u32;
+    let mut hits_b = 0u32;
+    let mut hits_c = 0u32;
+
+    for i in 0..SESSIONS {
+        // A distinct ephemeral source port per client is a distinct UDP session.
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .connect(format!("127.0.0.1:{}", proxy_port))
+            .await
+            .unwrap();
+        let payload = format!("session-{i}");
+        client.send(payload.as_bytes()).await.expect("send payload");
+
+        let mut buf = vec![0u8; 1024];
+        let n = tokio::time::timeout(Duration::from_secs(5), client.recv(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("session {i} recv timed out"))
+            .unwrap_or_else(|error| panic!("session {i} recv failed: {error}"));
+        assert!(n >= 2, "session {i} reply too short: {n}");
+        match &buf[..2] {
+            b"A:" => hits_a += 1,
+            b"B:" => hits_b += 1,
+            b"C:" => hits_c += 1,
+            other => panic!("unexpected tag for session {i}: {other:?}"),
+        }
+        held.push(client);
+    }
+
+    assert_eq!(hits_a + hits_b + hits_c, SESSIONS as u32);
+    assert!(
+        hits_a > 0 && hits_b > 0 && hits_c > 0,
+        "least_connections must use every healthy target, got A={hits_a} B={hits_b} C={hits_c}"
+    );
+
+    drop(held);
+    shutdown_gateway(&mut gateway);
+    backend_a.abort();
+    backend_b.abort();
+    backend_c.abort();
+}

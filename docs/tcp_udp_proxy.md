@@ -460,6 +460,13 @@ proxies:
     upstream_id: "postgres-cluster"
 ```
 
+Every upstream algorithm applies on the stream family. `least_connections` is
+accounted per TCP connection and per UDP/DTLS session, so it distributes rather
+than pinning; `least_latency` is fed by active health-check probe RTT and, on
+TCP, by the backend connect RTT (passive, and only while no active probes run). Per-port DestinationRule `LEAST_LATENCY`
+overrides are the one exception and are refused on stream proxies — see
+[Stream-family proxies](load_balancing.md#stream-family-proxies-tcp--udp--dtls).
+
 ## Health Checks
 
 ### TCP Probe (`probe_type: tcp`)
