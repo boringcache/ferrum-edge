@@ -840,7 +840,13 @@ fn exclusive_c14n_rejects_excessive_element_depth() {
     let error = soap_exclusive_canonicalize_element_for_test(&xml, "Root", "")
         .expect_err("excessive c14n depth must fail closed");
 
-    assert!(error.contains("depth exceeds"), "unexpected error: {error}");
+    // Issue #4565: the shared pre-parse nesting screen (256 levels) now fires
+    // before the post-parse canonicalization guard for a document this deep,
+    // so either fail-closed message satisfies the contract.
+    assert!(
+        error.contains("depth exceeds") || error.contains("nesting exceeds the supported depth"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]

@@ -97,7 +97,11 @@ fn processing_instructions_and_doctype_are_skipped() {
         r#"<!DOCTYPE root [<!ENTITY e "x">]>"#,
         "<root><child/></root>"
     );
-    assert!(xml_nesting_depth_within_limit(xml, 1));
+    // `<child/>` is still an element nested inside `<root>`, so the document
+    // is two levels deep: the PI and DOCTYPE contribute nothing, and only the
+    // real elements count.
+    assert!(xml_nesting_depth_within_limit(xml, 2));
+    assert!(!xml_nesting_depth_within_limit(xml, 1));
 }
 
 #[test]
