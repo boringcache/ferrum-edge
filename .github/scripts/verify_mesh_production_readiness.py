@@ -321,19 +321,13 @@ def validate_serving_podspecs(results_dir: Path) -> None:
         "node-agent must not render serving preStop",
     )
 
-    injector = resource_document(rendered, "ferrum-mesh-injector", "Deployment")
-    forbid_text(
-        injector,
-        "FERRUM_SHUTDOWN_DRAIN_SECONDS",
-        "Injector serving drain",
-        "injector is a webhook, not a Ferrum serving mode; do not apply drain env",
-    )
-    forbid_text(
-        injector,
-        "preStop:",
-        "Injector preStop",
-        "injector must not render the serving SleepAction drain contract",
-    )
+    # The injector DOES take the drain contract (issue #4512): FERRUM_MODE=injector
+    # reads FERRUM_SHUTDOWN_DRAIN_SECONDS and waits that long for in-flight
+    # admission connections, and its failurePolicy=Fail webhook needs the
+    # preStop endpoint-propagation window. Its positive shape (grace period,
+    # SleepAction preStop, drain env rendered exactly once) is asserted by
+    # validate_injector_shutdown; only node-agent stays drain-free above.
+    resource_document(rendered, "ferrum-mesh-injector", "Deployment")
     print("mesh serving podspecs ok")
 
 
