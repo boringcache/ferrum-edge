@@ -1312,10 +1312,12 @@ fn wildcard_parent_unlimited_listener_dominates_status_regardless_of_order() {
                 Some(2.0),
                 "dns listener must keep its finite policy"
             );
+            // Issue #4515: an explicit Gateway API unlimited override projects
+            // the `0` sentinel, so the finite default cannot overwrite it.
             assert_eq!(
                 translated_factor_on_port(&objects, 15354),
-                None,
-                "alt listener must stay unlimited"
+                Some(0.0),
+                "alt listener must stay unlimited (explicit 0 sentinel)"
             );
             let (protected, reason, message) = route_protection_named(&objects, "wild");
             assert!(
