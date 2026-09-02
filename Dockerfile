@@ -150,10 +150,12 @@ WORKDIR /app
 COPY --from=builder --chown=65532:65532 /build/target/release/ferrum-edge /app/ferrum-edge
 COPY --from=builder --chown=65532:65532 /build/target/release/ferrum-cni /app/ferrum-cni
 
-# Set environment variables
+# Set environment variables. `FERRUM_LOG_LEVEL` defaults to `warn` so the startup
+# operability warnings stay visible; every published runtime stage must agree with
+# `Dockerfile.release` and `docs/configuration.md`. See `docs/docker.md`.
 ENV PATH="/app:${PATH}" \
     FERRUM_MODE=database \
-    FERRUM_LOG_LEVEL=error \
+    FERRUM_LOG_LEVEL=warn \
     FERRUM_PROXY_HTTP_PORT=8000 \
     FERRUM_PROXY_HTTPS_PORT=8443 \
     FERRUM_ADMIN_HTTP_PORT=9000 \
@@ -250,9 +252,12 @@ COPY --from=builder /build/target/release/ferrum-cni /app/ferrum-cni
 COPY --from=ebpf-builder \
     /build/ebpf/target/bpfel-unknown-none/release/ferrum-ebpf /app/bpf/ferrum-ebpf
 
+# `FERRUM_LOG_LEVEL` defaults to `warn` so the startup operability warnings stay
+# visible; every published runtime stage must agree with `Dockerfile.release`
+# and `docs/configuration.md`. See `docs/docker.md`.
 ENV PATH="/app:${PATH}" \
     FERRUM_MODE=database \
-    FERRUM_LOG_LEVEL=error \
+    FERRUM_LOG_LEVEL=warn \
     FERRUM_PROXY_HTTP_PORT=8000 \
     FERRUM_PROXY_HTTPS_PORT=8443 \
     FERRUM_ADMIN_HTTP_PORT=9000 \

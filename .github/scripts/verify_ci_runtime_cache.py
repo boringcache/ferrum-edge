@@ -46,6 +46,8 @@ FIPS_PLANNER_PATH = ".github/scripts/ci_runtime_plan.py"
 NODE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "node-waypoint-ebpf-live.yml"
 AMBIENT_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ambient-host-udp-live.yml"
 DOCKERFILE = REPO_ROOT / "Dockerfile"
+DOCKERFILE_RELEASE = REPO_ROOT / "Dockerfile.release"
+DOCKERFILE_EBPF_TOOLS_LAYER = REPO_ROOT / "Dockerfile.ebpf-tools-layer"
 SETUP_RUST = REPO_ROOT / ".github" / "actions" / "setup-rust-ci" / "action.yml"
 SETUP_SCCACHE = REPO_ROOT / ".github" / "actions" / "setup-sccache" / "action.yml"
 SETUP_FAST_LINKER = REPO_ROOT / ".github" / "actions" / "setup-fast-linker" / "action.yml"
@@ -3869,6 +3871,41 @@ def builder_arg_features_is_after_apt(dockerfile: str) -> bool:
     return apt >= 0 and features > apt
 
 
+DOCUMENTED_LOG_LEVEL_DEFAULT = "warn"
+
+
+def ferrum_log_level_assignments(dockerfile: str) -> list[str]:
+    """Every `FERRUM_LOG_LEVEL=<value>` baked into a Dockerfile's runtime ENV.
+
+    The assignments live inside multi-line `ENV ... \\` continuations, so match
+    the assignment token itself rather than a line that starts with `ENV`.
+    """
+
+    return re.findall(r"\bFERRUM_LOG_LEVEL=([^\s\\]+)", dockerfile)
+
+
+def check_dockerfile_log_level(
+    label: str, dockerfile: str, failures: list[str]
+) -> None:
+    """Every published runtime image must bake the documented log-level default."""
+
+    values = ferrum_log_level_assignments(dockerfile)
+    require(
+        bool(values),
+        f"{label} must bake a FERRUM_LOG_LEVEL default; found none (a rename or "
+        "deletion must fail closed, not pass vacuously)",
+        failures,
+    )
+    offenders = sorted({value for value in values if value != DOCUMENTED_LOG_LEVEL_DEFAULT})
+    require(
+        not offenders,
+        f"{label} sets FERRUM_LOG_LEVEL={', '.join(offenders)}; every published "
+        f"runtime stage must use '{DOCUMENTED_LOG_LEVEL_DEFAULT}' so the startup "
+        "operability warnings stay visible (docs/configuration.md, docs/docker.md)",
+        failures,
+    )
+
+
 def workflow_permissions_are_read_only(text: str) -> bool:
     """Require one explicit top-level permissions map with no write grants."""
 
@@ -4879,6 +4916,15 @@ def check_dockerfile(failures: list[str]) -> None:
         "runtime-ebpf target must remain",
         failures,
     )
+    check_dockerfile_log_level("Dockerfile", dockerfile, failures)
+    check_dockerfile_log_level(
+        "Dockerfile.release", DOCKERFILE_RELEASE.read_text(encoding="utf-8"), failures
+    )
+    check_dockerfile_log_level(
+        "Dockerfile.ebpf-tools-layer",
+        DOCKERFILE_EBPF_TOOLS_LAYER.read_text(encoding="utf-8"),
+        failures,
+    )
 
 
 def self_test() -> int:
@@ -4918,6 +4964,42 @@ def self_test() -> int:
             "ARG FEATURES\n"
         ),
         "self-test: a non-rust builder base must not satisfy the contract",
+        failures,
+    )
+    log_level_warn = (
+        'ENV PATH="/app:${PATH}" \\\n'
+        "    FERRUM_MODE=database \\\n"
+        "    FERRUM_LOG_LEVEL=warn \\\n"
+        "    FERRUM_PROXY_HTTP_PORT=8000\n"
+    )
+    log_level_error = log_level_warn.replace(
+        "FERRUM_LOG_LEVEL=warn", "FERRUM_LOG_LEVEL=error"
+    )
+    log_level_absent = "\n".join(
+        line
+        for line in log_level_warn.splitlines()
+        if "FERRUM_LOG_LEVEL" not in line
+    )
+    log_level_failures: list[str] = []
+    check_dockerfile_log_level("synthetic", log_level_warn, log_level_failures)
+    require(
+        not log_level_failures,
+        "self-test: FERRUM_LOG_LEVEL=warn should pass",
+        failures,
+    )
+    log_level_failures = []
+    check_dockerfile_log_level("synthetic", log_level_error, log_level_failures)
+    require(
+        len(log_level_failures) == 1
+        and "FERRUM_LOG_LEVEL=error" in log_level_failures[0],
+        "self-test: FERRUM_LOG_LEVEL=error should fail and name the value",
+        failures,
+    )
+    log_level_failures = []
+    check_dockerfile_log_level("synthetic", log_level_absent, log_level_failures)
+    require(
+        len(log_level_failures) == 1 and "found none" in log_level_failures[0],
+        "self-test: a missing FERRUM_LOG_LEVEL assignment must fail closed",
         failures,
     )
     sample = (
