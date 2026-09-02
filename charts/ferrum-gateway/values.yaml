@@ -50,7 +50,9 @@ commonLabels: {}
 
 image:
   repository: ferrumedge/ferrum-edge
-  # Defaults to the chart appVersion when empty.
+  # Defaults to the chart appVersion when empty. That tag must exist in the
+  # container registry. Override with a published tag (for example
+  # --set image.tag=<tag>). latest is mutable and for evaluation only.
   tag: ""
   pullPolicy: IfNotPresent
   # Names of imagePullSecrets to attach to the pod.

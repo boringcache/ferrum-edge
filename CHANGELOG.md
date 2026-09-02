@@ -275,6 +275,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   use process-monotonic time, so NTP corrections and VM wall-clock jumps cannot
   freeze protection or release a backend early (issue #4436). Operator-facing
   ejection timestamps remain Unix epoch milliseconds.
+- **Mesh chart image tag defaults from `Chart.appVersion` instead of a hard-coded
+  version** (issue #4440). `charts/ferrum-mesh` now matches
+  `charts/ferrum-gateway` by deriving the default tag from `Chart.appVersion`
+  when `image.tag` is empty, so the two charts cannot drift after a version
+  bump. Root `README.md` quickstart prose now matches its copy/paste example
+  about pinning releases versus using the mutable `latest` tag for evaluation.
 
 - **Injector inbound capture excludes kubelet HTTP and TCP probe ports**
   (issue #4431). `startupProbe` / `readinessProbe` / `livenessProbe` `httpGet`

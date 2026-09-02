@@ -65,7 +65,7 @@
 {{- if and $cni $cni.uninstall }}{{ $uninstall = $cni.uninstall }}{{ end }}
 {{- if and .Values.nodeAgent.enabled $cni $cni.enabled $uninstall.enabled }}
 {{- $imageRepository := toString (default .Values.image.repository .Values.nodeAgent.image.repository) -}}
-{{- $imageTag := toString (default .Values.image.tag .Values.nodeAgent.image.tag) -}}
+{{- $imageTag := include "ferrum-mesh.resolveImageTag" (dict "root" . "override" .Values.nodeAgent.image.tag) -}}
 {{- if and (eq (lower (toString .Values.nodeAgent.captureMode)) "ebpf") (not (hasSuffix "-ebpf" $imageTag)) -}}
 {{- $imageTag = printf "%s-ebpf" $imageTag -}}
 {{- end -}}
