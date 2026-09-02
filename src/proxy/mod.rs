@@ -45955,6 +45955,37 @@ pub fn normalize_request_authority_for_signing(
     normalize_authority_for_consistency(value, scheme).filter(|authority| !authority.is_empty())
 }
 
+/// Compare a `Host` field value against a request-target authority under
+/// scheme-default-port normalization.
+///
+/// Returns `None` when the two agree (or the URI carries no authority);
+/// otherwise the JSON error body to return. Shared by the H2/H3
+/// `:authority` rule (`check_host_authority_consistency`) and the HTTP/1.1
+/// absolute-form rule in `check_protocol_headers_with_wire_framing`, so the
+/// two cannot drift apart on either the comparison or the wording.
+///
+/// The `Host` value is validated even when the URI carries no authority: an
+/// unparseable `Host` cannot select a vhost. Callers that must not reject a
+/// bare origin-form request gate the call on `uri.authority().is_some()`.
+fn host_authority_disagreement(host: &str, uri: &hyper::Uri) -> Option<&'static str> {
+    let scheme = uri.scheme_str();
+    let Some(host) = normalize_authority_for_consistency(host, scheme) else {
+        return Some(r#"{"error":"Host header contains invalid authority"}"#);
+    };
+
+    // `?` here is the "no URI authority, nothing to compare" exit: the
+    // function's `None` means "agrees".
+    let authority = uri.authority()?;
+    let Some(authority) = normalize_authority_for_consistency(authority.as_str(), scheme) else {
+        return Some(r#"{"error":"Request authority contains invalid authority"}"#);
+    };
+    if host != authority {
+        return Some(r#"{"error":"Host header and request authority disagree"}"#);
+    }
+
+    None
+}
+
 /// Validate HTTP/2 and HTTP/3 `Host`/`:authority` consistency before routing.
 ///
 /// RFC 9113 §8.3.1 and RFC 9114 §4.3.1 require a request to include either
@@ -45996,22 +46027,7 @@ pub fn check_host_authority_consistency(
     let Ok(host) = host.to_str() else {
         return Some(r#"{"error":"Host header contains invalid characters"}"#);
     };
-    let scheme = uri.scheme_str();
-    let Some(host) = normalize_authority_for_consistency(host, scheme) else {
-        return Some(r#"{"error":"Host header contains invalid authority"}"#);
-    };
-
-    if let Some(authority) = uri.authority() {
-        let Some(authority) = normalize_authority_for_consistency(authority.as_str(), scheme)
-        else {
-            return Some(r#"{"error":"Request authority contains invalid authority"}"#);
-        };
-        if host != authority {
-            return Some(r#"{"error":"Host header and request authority disagree"}"#);
-        }
-    }
-
-    None
+    host_authority_disagreement(host, uri)
 }
 
 /// Validate protocol-level header constraints to block smuggling and desync attacks.
@@ -46035,8 +46051,17 @@ pub fn check_host_authority_consistency(
 ///    (`GET http://host/path HTTP/1.1`) carry the authority on the URI
 ///    (`uri.authority()`) and are accepted without a Host field. An empty
 ///    Host value (`Host:` with no tokens) is present but invalid and MUST 400
-///    on HTTP/1.1. HTTP/2 and HTTP/3 are not checked here; they use
-///    `:authority`, governed by `check_host_authority_consistency()`.
+///    on HTTP/1.1. When an HTTP/1.1 absolute-form request-target carries an
+///    authority *and* a Host field is present, the two must agree under
+///    scheme-default-port normalization (`host_authority_disagreement()`);
+///    disagreement is a 400, matching the HTTP/2 / HTTP/3 `:authority` rule.
+///    RFC 9112 §3.2.1 has a recipient route on the request-target authority
+///    and ignore Host, so a disagreeing pair would let an upstream hop
+///    authorize one authority while Ferrum selects the other. HTTP/1.0 is out
+///    of scope for both the missing-Host and the disagreement rule: RFC 9112
+///    §3.2.2 does not require a Host field on HTTP/1.0. HTTP/2 and HTTP/3 are
+///    not checked here; they use `:authority`, governed by
+///    `check_host_authority_consistency()`.
 ///
 /// 4. **Transfer-Encoding rejection** (HTTP/2 and HTTP/3): RFC 9113 §8.2.2 and
 ///    RFC 9114 §4.2 forbid this HTTP/1.x framing header on multiplexed protocols.
@@ -46157,8 +46182,29 @@ fn check_protocol_headers_with_wire_framing(
                     // it is an invalid field value. RFC 9112 §3.2.2 also MUST
                     // 400 invalid Host values, and an empty Host cannot select
                     // a vhost (it would otherwise fall through to catch-all).
+                    // This stays ahead of the absolute-form comparison below:
+                    // "present but invalid" is a distinct, already-specified
+                    // rejection from "present and disagreeing".
                     if trim_ows(value.as_bytes()).is_empty() {
                         return Some(r#"{"error":"Host header contains invalid empty value"}"#);
+                    }
+                    // Absolute-form (`GET http://host/path HTTP/1.1`) carries
+                    // an authority on the request-target as well. RFC 9112
+                    // §3.2.1 requires a recipient to route on the
+                    // request-target's authority and ignore Host; Ferrum
+                    // routes on Host (with the target authority only as a
+                    // fallback), so a disagreeing pair lets a compliant
+                    // upstream hop authorize one authority while Ferrum
+                    // selects another. Reject rather than pick a side, which
+                    // matches the H2/H3 `:authority` rule and keeps one rule
+                    // across all three protocols.
+                    if uri.authority().is_some() {
+                        let Ok(host) = value.to_str() else {
+                            return Some(r#"{"error":"Host header contains invalid characters"}"#);
+                        };
+                        if let Some(error) = host_authority_disagreement(host, uri) {
+                            return Some(error);
+                        }
                     }
                 }
             }
