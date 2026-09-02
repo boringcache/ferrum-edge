@@ -803,6 +803,18 @@ pub fn execute_version(args: &VersionArgs) {
     }
 }
 
+/// Operator-facing scope of what SIGHUP actually does (issue #4548).
+///
+/// The target is resolved by `pgrep -x ferrum-edge` when `--pid` is omitted,
+/// which cannot distinguish a file-mode gateway from a database-mode one. The
+/// signal is delivered either way, so the exit status stays `0`; this line says
+/// what the receiving process will do with it. Every mode now registers a
+/// hangup stream, so a SIGHUP to a non-reloading mode is a logged no-op rather
+/// than an undrained termination.
+pub const RELOAD_SCOPE_NOTICE: &str = "Note: SIGHUP triggers a config reload only in file mode, \
+and in mesh mode with a local file or xDS config source. Other modes log the signal and ignore \
+it — use database polling, control-plane push, or a rolling restart instead.";
+
 /// Send SIGHUP to a running gateway process.
 pub fn execute_reload(args: &ReloadArgs) -> Result<(), String> {
     #[cfg(unix)]
@@ -818,6 +830,7 @@ pub fn execute_reload(args: &ReloadArgs) -> Result<(), String> {
         let rc = unsafe { libc::kill(target, libc::SIGHUP) };
         if rc == 0 {
             println!("Sent SIGHUP to PID {}", pid);
+            println!("{}", RELOAD_SCOPE_NOTICE);
             Ok(())
         } else {
             Err(format!(

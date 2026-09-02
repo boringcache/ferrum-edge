@@ -304,7 +304,7 @@ All in-memory caches are bounded to prevent unbounded memory growth under advers
 
 ## CLI
 
-- Six subcommands: `run` (foreground gateway), `validate` (config check), `reload` (SIGHUP), `health`, `version`, `ambient-udp-preflight` (privileged Ambient UDP node preflight)
+- Six subcommands: `run` (foreground gateway), `validate` (config check), `reload` (SIGHUP — a config reload in file mode and in mesh mode with a local file/xDS config source; a logged no-op in every other mode), `health`, `version`, `ambient-udp-preflight` (privileged Ambient UDP node preflight)
 - Smart path defaults — `ferrum-edge run` works zero-config when `./ferrum.conf` and `./resources.yaml` exist
 - Mode inference — `--spec` auto-sets file mode when no mode is configured
 - Configuration precedence: CLI flag > env var > conf file > smart defaults > hardcoded defaults
@@ -319,7 +319,7 @@ All in-memory caches are bounded to prevent unbounded memory growth under advers
 - Database error masking in API responses (internal details logged, not exposed)
 - Batch operations and full config backup/restore
 - API Spec import — submit OpenAPI/Swagger documents to atomically provision proxy + upstream + plugins as a bundle (`POST /api-specs`); see [docs/api_specs.md](docs/api_specs.md)
-- Zero-downtime config reload via DB polling, SIGHUP, or CP push
+- Zero-downtime config reload via DB polling (database/cp modes), CP push over gRPC (dp mode), or SIGHUP (file mode, and mesh mode with a local file/xDS config source). Modes without a SIGHUP reload path log the signal and ignore it
 - Atomic config swap via ArcSwap (no partial config visible to requests)
 - Incremental database polling with indexed `updated_at` queries and full config validation
 
