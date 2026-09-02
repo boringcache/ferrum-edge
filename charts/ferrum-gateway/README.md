@@ -46,6 +46,12 @@ migrations; use the explicit Job for `status`, dry-run, and operator-controlled
 
 ## Security defaults you should know
 
+- **Container image tag.** When `image.tag` is empty the chart defaults to
+  `Chart.appVersion`. That tag must exist in the container registry before
+  install. Override with a published tag from `docker.io/ferrumedge/ferrum-edge`
+  or `ghcr.io/ferrum-edge/ferrum-edge` (for example
+  `--set image.tag=<tag>`). The mutable `latest` tag exists for evaluation but
+  must not be used in production.
 - **Secrets are never generated or rendered into ConfigMaps.** Admin JWT, DB
   URL, and CP/DP gRPC JWT material come from inline values (dev only) or Secret
   references you own. The chart validates that database, cp, and dp modes have
@@ -248,6 +254,9 @@ helm install ferrum ./charts/ferrum-gateway -n ferrum \
   -f charts/ferrum-gateway/examples/database-values.yaml
 ```
 
+Override `image.tag` when the chart `appVersion` is not yet published (for
+example `--set image.tag=<published-tag>`).
+
 ### File mode (inline config, no Secrets)
 
 ```bash
@@ -329,7 +338,7 @@ of the Job manifests under [`examples/`](examples/):
 | Dry-run pending DB migrations | [`migrate-job-up-dry-run.yaml`](examples/migrate-job-up-dry-run.yaml) |
 | Persist file-config version migration on a pre-staged writable PVC | [`migrate-job-config.yaml`](examples/migrate-job-config.yaml) |
 
-Reuse the same image tag, DB Secret, ServiceAccount, and security context as the
+Reuse the same published `image.tag`, DB Secret, ServiceAccount, and security context as the
 gateway Deployment so the Job cannot drift from the running release. Do not run
 overlapping `up` Jobs against the same database; the binary takes a migration
 lock, but one operator-owned Job at a time is the supported workflow.

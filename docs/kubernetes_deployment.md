@@ -72,6 +72,12 @@ is missing its `>=32`-char admin JWT secret, a dp install is missing
 `dp.cpGrpcUrls`, or an admin Service is requested without a non-loopback admin
 bind (which the binary hard-fails on in database/cp modes).
 
+Both `charts/ferrum-gateway` and `charts/ferrum-mesh` default an empty
+`image.tag` to `Chart.appVersion`. That tag must exist in the container
+registry before install. Override with a published tag on the command line or in
+your values file (for example `--set image.tag=<published-tag>`). The mutable
+`latest` tag exists for evaluation but must not be used in production.
+
 Per-mode quickstarts:
 
 ```bash

@@ -50,7 +50,7 @@
 {{- end }}
 {{- end }}
 {{- $nodeAgentImageRepository := toString (default .Values.image.repository .Values.nodeAgent.image.repository) -}}
-{{- $nodeAgentImageTag := toString (default .Values.image.tag .Values.nodeAgent.image.tag) -}}
+{{- $nodeAgentImageTag := include "ferrum-mesh.resolveImageTag" (dict "root" . "override" .Values.nodeAgent.image.tag) -}}
 {{- if and (eq (lower (toString .Values.nodeAgent.captureMode)) "ebpf") (not (hasSuffix "-ebpf" $nodeAgentImageTag)) -}}
 {{- $nodeAgentImageTag = printf "%s-ebpf" $nodeAgentImageTag -}}
 {{- end -}}
