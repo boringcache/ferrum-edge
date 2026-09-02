@@ -16,9 +16,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crossbeam_utils::CachePadded;
 
-/// Finite controller default projected onto every Gateway API `UDPRoute`
-/// listener that has no more specific valid policy.
-pub const GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR: f32 = 8.0;
+/// Finite response-amplification default applied to every UDP/DTLS proxy that
+/// has no more specific valid policy, regardless of configuration source.
+///
+/// `Proxy::normalize_fields()` projects this onto any UDP/DTLS proxy whose
+/// `udp_max_response_amplification_factor` is unset, so file, database, admin
+/// API, CP→DP, mesh, and Gateway API proxies all start bounded. Operators who
+/// genuinely need unlimited replies set the explicit `0` sentinel
+/// (`factor_is_unlimited`).
+pub const DEFAULT_UDP_AMPLIFICATION_FACTOR: f32 = 8.0;
 
 /// Inclusive ceiling for a finite amplification factor. Values above this are
 /// rejected at admission; protocols that need more must use the explicit
@@ -79,8 +85,34 @@ pub fn record_policy_unlimited() {
 }
 
 /// Whether `factor` is an admissible finite amplification ratio.
+///
+/// Deliberately excludes `0.0`: `udp_amplification_response_budget` relies on
+/// this predicate to fail closed to a zero budget, so the explicit-unlimited
+/// sentinel must never reach it as a "valid" ratio.
 pub fn factor_is_valid(factor: f32) -> bool {
     factor.is_finite() && factor > 0.0 && factor <= MAX_UDP_AMPLIFICATION_FACTOR
+}
+
+/// Whether `factor` is admissible at config validation for a UDP/DTLS proxy.
+///
+/// Accepts every finite ratio `factor_is_valid` accepts, plus the explicit
+/// unlimited sentinel `0`. Negatives, NaN, infinities, and values above
+/// `MAX_UDP_AMPLIFICATION_FACTOR` are still rejected.
+pub fn factor_is_valid_or_unlimited(factor: f32) -> bool {
+    factor == 0.0 || factor_is_valid(factor)
+}
+
+/// Whether a configured factor means "no amplification limit".
+///
+/// `None` is an un-normalized proxy (a test fixture or an internal
+/// constructor) that never had a budget; `Some(0.0)` is the operator's
+/// explicit opt-out. Both skip the response guard.
+#[inline]
+pub fn factor_is_unlimited(factor: Option<f32>) -> bool {
+    match factor {
+        None => true,
+        Some(configured) => configured == 0.0,
+    }
 }
 
 /// Maximum response payload allowed by the UDP amplification guard for one

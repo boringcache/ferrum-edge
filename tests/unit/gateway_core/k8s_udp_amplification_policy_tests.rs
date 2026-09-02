@@ -16,7 +16,7 @@ use ferrum_edge::k8s_controller::status::{
     FERRUM_GATEWAY_CONTROLLER_NAME, GatewayApiStatusUpdate, plan_gateway_api_status_updates,
 };
 use ferrum_edge::udp_amplification::{
-    GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR, UDP_AMPLIFICATION_POLICY_KIND,
+    DEFAULT_UDP_AMPLIFICATION_FACTOR, UDP_AMPLIFICATION_POLICY_KIND,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -439,7 +439,7 @@ fn translated_udproute_gets_finite_controller_default() {
     ];
     assert_eq!(
         translated_factor(&objects),
-        Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR)
+        Some(DEFAULT_UDP_AMPLIFICATION_FACTOR)
     );
     let (protected, reason, message) = route_protection_named(&objects, "dns");
     assert!(protected);
@@ -629,7 +629,7 @@ fn invalid_zero_factor_falls_back_to_default() {
     ];
     assert_eq!(
         translated_factor(&objects),
-        Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR)
+        Some(DEFAULT_UDP_AMPLIFICATION_FACTOR)
     );
     assert_eq!(route_protection_reason(&objects), "FiniteDefault");
 }
@@ -645,7 +645,7 @@ fn invalid_negative_and_excessive_factors_fall_back_to_default() {
         ];
         assert_eq!(
             translated_factor(&objects),
-            Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR),
+            Some(DEFAULT_UDP_AMPLIFICATION_FACTOR),
             "factor {factor} must not program the listener"
         );
     }
@@ -671,7 +671,7 @@ fn unlimited_without_ack_falls_back_to_default() {
     ];
     assert_eq!(
         translated_factor(&objects),
-        Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR)
+        Some(DEFAULT_UDP_AMPLIFICATION_FACTOR)
     );
 }
 
@@ -694,7 +694,9 @@ fn unlimited_with_ack_programs_none() {
             }),
         ),
     ];
-    assert_eq!(translated_factor(&objects), None);
+    // Explicit unlimited is encoded as the `0` sentinel so
+    // `Proxy::normalize_fields()` does not project the finite default over it.
+    assert_eq!(translated_factor(&objects), Some(0.0));
     assert_eq!(route_protection_reason(&objects), "ExplicitUnlimited");
 }
 
@@ -768,7 +770,7 @@ fn deleting_policy_returns_to_finite_default() {
     assert_eq!(translated_factor(&with_policy), Some(2.0));
     assert_eq!(
         translated_factor(&without_policy),
-        Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR)
+        Some(DEFAULT_UDP_AMPLIFICATION_FACTOR)
     );
 }
 
@@ -813,7 +815,7 @@ fn cross_namespace_policy_without_grant_falls_back_to_default() {
     ];
     let result = translate_k8s_objects(&objects, multi_namespace_options()).expect("ok");
     let factor = result.config.proxies[0].udp_max_response_amplification_factor;
-    assert_eq!(factor, Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR));
+    assert_eq!(factor, Some(DEFAULT_UDP_AMPLIFICATION_FACTOR));
 }
 
 #[test]
@@ -863,7 +865,7 @@ fn missing_target_does_not_unprogram_the_route() {
     ];
     assert_eq!(
         translated_factor(&objects),
-        Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR)
+        Some(DEFAULT_UDP_AMPLIFICATION_FACTOR)
     );
     let result = translate_k8s_objects(&objects, options()).expect("ok");
     assert_eq!(result.config.proxies.len(), 1);
@@ -896,7 +898,7 @@ fn assert_invalid_policy_falls_back(spec: Value, message: &str, forbidden: &str)
     ];
     assert_eq!(
         translated_factor(&objects),
-        Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR)
+        Some(DEFAULT_UDP_AMPLIFICATION_FACTOR)
     );
     assert_eq!(route_protection_reason(&objects), "FiniteDefault");
     let status = policy_status_named(&objects, "bad");
@@ -991,7 +993,7 @@ fn duplicate_canonical_target_refs_are_rejected() {
     ];
     assert_eq!(
         translated_factor(&objects),
-        Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR)
+        Some(DEFAULT_UDP_AMPLIFICATION_FACTOR)
     );
     let status = policy_status_named(&objects, "dup");
     assert!(!status.accepted);
@@ -1028,7 +1030,7 @@ fn typoed_gateway_section_falls_back_to_finite_default_and_is_rejected() {
     ];
     assert_eq!(
         translated_factor(&objects),
-        Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR)
+        Some(DEFAULT_UDP_AMPLIFICATION_FACTOR)
     );
     assert_eq!(route_protection_reason(&objects), "FiniteDefault");
     let status = policy_status_named(&objects, "typo");
@@ -1129,7 +1131,7 @@ fn conflicted_direct_policy_is_withdrawn_from_gatewayclass_lookup() {
     assert_eq!(translated_factor_on_port(&objects, 15353), Some(2.0));
     assert_eq!(
         translated_factor_on_port(&objects, 15354),
-        Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR)
+        Some(DEFAULT_UDP_AMPLIFICATION_FACTOR)
     );
     assert_eq!(
         route_protection_reason_named(&objects, "dns"),
@@ -1254,7 +1256,7 @@ fn atomic_multi_target_conflict_promotes_next_eligible_candidate() {
         assert_three_policy_cascade(&objects, &format!("order {order:?}"));
         assert_eq!(
             translated_factor_on_port(&objects, 15355),
-            Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR),
+            Some(DEFAULT_UDP_AMPLIFICATION_FACTOR),
             "order {order:?}: conflicted P1 must not win through GatewayClass.parametersRef"
         );
         let (on_c, reason_c, message_c) = route_protection_named(&objects, "c");
@@ -1339,15 +1341,9 @@ fn wildcard_parent_mixed_finite_and_default_reports_finite_default() {
             let alt_factor = translated_factor_on_port(&objects, 15354);
             if section == "dns" {
                 assert_eq!(dns_factor, Some(2.0));
-                assert_eq!(
-                    alt_factor,
-                    Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR)
-                );
+                assert_eq!(alt_factor, Some(DEFAULT_UDP_AMPLIFICATION_FACTOR));
             } else {
-                assert_eq!(
-                    dns_factor,
-                    Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR)
-                );
+                assert_eq!(dns_factor, Some(DEFAULT_UDP_AMPLIFICATION_FACTOR));
                 assert_eq!(alt_factor, Some(2.0));
             }
             let (protected, reason, message) = route_protection_named(&objects, "wild");
@@ -1574,11 +1570,7 @@ fn shared_port_unlimited_plus_default_stays_finite_default_regardless_of_order()
             )]
         },
         |objects, label| {
-            assert_shared_port_proxy_factor(
-                objects,
-                Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR),
-                label,
-            );
+            assert_shared_port_proxy_factor(objects, Some(DEFAULT_UDP_AMPLIFICATION_FACTOR), label);
             assert_both_shared_parents_protection(objects, true, "FiniteDefault", label);
         },
     );
@@ -1601,7 +1593,7 @@ fn shared_port_differing_finite_policies_choose_smaller_factor() {
 }
 
 #[test]
-fn shared_port_all_explicit_unlimited_is_only_none_case() {
+fn shared_port_all_explicit_unlimited_is_only_unlimited_sentinel_case() {
     for_each_shared_port_order(
         || {
             vec![
@@ -1610,7 +1602,7 @@ fn shared_port_all_explicit_unlimited_is_only_none_case() {
             ]
         },
         |objects, label| {
-            assert_shared_port_proxy_factor(objects, None, label);
+            assert_shared_port_proxy_factor(objects, Some(0.0), label);
             assert_both_shared_parents_protection(objects, false, "ExplicitUnlimited", label);
         },
     );
@@ -1643,7 +1635,7 @@ fn shared_port_route_unlimited_applies_to_every_claim() {
             ]
         },
         |objects, label| {
-            assert_shared_port_proxy_factor(objects, None, label);
+            assert_shared_port_proxy_factor(objects, Some(0.0), label);
             assert_both_shared_parents_protection(objects, false, "ExplicitUnlimited", label);
         },
     );

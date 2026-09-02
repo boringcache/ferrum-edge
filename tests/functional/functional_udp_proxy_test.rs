@@ -913,6 +913,124 @@ plugin_configs: []
     response_server.abort();
 }
 
+/// Issue #4515: a hand-authored `udp` proxy that names NO amplification factor
+/// is bounded, not an open reflector. `Proxy::normalize_fields()` projects the
+/// finite default (`8.0`) onto every configuration source, so a 4-byte request
+/// buys a 32-byte reply budget and a 16 KiB backend response is dropped.
+#[ignore]
+#[tokio::test]
+async fn test_udp_proxy_without_explicit_factor_bounds_amplification_by_default() {
+    let backend_port = 19840u16;
+    let proxy_port = 19841u16;
+    let gateway_http_port = 18224u16;
+
+    let large_response = vec![b'z'; 16384];
+    let response_server =
+        start_udp_fixed_response_server(backend_port, large_response.clone()).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    write_config(
+        &config_path,
+        &format!(
+            r#"
+version: "1"
+proxies:
+  - id: "udp-default-amplification-guard"
+    listen_port: {proxy_port}
+    backend_scheme: udp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+
+consumers: []
+plugin_configs: []
+"#
+        ),
+    );
+
+    let mut gateway =
+        start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
+    sleep(Duration::from_secs(3)).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client
+        .connect(format!("127.0.0.1:{}", proxy_port))
+        .await
+        .unwrap();
+
+    let mut buf = vec![0u8; 65535];
+    client.send(b"tiny").await.expect("Failed to send");
+    let dropped = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf)).await;
+    assert!(
+        dropped.is_err(),
+        "a udp proxy with no explicit factor must still bound the reply: a 4-byte request \
+         cannot draw a 16 KiB response"
+    );
+
+    shutdown_gateway(&mut gateway);
+    response_server.abort();
+}
+
+/// Mirror of the above: `udp_max_response_amplification_factor: 0` is the
+/// explicit operator opt-out, so the same oversized reply is delivered.
+#[ignore]
+#[tokio::test]
+async fn test_udp_proxy_zero_factor_sentinel_disables_the_amplification_guard() {
+    let backend_port = 19842u16;
+    let proxy_port = 19843u16;
+    let gateway_http_port = 18225u16;
+
+    let large_response = vec![b'z'; 16384];
+    let response_server =
+        start_udp_fixed_response_server(backend_port, large_response.clone()).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    write_config(
+        &config_path,
+        &format!(
+            r#"
+version: "1"
+proxies:
+  - id: "udp-unlimited-amplification"
+    listen_port: {proxy_port}
+    backend_scheme: udp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    udp_max_response_amplification_factor: 0
+
+consumers: []
+plugin_configs: []
+"#
+        ),
+    );
+
+    let mut gateway =
+        start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
+    sleep(Duration::from_secs(3)).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client
+        .connect(format!("127.0.0.1:{}", proxy_port))
+        .await
+        .unwrap();
+
+    let mut buf = vec![0u8; 65535];
+    client.send(b"tiny").await.expect("Failed to send");
+    let n = tokio::time::timeout(Duration::from_secs(5), client.recv(&mut buf))
+        .await
+        .expect("explicitly unlimited reply timed out")
+        .expect("recv error");
+    assert_eq!(
+        &buf[..n],
+        large_response.as_slice(),
+        "the 0 sentinel must deliver the oversized reply the finite default would drop"
+    );
+
+    shutdown_gateway(&mut gateway);
+    response_server.abort();
+}
+
 /// Test 6: DTLS backend — send plain UDP datagrams through the gateway,
 /// which encrypts them via DTLS to a DTLS echo server backend.
 ///
