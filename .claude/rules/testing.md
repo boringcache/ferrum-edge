@@ -105,9 +105,12 @@ paths:
   `docs/fuzz.md` for budgets, corpora policy, and crash promotion.
 - Ordinary full-mode PR CI runs the deterministic `Fuzz Smoke` property gate
   (`cargo test --locked` in `fuzz/`) in `.github/workflows/ci.yml`.
-- The six-target bounded sanitizer smoke (`-runs=512`, `-max_total_time=8`,
-  `-max_len=4096`) runs on `merge_group`, push to `main`, and manual
-  `workflow_dispatch` of `ci.yml`, not on `pull_request`.
+- The bounded sanitizer smoke runs on push to `main` and manual
+  `workflow_dispatch` of `ci.yml` only -- not on `pull_request` (#3902, cost)
+  and not on `merge_group` (#4238, blast radius). Six targets run at
+  `-runs=512`, `-max_total_time=8`, `-max_len=4096`; `datagram_client_address`
+  runs as its own invocation at the same bounds with `-max_len=65536`, its
+  documented 64 KiB budget (#4442).
 - `Swatinem/rust-cache` `save-if` for that job is strictly a push to `main`;
   pull_request, fork, merge_group, and workflow_dispatch never publish a
   `fuzz-smoke` cache.
