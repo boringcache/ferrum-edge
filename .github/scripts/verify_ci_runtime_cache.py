@@ -5337,7 +5337,7 @@ def self_test() -> int:
     )
 
     scalar_count_decoy = real_fips.replace(
-        "    branches: [main]\n",
+        "    branches:\n      - main\n",
         "    branches:\n"
         "      - main\n"
         "      - |\n"

@@ -81,8 +81,8 @@ Pull Request / Merge Queue group
                     ├─► Unit+inline-lib / integration-shard / functional-shard tests
                     ├─► Planner-gated Secret Backends / PKCS#11 SoftHSM jobs
                     ├─► Lint, dependency audit, vendored regressions
-                    ├─► Fuzz smoke (property budgets on PRs; the six-target
-                    │   libFuzzer budget on merge_group / push to main / manual)
+                    ├─► Fuzz smoke (property budgets on PRs; the seven-target
+                    │   libFuzzer budget on push to main / manual)
                     ├─► Per-suite eBPF kernel / netns-capture / two-cluster live checks when planner marks relevant
                     ├─► Planner-gated Helm / eBPF / Secret Backends / PKCS#11 / performance gates
                     └─► Five target release builds
@@ -105,9 +105,9 @@ Push to main
 
 ### Required checks and merge queue
 
-Branch protection / repository rulesets for `main` must require these eight
+Branch protection / repository rulesets for `main` must require these nine
 GitHub Actions check names (exact spelling; source app is **GitHub Actions**,
-app id `15368`). The same eight are the publish-blocking set: see
+app id `15368`). The same nine are the publish-blocking set: see
 [Publish-blocking required checks](#publish-blocking-required-checks).
 
 | Required check name | Owning workflow | Owning job |
@@ -120,6 +120,7 @@ app id `15368`). The same eight are the publish-blocking set: see
 | `Multicluster Federation Live` | `.github/workflows/multicluster-federation-live.yml` | `gate` |
 | `Multicluster Poller Partition Live` | `.github/workflows/multicluster-poller-partition-live.yml` | `gate` |
 | `Ambient Host UDP Live` | `.github/workflows/ambient-host-udp-live.yml` | `gate` |
+| `FIPS Build & Test` | `.github/workflows/fips-build.yml` | `fips-build` |
 
 The launch-readiness governance lane (`launch-readiness.yml`,
 `launch-integrity.yml`, `launch-advisory-trust.yml`, their verifiers, the blocker
@@ -167,8 +168,8 @@ under `pull_request_target` and rejects any change to
 `.github/scripts/verify_cross_build_policy.py`. Consequences for operators:
 
 - Do **not** follow the common "trigger required checks on `merge_group` only"
-  advice for these eight owners. Every owner must keep reporting on the pull
-  request as well, and all eight must stay *required* so a failing PR-side check
+  advice for these nine owners. Every owner must keep reporting on the pull
+  request as well, and all nine must stay *required* so a failing PR-side check
   blocks queue entry. `verify_required_ci.py` enforces both the `merge_group`
   trigger and an unfiltered `pull_request` / `pull_request_target` trigger for
   each owner.
@@ -178,26 +179,30 @@ under `pull_request_target` and rejects any change to
   against its own base before being queued, which is what keeps the payload
   base usable as a trusted baseline.
 
-**Live admin / no-bypass posture (root-owned repository settings; verified
-2026-08-05):** classic branch protection and ruleset `20208307` both require all
-eight GitHub Actions checks above. Classic protection enforces administrators.
-The active ruleset has no bypass actors, blocks force pushes and deletion,
-requires one approval with stale approvals dismissed on push, resolves review
-threads, and validates the combined result through the merge queue. The owner
-intentionally disabled GitHub's "approval of the most recent reviewable push by
-someone other than the pusher" rule (`require_last_push_approval=false`), so do
-not document or re-enable that distinct restriction without an explicit settings
-decision.
+**Live admin / no-bypass posture (root-owned repository settings; re-applied
+and re-verified 2026-09-01, issue #4445):** classic branch protection and
+ruleset `20208307` both require all nine GitHub Actions checks above, including
+`FIPS Build & Test`. Classic protection enforces administrators
+(`enforce_admins=true`); it previously did not, and it previously required only
+seven contexts. The active ruleset has no bypass actors -- the standing
+`OrganizationAdmin` / `bypass_mode: always` actor is removed, not narrowed --
+and it blocks force pushes and deletion, requires one approval with stale
+approvals dismissed on push, resolves review threads, and validates the combined
+result through the merge queue. The pull-request and merge-queue parameters are
+unchanged by this settings edit. The owner intentionally disabled GitHub's
+"approval of the most recent reviewable push by someone other than the pusher"
+rule (`require_last_push_approval=false`), so do not document or re-enable that
+distinct restriction without an explicit settings decision.
 
 After any future settings edit, re-query both protection APIs and confirm the
-eight exact check names, GitHub Actions app id `15368`, admin enforcement, empty
+nine exact check names, GitHub Actions app id `15368`, admin enforcement, empty
 bypass list, pull-request parameters, and merge-queue parameters. Exercise a
 queued PR to prove every required owner reports on the synthesized SHA.
 
 `.github/scripts/verify_required_ci.py` statically enforces merge_group
 triggers, unfiltered `pull_request` / `pull_request_target` triggers,
 check-name parity, event-aware SHA/base markers, and concurrency markers for
-all eight owners.
+all nine owners.
 
 ### Publish-blocking required checks
 
@@ -223,6 +228,7 @@ and display name, the owning job, how the `main` publishing path carries it
 | `Multicluster Federation Live` | `multicluster-federation-live.yml` | `publication_gate_job` | `push_main` |
 | `Multicluster Poller Partition Live` | `multicluster-poller-partition-live.yml` | `publication_gate_job` | `push_main` |
 | `Ambient Host UDP Live` | `ambient-host-udp-live.yml` | `publication_gate_job` | `push_main` |
+| `FIPS Build & Test` | `fips-build.yml` | `publication_gate_job` | `push_main` |
 
 #### Why the `main` path has two halves
 
@@ -231,7 +237,7 @@ and display name, the owning job, how the `main` publishing path carries it
 `.github/scripts/verify_cross_build_policy.py`, a protected trusted-policy file
 **no pull request may modify**. Its polling array therefore keeps carrying three
 contexts, while `Tests` is carried by the publishing jobs' direct in-run
-dependency. The remaining four are carried by a second job,
+dependency. The remaining five are carried by a second job,
 `main-publication-required-checks`, hosted in `gateway-api-conformance.yml` --
 a workflow whose *run conclusion* the frozen array already requires to be
 successful for the exact SHA before anything publishes. A failure there makes
@@ -994,14 +1000,15 @@ and accepts the planned heavy jobs as skipped. Pushes to `main` publish the
 `latest` prerelease and Docker images only after the full aggregate and build
 matrix pass.
 
-Branch protection must require eight independent PR **and** merge-queue checks:
+Branch protection must require nine independent PR **and** merge-queue checks:
 the unchanged `Tests` aggregate from `ci.yml`, `Merge Coverage` from
 `coverage.yml`, `Gateway API Conformance` from `gateway-api-conformance.yml`,
 `Mesh E2E Sidecar Live` from `mesh-e2e-sidecar-live.yml`,
 `Multicluster Federation Live` from `multicluster-federation-live.yml`,
 `Multicluster Poller Partition Live` from
 `multicluster-poller-partition-live.yml`,
-`Ambient Host UDP Live` from `ambient-host-udp-live.yml`, and
+`Ambient Host UDP Live` from `ambient-host-udp-live.yml`,
+`FIPS Build & Test` from `fips-build.yml`, and
 `Trusted Cross Build Policy` from `cross-build-policy.yml`. Each dedicated
 workflow triggers on every pull request and on `merge_group`, and fails closed
 on planning or validation failures. They are required directly rather than
@@ -2513,11 +2520,11 @@ shapes and nothing else:
   1024 MiB RSS cap leaves bounded headroom above the roughly 400 MiB baseline
   of the fully linked, sanitizer-instrumented fuzz binaries.
 
-  Because a whole-job freeze cannot express an edit, issue #3902's change of
-  *where* each half of the lane runs is admitted as two byte-frozen
-  **generations** with a one-way transition between them
-  (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first) — the same shape as the
-  admitted `release.yml` image-family adoption. See
+  Because a whole-job freeze cannot express an edit, a change to *where* each
+  half of the lane runs (#3902, #4238) or to *which targets* the budget covers
+  (#4442) is admitted as two byte-frozen **generations** with a one-way
+  transition between them (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first) — the
+  same shape as the admitted `release.yml` image-family adoption. See
   [Admitted `fuzz-smoke` lane-split generation](#admitted-fuzz-smoke-lane-split-generation).
 - `FUZZ_WORKFLOW` — the whole of `.github/workflows/fuzz.yml`. A repository
   that has not adopted it may omit it; once the trusted base carries it, a pull
@@ -2576,60 +2583,84 @@ unreviewed place to set a target linker, runner, or rustflags.
 
 ###### Admitted `fuzz-smoke` lane-split generation
 
-`Fuzz Smoke` was the longest job in required pull-request CI — roughly 47
-minutes — and roughly 46 of those minutes were compilation. The six
-sanitizer-instrumented libFuzzer targets were rebuilt from scratch on every
-pull request, because the retired generation cleared `RUSTC_WRAPPER` /
-`CARGO_BUILD_RUSTC_WRAPPER` and installed no compiler cache, to buy about 48
-seconds of actual fuzzing (issue #3902).
+The whole job is frozen, so neither moving the lane nor extending its target
+list can be an edit. `CI_FUZZ_SMOKE_JOB_GENERATIONS` therefore lists the job's
+admitted texts oldest first, and a generation retires once its successor is on
+`main`. The pair currently carries issue #4442.
 
-The whole job is frozen, so this could not be an edit. `CI_FUZZ_SMOKE_JOB_GENERATIONS`
-therefore lists the job's admitted texts oldest first:
+- `CI_FUZZ_SMOKE_RETIRED_JOB` — the shape issue #4238 landed. `Fuzz Smoke` had
+  been the longest job in required pull-request CI (roughly 47 minutes, of which
+  roughly 46 were compilation) because the six sanitizer-instrumented libFuzzer
+  targets were rebuilt from scratch on every pull request to buy about 48
+  seconds of actual fuzzing. #3902 moved that budget off the pull-request path
+  and added the checksum-pinned `setup-sccache` compiler cache; #4238 moved it
+  off `merge_group` as well, because a hosted-runner reclamation (`exit 143`)
+  inside the ~38-minute window ejected the queue entry and cascaded a rebuild of
+  everything behind it with no defect in the ejected change. In this shape the
+  deterministic property smoke is the required `pull_request` and `merge_group`
+  gate, and the six-target bounded budget runs on the push to `main` and on
+  `workflow_dispatch` only.
+- `CI_FUZZ_SMOKE_JOB` — the adopted shape (#4442): identical, plus a seventh
+  bounded libFuzzer invocation for `datagram_client_address`.
 
-- `CI_FUZZ_SMOKE_RETIRED_JOB` — the shape issue #2461 landed: property smoke and
-  the six-target libFuzzer budget on every full-mode pull request, with compiler
-  caching explicitly disabled.
-- `CI_FUZZ_SMOKE_JOB` — the adopted shape:
-  - the property smoke runs the same `cargo test --locked` and is still the
-    required full-mode pull-request gate; only a duration line was added around
-    it;
-  - the six-target bounded budget carries `if: github.event_name != 'pull_request'`,
-    so it runs on `merge_group`, on the push to `main`, and on
-    `workflow_dispatch` (added to the job's own `if:`). Nothing reaches `main`
-    without it, and the merge queue still runs it before merge;
-  - the run itself is byte-identical across generations. The self-test asserts
-    `CI_FUZZ_SMOKE_BOUNDED_BUDGET` — the six `Fuzz smoke target:` markers, the
-    `cargo fuzz run --codegen-units 16` invocation, and `-runs=512`,
-    `-max_total_time=8`, `-max_len=4096`, `-timeout=2`, `-rss_limit_mb=1024` —
-    appears exactly once in every generation, so a generation cannot move the
-    lane and relax it in the same change;
-  - compiler caching is admitted through the repository's own
-    `./.github/actions/setup-sccache`, the single local action the contract
-    permits. That action installs a checksum-pinned sccache release, never
-    enables the credential-bearing sccache GHA backend, never persists
-    `ACTIONS_RUNTIME_TOKEN` / `ACTIONS_RESULTS_URL` into later
-    pull-request-controlled steps, asserts those variables are absent before any
-    build runs, and clears the wrapper entirely if the install fails. Local
-    actions are not exempt from the policy: `validate_action_collection` and
-    `compare_pr_action_collection` reject a Cross executable or configuration
-    input in any of them, and the action's own surfaces are attributed to
-    `actions/<name>`, never withheld with the job's;
-  - the job therefore no longer pins `RUSTC_WRAPPER` at job level — a job-level
-    `env` entry would override the installer's fail-closed `GITHUB_ENV`
-    decision — while `RUSTFLAGS: ""` stays, because the root Cargo
-    configuration still selects a mold linker this lane does not install;
-  - the sccache directory is persisted by the pinned `Swatinem/rust-cache` step
-    under `save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}`
-    and nothing else. That predicate is the cache-quota control: `pull_request`
-    (same-repository PR refs and forks), `merge_group`, and `workflow_dispatch`
-    may restore a `fuzz-smoke` cache but cannot publish one. The retired
-    generation had no `save-if`, so a full-mode predecessor PR could still mint
-    a PR-ref `fuzz-smoke` entry; the adopted job cannot create another;
-  - telemetry: the job prints `Fuzz property smoke seconds`, `Fuzz sanitizer
-    lane seconds`, sccache statistics before and after the sanitizer build, the
-    lane shape it took, and the on-disk cache size — so a hosted log shows
-    whether the sanitizer build actually reused work, and warns explicitly when
-    sccache was unavailable.
+  That target parses the Datagram PROXY v2 envelope — address block, the `0xE0`
+  authentication-tag and `0xE1` freshness TLVs, and the freshness value — on
+  attacker-controlled UDP input, entirely **before** the MAC decision. It had
+  been registered, corpus-seeded, and property-tested since #3289/#3862, but
+  neither libFuzzer lane executed it, so no lane was actually fuzzing that
+  parser.
+
+  It is invoked on its own rather than appended to the six-target loop because
+  its documented input budget is 64 KiB (`fuzz_support::MAX_FUZZ_INPUT_BYTES`),
+  not the loop's 4 KiB. The scheduled `fuzz.yml` lane runs every target at
+  `-max_len=65536`; running this one at 4 KiB here would leave the same parser's
+  length boundaries reachable in one required lane and unreachable in the other.
+  Every other bound — `-runs=512`, `-max_total_time=8`, `-timeout=2`,
+  `-rss_limit_mb=1024` — is byte-identical to the loop's, so the budget is
+  widened by one target rather than relaxed.
+
+What is invariant across both generations:
+
+- the property smoke runs the same `cargo test --locked` and is the required
+  full-mode `pull_request` and `merge_group` gate;
+- the six-target loop is byte-identical. The self-test asserts
+  `CI_FUZZ_SMOKE_BOUNDED_BUDGET` — the six `Fuzz smoke target:` markers, the
+  `cargo fuzz run --codegen-units 16` invocation, and `-runs=512`,
+  `-max_total_time=8`, `-max_len=4096`, `-timeout=2`, `-rss_limit_mb=1024` —
+  appears exactly once in every generation, so a generation can never move or
+  extend the lane and relax its bounds in the same change;
+- the seventh invocation is frozen the same way in the adopted generation only.
+  `CI_FUZZ_SMOKE_DATAGRAM_BUDGET` must appear exactly once in
+  `CI_FUZZ_SMOKE_JOB` and never in `CI_FUZZ_SMOKE_RETIRED_JOB`, and the
+  self-test separately asserts its 64 KiB `-max_len` and each shared bound;
+- the bounded budget is gated by an **allow-list** —
+  `if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'`
+  — not by excluding events. The self-test rejects a `!=` form outright;
+- compiler caching is admitted only through the repository's own
+  `./.github/actions/setup-sccache`, the single local action the contract
+  permits. That action installs a checksum-pinned sccache release, never enables
+  the credential-bearing sccache GHA backend, never persists
+  `ACTIONS_RUNTIME_TOKEN` / `ACTIONS_RESULTS_URL` into later
+  pull-request-controlled steps, asserts those variables are absent before any
+  build runs, and clears the wrapper entirely if the install fails. Local
+  actions are not exempt from the policy: `validate_action_collection` and
+  `compare_pr_action_collection` reject a Cross executable or configuration
+  input in any of them, and the action's own surfaces are attributed to
+  `actions/<name>`, never withheld with the job's;
+- the job does not pin `RUSTC_WRAPPER` at job level — a job-level `env` entry
+  would override the installer's fail-closed `GITHUB_ENV` decision — while
+  `RUSTFLAGS: ""` stays, because the root Cargo configuration still selects a
+  mold linker this lane does not install;
+- the sccache directory is persisted by the pinned `Swatinem/rust-cache` step
+  under `save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}`
+  and nothing else. That predicate is the cache-quota control: `pull_request`
+  (same-repository PR refs and forks), `merge_group`, and `workflow_dispatch`
+  may restore a `fuzz-smoke` cache but cannot publish one;
+- telemetry: the job prints `Fuzz property smoke seconds`, `Fuzz sanitizer lane
+  seconds`, sccache statistics before and after the sanitizer build, the lane
+  shape it took, and the on-disk cache size — so a hosted log shows whether the
+  sanitizer build actually reused work, and warns explicitly when sccache was
+  unavailable.
 
 The transition is exact on both ends and one-way. `admitted_fuzz_smoke_errors`
 accepts a `fuzz-smoke` job only at one of these two texts (or absent);
@@ -2637,13 +2668,19 @@ accepts a `fuzz-smoke` job only at one of these two texts (or absent);
 generation. That direction check is load-bearing rather than decorative: every
 admitted generation is withheld from *both* sides of the surface comparison, so
 the digest comparison alone would accept a revert. The self-test drives the full
-transition through `compare_pr_workflow_job` in both directions, re-runs all
-thirteen shared tamper mutations against every generation, and adds seven
-mutations covering exactly what #3902 introduced — restoring the sanitizer
-budget to pull requests, dropping it from the merge queue, skipping the property
-gate on pull requests, allowing untrusted cache writes, substituting an
-unpinned third-party sccache installer, enabling the credential-bearing GHA
-backend, and widening the cached directory.
+transition through `compare_pr_workflow_job` in both directions, re-runs every
+shared tamper mutation against each generation, and adds adopted-generation
+mutations covering what #3902, #4238, and #4442 introduced — restoring the
+sanitizer budget to pull requests, dropping it from the push to `main`,
+re-adding it to the merge queue, skipping the property gate on pull requests,
+allowing untrusted cache writes, substituting an unpinned third-party sccache
+installer, enabling the credential-bearing GHA backend, widening the cached
+directory, deleting the `datagram_client_address` invocation, re-bounding it to
+the generic 4 KiB ceiling, and pointing it at a target the loop already covers.
+
+The scheduled lane's own contract carries the same target inventory: the
+`fuzz.yml` freeze includes `datagram_client_address` in both the matrix and the
+shell allowlist, and the self-test rejects a revision that drops it from either.
 
 The aggregate wiring is unaffected: this is still one job named `fuzz-smoke`,
 so `CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS` and the `require_success "Fuzz Smoke"`
@@ -2815,8 +2852,6 @@ relaxing the scan, the trusted policy admits exact retired→adopted pairs
 | `ebpf-live` | `b7596b48641c850f797c84710dd5646013414d6ba01c30f4d4b2805737c8c26c` | `9aa3332bff5c4538f797f31133be0ef7dfc9767a72e7212b39be33ed58dcca87` | PR #3915 / issue #3900 |
 | `netns-capture-live` | `db543d5c35bfbd4a7b987a52635b359ea6268669257cd313146324f5ca79f598` | `b71296ba5929c78cd786301cc8ed677905cca82cd605be46880021b88c243e32` | PR #3915 / issue #3900 |
 | `two-cluster-mesh-live` | `0586ab0b5b8b803f2ee3663b608c40caca06f9c92e58d4cb28c2080d68f23f27` | `9c3d5b4dfbc6a209e801a47bceabd31fe8aa7df033d49989ad8f88a3e4ed73e7` | PR #3915 / issue #3900 |
-| `build-binaries` | `14b0890e2693cd0825fcf25ba7f48810b5ae9a33f2cbb5751bdaaf60186b83b1` | `6561ef8614337be946f0a68d8f1f3ef94c2897c5acd266157c15b4d90fdc3240` | PR #4355 / issue #4301 |
-| `build-release-binaries` (`release.yml`) | `678699fb04a2319c5b7b706c8fdf05f0d4b58a30d07e023091499d27a88bbb9f` | `55489ade23f4e15fe047bca88fc18b4a1bd9e000605e99263715df630434b591` | PR #4355 / issue #4301 |
 
 The three `#3915` pairs admit the per-suite planner-gate split (the union
 `run_ebpf_live` output becomes `run_ebpf_kernel_live` /
@@ -2830,32 +2865,14 @@ PR #3916's `build-binaries` pair is retired: its destination is main's live
 value, so the tuple admitted a transition between two states `main` is not in
 and only widened what a pull request could claim.
 
-The two #4355 pairs are the published GNU runtime-floor repair (issue #4301).
-`release.yml` has no separate table: `compare_pr_workflow_job` consults
-`CI_JOB_GENERATION_TRANSITIONS` for both protected workflows, and the binding
-includes the job name, so a `release.yml` job is admitted here by name. Each
-pair moves the ONE matrix cell that produces
-`binary-x86_64-unknown-linux-gnu` / `release-binaries-x86_64-unknown-linux-gnu`
-from a native `ubuntu-latest` `cargo build` — whose moving glibc defined the
-published runtime floor — to the digest-pinned AlmaLinux 8.10 sysroot builder,
-and adds an ABI/oldest-baseline gate over the staged, checksummed assets the
-job is about to upload. No `needs` edge, artifact name, publishing job, or
-other matrix cell moves.
-
-Withholding a digest surface is not enough on its own, so the destination is
-additionally held to `linux_gnu_producer_contract_errors`, an absolute check
-on the proposed revision. Once the repository references
-`.github/scripts/build_linux_gnu_sysroot.sh`, that check requires the producer
-job to run the pinned builder under
-`matrix.target == 'x86_64-unknown-linux-gnu'`, to exclude that target from
-every publishing native compile, to ABI-scan and smoke
-`release-assets/ferrum-{edge,cni}-linux-x86_64` before `Upload artifacts`,
-never to hand the scanner a `target/x86_64-unknown-linux-gnu/...` build-tree
-path, and to be the only job that uploads the canonical artifact name. A
-revision that predates the builder is unaffected, so the trusted-policy
-predecessor can land before the workflow change. Returning either producer to
-its retired native text is refused outright by
-`ci_job_generation_transition_errors`, which is what makes the move one-way.
+PR #4355's `build-binaries` / `build-release-binaries` pairs (issue #4301) are
+retired for the same reason, and more strongly: both destinations landed on
+`main`, and the issue #4423 predecessor has since moved both jobs again on
+`main` directly, so neither end of either pair is a state `main` is in.
+Keeping them would only widen what a pull request may claim. Both producers
+are held to `main`'s own text by the ordinary whole-job surface comparison,
+and absolutely by `linux_gnu_producer_contract_errors` — see the standing
+contract below.
 
 Each digest is the SHA-256 of `extract_job_block` text. Both ends are exact, the
 binding includes the job name, the move is one-way, and only that job's
@@ -2878,6 +2895,81 @@ predecessor; if hosted Cross disagrees after a latest-`main` merge, they need
 their own exact pair rather than a wildcard. Coverage planning (`#3917`) is
 admitted, but in the workflow-directory table below because `coverage.yml` is
 not a protected workflow.
+
+##### Published x86_64 GNU producer contract (standing)
+
+`linux_gnu_producer_contract_errors` is an ABSOLUTE check on the proposed
+revision, not a comparison against the trusted base, and it is permanent
+rather than a transition admission. It binds as soon as the repository
+references `.github/scripts/build_linux_gnu_sysroot.sh`, so a revision that
+predates the builder is unaffected and the trusted-policy predecessor could
+land before the workflow change.
+
+For each of the two producers — `build-binaries` in `ci.yml` and
+`build-release-binaries` in `release.yml` (`release.yml` has no separate table
+or contract of its own: the binding includes the job name, so a `release.yml`
+job is named here directly) — the check requires the job to:
+
+- run the pinned sysroot builder exactly once, under
+  `matrix.target == 'x86_64-unknown-linux-gnu'`;
+- exclude that target from every publishing native compile;
+- ABI-scan and smoke `release-assets/ferrum-{edge,cni}-linux-x86_64` before
+  `Upload artifacts`;
+- never hand the scanner a `target/x86_64-unknown-linux-gnu/...` build-tree
+  path;
+- be the only job that uploads the canonical artifact name;
+- pin the sysroot image, the protoc archive digest, and both baseline smoke
+  images in its job-level `env:`, to the literals the trusted policy hardcodes
+  (issue #4423 — see "GNU sysroot identity pins" below);
+- set `persist-credentials: false` on its `actions/checkout` step (issue
+  #4423): the job bind-mounts the whole workspace read-write into a root
+  container that installs packages and runs every dependency's `build.rs`, so
+  the checkout must not leave `http.https://github.com/.extraheader` in
+  `.git/config`.
+
+##### GNU sysroot identity pins (issue #4423)
+
+`.github/linux-gnu-abi.toml` names the container image that compiles the
+published x86_64 GNU binaries and the protoc archive that image executes as
+`build.rs`'s code generator. That file is pull-request-editable, and
+`verify_linux_gnu_abi.py` — which reads it — runs from the pull request's own
+checkout. Before issue #4423 the only constraint on the image reference was
+that *some* `@sha256:` digest was present, and the only constraint on
+`protoc_url` was that its archive hashed to the 64-character hex string the
+same pull request supplied. A merged change to
+`image = "ghcr.io/<attacker>/almalinux@sha256:…"` would have produced the
+released `ferrum-edge-linux-x86_64` / `ferrum-cni-linux-x86_64` bytes, their
+`.sha256` sidecars, the moving `latest` prerelease, and the default container
+images, with every gate green.
+
+The identity now lives in the trusted base, in two places that must agree:
+
+1. Each producer job pins `LINUX_GNU_SYSROOT_IMAGE`,
+   `LINUX_GNU_PROTOC_SHA256`, `LINUX_GNU_SMOKE_FLOOR_IMAGE`, and
+   `LINUX_GNU_SMOKE_UBUNTU2204_IMAGE` in its own job-level `env:`.
+   `build_linux_gnu_sysroot.sh` and `smoke_linux_gnu_baseline.sh` already
+   refuse to run when those disagree with the TOML, so a pull request that
+   edits the contract file alone breaks the build. The literals themselves are
+   held to the trusted constants by `linux_gnu_producer_contract_errors`, an
+   absolute check — so a pull request that moves the TOML **and** the matching
+   `env:` pin together is refused on the `env:` half.
+2. `linux_gnu_contract_pin_errors` re-validates `.github/linux-gnu-abi.toml`
+   itself against the same constants. It reads the file through
+   `--linux-gnu-contract`, whose default resolves inside the
+   `cross-build-policy.yml` checkout — the pinned trusted base — because
+   asking the contract file to certify itself from the pull request's tree is
+   the defect being closed. The build image, both baseline smoke images, and
+   the protoc archive digest are compared for exact equality (an unqualified
+   Docker Hub reference, so equality also refuses a registry-host prefix and a
+   renamed repository), and `protoc_url` must start with
+   `https://github.com/protocolbuffers/protobuf/releases/download/`.
+
+A deliberate image or protoc bump is consequently a direct-to-`main`
+predecessor: the constants in `verify_cross_build_policy.py`, the two producer
+`env:` blocks, and the TOML all move in one commit. The policy's `--self-test`
+drives both halves with fixtures: a producer missing the pins or the
+credential-free checkout, and a contract file with a substituted digest,
+registry, repository, protoc host, or smoke image.
 
 ##### Admitted workflow-directory job SHA-256 generation transitions (temporary)
 
@@ -2969,7 +3061,7 @@ not close them.
 
 **Runs**: `ubuntu-latest`
 
-On pushes to `main`, the `main-publish-gate` job runs after the native build matrix and the `Tests` aggregate, then waits for successful same-commit push runs of the frozen three-workflow polling array (Coverage, Gateway API Conformance, and Mesh E2E Sidecar Live Datapath). Each requirement is queried through its canonical workflow-file endpoint and accepted only when the server-reported workflow path, display name, commit SHA, `push` event, and `main` branch all match. A different workflow that reuses the display name therefore cannot satisfy a missing canonical run, and every matching canonical run must conclude `success`, so one passing duplicate cannot mask a failed run of the same workflow for the same commit. A missing, still-running, failed, cancelled, stale, malformed, identity-mismatched, or timed-out dedicated run fails the gate closed. Each Actions API query receives up to three bounded attempts with short backoff; exhausting those attempts also fails closed. The gate polls for at most 60 minutes inside a 75-minute job timeout, runs only on `main` pushes so it never holds a runner on a pull request, and grants only `actions: read` because it checks out no code. The protected Cross verifier freezes the complete gate job and rejects workflow-wide run defaults that could alter a protected publishing shell's failure semantics, while the required-CI verifier independently pins the gate's exact digest, checks the three workflow file/name bindings and their unconditional `main` push triggers, and validates the publisher dependencies. Comments cannot stand in for executable gate fields, and changing the gate or either publishing dependency requires a trusted-base update. Publication of the mutable `latest` release and the `latest` / `main-<sha>` Docker tags additionally requires the `Gateway API Conformance` run to succeed via its embedded `main-publication-required-checks` job, which enforces the remaining four publish-blocking contexts in the complete eight-check inventory (see [Publish-blocking required checks](#publish-blocking-required-checks)). The `latest-release` job and the per-architecture Linux Docker publishing job keep their direct dependencies on the `Tests` aggregate, the native build matrix, and the protected `build-arm64-cross` job, and additionally require a successful `main-publish-gate`; they can run in parallel only once all four succeed. The `docker-manifest` job runs after the Docker digests are pushed. A Docker failure on `main` does not block replacing the `latest` prerelease, but neither publish path can start until every inventoried publish-blocking check passes for the exact SHA. Version-tag releases are stricter and gate GitHub Release creation on `docker-manifest`. Docker Hub publishing requires the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets. GHCR publishing uses `GITHUB_TOKEN` and the job-level `packages: write` permission. The Docker manifests publish both `latest` and `main-<sha>` tags (where `<sha>` is the full commit SHA from `github.sha`).
+On pushes to `main`, the `main-publish-gate` job runs after the native build matrix and the `Tests` aggregate, then waits for successful same-commit push runs of the frozen three-workflow polling array (Coverage, Gateway API Conformance, and Mesh E2E Sidecar Live Datapath). Each requirement is queried through its canonical workflow-file endpoint and accepted only when the server-reported workflow path, display name, commit SHA, `push` event, and `main` branch all match. A different workflow that reuses the display name therefore cannot satisfy a missing canonical run, and every matching canonical run must conclude `success`, so one passing duplicate cannot mask a failed run of the same workflow for the same commit. A missing, still-running, failed, cancelled, stale, malformed, identity-mismatched, or timed-out dedicated run fails the gate closed. Each Actions API query receives up to three bounded attempts with short backoff; exhausting those attempts also fails closed. The gate polls for at most 60 minutes inside a 75-minute job timeout, runs only on `main` pushes so it never holds a runner on a pull request, and grants only `actions: read` because it checks out no code. The protected Cross verifier freezes the complete gate job and rejects workflow-wide run defaults that could alter a protected publishing shell's failure semantics, while the required-CI verifier independently pins the gate's exact digest, checks the three workflow file/name bindings and their unconditional `main` push triggers, and validates the publisher dependencies. Comments cannot stand in for executable gate fields, and changing the gate or either publishing dependency requires a trusted-base update. Publication of the mutable `latest` release and the `latest` / `main-<sha>` Docker tags additionally requires the `Gateway API Conformance` run to succeed via its embedded `main-publication-required-checks` job, which enforces the remaining five publish-blocking contexts in the complete nine-check inventory (see [Publish-blocking required checks](#publish-blocking-required-checks)). The `latest-release` job and the per-architecture Linux Docker publishing job keep their direct dependencies on the `Tests` aggregate, the native build matrix, and the protected `build-arm64-cross` job, and additionally require a successful `main-publish-gate`; they can run in parallel only once all four succeed. The `docker-manifest` job runs after the Docker digests are pushed. A Docker failure on `main` does not block replacing the `latest` prerelease, but neither publish path can start until every inventoried publish-blocking check passes for the exact SHA. Version-tag releases are stricter and gate GitHub Release creation on `docker-manifest`. Docker Hub publishing requires the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets. GHCR publishing uses `GITHUB_TOKEN` and the job-level `packages: write` permission. The Docker manifests publish both `latest` and `main-<sha>` tags (where `<sha>` is the full commit SHA from `github.sha`).
 
 ## Release Pipeline (release.yml)
 
