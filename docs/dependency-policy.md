@@ -165,8 +165,8 @@ Run locally:
 ```bash
 cargo install --locked cargo-deny
 cargo deny check advisories bans sources licenses   # the gate (root workspace)
-cargo deny --manifest-path ebpf/Cargo.toml --config deny.toml \
-    check advisories bans sources licenses          # the gate (eBPF workspace)
+cargo deny --manifest-path ebpf/Cargo.toml \
+    check --config deny.toml advisories bans sources licenses          # the gate (eBPF workspace)
 ```
 
 ### 2. Advisory exceptions are time-boxed
