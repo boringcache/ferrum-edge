@@ -3203,14 +3203,32 @@ pub async fn run(
     Ok(())
 }
 
-async fn load_full_config_with_sequence(
+pub(crate) async fn load_full_config_with_sequence(
     db: &Arc<dyn DatabaseBackend>,
     namespace: &str,
 ) -> Result<(GatewayConfig, LiveApplyCursor), anyhow::Error> {
     let topology_permit = db.acquire_write_topology_permit().await;
     let topology_epoch = topology_permit.topology_epoch();
     db.maybe_apply_deferred_migrations().await?;
-    let sequence = db.latest_change_sequence(namespace).await?;
+    // The full reload is the repair path for a poisoned change log, so it must
+    // not be gated on the same `config_changes` field that broke incremental
+    // polling (issue #4530). A `0` watermark makes the next incremental poll
+    // re-read the retained change log — bounded by
+    // `CHANGE_LOG_RETAIN_PER_NAMESPACE` — which is strictly better than leaving
+    // the process unable to publish fresh config at all.
+    let sequence = match db.latest_change_sequence(namespace).await {
+        Ok(sequence) => sequence,
+        Err(error) => {
+            warn!(
+                namespace = %namespace,
+                error = %error,
+                "full reload could not read the config_changes watermark; continuing with \
+                 sequence 0 so the reload still publishes (the next incremental poll re-reads \
+                 the retained change log)"
+            );
+            0
+        }
+    };
     let config = db.load_full_config(namespace).await?;
     drop(topology_permit);
     Ok((config, LiveApplyCursor::new(topology_epoch, sequence)))

@@ -5519,6 +5519,19 @@ pub mod _test_support {
         store.set_latest_change_sequence_fault_for_test(fail);
     }
 
+    /// Run the database-mode full-reload helper. Proves the reload still
+    /// publishes when the `config_changes` watermark read fails, so the repair
+    /// path is not gated on the same corrupt field (issue #4530). Returns the
+    /// loaded config and the cursor sequence the reload committed.
+    pub async fn database_mode_load_full_config_with_sequence_for_test(
+        db: &std::sync::Arc<dyn crate::config::db_backend::DatabaseBackend>,
+        namespace: &str,
+    ) -> Result<(crate::config::types::GatewayConfig, u64), anyhow::Error> {
+        let (config, cursor) =
+            crate::modes::database::load_full_config_with_sequence(db, namespace).await?;
+        Ok((config, cursor.sequence))
+    }
+
     // ── config/mongo_store: Admin write-topology / publication test seams ────
     pub use crate::config::mongo_store::{
         MongoReconnectTopology, MongoReconnectTransitionHook, MongoReconnectTransitionTestHooks,

@@ -650,4 +650,32 @@ MongoDB replica sets use the same durable incremental polling strategy as SQL ba
 
 The `config_changes` collection has `{namespace, sequence}` and `{sequence}` indexes so polling cost is proportional to the number of retained changes read, not total runtime resource count.
 
+### `config_changes.sequence` types
+
+Ferrum writes `config_changes.sequence` as a 64-bit integer. Every reader —
+incremental decode, the `latest_change_sequence` watermark, the all-scope
+`latest_global_change_sequence` roll-up, and change-log compaction — accepts:
+
+- `Int64` (BSON `long`) — what Ferrum itself writes;
+- `Int32` (BSON `int`);
+- `Double` (BSON `double`) **only** when the value is finite, non-negative,
+  has no fractional part, and is at or below 2^53 (`9007199254740992`), the
+  largest double that still names exactly one integer.
+
+Everything else — a string, a negative or fractional number, a value beyond
+2^53, or a missing field — is rejected, and the poll fails closed rather than
+advancing the cursor past a record it could not read.
+
+If you insert `config_changes` documents by hand, write
+`NumberLong(<n>)`. `mongosh`'s default numeric literal
+(`db.config_changes.insertOne({ sequence: 5, ... })`) is a `double`; an integral
+double is accepted for compatibility with that shell default, but `NumberLong`
+is the type Ferrum stores and the one to use.
+
+A `sequence` value that no reader can decode no longer wedges the gateway. The
+full-reload fallback logs a warning and continues with a `0` watermark rather
+than aborting, so fresh config is still published; the next incremental poll
+re-reads the retained change log.
+
+
 Standalone MongoDB does not provide multi-document transactions, so resource writes and their `config_changes` records cannot be made crash-atomic. Ferrum therefore forces standalone MongoDB pollers through the full-load fallback path instead of accepting an incremental cursor that could miss a resource mutation whose change record was not committed.
