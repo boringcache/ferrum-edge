@@ -18798,6 +18798,7 @@ pub fn build_node_waypoint_dtls_owner_configs(
                 key_path,
                 route_client_ca,
                 &crls,
+                proxy_state.tls_policy.as_deref(),
             ) {
                 Ok(built) => built,
                 Err(error) => {

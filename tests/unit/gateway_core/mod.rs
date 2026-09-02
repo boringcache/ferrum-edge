@@ -40,6 +40,7 @@ mod dp_listener_supervision_tests;
 mod dtls_frontend_app_send_tests;
 mod dtls_recv_loop_supervision_tests;
 mod dtls_session_identity_tests;
+mod dtls_tls_policy_tests;
 mod early_upload_deadline_tests;
 mod error_classifier_tests;
 mod error_response_headers_tests;

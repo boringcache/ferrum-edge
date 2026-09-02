@@ -858,6 +858,241 @@ fn apply_scoped_dtls_socket_options(
     Ok(())
 }
 
+// ============================================================================
+// Gateway TLS policy → DTLS
+// ============================================================================
+
+/// The gateway TLS policy (`FERRUM_TLS_MIN_VERSION`, `FERRUM_TLS_MAX_VERSION`,
+/// `FERRUM_TLS_CIPHER_SUITES`, `FERRUM_TLS_CURVES`) expressed in the DTLS
+/// stack's vocabulary.
+///
+/// `docs/configuration.md` documents those variables as applying "inbound +
+/// outbound". Every rustls listener and client honours the parsed
+/// [`crate::tls::TlsPolicy`]; before issue #4507 the DTLS builders never
+/// received it, so a `udp` + `dtls` proxy kept accepting DTLS 1.2 with dimpl's
+/// full default suite list even under `FERRUM_TLS_MIN_VERSION=1.3`.
+///
+/// Mapping rules, all derived from `TlsPolicy::from_env_config`:
+///
+/// * **Versions.** `TlsPolicy::protocol_versions` gates the two DTLS versions
+///   one-for-one (TLS 1.2 ↔ DTLS 1.2, TLS 1.3 ↔ DTLS 1.3). dimpl expresses a
+///   disabled version as an EMPTY suite filter for it: `ConfigBuilder`'s
+///   `dtls12_cipher_suites` / `dtls13_cipher_suites` accept an empty slice and
+///   `build()` only refuses when BOTH versions end up with zero suites
+///   (`vendor/dimpl-0.6.1-ferrum-patched/src/config.rs`, the "No cipher suites
+///   remain after filtering" gate). So the empty filter is a supported way to
+///   disable a version, not an accident that has to be worked around.
+/// * **Cipher suites.** The nine suite names `parse_cipher_suites` accepts are
+///   the entire universe here. The three TLS 1.3 suites and the three
+///   `ECDHE-ECDSA-*` TLS 1.2 suites map exactly onto dimpl's enums.
+/// * **`ECDHE-RSA-*`.** dimpl implements no RSA-authenticated DTLS 1.2 suite,
+///   and a DTLS surface requires an ECDSA P-256/P-384 certificate anyway, so an
+///   RSA-auth suite could never be negotiated on a DTLS surface even with
+///   dimpl's unfiltered defaults. Those names are therefore inapplicable
+///   rather than dropped: excluding them removes nothing an operator could have
+///   observed. But a policy whose ENTIRE TLS 1.2 selection is `ECDHE-RSA-*`
+///   while TLS 1.2 is enabled WOULD silently lose DTLS 1.2, so that is a
+///   startup error naming the suites and the surface.
+/// * **Key-exchange groups.** `FERRUM_TLS_CURVES` parses to exactly X25519,
+///   secp256r1 and secp384r1, which are exactly the three groups dimpl
+///   implements, so the mapping is faithful and is applied.
+///
+/// Anything else — a suite this build learns to parse later that has no DTLS
+/// counterpart, or a policy that leaves every enabled DTLS version with no
+/// usable suite — is refused at startup rather than quietly building a config
+/// weaker (or more silent) than the operator asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DtlsSuitePolicy {
+    dtls12: Vec<dimpl::crypto::Dtls12CipherSuite>,
+    dtls13: Vec<dimpl::crypto::Dtls13CipherSuite>,
+    kx_groups: Vec<dimpl::crypto::NamedGroup>,
+}
+
+impl DtlsSuitePolicy {
+    /// Map a gateway [`crate::tls::TlsPolicy`] onto the DTLS stack.
+    ///
+    /// `surface` names the DTLS surface being built (for example
+    /// `"frontend DTLS listener"`) and appears verbatim in every refusal so an
+    /// operator can tell which listener or backend the policy could not serve.
+    pub fn from_tls_policy(
+        policy: &crate::tls::TlsPolicy,
+        surface: &str,
+    ) -> Result<Self, anyhow::Error> {
+        use dimpl::crypto::{Dtls12CipherSuite as D12, Dtls13CipherSuite as D13};
+
+        let dtls12_enabled = policy
+            .protocol_versions
+            .iter()
+            .any(|v| std::ptr::eq(*v, &rustls::version::TLS12));
+        let dtls13_enabled = policy
+            .protocol_versions
+            .iter()
+            .any(|v| std::ptr::eq(*v, &rustls::version::TLS13));
+
+        let mut dtls12: Vec<D12> = Vec::new();
+        let mut dtls13: Vec<D13> = Vec::new();
+        // TLS 1.2 suites the operator selected that DTLS cannot authenticate.
+        let mut rsa_auth_tls12: Vec<&'static str> = Vec::new();
+
+        for suite in &policy.crypto_provider.cipher_suites {
+            match suite.suite() {
+                rustls::CipherSuite::TLS13_AES_128_GCM_SHA256 => {
+                    dtls13.push(D13::AES_128_GCM_SHA256)
+                }
+                rustls::CipherSuite::TLS13_AES_256_GCM_SHA384 => {
+                    dtls13.push(D13::AES_256_GCM_SHA384)
+                }
+                rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => {
+                    dtls13.push(D13::CHACHA20_POLY1305_SHA256)
+                }
+                rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 => {
+                    dtls12.push(D12::ECDHE_ECDSA_AES128_GCM_SHA256)
+                }
+                rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 => {
+                    dtls12.push(D12::ECDHE_ECDSA_AES256_GCM_SHA384)
+                }
+                rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 => {
+                    dtls12.push(D12::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256)
+                }
+                // RSA-authenticated ECDHE AEAD suites: recognized, but no DTLS
+                // surface can ever negotiate one (dimpl implements no RSA-auth
+                // DTLS 1.2 suite and DTLS requires an ECDSA certificate).
+                rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 => {
+                    rsa_auth_tls12.push("ECDHE-RSA-AES128-GCM-SHA256")
+                }
+                rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 => {
+                    rsa_auth_tls12.push("ECDHE-RSA-AES256-GCM-SHA384")
+                }
+                rustls::CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => {
+                    rsa_auth_tls12.push("ECDHE-RSA-CHACHA20-POLY1305")
+                }
+                // Refuse rather than thin the operator's list silently.
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "Cipher suite {:?} selected by FERRUM_TLS_CIPHER_SUITES has no DTLS \
+                         equivalent, so the {} cannot honour the configured TLS policy. Remove it \
+                         from FERRUM_TLS_CIPHER_SUITES or stop terminating/originating DTLS.",
+                        other,
+                        surface
+                    ));
+                }
+            }
+        }
+
+        // A TLS 1.2 selection that is entirely RSA-authenticated WOULD lose
+        // DTLS 1.2 outright. That is exactly the silent drop this mapping
+        // exists to prevent, so refuse and name the remedy.
+        if dtls12_enabled && dtls12.is_empty() && !rsa_auth_tls12.is_empty() {
+            return Err(anyhow::anyhow!(
+                "FERRUM_TLS_CIPHER_SUITES selects only RSA-authenticated TLS 1.2 suites ({}), \
+                 which have no DTLS equivalent: the DTLS stack authenticates with ECDSA \
+                 P-256/P-384 certificates only. The {} would silently lose DTLS 1.2. Add the \
+                 matching ECDHE-ECDSA-* suite(s), or set FERRUM_TLS_MIN_VERSION=1.3.",
+                rsa_auth_tls12.join(", "),
+                surface
+            ));
+        }
+
+        if !dtls12_enabled {
+            dtls12.clear();
+        }
+        if !dtls13_enabled {
+            dtls13.clear();
+        }
+
+        if dtls12.is_empty() && dtls13.is_empty() {
+            return Err(anyhow::anyhow!(
+                "The configured TLS policy (FERRUM_TLS_MIN_VERSION / FERRUM_TLS_MAX_VERSION / \
+                 FERRUM_TLS_CIPHER_SUITES) leaves the {} with no usable DTLS cipher suite for \
+                 any enabled version, so it could never complete a handshake.",
+                surface
+            ));
+        }
+
+        let mut kx_groups: Vec<dimpl::crypto::NamedGroup> = Vec::new();
+        for group in &policy.crypto_provider.kx_groups {
+            match group.name() {
+                rustls::NamedGroup::X25519 => kx_groups.push(dimpl::crypto::NamedGroup::X25519),
+                rustls::NamedGroup::secp256r1 => {
+                    kx_groups.push(dimpl::crypto::NamedGroup::Secp256r1)
+                }
+                rustls::NamedGroup::secp384r1 => {
+                    kx_groups.push(dimpl::crypto::NamedGroup::Secp384r1)
+                }
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "Key-exchange group {:?} selected by FERRUM_TLS_CURVES has no DTLS \
+                         equivalent, so the {} cannot honour the configured TLS policy.",
+                        other,
+                        surface
+                    ));
+                }
+            }
+        }
+        if kx_groups.is_empty() {
+            return Err(anyhow::anyhow!(
+                "The configured TLS policy leaves the {} with no usable key-exchange group.",
+                surface
+            ));
+        }
+
+        Ok(Self {
+            dtls12,
+            dtls13,
+            kx_groups,
+        })
+    }
+
+    /// DTLS 1.2 suites this policy admits. Empty means DTLS 1.2 is disabled.
+    pub fn dtls12_cipher_suites(&self) -> &[dimpl::crypto::Dtls12CipherSuite] {
+        &self.dtls12
+    }
+
+    /// DTLS 1.3 suites this policy admits. Empty means DTLS 1.3 is disabled.
+    pub fn dtls13_cipher_suites(&self) -> &[dimpl::crypto::Dtls13CipherSuite] {
+        &self.dtls13
+    }
+
+    /// Key-exchange groups this policy admits.
+    pub fn kx_groups(&self) -> &[dimpl::crypto::NamedGroup] {
+        &self.kx_groups
+    }
+
+    /// Apply the mapped policy to a dimpl `ConfigBuilder`.
+    fn apply(&self, builder: dimpl::ConfigBuilder) -> dimpl::ConfigBuilder {
+        builder
+            .dtls12_cipher_suites(self.dtls12_cipher_suites())
+            .dtls13_cipher_suites(self.dtls13_cipher_suites())
+            .kx_groups(self.kx_groups())
+    }
+}
+
+/// Start a dimpl `ConfigBuilder` already carrying the gateway TLS policy.
+///
+/// `None` keeps dimpl's own defaults; every serving mode builds a
+/// [`crate::tls::TlsPolicy`] at startup and passes `Some`, so `None` is the
+/// test/plugin path only.
+fn policy_config_builder(
+    policy: Option<&crate::tls::TlsPolicy>,
+    surface: &str,
+) -> Result<dimpl::ConfigBuilder, anyhow::Error> {
+    let builder = Config::builder();
+    match policy {
+        Some(policy) => {
+            let mapped = DtlsSuitePolicy::from_tls_policy(policy, surface)?;
+            debug!(
+                surface = surface,
+                dtls12_suites = mapped.dtls12_cipher_suites().len(),
+                dtls13_suites = mapped.dtls13_cipher_suites().len(),
+                kx_groups = mapped.kx_groups().len(),
+                "Applied the gateway TLS policy to a DTLS configuration"
+            );
+            Ok(mapped.apply(builder))
+        }
+        None => Ok(builder),
+    }
+}
+
 /// Build a DTLS client config for backend connections (gateway → backend).
 ///
 /// Maps the proxy's `backend_tls_*` fields to dimpl `Config`:
@@ -871,6 +1106,7 @@ pub fn build_backend_dtls_config(
     tls_no_verify: bool,
     crls: &crate::tls::CrlList,
     global_ca_bundle_path: Option<&str>,
+    tls_policy: Option<&crate::tls::TlsPolicy>,
 ) -> Result<BackendDtlsParams, anyhow::Error> {
     // An explicit `system://` trust selection never inherits the global
     // `FERRUM_TLS_NO_VERIFY` opt-out.
@@ -901,7 +1137,17 @@ pub fn build_backend_dtls_config(
         load_root_store_from_pem(ca_path)?;
     }
 
-    let config = Arc::new(Config::default());
+    // The gateway TLS policy applies outbound too (issue #4507): a
+    // `Config::default()` here would originate DTLS 1.2 with dimpl's full
+    // default suite list under `FERRUM_TLS_MIN_VERSION=1.3`.
+    let config = Arc::new(
+        policy_config_builder(
+            tls_policy,
+            &format!("backend DTLS client for proxy '{}'", proxy.id),
+        )?
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build backend DTLS config: {}", e))?,
+    );
     let (server_name, server_cert_verifier) = if skip_verify {
         (None, None)
     } else {
@@ -967,6 +1213,7 @@ pub fn build_frontend_dtls_config(
     key_path: &str,
     client_ca_cert_path: Option<&str>,
     crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
+    tls_policy: Option<&crate::tls::TlsPolicy>,
 ) -> Result<FrontendDtlsConfig, anyhow::Error> {
     let certificate = load_dtls_certificate(cert_path, key_path)?;
 
@@ -1012,7 +1259,12 @@ pub fn build_frontend_dtls_config(
         (false, None, None)
     };
 
-    let config_builder = Config::builder().require_client_certificate(require_client_cert);
+    // The gateway TLS policy applies inbound (issue #4507). Version and suite
+    // admission is decided here, before the listener can serve anything, so a
+    // policy the DTLS stack cannot express is a startup/reload refusal rather
+    // than a listener that quietly accepts more than the operator allowed.
+    let config_builder = policy_config_builder(tls_policy, "frontend DTLS listener")?
+        .require_client_certificate(require_client_cert);
     let config = Arc::new(
         config_builder
             .build()

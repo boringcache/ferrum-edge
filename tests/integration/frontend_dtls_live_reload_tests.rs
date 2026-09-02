@@ -72,6 +72,7 @@ fn build_config(
         key_path.to_str().expect("key utf8"),
         None,
         &[],
+        None,
     )
     .expect("build frontend dtls config")
 }
@@ -271,6 +272,7 @@ fn frontend_dtls_builder_rejects_expired_and_not_yet_valid_certificates() {
             key_path.to_str().expect("key utf8"),
             None,
             &[],
+            None,
         )
         .err()
         .expect("invalid certificate lifetime must be refused");
@@ -397,6 +399,7 @@ fn frontend_config(
         path_str(&server.key_path),
         client_ca.map(|ca| path_str(&ca.path)),
         crls,
+        None,
     )
     .expect("build frontend dtls config")
 }
@@ -785,6 +788,7 @@ async fn frontend_dtls_candidate_identity_matches_the_bytes_its_verifier_was_bui
         path_str(&server.key_path),
         Some(path_str(&bundle_path)),
         &[],
+        None,
     )
     .expect("build candidate over CA A");
 
@@ -795,6 +799,7 @@ async fn frontend_dtls_candidate_identity_matches_the_bytes_its_verifier_was_bui
         path_str(&server.key_path),
         Some(path_str(&bundle_path)),
         &[],
+        None,
     )
     .expect("build candidate over CA B");
 
@@ -872,6 +877,7 @@ async fn frontend_dtls_candidate_accepts_a_non_file_inline_client_ca_source() {
         path_str(&server.key_path),
         Some(inline_pem.as_str()),
         &[],
+        None,
     )
     .expect("an inline PEM client-CA source must load");
 
@@ -912,6 +918,7 @@ async fn frontend_dtls_candidate_binds_its_crls_to_the_same_identity() {
         path_str(&server.key_path),
         Some(path_str(&client_ca.path)),
         &[],
+        None,
     )
     .expect("build candidate without revocations");
 
@@ -921,6 +928,7 @@ async fn frontend_dtls_candidate_binds_its_crls_to_the_same_identity() {
         path_str(&server.key_path),
         Some(path_str(&client_ca.path)),
         &crls,
+        None,
     )
     .expect("build candidate with revocations");
 
@@ -982,6 +990,7 @@ async fn frontend_dtls_candidate_without_a_client_ca_publishes_no_identity() {
         path_str(&server.key_path),
         None,
         &crls,
+        None,
     )
     .expect("build candidate without client authentication");
 

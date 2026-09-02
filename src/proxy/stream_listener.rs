@@ -1900,6 +1900,7 @@ impl StreamListenerManager {
             &key_path,
             client_ca_cert_path.as_deref(),
             &self.crls.load_full(),
+            self.tls_policy.as_deref(),
         ) {
             Ok(config) => {
                 let _ = self
@@ -3142,6 +3143,7 @@ impl StreamListenerManager {
                                     key_path,
                                     client_ca_cert_path.as_deref(),
                                     &self.crls.load_full(),
+                                    self.tls_policy.as_deref(),
                                 ) {
                                     Ok(cfg) => Some(cfg),
                                     Err(e) => {
@@ -3209,6 +3211,9 @@ impl StreamListenerManager {
                 let udp_cleanup_interval = self.udp_cleanup_interval_seconds;
                 let crls = self.crls.load_full();
                 let backend_tls_reload_epoch = self.backend_tls_reload_epoch.clone();
+                // Gateway TLS policy for backend DTLS originated by this
+                // listener (issue #4507).
+                let listener_tls_policy = self.tls_policy.clone();
                 let tls_ca_bundle_path = self.tls_ca_bundle_path.clone();
                 let sni_ids = sni_ids.clone();
                 let adaptive_buf = self.adaptive_buffer.clone();
@@ -3302,6 +3307,7 @@ impl StreamListenerManager {
                         circuit_breaker_cache: cb_cache,
                         crls,
                         backend_tls_reload_epoch,
+                        tls_policy: listener_tls_policy,
                         started: started_for_listener,
                         sni_proxy_ids: sni_ids,
                         adaptive_buffer: adaptive_buf,

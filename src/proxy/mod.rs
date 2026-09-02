@@ -8732,6 +8732,7 @@ impl ProxyState {
             &key_path,
             client_ca_cert_path.as_deref(),
             active_crls.as_ref().as_slice(),
+            self.tls_policy.as_deref(),
         ) {
             Ok(config) => config,
             Err(err) => {

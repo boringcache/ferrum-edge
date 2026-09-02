@@ -168,6 +168,15 @@ fn start_gateway_with_dtls(
     http_port: u16,
     dtls_env: Option<&GatewayDtlsEnv>,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+    start_gateway_with_dtls_and_env(config_path, http_port, dtls_env, &[])
+}
+
+fn start_gateway_with_dtls_and_env(
+    config_path: &str,
+    http_port: u16,
+    dtls_env: Option<&GatewayDtlsEnv>,
+    extra_env: &[(&str, &str)],
+) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     // Use http_port + 1000 as admin port to avoid collisions
     let admin_port = http_port + 1000;
     let mut cmd = std::process::Command::new(gateway_binary_path());
@@ -183,6 +192,9 @@ fn start_gateway_with_dtls(
     if let Some(dtls) = dtls_env {
         cmd.env("FERRUM_DTLS_CERT_PATH", &dtls.cert_path)
             .env("FERRUM_DTLS_KEY_PATH", &dtls.key_path);
+    }
+    for (k, v) in extra_env {
+        cmd.env(k, v);
     }
 
     configure_coverage_gateway_command(&mut cmd);
@@ -1286,6 +1298,102 @@ plugin_configs: []
     dtls_client.close().await;
     shutdown_gateway(&mut gateway);
     dtls_echo.abort();
+}
+
+/// Issue #4507: `FERRUM_TLS_MIN_VERSION` reaches the frontend DTLS listener.
+///
+/// The gateway's TLS policy is documented as applying "inbound + outbound".
+/// Before #4507 the DTLS builders never received it, so a listener under
+/// `FERRUM_TLS_MIN_VERSION=1.3` still completed a DTLS 1.2 handshake. Here the
+/// client offers DTLS 1.2 only (its DTLS 1.3 suite list is empty) and must be
+/// refused. The positive control is the existing
+/// `test_udp_proxy_frontend_dtls_termination`, whose default-version client
+/// completes against the same listener shape.
+#[ignore]
+#[tokio::test]
+async fn test_frontend_dtls_refuses_dtls_1_2_when_policy_minimum_is_1_3() {
+    let backend_port = 19878u16;
+    let proxy_port = 19879u16;
+    let gateway_http_port = 18278u16;
+
+    let echo_server = start_udp_echo_server(backend_port).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    let (cert_path, key_path) = generate_test_dtls_cert(&temp_dir);
+
+    write_config(
+        &config_path,
+        &format!(
+            r#"
+version: "1"
+proxies:
+  - id: "frontend-dtls-min-13"
+    listen_port: {proxy_port}
+    frontend_tls: true
+    backend_scheme: udp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    udp_idle_timeout_seconds: 30
+
+consumers: []
+plugin_configs: []
+"#
+        ),
+    );
+
+    let dtls_env = GatewayDtlsEnv {
+        cert_path: cert_path.clone(),
+        key_path: key_path.clone(),
+    };
+    let mut gateway = start_gateway_with_dtls_and_env(
+        config_path.to_str().unwrap(),
+        gateway_http_port,
+        Some(&dtls_env),
+        &[("FERRUM_TLS_MIN_VERSION", "1.3")],
+    )
+    .expect("Failed to start gateway");
+    sleep(Duration::from_secs(3)).await;
+
+    // A client with no DTLS 1.3 suites can only offer DTLS 1.2.
+    let no_dtls13: &[dimpl::crypto::Dtls13CipherSuite] = &[];
+    let client_config = dimpl::Config::builder()
+        .require_client_certificate(false)
+        .dtls13_cipher_suites(no_dtls13)
+        .build()
+        .expect("build DTLS 1.2-only client config");
+
+    let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client_socket
+        .connect(format!("127.0.0.1:{}", proxy_port))
+        .await
+        .unwrap();
+    let params = ferrum_edge::dtls::BackendDtlsParams {
+        config: std::sync::Arc::new(client_config),
+        certificate: dimpl::certificate::generate_self_signed_certificate()
+            .expect("generate ephemeral cert")
+            .into(),
+        server_name: None,
+        server_cert_verifier: None,
+        connect_timeout_ms: 5_000,
+    };
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        ferrum_edge::dtls::DtlsConnection::connect(client_socket, params),
+    )
+    .await;
+
+    let completed = matches!(outcome, Ok(Ok(_)));
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_server.abort();
+
+    assert!(
+        !completed,
+        "a DTLS 1.2-only client must not complete a handshake against a listener whose \
+         FERRUM_TLS_MIN_VERSION is 1.3"
+    );
 }
 
 // ============================================================================

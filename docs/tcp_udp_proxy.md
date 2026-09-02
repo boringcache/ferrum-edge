@@ -393,6 +393,36 @@ This provides full encryption: DTLS client → gateway (DTLS termination) → ga
   keys remain inside the selected cryptographic provider and follow that
   provider's secret-memory lifecycle.
 
+### DTLS and the TLS policy
+
+`FERRUM_TLS_MIN_VERSION`, `FERRUM_TLS_MAX_VERSION`, `FERRUM_TLS_CIPHER_SUITES` and
+`FERRUM_TLS_KEY_EXCHANGE_GROUPS` (alias `FERRUM_TLS_CURVES`) are documented as applying
+"inbound + outbound". Since issue #4507 that includes every DTLS surface: the frontend
+DTLS listener, the DTLS live-reload rebuild, the generated NodeWaypoint DTLS listeners,
+and the backend DTLS client. The policy is resolved once at startup (and again on each
+reload) and applied to the DTLS configuration before any listener can serve.
+
+| Policy dimension | DTLS mapping |
+| --- | --- |
+| Protocol versions | One-for-one: TLS 1.2 ↔ DTLS 1.2, TLS 1.3 ↔ DTLS 1.3. `FERRUM_TLS_MIN_VERSION=1.3` leaves the listener with no negotiable DTLS 1.2 suite, so a DTLS 1.2 client's handshake fails |
+| TLS 1.3 cipher suites | `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384` and `TLS_CHACHA20_POLY1305_SHA256` map exactly onto their DTLS 1.3 counterparts |
+| TLS 1.2 cipher suites | `ECDHE-ECDSA-AES128-GCM-SHA256`, `ECDHE-ECDSA-AES256-GCM-SHA384` and `ECDHE-ECDSA-CHACHA20-POLY1305` map exactly onto their DTLS 1.2 counterparts |
+| `ECDHE-RSA-*` | No DTLS counterpart. DTLS authenticates with ECDSA P-256/P-384 certificates only, so an RSA-authenticated suite could never be negotiated on a DTLS surface. Naming one alongside its ECDSA sibling costs nothing; a selection whose **entire** TLS 1.2 half is `ECDHE-RSA-*` is refused at startup rather than silently losing DTLS 1.2 |
+| Key-exchange groups | One-for-one. X25519, secp256r1 and secp384r1 are exactly the groups the DTLS stack implements |
+
+Nothing is dropped silently. A policy that leaves a DTLS surface with no usable cipher
+suite for any enabled version, or that names a suite or group with no DTLS equivalent, is
+a startup (or reload) failure whose message names both the offending value and the DTLS
+surface — a listener that can never complete a handshake is not a listener.
+
+One DTLS client is deliberately not covered: the `udp_logging` plugin's DTLS log-sink
+client (`src/plugins/udp_logging.rs`). It is a plugin-owned observability egress rather
+than a proxy datapath surface, and plugin configuration carries no gateway `TlsPolicy`; it
+keeps the DTLS stack's own defaults.
+
+FIPS enforcement refuses DTLS outright, so this mapping only ever applies to non-FIPS
+deployments.
+
 ### Trust Store Model
 
 The gateway uses separate trust stores for TCP and UDP encryption:

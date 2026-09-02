@@ -309,6 +309,7 @@ async fn try_spawn_udp_gateway(
         circuit_breaker_cache,
         crls: Arc::new(Vec::new()),
         backend_tls_reload_epoch: Arc::new(AtomicU64::new(0)),
+        tls_policy: None,
         started: listener_started,
         sni_proxy_ids: None,
         adaptive_buffer,
