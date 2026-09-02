@@ -2369,8 +2369,11 @@ fn incremental_poll_rejects_missing_fields() {
             decode_mongo_config_change_record(&doc).expect_err("missing field must abort the poll");
         let message = error.to_string();
         if field == "sequence" {
+            // Issue #4530: the shared decoder names the field in quotes and
+            // states the expected shape, never the payload.
             assert!(
-                message.contains("invalid sequence"),
+                message.contains("invalid 'sequence'")
+                    && message.contains("expected a non-negative integral number"),
                 "missing sequence must fail closed, got: {message}"
             );
         } else {
