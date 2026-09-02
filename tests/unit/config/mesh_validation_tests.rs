@@ -2881,9 +2881,18 @@ mod virtual_service_cors {
             MeshCorsOriginMatch::Prefix("https://".into()),
             MeshCorsOriginMatch::Prefix("h".into()),
             MeshCorsOriginMatch::Prefix("chrome-extension://".into()),
+            // Issue #4522: prefix matching is an unbounded `starts_with`, so a
+            // bare `scheme://host` (or `scheme://host:port`) does not
+            // terminate at an origin boundary.
+            MeshCorsOriginMatch::Prefix("https://app.example.com".into()),
+            MeshCorsOriginMatch::Prefix("https://app.".into()),
+            MeshCorsOriginMatch::Prefix("https://app.example.com:8443".into()),
             MeshCorsOriginMatch::Regex(".*".into()),
             MeshCorsOriginMatch::Regex("https://.*".into()),
             MeshCorsOriginMatch::Regex("null".into()),
+            // Issue #4521: hostname-character-class regexes are scheme-universal.
+            MeshCorsOriginMatch::Regex("https://[\\w.-]+".into()),
+            MeshCorsOriginMatch::Regex("^https://([a-z0-9-]+\\.)+[a-z]{2,}$".into()),
         ] {
             let mut credentialed = policy(vec![origin.clone()]);
             credentialed.cors.allow_credentials = Some(true);
@@ -2904,14 +2913,27 @@ mod virtual_service_cors {
             );
         }
 
+        // Only a `scheme://host:` prefix pins the host exactly (issue #4522).
         let mut narrow = policy(vec![MeshCorsOriginMatch::Prefix(
-            "https://app.example.com".into(),
+            "https://app.example.com:".into(),
         )]);
         narrow.cors.allow_credentials = Some(true);
         let errors = validate(vec![narrow]);
         assert!(
             errors.is_empty(),
-            "credentialed host-constraining prefix must remain representable: {errors:?}"
+            "credentialed host-bounded prefix must remain representable: {errors:?}"
+        );
+
+        // An anchored host-constraining regex stays strict under the narrowed
+        // reserved-DNS probe set (issue #4521).
+        let mut narrow_regex = policy(vec![MeshCorsOriginMatch::Regex(
+            "^https://[a-z0-9-]+\\.example\\.com$".into(),
+        )]);
+        narrow_regex.cors.allow_credentials = Some(true);
+        let errors = validate(vec![narrow_regex]);
+        assert!(
+            errors.is_empty(),
+            "credentialed anchored host regex must remain representable: {errors:?}"
         );
     }
 

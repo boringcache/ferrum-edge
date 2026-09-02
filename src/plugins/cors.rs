@@ -126,28 +126,27 @@ const ORIGIN_REGEX_NEST_LIMIT: u32 = 24;
 /// Fixed synthetic HTTPS origins used to detect an effectively universal regex
 /// at construction (issue #4269). Constant-size, no network, no attacker-
 /// amplified cost: each compiled matcher is probed against this closed set
-/// once on the cold path. Hosts are reserved/unrelated (`.invalid` / `.example`
-/// / `.test` / IPv6 / loopback) so a reasonable host-constraining policy such
-/// as `https://.*\.example\.com` cannot match every probe, while `.*` and
-/// `https://.*` do.
-const ORIGIN_REGEX_HTTPS_UNIVERSALITY_PROBES: &[&str] = &[
-    "https://a.invalid",
-    "https://b.example",
-    "https://z.test",
-    "https://[::1]",
-    "https://127.0.0.1",
-];
+/// once on the cold path.
+///
+/// The probes are reserved DNS-shaped hosts only (`.invalid` / `.example` /
+/// `.test`), so a reasonable host-constraining policy such as
+/// `https://.*\.example\.com` cannot match every probe, while `.*` and
+/// `https://.*` do. IP-literal probes are deliberately absent (issue #4521):
+/// universality is a conjunction over the whole group, and an ordinary
+/// hostname character class such as `[\w.-]+` or `[a-z0-9.-]+` never matches
+/// `https://[::1]`, so a single IP-literal probe cleared the conjunction and
+/// let a scheme-universal hostname regex classify `Strict` — admitting it with
+/// credentials. Removing probes only makes the conjunction easier to satisfy,
+/// i.e. strictly more matchers classify `EffectivelyUniversal`: the
+/// fail-closed direction.
+const ORIGIN_REGEX_HTTPS_UNIVERSALITY_PROBES: &[&str] =
+    &["https://a.invalid", "https://b.example", "https://z.test"];
 
 /// HTTP counterpart of [`ORIGIN_REGEX_HTTPS_UNIVERSALITY_PROBES`]. A regex that
 /// matches every probe in either group is scheme-universal: it would reflect
 /// an arbitrary origin of that scheme under `allow_credentials`.
-const ORIGIN_REGEX_HTTP_UNIVERSALITY_PROBES: &[&str] = &[
-    "http://a.invalid",
-    "http://b.example",
-    "http://z.test",
-    "http://[::1]",
-    "http://127.0.0.1",
-];
+const ORIGIN_REGEX_HTTP_UNIVERSALITY_PROBES: &[&str] =
+    &["http://a.invalid", "http://b.example", "http://z.test"];
 
 /// Browser extensions can issue credentialed cross-origin requests too. Keep
 /// scheme-wide extension matchers from bypassing the same interlock merely
@@ -267,17 +266,41 @@ pub(crate) fn allowed_origin_entry_is_non_strict(origin: &Value) -> bool {
         .is_some_and(|spec| origin_matcher_breadth(spec) != OriginPolicyBreadth::Strict)
 }
 
-/// A prefix is effectively universal when it does not constrain the origin
-/// authority (scheme+host). This is scheme-independent: browser-extension and
-/// custom serialized origins are security principals too, not only HTTP(S).
+/// A prefix is strict only when it terminates at an origin boundary, i.e. it
+/// has the shape `scheme://host:` — a trailing colon after a complete host.
 ///
-/// `https://app.` and `https://preview-` constrain the host and are strict.
-/// `h`, `https://`, and `https:/` do not and are effectively universal.
+/// Request-time prefix matching is an unbounded
+/// `origin.starts_with(prefix)` with no origin parse (unlike
+/// `WildcardSubdomain`, which goes through [`origin_host`]), so a prefix that
+/// stops anywhere inside the authority does not constrain the host at all
+/// (issue #4522): a bare `https://app.example.com` also matches
+/// `https://app.example.com.evil.net`, `https://app.` matches
+/// `https://app.evil.com`, and `https://preview-` matches
+/// `https://preview-evil.com`. A `scheme://host:port` prefix is extendable in
+/// the same way (`:84` prefix-matches `:8443`). Only the trailing port
+/// separator pins the host exactly: any matching origin must continue with
+/// `:`, so its host is precisely the prefix's host.
+///
+/// This is scheme-independent — browser-extension and custom serialized
+/// origins are security principals too, not only HTTP(S) — so
+/// `chrome-extension://<id>:` behaves the same way.
+///
+/// Prefix *matching* semantics are unchanged (Istio `StringMatch.prefix` stays
+/// faithful); only the breadth classification consumed by the credentials
+/// interlock and the strict-policy diagnostic changes.
 pub(crate) fn origin_prefix_is_effectively_universal(prefix: &str) -> bool {
-    match prefix.split_once("://") {
-        None => true,
-        Some((scheme, authority)) => scheme.is_empty() || authority.is_empty(),
+    let Some((scheme, authority)) = prefix.split_once("://") else {
+        return true;
+    };
+    if scheme.is_empty() {
+        return true;
     }
+    let Some(host) = authority.strip_suffix(':') else {
+        return true;
+    };
+    host.is_empty()
+        || host.contains(['/', '?', '#', '@', ':'])
+        || host.chars().any(|c| c.is_ascii_whitespace())
 }
 
 /// A compiled origin regex is effectively universal when it full-matches every
@@ -455,6 +478,13 @@ enum OriginPattern {
     /// must START WITH this literal string (case-sensitive, matching Istio's
     /// literal prefix semantics — e.g. `"https://app."` matches
     /// `https://app.company.com`).
+    ///
+    /// The match is unbounded: it does not stop at an origin boundary, so
+    /// `"https://app."` also matches `https://app.evil.com` and
+    /// `"https://app.example.com"` also matches
+    /// `https://app.example.com.evil.net`. Only a `scheme://host:` prefix pins
+    /// the host — see [`origin_prefix_is_effectively_universal`], which is why
+    /// every other shape is refused with `allow_credentials` (issue #4522).
     Prefix(String),
     /// Istio `StringMatch.regex` on the request `Origin` header: the compiled
     /// RE2 pattern must FULLY match the entire origin. Compiled once at config
@@ -616,9 +646,10 @@ impl CorsPlugin {
                     return Err(
                         "cors: allow_credentials=true is incompatible with an effectively \
                          universal origin matcher (the opaque exact 'null' origin, a prefix \
-                         that does not constrain the host, or a regex that admits every origin \
-                         of a scheme); specify a \
-                         host-constraining origin policy to use credentials"
+                         that does not terminate at an origin boundary — only a \
+                         'scheme://host:' prefix pins the host, because prefix matching is an \
+                         unbounded starts_with — or a regex that admits every origin of a \
+                         scheme); specify a host-constraining origin policy to use credentials"
                             .to_string(),
                     );
                 }
