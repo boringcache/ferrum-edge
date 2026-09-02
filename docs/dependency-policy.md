@@ -147,11 +147,26 @@ its advisory is fixed/removed. `bans` (duplicate-version visibility) and
 `confidence-threshold` are **blocking** too: any dependency whose SPDX
 expression is outside the allowlist or below the confidence floor fails CI.
 
+The gate runs **twice**, in both the per-PR `dependency-audit` job and the weekly
+`.github/workflows/dependency-audit.yml`: once over the root workspace, and once
+over `ebpf/Cargo.toml` with `--config deny.toml` so both invocations share one
+policy and the allowlists cannot drift. `ebpf/` is a separate `[workspace]` with
+its own lockfile, and the root crate path-depends only on `ferrum-ebpf-common` —
+so `ferrum-ebpf` (aya-ebpf / aya-log-ebpf and their transitive tree) is invisible
+to the root-graph check. That object is nonetheless built by the `ebpf-builder`
+stage in `Dockerfile` and shipped in the published `-ebpf` / `-ebpf-tools`
+images, where the mesh chart runs it privileged on the host network. Both eBPF
+members are `publish = false`, so `[licenses] private = { ignore = true }`
+already covers their PolyForm-Noncommercial first-party licenses. Do not add an
+`ebpf/deny.toml`: a second config would let the two policies diverge.
+
 Run locally:
 
 ```bash
 cargo install --locked cargo-deny
-cargo deny check advisories bans sources licenses   # the gate
+cargo deny check advisories bans sources licenses   # the gate (root workspace)
+cargo deny --manifest-path ebpf/Cargo.toml --config deny.toml \
+    check advisories bans sources licenses          # the gate (eBPF workspace)
 ```
 
 ### 2. Advisory exceptions are time-boxed

@@ -1150,6 +1150,20 @@ jobs:
         # Policy: docs/dependency-policy.md.
         run: cargo deny check advisories bans sources licenses
 
+      - name: cargo-deny (eBPF workspace)
+        # Same BLOCKING gate over `ebpf/Cargo.toml`, a SEPARATE [workspace] with
+        # its own lockfile. Its `ferrum-ebpf` member (aya-ebpf / aya-log-ebpf and
+        # their transitive tree) never enters the root graph — the root crate
+        # path-depends only on `ferrum-ebpf-common` — so the step above cannot
+        # see it. That object is compiled by the `ebpf-builder` stage in
+        # Dockerfile and ships in the published `-ebpf` / `-ebpf-tools` images,
+        # where the mesh chart runs it privileged on the host network. `--config
+        # deny.toml` reuses the root policy so the two allowlists cannot drift.
+        # Policy: docs/dependency-policy.md.
+        run: >-
+          cargo deny --manifest-path ebpf/Cargo.toml --config deny.toml
+          check advisories bans sources licenses
+
       - name: Advisory-exception expiry
         # cargo-deny accepts ignores without the repo's [expires:] convention, so
         # validate it here too: a PR that adds a malformed or already-expired

@@ -56,6 +56,17 @@ jobs:
         # time-boxed in deny.toml fails here even when no PR has opened.
         run: cargo deny check advisories bans sources licenses
 
+      - name: cargo-deny (eBPF workspace)
+        # `ebpf/Cargo.toml` is a separate [workspace]; its `ferrum-ebpf` member
+        # never enters the root graph but ships in the published `-ebpf` /
+        # `-ebpf-tools` images and runs privileged on the host network. Shares
+        # the root policy via `--config deny.toml`. `always()` so a root-graph
+        # failure above can't hide the eBPF verdict.
+        if: always()
+        run: >-
+          cargo deny --manifest-path ebpf/Cargo.toml --config deny.toml
+          check advisories bans sources licenses
+
       - name: Advisory-exception expiry
         # Fails once any deny.toml [expires:] date has passed, so a time-boxed
         # exception can never silently become permanent.
