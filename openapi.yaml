@@ -20575,6 +20575,7 @@ components:
         exact destination Service and waypoint Gateway/GatewayClass identity — construction-time
         retention is OR over the attachment list and never widens a targeted
         policy onto another destination. See `docs/mesh.md`.
+      additionalProperties: false
       properties:
         mesh_slice:
           type: object
@@ -20760,6 +20761,7 @@ components:
         explicit `host:port` pairs, `host:*` (any explicit Host port), and
         wildcard hosts (`*.example.com`, `*.example.com:443`,
         `*.example.com:*`). Empty registry fails closed.
+      additionalProperties: false
       properties:
         registry:
           type: array
@@ -21368,6 +21370,7 @@ components:
         `custom_tags`, `custom_header_tags`, and `custom_env_tags` combined. The
         individual `maxProperties: 32` bounds remain for generated clients, but
         the cross-property combined total cannot be expressed mechanically.
+      additionalProperties: false
       properties:
         node_id:
           type: string
@@ -21632,6 +21635,84 @@ components:
           description: |
             Service name attached to exported spans. Defaults to the
             workload's service when omitted.
+        deployment_environment:
+          type: string
+          description: |
+            `deployment.environment` resource attribute stamped on exported
+            spans. Read by the shared OTel exporter options off this same
+            root config object.
+        batch_size:
+          type: integer
+          description: |
+            Span export batch size. Read by the shared OTel exporter options
+            off this same root config object.
+        flush_interval_ms:
+          type: integer
+          description: |
+            Span export flush interval in milliseconds. Read by the shared
+            OTel exporter options off this same root config object.
+        buffer_capacity:
+          type: integer
+          description: |
+            Maximum buffered spans awaiting export. Read by the shared OTel
+            exporter options off this same root config object.
+        buffer_max_bytes:
+          type: integer
+          description: |
+            Maximum retained bytes of buffered spans. Read by the shared OTel
+            exporter options off this same root config object.
+        max_retries:
+          type: integer
+          description: |
+            Span export retry attempts. Read by the shared OTel exporter
+            options off this same root config object.
+        retry_delay_ms:
+          type: integer
+          description: |
+            Delay between span export retries, in milliseconds. Read by the
+            shared OTel exporter options off this same root config object.
+        disable_span_reporting:
+          type: boolean
+          description: |
+            Alias for `span_reporting_disabled`, accepted for parity with the
+            Istio Telemetry CRD field name. Ignored when
+            `span_reporting_disabled` is present.
+        disableSpanReporting:
+          type: boolean
+          description: |
+            camelCase alias for `span_reporting_disabled`, accepted for parity
+            with the Istio Telemetry CRD field name. Ignored when either
+            snake_case spelling is present.
+        direction_emit:
+          type: object
+          additionalProperties: false
+          properties:
+            server:
+              type: boolean
+            client:
+              type: boolean
+          description: |
+            Which traffic directions emit telemetry, translated from
+            `Telemetry.tracing[].match.mode`. Defaults to server-only.
+        _effective_mesh_authz_baggage_gates:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            properties:
+              trusted_hbone_assertors:
+                type: array
+                items:
+                  type: object
+              trust_domain_aliases:
+                type: array
+                items:
+                  type: string
+          description: |
+            Internal mesh-injection field: an exact copy of every enabled
+            global `mesh_authz` baggage gate, evaluated as a fail-closed
+            conjunction. Not operator-facing; direct instances configure
+            `trusted_hbone_assertors` / `trust_domain_aliases` instead.
 
     MeshBpfMetricsConfig:
       type: object
@@ -21642,6 +21723,7 @@ components:
         surface. Mesh mode auto-injects it when BPF metrics are available;
         operator-managed plugin configs should not create names prefixed
         with `__`.
+      additionalProperties: false
       properties:
         prefix:
           type: string

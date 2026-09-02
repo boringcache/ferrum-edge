@@ -74,6 +74,12 @@ thread_local! {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+// Unknown root keys fail closed at construction. A misspelled `registry`
+// would otherwise build an empty registry, and a misspelled
+// `outbound_listen_ports` would widen enforcement to every listener.
+// serde's message names the offending field, which is the diagnostic the
+// operator needs; `OutboundRegistry::new` wraps it with the plugin prefix.
+#[serde(deny_unknown_fields)]
 pub struct OutboundRegistryConfig {
     /// Operator-supplied list of known destinations. Each entry is a bare
     /// hostname (`reviews.default.svc.cluster.local`), a `host:port` pair,

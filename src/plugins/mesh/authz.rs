@@ -1520,6 +1520,28 @@ fn same_namespace_assertion(peer: &SpiffeId, asserted: &SpiffeId) -> bool {
 /// explicit `asserts` inventory or `scope: mesh_wide` contract.
 const DEFAULT_TRUSTED_HBONE_ASSERTOR_SA_NAMES: &[&str] = &["ztunnel", "waypoint"];
 
+/// Every root `config` key `mesh_authz` reads, and the exact set mesh slice
+/// injection writes (`inject_mesh_authz_plugin`). Unknown root keys fail
+/// closed at construction: a `mesh_policies` misspelling would otherwise
+/// build an instance with zero policies, `saw_allow` would never become
+/// true, the implicit-deny branch would be unreachable, and every request
+/// would be ALLOWED. A misspelled `trusted_hbone_assertors` silently
+/// restores the built-in assertor defaults, undoing an operator's
+/// `trusted_hbone_assertors: []` baggage lockdown.
+pub const MESH_AUTHZ_CONFIG_KEYS: &[&str] = &[
+    "mesh_slice",
+    "mesh_policies",
+    "namespace",
+    "labels",
+    "per_pod_policy_scoping",
+    "ambient_udp_source_scoping",
+    "trust_domain_aliases",
+    "trusted_hbone_assertors",
+    "cluster_domain",
+    "cluster_domains",
+    "node_waypoint_route_upstreams",
+];
+
 fn ambient_udp_source_scope_index(
     slice: &MeshSlice,
 ) -> HashMap<[u8; 16], crate::modes::mesh::runtime::PolicyScopeCache> {
@@ -1587,6 +1609,14 @@ impl MeshAuthz {
         config: &Value,
         http_client: Option<PluginHttpClient>,
     ) -> Result<Self, String> {
+        // Unknown root keys fail closed. A non-object config keeps its existing
+        // behavior (every `config.get` below yields `None`, producing a
+        // default, policy-free instance) — closing that shape is a separate
+        // change, not an admission fix.
+        if let Some(object) = config.as_object() {
+            reject_unknown_keys(object, "config", MESH_AUTHZ_CONFIG_KEYS, "mesh_authz: ")?;
+        }
+
         // Whether the policies arrived via a `mesh_slice` (the slice-apply path
         // builds this — see `inject_mesh_authz_plugin`) vs. a flat
         // `mesh_policies` operator config with no slice context. This selects

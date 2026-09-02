@@ -88,6 +88,7 @@ mod plugin_http_client_tests;
 mod plugin_integration_tests;
 mod plugin_trigger_carrier_tests;
 mod plugin_trigger_gate_tests;
+mod plugin_unknown_key_registry_tests;
 mod plugin_utils_core_tests;
 mod prometheus_metric_contract_tests;
 mod prometheus_metrics_tests;

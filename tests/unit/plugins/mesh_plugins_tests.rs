@@ -8068,3 +8068,182 @@ async fn mesh_authz_node_waypoint_stream_still_enforces_on_its_source_side_leg()
         "per_pod_policy_scoping is exempt from the outbound-capture gate"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #4525: the four `src/plugins/mesh/` plugin roots are closed key sets.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mesh_authz_rejects_a_misspelled_policy_key_instead_of_allowing_everything() {
+    // `policies` / `mesh_policy` are the natural misspellings of
+    // `mesh_policies`. Before #4525 either built an instance carrying ZERO
+    // policies: `saw_allow` never became true, the implicit-deny branch was
+    // unreachable, and every request was ALLOWED.
+    for typo in ["policies", "mesh_policy"] {
+        let error = MeshAuthz::new(&json!({ typo: [allow_client_policy(PolicyAction::Allow)] }))
+            .err()
+            .unwrap_or_else(|| {
+                panic!(
+                    "mesh_authz must reject '{typo}' rather than build an allow-everything instance"
+                )
+            });
+        assert!(error.contains("mesh_authz:"), "{error}");
+        assert!(error.contains(typo), "{error}");
+    }
+}
+
+#[test]
+fn mesh_authz_rejects_a_misspelled_trusted_hbone_assertors_key() {
+    // `trusted_hbone_assertors: []` is the baggage-rewrite LOCKDOWN; an
+    // absent or misspelled key restores the built-in assertor defaults, so
+    // the typo silently undoes the operator's intent.
+    let error = MeshAuthz::new(&json!({ "trusted_hbone_asserters": [] }))
+        .err()
+        .expect("misspelled assertor key must fail construction");
+    assert!(error.contains("trusted_hbone_asserters"), "{error}");
+}
+
+#[test]
+fn mesh_authz_accepts_every_allowlisted_key() {
+    use ferrum_edge::plugins::mesh::authz::MESH_AUTHZ_CONFIG_KEYS;
+
+    // A config exercising all 11 allowlisted keys at once: an over-narrow
+    // allowlist fails here rather than failing mesh slice apply in production.
+    let config = json!({
+        "mesh_slice": MeshSlice::default(),
+        "mesh_policies": [],
+        "namespace": "default",
+        "labels": { "app": "reviews" },
+        "per_pod_policy_scoping": false,
+        "ambient_udp_source_scoping": false,
+        "trust_domain_aliases": ["cluster.local"],
+        "trusted_hbone_assertors": [],
+        "cluster_domain": "cluster.local",
+        "cluster_domains": ["cluster.local"],
+        "node_waypoint_route_upstreams": [],
+    });
+    let configured: std::collections::BTreeSet<&str> = config
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let allowed: std::collections::BTreeSet<&str> =
+        MESH_AUTHZ_CONFIG_KEYS.iter().copied().collect();
+    assert_eq!(
+        configured, allowed,
+        "this test must exercise the whole mesh_authz allowlist"
+    );
+    assert!(MeshAuthz::new(&config).is_ok());
+}
+
+#[test]
+fn workload_metrics_rejects_a_misspelled_trusted_hbone_assertors_key() {
+    let error = WorkloadMetrics::new(&json!({ "trusted_hbone_asserters": [] }))
+        .err()
+        .expect("misspelled assertor key must fail construction");
+    assert!(error.contains("workload_metrics:"), "{error}");
+    assert!(error.contains("trusted_hbone_asserters"), "{error}");
+}
+
+#[test]
+fn workload_metrics_accepts_every_allowlisted_key() {
+    use ferrum_edge::plugins::mesh::workload_metrics::WORKLOAD_METRICS_CONFIG_KEYS;
+
+    // Includes the internal injection field, the GAP-3F direction gate, and
+    // the OTel exporter tuning keys that `trace_exporters_from_providers`
+    // reads off this same root object — the three groups an allowlist
+    // derived only from this file's `config.get` calls would miss.
+    let config = json!({
+        "node_id": "node-a",
+        "topology": "sidecar",
+        "namespace": "default",
+        "workload_spiffe_id": "spiffe://cluster.local/ns/default/sa/reviews",
+        "labels": { "app": "reviews" },
+        "trust_domain_aliases": ["cluster.local"],
+        "trusted_hbone_assertors": [],
+        EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY: [{ "trusted_hbone_assertors": [] }],
+        "sampling_percentage": 50.0,
+        "custom_tags": { "team": "payments" },
+        "custom_header_tags": { "ua": "user-agent" },
+        "custom_env_tags": {},
+        "metrics": {},
+        "tracing_provider": serde_json::Value::Null,
+        "tracing_providers": [],
+        "direction_emit": { "server": true, "client": true },
+        "span_reporting_disabled": false,
+        "disable_span_reporting": false,
+        "disableSpanReporting": false,
+        "service_name": "reviews",
+        "deployment_environment": "staging",
+        "batch_size": 128,
+        "flush_interval_ms": 1000,
+        "buffer_capacity": 1024,
+        "buffer_max_bytes": 1048576,
+        "max_retries": 2,
+        "retry_delay_ms": 250,
+    });
+    let configured: std::collections::BTreeSet<&str> = config
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let allowed: std::collections::BTreeSet<&str> =
+        WORKLOAD_METRICS_CONFIG_KEYS.iter().copied().collect();
+    assert_eq!(
+        configured, allowed,
+        "this test must exercise the whole workload_metrics allowlist"
+    );
+    let plugin = WorkloadMetrics::new(&config);
+    assert!(plugin.is_ok(), "{:?}", plugin.err());
+}
+
+#[test]
+fn mesh_outbound_registry_rejects_a_misspelled_registry_key() {
+    let error = create_plugin(
+        "mesh_outbound_registry",
+        &json!({
+            "registry": ["reviews.default.svc.cluster.local"],
+            "regsitry": [],
+        }),
+    )
+    .err()
+    .expect("misspelled registry key must fail construction");
+    assert!(error.contains("mesh_outbound_registry:"), "{error}");
+    assert!(error.contains("regsitry"), "{error}");
+}
+
+#[test]
+fn mesh_outbound_registry_accepts_every_documented_key() {
+    // Mirrors the `OutboundRegistryConfig` serde fields; the injected shape
+    // in `inject_mesh_outbound_registry_plugin` writes exactly these four.
+    let plugin = create_plugin(
+        "mesh_outbound_registry",
+        &json!({
+            "registry": ["reviews.default.svc.cluster.local"],
+            "reject_status": 404,
+            "outbound_listen_ports": [15001],
+            "namespace": "default",
+        }),
+    );
+    assert!(plugin.is_ok(), "{:?}", plugin.err());
+}
+
+#[test]
+fn mesh_bpf_metrics_rejects_a_misspelled_prefix_key() {
+    let error = create_plugin("__mesh_bpf_metrics", &json!({ "prefx": "x" }))
+        .err()
+        .expect("misspelled prefix key must fail construction");
+    assert!(error.contains("__mesh_bpf_metrics:"), "{error}");
+    assert!(error.contains("prefx"), "{error}");
+}
+
+#[test]
+fn mesh_bpf_metrics_accepts_its_documented_key() {
+    let plugin = create_plugin(
+        "__mesh_bpf_metrics",
+        &json!({ "prefix": "ferrum_mesh_bpf" }),
+    );
+    assert!(plugin.is_ok(), "{:?}", plugin.err());
+}
