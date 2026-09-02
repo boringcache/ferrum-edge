@@ -21,11 +21,52 @@ Actions escalate with pressure. Each action is additive — higher pressure acti
 
 | Pressure Level | Action | Effect | Hot Path Cost |
 |----------------|--------|--------|---------------|
-| **0.80** (pressure) | Disable keepalive | Responses include `Connection: close`, causing HTTP/1.1 clients to disconnect after each request. This naturally frees connection slots | 1 `AtomicBool::load` per response (~1ns) |
+| **0.80** (pressure) | Disable keepalive | HTTP/1.1 and HTTP/2 responses include `Connection: close`, causing clients to disconnect after each request. HTTP/3 expresses the same tier as a one-shot GOAWAY per connection (see below). This naturally frees connection slots | 1 `AtomicBool::load` per response (~1ns); HTTP/3 pays nothing per request |
 | **0.95** (critical) | Reject new connections | TCP connections are accepted and immediately dropped (HTTP/H2). H3 connections are refused via QUIC. Existing connections continue serving | 1 `AtomicBool::load` per accept loop iteration (~1ns) |
 | **0.95** (critical) | Reject new requests | New requests are rejected with `503` (gRPC `UNAVAILABLE`) once active requests reach `FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD` of `FERRUM_MAX_REQUESTS`. Only active when a request cap is configured (`FERRUM_MAX_REQUESTS` > 0) | 1 `AtomicBool::load` per request (~1ns) |
 
 State transitions are logged at `warn` (entering overload) and `info` (recovering).
+
+### The keepalive tier on HTTP/3
+
+HTTP/1.1 and HTTP/2 shrink the connection population one response at a time: every
+response emitted while `disable_keepalive` is set (or while RED sampling fires)
+carries `Connection: close`. HTTP/3 has no equivalent per-response lever — a QUIC
+connection multiplexes request streams and is not torn down by a response header —
+so the gateway expresses this tier as a **one-shot HTTP/3 GOAWAY** on each open
+connection: the peer stops opening new request streams while already-accepted
+streams run to completion.
+
+Each HTTP/3 connection subscribes to an edge-triggered watch of the binary
+`disable_keepalive` flag, so the GOAWAY costs no per-connection timer and nothing
+at all on the request path. The GOAWAY is latched: it fires at most once per
+connection, and the same latch is shared with the SIGTERM/SIGINT drain, so a
+connection never receives two.
+
+Three consequences are deliberate and worth stating plainly:
+
+- **The GOAWAY is terminal for that connection.** Unlike HTTP/1.1 and HTTP/2
+  `Connection: close`, it cannot be withdrawn if pressure recovers. The peer
+  reconnects, and that new connection is still admitted — only the critical tier
+  (`reject_new_connections`, FD ≥ 0.95 / Conn ≥ 0.95) refuses new connections.
+- **Only the binary `disable_keepalive` flag drives it — never RED sampling.**
+  `should_disable_keepalive_red()` is a per-response probabilistic sampler; a
+  GOAWAY is per-connection and terminal. Sampling it would kill a random subset of
+  connections outright instead of shrinking the population gracefully, so the RED
+  probability is deliberately not consulted on the HTTP/3 path.
+- **A peer that goes idle after receiving GOAWAY is bounded by the QUIC idle
+  timeout, not closed immediately.** The vendored h3 accept loop returns
+  `Ok(None)` only once in-flight streams have completed *and* the peer has either
+  sent its own GOAWAY or tried to open a stream past `max_id`; outside graceful
+  shutdown there is no drain deadline to force the issue. Such a connection is
+  therefore reclaimed by `FERRUM_HTTP3_IDLE_TIMEOUT` (default 30 s). No additional
+  timer is armed for it.
+
+Because the watch is edge-triggered, a connection that is established while
+pressure is *already* raised is not sent a GOAWAY until the next rising edge. That
+is the intended split of responsibility: admitting new connections during the
+pressure tier is exactly what the tier permits, and refusing them is the critical
+tier's job.
 
 ## Configuration
 

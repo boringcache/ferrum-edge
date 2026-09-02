@@ -247,3 +247,228 @@ fn connect_udp_is_not_rewritten_for_shutdown() {
     assert!(src.contains("SessionEnd::Draining"));
     assert!(src.contains("wait_for_drain_start()"));
 }
+
+// ---------------------------------------------------------------------------
+// Issue #4542 — the overload keepalive tier reaches HTTP/3 as a one-shot GOAWAY
+// ---------------------------------------------------------------------------
+
+/// A fresh subscriber must start with the current value already marked seen, so
+/// the accept-loop arm only ever fires on a transition. A `false` publication is
+/// not a transition worth waking for and must never arm a GOAWAY.
+#[tokio::test]
+async fn keepalive_pressure_watch_only_wakes_on_a_real_transition() {
+    let state = Arc::new(OverloadState::new());
+    let mut rx = state.subscribe_keepalive_pressure();
+
+    // Nothing published yet: the arm must stay parked.
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            ferrum_edge::http3::server::h3_keepalive_pressure_raised(&mut rx),
+        )
+        .await
+        .is_err(),
+        "an unpublished watch must not arm a GOAWAY"
+    );
+
+    // Republishing the same `false` value is not a transition.
+    state.publish_keepalive_pressure(false);
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            ferrum_edge::http3::server::h3_keepalive_pressure_raised(&mut rx),
+        )
+        .await
+        .is_err(),
+        "re-publishing `false` must not arm a GOAWAY"
+    );
+
+    // The rising edge is the only thing that arms it.
+    state.publish_keepalive_pressure(true);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        ferrum_edge::http3::server::h3_keepalive_pressure_raised(&mut rx),
+    )
+    .await
+    .expect("the rising edge must arm a GOAWAY");
+}
+
+/// The recovery edge (`true -> false`) also wakes `changed()`. It must not be
+/// mistaken for pressure: a GOAWAY is terminal and cannot be withdrawn.
+#[tokio::test]
+async fn keepalive_pressure_recovery_edge_does_not_arm_a_goaway() {
+    let state = Arc::new(OverloadState::new());
+    state.publish_keepalive_pressure(true);
+
+    // Subscribe AFTER the rise, so this receiver has only the fall ahead of it.
+    let mut rx = state.subscribe_keepalive_pressure();
+    state.publish_keepalive_pressure(false);
+
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            ferrum_edge::http3::server::h3_keepalive_pressure_raised(&mut rx),
+        )
+        .await
+        .is_err(),
+        "the `true -> false` recovery edge must not arm a GOAWAY"
+    );
+}
+
+/// The RED sampler is deliberately not consulted on the HTTP/3 path: it is a
+/// per-response probability and a GOAWAY is per-connection and terminal.
+#[test]
+fn h3_accept_loop_reads_only_the_binary_keepalive_tier() {
+    let src = server_src();
+    let accept_loop = src
+        .split("let mut h3_goaway_sent = false;")
+        .nth(1)
+        .expect("GOAWAY latch must remain present")
+        .split("/// Peer-gone watch backed by QUIC connection close.")
+        .next()
+        .expect("bounded H3 accept loop");
+    assert!(
+        accept_loop.contains("subscribe_keepalive_pressure()"),
+        "the accept loop must observe the overload keepalive tier (issue #4542)"
+    );
+    assert!(
+        accept_loop.contains("h3_keepalive_pressure_raised(&mut keepalive_pressure_rx)"),
+        "the keepalive tier must be observed by parking on the watch, not by a per-connection timer"
+    );
+    assert!(
+        !accept_loop.contains("should_disable_keepalive_red"),
+        "RED sampling must never drive a terminal per-connection GOAWAY"
+    );
+    assert!(
+        !accept_loop.contains("tokio::time::interval"),
+        "the keepalive tier must not cost a per-connection timer"
+    );
+    assert!(
+        accept_loop.contains("H3GoawayTrigger::KeepalivePressure"),
+        "the pressure-driven GOAWAY must be distinguishable from the shutdown-driven one"
+    );
+}
+
+/// Both `select!` branches must carry the arm, and it must stay after the
+/// shutdown arm so `biased;` ordering keeps process shutdown first.
+#[test]
+fn both_select_branches_observe_keepalive_pressure_after_shutdown() {
+    let src = compact(server_src());
+    assert_eq!(
+        src.matches("h3_keepalive_pressure_raised(&mutkeepalive_pressure_rx),if!h3_goaway_sent")
+            .count(),
+        2,
+        "both the 0-RTT and the full-handshake select branches must observe the tier"
+    );
+    let shutdown_first = src
+        .match_indices("_=shutdown_rx.changed(),if!h3_goaway_sent")
+        .map(|(i, _)| i)
+        .collect::<Vec<_>>();
+    let pressure = src
+        .match_indices("h3_keepalive_pressure_raised(&mutkeepalive_pressure_rx)")
+        .map(|(i, _)| i)
+        .collect::<Vec<_>>();
+    assert_eq!(shutdown_first.len(), 2);
+    assert_eq!(pressure.len(), 2);
+    for (s, p) in shutdown_first.iter().zip(pressure.iter()) {
+        assert!(
+            s < p,
+            "the shutdown arm must precede the pressure arm under `biased;`"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #4537 — the request-header arrival deadline
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn header_arrival_deadline_elapses_and_drops_the_resolver() {
+    let (drop_tx, drop_rx) = tokio::sync::oneshot::channel::<()>();
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+    let sentinel = DropSignal(Some(drop_tx));
+    let never = async move {
+        let _held = sentinel;
+        std::future::pending::<u8>().await
+    };
+
+    let resolved = ferrum_edge::http3::server::await_h3_request_headers(never, 1).await;
+    assert!(
+        resolved.is_none(),
+        "a stream that never sends HEADERS must elapse"
+    );
+    assert!(
+        drop_rx.await.is_ok(),
+        "the elapsed resolver must be dropped — the drop is what reclaims the QUIC stream slot"
+    );
+}
+
+#[tokio::test]
+async fn header_arrival_deadline_passes_a_resolved_request_through() {
+    let resolved =
+        ferrum_edge::http3::server::await_h3_request_headers(std::future::ready(7u8), 30).await;
+    assert_eq!(resolved, Some(7u8));
+}
+
+#[tokio::test]
+async fn zero_disables_the_header_arrival_deadline() {
+    // Opt-out parity with hyper's `header_read_timeout` and the H2
+    // `wait_pre_request_deadline`: `0` must never resolve on its own.
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            ferrum_edge::http3::server::await_h3_request_headers(std::future::pending::<u8>(), 0),
+        )
+        .await
+        .is_err(),
+        "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS=0 must disable the H3 bound"
+    );
+    // …while still passing a completed resolution straight through.
+    assert_eq!(
+        ferrum_edge::http3::server::await_h3_request_headers(std::future::ready(3u8), 0).await,
+        Some(3u8)
+    );
+}
+
+#[test]
+fn h3_header_arrival_elapse_logs_at_debug_and_never_unwraps() {
+    let src = server_src();
+    assert!(
+        compact(src).contains(
+            "letSome(resolved)=await_h3_request_headers(resolver.resolve_request(),             header_deadline_seconds,)"
+        ),
+        "the per-stream resolve must be bounded by the hoisted deadline (issue #4537)"
+    );
+    let spawn = src
+        .split("let Some(resolved) = await_h3_request_headers(")
+        .nth(1)
+        .expect("the per-stream resolve must be bounded (issue #4537)")
+        .split("Ok((req, stream)) =>")
+        .next()
+        .expect("bounded resolve arm");
+    assert!(
+        spawn.contains("debug!("),
+        "an unauthenticated peer must not drive warn/error logging one stream at a time"
+    );
+    assert!(
+        !spawn.contains("warn!(") && !spawn.contains("error!("),
+        "the elapse arm must not raise log severity: {spawn}"
+    );
+    assert!(
+        !spawn.contains(".unwrap()") && !spawn.contains(".expect("),
+        "no unwrap/expect on the H3 accept path: {spawn}"
+    );
+    assert!(
+        src.contains(
+            "let header_deadline_seconds = state.env_config.http_header_read_timeout_seconds;"
+        ),
+        "the deadline must be hoisted once per connection, not read per stream"
+    );
+}

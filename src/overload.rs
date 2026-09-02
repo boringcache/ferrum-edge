@@ -98,9 +98,10 @@ pub enum OverloadLevel {
 /// cache line as the `fetch_add`/`fetch_sub` counters, causing the line to
 /// ping-pong between cores and turning every accept into a coherence stall.
 /// Snapshot fields (`fd_current`, `conn_current`, etc.), `draining`, the
-/// one-shot `drain_started` notifier, and `port_exhaustion_events` are NOT
-/// padded — they are written ≤ once/sec or only on rare events, so contention
-/// does not justify the memory cost.
+/// one-shot `drain_started` notifier, the `keepalive_pressure_tx` transition
+/// watch, and `port_exhaustion_events` are NOT padded — they are written
+/// ≤ once/sec or only on rare events, so contention does not justify the memory
+/// cost.
 /// `CachePadded<T>` derefs to `T`, so all existing
 /// `.load()` / `.fetch_add()` call sites compile unchanged.
 pub struct OverloadState {
@@ -131,6 +132,21 @@ pub struct OverloadState {
     /// Notified each time `active_connections` or `active_requests` reaches zero
     /// during drain. The drain waiter re-checks both counters in a loop.
     pub drain_complete: tokio::sync::Notify,
+
+    /// Edge-triggered publication of the binary keepalive-pressure flag
+    /// (issue #4542).
+    ///
+    /// H1/H2 express the first overload tier per response (`Connection: close`),
+    /// so they can read [`Self::disable_keepalive`] on the path they already
+    /// take. An idle multiplexed HTTP/3 connection has no such path: it parks in
+    /// `accept()` and would otherwise need a per-connection timer to notice the
+    /// tier at all. This watch lets each H3 connection park on the transition
+    /// instead, and express the tier as a one-shot GOAWAY.
+    ///
+    /// Deliberately NOT a `CachePadded` hot atomic: it is written by the
+    /// overload monitor at most once per second, and only when the value
+    /// actually changes. Nothing on the request path reads it.
+    keepalive_pressure_tx: tokio::sync::watch::Sender<bool>,
 
     // ── RED adaptive load shedding ────────────────────────────────────
     /// RED (Random Early Detection) drop probability (0–[`RED_PROBABILITY_SCALE`] scale,
@@ -190,6 +206,7 @@ impl OverloadState {
             active_connections: CachePadded::new(AtomicU64::new(0)),
             active_requests: CachePadded::new(AtomicU64::new(0)),
             drain_complete: tokio::sync::Notify::new(),
+            keepalive_pressure_tx: tokio::sync::watch::channel(false).0,
             red_drop_probability: CachePadded::new(AtomicU32::new(0)),
             red_request_counter: CachePadded::new(AtomicU64::new(0)),
             fd_current: AtomicU64::new(0),
@@ -220,6 +237,42 @@ impl OverloadState {
         } else {
             OverloadLevel::Normal
         }
+    }
+
+    /// Subscribe to the binary keepalive-pressure transition (issue #4542).
+    ///
+    /// The returned receiver starts with the CURRENT value already marked seen,
+    /// so `changed()` fires only on a subsequent transition. Subscribers must
+    /// re-read the value after `changed()`: the recovery edge (`true -> false`)
+    /// wakes them too, and must not be mistaken for pressure.
+    ///
+    /// Callers deliberately observe only the binary
+    /// [`Self::disable_keepalive`] tier here, never
+    /// [`Self::should_disable_keepalive_red`]: RED is a per-response
+    /// probabilistic sampler, and the H3 expression of this tier
+    /// (a per-connection GOAWAY) is terminal for the whole connection.
+    pub fn subscribe_keepalive_pressure(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.keepalive_pressure_tx.subscribe()
+    }
+
+    /// Set the binary keepalive tier and publish it on the transition watch.
+    ///
+    /// The atomic remains the authoritative state and the hot-path read for
+    /// H1/H2; the watch is only how HTTP/3 learns of the transition without a
+    /// per-connection timer. Both are written here so they can never diverge.
+    /// `send_if_modified` wakes subscribers only when the published value
+    /// actually changes. Called by the overload monitor at most once per second.
+    pub fn publish_keepalive_pressure(&self, disable_keepalive: bool) {
+        self.disable_keepalive
+            .store(disable_keepalive, Ordering::Relaxed);
+        self.keepalive_pressure_tx.send_if_modified(|published| {
+            if *published == disable_keepalive {
+                false
+            } else {
+                *published = disable_keepalive;
+                true
+            }
+        });
     }
 
     /// Returns true if this response should have keepalive disabled based on RED probability.
@@ -978,9 +1031,11 @@ pub fn start_monitor(
             let was_rejecting_requests = state.reject_new_requests.load(Ordering::Acquire);
             let was_keepalive_disabled = state.disable_keepalive.load(Ordering::Relaxed);
 
-            state
-                .disable_keepalive
-                .store(should_disable_keepalive, Ordering::Relaxed);
+            // Issue #4542: one call writes the hot-path atomic H1/H2 reads and
+            // publishes the same binary tier on the edge-triggered watch an
+            // idle HTTP/3 connection parks on, so the two can never diverge.
+            // This loop body runs at most once per second; it is not a hot path.
+            state.publish_keepalive_pressure(should_disable_keepalive);
             state
                 .reject_new_connections
                 .store(should_reject, Ordering::Relaxed);
