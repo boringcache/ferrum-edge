@@ -8468,3 +8468,139 @@ async fn test_timestamp_created_comment_truncation_rejected() {
         reject_body(&result)
     );
 }
+
+// ── Pre-parse XML nesting depth (issue #4565) ──────────────────────────────
+//
+// `roxmltree`'s tokenizer recurses once per open element
+// (`parse_element` -> `parse_content` -> `parse_element`), so `MAX_XML_NODES`
+// alone cannot stop a deeply nested envelope from overflowing the worker stack
+// *inside* `Document::parse_with_options`. `parse_bounded_xml` therefore
+// screens element nesting over the raw bytes first, bounded by the shared
+// `XML_MAX_NESTING_DEPTH` (256). `MAX_CANONICALIZATION_DEPTH` remains the
+// separate post-parse walk budget.
+
+/// `<soap:Body>` payload nested `levels` deep. The envelope itself contributes
+/// two levels (`Envelope` > `Body`) above this.
+fn nested_soap_payload(levels: usize) -> String {
+    let mut xml = String::with_capacity(levels * 8);
+    for _ in 0..levels {
+        xml.push_str("<n>");
+    }
+    xml.push_str("leaf");
+    for _ in 0..levels {
+        xml.push_str("</n>");
+    }
+    xml
+}
+
+fn soap_envelope_with_body(security_content: &str, body_content: &str) -> String {
+    format!(
+        r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Header>
+    <wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
+                   xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
+      {security_content}
+    </wsse:Security>
+  </soap:Header>
+  <soap:Body>
+    {body_content}
+  </soap:Body>
+</soap:Envelope>"#
+    )
+}
+
+#[tokio::test]
+async fn soap_envelope_nested_beyond_the_depth_bound_is_rejected_before_parse() {
+    let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+    let envelope = soap_envelope_with_body(&fresh_timestamp(), &nested_soap_payload(300));
+    let mut ctx = make_ctx_with_soap_body(&envelope);
+    let mut headers = soap_headers_with_content_type("text/xml");
+
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+    match &result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(*status_code, 400),
+        other => panic!("expected Reject for a nesting bomb, got {other:?}"),
+    }
+    assert!(
+        reject_body(&result).contains("nesting exceeds the supported depth"),
+        "expected the fixed depth rejection, got: {}",
+        reject_body(&result)
+    );
+    // The rejection never echoes envelope bytes.
+    assert!(!reject_body(&result).contains("leaf"));
+}
+
+#[tokio::test]
+async fn soap_envelope_within_the_depth_bound_still_validates() {
+    let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+    // 250 payload levels + `Envelope` + `Body` = 252, inside the 256 bound.
+    let envelope = soap_envelope_with_body(&fresh_timestamp(), &nested_soap_payload(250));
+    let mut ctx = make_ctx_with_soap_body(&envelope);
+    let mut headers = soap_headers_with_content_type("text/xml");
+
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a 252-level envelope must validate normally, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn soap_depth_screen_ignores_tags_inside_comments_and_cdata() {
+    let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+    let mut payload = String::from("<wrapper><!--");
+    for _ in 0..600 {
+        payload.push_str("<a><b><c>");
+    }
+    payload.push_str("--><data><![CDATA[");
+    for _ in 0..600 {
+        payload.push_str("<a><b><c>");
+    }
+    payload.push_str("]]></data></wrapper>");
+
+    let envelope = soap_envelope_with_body(&fresh_timestamp(), &payload);
+    let mut ctx = make_ctx_with_soap_body(&envelope);
+    let mut headers = soap_headers_with_content_type("text/xml");
+
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "commented-out and CDATA-quoted tags must not count toward nesting, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn soap_depth_screen_does_not_end_a_tag_at_a_quoted_angle_bracket() {
+    let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+    // Each start tag carries an attribute value of `/>`. A scan that is not
+    // quote-aware terminates the tag at that `>` and, seeing `/` as the last
+    // significant byte, mistakes every element for self-closing — so 300 real
+    // levels would measure as depth 1 and sail past the bound. Both `>` and `/`
+    // are legal unescaped inside an attribute value, so `roxmltree` accepts the
+    // document; only the screen may refuse it.
+    let mut payload = String::new();
+    for _ in 0..300 {
+        payload.push_str(r#"<n note="/>">"#);
+    }
+    payload.push_str("leaf");
+    for _ in 0..300 {
+        payload.push_str("</n>");
+    }
+
+    let envelope = soap_envelope_with_body(&fresh_timestamp(), &payload);
+    let mut ctx = make_ctx_with_soap_body(&envelope);
+    let mut headers = soap_headers_with_content_type("text/xml");
+
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+    match &result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(*status_code, 400),
+        other => {
+            panic!("expected Reject: a quoted `>` must not terminate the start tag, got {other:?}")
+        }
+    }
+    assert!(
+        reject_body(&result).contains("nesting exceeds the supported depth"),
+        "expected the fixed depth rejection, got: {}",
+        reject_body(&result)
+    );
+}

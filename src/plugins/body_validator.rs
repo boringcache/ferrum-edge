@@ -67,6 +67,7 @@ use super::utils::validation_diagnostics::{
     SafeFieldNames, bound_detail, safe_keyword, safe_location, schema_violation_detail,
     xml_error_category,
 };
+use super::utils::xml_bounds::{XML_MAX_NESTING_DEPTH, xml_nesting_depth_within_limit};
 use super::{Plugin, PluginResult, RequestContext};
 
 /// Per-method message type descriptors for protobuf validation.
@@ -663,12 +664,16 @@ impl BodyValidator {
     /// documented contract. The exact original string is parsed without Unicode
     /// whitespace normalization. External entities are never retrieved.
     ///
-    /// Two bounded pre-parse guards still run first because they encode policy the
-    /// parser has no opinion on: the configured `<!ENTITY` declaration cap /
-    /// nested-entity rejection, and outright rejection of external
-    /// (`SYSTEM`/`PUBLIC`) identifiers on both the DOCTYPE and entity
-    /// declarations. The parser is then given a node budget so a pathologically
-    /// wide document cannot allocate without bound.
+    /// Three bounded pre-parse guards still run first because they encode policy
+    /// the parser has no opinion on, or a limit it cannot enforce on itself: the
+    /// configured `<!ENTITY` declaration cap / nested-entity rejection, outright
+    /// rejection of external (`SYSTEM`/`PUBLIC`) identifiers on both the DOCTYPE
+    /// and entity declarations, and the shared
+    /// [`xml_nesting_depth_within_limit`] screen — `roxmltree`'s tokenizer
+    /// recurses per nesting level, so a node budget alone cannot keep a deeply
+    /// nested document from overflowing the worker stack inside the parser. The
+    /// parser is then given a node budget so a pathologically wide document
+    /// cannot allocate without bound.
     fn validate_xml_body(
         body: &str,
         required_xml_elements: &[RequiredXmlElement],
@@ -682,6 +687,16 @@ impl BodyValidator {
         // Reject entity-expansion bombs and external identifiers at the edge
         // (Ferrum does not expand entities, but backends may).
         check_xml_entity_expansion(body, max_entities, reject_nested)?;
+
+        // Bound element nesting over the raw bytes before `roxmltree` sees
+        // them: its tokenizer recurses once per open element
+        // (`parse_element` -> `parse_content` -> `parse_element`), so the node
+        // budget below cannot stop a deeply nested document from overflowing
+        // the worker stack *inside* the parser. Under `panic = "abort"` that
+        // would be a process kill on the request path.
+        if !xml_nesting_depth_within_limit(body, XML_MAX_NESTING_DEPTH) {
+            return Err(XML_DEPTH_DETAIL.to_string());
+        }
 
         let document = roxmltree::Document::parse_with_options(
             body,
@@ -968,6 +983,12 @@ const MAX_SCHEMA_NODES: usize = 20_000;
 /// Node budget handed to the XML parser so a pathologically wide document
 /// cannot allocate a tree without bound.
 const XML_MAX_NODES: u32 = 100_000;
+
+/// Fixed diagnostic for a body whose element nesting exceeds
+/// [`XML_MAX_NESTING_DEPTH`]. Like every other XML diagnostic here it is a
+/// compiled-in constant; no body byte is ever interpolated
+/// (`GHSA-5p2h-fq6q-gwh9`).
+const XML_DEPTH_DETAIL: &str = "Invalid XML: document nesting exceeds the supported depth";
 
 fn parse_schema_draft(raw: Option<&str>) -> Result<SchemaDraft, String> {
     match raw {
