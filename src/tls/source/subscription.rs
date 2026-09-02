@@ -819,15 +819,24 @@ async fn run_material_set_reload_loop(
         }
     };
 
+    // `tokio::time::interval` completes its first tick immediately. The startup
+    // fingerprint above already is that pass, so consume the immediate tick
+    // here, before readiness is announced. Leaving it pending makes the loop
+    // perform a second, unrequested load of every source concurrently with
+    // whatever the caller does after readiness, which duplicates startup source
+    // I/O and can publish a revision for a rotation nobody asked for. Consuming
+    // it does not shift later ticks: the next one still fires one interval
+    // after the ticker was created.
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await;
+
     // Deterministic readiness: force/tick handling starts only after the
     // initial fingerprint baseline is established, so callers cannot race the
     // baseline onto a rewritten candidate.
     if let Some(ready_tx) = ready_tx {
         let _ = ready_tx.send(());
     }
-
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         if shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
@@ -1014,6 +1023,14 @@ async fn run_async_material_set_reload_loop(
         }
     }
 
+    // Consume `tokio::time::interval`'s immediate first tick before readiness,
+    // for the same reason as the blocking loop: the startup fingerprint above
+    // is that pass, and leaving the tick pending races an unrequested reload
+    // against the caller that just observed readiness.
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await;
+
     // Deterministic readiness: force/tick handling starts only after the
     // initial fingerprint baseline and any requested startup reconciliation
     // are complete, so callers cannot race the baseline onto a rewritten
@@ -1021,9 +1038,6 @@ async fn run_async_material_set_reload_loop(
     if let Some(ready_tx) = ready_tx {
         let _ = ready_tx.send(());
     }
-
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         if shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow()) {

@@ -34,6 +34,19 @@ fn ensure_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// Rewrite a watched material path atomically.
+///
+/// `std::fs::write` truncates before it writes, so a reload pass landing in that
+/// window reads a short (often empty) file. The loader accepts an empty file, so
+/// that intermediate state is a legitimate fingerprint change and publishes a
+/// revision of its own. Staging into a sibling temp file and renaming keeps
+/// every reader on a whole generation.
+fn rotate_material_atomically(path: &std::path::Path, bytes: impl AsRef<[u8]>) {
+    let staged = path.with_extension("rotate-staged");
+    std::fs::write(&staged, bytes).expect("stage rotated material");
+    std::fs::rename(&staged, path).expect("publish rotated material atomically");
+}
+
 fn write_ecdsa_material(
     dir: &std::path::Path,
     san: &str,
@@ -118,8 +131,8 @@ async fn dtls_material_watcher_rotates_on_file_change_and_exits_on_shutdown() {
         rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("rotate key");
     let params = rcgen::CertificateParams::new(vec!["watch-rotated".to_string()]).expect("params");
     let cert = params.self_signed(&key_pair).expect("self-sign");
-    std::fs::write(&cert_path, cert.pem()).expect("rewrite cert");
-    std::fs::write(&key_path, key_pair.serialize_pem()).expect("rewrite key");
+    rotate_material_atomically(&cert_path, cert.pem());
+    rotate_material_atomically(&key_path, key_pair.serialize_pem());
 
     assert!(request_material_set_reload("test_frontend_dtls_reload"));
     tokio::time::timeout(Duration::from_secs(2), revision_rx.changed())
@@ -185,7 +198,7 @@ async fn dtls_material_watcher_keeps_prior_state_and_retries_same_failed_candida
     );
     ready_rx.await.expect("watcher fingerprint baseline");
 
-    std::fs::write(&cert_path, b"not-a-certificate").expect("corrupt cert");
+    rotate_material_atomically(&cert_path, b"not-a-certificate");
     assert!(request_material_set_reload(
         "test_frontend_dtls_reload_fail"
     ));

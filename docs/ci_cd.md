@@ -1567,13 +1567,63 @@ closed), matching the smoke benchmark. `push` to `main` and
 every full-mode job, including when the Criterion benches themselves are
 skipped.
 
-The RoundRobin and WRR parallel-speedup floors stay at 1.10x. On a miss,
-the verifier measures an independent-process CPU control (median of five
-repeats) at the same thread count. If that control also misses 1.10x, the
-runner is oversubscribed and the floor is advisory (`::warning::`) rather
-than a required failure. If the control clears 1.10x, a selection miss is
-still a hard failure. Serial-ratio and missing-artifact contracts stay
-hard either way. The floor value is not lowered.
+The WRR parallel-speedup floor stays at 1.10x for its mandatory
+high-cardinality fixtures (32 and 129 targets), which genuinely scale. On
+a miss, `verify_wrr_selection_benchmark.py` measures an independent-process
+CPU control (median of five repeats) at the same thread count. If that
+control also misses 1.10x, the runner is oversubscribed and the floor is
+advisory (`::warning::`) rather than a required failure. If the control
+clears 1.10x, a selection miss is still a hard failure. Its 4-target
+small-cardinality fixture is measured but informational, because an Arc
+strong-count hotspot dominates it.
+
+The **RoundRobin** guard does not assert a parallel speedup at all
+(issue #4484). Its only fixture is a 2-target upstream, whose measurement
+is dominated by a shared-line hotspot: hosted runs of an unmodified tree
+land near 0.6x-0.7x, so a 1.10x floor sat above the workload's own typical
+value and ejected green pull requests from the merge queue. That fixture is
+the RoundRobin analogue of the WRR 4-target one, and is now treated the
+same way: `verify_rr_selection_benchmark.py` still prints its wall times and
+its throughput speedup against `--min-parallel-speedup`, but reports a miss
+as a `::notice::` instead of failing on it.
+
+What it enforces instead is a **per-selection contention bound** built from
+the same two measurements the fixture already records:
+
+```
+contention_ratio = parallel_ns / (8 * serial_ns)
+                 = parallel ns/selection / serial ns/selection
+```
+
+`contention_ratio` is 1.00x for a workload that scales perfectly and rises
+toward 8.00x as the batch serializes on one cache line. The reference for
+"serialized on one cache line" is not a constant: the Criterion bench adds
+`shared_counter_control_{1,8}_threads`, which drives the same
+barrier-synchronized worker pool at the same thread counts over one
+genuinely shared `AtomicU64` — the exact cost the sharded `CachePadded`
+selection counters exist to avoid, measured on the same runner in the same
+run. The gate passes when
+
+```
+selection contention_ratio <= 0.50 * shared_counter_control contention_ratio
+```
+
+An oversubscribed or coherence-degraded runner inflates both readings
+together, so the verdict does not flip; a regression that puts every worker
+back on one shared counter drives the selection reading up to the control's
+own, whatever absolute value that runner produces that day. This is what
+makes the control representative — unlike the independent-process CPU
+control, which measures whether cores are free rather than what a contended
+cache line costs, and therefore cleared on all three of the readings that
+ejected #4466.
+
+Two fallbacks apply the wide absolute backstop `contention_ratio <= 4.00x`
+(healthy hosted readings are ~1.3x-1.7x; full serialization is >= 8.00x)
+and say so with a `::warning::`: a control below 2.00x, meaning the runner
+resolves no shared-line penalty at all so the comparison has no signal; and
+an unreadable control fixture, which is fail-closed. Serial-ratio and
+missing-artifact contracts stay hard either way. The WRR floor value is not
+lowered.
 
 **Failures**:
 - Indicate performance regression issues

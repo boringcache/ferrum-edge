@@ -1192,6 +1192,15 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         return;
     };
 
+    // Issue #4491: `reconciliations` counts passes started, including the ones
+    // that swap nothing. Only this counter proves the reconciler turned an
+    // observed cluster change into newly served configuration, which is what
+    // separates "the control plane never saw the withdrawal" from "it did, and
+    // the data plane is still serving the old route".
+    ctx.metrics
+        .config_publications
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     // Same shared-snapshot contract as the no-change branch above.
     run_status_patchers(StatusPatchersRequest {
         gateway_writer: ctx.gateway_status_writer,

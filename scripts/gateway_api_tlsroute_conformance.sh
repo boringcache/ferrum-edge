@@ -21,6 +21,23 @@ TLS_SNI_CROSS="${TLS_SNI_CROSS:-cross.tls.blackbox.example}"
 TLS_SNI_DELETE="${TLS_SNI_DELETE:-delete.tls.blackbox.example}"
 TLS_SNI_UNKNOWN="${TLS_SNI_UNKNOWN:-unknown.tls.blackbox.example}"
 
+# Control-plane reconcile observability (issue #4491). "The withdrawn route is
+# still served" is two very different faults wearing one message: the control
+# plane never observed the delete (a stalled watch), or it observed and
+# published and the data plane kept the listener. The counters below separate
+# them, so the delete assertion below can say which one it hit instead of
+# leaving triage to guess. Defaults mirror the lab setup script; the metrics
+# bearer token authenticates `/metrics` without minting an admin JWT.
+CP_NAMESPACE="${CP_NAMESPACE:-ferrum}"
+CP_DEPLOYMENT="${CP_DEPLOYMENT:-ferrum-mesh-control-plane}"
+ADMIN_HTTP_PORT="${ADMIN_HTTP_PORT:-9000}"
+METRICS_TOKEN="${METRICS_TOKEN:-ferrum-edge-gateway-api-conformance-metrics-token}"
+# Distinct from the data-plane script's 18090 so the two can never collide.
+CONTROLLER_METRICS_LOCAL_PORT="${CONTROLLER_METRICS_LOCAL_PORT:-18094}"
+CONTROLLER_METRICS_PF_PID=""
+
+mkdir -p "$RESULTS_DIR"
+
 create_tls_echo_secret() {
   local namespace="$1"
   local name="$2"
@@ -365,6 +382,56 @@ assert_tls_exchange_fails() {
   return 0
 }
 
+# Hold one port-forward open for the whole delete assertion rather than paying
+# a new one per scrape. Best-effort: every caller tolerates an empty reading, so
+# an unreachable admin port degrades the message and never fails a green run.
+start_controller_metrics_forward() {
+  [ -z "$CONTROLLER_METRICS_PF_PID" ] || return 0
+  local log="$RESULTS_DIR/tlsroute-controller-metrics-port-forward.log"
+  kubectl -n "$CP_NAMESPACE" port-forward "deploy/${CP_DEPLOYMENT}" \
+    "${CONTROLLER_METRICS_LOCAL_PORT}:${ADMIN_HTTP_PORT}" >"$log" 2>&1 &
+  CONTROLLER_METRICS_PF_PID=$!
+  local _attempt
+  for _attempt in 1 2 3 4 5; do
+    sleep 1
+    if [ -n "$(controller_metric ferrum_k8s_controller_reconciliations_total)" ]; then
+      return 0
+    fi
+  done
+  echo "controller /metrics is unreadable; the TLSRoute delete assertion will report data-plane state only (see ${log})" >&2
+  stop_controller_metrics_forward
+  return 1
+}
+
+stop_controller_metrics_forward() {
+  [ -n "$CONTROLLER_METRICS_PF_PID" ] || return 0
+  kill "$CONTROLLER_METRICS_PF_PID" >/dev/null 2>&1 || true
+  wait "$CONTROLLER_METRICS_PF_PID" >/dev/null 2>&1 || true
+  CONTROLLER_METRICS_PF_PID=""
+}
+
+# Print one unlabeled `ferrum_k8s_controller_*` counter value, or nothing when
+# the scrape fails or the family is absent. Never fails the caller.
+controller_metric() {
+  local family="$1"
+  local scrape=""
+  scrape="$(curl -fsS -m 5 -H "Authorization: Bearer ${METRICS_TOKEN}" \
+    "http://127.0.0.1:${CONTROLLER_METRICS_LOCAL_PORT}/metrics" 2>/dev/null || true)"
+  [ -n "$scrape" ] || return 0
+  awk -v family="$family" '$1 == family { value = $2 } END { if (value != "") print value }' \
+    <<<"$scrape"
+}
+
+# Space-separated snapshot: watch Delete events observed, reconciles that
+# committed a changed config, reconcile passes started, watch-scope relists.
+controller_reconcile_observable() {
+  printf '%s %s %s %s\n' \
+    "$(controller_metric ferrum_k8s_controller_watch_deletes_total)" \
+    "$(controller_metric ferrum_k8s_controller_config_publications_total)" \
+    "$(controller_metric ferrum_k8s_controller_reconciliations_total)" \
+    "$(controller_metric ferrum_k8s_controller_watch_idle_relists_total)"
+}
+
 wait_for_tlsroute_parent_condition() {
   local name="$1"
   local condition_type="$2"
@@ -503,6 +570,19 @@ YAML
   echo "TLSRoute update switched live SNI ${TLS_SNI_A} traffic to blackbox-tls-b on :${TLS_BLACKBOX_PORT_SNI}" >> "$report"
 
   wait_for_tls_echo "$TLS_BLACKBOX_PORT_DELETE" "$TLS_SNI_DELETE" "blackbox-tls-a" "pre-delete" | tee -a "$report"
+
+  # Issue #4491. Read the control plane's reconcile observable on both sides of
+  # the deletion so a failure here names the fault instead of only its symptom.
+  # Best-effort by construction: an unreadable observable weakens the message
+  # and leaves the data-plane assertion below exactly as it was.
+  local observable_ok=0
+  local pre_deletes="" pre_publications="" pre_reconciles="" pre_relists=""
+  if start_controller_metrics_forward; then
+    observable_ok=1
+    read -r pre_deletes pre_publications pre_reconciles pre_relists \
+      < <(controller_reconcile_observable) || true
+  fi
+
   kubectl -n "$DP_GATEWAY_NAMESPACE" delete tlsroute blackbox-tls-delete --wait=true
   local delete_ok=0
   local delete_body=""
@@ -517,11 +597,40 @@ YAML
     fi
     sleep 2
   done
+
+  local post_deletes="" post_publications="" post_reconciles="" post_relists=""
+  local observable_line="controller reconcile observable unavailable"
+  if [ "$observable_ok" -eq 1 ]; then
+    read -r post_deletes post_publications post_reconciles post_relists \
+      < <(controller_reconcile_observable) || true
+    printf -v observable_line \
+      'watch_deletes %s->%s config_publications %s->%s reconciliations %s->%s watch_idle_relists %s->%s' \
+      "${pre_deletes:-?}" "${post_deletes:-?}" \
+      "${pre_publications:-?}" "${post_publications:-?}" \
+      "${pre_reconciles:-?}" "${post_reconciles:-?}" \
+      "${pre_relists:-?}" "${post_relists:-?}"
+  fi
+  stop_controller_metrics_forward
+
   if [ "$delete_ok" -ne 1 ]; then
-    echo "deleted TLSRoute kept serving TLS echo on :${TLS_BLACKBOX_PORT_DELETE}" >&2
+    # Two faults, one symptom. Say which one this run hit.
+    local observable_read=0
+    if [ -n "$pre_deletes" ] && [ -n "$post_deletes" ] \
+      && [ -n "$pre_publications" ] && [ -n "$post_publications" ]; then
+      observable_read=1
+    fi
+    if [ "$observable_read" -eq 1 ] \
+      && [ "$post_deletes" = "$pre_deletes" ] \
+      && [ "$post_publications" = "$pre_publications" ]; then
+      echo "deleted TLSRoute kept serving TLS echo on :${TLS_BLACKBOX_PORT_DELETE}: the control plane never observed the withdrawal (no watch Delete event and no config publication) — stalled watch, recovery bounded by FERRUM_K8S_WATCH_IDLE_RELIST_SECS; ${observable_line}" >&2
+    elif [ "$observable_read" -eq 1 ]; then
+      echo "deleted TLSRoute kept serving TLS echo on :${TLS_BLACKBOX_PORT_DELETE}: the control plane observed the withdrawal and reconciled, so the fault is downstream of reconcile (CP->DP distribution or stream listener rebuild); ${observable_line}" >&2
+    else
+      echo "deleted TLSRoute kept serving TLS echo on :${TLS_BLACKBOX_PORT_DELETE}; ${observable_line}" >&2
+    fi
     return 1
   fi
-  echo "deleted TLSRoute stopped serving on :${TLS_BLACKBOX_PORT_DELETE}" >> "$report"
+  echo "deleted TLSRoute stopped serving on :${TLS_BLACKBOX_PORT_DELETE} (${observable_line})" >> "$report"
 }
 
 run_blackbox() {
