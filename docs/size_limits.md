@@ -6,7 +6,7 @@ Ferrum Edge enforces configurable size limits on request headers, request bodies
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `FERRUM_MAX_HEADER_SIZE_BYTES` | `usize` | `32768` (32KB) | Maximum total size of all request headers combined. Enforced at both the hyper protocol layer (HTTP/1.1 `max_buf_size`, HTTP/2 `max_header_list_size`) and the application layer. |
+| `FERRUM_MAX_HEADER_SIZE_BYTES` | `usize` | `32768` (32KB) | Maximum total size of all request headers combined. Enforced at both the hyper protocol layer (HTTP/1.1 `max_buf_size`, HTTP/2 `max_header_list_size`) and the application layer. **Maximum accepted value `768000`**; a larger value is a startup error because the HTTP/3 frontend could not advertise it without exceeding `http::HeaderMap`'s 24,576-entry construction ceiling (see [HTTP/3 header size limits](http3.md#header-size-limits)). |
 | `FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES` | `usize` | `16384` (16KB) | Maximum size of any single request header (name + value in bytes). Prevents individual oversized headers. |
 | `FERRUM_MAX_HEADER_COUNT` | `usize` | `100` | Maximum number of request headers allowed. Set to `0` for unlimited. |
 | `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` | `usize` | `10485760` (10MB) | Maximum request body size. Set to `0` for unlimited. Checked via `Content-Length` header (fast reject) and enforced during body collection / streaming (`http_body_util::Limited`, `SizeLimitedIncoming` on direct-H2). Nonzero values do not disqualify the multiplexed direct-H2 pool. |
