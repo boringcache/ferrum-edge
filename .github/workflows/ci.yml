@@ -3262,6 +3262,125 @@ jobs:
             --set ambient.admin.bindAddress=0.0.0.0 \
             --set nodeAgent.admin.bindAddress=0.0.0.0 \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs.yaml"
+          # A metrics bearer credential is only ever attached to a verified
+          # HTTPS scrape (issue #4509): FERRUM_METRICS_BEARER_TOKEN also unlocks
+          # full /health, /status and /overload detail, and both DaemonSets run
+          # host-network, so a plaintext scrape leaks it on the node network.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ca.enabled=true \
+            --set eastWest.enabled=true \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set observability.enabled=true \
+            --set observability.metrics.bearerToken.existingSecret.name=mesh-metrics-bearer \
+            --set observability.metrics.serviceMonitor.tlsConfig.ca.secret.name=mesh-scrape-ca \
+            --set observability.metrics.serviceMonitor.tlsConfig.ca.secret.key=ca.crt \
+            --set observability.metrics.podMonitor.tlsConfig.ca.secret.name=mesh-scrape-ca \
+            --set observability.metrics.podMonitor.tlsConfig.ca.secret.key=ca.crt \
+            --set controlPlane.admin.bindAddress=0.0.0.0 \
+            --set-string 'controlPlane.admin.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
+            --set controlPlane.admin.httpsPort=9443 \
+            --set controlPlane.admin.tls.enabled=true \
+            --set controlPlane.admin.tls.secretName=cp-admin-tls \
+            --set ca.admin.bindAddress=0.0.0.0 \
+            --set-string 'ca.admin.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
+            --set ca.admin.httpsPort=9443 \
+            --set ca.admin.tls.enabled=true \
+            --set ca.admin.tls.secretName=ca-admin-tls \
+            --set eastWest.admin.bindAddress=0.0.0.0 \
+            --set eastWest.admin.httpsPort=9443 \
+            --set eastWest.admin.tls.enabled=true \
+            --set eastWest.admin.tls.secretName=ew-admin-tls \
+            --set ambient.admin.bindAddress=0.0.0.0 \
+            --set ambient.admin.httpsPort=9444 \
+            --set ambient.admin.tls.enabled=true \
+            --set ambient.admin.tls.secretName=ambient-admin-tls \
+            --set nodeAgent.admin.bindAddress=0.0.0.0 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=na-admin-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-bearer-https.yaml"
+          # Bearer + plaintext-only admin must fail closed.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ca.enabled=true \
+            --set eastWest.enabled=true \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set observability.enabled=true \
+            --set observability.metrics.bearerToken.existingSecret.name=mesh-metrics-bearer \
+            --set observability.metrics.serviceMonitor.tlsConfig.ca.secret.name=mesh-scrape-ca \
+            --set observability.metrics.serviceMonitor.tlsConfig.ca.secret.key=ca.crt \
+            --set observability.metrics.podMonitor.tlsConfig.ca.secret.name=mesh-scrape-ca \
+            --set observability.metrics.podMonitor.tlsConfig.ca.secret.key=ca.crt \
+            --set controlPlane.admin.bindAddress=0.0.0.0 \
+            --set-string 'controlPlane.admin.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
+            --set ca.admin.bindAddress=0.0.0.0 \
+            --set-string 'ca.admin.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
+            --set eastWest.admin.bindAddress=0.0.0.0 \
+            --set ambient.admin.bindAddress=0.0.0.0 \
+            --set nodeAgent.admin.bindAddress=0.0.0.0 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-bearer-plaintext.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-bearer-plaintext.err"; then
+            echo "::error title=Metrics bearer accepted over plaintext admin::a bearer scrape must require admin HTTPS"
+            exit 1
+          fi
+          # Bearer + HTTPS with insecureSkipVerify must fail closed.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set observability.enabled=true \
+            --set observability.metrics.bearerToken.existingSecret.name=mesh-metrics-bearer \
+            --set observability.metrics.serviceMonitor.tlsConfig.ca.secret.name=mesh-scrape-ca \
+            --set observability.metrics.serviceMonitor.tlsConfig.ca.secret.key=ca.crt \
+            --set observability.metrics.serviceMonitor.tlsConfig.insecureSkipVerify=true \
+            --set observability.metrics.podMonitor.tlsConfig.ca.secret.name=mesh-scrape-ca \
+            --set observability.metrics.podMonitor.tlsConfig.ca.secret.key=ca.crt \
+            --set controlPlane.admin.bindAddress=0.0.0.0 \
+            --set-string 'controlPlane.admin.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
+            --set controlPlane.admin.httpsPort=9443 \
+            --set controlPlane.admin.tls.enabled=true \
+            --set controlPlane.admin.tls.secretName=cp-admin-tls \
+            --set ambient.admin.bindAddress=0.0.0.0 \
+            --set ambient.admin.httpsPort=9444 \
+            --set ambient.admin.tls.enabled=true \
+            --set ambient.admin.tls.secretName=ambient-admin-tls \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.bindAddress=0.0.0.0 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=na-admin-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-bearer-insecure.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-bearer-insecure.err"; then
+            echo "::error title=insecureSkipVerify accepted with bearer::a bearer scrape requires certificate verification"
+            exit 1
+          fi
+          # Bearer + HTTPS with an EMPTY tlsConfig must fail closed.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set observability.enabled=true \
+            --set observability.metrics.bearerToken.existingSecret.name=mesh-metrics-bearer \
+            --set controlPlane.admin.bindAddress=0.0.0.0 \
+            --set-string 'controlPlane.admin.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
+            --set controlPlane.admin.httpsPort=9443 \
+            --set controlPlane.admin.tls.enabled=true \
+            --set controlPlane.admin.tls.secretName=cp-admin-tls \
+            --set ambient.admin.bindAddress=0.0.0.0 \
+            --set ambient.admin.httpsPort=9444 \
+            --set ambient.admin.tls.enabled=true \
+            --set ambient.admin.tls.secretName=ambient-admin-tls \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.bindAddress=0.0.0.0 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=na-admin-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-bearer-no-tlsconfig.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-bearer-no-tlsconfig.err"; then
+            echo "::error title=Empty tlsConfig accepted for an HTTPS scrape::an HTTPS scrape must verify the admin certificate"
+            exit 1
+          fi
           # Strict admin/metrics IP+CIDR validation ported from ferrum-gateway.
           # Each of these renders cleanly under a permissive approximation and
           # then CrashLoops (or has the admin accept loop silently drop the

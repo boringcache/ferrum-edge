@@ -55,11 +55,16 @@ spec:
           securityContext:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- if ne (toString $admin.port) "0" }}
+          {{- if or (ne (toString $admin.port) "0") (ne (toString $admin.httpsPort) "0") }}
           ports:
+            {{- if ne (toString $admin.port) "0" }}
             - name: admin-http
               containerPort: {{ $admin.port }}
               protocol: TCP
+            {{- end }}
+            {{- with (include "ferrum-mesh.adminHttpsPort" (dict "resolved" $admin)) }}
+            {{- . | nindent 12 }}
+            {{- end }}
           {{- end }}
           env:
             {{- include "ferrum-mesh.renderControlPlaneRequiredEnv" . | nindent 12 }}
@@ -69,7 +74,7 @@ spec:
             {{- include "ferrum-mesh.shutdownEnv" .Values.ca | nindent 12 }}
             {{- include "ferrum-mesh.metricsEnv" . | nindent 12 }}
             {{- range $name, $value := .Values.ca.env }}
-            {{- if not (has $name (list "FERRUM_DB_TYPE" "FERRUM_DB_URL" "FERRUM_ADMIN_JWT_SECRET" "FERRUM_CP_DP_GRPC_JWT_SECRET" "FERRUM_ADMIN_HTTP_PORT" "FERRUM_ADMIN_BIND_ADDRESS" "FERRUM_ALLOW_INSECURE_ADMIN_HTTP" "FERRUM_ADMIN_ALLOWED_CIDRS" "FERRUM_MODE")) }}
+            {{- if not (has $name (list "FERRUM_DB_TYPE" "FERRUM_DB_URL" "FERRUM_ADMIN_JWT_SECRET" "FERRUM_CP_DP_GRPC_JWT_SECRET" "FERRUM_ADMIN_HTTP_PORT" "FERRUM_ADMIN_HTTPS_PORT" "FERRUM_ADMIN_BIND_ADDRESS" "FERRUM_ALLOW_INSECURE_ADMIN_HTTP" "FERRUM_ADMIN_ALLOWED_CIDRS" "FERRUM_MODE")) }}
             - name: {{ $name }}
               value: {{ $value | quote }}
             {{- end }}
@@ -77,6 +82,9 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            {{- with (include "ferrum-mesh.adminTlsVolumeMount" (dict "resolved" $admin)) }}
+            {{- . | nindent 12 }}
+            {{- end }}
           {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.ca.probes "startupHandler" $startupHandler "liveHandler" $liveHandler "readyHandler" $readyHandler) }}
           {{- include "ferrum-mesh.preStopLifecycle" .Values.ca | nindent 10 }}
           {{- with .Values.ca.resources }}
@@ -86,4 +94,7 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- with (include "ferrum-mesh.adminTlsVolume" (dict "resolved" $admin)) }}
+        {{- . | nindent 8 }}
+        {{- end }}
 {{- end }}

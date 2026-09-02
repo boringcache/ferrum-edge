@@ -173,6 +173,25 @@ controlPlane:
     httpPort: 9000
     allowInsecureHttp: false
     allowedCidrs: ""
+    # Admin HTTPS port. Default 0 keeps existing HTTP-only installs unchanged
+    # (the binary default is 9443, so the chart must pin 0 until TLS is opted
+    # in). Set a nonzero port together with admin.tls below for HTTPS-only
+    # (httpPort=0) or dual-listener operation. A metrics bearer scrape is only
+    # ever attached to this HTTPS listener, never to httpPort.
+    httpsPort: 0
+    # Optional admin TLS Secret mount. Uses the shared FERRUM_ADMIN_TLS_*
+    # contract, the same shape nodeAgent.admin.tls uses. When enabled with a
+    # secretName the chart mounts cert/key (and optional client CA / CRL)
+    # read-only and sets the matching PATH env vars. Incomplete or invalid
+    # combinations fail at helm render; do not store PEM material in values.
+    tls:
+      enabled: false
+      secretName: ""
+      mountPath: /etc/ferrum/tls/admin
+      certKey: tls.crt
+      keyKey: tls.key
+      clientCaKey: ""
+      crlKey: ""
   # Graceful shutdown (issue #4266). terminationGracePeriodSeconds must cover
   # preStop + preDrain + drain + 6s pool + 5s background + clamp(drain,5,60)s
   # audit + 2s observability + 5s finalizer slack (docs/graceful_shutdown.md).
@@ -456,6 +475,25 @@ ambient:
     httpPort: 9000
     allowInsecureHttp: false
     allowedCidrs: ""
+    # Admin HTTPS port. Default 0 keeps existing HTTP-only installs unchanged
+    # (the binary default is 9443, so the chart must pin 0 until TLS is opted
+    # in). Set a nonzero port together with admin.tls below for HTTPS-only
+    # (httpPort=0) or dual-listener operation. A metrics bearer scrape is only
+    # ever attached to this HTTPS listener, never to httpPort.
+    httpsPort: 0
+    # Optional admin TLS Secret mount. Uses the shared FERRUM_ADMIN_TLS_*
+    # contract, the same shape nodeAgent.admin.tls uses. When enabled with a
+    # secretName the chart mounts cert/key (and optional client CA / CRL)
+    # read-only and sets the matching PATH env vars. Incomplete or invalid
+    # combinations fail at helm render; do not store PEM material in values.
+    tls:
+      enabled: false
+      secretName: ""
+      mountPath: /etc/ferrum/tls/admin
+      certKey: tls.crt
+      keyKey: tls.key
+      clientCaKey: ""
+      crlKey: ""
   shutdownDrainSeconds: 30
   shutdownPreStopSeconds: 30
   shutdownPreDrainSeconds: 0
@@ -517,6 +555,25 @@ eastWest:
     httpPort: 9000
     allowInsecureHttp: false
     allowedCidrs: ""
+    # Admin HTTPS port. Default 0 keeps existing HTTP-only installs unchanged
+    # (the binary default is 9443, so the chart must pin 0 until TLS is opted
+    # in). Set a nonzero port together with admin.tls below for HTTPS-only
+    # (httpPort=0) or dual-listener operation. A metrics bearer scrape is only
+    # ever attached to this HTTPS listener, never to httpPort.
+    httpsPort: 0
+    # Optional admin TLS Secret mount. Uses the shared FERRUM_ADMIN_TLS_*
+    # contract, the same shape nodeAgent.admin.tls uses. When enabled with a
+    # secretName the chart mounts cert/key (and optional client CA / CRL)
+    # read-only and sets the matching PATH env vars. Incomplete or invalid
+    # combinations fail at helm render; do not store PEM material in values.
+    tls:
+      enabled: false
+      secretName: ""
+      mountPath: /etc/ferrum/tls/admin
+      certKey: tls.crt
+      keyKey: tls.key
+      clientCaKey: ""
+      crlKey: ""
   probes:
     startup:
       enabled: true
@@ -592,6 +649,25 @@ ca:
     httpPort: 9000
     allowInsecureHttp: false
     allowedCidrs: ""
+    # Admin HTTPS port. Default 0 keeps existing HTTP-only installs unchanged
+    # (the binary default is 9443, so the chart must pin 0 until TLS is opted
+    # in). Set a nonzero port together with admin.tls below for HTTPS-only
+    # (httpPort=0) or dual-listener operation. A metrics bearer scrape is only
+    # ever attached to this HTTPS listener, never to httpPort.
+    httpsPort: 0
+    # Optional admin TLS Secret mount. Uses the shared FERRUM_ADMIN_TLS_*
+    # contract, the same shape nodeAgent.admin.tls uses. When enabled with a
+    # secretName the chart mounts cert/key (and optional client CA / CRL)
+    # read-only and sets the matching PATH env vars. Incomplete or invalid
+    # combinations fail at helm render; do not store PEM material in values.
+    tls:
+      enabled: false
+      secretName: ""
+      mountPath: /etc/ferrum/tls/admin
+      certKey: tls.crt
+      keyKey: tls.key
+      clientCaKey: ""
+      crlKey: ""
   shutdownDrainSeconds: 30
   shutdownPreStopSeconds: 30
   shutdownPreDrainSeconds: 0
