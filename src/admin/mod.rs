@@ -7629,6 +7629,14 @@ fn injected_batch_reference_check_error(namespace: &str) -> Option<anyhow::Error
         .map(|detail| anyhow::anyhow!("{detail}"))
 }
 
+/// Map a batch candidate-validation database failure onto the same retryable,
+/// redacted 503 that `batch_reference_lookup` and `handle_restore` return. A
+/// database outage is not a malformed payload, and a 400 tells an automated
+/// caller not to retry (issues #4377, #4527).
+fn batch_candidate_db_failure(error: &dyn std::fmt::Display) -> Response<Full<Bytes>> {
+    json_response(StatusCode::SERVICE_UNAVAILABLE, &db_error_response(error))
+}
+
 /// Map a batch reference-check `Err` onto the same 503 body used by
 /// `batch_existing_resource_conflict`. A genuine miss (`Ok(false)`) stays
 /// on the 400 `validation_errors` path (issue #4377).
@@ -7905,17 +7913,18 @@ async fn handle_batch_create(
             ) => {
                 validation_errors.extend(errors);
             }
-            Err(crud::AfterValidateError::Db(error)) => validation_errors.push(format!(
-                "Failed to load config for transaction-log schema candidate validation: {}",
-                redacted_persistence_error_message(
-                    "batch_transaction_log_schema_candidate_load",
-                    &error,
-                )
-            )),
-            Err(crud::AfterValidateError::Response(_)) => validation_errors.push(
-                "Transaction-log schema candidate validation returned an unexpected response"
-                    .to_string(),
-            ),
+            Err(crud::AfterValidateError::Db(error)) => {
+                warn_persistence_failure_redacted("batch_transaction_log_schema_candidate_load");
+                return Ok(batch_candidate_db_failure(&error));
+            }
+            Err(crud::AfterValidateError::Response(_)) => {
+                return Ok(json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({
+                        "error": "Transaction-log schema candidate validation returned an unexpected response"
+                    }),
+                ));
+            }
         }
     }
 
@@ -7987,10 +7996,10 @@ async fn handle_batch_create(
                     validation_errors.extend(errors);
                 }
             }
-            Err(error) => validation_errors.push(format!(
-                "Failed to load namespace config for credential candidate validation: {}",
-                redacted_persistence_error_message("batch_credential_candidate_load", &error,)
-            )),
+            Err(error) => {
+                warn_persistence_failure_redacted("batch_credential_candidate_load");
+                return Ok(batch_candidate_db_failure(&error));
+            }
         }
     } else if batch_needs_mtls_plugin_compat(&batch) {
         match db.load_namespace_policy_graph(namespace).await {
@@ -8001,14 +8010,20 @@ async fn handle_batch_create(
                     validation_errors.extend(errors);
                 }
             }
-            Err(error) => validation_errors.push(format!(
-                "Failed to load namespace config for mTLS compatibility validation: {}",
-                redacted_persistence_error_message("batch_mtls_compat_candidate_load", &error,)
-            )),
+            Err(error) => {
+                warn_persistence_failure_redacted("batch_mtls_compat_candidate_load");
+                return Ok(batch_candidate_db_failure(&error));
+            }
         }
     }
 
     if batch_submits_plugin_graph(&batch) {
+        // Same namespace-keyed fault hook `batch_reference_lookup` uses, so the
+        // 503 classification of this earlier candidate-validation site is
+        // testable without a second `_test_support` export (issue #4527).
+        if let Some(error) = injected_batch_reference_check_error(namespace) {
+            return Ok(batch_candidate_db_failure(&error));
+        }
         match crud::validate_plugin_graph_candidates(
             db.as_ref(),
             state,
@@ -8026,13 +8041,18 @@ async fn handle_batch_create(
             ) => {
                 validation_errors.extend(errors);
             }
-            Err(crud::AfterValidateError::Db(error)) => validation_errors.push(format!(
-                "Failed to load config for plugin-graph candidate validation: {}",
-                redacted_persistence_error_message("batch_plugin_graph_candidate_load", &error)
-            )),
-            Err(crud::AfterValidateError::Response(_)) => validation_errors.push(
-                "Plugin-graph candidate validation returned an unexpected response".to_string(),
-            ),
+            Err(crud::AfterValidateError::Db(error)) => {
+                warn_persistence_failure_redacted("batch_plugin_graph_candidate_load");
+                return Ok(batch_candidate_db_failure(&error));
+            }
+            Err(crud::AfterValidateError::Response(_)) => {
+                return Ok(json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({
+                        "error": "Plugin-graph candidate validation returned an unexpected response"
+                    }),
+                ));
+            }
         }
     }
 

@@ -4258,6 +4258,16 @@ paths:
         contention, a lapsed admission lease, and a failed datastore write —
         all retryable with the identical payload.
 
+        A database failure during the validation phase is likewise a `503`,
+        never a `400`, and returns the redacted database-unavailable body
+        (`{"error": "Database unavailable — operation failed"}` with no
+        `validation_errors`). This covers the reference lookups and the four
+        candidate-validation loads that run before them — transaction-log
+        schema, consumer credentials, mTLS compatibility, and the plugin graph
+        (the first database call for any batch carrying `plugin_configs`).
+        `400` is reserved for payload problems: the failures a retry of the
+        identical body cannot fix.
+
         One residual case is not decidable by the server: if the commit itself
         is acknowledged but the acknowledgement is lost in transit, the batch
         is reported as a `503` even though the graph is durable. A retry of the
