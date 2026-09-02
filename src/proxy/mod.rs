@@ -4819,19 +4819,23 @@ impl Drop for PerIpRequestGuard {
     }
 }
 
-/// RAII guard that decrements the per-source WebSocket session counter on drop.
+/// RAII guard that decrements a per-source concurrency counter on drop.
 ///
-/// Created after the global `FERRUM_WEBSOCKET_MAX_CONNECTIONS` permit is taken
-/// and moved into the upgraded session task so every disconnect path (relay
-/// exit, upgrade failure, cancellation, panic) releases the slot. Independent
-/// of [`PerIpRequestGuard`], which is deliberately dropped at the upgrade
-/// boundary so a long-lived session does not block ordinary HTTP requests.
-pub struct PerIpWebSocketGuard {
+/// Shared by every long-lived per-source admission dimension: upgraded
+/// WebSocket sessions (`FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP`), TCP stream
+/// connections (`FERRUM_TCP_MAX_CONNECTIONS_PER_IP`) and UDP/DTLS stream
+/// sessions (`FERRUM_UDP_MAX_SESSIONS_PER_IP`). Created after the surface's
+/// global permit is taken and moved into the owning connection/session task so
+/// every exit path (relay exit, upgrade failure, cancellation, panic) releases
+/// the slot. Independent of [`PerIpRequestGuard`], which is deliberately
+/// dropped at the upgrade boundary so a long-lived session does not block
+/// ordinary HTTP requests.
+pub struct PerIpConnectionGuard {
     pub ip: String,
     pub counts: Arc<dashmap::DashMap<String, AtomicU64>>,
 }
 
-impl Drop for PerIpWebSocketGuard {
+impl Drop for PerIpConnectionGuard {
     fn drop(&mut self) {
         if let Some(entry) = self.counts.get(&self.ip) {
             entry.value().fetch_sub(1, Ordering::Relaxed);
@@ -4839,10 +4843,40 @@ impl Drop for PerIpWebSocketGuard {
     }
 }
 
-/// Sentinel returned when a resolved client IP already holds
-/// `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP` upgraded sessions.
+/// Sentinel returned when a resolved client IP already holds that surface's
+/// full per-source budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PerIpWebSocketLimitExceeded;
+pub struct PerIpLimitExceeded;
+
+/// Per-source admission counters plus the limit for one stream-listener family.
+///
+/// Handed to every spawned TCP/UDP stream listener so the whole gateway shares
+/// ONE counter map per family — a per-listener copy would make the effective
+/// ceiling `max` per listener rather than `max` per source. The map is owned by
+/// [`ProxyState`], which also registers it with
+/// [`ProxyState::start_per_ip_cleanup_task`] so stale zero-count entries are
+/// swept. `Default` is the disabled dimension, which is what standalone/test
+/// listener constructors get.
+#[derive(Clone, Default)]
+pub struct PerIpStreamAdmission {
+    /// `None` when the dimension is disabled (`max == 0` at startup).
+    pub counts: Option<Arc<dashmap::DashMap<String, AtomicU64>>>,
+    /// `0` = unlimited.
+    pub max: u64,
+}
+
+impl PerIpStreamAdmission {
+    /// Try to admit one connection/session for `ip`.
+    ///
+    /// `Ok(None)` means the dimension is disabled. The returned guard must
+    /// outlive the admitted connection/session.
+    pub fn try_acquire(
+        &self,
+        ip: &str,
+    ) -> Result<Option<PerIpConnectionGuard>, PerIpLimitExceeded> {
+        try_acquire_per_ip_slot(self.counts.as_ref(), ip, self.max)
+    }
+}
 
 /// Build the synthetic [`UpstreamTarget`] that keys stream load-balancer
 /// accounting for an already-resolved backend (issue #4514).
@@ -6414,6 +6448,21 @@ pub struct ProxyState {
     /// 0 = disabled. Keyed on the same trusted-proxy-resolved `client_ip` as
     /// [`Self::per_ip_request_counts`].
     pub websocket_max_connections_per_ip: u64,
+    /// Per-effective-source-IP concurrent TCP stream-proxy connection counters.
+    /// `None` when `FERRUM_TCP_MAX_CONNECTIONS_PER_IP=0` (unlimited). Handed to
+    /// every spawned TCP stream listener through
+    /// [`stream_listener::StreamListenerManager::attach_per_ip_stream_admission`]
+    /// so one map bounds the whole gateway rather than one per listener.
+    pub per_ip_tcp_connections: Option<Arc<dashmap::DashMap<String, AtomicU64>>>,
+    /// Maximum concurrent TCP stream-proxy connections per effective source IP.
+    /// 0 = unlimited.
+    pub tcp_max_connections_per_ip: u64,
+    /// Per-effective-source-IP concurrent UDP/DTLS stream-proxy session
+    /// counters. `None` when `FERRUM_UDP_MAX_SESSIONS_PER_IP=0` (unlimited).
+    pub per_ip_udp_sessions: Option<Arc<dashmap::DashMap<String, AtomicU64>>>,
+    /// Maximum concurrent UDP/DTLS stream-proxy sessions per effective source
+    /// IP. 0 = unlimited.
+    pub udp_max_sessions_per_ip: u64,
     /// Manages TCP/UDP stream proxy listeners (dedicated port per proxy).
     pub stream_listener_manager: Arc<stream_listener::StreamListenerManager>,
     /// Monotonic counter bumped once per successful config publication.
@@ -9586,6 +9635,30 @@ impl ProxyState {
             env_config_arc.datagram_proxy_protocol_secret.clone(),
         );
 
+        // Per-source admission for the stream listeners (issue #4544). Built
+        // here and attached before the first `reconcile()` so every spawned
+        // TCP/UDP listener shares ONE counter map per family: a per-listener
+        // copy would make the effective ceiling `max` per listener instead of
+        // `max` per source. `None` when the dimension is disabled (`0`).
+        let tcp_max_connections_per_ip = env_config.tcp_max_connections_per_ip;
+        let udp_max_sessions_per_ip = env_config.udp_max_sessions_per_ip;
+        let per_ip_tcp_connections: Option<Arc<dashmap::DashMap<String, AtomicU64>>> =
+            (tcp_max_connections_per_ip > 0)
+                .then(|| Arc::new(dashmap::DashMap::with_shard_amount(pool_shard_amount)));
+        let per_ip_udp_sessions: Option<Arc<dashmap::DashMap<String, AtomicU64>>> =
+            (udp_max_sessions_per_ip > 0)
+                .then(|| Arc::new(dashmap::DashMap::with_shard_amount(pool_shard_amount)));
+        stream_listener_manager.attach_per_ip_stream_admission(
+            PerIpStreamAdmission {
+                counts: per_ip_tcp_connections.clone(),
+                max: tcp_max_connections_per_ip,
+            },
+            PerIpStreamAdmission {
+                counts: per_ip_udp_sessions.clone(),
+                max: udp_max_sessions_per_ip,
+            },
+        );
+
         let state = Self {
             config: config_arc,
             request_epoch,
@@ -9667,6 +9740,10 @@ impl ProxyState {
                 None
             },
             websocket_max_connections_per_ip,
+            per_ip_tcp_connections,
+            tcp_max_connections_per_ip,
+            per_ip_udp_sessions,
+            udp_max_sessions_per_ip,
             stream_listener_manager,
             config_revision: ConfigRevisionNotifier::new(),
             started_at: Instant::now(),
@@ -9747,18 +9824,19 @@ impl ProxyState {
     }
 
     /// Start a background task that periodically removes stale zero-count
-    /// entries from `per_ip_request_counts` and `per_ip_websocket_sessions`.
+    /// entries from `per_ip_request_counts`, `per_ip_websocket_sessions`,
+    /// `per_ip_tcp_connections` and `per_ip_udp_sessions`.
     /// Normally entries are cleaned via the RAII drop of
-    /// [`PerIpRequestGuard`] / [`PerIpWebSocketGuard`], but this sweep catches
+    /// [`PerIpRequestGuard`] / [`PerIpConnectionGuard`], but this sweep catches
     /// edge cases (e.g., task cancellation without guard drop).
     ///
     /// Returns `Some(JoinHandle)` when either per-IP map is enabled so the
     /// caller can join the task during the background-task drain phase of
     /// graceful shutdown. Returns `None` when both
     /// `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP=0` and
-    /// `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP=0` (no tracking, no task to
-    /// spawn). The task exits cleanly on `shutdown_rx` change so it doesn't
-    /// wedge shutdown — consistent with `start_backend_capability_refresh_task`,
+    /// `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP=0` and both stream-listener
+    /// per-source caps are `0` (no tracking, no task to spawn). The task exits
+    /// cleanly on `shutdown_rx` change so it doesn't wedge shutdown — consistent with `start_backend_capability_refresh_task`,
     /// `dns_cache.start_background_refresh_with_shutdown`, and the overload /
     /// metrics monitors.
     pub fn start_per_ip_cleanup_task(
@@ -9770,6 +9848,16 @@ impl ProxyState {
             maps.push(counts.clone());
         }
         if let Some(counts) = self.per_ip_websocket_sessions.as_ref() {
+            maps.push(counts.clone());
+        }
+        // Stream-listener per-source admission maps (issue #4544). Their
+        // `PerIpConnectionGuard`s are released by the TCP connection task and by
+        // the UDP session's `release_session_guards`; this sweep only reclaims
+        // the map entries those decrements leave at zero.
+        if let Some(counts) = self.per_ip_tcp_connections.as_ref() {
+            maps.push(counts.clone());
+        }
+        if let Some(counts) = self.per_ip_udp_sessions.as_ref() {
             maps.push(counts.clone());
         }
         if maps.is_empty() {
@@ -13911,7 +13999,28 @@ pub fn try_acquire_per_ip_websocket_session(
     counts: Option<&Arc<dashmap::DashMap<String, AtomicU64>>>,
     ip: &str,
     max: u64,
-) -> Result<Option<PerIpWebSocketGuard>, PerIpWebSocketLimitExceeded> {
+) -> Result<Option<PerIpConnectionGuard>, PerIpLimitExceeded> {
+    try_acquire_per_ip_slot(counts, ip, max)
+}
+
+/// Try to admit one long-lived unit of work for `ip` against a per-source
+/// budget.
+///
+/// The shared primitive behind every per-source admission dimension —
+/// WebSocket sessions, TCP stream connections and UDP/DTLS stream sessions.
+///
+/// `counts == None` or `max == 0` means the dimension is disabled (`Ok(None)`).
+/// The increment happens BEFORE the comparison and the guard is constructed
+/// before the overflow branch, so concurrent acquirers can never both observe
+/// room that only one of them has: an over-limit acquirer drops its own
+/// increment and is refused (fail closed). Source identity is the caller's
+/// resolved effective client IP — forwarding evidence must already have been
+/// accepted only from a trusted peer.
+pub fn try_acquire_per_ip_slot(
+    counts: Option<&Arc<dashmap::DashMap<String, AtomicU64>>>,
+    ip: &str,
+    max: u64,
+) -> Result<Option<PerIpConnectionGuard>, PerIpLimitExceeded> {
     let Some(counts) = counts else {
         return Ok(None);
     };
@@ -13924,13 +14033,13 @@ pub fn try_acquire_per_ip_websocket_session(
             .or_insert_with(|| AtomicU64::new(0));
         count.value().fetch_add(1, Ordering::Relaxed) + 1
     };
-    let guard = PerIpWebSocketGuard {
+    let guard = PerIpConnectionGuard {
         ip: ip.to_string(),
         counts: counts.clone(),
     };
     if current > max {
         drop(guard);
-        Err(PerIpWebSocketLimitExceeded)
+        Err(PerIpLimitExceeded)
     } else {
         Ok(Some(guard))
     }

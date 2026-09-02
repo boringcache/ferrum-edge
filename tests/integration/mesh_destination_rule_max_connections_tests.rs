@@ -766,7 +766,10 @@ fn raw_tcp_and_pooled_transports_share_one_destination_ceiling() {
 
     let limiter = Arc::new(BackendConnectionLimiter::new());
     // Exactly how `StreamListenerManager` builds a listener's metrics.
-    let metrics = Arc::new(TcpProxyMetrics::with_backend_conn_limit(limiter.clone()));
+    let metrics = Arc::new(TcpProxyMetrics::with_backend_conn_limit(
+        limiter.clone(),
+        Default::default(),
+    ));
 
     let proxy = proxy_with_port_override(POLICY_PORT, Some(CAP), None);
     let pooled = pooled_lane(&limiter, &proxy, HOST_FQDN, POLICY_PORT);
@@ -829,8 +832,14 @@ fn two_raw_tcp_listeners_share_one_destination_ceiling() {
     const POLICY_PORT: u16 = 80;
 
     let limiter = Arc::new(BackendConnectionLimiter::new());
-    let listener_a = Arc::new(TcpProxyMetrics::with_backend_conn_limit(limiter.clone()));
-    let listener_b = Arc::new(TcpProxyMetrics::with_backend_conn_limit(limiter.clone()));
+    let listener_a = Arc::new(TcpProxyMetrics::with_backend_conn_limit(
+        limiter.clone(),
+        Default::default(),
+    ));
+    let listener_b = Arc::new(TcpProxyMetrics::with_backend_conn_limit(
+        limiter.clone(),
+        Default::default(),
+    ));
 
     let a_slot = listener_a
         .backend_inflight
@@ -889,7 +898,8 @@ fn stream_listeners_are_wired_to_the_gateway_backend_conn_limit() {
     // private one and is reserved for standalone/test constructors).
     assert!(
         STREAM_SOURCE.contains("let conn_limit = self.backend_conn_limit();")
-            && STREAM_SOURCE.contains("TcpProxyMetrics::with_backend_conn_limit(conn_limit)"),
+            && STREAM_SOURCE.contains("TcpProxyMetrics::with_backend_conn_limit(")
+            && STREAM_SOURCE.contains("conn_limit,"),
         "the spawned stream listener must build its metrics from the manager's \
          shared limiter, not from `TcpProxyMetrics::default()`, so every \
          listener shares the gateway-wide counter"
@@ -1005,7 +1015,10 @@ fn raw_tcp_and_pooled_admission_share_a_lane_across_host_spellings() {
     const NORMALIZED: &str = "ws.default.svc.cluster.local";
 
     let limiter = Arc::new(BackendConnectionLimiter::new());
-    let metrics = Arc::new(TcpProxyMetrics::with_backend_conn_limit(limiter.clone()));
+    let metrics = Arc::new(TcpProxyMetrics::with_backend_conn_limit(
+        limiter.clone(),
+        Default::default(),
+    ));
 
     let tcp_slot = metrics
         .backend_inflight

@@ -1725,6 +1725,17 @@ pub struct TcpProxyMetrics {
     /// counters): those stay per listener so `/overload` and the stream metric
     /// snapshot keep reporting per-listener activity.
     pub backend_inflight: Arc<BackendConnectionLimiter>,
+    /// Gateway-wide per-effective-source-IP connection admission
+    /// (`FERRUM_TCP_MAX_CONNECTIONS_PER_IP`, issue #4544).
+    ///
+    /// A HANDLE to the ONE map `ProxyState` owns, for the same reason as
+    /// `backend_inflight`: a per-listener copy would let one source hold `max`
+    /// connections on every listener. `Default` is the disabled dimension.
+    pub per_ip_admission: crate::proxy::PerIpStreamAdmission,
+    /// Connections refused at accept because the effective source IP already
+    /// held `FERRUM_TCP_MAX_CONNECTIONS_PER_IP` connections. Fixed cardinality:
+    /// one listener-local counter, never labelled by client address.
+    pub per_ip_rejections: AtomicU64,
 }
 
 impl TcpProxyMetrics {
@@ -1734,7 +1745,10 @@ impl TcpProxyMetrics {
     /// Every spawned stream listener is constructed this way so raw TCP shares
     /// the destination ceiling with WebSocket, the pooled transports, and
     /// reqwest. Observability counters remain listener-local.
-    pub fn with_backend_conn_limit(backend_inflight: Arc<BackendConnectionLimiter>) -> Self {
+    pub fn with_backend_conn_limit(
+        backend_inflight: Arc<BackendConnectionLimiter>,
+        per_ip_admission: crate::proxy::PerIpStreamAdmission,
+    ) -> Self {
         // Fields are listed rather than filled from `..Self::default()`: the
         // derived `Default` builds a whole private `BackendConnectionLimiter`
         // (a `DashMap` with `max(64, cpus * 16)` shards) only to drop it
@@ -1747,7 +1761,27 @@ impl TcpProxyMetrics {
             bytes_out: AtomicU64::new(0),
             splice_bytes_transferred: AtomicU64::new(0),
             backend_inflight,
+            per_ip_admission,
+            per_ip_rejections: AtomicU64::new(0),
         }
+    }
+}
+
+/// Emit a rate-limited warning for a connection refused by the per-source-IP
+/// admission bound (first refusal, then every 100th).
+///
+/// Deliberately omits the client address: this is a hostile-source path, so the
+/// log record must stay fixed-cardinality just like the counter it reads.
+fn record_tcp_per_ip_rejection(metrics: &TcpProxyMetrics, proxy_id: &str, listen_port: u16) {
+    let n = metrics.per_ip_rejections.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(100) {
+        warn!(
+            proxy_id = %proxy_id,
+            listen_port,
+            limit = metrics.per_ip_admission.max,
+            rejections = n,
+            "TCP connection refused before the frontend handshake: per-source-IP connection limit reached"
+        );
     }
 }
 
@@ -2571,6 +2605,32 @@ async fn run_tcp_accept_loop(
                         }
                     } else {
                         (direct_client_ip.clone(), remote_addr.port(), None)
+                    };
+
+                    // Per-source-IP admission bound (issue #4544). Keyed on the
+                    // EFFECTIVE client IP: the forwarded source when a trusted
+                    // inbound PROXY-protocol header was accepted just above,
+                    // the canonicalized socket peer otherwise — so a trusted L4
+                    // balancer is not collapsed into one source.
+                    //
+                    // Placed here, before `handle_tcp_connection`, so a refused
+                    // connection reaches NO frontend TLS handshake, NO
+                    // `on_stream_connect` plugin chain, and NO backend dial.
+                    // That is the gap the opt-in `tcp_connection_throttle`
+                    // plugin cannot close: its `on_stream_connect` hook runs
+                    // AFTER the handshake on `tcp_tls` proxies, so it can never
+                    // bound concurrent pre-handshake state from one source.
+                    //
+                    // The guard is held for the whole connection task, so every
+                    // close path (relay exit, handshake failure, cancellation,
+                    // panic) releases the slot.
+                    let _per_ip_guard = match metrics.per_ip_admission.try_acquire(&client_ip) {
+                        Ok(guard) => guard,
+                        Err(crate::proxy::PerIpLimitExceeded) => {
+                            record_tcp_per_ip_rejection(&metrics, &proxy_id, port);
+                            drop(stream); // TCP RST/FIN before any handshake byte
+                            return;
+                        }
                     };
 
                     // Node-waypoint per-pod policy scoping (parity with the

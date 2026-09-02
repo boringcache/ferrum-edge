@@ -23,6 +23,7 @@ use crate::request_epoch::RequestEpochStore;
 use crate::tls::TlsPolicy;
 use crate::tls::source::{CertSource, MaterialKind, load_material};
 
+use super::PerIpStreamAdmission;
 use super::tcp_proxy::{TcpListenerConfig, TcpProxyMetrics};
 use super::udp_proxy::{UdpListenerConfig, UdpProxyMetrics};
 
@@ -1364,6 +1365,18 @@ pub struct StreamListenerManager {
     /// own private limiter on first use, which is safe because nothing else
     /// shares it.
     backend_conn_limit: std::sync::OnceLock<SharedBackendConnectionLimiter>,
+    /// Gateway-wide per-effective-source-IP admission for the TCP and UDP/DTLS
+    /// stream listeners (`FERRUM_TCP_MAX_CONNECTIONS_PER_IP` /
+    /// `FERRUM_UDP_MAX_SESSIONS_PER_IP`, issue #4544).
+    ///
+    /// `OnceLock`, not `ArcSwap`, for the same reason as
+    /// [`Self::backend_conn_limit`]: live guards held by in-flight connections
+    /// and sessions must keep counting against the exact map that admitted
+    /// them. Installed by
+    /// [`Self::attach_per_ip_stream_admission`] after `ProxyState` builds the
+    /// maps and before the first `reconcile()`. Unset (the standalone/test
+    /// path) means both dimensions are disabled.
+    per_ip_stream_admission: std::sync::OnceLock<(PerIpStreamAdmission, PerIpStreamAdmission)>,
 }
 
 impl StreamListenerManager {
@@ -1608,6 +1621,7 @@ impl StreamListenerManager {
             trusted_proxies,
             datagram_client_address_secret: arc_swap::ArcSwapOption::empty(),
             backend_conn_limit: std::sync::OnceLock::new(),
+            per_ip_stream_admission: std::sync::OnceLock::new(),
             stream_sni_plaintext_fallback: AtomicBool::new(false),
         }
     }
@@ -1652,6 +1666,40 @@ impl StreamListenerManager {
     /// counting against the limiter that admitted them.
     pub fn attach_backend_conn_limit(&self, limiter: SharedBackendConnectionLimiter) {
         let _ = self.backend_conn_limit.set(limiter);
+    }
+
+    /// Install the gateway-wide per-source-IP stream admission counters
+    /// (issue #4544) so every spawned TCP/UDP stream listener bounds a source
+    /// against ONE map per family rather than its own private copy.
+    ///
+    /// Must be called after [`Self::new`] and BEFORE the first `reconcile()`.
+    /// Idempotent and one-shot for the same reason as
+    /// [`Self::attach_backend_conn_limit`]: live guards must keep counting
+    /// against the map that admitted them.
+    pub fn attach_per_ip_stream_admission(
+        &self,
+        tcp: PerIpStreamAdmission,
+        udp: PerIpStreamAdmission,
+    ) {
+        let _ = self.per_ip_stream_admission.set((tcp, udp));
+    }
+
+    /// The TCP stream listener's per-source admission handle (disabled when
+    /// nothing was attached).
+    fn per_ip_tcp_admission(&self) -> PerIpStreamAdmission {
+        self.per_ip_stream_admission
+            .get()
+            .map(|(tcp, _)| tcp.clone())
+            .unwrap_or_default()
+    }
+
+    /// The UDP/DTLS stream listener's per-source admission handle (disabled
+    /// when nothing was attached).
+    fn per_ip_udp_admission(&self) -> PerIpStreamAdmission {
+        self.per_ip_stream_admission
+            .get()
+            .map(|(_, udp)| udp.clone())
+            .unwrap_or_default()
     }
 
     /// The limiter every spawned TCP listener's metrics share.
@@ -3174,7 +3222,9 @@ impl StreamListenerManager {
                 } else {
                     None
                 };
-                let metrics = Arc::new(UdpProxyMetrics::default());
+                let metrics = Arc::new(UdpProxyMetrics::with_per_ip_admission(
+                    self.per_ip_udp_admission(),
+                ));
                 // Datagram client-address metadata gate (issues #3289, #3856,
                 // #3862), built once per listener from the process-wide trust
                 // boundary, the optional MAC key, and this listener's exact
@@ -3456,7 +3506,10 @@ impl StreamListenerManager {
                 // same destination must share the configured ceiling, and two
                 // stream listeners must not each get their own copy of it.
                 let conn_limit = self.backend_conn_limit();
-                let metrics = Arc::new(TcpProxyMetrics::with_backend_conn_limit(conn_limit));
+                let metrics = Arc::new(TcpProxyMetrics::with_backend_conn_limit(
+                    conn_limit,
+                    self.per_ip_tcp_admission(),
+                ));
                 let listener_tcp_metrics = Some(metrics.clone());
                 let tcp_idle_timeout = self.tcp_idle_timeout_seconds;
                 let tcp_half_close_max_wait = self.tcp_half_close_max_wait_seconds;
