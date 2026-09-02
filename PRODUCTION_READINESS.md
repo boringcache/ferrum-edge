@@ -85,6 +85,18 @@ reconciliations. They are **historical evidence**, not the live launch verdict.
   FERRUM_ADMIN_JWT_AUDIENCE is unset (RFC 7519 §4.1.3, jsonwebtoken default, pre-existing
   behavior). Loosening would enable cross-service token replay under HS256 secret reuse.
   Pinned by `test_audience_unset_rejects_aud_bearing_token`.
+- **Admin `ns`-claim enforcement auto-engages on a multi-namespace CP**:
+  `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` defaults to `false`, but `cp` mode ORs it
+  with `CpScope::requires_namespace_claim_by_default()`, so a CP whose
+  `FERRUM_CP_NAMESPACES` names more than one namespace (or `*`) requires an `ns`
+  claim on namespace-scoped admin routes even with the flag unset (issue #4529).
+  The two control planes of one process must agree that namespace is an
+  authorization boundary: the REST plane serialises consumer credentials through
+  `GET /backup` and can wipe a tenant through `POST /restore`, so it must not
+  accept a token the gRPC plane already refuses. This is intentionally breaking
+  for tokens minted without `ns`. Do not restore the flag-only gate. Pinned by
+  `admin_namespace_claim_derivation_matches_cp_scope` and
+  `multi_namespace_cp_scope_engages_backup_tenancy_without_the_env_flag`.
 - **Mesh CRL unknown-revocation allowance**: peers whose revocation status is
   undeterminable (no CRL from their issuing CA) are accepted, matching the shared inbound
   model; removing it would break federated meshes lacking per-CA CRLs. Documented in

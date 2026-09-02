@@ -314,12 +314,18 @@ pub struct AdminState {
     /// Tests inject an isolated path here so they do not mutate process-global
     /// environment state.
     pub admin_audit_fallback_dir: Option<std::path::PathBuf>,
-    /// When `true` (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`), namespace-scoped
-    /// admin routes require the admin JWT to carry an `ns` claim authorizing
-    /// the `X-Ferrum-Namespace` value (mirrors the CP↔DP gRPC plane's
-    /// `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM`). Default `false`: the namespace
-    /// header stays a routing selector and any valid admin JWT may address
-    /// any namespace, matching pre-existing behavior.
+    /// When `true`, namespace-scoped admin routes require the admin JWT to
+    /// carry an `ns` claim authorizing the `X-Ferrum-Namespace` value.
+    ///
+    /// Set explicitly by `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`, and forced on
+    /// in `cp` mode whenever the CP scope is multi-namespace (`FERRUM_CP_NAMESPACES`
+    /// naming more than one namespace or `*`) — the same rule the CP↔DP gRPC
+    /// plane applies via `CpScope::namespace_claim_required` (issue #4529), so
+    /// both planes agree on whether namespace is an authorization boundary.
+    /// The effective value is derived once at `AdminState` construction.
+    ///
+    /// Otherwise `false`: the namespace header stays a routing selector and any
+    /// valid admin JWT may address any namespace.
     pub admin_require_namespace_claim: bool,
     /// Startup readiness flag — flipped once by the mode after the initial config
     /// is loaded, all caches are built, DNS/pools are warmed, and every listener
@@ -3251,9 +3257,10 @@ async fn handle_admin_request_inner(
     let segments_peek: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
     // Per-namespace tenancy enforcement on the REST admin plane (issue #2120,
-    // option B). Opt-in via FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM; mirrors the
-    // CP↔DP gRPC `ns` claim so a staging-scoped operator token cannot address
-    // prod by swapping X-Ferrum-Namespace. Applies only to namespace-scoped
+    // option B). Opt-in via FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM and engaged
+    // automatically on a multi-namespace CP (issue #4529); mirrors the CP↔DP
+    // gRPC `ns` claim so a staging-scoped operator token cannot address prod by
+    // swapping X-Ferrum-Namespace. Applies only to namespace-scoped
     // resource routes — global admin surfaces (TLS management, /cluster,
     // /namespaces registry, metrics, mesh introspection) are not selected
     // by X-Ferrum-Namespace. Registry handlers apply the claim to the
