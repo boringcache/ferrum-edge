@@ -735,6 +735,37 @@ The OpenAPI document models these wire differences with separate Consumer surfac
 
 Consumer credential string maxima use Unicode character counts, matching OpenAPI `maxLength`: `basicauth.password`, `keyauth.key`, `hmac_auth.secret`, `jwt.secret`, and `mtls_auth.identity` are limited to 4096 characters and reject disallowed ASCII control bytes. HMAC secrets additionally require at least 32 non-whitespace characters. Consumer `jwt` credential entries support one key form: exactly one `secret` string (32-4096 characters) used for HS256 verification. Fields such as `algorithm`, `public_key`, `jwks`, and `jwks_uri` are rejected rather than ignored. RSA/EC/JWKS verification is configured through the separate `jwks_auth` plugin; it may map verified claims to a Consumer identity but does not read Consumer `jwt` credentials.
 
+## Replace semantics for `PUT`
+
+`PUT /proxies/{id}`, `PUT /upstreams/{id}` and `PUT /plugins/config/{id}` are
+**full replaces**: the body is deserialized into a fresh resource, so a field
+the body omits takes its schema default rather than the stored value. `POST`
+is unaffected — a create has no prior state to overwrite. Two fields whose
+default would otherwise silently change security state are handled explicitly:
+
+- **`PluginConfig.enabled` is required on `PUT`.** Its default is `true`, so an
+  omitted key would re-enable a deliberately disabled plugin config with a
+  `200`. A `PUT` body that is a JSON object without an `enabled` key is
+  rejected with `400` and nothing is mutated:
+  `{"error":"PUT is a full replace: 'enabled' is required (openapi.yaml declares it required). Send the field explicitly."}`.
+  `openapi.yaml` already lists `enabled` in the `PluginConfig` `required` set;
+  this makes the implementation match it. `POST /plugins/config` still defaults
+  `enabled` to `true` when the key is absent.
+- **An omitted `Proxy.plugins` preserves the stored associations.** Its default
+  is the empty list, so an omitted key would detach every plugin association —
+  including an authentication plugin — with a `200`. `PUT /proxies/{id}` is
+  therefore presence-aware for this one field, the same way `PUT
+  /namespaces/{name}` is for its fields. Send `"plugins": []` explicitly to
+  clear the associations; any present array replaces them wholesale.
+- **`Upstream.targets` is required by the schema**, so a `PUT
+  /upstreams/{id}` that omits it is already rejected with
+  `400 Invalid body: ...`. `Upstream` has no field of this class and needs no
+  special handling.
+
+Every other field on these three resources replaces normally: a `GET`-modify-`PUT`
+round trip is safe because the response serializes them, but a hand-authored or
+templated partial body will reset anything it leaves out to the schema default.
+
 ## Plugin Configs
 
 ```bash

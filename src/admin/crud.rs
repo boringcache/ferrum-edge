@@ -2462,11 +2462,25 @@ pub(crate) trait AdminResource:
     /// Inspect the raw request body *before* it is deserialized into `Self`.
     /// Return `Err` to reject the request with a 400 Bad Request. Default is
     /// a no-op. Override on resources that need schema-specific raw checks.
-    fn validate_raw_body(_body: &[u8]) -> Result<(), String> {
+    ///
+    /// `action` distinguishes `POST` (`Create`) from `PUT` (`Update`) so a
+    /// resource can demand explicit presence only where an absent key would
+    /// silently overwrite prior state on a full replace.
+    fn validate_raw_body(_body: &[u8], _action: WriteAction<'_>) -> Result<(), String> {
         Ok(())
     }
 
     fn prepare_for_update(&mut self, _existing: &Self) {}
+
+    /// Presence-aware repair for fields whose serde default is unsafe on a full
+    /// replace. `raw` is the request body's top-level object, so an *absent* key
+    /// can be distinguished from an explicitly supplied one. Update path only.
+    fn restore_absent_update_fields(
+        &mut self,
+        _existing: &Self,
+        _raw: &serde_json::Map<String, serde_json::Value>,
+    ) {
+    }
 
     fn prepare_for_write(&mut self) -> Result<(), PrepareWriteError> {
         Ok(())
@@ -3829,6 +3843,28 @@ impl AdminResource for PluginConfig {
     const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;
     const ID_CONFLICT_LABEL: &'static str = "PluginConfig";
 
+    /// `PUT` is a full replace and `enabled` carries `#[serde(default =
+    /// "default_true")]`, so an omitted key would flip a deliberately disabled
+    /// plugin row back on with a `200`. `openapi.yaml` already declares
+    /// `enabled` required; enforce that on the replace path only — a `POST`
+    /// has no prior state to overwrite, so it keeps defaulting.
+    fn validate_raw_body(body: &[u8], action: WriteAction<'_>) -> Result<(), String> {
+        let WriteAction::Update { .. } = action else {
+            return Ok(());
+        };
+        // A non-object body falls through to the shared `from_slice` error so
+        // the caller keeps seeing the existing `Invalid body: ...` message.
+        if let Ok(Value::Object(raw)) = serde_json::from_slice::<Value>(body)
+            && !raw.contains_key("enabled")
+        {
+            return Err(
+                "PUT is a full replace: 'enabled' is required (openapi.yaml declares it required). Send the field explicitly."
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
     fn id(&self) -> &str {
         &self.id
     }
@@ -4275,6 +4311,22 @@ impl AdminResource for Proxy {
     const VALIDATION_ERROR_LABEL: &'static str = "proxy fields";
     const NOT_FOUND_MESSAGE: &'static str = "Proxy not found";
     const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;
+
+    /// `plugins` is `#[serde(default)]`, so a `PUT` body that omits the key
+    /// would silently detach every association — including an authentication
+    /// plugin — with a `200`. Rejecting would break far more callers than it
+    /// protects, so an absent key preserves the stored associations (the
+    /// presence-aware `PUT` semantics `/namespaces` already has). An explicit
+    /// `"plugins": []` still clears them.
+    fn restore_absent_update_fields(
+        &mut self,
+        existing: &Self,
+        raw: &serde_json::Map<String, serde_json::Value>,
+    ) {
+        if !raw.contains_key("plugins") {
+            self.plugins = existing.plugins.clone();
+        }
+    }
 
     fn id(&self) -> &str {
         &self.id
@@ -5222,7 +5274,7 @@ async fn handle_write<R: AdminResource>(
         None
     };
 
-    if let Err(message) = R::validate_raw_body(body) {
+    if let Err(message) = R::validate_raw_body(body, action) {
         return Ok(super::json_response(
             StatusCode::BAD_REQUEST,
             &json!({"error": message}),
@@ -5286,6 +5338,11 @@ async fn handle_write<R: AdminResource>(
         WriteAction::Update { id } => {
             resource.set_id(id.to_string());
             if let Some(existing) = existing.as_ref() {
+                // `from_slice::<R>` already succeeded, so this only skips
+                // bodies that are not a JSON object.
+                if let Ok(Value::Object(raw)) = serde_json::from_slice::<Value>(body) {
+                    resource.restore_absent_update_fields(existing, &raw);
+                }
                 resource.prepare_for_update(existing);
             }
         }

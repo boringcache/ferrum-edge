@@ -9782,3 +9782,203 @@ async fn pre_body_pagination_never_preempts_authentication_or_rbac() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body, json!({"status": "ok"}));
 }
+
+// ---- PUT full-replace presence semantics (issue #4532) ----
+//
+// `PUT` deserializes into a fresh struct, so a key the body omits is filled
+// from its serde default. For `PluginConfig.enabled` (`default_true`) and
+// `Proxy.plugins` (`default`) that silently flips security state on a `200`.
+// `PUT` now demands `enabled` explicitly and preserves an absent `plugins`.
+
+#[tokio::test]
+async fn plugin_config_put_without_enabled_is_rejected_and_row_stays_disabled() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/proxies",
+        &token,
+        &json!({
+            "id": "put-presence-proxy",
+            "listen_path": "/put-presence",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "seed proxy failed: {body:?}");
+
+    // A POST that omits `enabled` still defaults it — create has no prior
+    // state to overwrite, so the defaulting behaviour is unchanged.
+    let (status, body) = admin_post(
+        &base_url,
+        "/plugins/config",
+        &token,
+        &json!({
+            "id": "put-presence-pc",
+            "plugin_name": "key_auth",
+            "scope": "proxy",
+            "proxy_id": "put-presence-proxy",
+            "enabled": false,
+            "config": {"key_location": "header:X-API-Key"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "seed plugin config failed: {body:?}");
+
+    let (status, body) = admin_put(
+        &base_url,
+        "/plugins/config/put-presence-pc",
+        &token,
+        &json!({
+            "plugin_name": "key_auth",
+            "scope": "proxy",
+            "proxy_id": "put-presence-proxy",
+            "config": {"key_location": "header:X-API-Key"},
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a PUT omitting `enabled` must not silently re-enable the row: {body:?}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("'enabled' is required"),
+        "rejection must name the missing field: {body:?}"
+    );
+
+    let (status, stored, _) = admin_get(&base_url, "/plugins/config/put-presence-pc", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "read back failed: {stored:?}"
+    );
+    assert_eq!(
+        stored["enabled"], false,
+        "the deliberately disabled row must survive the rejected PUT: {stored:?}"
+    );
+}
+
+#[tokio::test]
+async fn plugin_config_post_without_enabled_is_still_accepted() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/plugins/config",
+        &token,
+        &json!({
+            "id": "post-presence-pc",
+            "plugin_name": "key_auth",
+            "scope": "global",
+            "config": {"key_location": "header:X-API-Key"},
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "POST must keep defaulting `enabled`; the presence rule is PUT-only: {body:?}"
+    );
+    assert_eq!(
+        body["enabled"], true,
+        "POST default must stay true: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn proxy_put_omitting_plugins_preserves_associations_and_empty_array_clears_them() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/batch",
+        &token,
+        &json!({
+            "proxies": [{
+                "id": "put-plugins-proxy",
+                "listen_path": "/put-plugins",
+                "backend_scheme": "http",
+                "backend_host": "localhost",
+                "backend_port": 8080,
+                "strip_listen_path": true,
+                "plugins": [{"plugin_config_id": "put-plugins-auth"}],
+            }],
+            "plugin_configs": [{
+                "id": "put-plugins-auth",
+                "plugin_name": "key_auth",
+                "scope": "proxy",
+                "proxy_id": "put-plugins-proxy",
+                "enabled": true,
+                "config": {"key_location": "header:X-API-Key"},
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "batch seed failed: {body:?}");
+
+    let replacement = json!({
+        "listen_path": "/put-plugins-renamed",
+        "backend_scheme": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+        "strip_listen_path": true,
+    });
+    let (status, body) = admin_put(
+        &base_url,
+        "/proxies/put-plugins-proxy",
+        &token,
+        &replacement,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a PUT omitting `plugins` must succeed, not 400: {body:?}"
+    );
+
+    let (status, stored, _) = admin_get(&base_url, "/proxies/put-plugins-proxy", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "read back failed: {stored:?}"
+    );
+    assert_eq!(
+        stored["listen_path"], "/put-plugins-renamed",
+        "the rest of the body must still replace: {stored:?}"
+    );
+    assert_eq!(
+        stored["plugins"][0]["plugin_config_id"], "put-plugins-auth",
+        "an absent `plugins` key must not detach the auth association: {stored:?}"
+    );
+
+    // An explicit empty array is still a deliberate clear.
+    let mut cleared = replacement.clone();
+    cleared["plugins"] = json!([]);
+    let (status, body) = admin_put(&base_url, "/proxies/put-plugins-proxy", &token, &cleared).await;
+    assert_eq!(status, 200, "explicit clear must succeed: {body:?}");
+
+    let (status, stored, _) = admin_get(&base_url, "/proxies/put-plugins-proxy", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "read back failed: {stored:?}"
+    );
+    assert_eq!(
+        stored["plugins"],
+        json!([]),
+        "an explicit `\"plugins\": []` must clear the associations: {stored:?}"
+    );
+}
