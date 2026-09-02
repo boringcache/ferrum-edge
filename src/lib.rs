@@ -151,6 +151,25 @@ pub mod _test_support {
         Some((host, authority))
     }
 
+    /// Outbound `Host` the reqwest (HTTP/1.1 + HTTP/2) and native-HTTP/3
+    /// backend builders emit for a target selected as `host` + `port`.
+    ///
+    /// Thin wrapper over `proxy::outbound_host_header_value`, the shared
+    /// helper those four builders call (issue #4539). `scheme` is the
+    /// scheme the outbound URL was built with — `https` for every H3
+    /// backend. An explicit default port (80 for `http`/`ws`, 443 for
+    /// `https`/`wss`) is omitted; any other port is appended, with an
+    /// unbracketed IPv6 literal bracketed first. `preserve_host_header`
+    /// is not modelled here: when it is on, all four builders forward the
+    /// client's Host verbatim and never reach this helper.
+    pub fn outbound_host_header_for_target_for_test(
+        host: &str,
+        port: u16,
+        scheme: Option<&str>,
+    ) -> String {
+        crate::proxy::outbound_host_header_value(host, port, scheme).into_owned()
+    }
+
     /// Native-gRPC mesh-mTLS outbound `Host` / `:authority` after
     /// `mesh_mtls_dispatch_authority` plus Host-only sync.
     ///

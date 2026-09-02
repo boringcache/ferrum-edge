@@ -39423,6 +39423,24 @@ pub fn build_backend_url(
     )
 }
 
+/// The URL scheme [`build_backend_url_with_target`] renders into the outbound
+/// backend URL for this dispatch.
+///
+/// A function of TLS-vs-plaintext only. gRPC and WebSocket use the same
+/// `http`/`https` wire scheme — the flavor only changes the request's
+/// content-type / Upgrade header, not the URL scheme. Stream kinds never
+/// reach the URL builder but fall through safely.
+///
+/// Shared with the reqwest `Host` builders so the scheme that decides
+/// default-port omission in [`outbound_host_header_value`] is the same one
+/// the URL (and therefore hyper's `:authority`) was actually built with.
+fn backend_url_scheme_for_dispatch(proxy: &Proxy) -> &'static str {
+    match proxy.dispatch_kind {
+        DispatchKind::HttpPool | DispatchKind::TcpRaw | DispatchKind::UdpRaw => "http",
+        DispatchKind::HttpsPool | DispatchKind::TcpTls | DispatchKind::UdpDtls => "https",
+    }
+}
+
 /// Build backend URL using a specific host and port (for load-balanced targets).
 ///
 /// `strip_len` is the number of bytes to strip from the start of `incoming_path`
@@ -39443,16 +39461,7 @@ pub fn build_backend_url_with_target(
 ) -> String {
     use std::fmt::Write;
 
-    // URL scheme is a function of TLS-vs-plaintext only. gRPC and WebSocket
-    // use the same `http`/`https` wire scheme — the flavor only changes the
-    // request's content-type / Upgrade header, not the URL scheme. Stream
-    // kinds never reach this builder but we fall through safely for them.
-    let scheme = match proxy.dispatch_kind {
-        DispatchKind::HttpPool => "http",
-        DispatchKind::HttpsPool => "https",
-        DispatchKind::TcpRaw | DispatchKind::UdpRaw => "http",
-        DispatchKind::TcpTls | DispatchKind::UdpDtls => "https",
-    };
+    let scheme = backend_url_scheme_for_dispatch(proxy);
 
     with_backend_path_parts(
         proxy,
@@ -40156,6 +40165,16 @@ pub(crate) async fn proxy_to_backend_retry(
     let effective_host = upstream_target
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
+    // The port half of the same selection. `Host` must carry the FULL outbound
+    // authority, not a bare hostname: reqwest builds its URL from
+    // `build_backend_url_with_target`, so hyper's `:authority` is
+    // `host:port` for a non-default port. A hostname-only `Host` is an
+    // RFC 9112 §3.2 violation on H1 (hyper-util's `set_host` is
+    // `entry(HOST).or_insert_with(..)`, so Ferrum's value wins) and an
+    // RFC 9113 §8.3.1 disagreement on H2 (issues #4410, #4539).
+    let effective_port = upstream_target
+        .map(|t| t.port)
+        .unwrap_or(proxy.backend_port);
 
     // Re-screen the (possibly LB-rotated) retry target: reqwest skips the
     // DnsCacheResolver for IP literals, so a denied literal reached via retry
@@ -40375,9 +40394,19 @@ pub(crate) async fn proxy_to_backend_retry(
                 if proxy.preserve_host_header {
                     req_builder = req_builder.header("Host", v.as_str());
                 } else {
-                    // Use upstream target host when load balancing, so SNI-based
-                    // ingress routers see the correct Host header for the target.
-                    req_builder = req_builder.header("Host", effective_host);
+                    // Use the upstream target's FULL authority when load
+                    // balancing, so SNI-based ingress routers see the correct
+                    // Host for the target and `Host` agrees with the
+                    // `:authority` hyper derives from the reqwest URL
+                    // (issues #4410, #4539). Default ports are omitted, so a
+                    // conventional 80/443 backend is byte-identical to the
+                    // previous hostname-only value.
+                    let outbound_host = outbound_host_header_value(
+                        effective_host,
+                        effective_port,
+                        Some(backend_url_scheme_for_dispatch(proxy)),
+                    );
+                    req_builder = req_builder.header("Host", &*outbound_host);
                 }
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
@@ -40407,7 +40436,12 @@ pub(crate) async fn proxy_to_backend_retry(
     // value. The backend must never see the TLS server name merely because it
     // was used for SNI.
     if sni_reqwest_dial.is_some() && !headers.contains_key("host") {
-        req_builder = req_builder.header("Host", effective_host);
+        let outbound_host = outbound_host_header_value(
+            effective_host,
+            effective_port,
+            Some(backend_url_scheme_for_dispatch(proxy)),
+        );
+        req_builder = req_builder.header("Host", &*outbound_host);
     }
 
     // Add proxy-managed forwarding metadata.
@@ -42584,6 +42618,12 @@ async fn proxy_to_backend(
     let effective_host = upstream_target
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
+    // The port half of the same selection; see `proxy_to_backend_retry` for
+    // why outbound `Host` must be the full authority rather than a bare
+    // hostname (issues #4410, #4539).
+    let effective_port = upstream_target
+        .map(|t| t.port)
+        .unwrap_or(proxy.backend_port);
 
     // A Unix backend's `host:port` is only a schema-compatible carrier. It is
     // never resolved or dialed: the reserved target tag below is re-admitted
@@ -43699,9 +43739,19 @@ async fn proxy_to_backend(
                 if proxy.preserve_host_header {
                     req_builder = req_builder.header("Host", v.as_str());
                 } else {
-                    // Use upstream target host when load balancing, so SNI-based
-                    // ingress routers see the correct Host header for the target.
-                    req_builder = req_builder.header("Host", effective_host);
+                    // Use the upstream target's FULL authority when load
+                    // balancing, so SNI-based ingress routers see the correct
+                    // Host for the target and `Host` agrees with the
+                    // `:authority` hyper derives from the reqwest URL
+                    // (issues #4410, #4539). Default ports are omitted, so a
+                    // conventional 80/443 backend is byte-identical to the
+                    // previous hostname-only value.
+                    let outbound_host = outbound_host_header_value(
+                        effective_host,
+                        effective_port,
+                        Some(backend_url_scheme_for_dispatch(proxy)),
+                    );
+                    req_builder = req_builder.header("Host", &*outbound_host);
                 }
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
@@ -43731,7 +43781,12 @@ async fn proxy_to_backend(
     // value. The backend must never see the TLS server name merely because it
     // was used for SNI.
     if sni_reqwest_dial.is_some() && !headers.contains_key("host") {
-        req_builder = req_builder.header("Host", effective_host);
+        let outbound_host = outbound_host_header_value(
+            effective_host,
+            effective_port,
+            Some(backend_url_scheme_for_dispatch(proxy)),
+        );
+        req_builder = req_builder.header("Host", &*outbound_host);
     }
 
     // Add proxy-managed forwarding metadata.
@@ -45774,6 +45829,44 @@ fn outbound_h2_authority(uri: &hyper::Uri) -> Option<&str> {
         return authority_str.rsplit_once(':').map(|(host, _)| host);
     }
     Some(authority_str)
+}
+
+/// Outbound `Host` for a backend selected as `host` + `port`.
+///
+/// Same rule as [`outbound_h2_authority`], expressed over the SELECTED
+/// TARGET instead of a parsed URI: an explicit default port (80 for
+/// `http`/`ws`, 443 for `https`/`wss`) is omitted, any other port is
+/// appended. Used by the transports that never parse an outbound
+/// `hyper::Uri` before writing `Host` — the reqwest HTTP/1.1 + HTTP/2
+/// builders and the two native-HTTP/3 backend header builders — so all
+/// four emit the same authority the direct-H2 pool and native gRPC do
+/// (issues #4410, #4539). Deriving from `(host, port)` rather than
+/// re-parsing `backend_url` keeps the dispatch hot path free of a URI
+/// parse.
+///
+/// Borrows on the default-port path, which is the common case, so the hot
+/// path adds no allocation there. Otherwise `{host}:{port}`, with an
+/// unbracketed IPv6 literal bracketed first (shared with the HBONE/Unix
+/// builders via [`hbone_pool::authority_for_host_port`], which is also what
+/// `build_backend_url_with_target` renders into the URL authority, so `Host`
+/// and reqwest's `:authority` agree byte for byte).
+pub(crate) fn outbound_host_header_value<'a>(
+    host: &'a str,
+    port: u16,
+    scheme: Option<&str>,
+) -> Cow<'a, str> {
+    // Parsing the shared table's literal (`"80"` / `"443"`) rather than
+    // re-spelling it here is what keeps this helper and
+    // `outbound_h2_authority` from drifting on the default-port set.
+    if default_port_for_scheme(scheme).and_then(|p| p.parse::<u16>().ok()) == Some(port) {
+        // Render exactly as `build_backend_url_with_target` renders the URL
+        // authority, so an unbracketed IPv6 target host still yields a
+        // parseable authority (`::1` -> `[::1]`), matching what
+        // `outbound_h2_authority` returns after stripping `:443` from
+        // `[::1]:443`. Borrows for every non-IPv6 host, i.e. the hot path.
+        return url_render_host(host);
+    }
+    Cow::Owned(hbone_pool::authority_for_host_port(host, port))
 }
 
 /// Rewrite `uri`'s authority so Hyper's `:authority` equals `authority`.
@@ -52527,6 +52620,11 @@ struct Http3BackendHeaderContext<'a> {
     client_ip: &'a str,
     xff_append_ip: &'a str,
     effective_host: &'a str,
+    /// Port half of the same LB selection as `effective_host`. Outbound
+    /// `Host` carries the full authority (default ports omitted) so a
+    /// non-default-port H3 backend can still do vhost selection and emit
+    /// correct absolute redirects (issue #4539).
+    effective_port: u16,
     request_is_secure: bool,
     inbound_version: hyper::Version,
     content_length: Option<&'a str>,
@@ -52571,10 +52669,16 @@ fn build_http3_backend_headers(
                 // `handle_proxy_request_inner` synthesis above) would
                 // forward the client's external authority to an H3-native
                 // backend even when `preserve_host_header == false`.
-                let host_value = if proxy.preserve_host_header {
-                    value.as_str()
+                // HTTP/3 is TLS-only, so the default-port rule is the
+                // `https` one: 443 is omitted, any other port is appended.
+                let host_value: Cow<'_, str> = if proxy.preserve_host_header {
+                    Cow::Borrowed(value.as_str())
                 } else {
-                    ctx.effective_host
+                    outbound_host_header_value(
+                        ctx.effective_host,
+                        ctx.effective_port,
+                        Some("https"),
+                    )
                 };
                 if let Ok(hv) = host_value.parse::<hyper::header::HeaderValue>() {
                     http3_headers.push((hyper::header::HOST, hv));
@@ -52694,6 +52798,11 @@ async fn proxy_to_backend_http3(
     let effective_host = upstream_target
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
+    // Port half of the same selection, for the outbound `Host` authority
+    // (issue #4539).
+    let effective_port = upstream_target
+        .map(|t| t.port)
+        .unwrap_or(proxy.backend_port);
     // Enforce the backend egress policy for a literal-IP backend before dialing.
     // The native H3 pool self-resolves via the shared DNS cache — whose
     // literal fast path is canonical `IpAddr::parse` (non-canonical spellings go
@@ -52776,6 +52885,7 @@ async fn proxy_to_backend_http3(
                         client_ip,
                         xff_append_ip,
                         effective_host,
+                        effective_port,
                         request_is_secure,
                         inbound_version,
                         content_length: headers.get("content-length").map(String::as_str),
@@ -53195,6 +53305,7 @@ async fn proxy_to_backend_http3(
             client_ip,
             xff_append_ip,
             effective_host,
+            effective_port,
             request_is_secure,
             inbound_version,
             content_length: request_content_length.as_deref(),
@@ -53902,6 +54013,7 @@ async fn proxy_to_backend_http3_retry(
             client_ip,
             xff_append_ip,
             effective_host,
+            effective_port,
             request_is_secure,
             inbound_version,
             content_length: None,
@@ -58539,6 +58651,7 @@ mod tests {
                 client_ip: "203.0.113.44",
                 xff_append_ip: "127.0.0.1",
                 effective_host: "backend.internal",
+                effective_port: 443,
                 request_is_secure: false,
                 inbound_version: hyper::Version::HTTP_11,
                 content_length: None,
@@ -58585,6 +58698,7 @@ mod tests {
                 client_ip: "127.0.0.1",
                 xff_append_ip: "127.0.0.1",
                 effective_host: "backend.internal",
+                effective_port: 443,
                 request_is_secure: false,
                 inbound_version: hyper::Version::HTTP_11,
                 content_length: None,
@@ -58620,6 +58734,7 @@ mod tests {
                 client_ip: "203.0.113.9",
                 xff_append_ip: "10.0.0.7",
                 effective_host: "h3-backend.example",
+                effective_port: 443,
                 request_is_secure: true,
                 inbound_version: hyper::Version::HTTP_2,
                 content_length: None,
@@ -58668,6 +58783,7 @@ mod tests {
                 client_ip: "203.0.113.9",
                 xff_append_ip: "10.0.0.7",
                 effective_host: "h3-backend.example",
+                effective_port: 443,
                 request_is_secure: true,
                 inbound_version: hyper::Version::HTTP_11,
                 content_length: None,
@@ -58711,6 +58827,7 @@ mod tests {
                 client_ip: "203.0.113.9",
                 xff_append_ip: "10.0.0.7",
                 effective_host: "h3-backend.example",
+                effective_port: 443,
                 request_is_secure: true,
                 inbound_version: hyper::Version::HTTP_11,
                 content_length: None,

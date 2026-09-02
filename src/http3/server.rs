@@ -9879,13 +9879,17 @@ fn build_h3_backend_url_for_flavor(
 ///
 /// `upstream_target` carries the load-balanced backend selection. When the
 /// proxy is upstream-backed and `preserve_host_header == false`, the Host
-/// header is rewritten to **the selected target's host** — not
-/// `proxy.backend_host`. Without this, the H3 connection routes to
-/// `upstream_target.host` while the synthesized Host points at the proxy's
-/// template `backend_host`, producing a Host/authority mismatch that strict
-/// backends reject and that breaks virtual-host routing on the upstream.
-/// Falls back to `proxy.backend_host` only when no upstream selection is
-/// available (single-target proxies).
+/// header is rewritten to **the selected target's full authority** — host
+/// AND port, not `proxy.backend_host` and not a bare hostname. Without the
+/// host half, the H3 connection routes to `upstream_target.host` while the
+/// synthesized Host points at the proxy's template `backend_host`, producing
+/// a Host/authority mismatch that strict backends reject and that breaks
+/// virtual-host routing on the upstream. Without the port half, a
+/// non-default-port backend cannot select the right virtual host and emits
+/// absolute redirects for the wrong authority (issue #4539); HTTP/3 is
+/// TLS-only, so 443 is the omitted default. Falls back to
+/// `proxy.backend_host`/`proxy.backend_port` only when no upstream selection
+/// is available (single-target proxies).
 #[allow(clippy::too_many_arguments)]
 fn build_h3_backend_headers(
     proxy: &Proxy,
@@ -9902,6 +9906,14 @@ fn build_h3_backend_headers(
     let effective_backend_host = upstream_target
         .map(|t| t.host.as_str())
         .unwrap_or(proxy.backend_host.as_str());
+    // Port half of the same selection. Outbound `Host` must carry the full
+    // authority, not a bare hostname: a non-default-port backend otherwise
+    // cannot do vhost selection and emits absolute redirects for the wrong
+    // authority (issue #4539). HTTP/3 is TLS-only, so 443 is the omitted
+    // default and conventional backends are byte-identical to before.
+    let effective_backend_port = upstream_target
+        .map(|t| t.port)
+        .unwrap_or(proxy.backend_port);
 
     let connection_listed_strip = parse_connection_listed_from_str_map(headers);
     let peer_trusted =
@@ -9909,12 +9921,18 @@ fn build_h3_backend_headers(
     for (k, v) in headers {
         match k.as_str() {
             "host" | ":authority" => {
-                let host_val = if proxy.preserve_host_header {
-                    v.as_str()
+                // HTTP/3 is TLS-only, so the default-port rule is the
+                // `https` one: 443 is omitted, any other port is appended.
+                let host_val: std::borrow::Cow<'_, str> = if proxy.preserve_host_header {
+                    std::borrow::Cow::Borrowed(v.as_str())
                 } else {
-                    effective_backend_host
+                    crate::proxy::outbound_host_header_value(
+                        effective_backend_host,
+                        effective_backend_port,
+                        Some("https"),
+                    )
                 };
-                if let Ok(val) = http::header::HeaderValue::from_str(host_val) {
+                if let Ok(val) = http::header::HeaderValue::from_str(&host_val) {
                     h3_headers.push((http::header::HOST, val));
                 }
             }

@@ -1712,6 +1712,145 @@ fn direct_h2_outbound_host_matches_authority_including_non_default_port() {
     }
 }
 
+fn outbound_host_for_target(host: &str, port: u16, scheme: &str) -> String {
+    ferrum_edge::_test_support::outbound_host_header_for_target_for_test(host, port, Some(scheme))
+}
+
+/// Issue #4539: the reqwest transport (default HTTP/1.1 AND HTTP/2 backend
+/// path whenever the capability registry has no `h2_tls` entry) and the two
+/// native-HTTP/3 backend builders derive outbound `Host` from the selected
+/// `(host, port)` rather than from the hostname alone.
+///
+/// A hostname-only `Host` beside a `host:port` URL authority is an RFC 9112
+/// §3.2 violation on HTTP/1.1 (hyper-util's `set_host` is
+/// `entry(HOST).or_insert_with(..)`, so Ferrum's value wins) and the RFC 9113
+/// §8.3.1 `Host` / `:authority` disagreement issue #4410 reported on HTTP/2.
+#[test]
+fn reqwest_and_h3_outbound_host_carries_selected_target_port() {
+    assert_eq!(
+        outbound_host_for_target("127.0.0.1", 21212, "https"),
+        "127.0.0.1:21212",
+        "a non-default TLS backend port must ride in Host"
+    );
+    assert_eq!(
+        outbound_host_for_target("backend.internal", 8080, "http"),
+        "backend.internal:8080",
+        "a non-default plaintext backend port must ride in Host"
+    );
+}
+
+/// An EXPLICIT default port is omitted, matching what `url`/hyper normalize
+/// the reqwest URL authority to — so a conventional 80/443 backend keeps the
+/// byte-identical hostname-only `Host` it had before #4539.
+#[test]
+fn reqwest_and_h3_outbound_host_omits_explicit_default_port() {
+    assert_eq!(
+        outbound_host_for_target("127.0.0.1", 443, "https"),
+        "127.0.0.1"
+    );
+    assert_eq!(
+        outbound_host_for_target("127.0.0.1", 80, "http"),
+        "127.0.0.1"
+    );
+    assert_eq!(
+        outbound_host_for_target("backend.example", 443, "wss"),
+        "backend.example"
+    );
+    assert_eq!(
+        outbound_host_for_target("backend.example", 80, "ws"),
+        "backend.example"
+    );
+    // The default-port rule is scheme-relative: 80 is NOT default for https.
+    assert_eq!(
+        outbound_host_for_target("backend.example", 80, "https"),
+        "backend.example:80"
+    );
+    assert_eq!(
+        outbound_host_for_target("backend.example", 443, "http"),
+        "backend.example:443"
+    );
+    // HTTP/3 is TLS-only, so its builders always ask with `https`.
+    assert_eq!(
+        outbound_host_for_target("h3-backend.example", 443, "https"),
+        "h3-backend.example"
+    );
+    assert_eq!(
+        outbound_host_for_target("h3-backend.example", 8443, "https"),
+        "h3-backend.example:8443"
+    );
+}
+
+/// An IPv6 literal target keeps its brackets so the value is a parseable
+/// authority (RFC 3986 §3.2.2), and an already-bracketed host is not
+/// double-bracketed.
+#[test]
+fn reqwest_and_h3_outbound_host_brackets_ipv6_literals() {
+    assert_eq!(outbound_host_for_target("::1", 8443, "https"), "[::1]:8443");
+    assert_eq!(
+        outbound_host_for_target("[::1]", 8443, "https"),
+        "[::1]:8443"
+    );
+    assert_eq!(
+        outbound_host_for_target("2001:db8::10", 8080, "http"),
+        "[2001:db8::10]:8080"
+    );
+    // A default port omits the port but still renders a parseable authority.
+    assert_eq!(outbound_host_for_target("::1", 443, "https"), "[::1]");
+    assert_eq!(outbound_host_for_target("[::1]", 443, "https"), "[::1]");
+}
+
+/// Drift guard: for the same selected `(host, port)` and scheme, the value the
+/// reqwest / native-H3 builders emit must equal the one `apply_outbound_h2_host`
+/// derives from the direct-H2 pool's parsed URI. Both fixes for #4410 must stay
+/// one rule.
+#[test]
+fn reqwest_outbound_host_agrees_with_direct_h2_authority() {
+    for (host, port, scheme) in [
+        ("127.0.0.1", 21212u16, "https"),
+        ("127.0.0.1", 443, "https"),
+        ("127.0.0.1", 80, "http"),
+        ("backend.example", 8080, "http"),
+        ("[::1]", 8443, "https"),
+        ("[::1]", 443, "https"),
+    ] {
+        let backend_url = format!("{scheme}://{host}:{port}/h2tls");
+        let (direct_h2_host, direct_h2_authority) =
+            ferrum_edge::_test_support::outbound_h2_host_and_authority_for_test(
+                &backend_url,
+                false,
+                None,
+            )
+            .unwrap_or_else(|| panic!("expected authority for {backend_url}"));
+        let reqwest_host = outbound_host_for_target(host, port, scheme);
+        assert_eq!(
+            reqwest_host, direct_h2_host,
+            "reqwest/H3 Host must equal the direct-H2 Host for {backend_url}"
+        );
+        assert_eq!(
+            reqwest_host, direct_h2_authority,
+            "reqwest/H3 Host must equal the direct-H2 :authority for {backend_url}"
+        );
+    }
+}
+
+/// `preserve_host_header: true` is untouched by #4539: every builder forwards
+/// the client's `Host` verbatim and never consults the selected target.
+#[test]
+fn preserve_host_header_still_forwards_the_client_value_verbatim() {
+    assert_outbound_h2_host_matches_authority(
+        "https://127.0.0.1:21212/h2tls",
+        true,
+        Some("api.example.com"),
+        "api.example.com",
+    );
+    assert_outbound_h2_host_matches_authority(
+        "https://127.0.0.1:21212/h2tls",
+        true,
+        Some("api.example.com:9443"),
+        "api.example.com:9443",
+    );
+}
+
 #[test]
 fn direct_h2_mesh_mtls_pinned_authority_wins_over_preserve_host() {
     let (host, authority) =
