@@ -7094,3 +7094,71 @@ fn on_body_too_large_openapi_runtime_parity() {
         );
     }
 }
+
+// ── Issue #4519 coverage: BOM / declaration resolution paths ────────────────
+
+#[tokio::test]
+async fn utf32_declared_le_with_be_bom_scans_the_bom_honouring_reading() {
+    // The declaration (LE) and the BOM (BE) disagree: both readings are
+    // scanned, and the BOM-honouring one exposes the payload.
+    let plugin = recommended_enforcing_waf();
+    let payload = "id=1 UNION SELECT password FROM users";
+    let mut body = vec![0x00, 0x00, 0xFE, 0xFF];
+    body.extend(encode_utf32(payload, true));
+    let (result, ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/x-www-form-urlencoded; charset=utf-32le",
+        &body,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(monitored(&ctx, "FE-SQLI-001-B"));
+}
+
+#[tokio::test]
+async fn utf32_declared_le_with_matching_le_bom_resolves_to_one_reading() {
+    let plugin = recommended_enforcing_waf();
+    let payload = "id=1 UNION SELECT password FROM users";
+    let mut body = vec![0xFF, 0xFE, 0x00, 0x00];
+    body.extend(encode_utf32(payload, false));
+    let (result, ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/x-www-form-urlencoded; charset=utf-32le",
+        &body,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(monitored(&ctx, "FE-SQLI-001-B"));
+}
+
+#[tokio::test]
+async fn bare_utf32_charset_with_bom_resolves_from_the_bom() {
+    let plugin = recommended_enforcing_waf();
+    let payload = "id=1 UNION SELECT password FROM users";
+    let mut body = vec![0x00, 0x00, 0xFE, 0xFF];
+    body.extend(encode_utf32(payload, true));
+    let (result, ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/x-www-form-urlencoded; charset=utf-32",
+        &body,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(monitored(&ctx, "FE-SQLI-001-B"));
+}
+
+#[tokio::test]
+async fn identical_wide_readings_collapse_to_a_single_benign_view() {
+    // A bare utf-16 declaration with no BOM decodes both endiannesses; an
+    // all-zero body reads identically either way, collapses to one view, and
+    // keeps the raw/lossy scan — nothing here can trip a rule.
+    let plugin = recommended_enforcing_waf();
+    let body = vec![0u8; 8];
+    let (result, _ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/x-www-form-urlencoded; charset=utf-16",
+        &body,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Continue));
+}
