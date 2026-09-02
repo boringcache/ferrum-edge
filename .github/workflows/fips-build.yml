@@ -77,10 +77,25 @@ name: FIPS Build Policy
 # operating environment fall under a CMVP certificate. See docs/fips.md.
 
 on:
-  push:
-    branches: [main]
   pull_request:
   merge_group:
+    types:
+      - checks_requested
+  # Issue #4445: `FIPS Build & Test` is a branch-protection-required AND
+  # publish-blocking check (`.github/required-publication-checks.json`), so
+  # every `main` SHA must carry its own trusted, exact-SHA evidence. The
+  # publication gate resolves this workflow's canonical `push` run for the
+  # product commit; merge-group evidence is not enough, because the queue
+  # reports against a synthesized commit and a commit that reaches `main`
+  # outside the queue would carry none at all. This trigger is therefore
+  # unconditional and carries NO `paths:` filter: a filtered required gate can
+  # make publication evidence absent. On a `main` push `fips-plan` takes its
+  # `--force-run` branch -- the one it uses for every event that is neither
+  # `pull_request` nor `merge_group` -- so the full compile/claimed-check/
+  # clippy/test gate always executes rather than a relevance decision.
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       force_cold_cache:

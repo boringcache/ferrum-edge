@@ -74,6 +74,16 @@
       "rationale": "Runs unconditionally on every push to main; ci.yml's frozen `main-publish-gate` array cannot be extended by a pull request, so publication evidence is collected by `main-publication-required-checks`."
     },
     {
+      "context": "FIPS Build & Test",
+      "workflow_file": "fips-build.yml",
+      "workflow_path": ".github/workflows/fips-build.yml",
+      "workflow_name": "FIPS Build Policy",
+      "job": "fips-build",
+      "main_publication": "publication_gate_job",
+      "evidence": "push_main",
+      "rationale": "Issue #4445 made the complete hosted FIPS compile/claimed-feature/clippy/handshake aggregate a required and publish-blocking context, so a red FIPS gate can no longer merge or ship a claimed release feature. It follows the `Multicluster Federation Live` / `Ambient Host UDP Live` pattern rather than the frozen ci.yml array: ci.yml's `main-publish-gate` polling array is frozen byte-for-byte by the protected trusted-policy verifier and cannot be extended, so publication evidence is collected by `main-publication-required-checks`. Issue #4445 added an unconditional `push: main` trigger with no `paths:` filter; on a `main` push `fips-plan` takes its `--force-run` branch, so the full gate always executes and every product SHA carries exact-main-SHA evidence. `merge_group` is not force-run and still classifies its change set, which is why merge-group evidence alone was not sufficient."
+    },
+    {
       "context": "Ambient Host UDP Live",
       "workflow_file": "ambient-host-udp-live.yml",
       "workflow_path": ".github/workflows/ambient-host-udp-live.yml",
