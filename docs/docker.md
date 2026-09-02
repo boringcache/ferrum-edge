@@ -30,6 +30,16 @@ docker build -t ferrum-edge:v0.1.0 .
 docker build -t myregistry.azurecr.io/ferrum-edge:latest .
 ```
 
+### Base Image Pinning
+
+Every image reference in `Dockerfile`, `Dockerfile.release`, `Dockerfile.test`,
+and `Dockerfile.ebpf-tools-layer` — `FROM` lines and the `ARG <NAME>=<image>`
+defaults their `FROM ${VAR}` stages expand — is pinned by `@sha256:` digest, so
+a local `docker build` pulls exactly the bytes CI and the published images were
+built from. Two CI gates enforce it and two automations refresh it; see
+[dependency-policy.md → Container build inputs](dependency-policy.md#container-build-inputs-enforcement-and-refresh).
+Never drop a digest to pick up a base-image fix by tag — bump the digest instead.
+
 ### Image Details
 
 The Dockerfile uses a **multi-stage build** for optimal size:

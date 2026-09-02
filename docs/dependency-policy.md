@@ -388,6 +388,56 @@ and rejects an unpinned floating Rust channel (`latest`, `stable`, `nightly`,
 does, so a note appended after an instruction is a failure rather than a
 silently accepted comment.
 
+### Container build inputs (enforcement and refresh)
+
+Every registry image reference in `Dockerfile`, `Dockerfile.release`,
+`Dockerfile.test`, and `Dockerfile.ebpf-tools-layer` — both `FROM <ref>` and the
+`ARG <NAME>=<ref>` defaults those `FROM ${VAR}` lines expand — carries an
+`@sha256:` digest. `scratch` is the only admissible digest-less base, and a
+`FROM` naming an earlier `AS` alias is an internal stage edge, not an input.
+
+Two independent gates enforce it, because each covers a hole the other leaves:
+
+- `check_dockerfile_image_pins()` in `.github/scripts/verify_ci_runtime_cache.py`,
+  reached from the required `verify_required_ci.py` run. It extracts every
+  reference from all four Dockerfiles, requires a digest on each, and separately
+  rejects a bare `:latest`. It needs no Rust build, so it fails fast, and it
+  binds an `ARG` image default even when no `FROM` consumes it. Its `--self-test`
+  cases cover the pinned, unpinned-`FROM`, unpinned-`ARG`, stage-alias, and
+  `scratch` shapes.
+- `tests/unit/gateway_core/container_base_pinning_tests.rs`, which additionally
+  rejects an unpinned floating Rust channel on the builder image.
+
+Refresh is automated on two tracks, because Dependabot's `docker` ecosystem
+parses `FROM` lines only (`dependabot-core`, `docker/lib/dependabot/docker/file_parser.rb`:
+`FROM_LINE`); it discovers every file matching `/dockerfile|containerfile/i`, so
+all four are in scope, but it cannot see an `ARG` default — which is every input
+of `Dockerfile.ebpf-tools-layer` and both runtime bases of `Dockerfile`.
+
+- `.github/dependabot.yml` `docker` ecosystem: weekly, Monday, `deps` prefix,
+  label `dependencies`, at most 5 open PRs. Covers the `FROM` references.
+- `.github/workflows/base-image-digest-refresh.yml`: weekly plus
+  `workflow_dispatch`. It resolves each pinned reference's tag with
+  `docker buildx imagetools inspect <image>:<tag> --format '{{json .Manifest.Digest}}'`,
+  rewrites the digest in place, re-runs the pin verifier, and opens or updates a
+  single pull request on the fixed branch `deps/base-image-digests`. It is
+  digest-preserving by construction: it substitutes a digest and never removes
+  one, never changes an image or tag. The PR carries no gates of its own — normal
+  required CI (multi-arch build, FIPS, eBPF, GNU ABI scan, chart smoke) is what
+  proves a new base before merge.
+
+Emergency procedure (a base-image CVE that cannot wait for Monday): resolve the
+fixed tag's manifest-list digest by hand, bump the `@sha256:` value and the
+resolution-date comment in a normal pull request, and let required CI gate it.
+**Never drop the digest to pick up a fix by tag** — that trades a one-line review
+for an unrecorded, unreproducible base and both gates will reject it anyway.
+
+`rust-toolchain.toml` deliberately tracks `channel = "stable"` rather than an
+exact version, and records why in the file itself: lint parity with the
+`dtolnay/rust-toolchain@stable` CI installs. That is not an unpinned build input.
+The compiler identity of a *release* build is fixed by the digest-pinned
+`rust:<tag>@sha256:…` builder image, which fixes the rustc inside it.
+
 ## CI Actions and Kubernetes tooling
 
 GitHub Actions and the kind / kubectl / Helm binaries used by live Kubernetes
