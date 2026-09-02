@@ -5,7 +5,10 @@ use ferrum_edge::config::types::AuthMode;
 use ferrum_edge::plugins::{
     HTTP_FAMILY_PROTOCOLS, JwtAuthAttributeValue, Plugin, PluginHttpClient, PluginResult,
     RequestContext,
-    jwks_auth::{JwksAuth, MAX_JWKS_MAX_STALE_SECONDS},
+    jwks_auth::{
+        DEFAULT_KID_MISS_REFRESH_COOLDOWN_SECONDS, JwksAuth, MAX_JWKS_MAX_STALE_SECONDS,
+        MAX_KID_MISS_REFRESH_COOLDOWN_SECONDS,
+    },
     key_auth::KeyAuth,
     priority, validate_plugin_config, validate_plugin_config_with_policy,
 };
@@ -4730,4 +4733,211 @@ fn removed_dpop_replay_knobs_are_rejected_with_guidance() {
             "diagnostic should name the removal and its replacement: {error}"
         );
     }
+}
+
+// ─── Unknown-`kid` on-demand refetch (issue #4508) ──────────────────────────
+
+/// An identity provider that rotates its signing key: the first fetch serves
+/// v1, every later fetch serves v2.
+async fn rotating_jwks_endpoint() -> (wiremock::MockServer, String) {
+    let server = wiremock::MockServer::start().await;
+    let jwks_path = unique_jwks_path("rotating-jwks");
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(jwks_path.clone()))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            build_rsa_jwks_from_pem_with_kid(
+                include_bytes!("../../../tests/fixtures/test_rsa_public.pem"),
+                "key-v1",
+            ),
+        ))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(jwks_path.clone()))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            build_rsa_jwks_from_pem_with_kid(
+                include_bytes!("../../../tests/fixtures/test_rsa_public_other.pem"),
+                "key-v2",
+            ),
+        ))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let jwks_uri = format!("{}{}", server.uri(), jwks_path);
+    (server, jwks_uri)
+}
+
+fn bearer_ctx(token: &str) -> RequestContext {
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {token}"));
+    ctx
+}
+
+/// End-to-end key rotation: the token minted with the new `kid` is rejected
+/// once — the gateway never blocks a request on a fetch — and verifies on a
+/// later attempt, with the refresh interval set to an hour so only the
+/// on-demand path can explain the recovery.
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test]
+async fn rotated_signing_key_verifies_without_waiting_out_the_refresh_interval() {
+    let _cache_guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let (server, jwks_uri) = rotating_jwks_endpoint().await;
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{"jwks_uri": jwks_uri}],
+            "jwks_refresh_interval_secs": 3600,
+            "kid_miss_refresh_cooldown_seconds": 30
+        }),
+        default_client(),
+    )
+    .unwrap();
+    start_background_tasks(&plugin);
+    wait_for_received_request_count(&server, 1).await;
+
+    let store = plugin
+        .remote_jwks_stores_for_test()
+        .first()
+        .cloned()
+        .expect("remote provider store");
+    let consumer_index = ConsumerIndex::new(&[]);
+    let token = create_rs256_token_with_kid(
+        &json!({"sub": "user"}),
+        include_bytes!("../../../tests/fixtures/test_rsa_private_other.pem"),
+        "key-v2",
+    );
+
+    let before = store.refresh_completions();
+    let mut first = bearer_ctx(&token);
+    assert_reject(
+        plugin.authenticate(&mut first, &consumer_index).await,
+        Some(401),
+    );
+    assert_eq!(
+        store.kid_miss_refresh_requests(),
+        1,
+        "the unknown kid must have asked for exactly one out-of-band refresh"
+    );
+
+    store.wait_for_refresh_completion_after(before).await;
+
+    let mut second = bearer_ctx(&token);
+    assert_continue(plugin.authenticate(&mut second, &consumer_index).await);
+    assert_eq!(
+        second.authenticated_identity.as_deref(),
+        Some("user"),
+        "the rotated key must verify on the next request"
+    );
+}
+
+/// Tokens with no `kid`, and with an empty `kid`, name no rotation and must
+/// never cost an upstream fetch.
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test]
+async fn tokens_without_a_kid_never_trigger_an_on_demand_refetch() {
+    let _cache_guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let (server, jwks_uri) = rotating_jwks_endpoint().await;
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{"jwks_uri": jwks_uri}],
+            "jwks_refresh_interval_secs": 3600
+        }),
+        default_client(),
+    )
+    .unwrap();
+    start_background_tasks(&plugin);
+    let after_startup = wait_for_received_request_count(&server, 1).await;
+
+    let store = plugin
+        .remote_jwks_stores_for_test()
+        .first()
+        .cloned()
+        .expect("remote provider store");
+    let consumer_index = ConsumerIndex::new(&[]);
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let no_kid = create_rs256_token_no_kid(&json!({"sub": "user"}), private_key_pem);
+    let empty_kid = create_rs256_token_with_kid(&json!({"sub": "user"}), private_key_pem, "");
+
+    for token in [no_kid, empty_kid] {
+        let mut ctx = bearer_ctx(&token);
+        assert_reject(
+            plugin.authenticate(&mut ctx, &consumer_index).await,
+            Some(401),
+        );
+    }
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    assert_eq!(store.kid_miss_refresh_requests(), 0);
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .map(|requests| requests.len())
+            .unwrap_or(0),
+        after_startup,
+        "a token with no key identifier must cost no upstream fetch"
+    );
+}
+
+/// The cooldown is a plugin field: default, explicit, disabled, and bounded.
+#[tokio::test]
+async fn kid_miss_refresh_cooldown_is_validated_and_defaults_to_thirty_seconds() {
+    let with_cooldown = |value: Option<u64>| {
+        let mut config = json!({"providers": [{"jwks_uri": "https://keys.example.com/jwks"}]});
+        if let Some(value) = value {
+            config["kid_miss_refresh_cooldown_seconds"] = json!(value);
+        }
+        config
+    };
+
+    let default_cooldown = JwksAuth::new(&with_cooldown(None), default_client())
+        .expect("default config")
+        .remote_jwks_stores_for_test()
+        .first()
+        .cloned()
+        .expect("remote store")
+        .kid_miss_cooldown();
+    assert_eq!(
+        default_cooldown,
+        std::time::Duration::from_secs(DEFAULT_KID_MISS_REFRESH_COOLDOWN_SECONDS)
+    );
+
+    for (configured, expected) in [
+        (0u64, 0u64),
+        (5, 5),
+        (
+            MAX_KID_MISS_REFRESH_COOLDOWN_SECONDS,
+            MAX_KID_MISS_REFRESH_COOLDOWN_SECONDS,
+        ),
+    ] {
+        let cooldown = JwksAuth::new(&with_cooldown(Some(configured)), default_client())
+            .expect("valid cooldown")
+            .remote_jwks_stores_for_test()
+            .first()
+            .cloned()
+            .expect("remote store")
+            .kid_miss_cooldown();
+        assert_eq!(cooldown, std::time::Duration::from_secs(expected));
+    }
+
+    let error = JwksAuth::new(
+        &with_cooldown(Some(MAX_KID_MISS_REFRESH_COOLDOWN_SECONDS + 1)),
+        default_client(),
+    )
+    .err()
+    .expect("out-of-range cooldown must fail");
+    assert!(error.contains("kid_miss_refresh_cooldown_seconds"));
+
+    let unknown_key = JwksAuth::new(
+        &json!({
+            "providers": [{"jwks_uri": "https://keys.example.com/jwks"}],
+            "kid_miss_refresh_cooldown": 30
+        }),
+        default_client(),
+    )
+    .err()
+    .expect("closed plugin config must reject a misspelled key");
+    assert!(unknown_key.contains("kid_miss_refresh_cooldown"));
 }

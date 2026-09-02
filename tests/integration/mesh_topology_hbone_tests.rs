@@ -319,6 +319,38 @@ fn request_authentication_plugin_only_injected_when_jwt_rules_present() {
             jwks.config["emit_mesh_request_principal_metadata"],
             serde_json::json!(true)
         );
+        // Mesh injection carries no cooldown knob, so the injected generation
+        // inherits the shared store's default unknown-`kid` refetch: an IdP
+        // rotation recovers for mesh workloads exactly as it does for a
+        // directly configured `jwks_auth` (issue #4508).
+        assert!(
+            jwks.config
+                .get("kid_miss_refresh_cooldown_seconds")
+                .is_none(),
+            "mesh must not invent a cooldown knob"
+        );
+        let injected = ferrum_edge::plugins::jwks_auth::JwksAuth::new(
+            &jwks.config,
+            ferrum_edge::plugins::PluginHttpClient::default(),
+        )
+        .expect("injected mesh request-auth config must construct");
+        let store = injected
+            .remote_jwks_stores_for_test()
+            .first()
+            .cloned()
+            .expect("the injected provider has a remote JWKS store");
+        assert_eq!(
+            store.kid_miss_cooldown(),
+            std::time::Duration::from_secs(
+                ferrum_edge::plugins::jwks_auth::DEFAULT_KID_MISS_REFRESH_COOLDOWN_SECONDS
+            )
+        );
+        store.request_refresh_on_kid_miss();
+        assert_eq!(
+            store.kid_miss_refresh_requests(),
+            1,
+            "the on-demand refetch path must be reachable from mesh RequestAuthentication"
+        );
     }
 }
 

@@ -24,6 +24,13 @@ pub struct JwtVerifyParams<'a> {
 /// There is no all-keys fallback. A token signed by a different published key
 /// is rejected even when that other key would verify the signature. Failures
 /// return `None` with no token, claim, key, or `kid` logging.
+///
+/// A token that names a *non-empty* `kid` the trusted map does not contain is
+/// the observable shape of an identity-provider key rotation, so it asks the
+/// store for one rate-limited out-of-band refresh. That request is never
+/// awaited and this call still fails closed; a later request verifies once the
+/// refreshed snapshot is published. A missing or empty `kid` triggers nothing —
+/// it names no rotation and would otherwise be a free fetch-spray vector.
 pub async fn verify_jwt_with_jwks(
     token: &str,
     store: &JwksKeyStore,
@@ -31,7 +38,15 @@ pub async fn verify_jwt_with_jwks(
 ) -> Option<Value> {
     let all_keys = store.trusted_keys()?;
     let header = decode_header(token).ok()?;
-    let cached_key = key_for_header_kid(&header, &all_keys)?;
+    let cached_key = match key_for_header_kid(&header, &all_keys) {
+        Some(cached_key) => cached_key,
+        None => {
+            if header.kid.as_deref().is_some_and(|kid| !kid.is_empty()) {
+                store.request_refresh_on_kid_miss();
+            }
+            return None;
+        }
+    };
     let validation = build_validation(cached_key.algorithm, params);
     decode::<Value>(token, &cached_key.decoding_key, &validation)
         .ok()

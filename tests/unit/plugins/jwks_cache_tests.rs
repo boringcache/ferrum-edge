@@ -7,7 +7,7 @@ use ferrum_edge::_test_support::jwks_discovery_candidate_for_test;
 use ferrum_edge::plugins::PluginHttpClient;
 use ferrum_edge::plugins::utils::jwks_cache::{
     JwksRefreshRequirement, cached_reaper_generation, cached_refresh_state, cached_requirement,
-    clear_jwks_cache, get_or_create_jwks_store as get_or_create_jwks_store_with_policy,
+    clear_jwks_cache, get_or_create_jwks_store as get_or_create_jwks_store_with_requirement,
     render_prometheus, retain_active_requirements, retain_active_uris,
     retire_jwks_store_if_unreferenced,
 };
@@ -26,6 +26,19 @@ const RSA_PUBLIC_PEM: &[u8] = include_bytes!("../../../tests/fixtures/test_rsa_p
 
 fn client() -> PluginHttpClient {
     PluginHttpClient::default()
+}
+
+fn get_or_create_jwks_store_with_policy(
+    uri: &str,
+    http_client: &PluginHttpClient,
+    refresh_interval: Duration,
+    max_stale: Duration,
+) -> Arc<JwksKeyStore> {
+    get_or_create_jwks_store_with_requirement(
+        uri,
+        http_client,
+        JwksRefreshRequirement::new(refresh_interval, max_stale),
+    )
 }
 
 fn get_or_create_jwks_store(
