@@ -99,19 +99,25 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   still compared byte for byte, and the wiring cannot be removed once adopted. A
   committed `.cargo/config[.toml]` below the repository root is rejected
   outright.
-- The `fuzz-smoke` job carries TWO admitted generations for issue #3902
+- The `fuzz-smoke` job carries TWO admitted generations, now for issue #4442
   (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first): `CI_FUZZ_SMOKE_RETIRED_JOB`
-  ran the six-target libFuzzer budget on every pull request with caching
-  disabled; `CI_FUZZ_SMOKE_JOB` keeps the deterministic property smoke as the
-  required pull-request gate, moves the budget to `merge_group` / push to `main`
-  / `workflow_dispatch`, and admits `./.github/actions/setup-sccache` plus a
-  `main`-push-only `save-if` cache (`pull_request`, fork, `merge_group`, and
-  `workflow_dispatch` restore but never publish a `fuzz-smoke` cache). The
+  is #4238's shape — the deterministic property smoke as the required
+  `pull_request`/`merge_group` gate, the six-target libFuzzer budget on push to
+  `main` / `workflow_dispatch` only, and `./.github/actions/setup-sccache` plus
+  a `main`-push-only `save-if` cache (`pull_request`, fork, `merge_group`, and
+  `workflow_dispatch` restore but never publish a `fuzz-smoke` cache);
+  `CI_FUZZ_SMOKE_JOB` adds a seventh bounded invocation for
+  `datagram_client_address` at `-max_len=65536`, that target's documented 64 KiB
+  budget, so one hostile-UDP parser's length boundaries are reachable in BOTH
+  required lanes rather than only the scheduled one. The
   transition is exact on both ends and
   one-way — withholding is symmetric, so `admitted_fuzz_smoke_removal_errors` is
   what refuses a revert. `CI_FUZZ_SMOKE_BOUNDED_BUDGET` must appear exactly once
-  in every generation, so a generation can never move the lane and relax its
-  bounds at the same time. Delete the retired generation once the adopted one is
+  in every generation and `CI_FUZZ_SMOKE_DATAGRAM_BUDGET` exactly once in the
+  adopted one, so a generation can never move or extend the lane and relax its
+  bounds at the same time. `FUZZ_WORKFLOW` carries the same target in the
+  scheduled matrix and the literal shell allowlist. Delete the retired
+  generation once the adopted one is
   on `main`. See `docs/ci_cd.md` → "Admitted `fuzz-smoke` lane-split
   generation".
 - `release.yml` is admitted in exactly two shapes

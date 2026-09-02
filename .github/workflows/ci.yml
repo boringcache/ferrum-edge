@@ -5308,7 +5308,8 @@ jobs:
     # Byte-frozen by the trusted Cross build policy
     # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
     # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
-    # issue #3902 decides where each half of it runs. This is its entire
+    # issue #3902 decides where each half of it runs, and issue #4442 decides
+    # which targets it covers. This is its entire
     # permitted shape. Every command, action pin, toolchain pin, tool version,
     # target name, and libFuzzer bound below is part of the contract, so a pull
     # request cannot widen the budget, change the target list, add a step, or
@@ -5316,9 +5317,9 @@ jobs:
     #
     # Lane split (#3902, narrowed by #4238): the deterministic property smoke
     # stays the required gate and runs on pull_request AND merge_group. The
-    # six-target, sanitizer-instrumented libFuzzer build spends roughly 39
-    # minutes compiling to buy roughly 48 seconds of fuzzing, so it runs only
-    # on the push to `main` and on manual dispatch.
+    # sanitizer-instrumented libFuzzer build spends roughly 39 minutes
+    # compiling to buy under a minute of fuzzing, so it runs only on the push
+    # to `main` and on manual dispatch.
     #
     # #3902 took it off the pull-request path for cost. #4238 takes it off the
     # merge_group path for blast radius: a hosted-runner reclamation (exit 143)
@@ -5327,6 +5328,15 @@ jobs:
     # ejected change. Discovery coverage is unchanged -- every merged change is
     # still fuzzed at byte-identical bounds by the push to `main` that follows
     # it, which is also the only event permitted to populate this lane's cache.
+    #
+    # Target inventory (#4442): `datagram_client_address` is the seventh smoke
+    # target. It is invoked on its own rather than from the six-target loop
+    # because its documented input budget is 64 KiB
+    # (`fuzz_support::MAX_FUZZ_INPUT_BYTES`) rather than the loop's 4 KiB, and
+    # the scheduled sanitizer lane already fuzzes it at that ceiling. A parser
+    # whose length boundaries are reachable in one required lane and not the
+    # other is not actually scheduled. Every other bound is byte-identical to
+    # the loop's.
     name: Fuzz Smoke
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
@@ -5423,6 +5433,14 @@ jobs:
               -timeout=2 \
               -rss_limit_mb=1024
           done
+
+          echo "Fuzz smoke target: datagram_client_address"
+          cargo fuzz run --codegen-units 16 datagram_client_address -- \
+            -runs=512 \
+            -max_total_time=8 \
+            -max_len=65536 \
+            -timeout=2 \
+            -rss_limit_mb=1024
           echo "Fuzz sanitizer lane seconds: $((SECONDS - sanitizer_started))"
 
       - name: Report fuzz lane compiler-cache telemetry
@@ -5431,7 +5449,7 @@ jobs:
           set -euo pipefail
 
           if [ "$GITHUB_EVENT_NAME" = "push" ] || [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "Fuzz lane shape: property gate plus the six-target sanitizer budget"
+            echo "Fuzz lane shape: property gate plus the seven-target sanitizer budget"
           else
             echo "Fuzz lane shape: deterministic property gate only"
           fi
