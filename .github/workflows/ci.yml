@@ -1160,9 +1160,13 @@ jobs:
         # where the mesh chart runs it privileged on the host network. `--config
         # deny.toml` reuses the root policy so the two allowlists cannot drift.
         # Policy: docs/dependency-policy.md.
+        # `--allow advisory-not-detected`: the shared deny.toml ignore list is
+        # scoped to the root graph (mongodb/aws/sqlx paths that the eBPF workspace
+        # never pulls in); with `unused-ignored-advisory = "deny"` those entries
+        # would otherwise fail this run for not matching anything here.
         run: >-
           cargo deny --manifest-path ebpf/Cargo.toml
-          check --config deny.toml advisories bans sources licenses
+          check --allow advisory-not-detected --config deny.toml advisories bans sources licenses
 
       - name: Advisory-exception expiry
         # cargo-deny accepts ignores without the repo's [expires:] convention, so
