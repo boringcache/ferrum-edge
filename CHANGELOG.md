@@ -191,6 +191,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   message; the data-plane assertion itself is unchanged, and nothing was muted,
   retried, or given a longer wait.
 
+- **TLS material watchers no longer run an unrequested reload pass at
+  readiness** (issue #4488). `tokio::time::interval` completes its first tick
+  immediately, so both material-set reload loops re-loaded and re-fingerprinted
+  every configured TLS source the instant after they announced readiness —
+  duplicating the startup fingerprint they had just computed, and racing that
+  extra pass against whatever the caller did next. On a source rewritten
+  non-atomically that pass could observe an intermediate file and publish a
+  revision for a rotation nobody requested. Both loops now consume the immediate
+  tick before signalling readiness, which makes the documented readiness
+  contract true and leaves the polling cadence unchanged (the next tick still
+  fires one interval after the ticker is created). Watcher startup only; no
+  proxy hot-path effect.
+
 - **BREAKING — backend mTLS handshake without a client certificate is
   pre-wire, not `connection_reset`** (issue #4406). An HTTPS origin that
   requires a client certificate previously classified as post-wire
