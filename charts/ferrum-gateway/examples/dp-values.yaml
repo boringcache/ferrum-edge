@@ -7,8 +7,12 @@
 #     --from-literal=cp-dp-grpc-jwt-secret="<same value as the CP>"
 #
 #   helm install ferrum-dp ./charts/ferrum-gateway -n ferrum \
+#     --set image.tag=<published-tag> \
 #     -f charts/ferrum-gateway/examples/dp-values.yaml
 mode: dp
+
+image:
+  tag: latest  # evaluation only; pin an immutable release tag in production
 
 replicaCount: 3
 
