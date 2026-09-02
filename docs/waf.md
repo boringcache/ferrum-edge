@@ -247,7 +247,7 @@ and `rule_overrides`. Categories:
 
 | Category | Rules | Notes |
 | --- | --- | --- |
-| `sqli` | FE-SQLI-001..005 plus FE-SQLI-001-B..003-B | UNION/tautology/stacked (001–003) are level 1 across decoded query values and admitted request bodies; body mirrors use the exact query patterns. Comment-token (004) is query-only level 2; SQLSTATE (005) is body-only level 2. |
+| `sqli` | FE-SQLI-001..005 plus FE-SQLI-001-B..004-B | UNION/tautology/stacked (001–003) are level 1 across decoded query values and admitted request bodies; body mirrors use the exact query patterns. Those three accept either whitespace **or a bounded inline `/*…*/` comment** between SQL tokens, so `UNION/**/SELECT` and `;/**/DROP` are caught at level 1; the tautology rule also accepts an unspaced `\|\|` (`1'\|\|1=1`). The comment body is bounded, so a comment longer than the bound falls through to the comment-token catch-alls: 004 (query) and 004-B (body) are both level 2. SQLSTATE (005) is body-only level 2. |
 | `nosqli` | FE-NOSQL-001 (operator key), FE-NOSQL-002 (bracket operator, L2) | |
 | `command_injection` | FE-CMD-001..003 | shell-substitution (003) is level 2 |
 | `jndi_injection` | FE-JNDI-001-{B,Q,H}, FE-JNDI-002-{B,Q,H} | **Log4Shell**; direct lookup is Critical/level 1 across body, query, and header; nested-obfuscation is level 2 |

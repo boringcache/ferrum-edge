@@ -2678,6 +2678,96 @@ async fn level_one_sqli_blocks_query_and_body_mirrors_without_broadening_union()
 }
 
 #[tokio::test]
+async fn level_one_sqli_matches_inline_comment_separator_and_unspaced_tautology() {
+    let plugin = recommended_enforcing_waf();
+
+    // `UNION/**/SELECT` is accepted by MySQL, PostgreSQL and MSSQL. It carries
+    // none of the decode triggers (`%`, `+`, `\`, `&`) that gate the layered
+    // normaliser, so the raw text is what the level-1 rules have to match.
+    let mut query_ctx = ctx("GET", "/waf");
+    query_ctx.set_raw_query_string("id=1%20UNION/**/SELECT%20password%20FROM%20users".into());
+    let query_result = plugin.authorize(&mut query_ctx).await;
+    assert!(matches!(query_result, PluginResult::Reject { .. }));
+    assert!(monitored(&query_ctx, "FE-SQLI-001"));
+
+    let (body_result, body_ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/x-www-form-urlencoded",
+        b"id=1 UNION/**/SELECT password FROM users",
+    )
+    .await;
+    assert!(matches!(body_result, PluginResult::Reject { .. }));
+    assert!(monitored(&body_ctx, "FE-SQLI-001-B"));
+
+    // A comment in both separator positions of `UNION [ALL] SELECT`.
+    let (both_result, both_ctx) =
+        scan_body_with_content_type(&plugin, "text/plain", b"UNION/*x*/ALL/*y*/SELECT").await;
+    assert!(matches!(both_result, PluginResult::Reject { .. }));
+    assert!(monitored(&both_ctx, "FE-SQLI-001-B"));
+
+    // Stacked statement behind a comment.
+    let (stacked_result, stacked_ctx) =
+        scan_body_with_content_type(&plugin, "text/plain", b";/**/DROP TABLE users").await;
+    assert!(matches!(stacked_result, PluginResult::Reject { .. }));
+    assert!(monitored(&stacked_ctx, "FE-SQLI-003-B"));
+
+    // The canonical unspaced `||` tautology: the `\|\|` alternative used to
+    // require whitespace after the operator, which made it dead.
+    let mut tautology_query_ctx = ctx("GET", "/waf");
+    tautology_query_ctx.set_raw_query_string("id=1%27%7C%7C1%3D1".into());
+    let tautology_query_result = plugin.authorize(&mut tautology_query_ctx).await;
+    assert!(matches!(
+        tautology_query_result,
+        PluginResult::Reject { .. }
+    ));
+    assert!(monitored(&tautology_query_ctx, "FE-SQLI-002"));
+
+    let (tautology_body_result, tautology_body_ctx) =
+        scan_body_with_content_type(&plugin, "text/plain", b"id=1'||1=1").await;
+    assert!(matches!(tautology_body_result, PluginResult::Reject { .. }));
+    assert!(monitored(&tautology_body_ctx, "FE-SQLI-002-B"));
+
+    // Regression guard: the spaced `or` branch still matches, and still needs
+    // at least one separator so a token like `orX` cannot hit.
+    let (or_result, or_ctx) =
+        scan_body_with_content_type(&plugin, "text/plain", b"id=1' or 1=1").await;
+    assert!(matches!(or_result, PluginResult::Reject { .. }));
+    assert!(monitored(&or_ctx, "FE-SQLI-002-B"));
+}
+
+#[tokio::test]
+async fn level_one_sqli_comment_separator_keeps_benign_comment_bodies_passing() {
+    let plugin = recommended_enforcing_waf();
+
+    // A `SELECT` with an inline comment but no `UNION`: the union signature
+    // must not widen into "any SELECT near a comment".
+    let (select_result, select_ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/json",
+        br#"{"note":"SELECT /* legit */ name"}"#,
+    )
+    .await;
+    assert!(matches!(select_result, PluginResult::Continue));
+    assert!(!monitored(&select_ctx, "FE-SQLI-001-B"));
+
+    // A bare comment token with no SQL keyword. `FE-SQLI-004-B` is the
+    // paranoia-2 catch-all, so it must stay silent at the default level 1.
+    let (comment_result, comment_ctx) =
+        scan_body_with_content_type(&plugin, "text/plain", b"style /* comment */ block").await;
+    assert!(matches!(comment_result, PluginResult::Continue));
+    assert!(!monitored(&comment_ctx, "FE-SQLI-004-B"));
+}
+
+#[tokio::test]
+async fn paranoia_two_records_sql_comment_token_in_body() {
+    let plugin = Waf::new(&json!({ "mode": "monitor", "paranoia_level": 2 })).unwrap();
+
+    let (_result, comment_ctx) =
+        scan_body_with_content_type(&plugin, "text/plain", b"style /* comment */ block").await;
+    assert!(monitored(&comment_ctx, "FE-SQLI-004-B"));
+}
+
+#[tokio::test]
 async fn prototype_pollution_blocks_decoded_query_keys_values_and_json_body() {
     let plugin = recommended_enforcing_waf();
 
