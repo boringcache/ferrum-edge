@@ -1273,15 +1273,22 @@ per-direction *idle* bound on writing the request body to the backend. HTTP-fami
 uploads arm it in the gateway-owned upload pump (H1/H2/reqwest and native gRPC)
 or on each native-H3 `send_data`/`finish` — streaming uploads through their body
 adapter, and buffered uploads (retries, body-processing policy, retry replays)
-by handing the collected buffer to the same pump in bounded slices; a backend
-that accepts and never reads
-surfaces as `504` / `X-Gateway-Error: backend_timeout` /
-`error_class=read_write_timeout`. `0` disables the write bound. Because the
-bound is idle rather than total, a buffered body is written in bounded slices
-and every slice that the backend takes re-arms it, so a large upload that is
-slow but continuously progressing is not timed out. Streaming
-pass-through uploads are otherwise unaffected by the buffered-upload collection
+by handing the collected buffer to the same pump in bounded slices. `0` disables
+the write bound. Because the bound is idle rather than total, a buffered body is
+written in bounded slices and every slice that the backend takes re-arms it, so a
+large upload that is slow but continuously progressing is not timed out.
+Streaming pass-through uploads are otherwise unaffected by the buffered-upload collection
 deadline above.
+
+The bound is on transport write *progress*, so it fires while the upload pump is
+blocked on bridge capacity — that expiry surfaces as `504` /
+`X-Gateway-Error: backend_timeout` / `error_class=read_write_timeout`. A backend
+that accepts the connection and never reads therefore only trips it while the
+upload is still backpressured: once the local kernel send buffer has absorbed the
+entire body, as it will for a small or medium POST against a never-reading peer,
+the pump observes a clean end-of-stream and the wait for response headers is
+bounded by `backend_read_timeout_ms` instead. Tracked as issue
+[#4411](https://github.com/ferrum-edge/ferrum-edge/issues/4411).
 
 The bound starts when the backend transport begins consuming the request body —
 the first moment a connection provably exists and the request head is written —
