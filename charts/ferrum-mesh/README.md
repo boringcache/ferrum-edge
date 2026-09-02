@@ -17,6 +17,14 @@ naming, labelling, secret, and validation conventions.
 
 Example value overlays live under [`examples/`](examples/).
 
+## Container image tag
+
+When `image.tag` is empty the chart defaults to `Chart.appVersion`. That tag
+must exist in the container registry before install. Override with a published
+tag from `docker.io/ferrumedge/ferrum-edge` or `ghcr.io/ferrum-edge/ferrum-edge`
+(for example `--set image.tag=<published-tag>`). The mutable `latest` tag exists
+for evaluation but must not be used in production.
+
 ## Gateway API CRDs (required)
 
 When `controlPlane.enabled=true` and `controlPlane.rbac.gatewayApi=true` (the

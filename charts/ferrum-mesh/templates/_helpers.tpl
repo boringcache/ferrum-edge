@@ -3,6 +3,24 @@ Ferrum mesh chart helpers. These helpers intentionally fail at template time for
 invalid CP settings so an unusable control-plane pod is not rendered.
 */}}
 
+{{- define "ferrum-mesh.imageTag" -}}
+{{- $tag := .Values.image.tag | default .Chart.AppVersion -}}
+{{- trim (toString $tag) -}}
+{{- end -}}
+
+{{- define "ferrum-mesh.image" -}}
+{{- printf "%s:%s" .Values.image.repository (include "ferrum-mesh.imageTag" .) -}}
+{{- end -}}
+
+{{- define "ferrum-mesh.resolveImageTag" -}}
+{{- $override := trim (toString (.override | default "")) -}}
+{{- if $override -}}
+{{- $override -}}
+{{- else -}}
+{{- include "ferrum-mesh.imageTag" .root -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "ferrum-mesh.validateOneSource" -}}
 {{- $label := .label -}}
 {{- $source := .source | default dict -}}
