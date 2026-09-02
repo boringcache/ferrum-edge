@@ -4697,7 +4697,7 @@ layered decode variants used for bodies, not raw whole-URI text.
 | `response_inspection` | bool | `false` | Inspect response headers and, when enabled separately, response bodies. |
 | `response_body_inspection` | bool | `false` | Enable response body rules. |
 | `body_methods` | string[] | `["POST","PUT","PATCH"]` | Methods eligible for request body buffering and scanning. |
-| `body_content_types` | string[] | JSON, form, XML, text, HTML | MIME types eligible for body scanning. Parameters such as `; charset=utf-8` are ignored. |
+| `body_content_types` | string[] | JSON (`application/json`, `text/json`), form, XML, text, HTML | Base MIME types eligible for body scanning. Parameters such as `; charset=utf-8` are ignored and matching is case-insensitive. RFC 6839 structured-syntax suffixes map onto their base family and re-check this list: `+json` types (`application/vnd.api+json`, `application/ld+json`, …) are inspected when `application/json` is listed, and `+xml` types when either `application/xml` or `text/xml` is. The suffix rule reuses this allowlist rather than adding hidden types. |
 | `inspect_multipart` | bool | `false` | Inspect `multipart/*` bodies. |
 | `inspect_binary_body` | bool | `false` | Inspect bodies whose content type is not in `body_content_types`. |
 | `max_scan_bytes` | usize | `1048576` | Maximum bytes scanned from each body. Must be greater than zero. |
