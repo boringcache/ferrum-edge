@@ -167,6 +167,47 @@ pub const MAX_EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES: usize = 16;
 const EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATE_KEYS: &[&str] =
     &["trusted_hbone_assertors", "trust_domain_aliases"];
 
+/// Every root `config` key `workload_metrics` reads, and the exact set mesh
+/// slice injection writes (`inject_workload_metrics_plugin`). Unknown root
+/// keys fail closed at construction: a misspelled `trusted_hbone_assertors`
+/// would otherwise silently restore the built-in assertor defaults and undo
+/// an operator's `trusted_hbone_assertors: []` baggage lockdown.
+///
+/// The last block is read by
+/// [`crate::plugins::otel_tracing::TraceExporterOptions::from_config`] off
+/// this same root object via `trace_exporters_from_providers`, so those keys
+/// are part of this plugin's schema even though no `config.get` for them
+/// appears in this file.
+pub const WORKLOAD_METRICS_CONFIG_KEYS: &[&str] = &[
+    "node_id",
+    "topology",
+    "namespace",
+    "workload_spiffe_id",
+    "labels",
+    "trust_domain_aliases",
+    "trusted_hbone_assertors",
+    EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY,
+    "sampling_percentage",
+    "custom_tags",
+    "custom_header_tags",
+    "custom_env_tags",
+    "metrics",
+    "tracing_provider",
+    "tracing_providers",
+    "direction_emit",
+    "span_reporting_disabled",
+    "disable_span_reporting",
+    "disableSpanReporting",
+    "service_name",
+    "deployment_environment",
+    "batch_size",
+    "flush_interval_ms",
+    "buffer_capacity",
+    "buffer_max_bytes",
+    "max_retries",
+    "retry_delay_ms",
+];
+
 /// One compiled `mesh_authz` baggage gate: the same
 /// [`TrustedAssertorIndex`] + alias list authorization uses.
 #[derive(Default)]
@@ -346,6 +387,18 @@ impl WorkloadMetrics {
     where
         F: FnMut(&str) -> Result<String, std::env::VarError>,
     {
+        // Unknown root keys fail closed. A non-object config keeps its existing
+        // behavior (every read below yields `None`, producing a default
+        // instance) — closing that shape is a separate change.
+        if let Some(object) = config.as_object() {
+            crate::util::unknown_keys::reject_unknown_keys(
+                object,
+                "config",
+                WORKLOAD_METRICS_CONFIG_KEYS,
+                "workload_metrics: ",
+            )?;
+        }
+
         let workload_spiffe_id = config
             .get("workload_spiffe_id")
             .and_then(Value::as_str)

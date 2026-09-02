@@ -3401,6 +3401,8 @@ Rejects HTTP-family requests whose `Host` / `:authority` destination is not in a
 | `reject_status` | u16 | `502` | HTTP 4xx/5xx status returned for unknown destinations. Use `404` when you want to mask policy details. |
 | `outbound_listen_ports` | u16[] | `[]` | Optional frontend listener ports where the registry applies. Mesh auto-injection sets this to the outbound capture listener so inbound sidecar/ambient traffic is not gated by outbound policy. Empty applies wherever the plugin runs. Port `0` is rejected at construction; use `[]` for intentional global scope. |
 
+Unknown top-level keys are rejected at construction (for example a misspelled `regsitry` cannot silently leave the registry empty and admit every destination).
+
 Bare-host registry entries match only requests whose Host header omits an explicit port. `host:port` entries match only that exact port. `host:*` entries match any explicit Host port; mesh-generated registries use this marker for services, ServiceEntries, or workload addresses with no declared ports so known destinations remain reachable when callers include `Host: service:9080`. One-label wildcards (`*.example.com`) are indexed by suffix so lookup cost does not grow with unrelated wildcard count. Decision metrics use fixed `host` buckets (`<admit_explicit>`, `<admit_wildcard>`, `<denied>`).
 
 ### `tcp_connection_throttle`
@@ -7417,11 +7419,13 @@ Adds Istio/GAMMA workload identity labels to request, stream, and log metadata, 
 
 HBONE `source.principal` attribution uses the same trusted-assertor relation as `mesh_authz`. Direct / user-created instances honor that relation from this plugin's own `trusted_hbone_assertors` / `trust_domain_aliases` config. Mesh injection additionally stamps an internal `_effective_mesh_authz_baggage_gates` list that is an exact, fail-closed conjunction of every enabled global `mesh_authz` baggage gate PluginCache will execute (including a force-injected reserved `__mesh_authz` under transparent inbound capture). Disabled operator rows are omitted; each gate keeps its own absent/null/default, explicit `[]`, and alias contract; a sibling cannot silently widen another gate. Malformed or over-bound internal lists fail construction. See [Trusted HBONE Assertors](mesh.md#trusted-hbone-assertors).
 
+Unknown top-level keys are rejected at construction (for example a misspelled `trusted_hbone_asserters` cannot silently restore the built-in assertor defaults and undo a `trusted_hbone_assertors: []` lockdown).
+
 See [Mesh Observability](mesh.md#observability) for metric names, service graph aggregation, and tracing behavior.
 
 ### `__mesh_bpf_metrics`
 
-Reserved internal plugin auto-injected only for mesh `NodeWaypoint` topology. It exposes TCP-layer BPF SOCK_OPS counters and fixed-bucket SRTT, SYN-to-ACK, and captured accept-to-first-application-byte latency histograms on the Prometheus scrape surface. Operator-managed plugin configs should not create names prefixed with `__`.
+Reserved internal plugin auto-injected only for mesh `NodeWaypoint` topology. It exposes TCP-layer BPF SOCK_OPS counters and fixed-bucket SRTT, SYN-to-ACK, and captured accept-to-first-application-byte latency histograms on the Prometheus scrape surface. Operator-managed plugin configs should not create names prefixed with `__`. Unknown top-level keys are rejected at construction (for example a misspelled `prefx` cannot silently publish the default metric namespace).
 
 See [BPF SOCK_OPS observability](mesh.md#bpf-sock_ops-observability-gap-sc3) for emitted counters, histogram bucket bounds, and the node-agent/process split.
 

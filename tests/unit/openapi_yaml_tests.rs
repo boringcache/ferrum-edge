@@ -10776,3 +10776,55 @@ fn live_applied_mutations_declare_config_cursor_on_success_deferred_and_committe
         );
     }
 }
+
+/// Issue #4525 closed the four `src/plugins/mesh/` plugin roots against
+/// unknown keys. Each now carries the same obligation every other closed
+/// plugin root does: an `additionalProperties: false` schema whose declared
+/// properties are exactly the runtime allowlist. Without this guard a new
+/// runtime key silently becomes an undocumented field the Admin API rejects,
+/// or a documented field the runtime refuses — and mesh slice apply would
+/// fail closed on the injected config.
+#[test]
+fn mesh_plugin_config_roots_are_closed_and_match_openapi() {
+    use ferrum_edge::plugins::mesh::authz::MESH_AUTHZ_CONFIG_KEYS;
+    use ferrum_edge::plugins::mesh::bpf_metrics::MESH_BPF_METRICS_CONFIG_KEYS;
+    use ferrum_edge::plugins::mesh::workload_metrics::WORKLOAD_METRICS_CONFIG_KEYS;
+
+    // `mesh_outbound_registry` closes its root with
+    // `#[serde(deny_unknown_fields)]` on `OutboundRegistryConfig`, so its
+    // key set is the struct's serde field names rather than a const.
+    const MESH_OUTBOUND_REGISTRY_FIELDS: &[&str] = &[
+        "registry",
+        "reject_status",
+        "outbound_listen_ports",
+        "namespace",
+    ];
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for (schema_name, runtime_keys) in [
+        ("MeshAuthzConfig", MESH_AUTHZ_CONFIG_KEYS),
+        ("WorkloadMetricsConfig", WORKLOAD_METRICS_CONFIG_KEYS),
+        ("MeshOutboundRegistryConfig", MESH_OUTBOUND_REGISTRY_FIELDS),
+        ("MeshBpfMetricsConfig", MESH_BPF_METRICS_CONFIG_KEYS),
+    ] {
+        let schema = spec
+            .pointer(&format!("/components/schemas/{schema_name}"))
+            .unwrap_or_else(|| panic!("{schema_name} component exists"));
+        assert_eq!(
+            schema["additionalProperties"],
+            json!(false),
+            "{schema_name} must reject undeclared properties"
+        );
+
+        let schema_fields: BTreeSet<&str> = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{schema_name} properties"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let runtime_fields: BTreeSet<&str> = runtime_keys.iter().copied().collect();
+        assert_eq!(schema_fields, runtime_fields, "{schema_name} key drift");
+    }
+}
