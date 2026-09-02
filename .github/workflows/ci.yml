@@ -1164,11 +1164,33 @@ jobs:
           cargo deny --manifest-path ebpf/Cargo.toml --config deny.toml
           check advisories bans sources licenses
 
+      - name: Advisory-exception expiry self-test
+        # The [expires:] convention is a repo rule cargo-deny knows nothing
+        # about, so the checker is the only thing enforcing it. Run its synthetic
+        # fixtures first: a checker that silently stopped rejecting an untokened
+        # or expired exception would otherwise pass this job forever.
+        run: bash scripts/check_advisory_expiry.sh --self-test
+
       - name: Advisory-exception expiry
-        # cargo-deny accepts ignores without the repo's [expires:] convention, so
-        # validate it here too: a PR that adds a malformed or already-expired
-        # exception is rejected at PR time, not only by the weekly workflow.
+        # cargo-deny accepts ignores and license exceptions without the repo's
+        # [expires:] convention, so validate it here too: a PR that adds a
+        # malformed or already-expired exception is rejected at PR time, not only
+        # by the weekly workflow.
         run: bash scripts/check_advisory_expiry.sh
+
+      - name: Third-party license inventory
+        # Crate -> license listing from the LOCKED graph, produced on every PR
+        # alongside the gate that enforces the allowlist, so a reviewer can see
+        # exactly what the tree ships under. `cargo deny list` compiles nothing.
+        run: cargo deny list --format json --layout crate > third-party-licenses.json
+
+      - name: Upload third-party license inventory
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: third-party-licenses
+          path: third-party-licenses.json
+          retention-days: 30
 
       - name: Vendored-patch lifecycle parity
         # Fails when docs/vendored-patch-lifecycle.json drifts from Cargo.toml,

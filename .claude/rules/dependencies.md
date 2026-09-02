@@ -253,6 +253,12 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 - Every `[advisories.ignore]` in `deny.toml` needs a rationale and an
   `[expires:YYYY-MM-DD]` token; `scripts/check_advisory_expiry.sh` fails the
   weekly run once a date passes. Do not silence an advisory without both.
+- `[licenses.exceptions]` entries are time-boxed the same way, enforced by the
+  same script on both workflows. cargo-deny accepts no `reason` field there, so
+  the `# owner: <name> — <rationale> [expires:YYYY-MM-DD]` token goes in a
+  comment immediately preceding (or trailing) the entry, one per entry. Both
+  workflows run `scripts/check_advisory_expiry.sh --self-test` first, and also
+  publish the locked-graph `third-party-licenses` inventory artifact.
 - Licenses ARE part of the blocking gate (since #4468): the `[licenses]`
   allowlist and `confidence-threshold` in `deny.toml` fail CI.
 - A CVE in a vendored crate's lineage follows the emergency procedure in

@@ -67,11 +67,34 @@ jobs:
           cargo deny --manifest-path ebpf/Cargo.toml --config deny.toml
           check advisories bans sources licenses
 
+      - name: Advisory-exception expiry self-test
+        # Proves the checker still rejects a missing/expired [expires:] token —
+        # for [advisories.ignore] AND [licenses.exceptions] — against synthetic
+        # deny.toml fixtures, before it is trusted on the real one below.
+        if: always()
+        run: bash scripts/check_advisory_expiry.sh --self-test
+
       - name: Advisory-exception expiry
         # Fails once any deny.toml [expires:] date has passed, so a time-boxed
-        # exception can never silently become permanent.
+        # advisory ignore or license exception can never silently become
+        # permanent.
         if: always()
         run: bash scripts/check_advisory_expiry.sh
+
+      - name: Third-party license inventory
+        # Crate -> license listing derived from the LOCKED graph, so the shipped
+        # notices and the enforced [licenses] allowlist cannot diverge silently.
+        # `cargo deny list` only reads `cargo metadata`; it compiles nothing.
+        if: always()
+        run: cargo deny list --format json --layout crate > third-party-licenses.json
+
+      - name: Upload third-party license inventory
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: third-party-licenses
+          path: third-party-licenses.json
+          retention-days: 30
 
       - name: cargo-audit (second opinion)
         # Belt-and-suspenders: cargo-audit's advisory matching occasionally
