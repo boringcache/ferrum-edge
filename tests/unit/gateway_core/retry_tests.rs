@@ -1442,8 +1442,7 @@ fn test_classify_boxed_error_post_connect_rustls_is_post_wire() {
     // class so request_reached_wire returns true and
     // `retry_on_connect_failure` does NOT replay non-idempotent
     // requests whose bytes may already have crossed the encrypted
-    // channel. Handshake-class rustls (CertificateRequired, etc.) is
-    // a different case — see the tests below.
+    // channel. Peer-provided alert descriptions are equally ambiguous.
     let err: Box<dyn std::error::Error + Send + Sync> = Box::new(rustls::Error::DecryptError);
     let class = classify_boxed_error(&*err);
     assert_eq!(
@@ -1460,31 +1459,29 @@ fn test_classify_boxed_error_post_connect_rustls_is_post_wire() {
 }
 
 #[test]
-fn test_classify_boxed_error_post_connect_handshake_alert_is_tls_error() {
-    // Issue #4406: reqwest reports backend mTLS handshake failures with
-    // `is_connect() = false` (TCP already succeeded). A typed handshake
-    // alert must still be TlsError so retry_on_connect_failure can replay
-    // and operators grepping tls_error see the misconfig.
+fn test_classify_boxed_error_post_connect_handshake_alert_is_post_wire() {
+    // A peer may send CertificateRequired after processing application data.
+    // Without independent handshake-phase evidence the alert is post-wire so
+    // retry_on_connect_failure cannot replay a non-idempotent request.
     let alert = rustls::AlertDescription::CertificateRequired;
     let err: Box<dyn std::error::Error + Send + Sync> =
         Box::new(rustls::Error::AlertReceived(alert));
     let class = classify_boxed_error(&*err);
-    assert_eq!(class, ErrorClass::TlsError);
+    assert_eq!(class, ErrorClass::ConnectionReset);
     assert!(
-        !ferrum_edge::retry::request_reached_wire(class),
-        "handshake-class rustls must stay pre-wire so retry_on_connect_failure \
-         can replay; nothing reached the origin application layer"
+        ferrum_edge::retry::request_reached_wire(class),
+        "an attacker-controlled alert must not authorize a pre-wire retry"
     );
 }
 
 #[test]
-fn test_classify_boxed_error_handshake_failure_alert_is_tls_error() {
+fn test_classify_boxed_error_handshake_failure_alert_is_post_wire() {
     let alert = rustls::AlertDescription::HandshakeFailure;
     let err: Box<dyn std::error::Error + Send + Sync> =
         Box::new(rustls::Error::AlertReceived(alert));
     let class = classify_boxed_error(&*err);
-    assert_eq!(class, ErrorClass::TlsError);
-    assert!(!ferrum_edge::retry::request_reached_wire(class));
+    assert_eq!(class, ErrorClass::ConnectionReset);
+    assert!(ferrum_edge::retry::request_reached_wire(class));
 }
 
 #[test]
@@ -1647,19 +1644,17 @@ fn test_post_connect_io_reset_without_rustls_is_connection_reset() {
 }
 
 #[test]
-fn test_post_connect_io_reset_wrapping_handshake_rustls_is_tls_error() {
-    // tokio-rustls / reqwest wrap a missing-client-cert alert as
-    // io::ErrorKind::ConnectionReset with rustls in get_ref(), and
-    // reqwest's is_connect() is already false (issue #4406). Must not
-    // stay ConnectionReset.
+fn test_post_connect_io_reset_wrapping_handshake_rustls_is_post_wire() {
+    // Once the phase is ambiguous, rustls in get_ref() does not make a
+    // peer-controlled alert safe to retry regardless of method.
     let io_err = std::io::Error::new(
         std::io::ErrorKind::ConnectionReset,
         rustls::Error::AlertReceived(rustls::AlertDescription::CertificateRequired),
     );
     let err: Box<dyn std::error::Error + Send + Sync> = Box::new(io_err);
     let class = classify_boxed_error(&*err);
-    assert_eq!(class, ErrorClass::TlsError);
-    assert!(!ferrum_edge::retry::request_reached_wire(class));
+    assert_eq!(class, ErrorClass::ConnectionReset);
+    assert!(ferrum_edge::retry::request_reached_wire(class));
 }
 
 #[test]

@@ -877,8 +877,8 @@ fn classify_typed_chain(
             // rustls often surfaces as `io::Error` wrapping `rustls::Error`
             // in `get_ref()`. `source()` skips that payload and returns
             // the inner error's source instead. Walk `get_ref()` *before*
-            // mapping the io kind so the three-way boundary can run:
-            // handshake rustls → `TlsError`; post-handshake rustls →
+            // mapping the io kind so the phase boundary can run:
+            // setup-phase rustls → `TlsError`; post-connect rustls →
             // `ConnectionReset`; no rustls + connect-phase RST →
             // `ConnectionRefused`. Typed rustls only — no Display match
             // on "tls" / "refused".
@@ -986,19 +986,15 @@ fn rustls_error_from_chain<'a>(
     None
 }
 
-/// Map a typed rustls error onto the three-way connect / handshake / reset
-/// boundary.
+/// Map a typed rustls error onto the connect / post-connect boundary.
 ///
-/// * Handshake-class rustls (certificate, ALPN, handshake alert, incomplete
-///   handshake) is always [`ErrorClass::TlsError`]. reqwest's `is_connect()`
-///   is TCP-only, so a backend that rejects a missing client certificate
-///   after TCP connect still lands here with `phase_is_connect = false`
-///   (issue #4406).
+/// * During an independently known setup phase, every rustls failure is
+///   [`ErrorClass::TlsError`].
 /// * `AlertReceived(CloseNotify)` is teardown, not handshake — same class
 ///   as omitted `close_notify` (#4051): [`ErrorClass::ConnectionClosed`].
-/// * Other rustls (decrypt, oversized record, mid-stream alert) stays
-///   [`ErrorClass::TlsError`] during connect/setup and
-///   [`ErrorClass::ConnectionReset`] after the handshake, so
+/// * After TCP setup, every other rustls error is conservatively
+///   [`ErrorClass::ConnectionReset`]. Alert descriptions are controlled by the
+///   peer and do not prove that the alert preceded application data, so
 ///   `retry_on_connect_failure` cannot replay a request whose bytes may
 ///   already have crossed the encrypted channel.
 fn classify_rustls_error(err: &rustls::Error, phase_is_connect: bool) -> ErrorClass {
@@ -1008,53 +1004,10 @@ fn classify_rustls_error(err: &rustls::Error, phase_is_connect: bool) -> ErrorCl
     ) {
         return ErrorClass::ConnectionClosed;
     }
-    if phase_is_connect || rustls_error_is_handshake(err) {
+    if phase_is_connect {
         ErrorClass::TlsError
     } else {
         ErrorClass::ConnectionReset
-    }
-}
-
-/// Typed handshake / certificate / ALPN rustls variants. Not Display text.
-fn rustls_error_is_handshake(err: &rustls::Error) -> bool {
-    use rustls::AlertDescription as Alert;
-    use rustls::Error::*;
-    match err {
-        InappropriateHandshakeMessage { .. }
-        | InvalidEncryptedClientHello(_)
-        | NoCertificatesPresented
-        | UnsupportedNameType
-        | PeerIncompatible(_)
-        | InvalidCertificate(_)
-        | InvalidCertRevocationList(_)
-        | HandshakeNotComplete
-        | NoApplicationProtocol => true,
-        AlertReceived(alert) => matches!(
-            *alert,
-            Alert::HandshakeFailure
-                | Alert::NoCertificate
-                | Alert::BadCertificate
-                | Alert::UnsupportedCertificate
-                | Alert::CertificateRevoked
-                | Alert::CertificateExpired
-                | Alert::CertificateUnknown
-                | Alert::UnknownCA
-                | Alert::AccessDenied
-                | Alert::CertificateRequired
-                | Alert::NoApplicationProtocol
-                | Alert::UnrecognisedName
-                | Alert::ProtocolVersion
-                | Alert::InsufficientSecurity
-                | Alert::InappropriateFallback
-                | Alert::MissingExtension
-                | Alert::UnsupportedExtension
-                | Alert::CertificateUnobtainable
-                | Alert::BadCertificateStatusResponse
-                | Alert::BadCertificateHashValue
-                | Alert::UnknownPSKIdentity
-                | Alert::EncryptedClientHelloRequired
-        ),
-        _ => false,
     }
 }
 
@@ -1381,18 +1334,17 @@ pub fn reqwest_error_is_protocol_nack(e: &reqwest::Error) -> bool {
 /// 1. **Connect-phase TCP** (`is_connect() = true`, no rustls): RST /
 ///    refused collapse to `ConnectionRefused` (a RST'd SYN is
 ///    ECONNREFUSED). Unchanged.
-/// 2. **Handshake-phase** (typed `rustls::Error` handshake / cert / alert
-///    in the chain): `TlsError`, whether or not `is_connect()` is set.
+/// 2. **Setup-phase TLS** (typed `rustls::Error` in an independently known
+///    connect/setup context): `TlsError`.
 /// 3. **Pool cancel** (`hyper::Error::is_canceled()`, no rustls):
 ///    `ConnectionPoolError`. Live backend-mTLS on the reqwest HTTP/1 path
 ///    lands here: hyper-util completes the connector, the connection
 ///    future then dies (TLS 1.3 post-handshake `CertificateRequired`),
 ///    and the queued request is canceled with no rustls in the chain
 ///    (issue #4406). Typed `is_canceled` only — not Display text.
-/// 4. **Post-handshake mid-stream** (`is_connect() = false`, no handshake
-///    rustls, not canceled): RST stays `ConnectionReset`. An origin that
-///    RSTs during handshake *without* rustls or `is_canceled` is
-///    indistinguishable from this case and stays `ConnectionReset`.
+/// 4. **Post-connect ambiguous failure** (`is_connect() = false`, not
+///    canceled): RST and rustls errors stay `ConnectionReset`. A peer-provided
+///    TLS alert cannot prove that no application bytes were processed.
 ///
 /// **Order:**
 /// 1. Port-exhaustion typed walk via [`is_port_exhaustion`].
@@ -1407,8 +1359,8 @@ pub fn reqwest_error_is_protocol_nack(e: &reqwest::Error) -> bool {
 ///    - DNS substring fallback (no typed DNS error from reqwest/hyper-util).
 ///    - Generic refused fallback.
 /// 3. `is_timeout()` (post-connect) → `ReadWriteTimeout`.
-/// 4. [`classify_typed_chain`] with `phase_is_connect = false` — handshake
-///    rustls still `TlsError` (case 2); hyper `is_canceled` is
+/// 4. [`classify_typed_chain`] with `phase_is_connect = false` — rustls is
+///    conservatively `ConnectionReset` (case 4); hyper `is_canceled` is
 ///    `ConnectionPoolError` (case 3); other mid-stream classification.
 /// 5. HTTP/2 protocol-error substring fallback (`h2` / `GOAWAY` / `RESET_STREAM`).
 pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
