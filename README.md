@@ -72,7 +72,7 @@ ferrum-edge version
 
 Download from [GitHub Releases](https://github.com/ferrum-edge/ferrum-edge/releases) for Linux x86_64/ARM64 and macOS x86_64/ARM64. Releases ship raw platform binaries plus adjacent `.sha256` checksum files (for example `ferrum-edge-linux-x86_64` and `ferrum-edge-linux-x86_64.sha256`).
 
-Pin an explicit release tag in download URLs. Ferrum's moving `latest` tag is published as a prerelease, while GitHub's `/releases/latest` redirect and the `releases/latest` API endpoint skip prereleases. Use `/releases/download/<tag>/…` or `gh release download <tag>` instead. No immutable `vX.Y.Z` semver release is published yet; pick the tag shown on the [Releases](https://github.com/ferrum-edge/ferrum-edge/releases) page and avoid pinning production to the mutable `latest` prerelease.
+Pin an explicit release tag in download URLs. Ferrum's moving `latest` tag is published as a prerelease, while GitHub's `/releases/latest` redirect and the `releases/latest` API endpoint skip prereleases. Use `/releases/download/<tag>/…` or `gh release download <tag>` instead. Pick the current immutable `vX.Y.Z` semver tag from the [Releases](https://github.com/ferrum-edge/ferrum-edge/releases) page, and do not pin production to the mutable `latest` prerelease.
 
 ```bash
 # Example: Linux x86_64
