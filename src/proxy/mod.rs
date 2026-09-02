@@ -9640,8 +9640,8 @@ impl ProxyState {
         // TCP/UDP listener shares ONE counter map per family: a per-listener
         // copy would make the effective ceiling `max` per listener instead of
         // `max` per source. `None` when the dimension is disabled (`0`).
-        let tcp_max_connections_per_ip = env_config.tcp_max_connections_per_ip;
-        let udp_max_sessions_per_ip = env_config.udp_max_sessions_per_ip;
+        let tcp_max_connections_per_ip = env_config_arc.tcp_max_connections_per_ip;
+        let udp_max_sessions_per_ip = env_config_arc.udp_max_sessions_per_ip;
         let per_ip_tcp_connections: Option<Arc<dashmap::DashMap<String, AtomicU64>>> =
             (tcp_max_connections_per_ip > 0)
                 .then(|| Arc::new(dashmap::DashMap::with_shard_amount(pool_shard_amount)));
