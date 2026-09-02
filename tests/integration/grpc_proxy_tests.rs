@@ -4694,7 +4694,7 @@ async fn grpc_retry_does_not_dial_path_changing_target() {
 
 /// Fix 4: with retry configured, a gRPC server-streaming response with
 /// multiple data frames separated by delays must still reach the client
-/// as distinct frames — the `grpc-status` trailer must NOT be delayed by
+/// incrementally — the `grpc-status` trailer must NOT be delayed by
 /// having the entire body buffered gateway-side.
 ///
 /// Assertion strategy: consume the response frame-by-frame on the client
@@ -4702,6 +4702,11 @@ async fn grpc_retry_does_not_dial_path_changing_target() {
 /// buffering, the first frame cannot arrive until the whole backend body
 /// is collected (~`(num_frames - 1) × per_frame_delay`). If streaming,
 /// the first frame arrives after the backend sends its first chunk.
+///
+/// The observed frame *count* is deliberately not asserted: the response
+/// rides `coalescing_h2_body`, so frame boundaries are producer-timing
+/// dependent. Byte totals, the trailer, and arrival timing are the
+/// invariants (issue #4489).
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_retry_enabled_does_not_stall_trailers_behind_streaming_body() {
     use std::time::Instant;
@@ -4779,21 +4784,45 @@ async fn grpc_retry_enabled_does_not_stall_trailers_behind_streaming_body() {
     // Drive the body frame-by-frame.
     let mut body = response.into_body();
     let mut arrival_times: Vec<Duration> = Vec::new();
+    let mut body_bytes: usize = 0;
     let mut saw_trailer = false;
     while let Some(frame_result) = body.frame().await {
         let frame = frame_result.expect("frame error");
         let arrival = t_start.elapsed();
         arrival_times.push(arrival);
+        if let Some(data) = frame.data_ref() {
+            body_bytes += data.len();
+        }
         if frame.is_trailers() {
             saw_trailer = true;
         }
     }
 
     assert!(saw_trailer, "client did not observe a trailers frame");
-    assert!(
-        arrival_times.len() >= NUM_FRAMES,
-        "expected at least {} frames, got {}",
+
+    // Do NOT assert on the number of DATA frames observed: the gRPC
+    // response path deliberately runs through `coalescing_h2_body`
+    // (128 KiB target), so how many frames reach the client is a function
+    // of producer timing and buffer occupancy, not a gateway contract.
+    // Coalescing is byte-preserving, so assert on total body length
+    // instead — that is what the client must always see intact.
+    assert_eq!(
+        body_bytes,
+        NUM_FRAMES * FRAME_SIZE,
+        "expected {} body bytes ({} backend frames × {} bytes), got {}",
+        NUM_FRAMES * FRAME_SIZE,
         NUM_FRAMES,
+        FRAME_SIZE,
+        body_bytes
+    );
+
+    // The `spread` check below compares the first and last arrival, so it
+    // is only meaningful with at least two frames. The coalescer can merge
+    // every DATA frame into one, but trailers are always a separate frame,
+    // so two is the floor the transport guarantees here.
+    assert!(
+        arrival_times.len() >= 2,
+        "expected at least a data frame and a trailers frame, got {} frames",
         arrival_times.len()
     );
 
