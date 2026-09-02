@@ -1493,3 +1493,83 @@ fn singular_target_ref_on_request_authentication_and_telemetry_reports_invalid()
         );
     }
 }
+
+/// Issue #4535: a wildcard `spec.hosts[]` element on a `resolution: DNS`
+/// ServiceEntry is skipped by every egress materialization branch (the wildcard
+/// string itself would be the unresolvable upstream dial target), so the status
+/// writer must surface it as a deferred field rather than reporting a fully
+/// accepted resource that serves nothing. `FerrumAccepted` stays `True` — the
+/// resource IS translated, just inert for that host.
+#[test]
+fn service_entry_unresolvable_wildcard_host_is_reported_as_deferred() {
+    let obj = object(
+        "networking.istio.io/v1",
+        "ServiceEntry",
+        "wildcard-dns",
+        json!({
+            "hosts": ["*.api.example.com"],
+            "location": "MESH_EXTERNAL",
+            "resolution": "DNS",
+            "ports": [{"number": 443, "name": "https", "protocol": "TLS"}]
+        }),
+    );
+    let updates = plan_istio_status_updates(&[obj], options());
+    let condition = find_condition(
+        updates[0].status["conditions"].as_array().unwrap(),
+        "FerrumAccepted",
+    );
+    assert_eq!(
+        condition["status"].as_str(),
+        Some("True"),
+        "the resource is still accepted/translated, just inert for that host"
+    );
+    let detail = updates[0].ferrum_detail.as_ref().unwrap();
+    let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        deferred.iter().any(|f| f.starts_with("spec.hosts[]:")),
+        "an unresolvable wildcard host must be reported as deferred: {deferred:?}"
+    );
+    assert!(
+        condition["message"]
+            .as_str()
+            .unwrap()
+            .contains("deferred fields"),
+        "the condition message must name the deferral: {condition:?}"
+    );
+}
+
+/// The converse: a wildcard host under `resolution: STATIC` with declared
+/// `endpoints[]` IS materialized (the endpoints are the dial set), so it must
+/// NOT be reported as deferred.
+#[test]
+fn service_entry_static_wildcard_host_with_endpoints_is_not_deferred() {
+    let obj = object(
+        "networking.istio.io/v1",
+        "ServiceEntry",
+        "wildcard-static",
+        json!({
+            "hosts": ["*.api.example.com"],
+            "location": "MESH_EXTERNAL",
+            "resolution": "STATIC",
+            "endpoints": [{"address": "203.0.113.10"}],
+            "ports": [{"number": 443, "name": "https", "protocol": "TLS"}]
+        }),
+    );
+    let updates = plan_istio_status_updates(&[obj], options());
+    let detail = updates[0].ferrum_detail.as_ref().unwrap();
+    let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        !deferred.iter().any(|f| f.starts_with("spec.hosts[]:")),
+        "a STATIC wildcard entry with endpoints materializes and must not be deferred: {deferred:?}"
+    );
+}
