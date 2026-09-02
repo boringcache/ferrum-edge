@@ -663,3 +663,97 @@ fn database_poll_respawn_delay_remains_one_second() {
         "DATABASE_POLL_RESPAWN_DELAY must stay a 1-second shutdown-aware backoff"
     );
 }
+
+/// Issue #4528: every poll-loop path that marks the configuration source
+/// unavailable must go through the one helper that flips the shared
+/// `db_available` flag AND counts the failure, so
+/// `ferrum_database_config_source_connected` and
+/// `ferrum_database_poll_failures_total` cannot drift apart.
+///
+/// The two remaining bare `store(false)` calls in the control-plane tick are
+/// deliberate and are NOT failures: both follow a *successful* pool reconnect
+/// and mark "a full reload is pending" for one cycle. Counting them would
+/// report a poll failure every time database DNS changes.
+#[test]
+fn poll_loop_availability_writes_go_through_the_counting_helper() {
+    for (label, source, wake_marker, shutdown_marker, expected_bare_stores) in [
+        (
+            "database",
+            include_str!("../../../src/modes/database.rs"),
+            "_ = wait_for_config_poll_wake(",
+            "_ = poll_shutdown.changed() => {",
+            0usize,
+        ),
+        (
+            "control_plane",
+            include_str!("../../../src/modes/control_plane.rs"),
+            "_ = interval.tick() => {",
+            "_ = cp_poll_shutdown.changed() => {",
+            2usize,
+        ),
+    ] {
+        let tick = poll_attempt_body(source, wake_marker, shutdown_marker);
+        assert_eq!(
+            tick.matches(".store(false").count(),
+            expected_bare_stores,
+            "{label}: an unaccounted bare availability write appeared in the poll tick; \
+             use record_config_source_unavailable() so the gauge and the counter move together"
+        );
+        assert!(
+            tick.contains("record_config_source_unavailable("),
+            "{label}: poll tick must mark outages through the counting helper"
+        );
+        assert!(
+            tick.contains("record_poll_failure("),
+            "{label}: poll tick must count classified poll failures"
+        );
+    }
+}
+
+/// The shared flag is the whole point: the metrics struct must hold the SAME
+/// `Arc<AtomicBool>` the poll loop and `AdminState` use, so `/metrics` and the
+/// admin API can never disagree about database availability.
+#[test]
+fn config_source_gauge_tracks_the_shared_admin_flag() {
+    let flag = Arc::new(AtomicBool::new(true));
+    let metrics = DatabaseDeltaPollMetrics::with_config_source_flag(flag.clone());
+    assert!(metrics.config_source_connected());
+    assert!(metrics.snapshot().config_source_connected);
+
+    // A write from the poll loop's side of the Arc is visible to the metrics.
+    flag.store(false, Ordering::Relaxed);
+    assert!(!metrics.config_source_connected());
+    assert!(!metrics.snapshot().config_source_connected);
+
+    // ...and a write through the metrics helper is visible to the admin side.
+    flag.store(true, Ordering::Relaxed);
+    metrics.record_config_source_unavailable(
+        ferrum_edge::modes::database::DatabasePollFailureReason::Connectivity,
+    );
+    assert!(!flag.load(Ordering::Relaxed));
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+        snapshot.poll_failures_by_reason.get("connectivity"),
+        Some(&1)
+    );
+    assert_eq!(
+        snapshot.poll_failures_by_reason.len(),
+        3,
+        "the reason label set is closed and always fully populated"
+    );
+}
+
+/// Default construction owns its own flag, so callers with no poll loop (and
+/// the existing tests) keep a sane "connected" starting point.
+#[test]
+fn default_metrics_own_a_connected_config_source_flag() {
+    let metrics = DatabaseDeltaPollMetrics::default();
+    assert!(metrics.config_source_connected());
+    for reason in ["connectivity", "validation_rejected", "migration_gate"] {
+        assert_eq!(
+            metrics.snapshot().poll_failures_by_reason.get(reason),
+            Some(&0)
+        );
+    }
+}

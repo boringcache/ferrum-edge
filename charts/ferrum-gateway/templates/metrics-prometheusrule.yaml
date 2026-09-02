@@ -1,5 +1,6 @@
 {{- if and .Values.metrics.enabled .Values.metrics.alerts.enabled }}
 {{- $alerts := .Values.metrics.alerts | default dict -}}
+{{- $runbook := $alerts.runbookBaseUrl | default "https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/runbooks/gateway.md" -}}
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -21,6 +22,7 @@ spec:
           annotations:
             summary: Ferrum gateway 5xx response rate is elevated
             description: "Gateway 5xx responses are above the configured threshold ({{ "{{ $value }}" }} req/s). Requires the globally scoped prometheus_metrics plugin."
+            runbook_url: {{ printf "%s#ferrumgatewayhigh5xxrate" $runbook | quote }}
         - alert: FerrumGatewayHighP99Latency
           expr: histogram_quantile(0.99, sum(rate(ferrum_request_duration_ms_bucket[5m])) by (le)) > {{ $alerts.p99LatencyMs | default 2000 }}
           for: 5m
@@ -29,6 +31,7 @@ spec:
           annotations:
             summary: Ferrum gateway P99 latency is elevated
             description: "Gateway P99 request latency is {{ "{{ $value }}" }} ms (threshold {{ $alerts.p99LatencyMs | default 2000 }} ms). Requires the globally scoped prometheus_metrics plugin."
+            runbook_url: {{ printf "%s#ferrumgatewayhighp99latency" $runbook | quote }}
     - name: ferrum.gateway.datapath
       rules:
         - alert: FerrumGatewayOverloadSheddingActive
@@ -39,6 +42,7 @@ spec:
           annotations:
             summary: Ferrum gateway load shedding is active
             description: "Progressive load shedding is engaged on namespace {{ "{{ $labels.namespace }}" }} (action {{ "{{ $labels.action }}" }})."
+            runbook_url: {{ printf "%s#ferrumgatewayoverloadsheddingactive" $runbook | quote }}
         - alert: FerrumGatewayUpstreamMajorityUnhealthy
           expr: max by (upstream_id, upstream_namespace, namespace) ((ferrum_upstream_targets > 0) and (ferrum_upstream_unhealthy_targets / ferrum_upstream_targets > {{ $alerts.upstreamUnhealthyRatio | default 0.5 }}))
           for: 5m
@@ -47,6 +51,7 @@ spec:
           annotations:
             summary: Ferrum gateway upstream has a majority of targets unhealthy
             description: "Upstream {{ "{{ $labels.upstream_id }}" }}/{{ "{{ $labels.upstream_namespace }}" }} in namespace {{ "{{ $labels.namespace }}" }} has more than {{ $alerts.upstreamUnhealthyRatio | default 0.5 }} of targets ejected by active health probes."
+            runbook_url: {{ printf "%s#ferrumgatewayupstreammajorityunhealthy" $runbook | quote }}
         - alert: FerrumGatewayCircuitBreakerOpen
           expr: max by (proxy_id, proxy_namespace, namespace) (ferrum_circuit_breakers{state="open"}) > 0
           for: 5m
@@ -55,6 +60,7 @@ spec:
           annotations:
             summary: Ferrum gateway circuit breaker is open
             description: "Proxy {{ "{{ $labels.proxy_id }}" }}/{{ "{{ $labels.proxy_namespace }}" }} in namespace {{ "{{ $labels.namespace }}" }} has at least one upstream circuit breaker in the open state."
+            runbook_url: {{ printf "%s#ferrumgatewaycircuitbreakeropen" $runbook | quote }}
 {{- if $alerts.frontendTlsHandshakeErrorsPerSecond }}
         - alert: FerrumGatewayFrontendTlsHandshakeErrors
           expr: sum(rate(ferrum_frontend_tls_handshake_failures_total{reason="error"}[5m])) > {{ $alerts.frontendTlsHandshakeErrorsPerSecond }}
@@ -64,6 +70,7 @@ spec:
           annotations:
             summary: Ferrum gateway frontend TLS handshake errors are elevated
             description: "Frontend TLS handshakes are being refused with reason=error at {{ "{{ $value }}" }} failures/s (threshold {{ $alerts.frontendTlsHandshakeErrorsPerSecond }})."
+            runbook_url: {{ printf "%s#ferrumgatewayfrontendtlshandshakeerrors" $runbook | quote }}
 {{- end }}
     - name: ferrum.gateway.tls
       rules:
@@ -75,6 +82,7 @@ spec:
           annotations:
             summary: Ferrum gateway TLS certificate is expiring soon
             description: "Certificate {{ "{{ $labels.cert_id }}" }} on surface {{ "{{ $labels.surface }}" }} expires in {{ "{{ $value }}" }} seconds."
+            runbook_url: {{ printf "%s#ferrumgatewaytlscertexpiringsoon" $runbook | quote }}
         - alert: FerrumGatewayRevocationMaterialExpiringSoon
           expr: min by (material_id, kind, namespace) (ferrum_tls_revocation_expiry_seconds) < {{ $alerts.revocationExpiringSeconds | default 604800 }}
           for: 15m
@@ -83,17 +91,28 @@ spec:
           annotations:
             summary: Ferrum gateway TLS revocation material is expiring soon
             description: "Revocation material {{ "{{ $labels.material_id }}" }} (kind {{ "{{ $labels.kind }}" }}) reaches nextUpdate in {{ "{{ $value }}" }} seconds. Ferrum refuses expired revocation material at reload AND at startup, so a pod that restarts after nextUpdate will not come back."
+            runbook_url: {{ printf "%s#ferrumgatewayrevocationmaterialexpiringsoon" $runbook | quote }}
     - name: ferrum.gateway.config
       rules:
 {{- if or (eq .Values.mode "database") (eq .Values.mode "cp") }}
+        - alert: FerrumGatewayDatabaseUnavailable
+          expr: min by (namespace) (ferrum_database_config_source_connected) == 0
+          for: {{ $alerts.databaseUnavailableFor | default "5m" }}
+          labels:
+            severity: critical
+          annotations:
+            summary: Ferrum gateway configuration database is unavailable
+            description: "The configuration source for namespace {{ "{{ $labels.namespace }}" }} is unreachable or unusable. The gateway keeps serving the last known-good configuration and the admin API rejects writes, so routing, credentials, and plugin configuration are frozen and drifting from the source of truth."
+            runbook_url: {{ printf "%s#ferrumgatewaydatabaseunavailable" $runbook | quote }}
         - alert: FerrumGatewayDatabasePollStale
           expr: (time() - ferrum_database_poll_last_completed_timestamp_seconds > {{ $alerts.databasePollStaleSeconds | default 300 }}) or absent(ferrum_database_poll_last_completed_timestamp_seconds)
           for: 10m
           labels:
             severity: warning
           annotations:
-            summary: Ferrum gateway database config poll is stale
-            description: "No successful database/CP config poll completed within the freshness window for namespace {{ "{{ $labels.namespace }}" }}."
+            summary: Ferrum gateway database config poll task has stopped advancing
+            description: "The supervised database/CP config poll task for namespace {{ "{{ $labels.namespace }}" }} has not completed a tick within the freshness window. This detects poll-TASK DEATH (panic, abort, cancellation, or a wedged tick) — it does NOT detect a database outage, because a handled poll error still completes a tick. Use FerrumGatewayDatabaseUnavailable for outages."
+            runbook_url: {{ printf "%s#ferrumgatewaydatabasepollstale" $runbook | quote }}
 {{- end }}
         - alert: FerrumGatewayDpConfigStale
           expr: max by (namespace) (ferrum_dp_config_stale) == 1
@@ -103,6 +122,7 @@ spec:
           annotations:
             description: "Data plane namespace {{ "{{ $labels.namespace }}" }} is serving with stale CP configuration."
             summary: Ferrum gateway data plane configuration is stale
+            runbook_url: {{ printf "%s#ferrumgatewaydpconfigstale" $runbook | quote }}
         - alert: FerrumGatewayConfigSyncDiverged
           expr: max by (namespace) (ferrum_configsync_diverged) == 1
           for: 5m
@@ -111,4 +131,5 @@ spec:
           annotations:
             summary: Ferrum gateway ConfigSync is diverged
             description: "Data plane namespace {{ "{{ $labels.namespace }}" }} is sticky-diverged after a rejected ConfigSync delta."
+            runbook_url: {{ printf "%s#ferrumgatewayconfigsyncdiverged" $runbook | quote }}
 {{- end }}

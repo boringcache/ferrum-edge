@@ -4750,6 +4750,39 @@ impl MetricsRegistry {
                 &ns_label,
             );
 
+            // Availability of the configuration source itself (issue #4528).
+            // `ferrum_database_poll_last_completed_timestamp_seconds` below
+            // advances on every normally completed poll outcome — including a
+            // handled error — because it detects poll-task death (issue
+            // #2986), so it cannot double as an outage signal. This gauge is
+            // the outage signal.
+            output.push_str(
+                "# HELP ferrum_database_config_source_connected Whether the configuration database (database mode) or the control plane's backing database (cp mode) is currently reachable and usable: 1 connected, 0 unavailable.\n",
+            );
+            output.push_str("# TYPE ferrum_database_config_source_connected gauge\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_database_config_source_connected",
+                u64::from(snapshot.config_source_connected),
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_database_poll_failures_total Database/CP config poll failures by bounded reason.\n",
+            );
+            output.push_str("# TYPE ferrum_database_poll_failures_total counter\n");
+            for reason in crate::modes::database::DATABASE_POLL_FAILURE_REASON_LABELS {
+                let count = snapshot
+                    .poll_failures_by_reason
+                    .get(reason)
+                    .copied()
+                    .unwrap_or(0);
+                output.push_str(&format!(
+                    "ferrum_database_poll_failures_total{{reason=\"{}\"{}}} {}\n",
+                    reason, ns_label, count
+                ));
+            }
+
             output.push_str(
                 "# HELP ferrum_database_poll_last_completed_timestamp_seconds Unix timestamp of the most recently completed database/CP config poll attempt (including empty success).\n",
             );

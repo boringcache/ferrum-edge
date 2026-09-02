@@ -1187,6 +1187,7 @@ fn bundled_grafana_dashboard_metric_refs_are_inventoried() {
         include_str!("../../../charts/ferrum-mesh/dashboards/gateway-overview.json"),
         include_str!("../../../charts/ferrum-mesh/dashboards/mesh-overview.json"),
         include_str!("../../../charts/ferrum-mesh/dashboards/policy-deny.json"),
+        include_str!("../../../charts/ferrum-gateway/dashboards/gateway-overview.json"),
     ];
     let mut unknown = Vec::new();
     for dash in DASHBOARDS {
@@ -1221,6 +1222,7 @@ fn bundled_classification_matches_chart_references() {
         include_str!("../../../charts/ferrum-mesh/dashboards/gateway-overview.json"),
         include_str!("../../../charts/ferrum-mesh/dashboards/mesh-overview.json"),
         include_str!("../../../charts/ferrum-mesh/dashboards/policy-deny.json"),
+        include_str!("../../../charts/ferrum-gateway/dashboards/gateway-overview.json"),
     ] {
         referenced.extend(ferrum_metric_names_in_text(dash, &contract));
     }
@@ -1418,5 +1420,96 @@ fn exposition_label_parser_rejects_ambiguous_or_truncated_samples() {
         std::panic::catch_unwind(|| split_sample_prefix(r#"ferrum_fixture{key="value"} "#))
             .is_err(),
         "sample without a value was accepted"
+    );
+}
+
+/// Issue #4528: a database outage must be visible on `/metrics`.
+///
+/// `ferrum_database_poll_last_completed_timestamp_seconds` advances on every
+/// normally completed poll tick — *including a handled error* — because it
+/// detects poll-task death (issue #2986). It therefore keeps advancing right
+/// through an outage, which is exactly why the shipped
+/// `FerrumGatewayDatabasePollStale` alert could not fire. This test pins the
+/// replacement signal: while the freshness gauge keeps advancing, the
+/// availability gauge goes to `0` and the bounded failure counter rises.
+#[test]
+fn database_outage_is_visible_on_metrics_while_poll_freshness_still_advances() {
+    use ferrum_edge::modes::database::DatabasePollFailureReason;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let registry = MetricsRegistry::new();
+    registry.configure(60, 3600, 0, 10_000, "outage-ns");
+
+    // The poll loop and `AdminState` share one `db_available` flag; the
+    // metrics struct holds the SAME Arc, so the gauge cannot drift from the
+    // admin API's view.
+    let db_available = Arc::new(AtomicBool::new(true));
+    let delta = Arc::new(DatabaseDeltaPollMetrics::with_config_source_flag(
+        db_available.clone(),
+    ));
+    registry.set_database_delta_poll_metrics(delta.clone());
+
+    // A healthy tick.
+    delta.record_poll_completed();
+    let healthy_poll_ms = delta.last_poll_completed_at_unix_ms();
+    assert!(healthy_poll_ms > 0, "first poll tick must set freshness");
+    let healthy = registry.render_uncached();
+    assert!(
+        healthy.contains("ferrum_database_config_source_connected{namespace=\"outage-ns\"} 1"),
+        "a healthy config source must report 1:\n{healthy}"
+    );
+
+    // The store goes away. Every failure path routes through the one helper
+    // that flips the shared flag and counts the failure together.
+    delta.record_config_source_unavailable(DatabasePollFailureReason::Connectivity);
+    delta.record_poll_completed();
+    delta.record_config_source_unavailable(DatabasePollFailureReason::Connectivity);
+    delta.record_poll_completed();
+
+    assert!(
+        !db_available.load(Ordering::Relaxed),
+        "the shared admin-facing flag must observe the outage"
+    );
+    assert!(
+        delta.last_poll_completed_at_unix_ms() >= healthy_poll_ms,
+        "poll freshness must keep advancing during an outage — that is the \
+         defect this metric pair exists to cover"
+    );
+
+    let outage = registry.render_uncached();
+    assert!(
+        outage.contains("ferrum_database_config_source_connected{namespace=\"outage-ns\"} 0"),
+        "an unavailable config source must report 0:\n{outage}"
+    );
+    assert!(
+        outage.contains(
+            "ferrum_database_poll_failures_total{reason=\"connectivity\",namespace=\"outage-ns\"} 2"
+        ),
+        "connectivity failures must be counted:\n{outage}"
+    );
+    // The label set is closed and always fully rendered, so a reason that has
+    // not fired is a stable zero rather than a missing series.
+    for reason in ["validation_rejected", "migration_gate"] {
+        assert!(
+            outage.contains(&format!(
+                "ferrum_database_poll_failures_total{{reason=\"{reason}\",namespace=\"outage-ns\"}} 0"
+            )),
+            "reason {reason} must render as a stable zero:\n{outage}"
+        );
+    }
+    // The freshness gauge is still present and non-zero: it did not detect the
+    // outage, which is the point.
+    assert!(
+        outage.contains(
+            "ferrum_database_poll_last_completed_timestamp_seconds{namespace=\"outage-ns\"} "
+        ),
+        "poll freshness must still be exported:\n{outage}"
+    );
+
+    let recovered = DatabaseDeltaPollMetrics::with_config_source_flag(db_available.clone());
+    db_available.store(true, Ordering::Relaxed);
+    assert!(
+        recovered.config_source_connected(),
+        "recovery on the shared flag must be observable without a metrics call site"
     );
 }

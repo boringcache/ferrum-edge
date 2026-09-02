@@ -666,6 +666,34 @@ metrics:
     # internet-facing listener, so 0 disables the alert. Set a rate that is
     # abnormal for your exposure to enable it.
     frontendTlsHandshakeErrorsPerSecond: 0
+    # How long FerrumGatewayDatabaseUnavailable must observe an unreachable
+    # configuration source before firing. Rendered verbatim as the alert's
+    # `for:` duration, so use Prometheus duration syntax ("5m", "90s").
+    databaseUnavailableFor: 5m
+    # Base URL for the per-alert `runbook_url` annotation. Every alert appends
+    # its own anchor (the GitHub heading slug of its section in
+    # docs/runbooks/gateway.md). Point this at your own fork/mirror if you
+    # maintain internal runbooks.
+    runbookBaseUrl: https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/runbooks/gateway.md
+  dashboards:
+    # When `metrics.enabled` is true, render a ConfigMap containing the bundled
+    # Grafana dashboards from `charts/ferrum-gateway/dashboards/*.json`. The
+    # ConfigMap carries the `grafana_dashboard: "1"` label that the Grafana
+    # sidecar (`kiwigrid/k8s-sidecar`) and the Grafana Operator both pick up
+    # automatically. Set to false if you manage dashboards out of band.
+    enabled: false
+    # Override the generated ConfigMap name (defaults to
+    # `<fullname>-dashboards`).
+    configMapName: ""
+    # Extra labels and annotations stamped on the dashboard ConfigMap. Useful
+    # for `grafana.com/folder`-style annotations or routing labels.
+    labels: {}
+    annotations: {}
+    # Sidecar label key/value override — only needed if your Grafana install
+    # uses a custom label (e.g. `grafana_dashboard_my-org`). The defaults are
+    # the upstream Grafana sidecar convention.
+    sidecarLabel: grafana_dashboard
+    sidecarLabelValue: "1"
 
 # Optional NetworkPolicy. Default off. When enabled, proxy and stream listener
 # ports stay reachable from any source while admin HTTP/HTTPS and CP gRPC ingress
