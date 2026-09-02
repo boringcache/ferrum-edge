@@ -2282,20 +2282,25 @@ async fn test_credentialed_host_bounded_prefix_reflects_only_that_host() {
         "true"
     );
 
-    // The suffix-extension origin the bare-host prefix used to admit.
+    // The suffix-extension origin the bare-host prefix used to admit. A
+    // disallowed origin on a simple request is the plugin's 403 rejection
+    // (the same signal the preflight tests assert), and it carries no
+    // `Access-Control-Allow-Origin`.
     let mut evil_ctx = make_cors_ctx("GET", "https://app.example.com.evil.net");
-    assert!(matches!(
-        plugin.on_request_received(&mut evil_ctx).await,
-        PluginResult::Continue
-    ));
-    let mut evil_headers = HashMap::new();
-    let _ = plugin
-        .after_proxy(&mut evil_ctx, 200, &mut evil_headers)
-        .await;
-    assert!(
-        !evil_headers.contains_key("access-control-allow-origin"),
-        "host-bounded prefix must not admit a suffix-extended origin: {evil_headers:?}"
-    );
+    match plugin.on_request_received(&mut evil_ctx).await {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 403);
+            assert!(
+                !headers.contains_key("access-control-allow-origin"),
+                "host-bounded prefix must not admit a suffix-extended origin: {headers:?}"
+            );
+        }
+        _ => panic!("expected a 403 rejection for the suffix-extended origin"),
+    }
 }
 
 #[tokio::test]
