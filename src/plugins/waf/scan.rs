@@ -268,6 +268,17 @@ impl Waf {
         } else {
             normalize::WideCharsetViews::empty()
         };
+        // A charset the WAF cannot transcode (UTF-7, ISO-2022-*, HZ-GB-2312,
+        // EBCDIC) can encode `<script>` as pure ASCII cover text, so a raw
+        // scan proves nothing about what the backend will parse. Report it
+        // through the existing encoding special so per-rule modes and
+        // overrides still apply, and keep the raw scan running as well.
+        if transcoded_views.uninspectable_charset()
+            && let Some(rule_index) = self.specials.encoding
+        {
+            let text = String::from_utf8_lossy(body);
+            self.push_special(&mut outcome, rule_index, text.as_ref(), subject);
+        }
         if transcoded_views.is_empty() || transcoded_views.include_lossy() {
             let text = String::from_utf8_lossy(body);
             self.scan_request_body_text_view(&mut outcome, text.as_ref(), subject);
