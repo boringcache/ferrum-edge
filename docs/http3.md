@@ -1432,18 +1432,42 @@ malicious or compromised H3 backend can declare an enormous HEADERS, unknown,
 CONTROL, or PUSH frame the same way a frontend client can; QUIC flow control
 does not bound accumulation on either side. Backend clients also set a distinct
 decoded response field-section ceiling to the smaller of the buffered
-non-`DATA` frame ceiling and 1 MiB − 1. The buffered-frame ceiling is twice
-the frontend request policy; the absolute cap keeps QPACK's 32-byte-per-field accounting from
-producing enough decoded fields to panic `http::HeaderMap` at its fixed
-32,768-entry limit when an operator configures a very large request limit.
-This preserves response headroom without leaving QPACK expansion or decoded
-field count effectively unbounded.
+non-`DATA` frame ceiling and the absolute field-section cap of **768,000 bytes**
+(issue #4538). The buffered-frame ceiling is twice the frontend request policy;
+the absolute cap keeps QPACK's 32-byte-per-field accounting from producing more
+decoded fields than `http::HeaderMap` can be constructed with. This preserves
+response headroom without leaving QPACK expansion or decoded field count
+effectively unbounded.
+
+### The 768,000-byte field-section cap (issue #4538)
+
+`http::HeaderMap::with_capacity(n)` is `try_with_capacity(n).expect(..)`, and
+`try_with_capacity` computes `n + n / 3`, rounds it up to the next power of two,
+and refuses once the result exceeds `MAX_SIZE = 1 << 15`. The real construction
+ceiling is therefore **24,576 entries**, not 32,768: `24_576` yields `32_768`
+(accepted) and `24_577` yields `65_536` (refused). The vendored `h3` builds every
+request and response head with `HeaderMap::with_capacity(headers.len())` on the
+raw decoded field vector, before any per-field validation and before Ferrum's own
+`431` check, so a decoded field count above 24,576 aborts the whole gateway
+process under `panic = "abort"`.
+
+QPACK bounds only the accumulated field-section size, never the field count, and
+accounts `name + value + 32` bytes per field, so the admitted field count is
+exactly `field_section_size / 32`. Both H3 field-section policies — the
+frontend request policy and the backend response policy — are therefore capped at
+`(24_576 − 576) × 32 = 768,000` bytes, which admits at most 24,000
+decoded fields. The 576-field margin covers pseudo-header expansion.
+
+The cap applies to the **frontend** policy as well as the backend one: with a
+sufficiently large `FERRUM_MAX_HEADER_SIZE_BYTES`, an unauthenticated H3 client
+could otherwise send 24,577 empty QPACK literals (~60–75 KB on the wire) and
+kill the process.
 
 | Value | Source | Effect |
 |---|---|---|
-| Frontend `SETTINGS_MAX_FIELD_SECTION_SIZE` | `FERRUM_MAX_HEADER_SIZE_BYTES`, floored at 16 KiB, clamped into the QUIC varint range | Advertised to the client, and enforced by frontend QPACK decoding. Before this the listener advertised `VarInt::MAX` (2^62-1) while enforcing the configured limit only after a complete decode. |
+| Frontend `SETTINGS_MAX_FIELD_SECTION_SIZE` | `FERRUM_MAX_HEADER_SIZE_BYTES`, floored at 16 KiB, capped at 768,000 bytes, clamped into the QUIC varint range | Advertised to the client, and enforced by frontend QPACK decoding. Before this the listener advertised `VarInt::MAX` (2^62-1) while enforcing the configured limit only after a complete decode. |
 | Buffered non-`DATA` frame ceiling | 2x the frontend field-section size | On frontend and pooled backend connections, a frame whose **declared** payload length exceeds it is refused before a single payload byte is buffered. |
-| Backend decoded response field-section ceiling | The smaller of the buffered non-`DATA` frame ceiling and 1 MiB − 1 | On pooled backend connections, QPACK decoding stops before a compact response can expand into enough fields to exceed `http::HeaderMap`'s 32,768-entry capacity (QPACK accounts 32 bytes per decoded field). |
+| Backend decoded response field-section ceiling | The smaller of the buffered non-`DATA` frame ceiling and 768,000 bytes | On pooled backend connections, QPACK decoding stops before a compact response can expand into more fields than `http::HeaderMap` can be constructed with (24,576 entries; QPACK accounts 32 bytes per decoded field). |
 
 **Failure posture.** The refusal happens as soon as the frame's type and length
 varints are decoded — before the payload is stored and before the decoder arms
@@ -1480,7 +1504,12 @@ header policy that H1/H2 backends do not share.
 varints. `EnvConfig::validate` refuses a `FERRUM_MAX_HEADER_SIZE_BYTES` whose
 derived ceiling would not fit in one, rather than silently clamping the policy
 into a bound the operator never configured (which would also make the H3
-frontend disagree with H1 and H2 about the same setting).
+frontend disagree with H1 and H2 about the same setting). For the same reason it
+also refuses a `FERRUM_MAX_HEADER_SIZE_BYTES` above **768,000** bytes: above
+that bound the advertised `SETTINGS_MAX_FIELD_SECTION_SIZE` would have to be
+capped and would no longer be the operator's policy. This is a **breaking**
+startup-validation change for anyone who had configured a header policy above
+768,000 bytes.
 
 This bound lives in the vendored `h3` crate; see
 [`docs/upstream-h3-patches/005-max-buffered-frame-len/`](upstream-h3-patches/005-max-buffered-frame-len/README.md)
