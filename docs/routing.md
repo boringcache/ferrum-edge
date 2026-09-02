@@ -130,6 +130,7 @@ proxies:
 Behavior:
 
 - Every request whose Host header matches `api.example.com` routes to `api-backend:8080`, regardless of path.
+- An HTTP/1.1 **absolute-form** request-target (`GET http://host/path HTTP/1.1`) whose authority disagrees with the `Host` field is rejected with **400** before routing, matching the HTTP/2 / HTTP/3 `Host`/`:authority` agreement rule. RFC 9112 §3.2.1 has a recipient route on the request-target authority and ignore `Host`, while Ferrum routes on `Host`, so a disagreeing pair would let an upstream hop authorize one host tier while Ferrum selects another. Absolute-form *without* a `Host` field is still accepted and routes on the target authority; HTTP/1.0 is unaffected (RFC 9112 §3.2.2 does not require `Host` on 1.0).
 - Request path is forwarded **unchanged** (there is no prefix to strip). `strip_listen_path: true` is a silent no-op.
 - `backend_path`, if set, still prepends to the forwarded path.
 - Host-only is the **last** tier within a host group — any exact path or regex match wins first. This lets you pin `/api/v2/*` to one backend and everything else on the same host to a different backend:

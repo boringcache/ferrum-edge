@@ -17,6 +17,8 @@
 //! - HTTP/2 Extended CONNECT (`:protocol=websocket`) with `:authority` still proceeds
 //! - HTTP/1.0 missing `Host` is still served
 //! - HTTP/1.1 absolute-form request-target without a Host field is still served
+//! - HTTP/1.1 absolute-form request-target whose authority disagrees with the
+//!   `Host` field is rejected with 400 (RFC 9112 §3.2.1); an agreeing pair still routes
 //! - `Host` trailing-dot normalization
 //! - `FERRUM_MAX_HEADER_SIZE_BYTES` total-header rejection on H1
 //! - Configured request header count limits and `0` disable semantics
@@ -1127,6 +1129,52 @@ async fn functional_protocol_validation_http11_absolute_form_without_host_not_re
     assert_eq!(
         resp.status_code, 200,
         "absolute-form without Host must still route; body={}",
+        resp.body
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http11_absolute_form_conflicting_host_rejected() {
+    // RFC 9112 §3.2.1 has a recipient route on the absolute-form authority
+    // and ignore Host; Ferrum routes on Host. A disagreeing pair therefore
+    // lets an upstream hop authorize `example.com` while Ferrum selects the
+    // `evil.example` tier. Reject with 400 before routing, and never reach a
+    // backend (the echo backend answers 200 with a JSON header map, so a 400
+    // that carries the gateway's error body proves the request stopped here).
+    let h = Harness::new(true).await;
+
+    let req = b"GET http://example.com/ HTTP/1.1\r\nHost: evil.example\r\n\r\n";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+
+    assert_eq!(resp.status_code, 400, "body={}", resp.body);
+    assert!(
+        resp.body.contains("authority disagree"),
+        "unexpected body: {}",
+        resp.body
+    );
+    assert!(
+        !resp.body.contains("x-forwarded-for"),
+        "request must not have reached the echo backend: {}",
+        resp.body
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http11_absolute_form_matching_host_still_routes() {
+    let h = Harness::new(true).await;
+
+    let req = b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+
+    assert_eq!(
+        resp.status_code, 200,
+        "absolute-form with an agreeing Host must still route; body={}",
         resp.body
     );
 

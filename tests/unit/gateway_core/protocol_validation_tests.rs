@@ -319,6 +319,96 @@ fn http11_absolute_form_does_not_override_empty_host() {
     assert!(result.unwrap().contains("invalid empty value"));
 }
 
+// --- HTTP/1.1 absolute-form authority vs Host (RFC 9112 §3.2.1) ---
+
+#[test]
+fn http11_rejects_absolute_form_authority_disagreeing_with_host() {
+    // A compliant recipient routes on the absolute-form authority and ignores
+    // Host; Ferrum routes on Host. Rather than let the two hops disagree about
+    // which authority the request is for, reject the pair.
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("internal.svc"));
+    let uri: hyper::Uri = "http://public.example/x".parse().unwrap();
+    let result = check_protocol_headers(&headers, hyper::Version::HTTP_11, &uri);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("authority disagree"));
+}
+
+#[test]
+fn http11_accepts_absolute_form_authority_matching_host() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("public.example"));
+    let uri: hyper::Uri = "http://public.example/x".parse().unwrap();
+    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_11, &uri).is_none());
+}
+
+#[test]
+fn http11_accepts_absolute_form_host_with_explicit_default_port() {
+    // Scheme-default-port normalization must absorb the explicit `:80`.
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("a.example:80"));
+    let uri: hyper::Uri = "http://a.example/".parse().unwrap();
+    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_11, &uri).is_none());
+}
+
+#[test]
+fn http11_accepts_absolute_form_host_after_case_and_trailing_dot_normalization() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("A.EXAMPLE.:8080"));
+    let uri: hyper::Uri = "http://a.example:8080/".parse().unwrap();
+    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_11, &uri).is_none());
+}
+
+#[test]
+fn http11_rejects_absolute_form_non_default_port_mismatch() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("a.example:8080"));
+    let uri: hyper::Uri = "http://a.example/".parse().unwrap();
+    let result = check_protocol_headers(&headers, hyper::Version::HTTP_11, &uri);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("authority disagree"));
+}
+
+#[test]
+fn http11_accepts_absolute_form_bracketed_ipv6_on_both_sides() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("[2001:db8::1]:443"));
+    let uri: hyper::Uri = "https://[2001:db8::1]/".parse().unwrap();
+    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_11, &uri).is_none());
+}
+
+#[test]
+fn http11_rejects_absolute_form_with_unparseable_host_authority() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("a.example:notaport"));
+    let uri: hyper::Uri = "http://a.example/".parse().unwrap();
+    let result = check_protocol_headers(&headers, hyper::Version::HTTP_11, &uri);
+    assert!(result.is_some());
+    assert!(
+        result
+            .unwrap()
+            .contains("Host header contains invalid authority")
+    );
+}
+
+#[test]
+fn http11_origin_form_with_host_is_unaffected_by_the_authority_comparison() {
+    // No URI authority: nothing to compare, and the Host is not re-validated.
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("a.example"));
+    assert!(check_protocol(&headers, hyper::Version::HTTP_11).is_none());
+}
+
+#[test]
+fn http10_absolute_form_authority_mismatch_is_out_of_scope() {
+    // RFC 9112 §3.2.2 does not require a Host field on HTTP/1.0; the
+    // disagreement rule is HTTP/1.1-only and 1.0 stays unchanged.
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("internal.svc"));
+    let uri: hyper::Uri = "http://public.example/x".parse().unwrap();
+    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_10, &uri).is_none());
+}
+
 // --- TE header validation (HTTP/2) ---
 
 #[test]
