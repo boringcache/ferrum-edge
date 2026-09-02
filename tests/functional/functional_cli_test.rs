@@ -1909,6 +1909,107 @@ async fn functional_cli_reload_sends_sighup() {
     let _ = child.wait();
 }
 
+/// A `database`-mode gateway must SURVIVE SIGHUP (issue #4548).
+///
+/// `ferrum-edge reload` resolves its target with `pgrep -x ferrum-edge`, which
+/// cannot distinguish a file-mode gateway from a database-mode one. Before the
+/// process-wide hangup stream in `main.rs`, SIGHUP kept its POSIX default
+/// disposition in every mode without its own handler and terminated the
+/// gateway with no drain — no `OverloadState.draining`, no `Connection:
+/// close`, no `FERRUM_SHUTDOWN_DRAIN_SECONDS` wait. Driven through the real
+/// binary because the defect only exists once signal registration and mode
+/// dispatch are both wired together.
+#[cfg(unix)]
+#[ignore]
+#[tokio::test]
+async fn functional_cli_sighup_does_not_kill_a_database_mode_gateway() {
+    const MAX_ATTEMPTS: u32 = 3;
+    let binary = binary_abs_path();
+
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        // Fresh temp dir (and therefore a fresh SQLite file) per attempt so a
+        // failed try cannot contaminate the next one.
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let (proxy_reservation, admin_reservation) =
+            reserve_port_pair().await.expect("reserve gateway ports");
+        let proxy_port = proxy_reservation.drop_and_take_port();
+        let admin_port = admin_reservation.drop_and_take_port();
+
+        let db_url = format!(
+            "sqlite:{}?mode=rwc",
+            temp_dir.path().join("sighup.db").to_string_lossy()
+        );
+
+        let mut cmd = Command::new(&binary);
+        cmd.arg("run")
+            .env("FERRUM_MODE", "database")
+            .env("FERRUM_DB_TYPE", "sqlite")
+            .env("FERRUM_DB_URL", &db_url)
+            .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
+            .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
+            .env("FERRUM_LOG_LEVEL", "warn")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let identity = crate::common::SpawnedGatewayIdentity::mint("cli-sighup-db");
+        identity.apply_to_command(&mut cmd);
+        let mut child = cmd.spawn().expect("Failed to spawn ferrum-edge");
+
+        if !wait_for_owned_health(&mut child, admin_port, &identity).await {
+            last_err = format!(
+                "attempt {}/{}: database-mode gateway never became healthy on admin port {}",
+                attempt, MAX_ATTEMPTS, admin_port
+            );
+            eprintln!("{}", last_err);
+            kill_child(child);
+            if attempt < MAX_ATTEMPTS {
+                sleep(Duration::from_secs(1)).await;
+            }
+            continue;
+        }
+
+        let pid = child.id();
+        let sent = std::process::Command::new("kill")
+            .args(["-HUP", &pid.to_string()])
+            .status()
+            .expect("failed to run kill -HUP");
+        assert!(sent.success(), "kill -HUP {} failed", pid);
+
+        // Give the default disposition time to take effect if it were still in
+        // place: an unhandled SIGHUP kills the process immediately.
+        sleep(Duration::from_millis(750)).await;
+
+        let exited = child.try_wait().expect("try_wait");
+        assert!(
+            exited.is_none(),
+            "database-mode gateway terminated on SIGHUP (status {:?}); the process-wide \
+             hangup stream must make it a logged no-op",
+            exited
+        );
+
+        // Still serving: `/live` is the always-unauthenticated liveness surface.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let live = client
+            .get(format!("http://127.0.0.1:{}/live", admin_port))
+            .send()
+            .await;
+        let status = live.as_ref().map(|r| r.status().as_u16());
+        kill_child(child);
+        assert_eq!(
+            status.ok(),
+            Some(200),
+            "/live must still answer 200 after SIGHUP: {:?}",
+            live.err()
+        );
+        return;
+    }
+    panic!("database-mode SIGHUP survival test never got a healthy gateway: {last_err}");
+}
+
 // ── smart path defaults ─────────────────────────────────────────────────────
 
 /// Smart-path discovery: with no `--settings`/`--spec` flags and no env vars
