@@ -813,6 +813,10 @@ This separation means you can configure the breaker to trip on connection errors
 
 Breakers are cached per `proxy_id` (direct backend) or `proxy_id::host:port` (upstream/target). Concurrent callers for the same key and config share one breaker instance. When the cache is at capacity, requests for **new** keys still proceed with a transient (uncached) breaker that does not retain state across requests and does not grow the map; entries already in the cache remain replaceable when their config changes.
 
+Entries are reclaimed on config reload **and** on every service-discovery publication: when a discovery provider retires a target, the breakers for that target are released for every proxy routing to the discovered upstream, in the same pass that reclaims its health-check state. Pod/endpoint churn therefore no longer accumulates dead entries between config changes.
+
+A transient breaker never accumulates failures, so it can never open. `ferrum_circuit_breaker_cache_admission_refused_total` (see `docs/prometheus_metrics.md`) counts every request that was handed one; a non-zero and rising value means circuit breaking is silently degraded for newly seen keys and `FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES` should be raised.
+
 ## Configuration Reference
 
 ### Complete YAML Example

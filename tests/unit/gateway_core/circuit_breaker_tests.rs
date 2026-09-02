@@ -2459,3 +2459,130 @@ async fn apply_incremental_preserves_live_breaker_state_for_all_target_kinds() {
         "retired upstream IPs must still be reclaimed on a config delta"
     );
 }
+
+fn sd_target(host: &str, port: u16) -> UpstreamTarget {
+    serde_json::from_value(serde_json::json!({ "host": host, "port": port }))
+        .expect("upstream target fixture")
+}
+
+/// Issue #4516 regression guard, and the #4159 over-prune guard in one test:
+/// a scoped prune reclaims only the named proxy's retired targets, and leaves
+/// every other proxy — including a proxy in another namespace that shares the
+/// exact same `host:port` — untouched.
+#[test]
+fn scoped_target_prune_reclaims_only_the_named_proxys_retired_targets() {
+    let cache = CircuitBreakerCache::new();
+    let config = default_config();
+
+    // Same target host:port in two namespaces, plus a second proxy in `a`.
+    cache.get_or_create("a", "proxy1", Some("10.0.0.1:8080"), &config);
+    cache.get_or_create("a", "proxy1", Some("10.0.0.2:8080"), &config);
+    cache.get_or_create("b", "proxy1", Some("10.0.0.1:8080"), &config);
+    cache.get_or_create("a", "proxy2", Some("10.0.0.1:8080"), &config);
+    // Proxy-scoped UDP/DTLS key (no "::") for the pruned proxy itself.
+    cache.get_or_create("a", "proxy1", None, &config);
+    assert_eq!(cache.len(), 5);
+
+    // `a|proxy1` now serves only 10.0.0.2:8080.
+    cache.prune_stale_targets_for_proxy("a", "proxy1", &[sd_target("10.0.0.2", 8080)]);
+
+    assert!(
+        cache.peek("a", "proxy1", Some("10.0.0.2:8080")).is_some(),
+        "a live target for the pruned proxy must survive"
+    );
+    assert!(
+        cache.peek("a", "proxy1", Some("10.0.0.1:8080")).is_none(),
+        "a retired target for the pruned proxy must be reclaimed"
+    );
+    assert!(
+        cache.peek("b", "proxy1", Some("10.0.0.1:8080")).is_some(),
+        "the same host:port in another namespace must not be pruned (#4159)"
+    );
+    assert!(
+        cache.peek("a", "proxy2", Some("10.0.0.1:8080")).is_some(),
+        "another proxy in the same namespace must not be pruned (#4159)"
+    );
+    assert!(
+        cache.peek("a", "proxy1", None).is_some(),
+        "proxy-scoped keys without '::' stay managed by prune()"
+    );
+    assert_eq!(
+        cache.len(),
+        4,
+        "exactly one admission slot must be released"
+    );
+}
+
+/// Once the cache is full, `get_or_create` hands out transient (uncached)
+/// breakers and increments the refusal counter. After a scoped prune retires
+/// the dead targets, a newly discovered live target is admitted again and its
+/// breaker is stateful across calls (issue #4516).
+#[test]
+fn ceiling_refusals_are_counted_and_a_scoped_prune_restores_admission() {
+    let cache = CircuitBreakerCache::with_max_entries(4);
+    let config = default_config();
+
+    for octet in 1..=4u8 {
+        cache.get_or_create(
+            "ferrum",
+            "proxy1",
+            Some(&target_key(&format!("10.0.0.{octet}"), 8080)),
+            &config,
+        );
+    }
+    assert_eq!(cache.len(), 4);
+    assert_eq!(cache.admission_refused_total(), 0);
+
+    // A newly discovered pod at the ceiling: refused, transient, stateless.
+    let transient = cache.get_or_create("ferrum", "proxy1", Some("10.0.0.5:8080"), &config);
+    assert_eq!(cache.admission_refused_total(), 1);
+    assert!(
+        cache
+            .peek("ferrum", "proxy1", Some("10.0.0.5:8080"))
+            .is_none(),
+        "a refused key must not be cached"
+    );
+    transient.record_failure(500, false, false);
+    transient.record_failure(500, false, false);
+    transient.record_failure(500, false, false);
+    let second_transient = cache.get_or_create("ferrum", "proxy1", Some("10.0.0.5:8080"), &config);
+    assert_eq!(cache.admission_refused_total(), 2);
+    assert_eq!(
+        second_transient.state_name(),
+        "closed",
+        "a transient breaker accumulates no failures, so it can never open"
+    );
+
+    // Service discovery retires the four dead pods and publishes the new one.
+    cache.prune_stale_targets_for_proxy("ferrum", "proxy1", &[sd_target("10.0.0.5", 8080)]);
+    assert_eq!(cache.len(), 0);
+
+    let admitted = cache.get_or_create("ferrum", "proxy1", Some("10.0.0.5:8080"), &config);
+    assert_eq!(
+        cache.admission_refused_total(),
+        2,
+        "admission after the prune must not count as a refusal"
+    );
+    assert!(
+        cache
+            .peek("ferrum", "proxy1", Some("10.0.0.5:8080"))
+            .is_some(),
+        "the live target must now receive a cached breaker"
+    );
+    let same = cache.get_or_create("ferrum", "proxy1", Some("10.0.0.5:8080"), &config);
+    assert!(
+        Arc::ptr_eq(&admitted, &same),
+        "the admitted breaker must be shared, not re-created per request"
+    );
+    admitted.record_failure(500, false, false);
+    admitted.record_failure(500, false, false);
+    admitted.record_failure(500, false, false);
+    assert_eq!(
+        cache
+            .peek("ferrum", "proxy1", Some("10.0.0.5:8080"))
+            .expect("cached breaker")
+            .state_name(),
+        "open",
+        "a cached breaker accumulates failures and opens"
+    );
+}
