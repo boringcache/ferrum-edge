@@ -149,36 +149,54 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   Source and destination are bound inside `verify_trusted_local_action.py`; the
   candidate cannot supply a digest. Retire the pair after #3910 is the trusted
   base.
-- The published x86_64 GNU producers carry an admitted generation pair each
-  (`CI_JOB_GENERATION_TRANSITIONS`): `ci.yml`'s `build-binaries` and
-  `release.yml`'s `build-release-binaries` move their ONE x86_64 GNU matrix
-  cell from a native `ubuntu-latest` `cargo build` to the digest-pinned
-  AlmaLinux 8.10 sysroot builder, and gain an ABI/oldest-baseline gate over
-  the staged, checksummed `release-assets/` files they are about to upload
-  (issue #4301). One producer, one artifact identity: the scanned bytes ARE
-  the published bytes, so `create-release`, the `.sha256` sidecars, the
-  `latest` prerelease, and the container image inputs cannot describe a
-  binary that was never verified. The digest withholding is backed by an
-  absolute check, `linux_gnu_producer_contract_errors`, which binds as soon
-  as the repository references
-  `.github/scripts/build_linux_gnu_sysroot.sh` and rejects a producer that
-  native-compiles x86_64 GNU, scans a `target/x86_64-unknown-linux-gnu/...`
-  rebuild, gates after the upload, or shares the canonical artifact name with
-  a second uploader. Reverting either producer to its native text is refused
-  outright. The ARM64 Cross producer, its command/environment/image freeze,
-  and every publication `needs` graph are untouched; ARM64 is scanned as
-  published by `verify-linux-gnu-abi-aarch64` /
-  `verify-latest-linux-gnu-abi-aarch64` and joined by the existing retraction
-  gates, which is the only shape available while both its producer and its
-  consumers are frozen. Retire both pairs once they are on `main`. See
-  `docs/ci_cd.md` → "Admitted CI job SHA-256 generation transitions".
+- The published x86_64 GNU producers — `ci.yml`'s `build-binaries` and
+  `release.yml`'s `build-release-binaries` — build their ONE x86_64 GNU matrix
+  cell in the digest-pinned AlmaLinux 8.10 sysroot rather than natively on a
+  moving `ubuntu-latest`, and gate the staged, checksummed `release-assets/`
+  files on an ABI/oldest-baseline scan before uploading them (issue #4301).
+  One producer, one artifact identity: the scanned bytes ARE the published
+  bytes, so `create-release`, the `.sha256` sidecars, the `latest` prerelease,
+  and the container image inputs cannot describe a binary that was never
+  verified. Their #4301 `CI_JOB_GENERATION_TRANSITIONS` pairs are RETIRED
+  (both destinations are on `main`, and issue #4423 moved both jobs again
+  direct-to-`main`); the standing control is the absolute check
+  `linux_gnu_producer_contract_errors`, which binds as soon as the repository
+  references `.github/scripts/build_linux_gnu_sysroot.sh` and rejects a
+  producer that native-compiles x86_64 GNU, scans a
+  `target/x86_64-unknown-linux-gnu/...` rebuild, gates after the upload,
+  shares the canonical artifact name with a second uploader, omits the
+  job-level identity pins, or checks out with `persist-credentials` left on.
+  The ARM64 Cross producer, its command/environment/image freeze, and every
+  publication `needs` graph are untouched; ARM64 is scanned as published by
+  `verify-linux-gnu-abi-aarch64` / `verify-latest-linux-gnu-abi-aarch64` and
+  joined by the existing retraction gates, which is the only shape available
+  while both its producer and its consumers are frozen. See `docs/ci_cd.md` →
+  "Published x86_64 GNU producer contract (standing)".
+- The GNU sysroot BUILD IMAGE and the protoc archive are pinned by IDENTITY,
+  not just by form (issue #4423). `.github/linux-gnu-abi.toml` is
+  PR-editable and `verify_linux_gnu_abi.py` runs from the pull request's own
+  checkout, so the TOML cannot be the control. Both producer jobs pin
+  `LINUX_GNU_SYSROOT_IMAGE`, `LINUX_GNU_PROTOC_SHA256`,
+  `LINUX_GNU_SMOKE_FLOOR_IMAGE`, and `LINUX_GNU_SMOKE_UBUNTU2204_IMAGE` in
+  their job-level `env:` — the shell scripts refuse to run when those
+  disagree with the TOML — and `verify_cross_build_policy.py` hardcodes the
+  expected image references, the protoc digest, and the required
+  `https://github.com/protocolbuffers/protobuf/releases/download/` URL
+  prefix. `linux_gnu_producer_contract_errors` holds the `env:` literals to
+  those constants absolutely, and `linux_gnu_contract_pin_errors` re-validates
+  the TOML from the trusted base checkout (`--linux-gnu-contract`, whose
+  default is deliberately not supplied by `cross-build-policy.yml`). A
+  deliberate image or protoc bump therefore moves the constants, both `env:`
+  blocks, and the TOML in one direct-to-`main` commit. See `docs/ci_cd.md` →
+  "GNU sysroot identity pins".
 - Cross-sensitive `ci.yml` jobs `ci-plan`, `test`, and `performance-regression`
   carry temporary SHA-256 generation pairs (`CI_JOB_GENERATION_TRANSITIONS`)
   for PRs #3913 and #3911, the three per-suite live gates (`ebpf-live`,
   `netns-capture-live`, `two-cluster-mesh-live`) carry pairs for PR #3915's
   planner-gate split (adopted digests pinned against #3915's latest-main merge
-  `d95ea4796`). PR #3916's `build-binaries` pair is retired; that job's pair is
-  now the issue #4301 one above. `setup-rust-ci/action.yml` carries a two-step
+  `d95ea4796`). The `build-binaries` / `build-release-binaries` pairs (PRs
+  #3916 and #4355) are all retired; those two jobs carry no transition pair.
+  `setup-rust-ci/action.yml` carries a two-step
   trusted-base chain (`LOCAL_ACTION_GENERATION_TRANSITIONS`): #3889's landed
   `fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda` moving to
   the cache-budget generation

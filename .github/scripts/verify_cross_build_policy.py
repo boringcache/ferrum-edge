@@ -12704,29 +12704,13 @@ CI_JOB_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
     # between two states main is not in and only widened what a pull request
     # could claim.
     #
-    # The two published x86_64 GNU producers on the trusted base → PR #4355
-    # (issue #4301). The moving `ubuntu-latest` image defined the runtime
-    # floor of every published generic Linux x86_64 binary, so the ONE cell
-    # that produces `binary-x86_64-unknown-linux-gnu` /
-    # `release-binaries-x86_64-unknown-linux-gnu` moves from a native
-    # `cargo build` to the digest-pinned AlmaLinux 8.10 sysroot builder and
-    # gains an ABI/oldest-baseline gate over the staged, checksummed assets it
-    # is about to upload. No other matrix cell, no `needs` edge, no artifact
-    # name, and no publishing job changes. The destination is additionally
-    # held to `linux_gnu_producer_contract_errors`, so the withheld surface
-    # cannot be spent on a producer that native-compiles x86_64 GNU or scans a
-    # separately rebuilt binary; the reverse pair is refused outright, which
-    # is what makes the move to the pinned sysroot one-way.
-    (
-        "build-binaries",
-        "14b0890e2693cd0825fcf25ba7f48810b5ae9a33f2cbb5751bdaaf60186b83b1",
-        "6561ef8614337be946f0a68d8f1f3ef94c2897c5acd266157c15b4d90fdc3240",
-    ),
-    (
-        "build-release-binaries",
-        "678699fb04a2319c5b7b706c8fdf05f0d4b58a30d07e023091499d27a88bbb9f",
-        "55489ade23f4e15fe047bca88fc18b4a1bd9e000605e99263715df630434b591",
-    ),
+    # PR #4355's `build-binaries` / `build-release-binaries` pairs (issue
+    # #4301) are retired too: both destinations landed on `main`, and issue
+    # #4423 has since moved both jobs again on `main` directly, so neither
+    # end of either pair is a state `main` is in. Keeping them would only
+    # widen what a pull request may claim. Both producers are now held to
+    # `main`'s own text by the ordinary surface comparison, and to
+    # `linux_gnu_producer_contract_errors` absolutely.
 )
 
 # ---------------------------------------------------------------------------
@@ -17472,6 +17456,153 @@ LINUX_GNU_NON_PUBLISHING_EVENTS = (
     "github.event_name == 'merge_group'",
 )
 
+# ---------------------------------------------------------------------------
+# GNU sysroot identity pins (issue #4423, follow-up to #4301)
+# ---------------------------------------------------------------------------
+# `.github/linux-gnu-abi.toml` names the container image that compiles the
+# published x86_64 GNU binaries and the protoc archive that image executes as
+# `build.rs`'s code generator. That file is PR-editable and the ABI scanner
+# that reads it runs from the pull request's own checkout, so before this
+# contract the only constraint on the image reference was that SOME digest was
+# present and the only constraint on `protoc_url` was that its archive hashed
+# to a 64-character hex string the same pull request supplied. A merged change
+# to `image = "ghcr.io/<attacker>/almalinux@sha256:..."` produced the released
+# `ferrum-edge-linux-x86_64` / `ferrum-cni-linux-x86_64` bytes with every gate
+# green.
+#
+# The identity therefore lives here, in the trusted base, in two places that
+# must agree:
+#
+#   1. Each producer job pins the values into its own `env:`, which
+#      `build_linux_gnu_sysroot.sh` and `smoke_linux_gnu_baseline.sh` refuse to
+#      contradict. Those literals are held to the constants below by
+#      `linux_gnu_producer_contract_errors`, which is an ABSOLUTE check on the
+#      proposed workflow — so a pull request that moves the TOML digest and the
+#      matching `env:` pin together is refused on the `env:` half.
+#   2. `linux_gnu_contract_pin_errors` re-validates the contract file itself
+#      from the trusted base checkout, so a digest, registry, repository, or
+#      protoc host that reaches `main` by any route turns this required check
+#      red for every subsequent pull request instead of silently publishing.
+#
+# A deliberate image or protoc bump is consequently a direct-to-`main`
+# predecessor: the constants here, the two producer `env:` blocks, and the
+# TOML all move in one commit.
+LINUX_GNU_ABI_CONTRACT = ".github/linux-gnu-abi.toml"
+# Docker Hub official `almalinux`, by digest. The reference is unqualified, so
+# an equality comparison against it also refuses a registry host prefix
+# (`ghcr.io/...`) and a different repository under the same name.
+LINUX_GNU_SYSROOT_IMAGE_REPOSITORY = "almalinux"
+LINUX_GNU_SYSROOT_IMAGE_DIGEST = (
+    "sha256:4a87d2615a770506e204c27d6248ac97f4df67f4e41e2e9c47c81f0ed0be98cb"
+)
+LINUX_GNU_SYSROOT_IMAGE_PIN = (
+    f"{LINUX_GNU_SYSROOT_IMAGE_REPOSITORY}@{LINUX_GNU_SYSROOT_IMAGE_DIGEST}"
+)
+LINUX_GNU_SMOKE_FLOOR_IMAGE_PIN = (
+    "almalinux@sha256:"
+    "1c718a4cd7bab3bdb069ddbbd1eb593a390e6932d51d0048a2f6556303bafba7"
+)
+LINUX_GNU_SMOKE_UBUNTU2204_IMAGE_PIN = (
+    "ubuntu@sha256:"
+    "2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc"
+)
+LINUX_GNU_PROTOC_SHA256_PIN = (
+    "ed8fca87a11c888fed329d6a59c34c7d436165f662a2c875246ddb1ac2b6dd50"
+)
+# The protoc archive is fetched by URL and verified against the digest above,
+# so the host is not a confidentiality boundary — but an unconstrained host is
+# still an unnecessary fetch dependency on the publishing path, and the digest
+# alone cannot say which project's release the pin claims to be. Constrain the
+# release prefix and leave the version free: a version bump moves
+# `LINUX_GNU_PROTOC_SHA256_PIN` here anyway.
+LINUX_GNU_PROTOC_URL_PREFIX = (
+    "https://github.com/protocolbuffers/protobuf/releases/download/"
+)
+# `(TOML key, producer job env var, pinned value)`. Every entry is cross-checked
+# by the shell script that consumes it, so a producer that pins the value and a
+# contract file that disagrees fails the build rather than the publication.
+LINUX_GNU_IDENTITY_PINS: tuple[tuple[str, str, str], ...] = (
+    ("image", "LINUX_GNU_SYSROOT_IMAGE", LINUX_GNU_SYSROOT_IMAGE_PIN),
+    ("protoc_sha256", "LINUX_GNU_PROTOC_SHA256", LINUX_GNU_PROTOC_SHA256_PIN),
+)
+# Smoke images run the PUBLISHED binary to prove the oldest advertised runtime
+# still starts it, so a substituted smoke image is a gate that always agrees.
+# They live in `[smoke.*]` tables rather than `[sysroot]`.
+LINUX_GNU_SMOKE_PINS: tuple[tuple[str, str, str], ...] = (
+    (
+        "smoke.floor",
+        "LINUX_GNU_SMOKE_FLOOR_IMAGE",
+        LINUX_GNU_SMOKE_FLOOR_IMAGE_PIN,
+    ),
+    (
+        "smoke.ubuntu2204",
+        "LINUX_GNU_SMOKE_UBUNTU2204_IMAGE",
+        LINUX_GNU_SMOKE_UBUNTU2204_IMAGE_PIN,
+    ),
+)
+LINUX_GNU_CHECKOUT_ACTION = re.compile(r"uses:\s*actions/checkout@", re.IGNORECASE)
+LINUX_GNU_PERSIST_CREDENTIALS = "persist-credentials: false"
+
+
+def linux_gnu_contract_pin_errors(contents: str, source: str) -> list[str]:
+    """Hold `.github/linux-gnu-abi.toml` to the trusted identity constants.
+
+    Read from the trusted base checkout, never from the pull request's tree:
+    the point is that the contract file is not self-certifying. `source` is the
+    reported path so the self-test can drive fixtures.
+    """
+
+    parsed, failures = parse_toml(contents, source)
+    if failures:
+        return failures
+
+    errors: list[str] = []
+    if not isinstance(parsed, dict):
+        return [f"{source} must be a TOML table"]
+
+    sysroot = parsed.get("sysroot")
+    if not isinstance(sysroot, dict):
+        return [f"{source} must declare a [sysroot] table"]
+
+    image = sysroot.get("image")
+    if image != LINUX_GNU_SYSROOT_IMAGE_PIN:
+        errors.append(
+            f"{source} [sysroot] image must be the trusted pinned build image "
+            f"{LINUX_GNU_SYSROOT_IMAGE_PIN!r} (repository "
+            f"{LINUX_GNU_SYSROOT_IMAGE_REPOSITORY!r}, digest "
+            f"{LINUX_GNU_SYSROOT_IMAGE_DIGEST!r}); got {image!r}"
+        )
+
+    protoc_sha256 = sysroot.get("protoc_sha256")
+    if protoc_sha256 != LINUX_GNU_PROTOC_SHA256_PIN:
+        errors.append(
+            f"{source} [sysroot] protoc_sha256 must be the trusted pinned "
+            f"digest {LINUX_GNU_PROTOC_SHA256_PIN!r}; got {protoc_sha256!r}"
+        )
+
+    protoc_url = sysroot.get("protoc_url")
+    if not isinstance(protoc_url, str) or not protoc_url.startswith(
+        LINUX_GNU_PROTOC_URL_PREFIX
+    ):
+        errors.append(
+            f"{source} [sysroot] protoc_url must start with "
+            f"{LINUX_GNU_PROTOC_URL_PREFIX!r}; got {protoc_url!r}"
+        )
+
+    for table_path, _, pinned in LINUX_GNU_SMOKE_PINS:
+        table: Any = parsed
+        for segment in table_path.split("."):
+            table = table.get(segment) if isinstance(table, dict) else None
+        if not isinstance(table, dict):
+            errors.append(f"{source} must declare a [{table_path}] table")
+            continue
+        if table.get("image") != pinned:
+            errors.append(
+                f"{source} [{table_path}] image must be the trusted pinned "
+                f"baseline image {pinned!r}; got {table.get('image')!r}"
+            )
+    return errors
+
 
 def workflow_job_steps(
     contents: str,
@@ -17545,6 +17676,49 @@ def linux_gnu_producer_contract_errors(
         return failures
 
     errors: list[str] = []
+
+    # The identity pins live in the producer's own `env:`, where the shell
+    # scripts cross-check them against `.github/linux-gnu-abi.toml` and refuse
+    # to run on a mismatch. Holding the literals to the trusted constants here
+    # is what makes the pair a control rather than a restatement: a pull
+    # request cannot move the contract file and its matching `env:` pin
+    # together, because this half is validated absolutely against the trusted
+    # base's constants rather than compared to the pull request's own baseline.
+    job_env_block, env_failures = extract_job_field_block(
+        contents,
+        label,
+        job_name,
+        "env",
+        required=True,
+    )
+    if env_failures:
+        errors.extend(env_failures)
+    else:
+        assert job_env_block is not None
+        for _, variable, pinned in (*LINUX_GNU_IDENTITY_PINS, *LINUX_GNU_SMOKE_PINS):
+            if f"\n      {variable}: {pinned}\n" not in job_env_block:
+                errors.append(
+                    f"{label} job {job_name!r} must pin {variable} to the "
+                    f"trusted identity {pinned!r} in its job-level env"
+                )
+
+    # The producer bind-mounts the whole workspace read-write into a root
+    # container that installs packages and runs every dependency's `build.rs`,
+    # so the checkout must not leave the job's credential in `.git/config`.
+    checkout_steps = [
+        (name, step_text)
+        for name, step_text in steps
+        if LINUX_GNU_CHECKOUT_ACTION.search(step_text) is not None
+    ]
+    if not checkout_steps:
+        errors.append(f"{label} job {job_name!r} must check the repository out")
+    for name, step_text in checkout_steps:
+        if LINUX_GNU_PERSIST_CREDENTIALS not in step_text:
+            errors.append(
+                f"{label} job {job_name!r} checkout step {name!r} must set "
+                f"{LINUX_GNU_PERSIST_CREDENTIALS!r}"
+            )
+
     sysroot_steps = [
         (index, name, text)
         for index, (name, text) in enumerate(steps)
@@ -29725,11 +29899,28 @@ pre_build = []
         "          name: binary-${{ matrix.target }}\n"
         "          path: release-assets/\n"
     )
+    gnu_env_block = (
+        "    env:\n"
+        f"      LINUX_GNU_SYSROOT_IMAGE: {LINUX_GNU_SYSROOT_IMAGE_PIN}\n"
+        f"      LINUX_GNU_SMOKE_FLOOR_IMAGE: {LINUX_GNU_SMOKE_FLOOR_IMAGE_PIN}\n"
+        "      LINUX_GNU_SMOKE_UBUNTU2204_IMAGE: "
+        f"{LINUX_GNU_SMOKE_UBUNTU2204_IMAGE_PIN}\n"
+        f"      LINUX_GNU_PROTOC_SHA256: {LINUX_GNU_PROTOC_SHA256_PIN}\n"
+    )
+    gnu_checkout_step = (
+        "      - uses: actions/checkout"
+        "@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6\n"
+        "        with:\n"
+        "          persist-credentials: false\n"
+    )
     gnu_adopted = (
         "jobs:\n"
         "  build-binaries:\n"
         "    name: Build\n"
-        "    steps:\n"
+        + gnu_env_block
+        + "    steps:\n"
+        + gnu_checkout_step
+        + "\n"
         "      - name: Build PR verification binary\n"
         "        if: github.event_name == 'pull_request'\n"
         "        run: cargo build --profile pr-build --target ${{ matrix.target }}\n"
@@ -29798,6 +29989,28 @@ pre_build = []
             "      - name: Verify published x86_64 GNU ABI floor\n"
             "        if: always()\n",
         ),
+        # Issue #4423: the identity pins and the credential-free checkout.
+        "no identity pins at all": (gnu_env_block, ""),
+        "substituted sysroot image pin": (
+            f"      LINUX_GNU_SYSROOT_IMAGE: {LINUX_GNU_SYSROOT_IMAGE_PIN}\n",
+            "      LINUX_GNU_SYSROOT_IMAGE: ghcr.io/attacker/almalinux@sha256:"
+            "0000000000000000000000000000000000000000000000000000000000000000\n",
+        ),
+        "dropped protoc digest pin": (
+            f"      LINUX_GNU_PROTOC_SHA256: {LINUX_GNU_PROTOC_SHA256_PIN}\n",
+            "",
+        ),
+        "substituted baseline smoke image pin": (
+            f"      LINUX_GNU_SMOKE_FLOOR_IMAGE: {LINUX_GNU_SMOKE_FLOOR_IMAGE_PIN}\n",
+            "      LINUX_GNU_SMOKE_FLOOR_IMAGE: almalinux@sha256:"
+            "1111111111111111111111111111111111111111111111111111111111111111\n",
+        ),
+        "credential-persisting checkout": (
+            gnu_checkout_step,
+            "      - uses: actions/checkout"
+            "@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6\n",
+        ),
+        "no checkout at all": (gnu_checkout_step + "\n", ""),
     }
     for tamper_name, (original, replacement) in gnu_tampering.items():
         tampered = gnu_adopted.replace(original, replacement)
@@ -29813,6 +30026,75 @@ pre_build = []
             producers=gnu_producers,
         ):
             failures.append(f"a GNU producer with {tamper_name} was not rejected")
+
+    # ------------------------------------------------------------------
+    # GNU sysroot identity contract (issue #4423)
+    # ------------------------------------------------------------------
+    gnu_contract = (
+        "glibc_max_version = \"2.34\"\n"
+        "\n"
+        "[sysroot]\n"
+        f"image = \"{LINUX_GNU_SYSROOT_IMAGE_PIN}\"\n"
+        "platform = \"linux/amd64\"\n"
+        f"protoc_url = \"{LINUX_GNU_PROTOC_URL_PREFIX}v25.1/"
+        "protoc-25.1-linux-x86_64.zip\"\n"
+        f"protoc_sha256 = \"{LINUX_GNU_PROTOC_SHA256_PIN}\"\n"
+        "\n"
+        "[smoke.floor]\n"
+        f"image = \"{LINUX_GNU_SMOKE_FLOOR_IMAGE_PIN}\"\n"
+        "\n"
+        "[smoke.ubuntu2204]\n"
+        f"image = \"{LINUX_GNU_SMOKE_UBUNTU2204_IMAGE_PIN}\"\n"
+    )
+    if linux_gnu_contract_pin_errors(gnu_contract, "self-test/linux-gnu-abi.toml"):
+        failures.append("the trusted GNU sysroot identity contract was rejected")
+
+    gnu_contract_tampering = {
+        # A digest swap under the same repository: present, 64 hex, unpinned
+        # before this contract existed.
+        "substituted build-image digest": (
+            LINUX_GNU_SYSROOT_IMAGE_DIGEST,
+            "sha256:"
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        ),
+        "substituted build-image registry": (
+            f"image = \"{LINUX_GNU_SYSROOT_IMAGE_PIN}\"",
+            f"image = \"ghcr.io/attacker/{LINUX_GNU_SYSROOT_IMAGE_PIN}\"",
+        ),
+        "substituted build-image repository": (
+            f"image = \"{LINUX_GNU_SYSROOT_IMAGE_PIN}\"",
+            "image = \"attacker-almalinux@"
+            f"{LINUX_GNU_SYSROOT_IMAGE_DIGEST}\"",
+        ),
+        "substituted protoc host": (
+            LINUX_GNU_PROTOC_URL_PREFIX,
+            "https://protobuf.example.invalid/releases/download/",
+        ),
+        "substituted protoc digest": (
+            f"protoc_sha256 = \"{LINUX_GNU_PROTOC_SHA256_PIN}\"",
+            "protoc_sha256 = \"" + "0" * 64 + "\"",
+        ),
+        "substituted baseline smoke image": (
+            LINUX_GNU_SMOKE_FLOOR_IMAGE_PIN,
+            "almalinux@sha256:"
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        ),
+        "deleted sysroot table": ("[sysroot]", "[unused]"),
+    }
+    for tamper_name, (original, replacement) in gnu_contract_tampering.items():
+        tampered = gnu_contract.replace(original, replacement)
+        if tampered == gnu_contract:
+            failures.append(
+                f"the {tamper_name} GNU contract self-test mutation is stale"
+            )
+            continue
+        if not linux_gnu_contract_pin_errors(
+            tampered,
+            "self-test/linux-gnu-abi.toml",
+        ):
+            failures.append(
+                f"a GNU sysroot contract with a {tamper_name} was not rejected"
+            )
 
     return failures
 
@@ -30085,6 +30367,15 @@ def main() -> int:
         type=Path,
         default=Path(".github/workflows/cross-build-policy.yml"),
     )
+    # Deliberately NOT supplied by `cross-build-policy.yml`: the default
+    # resolves inside that job's checkout, which is the pinned trusted base.
+    # Reading the pull request's copy would ask the contract file to certify
+    # itself, which is the defect issue #4423 closes.
+    parser.add_argument(
+        "--linux-gnu-contract",
+        type=Path,
+        default=Path(LINUX_GNU_ABI_CONTRACT),
+    )
     parser.add_argument("--merge-base-ci-workflow", type=Path)
     parser.add_argument("--proposed-ci-workflow", type=Path)
     parser.add_argument("--merge-base-release-workflow", type=Path)
@@ -30136,6 +30427,7 @@ def main() -> int:
         (args.ci_workflow, *WORKFLOW_CONTRACTS[0]),
         (args.release_workflow, *WORKFLOW_CONTRACTS[1]),
     )
+    trusted_workflows: dict[str, str | None] = {}
     for (
         workflow_path,
         label,
@@ -30145,6 +30437,7 @@ def main() -> int:
         expected_trigger_hash,
     ) in workflow_inputs:
         contents, workflow_failures = load_workflow(workflow_path, label)
+        trusted_workflows[label] = contents
         failures.extend(workflow_failures)
         if not workflow_failures:
             assert contents is not None
@@ -30156,6 +30449,26 @@ def main() -> int:
                     expected_hash,
                     expected_env_hash,
                     expected_trigger_hash,
+                )
+            )
+
+    # The GNU sysroot identity contract binds once the trusted revision claims
+    # the floor, so the commit that predates adoption is unaffected and the
+    # check cannot be escaped by deleting the contract file: the producer jobs
+    # would then have to stop referencing the builder, which is a producer-job
+    # text change the surface comparison already refuses.
+    if any(
+        contents is not None and LINUX_GNU_SYSROOT_BUILDER in contents
+        for contents in trusted_workflows.values()
+    ):
+        contract_contents, contract_failures = load_text(args.linux_gnu_contract)
+        failures.extend(contract_failures)
+        if not contract_failures:
+            assert contract_contents is not None
+            failures.extend(
+                linux_gnu_contract_pin_errors(
+                    contract_contents,
+                    str(args.linux_gnu_contract),
                 )
             )
 
