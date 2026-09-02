@@ -777,7 +777,7 @@ UDP capture (`FERRUM_MESH_CAPTURE_UDP_ENABLED`, default off) is read by both the
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_MAX_HEADER_SIZE_BYTES` | No | `32768` | Maximum total request header size (all headers combined) |
+| `FERRUM_MAX_HEADER_SIZE_BYTES` | No | `32768` | Maximum total request header size (all headers combined). Also bounds the response header block backends may return: it sets the H2 frontend parsers' `max_header_list_size`, the reqwest backend pool's `http2_max_header_list_size`, and the outbound HBONE / Sidecar mesh-mTLS h2 CONNECT client's receive-side `SETTINGS_MAX_HEADER_LIST_SIZE`. Floored at 16 KiB on those transports. |
 | `FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES` | No | `16384` | Maximum size of any single request header (name + value) |
 | `FERRUM_MAX_HEADER_COUNT` | No | `100` | Max number of request headers allowed (0=unlimited) |
 | `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` | No | `10485760` | Maximum request body size (0=unlimited). Enforced on reqwest and direct-H2 (in-path 413 / `RequestBodyTooLarge`, including frame-by-frame when `Content-Length` is absent) |

@@ -11,7 +11,8 @@ use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain, spiffe_id_to_san};
 use ferrum_edge::identity::{SharedSvidBundle, SvidBundle, TrustBundle, TrustBundleSet};
 use ferrum_edge::modes::mesh::hbone::HboneIdentity;
 use ferrum_edge::proxy::hbone_pool::{
-    H2ConnectTunnel, HBONE_TARGET_TAG, HboneConnectionPool, HbonePoolError,
+    H2ConnectTunnel, HBONE_DEFAULT_MAX_HEADER_LIST_SIZE, HBONE_TARGET_TAG, HboneConnectionPool,
+    HbonePoolError,
 };
 use ferrum_edge::proxy::mesh_mtls_pool::MeshMtlsSender;
 use ferrum_edge::proxy::mesh_trust_registry::{
@@ -1318,4 +1319,234 @@ fn hbone_keepalive_abort_is_distinct_from_trust_withdrawal() {
     assert_ne!(MESH_KEEPALIVE_FAILED_MESSAGE, MESH_TRUST_WITHDRAWN_MESSAGE);
     assert!(!keepalive.abort_keepalive(), "abort is one-shot");
     assert!(!trust.retire(), "retire is one-shot");
+}
+
+/// HBONE peer that answers the FIRST CONNECT stream with a response header block
+/// deliberately larger than the pool's receive-side
+/// `SETTINGS_MAX_HEADER_LIST_SIZE`, then serves the SECOND CONNECT stream on the
+/// SAME h2 connection as a normal echo.
+///
+/// The block is sized between the cap (16 KiB) and `h2`'s 4x "abuse" multiplier
+/// (64 KiB) on purpose: inside that band `h2` refuses the oversized STREAM and
+/// keeps the connection, which is exactly the behaviour the regression asserts.
+/// The returned counter is the number of TCP connections accepted, so a value of
+/// 1 after both streams proves the transport survived the refusal instead of
+/// being torn down and redialed.
+async fn start_hbone_oversize_response_header_server(
+    server_slot: SharedSvidBundle,
+    pad_headers: usize,
+    pad_value_len: usize,
+) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind hbone oversize header server");
+    let addr = listener.local_addr().expect("listener addr");
+    let connection_count = Arc::new(AtomicUsize::new(0));
+    let count_for_task = connection_count.clone();
+
+    tokio::spawn(async move {
+        let inbound = build_spiffe_inbound_config(server_slot, true, Arc::new(Vec::new()))
+            .expect("server config");
+        let acceptor = TlsAcceptor::from(inbound);
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            count_for_task.fetch_add(1, Ordering::SeqCst);
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let Ok(mut h2) = h2::server::handshake(tls).await else {
+                    return;
+                };
+                let mut stream_index = 0_usize;
+                while let Some(next) = h2.accept().await {
+                    let Ok((request, mut respond)) = next else {
+                        return;
+                    };
+                    let oversized = stream_index == 0;
+                    stream_index += 1;
+                    tokio::spawn(async move {
+                        let mut builder = Response::builder().status(StatusCode::OK);
+                        if oversized {
+                            let padding = "p".repeat(pad_value_len);
+                            for i in 0..pad_headers {
+                                builder = builder
+                                    .header(format!("x-ferrum-pad-{i:04}"), padding.as_str());
+                            }
+                        }
+                        let response = builder.body(()).expect("connect response");
+                        let Ok(mut send) = respond.send_response(response, false) else {
+                            return;
+                        };
+                        if oversized {
+                            // The client refuses this stream; nothing to echo.
+                            return;
+                        }
+                        let mut recv = request.into_body();
+                        while let Some(chunk) = recv.data().await {
+                            let Ok(chunk) = chunk else {
+                                return;
+                            };
+                            let _ = recv.flow_control().release_capacity(chunk.len());
+                            if send.send_data(chunk, false).is_err() {
+                                return;
+                            }
+                        }
+                        let _ = send.send_data(Bytes::new(), true);
+                    });
+                }
+            });
+        }
+    });
+
+    (addr, connection_count)
+}
+
+/// Issue #4541: the outbound HBONE h2 client must bound the response header block
+/// an SVID-holding peer can push at it. Without a `max_header_list_size` the raw
+/// `h2` client keeps its 16 MiB default and decodes/buffers the whole thing.
+///
+/// The cap is a STREAM-level refusal, so the CONNECT fails while the transport
+/// stays usable: the follow-up CONNECT is served on the same pooled connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn hbone_refuses_an_oversized_peer_response_header_block_without_killing_the_connection() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let td = TrustDomain::new("cluster.local").unwrap();
+    let (root_der, root_pem, root_key_pem) = synthetic_root(&td);
+    let gateway_id = SpiffeId::from_parts(&td, "ns/edge/sa/gateway").unwrap();
+    let workload_id = SpiffeId::from_parts(&td, "ns/default/sa/workload").unwrap();
+    let server_id = SpiffeId::from_parts(&td, "ns/default/sa/orders").unwrap();
+    let (gateway_leaf, gateway_key) = issue_svid(&gateway_id, &root_pem, &root_key_pem);
+    let (server_leaf, server_key) = issue_svid(&server_id, &root_pem, &root_key_pem);
+
+    let gateway_slot = svid_slot(bundle_for(
+        gateway_id.clone(),
+        gateway_leaf,
+        gateway_key,
+        root_der.clone(),
+    ));
+    let server_slot = svid_slot(bundle_for(server_id, server_leaf, server_key, root_der));
+
+    // 24 x (name 16 + value 1000 + 32 HPACK overhead) ~= 25 KiB decoded: over the
+    // 16 KiB cap, comfortably under the 64 KiB abuse ceiling that would make this
+    // a CONNECTION error instead of a stream refusal.
+    let (server_addr, connection_count) =
+        start_hbone_oversize_response_header_server(server_slot, 24, 1000).await;
+
+    let pool = HboneConnectionPool::new(
+        PoolConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        gateway_slot,
+        4,
+    );
+    assert_eq!(
+        pool.effective_max_header_list_size(),
+        HBONE_DEFAULT_MAX_HEADER_LIST_SIZE,
+        "an unattached pool must still bound the peer's header block"
+    );
+    let proxy = proxy_for_test();
+
+    let refused = tokio::time::timeout(
+        Duration::from_secs(15),
+        pool.get_tunnel_via(
+            &proxy,
+            "127.0.0.1",
+            "127.0.0.1",
+            8080,
+            8080,
+            server_addr.port(),
+            None,
+            None,
+            None,
+            Some(&workload_id),
+        ),
+    )
+    .await
+    .expect("timely hbone tunnel attempt")
+    .err()
+    .expect("oversized response header block must refuse the CONNECT stream");
+    assert!(
+        matches!(refused, HbonePoolError::ConnectStream { .. }),
+        "expected a stream-level CONNECT failure, got {refused:?}"
+    );
+
+    // The connection survived the refusal: this CONNECT rides the SAME pooled
+    // transport, so no second TCP dial is made.
+    let mut tunnel = tokio::time::timeout(
+        Duration::from_secs(15),
+        pool.get_tunnel_via(
+            &proxy,
+            "127.0.0.1",
+            "127.0.0.1",
+            8080,
+            8080,
+            server_addr.port(),
+            None,
+            None,
+            None,
+            Some(&workload_id),
+        ),
+    )
+    .await
+    .expect("timely hbone tunnel open after refusal")
+    .expect("connection must survive a stream-level header-size refusal");
+
+    tunnel.write_all(b"mesh-hello").await.expect("write tunnel");
+    let mut echoed = [0_u8; 10];
+    tokio::time::timeout(Duration::from_secs(5), tunnel.read_exact(&mut echoed))
+        .await
+        .expect("timely echo through surviving hbone tunnel")
+        .expect("read echoed tunnel bytes");
+    let _ = tokio::time::timeout(Duration::from_secs(1), tunnel.shutdown()).await;
+    assert_eq!(&echoed, b"mesh-hello");
+
+    assert_eq!(
+        connection_count.load(Ordering::SeqCst),
+        1,
+        "the header-size cap must refuse the stream, not tear down the connection"
+    );
+}
+
+/// Issue #4541: a pool built without an operator policy must not silently inherit
+/// `h2`'s 16 MiB `SETTINGS_MAX_HEADER_LIST_SIZE`. The unset default is hyper's
+/// own 16 KiB, which is what every sibling backend transport rides.
+#[test]
+fn hbone_pool_default_max_header_list_size_is_hyper_parity_not_h2s_16_mib() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    const H2_CRATE_DEFAULT_MAX_HEADER_LIST_SIZE: u32 = 16 << 20;
+    assert_eq!(HBONE_DEFAULT_MAX_HEADER_LIST_SIZE, 16 * 1024);
+    assert_ne!(
+        HBONE_DEFAULT_MAX_HEADER_LIST_SIZE,
+        H2_CRATE_DEFAULT_MAX_HEADER_LIST_SIZE
+    );
+
+    let td = TrustDomain::new("cluster.local").unwrap();
+    let (root_der, root_pem, root_key_pem) = synthetic_root(&td);
+    let gateway_id = SpiffeId::from_parts(&td, "ns/edge/sa/gateway").unwrap();
+    let (gateway_leaf, gateway_key) = issue_svid(&gateway_id, &root_pem, &root_key_pem);
+    let gateway_slot = svid_slot(bundle_for(gateway_id, gateway_leaf, gateway_key, root_der));
+
+    let pool = HboneConnectionPool::new(
+        PoolConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        gateway_slot,
+        4,
+    );
+    assert_eq!(
+        pool.effective_max_header_list_size(),
+        HBONE_DEFAULT_MAX_HEADER_LIST_SIZE
+    );
+
+    // Attaching the operator policy replaces the default, and is idempotent.
+    pool.attach_max_header_list_size(64 * 1024);
+    assert_eq!(pool.effective_max_header_list_size(), 64 * 1024);
+    pool.attach_max_header_list_size(1024 * 1024);
+    assert_eq!(
+        pool.effective_max_header_list_size(),
+        64 * 1024,
+        "attach must be one-shot (OnceLock::set)"
+    );
 }

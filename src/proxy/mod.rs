@@ -2110,7 +2110,7 @@ pub(crate) fn should_bypass_h2_coalesce_for_large_response(
 
 /// Keep H2 transport header-list enforcement from resetting the stream before
 /// Ferrum's configured total-header validator can produce a protocol-aware 431.
-fn h2_parser_max_header_list_size(max_header_size_bytes: usize) -> u32 {
+pub(crate) fn h2_parser_max_header_list_size(max_header_size_bytes: usize) -> u32 {
     const MIN_H2_HEADER_LIST_SIZE: usize = 16 * 1024;
 
     max_header_size_bytes
@@ -9189,6 +9189,12 @@ impl ProxyState {
         // pool discoverability.
         let mesh_trust_registry = mesh_trust_registry::MeshTrustRegistry::new();
         hbone_pool.attach_mesh_trust_registry(mesh_trust_registry.clone());
+        // Bound the response header block an SVID-holding HBONE peer may push
+        // back, under the operator's own `FERRUM_MAX_HEADER_SIZE_BYTES` policy
+        // (floored at 16 KiB). Without this the raw-`h2` client keeps `h2`'s
+        // 16 MiB default — 1,024x every sibling backend transport.
+        hbone_pool
+            .attach_max_header_list_size(h2_parser_max_header_list_size(max_header_size_bytes));
         mesh_mtls_pool.attach_mesh_trust_registry(mesh_trust_registry.clone());
         let backend_capabilities = Arc::new(BackendCapabilityRegistry::with_shard_amount(
             pool_shard_amount,
