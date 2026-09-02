@@ -762,7 +762,10 @@ async fn functional_protocol_validation_http10_plus_te_rejected() {
     assert_eq!(resp.status_code, 400, "body={}", resp.body);
     assert_eq!(resp.body, ERROR_BODY);
     assert_eq!(raw_header(&resp, "content-type"), Some("application/json"));
-    assert_eq!(raw_header(&resp, "x-gateway-error"), Some("request_error"));
+    // Issue #4543: the parse-layer 400 carries no `X-Gateway-Error` — that
+    // header is a closed vocabulary for backend-attempt failures, and a
+    // client-caused 400 names itself only in the log field and the 400 count.
+    assert_eq!(raw_header(&resp, "x-gateway-error"), None);
     assert_eq!(raw_header(&resp, "connection"), Some("close"));
 
     h.cleanup();
@@ -948,7 +951,10 @@ async fn functional_protocol_validation_multiple_content_length_conflicting() {
     assert_eq!(resp.status_code, 400, "body={}", resp.body);
     assert_eq!(resp.body, ERROR_BODY);
     assert_eq!(raw_header(&resp, "content-type"), Some("application/json"));
-    assert_eq!(raw_header(&resp, "x-gateway-error"), Some("request_error"));
+    // Issue #4543: the parse-layer 400 carries no `X-Gateway-Error` — that
+    // header is a closed vocabulary for backend-attempt failures, and a
+    // client-caused 400 names itself only in the log field and the 400 count.
+    assert_eq!(raw_header(&resp, "x-gateway-error"), None);
     assert_eq!(raw_header(&resp, "connection"), Some("close"));
 
     h.cleanup();
@@ -1012,7 +1018,10 @@ async fn functional_protocol_validation_non_utf8_request_target_rejected() {
     assert_eq!(resp.status_code, 400, "body={}", resp.body);
     assert_eq!(resp.body, ERROR_BODY);
     assert_eq!(raw_header(&resp, "content-type"), Some("application/json"));
-    assert_eq!(raw_header(&resp, "x-gateway-error"), Some("request_error"));
+    // Issue #4543: the parse-layer 400 carries no `X-Gateway-Error` — that
+    // header is a closed vocabulary for backend-attempt failures, and a
+    // client-caused 400 names itself only in the log field and the 400 count.
+    assert_eq!(raw_header(&resp, "x-gateway-error"), None);
     assert_eq!(raw_header(&resp, "connection"), Some("close"));
 
     h.cleanup();
