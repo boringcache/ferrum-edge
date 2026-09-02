@@ -2410,6 +2410,49 @@ there is no all-keys fallback. A known `kid` with a bad signature under that
 key is also rejected. Token data, key material, claims, and attacker-controlled
 `kid` values are never logged.
 
+### Credential storage at rest
+
+Ferrum stores consumer credentials in the configuration database (the
+`consumers.credentials` JSON column on SQL, the equivalent document field on
+MongoDB). Only `basicauth` is hashed. The other three secret-bearing credential
+types are **stored recoverable** — the database row holds the same value the
+client presents — because their verification schemes need the original value,
+not a one-way digest of it. This is inherent to the schemes, not a defect, but
+it is not parity with `basicauth` and it changes the threat model for anyone
+who can read the database, a replica, or a backup file.
+
+| Credential type | Stored form | Why | What a database read recovers |
+|---|---|---|---|
+| `basicauth` | `hmac_sha256:<64 lowercase hex>`, derived under `FERRUM_BASIC_AUTH_HMAC_SECRET` | Verification only has to compare hashes | Nothing directly usable without the server-side HMAC secret |
+| `keyauth` | The API key verbatim | The presented key is matched against the stored key by indexed lookup | Every API key, immediately replayable against the gateway |
+| `jwt` | The HS256 shared secret verbatim | HS256 verification needs the signing key itself | Every shared secret; the reader can forge accepted tokens |
+| `hmac_auth` | The shared secret verbatim | The request HMAC is recomputed from the secret | Every shared secret; the reader can forge accepted signatures |
+| `mtls_auth` | The certificate identity string only | Matching is on identity, not on a secret | No private key material — none is ever stored |
+
+The admin API's `[REDACTED]` projection and the `/backup` endpoint's unredacted
+export are both *response* behaviors; neither changes what the database row
+contains. See [Consumer credential redaction](admin_api.md#consumers) and
+[docs/admin_backup_restore.md](admin_backup_restore.md).
+
+**Mitigations**
+
+- Require TLS to the configuration database with `FERRUM_DB_TLS_MODE` (plus the
+  `FERRUM_DB_TLS_CA_CERT_PATH`, `FERRUM_DB_TLS_CLIENT_CERT_PATH`, and
+  `FERRUM_DB_TLS_CLIENT_KEY_PATH` material where the deployment uses database
+  mTLS), and enable the database engine's own at-rest encryption for the volume
+  holding the `consumers` table or collection.
+- Treat `/backup` output as credential material: it carries the same recoverable
+  values the database already holds. See
+  [docs/admin_backup_restore.md](admin_backup_restore.md).
+- Prefer schemes that keep no verifier-side secret where the deployment allows
+  it: [`jwks_auth`](#jwks_auth) with asymmetric issuer keys (the gateway holds
+  only public keys) and [`mtls_auth`](#mtls_auth) (the gateway holds only an
+  identity string).
+- Rotate without downtime through the multi-credential array endpoints —
+  `PUT`/`POST`/`DELETE /consumers/{id}/credentials/{type}` — so a suspected
+  database exposure can be remediated by adding a new credential, rolling
+  clients over, and deleting the old entry.
+
 ### `jwt_auth`
 
 Authenticates requests using HS256 JWT Bearer tokens matched against consumer credentials.

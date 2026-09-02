@@ -63,6 +63,11 @@ Include the following information:
 7. **Keep dependencies updated**: Monitor for security advisories
 8. **Enable audit logging**: Track administrative changes
 9. **Run with minimal privileges**: Don't run as root in containers
+10. **Protect the configuration database and its backups**: Consumer API keys
+    (`keyauth`) and shared secrets (`jwt`, `hmac_auth`) are stored recoverable
+    at rest so the gateway can verify them; only Basic passwords are hashed.
+    A database, replica, or backup read recovers them. See
+    [Credential storage at rest](docs/plugins.md#credential-storage-at-rest).
 
 ### Security Features
 
