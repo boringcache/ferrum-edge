@@ -13768,6 +13768,73 @@ impl Drop for LiveVethPod {
     }
 }
 
+/// Exact one-line kernel state of a host-side `hu*` capture device, or `absent`.
+///
+/// Both the lab's own setup assertion and the data-plane assertions downstream
+/// report through this, so a live failure always states whether the capture
+/// device the lab is responsible for creating was actually present (#4492).
+#[cfg(target_os = "linux")]
+fn host_capture_device_state(name: &str) -> String {
+    match Command::new("ip")
+        .args(["-o", "link", "show", "dev", name])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let rendered = String::from_utf8_lossy(&output.stdout);
+            let line = rendered.lines().next().unwrap_or("").trim().to_string();
+            if line.is_empty() {
+                format!("{name}: present (no detail)")
+            } else {
+                line
+            }
+        }
+        Ok(_) => format!("{name}: absent"),
+        Err(error) => format!("{name}: unknown ({error})"),
+    }
+}
+
+/// Existence probe for a `hu*` capture device with the child's own diagnostics
+/// suppressed.
+///
+/// `ip link del` on a name that has never existed prints `Cannot find device
+/// "hu…"`, and that benign line from the fixture's idempotent pre-clean has been
+/// read as the cause of unrelated live failures. Probing first keeps it off the
+/// job log entirely (#4492).
+#[cfg(target_os = "linux")]
+fn host_capture_device_exists(name: &str) -> bool {
+    Command::new("ip")
+        .args(["-o", "link", "show", "dev", name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Bounded readiness poll for a capture device a lab step has just created.
+///
+/// `ip link add` is synchronous, but the device is also the one object every
+/// later host-UDP assertion depends on, so the fixture proves it is visible
+/// before returning rather than letting its absence surface as a data-plane
+/// symptom.
+#[cfg(target_os = "linux")]
+fn wait_for_host_capture_device(name: &str, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if host_capture_device_exists(name) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "lab setup did not create capture device {name}: \
+                 `LiveHostUdpVethPod::spawn` completed but the device is still \
+                 absent after {timeout:?} ({})",
+                host_capture_device_state(name)
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Dual-stack host-side veth pair with `/32`+`/128` host routes so the production
 /// host-UDP interface resolver (`discover_dedicated_veth_for_pod_ip[6]`) can find
 /// the peer without `hostPID`/`setns`.
@@ -13784,7 +13851,13 @@ struct LiveHostUdpVethPod {
 impl LiveHostUdpVethPod {
     fn spawn(subnet_octet: u8) -> Result<Self, String> {
         let pod = LivePodNetns::spawn(false)?;
-        let suffix = format!("{:x}{subnet_octet:02x}", std::process::id());
+        // Name the device for this process, this subnet octet, AND this fixture
+        // instance. Sibling host-UDP fixtures therefore never share a name, so
+        // no fixture's pre-clean or `Drop` can remove another one's live capture
+        // device (#4492).
+        static SPAWN_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+        let sequence = SPAWN_SEQUENCE.fetch_add(1, Ordering::Relaxed) & 0xff;
+        let suffix = format!("{:x}{subnet_octet:02x}{sequence:02x}", std::process::id());
         let suffix = &suffix[suffix.len().saturating_sub(8)..];
         let host_if = format!("hu{suffix}");
         let pod_if = format!("pu{suffix}");
@@ -13794,7 +13867,15 @@ impl LiveHostUdpVethPod {
             format!("fd00:204:{subnet_octet:x}::1").parse().expect("v6");
         let pod_v6: std::net::Ipv6Addr =
             format!("fd00:204:{subnet_octet:x}::2").parse().expect("v6");
-        let _ = Command::new("ip").args(["link", "del", &host_if]).status();
+        // Ownership check before the idempotent pre-clean: the name above is
+        // unique to this fixture instance, so a device carrying it can only be
+        // our own leftover from an aborted run, never a sibling test's live
+        // capture device. Probing first also keeps the benign `Cannot find
+        // device "hu…"` line out of the job log (#4492).
+        if host_capture_device_exists(&host_if) {
+            eprintln!("host-udp lab: removing stale fixture-owned capture device {host_if}");
+            let _ = Command::new("ip").args(["link", "del", &host_if]).status();
+        }
         let setup = Command::new("ip")
             .args([
                 "link", "add", &host_if, "type", "veth", "peer", "name", &pod_if,
@@ -13875,6 +13956,12 @@ impl LiveHostUdpVethPod {
                  ip -6 route add default via {host_v6} dev {pod_if}"
             ),
         ) {
+            let _ = Command::new("ip").args(["link", "del", &host_if]).status();
+            return Err(error);
+        }
+        // Prove the capture device this lab step owns is visible before any
+        // caller depends on it, and name the step in the failure (#4492).
+        if let Err(error) = wait_for_host_capture_device(&host_if, Duration::from_secs(5)) {
             let _ = Command::new("ip").args(["link", "del", &host_if]).status();
             return Err(error);
         }
@@ -14141,6 +14228,24 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
         }
     };
 
+    // The `hu*` capture devices are this lab's own objects, created
+    // synchronously by `LiveHostUdpVethPod::spawn` above and torn down by its
+    // `Drop`. Assert them HERE, before any gateway is spawned, so a missing
+    // device fails as the lab-setup problem it is and names the step that
+    // should have created it, instead of surfacing later as a data-plane
+    // symptom (#4492).
+    for (label, host_if) in [
+        ("pod A", pod_a.host_if.as_str()),
+        ("pod B", pod_b.host_if.as_str()),
+    ] {
+        assert!(
+            host_capture_device_exists(host_if),
+            "lab setup did not create capture device {host_if} for host-UDP {label} \
+             (LiveHostUdpVethPod::spawn): {}",
+            host_capture_device_state(host_if)
+        );
+    }
+
     let registry = TempDir::new().expect("host-UDP registry");
     seed_host_udp_placement_state(registry.path(), NODE_UID).expect("seed placement state");
     let a_spiffe = "spiffe://cluster.local/ns/ferrum/sa/host-udp-a";
@@ -14238,7 +14343,10 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
     ));
     assert!(
         wait_for_tcp_port(b_hbone_port, STARTUP_TIMEOUT).await,
-        "host-UDP destination HBONE listener did not bind\n{}",
+        "host-UDP destination HBONE listener did not bind \
+         (capture devices at failure: {} | {})\n{}",
+        host_capture_device_state(&pod_a.host_if),
+        host_capture_device_state(&pod_b.host_if),
         captured_output(&temp_b)
     );
 
