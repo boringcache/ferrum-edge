@@ -245,7 +245,7 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   (`dependency-audit` job in `.github/workflows/ci.yml`) and re-runs weekly in
   `.github/workflows/dependency-audit.yml`.
 - The gate covers BOTH workspaces: the root graph, and `ebpf/Cargo.toml` via
-  `cargo deny --manifest-path ebpf/Cargo.toml --config deny.toml`, in the per-PR
+  `cargo deny --manifest-path ebpf/Cargo.toml check --config deny.toml ...`, in the per-PR
   job and the weekly workflow alike. `ferrum-ebpf` is not in the root graph but
   its object ships in the published `-ebpf` / `-ebpf-tools` images and runs
   privileged on the host network. One shared `deny.toml` — never add
