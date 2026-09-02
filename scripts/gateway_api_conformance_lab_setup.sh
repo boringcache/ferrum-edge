@@ -6,6 +6,19 @@ RESULTS_DIR="${RESULTS_DIR:-$ROOT_DIR/conformance-results}"
 KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-ferrum-gwapi}"
 FERRUM_IMAGE="${FERRUM_IMAGE:-ferrum-edge:gateway-api-conformance}"
 GATEWAY_API_VERSION="${GATEWAY_API_VERSION:-v1.5.1}"
+
+# Pinned SHA-256 of the experimental-channel CRD bundle served for
+# GATEWAY_API_PINNED_VERSION. The version and its checksum live next to each
+# other and must move together: bumping the default above without bumping the
+# digest below fails the install closed. Recompute with
+#   curl -fsSL "https://github.com/kubernetes-sigs/gateway-api/releases/download/<version>/experimental-install.yaml" | shasum -a 256
+# A dispatch run that overrides GATEWAY_API_VERSION to some other tag must
+# supply the matching digest in GATEWAY_API_EXPERIMENTAL_SHA256; there is no
+# unverified path.
+GATEWAY_API_PINNED_VERSION="v1.5.1"
+GATEWAY_API_PINNED_EXPERIMENTAL_SHA256="64ec76609a6ac885e0405dea79ca509c229fa019d342f0857aa8b6bdc8b8ba92"
+GATEWAY_API_EXPERIMENTAL_SHA256="${GATEWAY_API_EXPERIMENTAL_SHA256:-}"
+GATEWAY_API_CRD_FETCH_ATTEMPTS="${GATEWAY_API_CRD_FETCH_ATTEMPTS:-5}"
 GATEWAY_API_PROFILE="${GATEWAY_API_PROFILE:-GATEWAY-HTTP,GATEWAY-GRPC}"
 GATEWAY_API_SUPPORTED_FEATURES="${GATEWAY_API_SUPPORTED_FEATURES:-Gateway,ReferenceGrant,HTTPRoute,GRPCRoute}"
 GATEWAY_API_SKIP_TESTS="${GATEWAY_API_SKIP_TESTS:-}"
@@ -100,6 +113,77 @@ YAML
   kind load docker-image "$FERRUM_IMAGE" --name "$KIND_CLUSTER_NAME"
 }
 
+file_sha256() {
+  # Prefer sha256sum (Linux runners); fall back to shasum (macOS).
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    echo "::error::neither sha256sum nor shasum is available" >&2
+    return 1
+  fi
+}
+
+expected_gateway_api_crd_sha256() {
+  # Explicit override wins so a workflow_dispatch run can pin a different
+  # Gateway API tag together with its own reviewed digest.
+  if [ -n "$GATEWAY_API_EXPERIMENTAL_SHA256" ]; then
+    printf '%s' "$GATEWAY_API_EXPERIMENTAL_SHA256"
+    return 0
+  fi
+  if [ "$GATEWAY_API_VERSION" = "$GATEWAY_API_PINNED_VERSION" ]; then
+    printf '%s' "$GATEWAY_API_PINNED_EXPERIMENTAL_SHA256"
+    return 0
+  fi
+  echo "::error::no pinned SHA-256 for Gateway API ${GATEWAY_API_VERSION} (repository pin is ${GATEWAY_API_PINNED_VERSION}); set GATEWAY_API_EXPERIMENTAL_SHA256 to the reviewed digest for that tag" >&2
+  return 1
+}
+
+# Fetch the CRD bundle to a local file and verify it against the pinned digest.
+# Both a failed download and a digest mismatch are retried with backoff: the
+# upstream release CDN answers 5xx during outages and can serve partially
+# published bytes mid-release, and both read as this pull request's fault when
+# the cascade surfaces as "the server doesn't have a resource type". Retrying
+# never relaxes verification — every attempt must match the pin, and the last
+# failing attempt exits non-zero.
+fetch_gateway_api_crd_bundle() {
+  local dest="$1"
+  local url="$2"
+  local expected="$3"
+  local attempts="$GATEWAY_API_CRD_FETCH_ATTEMPTS"
+  local i backoff actual
+
+  if ! [[ "$expected" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "::error::expected Gateway API CRD bundle digest must be a 64-character lowercase hex SHA-256" >&2
+    return 1
+  fi
+
+  for i in $(seq 1 "$attempts"); do
+    rm -f "$dest"
+    if curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 \
+      --connect-timeout 30 --max-time 300 -o "$dest" "$url"; then
+      actual="$(file_sha256 "$dest")" || return 1
+      if [ "$actual" = "$expected" ]; then
+        echo "Gateway API CRD bundle ${GATEWAY_API_VERSION} verified (sha256 ${actual})"
+        return 0
+      fi
+      echo "::warning::Gateway API CRD bundle attempt ${i}/${attempts}: checksum mismatch (got ${actual}, want ${expected}); not applying these bytes"
+    else
+      echo "::warning::Gateway API CRD bundle attempt ${i}/${attempts} failed to download from ${url} (transient release CDN error?)"
+    fi
+    if [ "$i" -lt "$attempts" ]; then
+      backoff=$((i * 5))
+      echo "::warning::retrying Gateway API CRD bundle download in ${backoff}s"
+      sleep "$backoff"
+    fi
+  done
+
+  rm -f "$dest"
+  echo "::error::Gateway API CRD bundle ${GATEWAY_API_VERSION} could not be downloaded and verified after ${attempts} attempts — likely a gateway-api release CDN outage or a stale checksum pin, not this change" >&2
+  return 1
+}
+
 install_gateway_api_crds() {
   # Install the experimental-channel bundle (includes standard resources plus
   # TCPRoute/TLSRoute). Mixing standard-install with a standalone experimental
@@ -107,8 +191,19 @@ install_gateway_api_crds() {
   # Profile/features stay GATEWAY-HTTP,GATEWAY-GRPC /
   # Gateway,ReferenceGrant,HTTPRoute,GRPCRoute; TCPRoute/TLSRoute coverage
   # remains Ferrum black-box only.
-  kubectl apply --server-side=true \
-    -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/experimental-install.yaml"
+  #
+  # The bundle is downloaded to a file, checksum-verified against the pin above,
+  # and only then applied — same posture as the checksum-pinned kind/kubectl/Helm
+  # installs. kubectl never reads the URL itself, so a transient 504 is a retry
+  # here rather than a required-gate failure, and the applied CRD content is a
+  # reviewed input rather than whatever the URL serves that day.
+  local bundle expected
+  expected="$(expected_gateway_api_crd_sha256)"
+  bundle="${RUNNER_TEMP:-/tmp}/gateway-api-experimental-install-${GATEWAY_API_VERSION}.yaml"
+  fetch_gateway_api_crd_bundle "$bundle" \
+    "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/experimental-install.yaml" \
+    "$expected"
+  kubectl apply --server-side=true -f "$bundle"
   for crd in \
     gatewayclasses.gateway.networking.k8s.io \
     gateways.gateway.networking.k8s.io \

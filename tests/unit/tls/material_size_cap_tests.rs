@@ -45,6 +45,31 @@ fn assert_oversized(error: MaterialError, kind: MaterialKind) {
     }
 }
 
+/// Count the distinct TLS source-refresh counter series recorded for `surface`.
+///
+/// Every reload pass records at least one refresh outcome per configured
+/// source, so a zero count proves the watcher never ran a pass at all.
+fn surface_refresh_records(surface: &str) -> usize {
+    ferrum_edge::plugins::prometheus_metrics::global_registry()
+        .tls_source_refresh_counter
+        .iter()
+        .filter(|entry| entry.key().surface.as_ref() == surface)
+        .count()
+}
+
+/// Rewrite a watched material path atomically.
+///
+/// `std::fs::write` truncates before it writes, so a reload pass that lands in
+/// that window reads a short (often empty) file. Nothing in the loader rejects
+/// an empty file, so that intermediate state is a legitimate fingerprint change
+/// and publishes a revision of its own. Staging into a sibling temp file and
+/// renaming keeps every reader on a whole generation.
+fn rotate_material_atomically(path: &std::path::Path, bytes: impl AsRef<[u8]>) {
+    let staged = path.with_extension("rotate-staged");
+    std::fs::write(&staged, bytes).expect("stage rotated material");
+    std::fs::rename(&staged, path).expect("publish rotated material atomically");
+}
+
 fn assert_redacted(error: &MaterialError, forbidden: &[&str]) {
     let rendered = error.to_string();
     for fragment in forbidden {
@@ -576,12 +601,11 @@ async fn live_reload_retains_last_known_good_on_oversized_rotation() {
         .expect("ready signal");
 
     // Changed valid candidate advances once.
-    std::fs::write(&path, {
+    rotate_material_atomically(&path, {
         let mut bytes = vec![b'v'; LIMIT];
         bytes[0] = b'w';
         bytes
-    })
-    .expect("rewrite good changed bytes");
+    });
     assert!(request_material_set_reload(surface));
     tokio::time::timeout(Duration::from_secs(2), revision_rx.changed())
         .await
@@ -602,7 +626,7 @@ async fn live_reload_retains_last_known_good_on_oversized_rotation() {
 
     // Oversized candidate must not rebuild or advance revision, and must
     // record a bounded load_error event while retaining last-known-good.
-    std::fs::write(&path, vec![b'x'; LIMIT + 1]).expect("write oversized");
+    rotate_material_atomically(&path, vec![b'x'; LIMIT + 1]);
     assert!(request_material_set_reload(surface));
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -645,12 +669,11 @@ async fn live_reload_retains_last_known_good_on_oversized_rotation() {
     );
 
     // Retry remains possible: a later valid candidate advances again.
-    std::fs::write(&path, {
+    rotate_material_atomically(&path, {
         let mut bytes = vec![b'v'; LIMIT];
         bytes[0] = b'y';
         bytes
-    })
-    .expect("rewrite recoverable good bytes");
+    });
     assert!(request_material_set_reload(surface));
     tokio::time::timeout(Duration::from_secs(2), revision_rx.changed())
         .await
@@ -662,6 +685,77 @@ async fn live_reload_retains_last_known_good_on_oversized_rotation() {
         rebuilds_after_good + 1,
         "valid retry must rebuild once more"
     );
+
+    shutdown_tx.send_replace(true);
+    task.await.expect("watcher exits");
+}
+
+/// Issue #4488: announcing readiness must not leave an unrequested reload pass
+/// pending.
+///
+/// `tokio::time::interval` completes its first tick immediately, so the watcher
+/// used to run a second, duplicate load of every source the instant it
+/// announced readiness — concurrently with whatever the caller did next. That
+/// stray pass is what let an oversized-rotation assertion observe a revision
+/// nobody requested. With no forced reload and an interval far beyond the test
+/// window, the surface must record no refresh at all after readiness.
+#[tokio::test]
+async fn readiness_does_not_leave_an_unrequested_reload_pass_pending() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("startup.pem");
+    std::fs::write(&path, vec![b'v'; LIMIT]).expect("seed good material");
+    let source = CertSource::parse(path.to_string_lossy().into_owned(), MaterialKind::Cert);
+    let surface = "test_material_size_cap_startup_pass";
+
+    let rebuilds = Arc::new(AtomicUsize::new(0));
+    let rebuilds_clone = rebuilds.clone();
+    let rebuild = Box::new(move || {
+        rebuilds_clone.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+
+    let (revision_tx, revision_rx) = watch::channel(0u64);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let task = spawn_material_set_reload_task(
+        MaterialSetReloadConfig {
+            surface,
+            sources: vec![WatchedMaterialSource::new(
+                "cert",
+                source,
+                MaterialKind::Cert,
+            )],
+            interval: Duration::from_secs(3600),
+            revision_tx,
+            max_material_bytes: LIMIT,
+            rebuild,
+            ready_tx: Some(ready_tx),
+        },
+        Some(shutdown_rx),
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), ready_rx)
+        .await
+        .expect("watcher readiness")
+        .expect("ready signal");
+
+    // Hold the watcher's attention without forcing a reload: any pass it starts
+    // on its own would record a refresh outcome inside this window.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+    while tokio::time::Instant::now() < deadline {
+        assert_eq!(
+            surface_refresh_records(surface),
+            0,
+            "readiness must not be followed by an unrequested source reload pass"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        *revision_rx.borrow(),
+        0,
+        "an unrequested startup pass must never publish a revision"
+    );
+    assert_eq!(rebuilds.load(Ordering::SeqCst), 0);
 
     shutdown_tx.send_replace(true);
     task.await.expect("watcher exits");
