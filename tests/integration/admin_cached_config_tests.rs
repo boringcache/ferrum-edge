@@ -8270,6 +8270,9 @@ async fn test_proxy_invalid_association_does_not_fall_back_and_put_repairs() {
         Some("Database unavailable — operation failed")
     );
 
+    // Issue #4532: an ABSENT `plugins` key on PUT now preserves the stored
+    // associations (including the invalid one, which is then rejected), so the
+    // repair must clear them explicitly with an empty list.
     let repaired = json!({
         "id": "proxy-1",
         "name": "repaired proxy",
@@ -8277,12 +8280,13 @@ async fn test_proxy_invalid_association_does_not_fall_back_and_put_repairs() {
         "backend_scheme": "http",
         "backend_host": "repaired.example.com",
         "backend_port": 8081,
-        "strip_listen_path": true
+        "strip_listen_path": true,
+        "plugins": []
     });
     let (status, body) = admin_put(&base_url, "/proxies/proxy-1", &token, &repaired).await;
     assert_eq!(
         status, 200,
-        "PUT without the invalid association should repair proxy_plugins: {body:?}"
+        "PUT with an explicit empty plugins list should repair proxy_plugins: {body:?}"
     );
 
     let (status, body, data_source) = admin_get(&base_url, "/proxies/proxy-1", &token).await;
