@@ -1086,6 +1086,48 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
             let _ = shutdown_tx_signal.send(true);
         });
 
+        // Process-wide SIGHUP disposition (issue #4548). Without a registered
+        // stream SIGHUP keeps its POSIX default disposition and *terminates*
+        // the gateway with no drain in every mode that does not install its
+        // own handler (database, cp, dp, injector, node_agent, migrate, and
+        // native-MeshSubscribe mesh). `ferrum-edge reload` resolves its target
+        // with `pgrep`, so the documented command could take production
+        // traffic down. This task registers hangup for every mode and logs
+        // what the signal actually means.
+        //
+        // Deliberately a dedicated task rather than a branch of the shutdown
+        // `select!` above: a SIGHUP arm there would *initiate* shutdown, which
+        // is exactly the failure being fixed. Registering a second
+        // `SignalKind::hangup()` stream is supported — tokio delivers the
+        // notification to every registered stream — so file mode's and the
+        // mesh local sources' real handlers keep working unchanged.
+        #[cfg(unix)]
+        {
+            let sighup_mode = env_config.mode.clone();
+            tokio::spawn(async move {
+                use tokio::signal::unix::{SignalKind, signal};
+                let mut sighup = match signal(SignalKind::hangup()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("Failed to register SIGHUP handler: {}", e);
+                        return;
+                    }
+                };
+                while sighup.recv().await.is_some() {
+                    match startup::sighup_disposition(&sighup_mode) {
+                        startup::SighupDisposition::ReloadsConfig => {
+                            debug!(
+                                "SIGHUP received; handled by this mode's own config reload watcher"
+                            );
+                        }
+                        startup::SighupDisposition::IgnoredWithNotice(notice) => {
+                            warn!("{}", notice);
+                        }
+                    }
+                }
+            });
+        }
+
         // Run the appropriate mode
         let result = match env_config.mode {
             OperatingMode::Database => modes::database::run(env_config, shutdown_tx).await,
