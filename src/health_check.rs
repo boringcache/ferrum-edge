@@ -4381,6 +4381,8 @@ fn active_probe_timer(target_key: &str, interval: Duration) -> tokio::time::Inte
 
 /// Test-only accessors for the active-probe tick source (issue #4518).
 #[doc(hidden)]
+// Reached only from external unit tests; the bin target sees no caller.
+#[allow(dead_code)]
 pub mod probe_timer_for_test {
     use std::time::Duration;
 
