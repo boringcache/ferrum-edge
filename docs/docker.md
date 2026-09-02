@@ -313,11 +313,14 @@ FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true
 FERRUM_CP_DP_GRPC_JWT_SECRET=change-me-to-a-32-character-grpc-secret
 ```
 
-> **Note**: The prebuilt release image (`Dockerfile.release`) bakes
-> `FERRUM_LOG_LEVEL=warn` as its default so that startup operability warnings
-> (FD soft-cap floor, plaintext-admin guard, pending plugin migrations) are
-> visible out of the box. Override with `-e FERRUM_LOG_LEVEL=<level>` for
-> quieter (`error`) or more verbose (`info`/`debug`/`trace`) logging.
+> **Note**: Every published image family bakes `FERRUM_LOG_LEVEL=warn` as its
+> default — the standard image built from `Dockerfile.release` and the `-ebpf` /
+> `-ebpf-tools` images built from the root `Dockerfile` — so that startup
+> operability warnings (FD soft-cap floor, plaintext-admin guard, pending plugin
+> migrations, TLS expiry, capture degradation) are visible out of the box. A local
+> `docker build -f Dockerfile .` therefore reproduces the published default.
+> Override with `-e FERRUM_LOG_LEVEL=<level>` for quieter (`error`) or more
+> verbose (`info`/`debug`/`trace`) logging.
 
 ### Setting Variables in Docker
 
