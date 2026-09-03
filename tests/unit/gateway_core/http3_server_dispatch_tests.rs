@@ -5035,7 +5035,7 @@ fn h3_backend_response_field_section_size_is_finite_and_distinct() {
         H3_BACKEND_RESPONSE_FIELD_SECTION_SIZE_CAP
     );
     let max_fields = h3_backend_response_max_field_section_size(usize::MAX) / 32;
-    assert!(max_fields < 32_768);
+    assert!(max_fields <= ferrum_edge::http3::config::H3_HEADER_MAP_MAX_FIELDS);
 }
 
 /// A header policy whose derived H3 limits could not be represented as QUIC
@@ -5043,7 +5043,7 @@ fn h3_backend_response_field_section_size_is_finite_and_distinct() {
 /// bound the operator never asked for.
 #[test]
 fn h3_field_section_limits_refuse_an_unrepresentable_header_policy() {
-    use ferrum_edge::http3::config::{QUIC_VARINT_MAX_U64, validate_h3_field_section_limits};
+    use ferrum_edge::http3::config::{H3_FIELD_SECTION_SIZE_CAP, validate_h3_field_section_limits};
 
     assert!(validate_h3_field_section_limits(32_768).is_ok());
     assert!(validate_h3_field_section_limits(0).is_ok());
@@ -5055,8 +5055,10 @@ fn h3_field_section_limits_refuse_an_unrepresentable_header_policy() {
         "the refusal must name the offending variable: {err}"
     );
 
-    // The stated boundary is exact.
-    let largest_ok = (QUIC_VARINT_MAX_U64 / 2) as usize;
+    // The stated boundary is exact. Issue #4538 made the field-count bound the
+    // tighter of the two, so the admitted maximum is the field-section cap and
+    // no longer `QUIC_VARINT_MAX_U64 / 2`.
+    let largest_ok = H3_FIELD_SECTION_SIZE_CAP as usize;
     assert!(validate_h3_field_section_limits(largest_ok).is_ok());
     assert!(validate_h3_field_section_limits(largest_ok + 1).is_err());
 }
