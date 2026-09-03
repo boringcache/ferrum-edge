@@ -269,7 +269,10 @@ pub fn load_tls_policy(env_config: &EnvConfig) -> Result<TlsPolicy, anyhow::Erro
 
 /// `tls::load_crls` for `FERRUM_TLS_CRL_FILE_PATH` — shared by validate and serve.
 pub fn load_crls_from_env(env_config: &EnvConfig) -> Result<CrlList, anyhow::Error> {
-    tls::load_crls(env_config.tls_crl_file_path.as_deref())
+    tls::load_crls(
+        env_config.tls_crl_file_path.as_deref(),
+        env_config.tls_crl_expiry_warning_days,
+    )
 }
 
 /// Strict `FERRUM_ADMIN_ALLOWED_CIDRS` parse — shared by validate and serve.
@@ -360,6 +363,7 @@ pub fn try_load_frontend_tls_candidate(
         false,
         tls_policy,
         env_config.tls_cert_expiry_warning_days,
+        env_config.tls_crl_expiry_warning_days,
         crls,
         proxy_frontend_handshake_scope(env_config),
     )
@@ -425,6 +429,7 @@ pub fn load_admin_tls_candidate(
         env_config.admin_tls_no_verify,
         tls_policy,
         env_config.tls_cert_expiry_warning_days,
+        env_config.tls_crl_expiry_warning_days,
         crls,
         admin_https_handshake_scope(env_config),
     )

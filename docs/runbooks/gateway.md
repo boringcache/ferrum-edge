@@ -263,6 +263,41 @@ seeing the new material (check `ferrum_tls_source_fetch_failures_total`).
 **Escalation.** Page the PKI/certificate owner immediately when the remaining
 lifetime is under 24 hours, or when rotation is failing.
 
+## FerrumGatewayRevocationMaterialExpiringSoon
+
+**Symptom.** `ferrum_tls_revocation_expiry_seconds` for some CRL or stapled
+OCSP response is below `metrics.alerts.revocationExpiringSeconds` (default 7
+days) for 15 minutes. The gauge counts down to the material's `nextUpdate`;
+a negative value means it has already expired.
+
+**Why it pages.** Ferrum refuses expired revocation material at reload **and
+at startup**. A gateway that is still serving keeps its last good material,
+but any pod that restarts after `nextUpdate` will not come back until fresh
+material is published. This alert is the advance notice before that
+restart-blocking outage.
+
+**First checks.**
+
+1. `GET /metrics` — the `material_id`, `kind` (`crl` or `ocsp`), and
+   `source_kind` labels identify exactly which file or staple is aging out and
+   where it is loaded from.
+2. `ferrum_tls_inventory_snapshot_timestamp_seconds` versus
+   `ferrum_tls_inventory_snapshot_max_age_seconds` — confirm the inventory is
+   fresh, so you are not alerting on a stale snapshot.
+3. The gateway log — the same condition is logged at startup and on every
+   reload once the remaining lifetime is under
+   `FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS` (default 30 days).
+
+**Remediation.** Publish a freshly issued CRL (or a new stapled OCSP
+response) through the configured source; Ferrum reloads revocation material
+from watched sources without a restart. Do **not** restart the gateway as a
+remedy — if the material has already expired, the restart is exactly the
+outage this alert warns about. Verify the gauge moves after the source is
+updated; if it does not, the watcher is not seeing the new material.
+
+**Escalation.** Page the PKI/CRL-issuing owner immediately when the remaining
+lifetime is under 24 hours, or when the issuer has stopped publishing.
+
 ## FerrumGatewayDatabaseUnavailable
 
 **Symptom.** `ferrum_database_config_source_connected == 0` for 5 minutes in

@@ -114,6 +114,23 @@ reconciliations. They are **historical evidence**, not the live launch verdict.
   undeterminable (no CRL from their issuing CA) are accepted, matching the shared inbound
   model; removing it would break federated meshes lacking per-CA CRLs. Documented in
   docs/mesh.md.
+- **Expired revocation material refuses startup**: `tls::load_crls` refuses a
+  CRL past its `nextUpdate` (and a stapled OCSP response past its own), and
+  that `Err` is `?`-propagated out of every `startup_security::load_crls_from_env`
+  caller — database, file, cp, dp, mesh, node_agent — so the process exits
+  rather than booting. This is the *fail-closed* half of a real trade-off: a
+  pod that restarts after `nextUpdate` does not come back, which turns a
+  forgotten CRL refresh job into a fleet-wide outage. Booting anyway would
+  serve without revocation enforcement for that issuer, i.e. fail-open, and a
+  "refuse just that issuer" variant is the same outage with more machinery.
+  The mitigation is lead time, not softening: `FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS`
+  (default 30) warns at load, the `ferrum_tls_revocation_expiry_seconds` gauge
+  and the chart's `FerrumGatewayRevocationMaterialExpiringSoon` alert make it
+  recurring, and live reload
+  (`FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` / `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED`)
+  adopts a refreshed copy without a restart. Documented in
+  docs/frontend_tls.md and docs/backend_mtls.md; pinned by
+  `tests/unit/tls/crl_policy_tests.rs` (issue #4505).
 - **Fail-fast panics in shipping profiles**: `[profile.release]`,
   `[profile.ci-release]` (inherits `release`), and `[profile.max-perf]` set
   `panic = "abort"` (issue #4166). A panic anywhere in the process —

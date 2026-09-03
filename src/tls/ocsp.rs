@@ -321,6 +321,15 @@ pub struct OcspStructure {
     pub der_len: usize,
     /// Number of `SingleResponse` entries in the `BasicOCSPResponse`.
     pub single_responses: usize,
+    /// Soonest `nextUpdate` across the `SingleResponse` entries, as a Unix
+    /// timestamp, or `None` when no entry declares one (issue #4505).
+    ///
+    /// Certificate-independent, so this is a lead-time signal only: the
+    /// deadline that binds a served staple is the matched response's, which
+    /// [`validate_stapled_response`] returns as
+    /// [`OcspAcceptance::next_update`]. The two agree for the single-response
+    /// staples an operator actually configures.
+    pub earliest_next_update: Option<i64>,
 }
 
 /// Outcome of full, certificate-bound validation.
@@ -1461,6 +1470,12 @@ pub fn validate_structure_with_policy(
     Ok(OcspStructure {
         der_len: der.len(),
         single_responses: basic.response_data.single_responses.len(),
+        earliest_next_update: basic
+            .response_data
+            .single_responses
+            .iter()
+            .filter_map(|single| single.next_update)
+            .min(),
     })
 }
 

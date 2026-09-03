@@ -286,6 +286,7 @@ fn frontend_and_backend_builders_complete_a_real_tls_handshake() {
         false,
         &tls_policy,
         30,
+        30,
         &[],
     )
     .expect("build production frontend TLS config");

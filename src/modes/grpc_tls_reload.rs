@@ -54,6 +54,7 @@ pub fn build_cp_grpc_server_tls_config(
         false,
         tls_policy,
         env_config.tls_cert_expiry_warning_days,
+        env_config.tls_crl_expiry_warning_days,
         crls,
     )
 }

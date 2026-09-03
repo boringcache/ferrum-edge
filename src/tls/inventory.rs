@@ -86,6 +86,16 @@ pub struct TlsInventoryEntry {
     pub not_after: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub days_until_expiry: Option<i64>,
+    /// `nextUpdate` of this entry's revocation material: the soonest across a
+    /// CRL bundle, or the matched `SingleResponse`'s for an OCSP staple.
+    /// Absent for every other material kind (issue #4505).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_update: Option<DateTime<Utc>>,
+    /// Whole days until [`Self::next_update`], computed the same way
+    /// [`Self::days_until_expiry`] is so a certificate deadline and a
+    /// revocation deadline cannot be read on different scales.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub days_until_next_update: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fingerprint_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -240,6 +250,8 @@ impl InventoryEntryBuilder {
             not_before: None,
             not_after: None,
             days_until_expiry: None,
+            next_update: None,
+            days_until_next_update: None,
             fingerprint_sha256: None,
             certificate_count: None,
             crl_count: None,
@@ -320,16 +332,24 @@ impl InventoryEntryBuilder {
                     entry.error = Some(error);
                 }
             }
-            MaterialKind::Crl => match count_crls(&material.bytes) {
-                Ok(count) => {
-                    entry.crl_count = Some(count);
-                }
-                Err(error) => {
+            MaterialKind::Crl => {
+                if let Err(error) = populate_crl_metadata(&mut entry, &material.bytes) {
                     entry.state = TlsInventoryState::Invalid;
                     entry.error = Some(error);
                 }
-            },
-            MaterialKind::Jwks | MaterialKind::Ocsp | MaterialKind::Unknown => {}
+            }
+            // A stapled OCSP response carries the same operator deadline a CRL
+            // does, so the metrics path can alert on both from one family
+            // (issue #4505). Structure only: certificate binding is proven by
+            // the loader that actually serves the staple, and this inventory
+            // has no chain to bind against.
+            MaterialKind::Ocsp => {
+                if let Err(error) = populate_ocsp_metadata(&mut entry, &material.bytes) {
+                    entry.state = TlsInventoryState::Invalid;
+                    entry.error = Some(error);
+                }
+            }
+            MaterialKind::Jwks | MaterialKind::Unknown => {}
         }
 
         entry
@@ -916,14 +936,56 @@ fn validate_private_key(bytes: &crate::tls::source::SecretBytes) -> Result<(), S
         .map(|_| ())
 }
 
-fn count_crls(bytes: &crate::tls::source::SecretBytes) -> Result<usize, String> {
+/// Record a CRL bundle's size and its soonest `nextUpdate` (issue #4505).
+///
+/// The bundle is one admission unit — `tls::load_crls` refuses the whole
+/// source when any record has expired — so the earliest `nextUpdate` is the
+/// deadline an operator has to act on. A record that declares none is refused
+/// at admission, so it contributes nothing here rather than being reported as
+/// a bundle with no deadline.
+fn populate_crl_metadata(
+    entry: &mut TlsInventoryEntry,
+    bytes: &crate::tls::source::SecretBytes,
+) -> Result<(), String> {
     let crls = rustls_pemfile::crls(&mut Cursor::new(bytes.expose_secret()))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("failed to parse PEM CRLs: {error}"))?;
     if crls.is_empty() {
         return Err("no PEM CRLs found".to_string());
     }
-    Ok(crls.len())
+    entry.crl_count = Some(crls.len());
+    let next_update = crls
+        .iter()
+        .filter_map(crate::tls::crl_policy::crl_next_update_unix)
+        .min();
+    if let Some(next_update) = next_update {
+        set_next_update(entry, next_update);
+    }
+    Ok(())
+}
+
+/// Record a stapled OCSP response's `nextUpdate` (issue #4505).
+///
+/// Structural admission only, exactly as much as this inventory can prove
+/// without a chain: the served staple is bound to its leaf and issuer by the
+/// loader that publishes it.
+fn populate_ocsp_metadata(
+    entry: &mut TlsInventoryEntry,
+    bytes: &crate::tls::source::SecretBytes,
+) -> Result<(), String> {
+    let structure = crate::tls::ocsp::validate_structure(bytes.expose_secret())?;
+    if let Some(next_update) = structure.earliest_next_update {
+        set_next_update(entry, next_update);
+    }
+    Ok(())
+}
+
+/// Store `next_update` and its whole-day countdown on `entry`.
+fn set_next_update(entry: &mut TlsInventoryEntry, next_update_unix: i64) {
+    let now_ts = ASN1Time::now().timestamp();
+    entry.next_update = DateTime::<Utc>::from_timestamp(next_update_unix, 0);
+    entry.days_until_next_update =
+        Some(crate::tls::days_until_next_update(next_update_unix, now_ts));
 }
 
 #[cfg(test)]

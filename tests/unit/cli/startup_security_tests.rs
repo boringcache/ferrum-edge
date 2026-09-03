@@ -659,7 +659,7 @@ fn try_load_frontend_tls_returns_none_when_unset() {
     ensure_crypto_provider();
     let env = file_mode_env();
     let policy = TlsPolicy::from_env_config(&env).unwrap();
-    let crls = load_crls(None).unwrap();
+    let crls = load_crls(None, 30).unwrap();
     let loaded = try_load_frontend_tls(&env, &policy, &crls).unwrap();
     assert!(loaded.is_none());
 }

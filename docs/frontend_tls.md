@@ -491,6 +491,31 @@ are listed at the end of this section.
   A CRL that expires while the gateway is running therefore stops authorizing
   **new** handshakes on every surface it is installed on, without a reload and
   without a restart. Keep the CRL refreshed ahead of its own `nextUpdate`.
+- **CRL refresh is a restart-blocking dependency.** The same refusal applies at
+  **startup**, not only at reload: `FERRUM_TLS_CRL_FILE_PATH` /
+  `FERRUM_TLS_CRL_SOURCE` is loaded during startup in every serving mode
+  (database, file, cp, dp, mesh, node_agent) and an expired record fails that
+  load, so the process exits instead of booting. A pod that restarts after
+  `nextUpdate` — rolling deploy, node drain, OOM kill — does not come back, and
+  a forgotten CRL refresh job is therefore a fleet-wide outage rather than a
+  single-pod incident. This is deliberate (see
+  [PRODUCTION_READINESS.md](../PRODUCTION_READINESS.md) → "Deliberate
+  decisions"): booting with an expired CRL would serve without revocation
+  enforcement for that issuer, which is fail-open. Two things are required of
+  an operator: refresh the CRL before `nextUpdate`, and/or set
+  `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true` (and
+  `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true` for backend surfaces) so a
+  refreshed copy is adopted without a restart. Live reload is **off by
+  default**, so without it the only way to pick up a new CRL is a restart —
+  which the expired one blocks.
+- **A lead-time warning is the advance signal.** Every accepted CRL source
+  whose soonest `nextUpdate` falls within `FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS`
+  (default `30`, `0` disables) logs a `warn!` naming the redacted source id and
+  the remaining days. The same knob covers stapled OCSP responses — one refresh
+  loop, one deadline. The recurring signal is the Prometheus gauge
+  `ferrum_tls_revocation_expiry_seconds{material_id,kind,source_kind}`, which
+  the bundled chart alerts on as `FerrumGatewayRevocationMaterialExpiringSoon`
+  (`metrics.alerts.revocationExpiringSeconds`, default 7 days).
 
 ### What admission enforces
 
@@ -663,11 +688,26 @@ validity window above is evaluated while the `ServerConfig` candidate is being
 built — at startup, at config reload, and when a watched OCSP source's bytes
 change. An accepted staple is then served unchanged until one of those events
 happens again, so a response that passes `nextUpdate` while the gateway is
-running keeps being stapled. Refresh the OCSP source before `nextUpdate`
-elapses: with `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true` a file or provider
-source is re-read and re-validated as soon as its bytes change, and rewriting
-the source with a stale or otherwise invalid response is rejected while the
-previous known-good material keeps serving.
+running keeps being stapled.
+
+The reason it keeps being stapled is that **Ferrum has no OCSP responder
+client**: nothing inside the gateway fetches a fresh response, so there is no
+event to re-validate against and dropping the staple unilaterally would only
+trade one failure mode (a stale staple strict clients reject) for another (no
+staple at all, which a must-staple certificate also fails). Staple refresh is
+therefore the operator's own fetch loop plus live reload. Refresh the OCSP
+source before `nextUpdate` elapses: with
+`FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true` a file or provider source is
+re-read and re-validated as soon as its bytes change, and rewriting the source
+with a stale or otherwise invalid response is rejected while the previous
+known-good material keeps serving. Without live reload the only way to adopt a
+refreshed staple is a restart — and a restart after `nextUpdate` is refused by
+the same admission check, exactly as for CRLs above.
+
+A staple inside `FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS` of its `nextUpdate` logs a
+`warn!` at load and is exported as
+`ferrum_tls_revocation_expiry_seconds{kind="ocsp"}` on the authenticated
+`/metrics` surface.
 
 **Diagnostics.** Rejections name the redacted source identifier and the
 structural reason. They never contain certificate bytes, response bytes, private

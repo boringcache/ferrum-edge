@@ -32,12 +32,15 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use ferrum_edge::config::EnvConfig;
 use ferrum_edge::config::types::BackendTlsConfig;
 use ferrum_edge::health_check::build_probe_server_verifier_for_test;
 use ferrum_edge::identity::{SpiffeId, SvidBundle, TrustBundle, TrustBundleSet, TrustDomain};
+use ferrum_edge::plugins::prometheus_metrics::MetricsRegistry;
 use ferrum_edge::tls::crl_policy::{
     self, CrlWindowRejection, apply_client_crl_policy, classify_crl_window, validate_crl_windows_at,
 };
+use ferrum_edge::tls::inventory::TlsInventory;
 use ferrum_edge::tls::{
     build_client_cert_verifier, build_server_verifier_with_crls, build_spiffe_client_cert_verifier,
     load_crls,
@@ -566,7 +569,7 @@ fn load_crls_admits_a_fresh_source_and_refuses_an_expired_one() {
         crl_pem(&fresh_crl(&pki.root_issuer, &[UNRELATED_SERIAL])),
     )
     .expect("write fresh CRL");
-    let loaded = load_crls(Some(fresh_path.to_str().expect("utf-8 path")))
+    let loaded = load_crls(Some(fresh_path.to_str().expect("utf-8 path")), 30)
         .expect("a fresh CRL source loads");
     assert_eq!(loaded.len(), 1);
 
@@ -577,7 +580,7 @@ fn load_crls_admits_a_fresh_source_and_refuses_an_expired_one() {
     );
     let expired_path = dir.path().join("expired.crl.pem");
     std::fs::write(&expired_path, crl_pem(&expired_der)).expect("write expired CRL");
-    let error = load_crls(Some(expired_path.to_str().expect("utf-8 path")))
+    let error = load_crls(Some(expired_path.to_str().expect("utf-8 path")), 30)
         .expect_err("an expired CRL source is refused at admission")
         .to_string();
     assert!(error.contains("has expired"), "unexpected error: {error}");
@@ -592,7 +595,7 @@ fn load_crls_admits_a_fresh_source_and_refuses_an_expired_one() {
     );
     let no_expiry_path = dir.path().join("no-next-update.crl.pem");
     std::fs::write(&no_expiry_path, crl_pem(&missing_next_update)).expect("write CRL");
-    let error = load_crls(Some(no_expiry_path.to_str().expect("utf-8 path")))
+    let error = load_crls(Some(no_expiry_path.to_str().expect("utf-8 path")), 30)
         .expect_err("a CRL with no declared expiry is refused")
         .to_string();
     assert!(error.contains("nextUpdate"), "unexpected error: {error}");
@@ -613,7 +616,7 @@ fn load_crls_refuses_a_bundle_whose_second_record_expired() {
     let path = dir.path().join("bundle.crl.pem");
     std::fs::write(&path, bundle).expect("write bundle");
 
-    let error = load_crls(Some(path.to_str().expect("utf-8 path")))
+    let error = load_crls(Some(path.to_str().expect("utf-8 path")), 30)
         .expect_err("the usable first record must not be published on its own")
         .to_string();
     assert!(error.contains("record #2"), "unexpected error: {error}");
@@ -1242,4 +1245,245 @@ fn the_shared_validator_is_reachable_as_a_public_seam() {
     let pki = build_chain_pki();
     let crls = crl_list(vec![fresh_crl(&pki.root_issuer, &[UNRELATED_SERIAL])]);
     crl_policy::validate_crl_windows(&crls, "public-seam").expect("fresh CRL admitted");
+}
+
+// ── 4. Revocation lead-time signal (issue #4505) ─────────────────────────
+//
+// Enforcement is not the finding and is not softened here: the fail-closed
+// regression guard below re-asserts that an already-expired CRL is still an
+// `Err` out of `load_crls`, which is what every serving mode `?`-propagates
+// out of startup. What is new is advance notice — a `warn!` at load and the
+// `next_update` / `days_until_next_update` inventory fields the
+// `ferrum_tls_revocation_expiry_seconds` gauge is derived from.
+
+/// In-memory `tracing` sink, installed for the duration of the returned guard.
+#[derive(Clone, Default)]
+struct CapturedLogs {
+    buffer: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl CapturedLogs {
+    fn contents(&self) -> String {
+        String::from_utf8(self.buffer.lock().expect("log buffer").clone()).unwrap_or_default()
+    }
+}
+
+struct CapturedLogsWriter {
+    buffer: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl std::io::Write for CapturedLogsWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buffer
+            .lock()
+            .expect("log buffer")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    type Writer = CapturedLogsWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        CapturedLogsWriter {
+            buffer: Arc::clone(&self.buffer),
+        }
+    }
+}
+
+fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+    let writer = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .with_writer(writer.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    (writer, guard)
+}
+
+/// Write a CRL whose `nextUpdate` is `days` out and return its path.
+fn write_crl_expiring_in(dir: &Path, name: &str, pki: &ChainPki, days: i64) -> PathBuf {
+    let base = OffsetDateTime::now_utc();
+    let der = retime_crl(
+        &fresh_crl(&pki.root_issuer, &[UNRELATED_SERIAL]),
+        base - TimeDuration::hours(1),
+        // A twelve-hour margin so the whole-day countdown the warning and the
+        // inventory report is `days` rather than `days - 1` by the time the
+        // load actually runs.
+        Some(base + TimeDuration::days(days) + TimeDuration::hours(12)),
+    );
+    let path = dir.join(name);
+    std::fs::write(&path, crl_pem(&der)).expect("write CRL");
+    path
+}
+
+#[test]
+fn a_crl_inside_the_warning_window_warns_and_one_outside_it_does_not() {
+    let pki = build_chain_pki();
+    let dir = TempDir::new().expect("temp dir");
+
+    let soon = write_crl_expiring_in(dir.path(), "soon.crl.pem", &pki, 5);
+    let (logs, guard) = capture_logs();
+    load_crls(Some(soon.to_str().expect("utf-8 path")), 30).expect("a fresh CRL still loads");
+    drop(guard);
+    let warned = logs.contents();
+    assert!(
+        warned.contains("Revocation material expires within the configured warning window"),
+        "a CRL five days from nextUpdate must warn at 30 days of lead time: {warned}"
+    );
+    assert!(
+        warned.contains("days_until_next_update=5"),
+        "the warning must carry the remaining days: {warned}"
+    );
+    // The diagnostic names the redacted source id and nothing else about the
+    // material: no PEM, no issuer, no serials.
+    assert!(!warned.contains("BEGIN X509 CRL"), "{warned}");
+
+    let later = write_crl_expiring_in(dir.path(), "later.crl.pem", &pki, 90);
+    let (logs, guard) = capture_logs();
+    load_crls(Some(later.to_str().expect("utf-8 path")), 30).expect("a fresh CRL still loads");
+    drop(guard);
+    let quiet = logs.contents();
+    assert!(
+        !quiet.contains("Revocation material expires within the configured warning window"),
+        "a CRL ninety days out must not warn at 30 days of lead time: {quiet}"
+    );
+
+    // `0` disables the warning entirely, matching the certificate knob.
+    let (logs, guard) = capture_logs();
+    load_crls(Some(soon.to_str().expect("utf-8 path")), 0).expect("a fresh CRL still loads");
+    drop(guard);
+    assert!(
+        !logs
+            .contents()
+            .contains("Revocation material expires within the configured warning window"),
+        "FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS=0 disables the warning: {}",
+        logs.contents()
+    );
+}
+
+#[test]
+fn the_lead_time_warning_never_relaxes_the_expired_refusal() {
+    let pki = build_chain_pki();
+    let base = OffsetDateTime::now_utc();
+    let dir = TempDir::new().expect("temp dir");
+
+    let expired = retime_crl(
+        &fresh_crl(&pki.root_issuer, &[UNRELATED_SERIAL]),
+        base - TimeDuration::days(30),
+        Some(base - TimeDuration::days(1)),
+    );
+    let path = dir.path().join("expired.crl.pem");
+    std::fs::write(&path, crl_pem(&expired)).expect("write expired CRL");
+
+    // The boot posture is deliberately fail-closed (issue #4505): a huge
+    // warning window is still only a warning window, and every serving mode
+    // `?`-propagates this `Err` out of startup. If this ever returns `Ok`, a
+    // gateway boots serving without revocation enforcement for that issuer.
+    for warning_days in [0, 30, 3_650] {
+        let error = load_crls(Some(path.to_str().expect("utf-8 path")), warning_days)
+            .expect_err("an expired CRL is refused whatever the warning window")
+            .to_string();
+        assert!(error.contains("has expired"), "unexpected error: {error}");
+    }
+}
+
+#[test]
+fn the_next_update_siblings_read_the_same_field_admission_does() {
+    let pki = build_chain_pki();
+    let base = OffsetDateTime::now_utc();
+
+    let early = retime_crl(
+        &fresh_crl(&pki.root_issuer, &[UNRELATED_SERIAL]),
+        base - TimeDuration::hours(1),
+        Some(base + TimeDuration::days(3)),
+    );
+    let late = retime_crl(
+        &fresh_crl(&pki.unrelated_issuer, &[UNRELATED_SERIAL]),
+        base - TimeDuration::hours(1),
+        Some(base + TimeDuration::days(40)),
+    );
+    let bundle = crl_list(vec![late, early.clone()]);
+
+    let early_next = crl_policy::crl_next_update_unix(&CertificateRevocationListDer::from(early))
+        .expect("a CRL admission accepts declares a nextUpdate");
+    // The bundle is one admission unit, so the operator's deadline is the
+    // earliest record's — not the order the file happens to list.
+    assert_eq!(
+        crl_policy::earliest_next_update_unix(&bundle),
+        Some(early_next),
+        "the soonest nextUpdate is the whole source's refusal deadline"
+    );
+
+    // A record with no declared nextUpdate is refused at admission, so it
+    // contributes no deadline rather than reporting an endless one.
+    let endless = retime_crl(
+        &fresh_crl(&pki.root_issuer, &[UNRELATED_SERIAL]),
+        base - TimeDuration::hours(1),
+        None,
+    );
+    assert_eq!(
+        crl_policy::crl_next_update_unix(&CertificateRevocationListDer::from(endless.clone())),
+        None
+    );
+    assert_eq!(
+        classify_crl_window(
+            &CertificateRevocationListDer::from(endless),
+            unix(OffsetDateTime::now_utc())
+        ),
+        Err(CrlWindowRejection::MissingNextUpdate)
+    );
+}
+
+#[test]
+fn a_crl_inventory_entry_carries_next_update_and_reaches_the_prometheus_gauge() {
+    let pki = build_chain_pki();
+    let dir = TempDir::new().expect("temp dir");
+    let path = write_crl_expiring_in(dir.path(), "inventory.crl.pem", &pki, 5);
+
+    let env = EnvConfig {
+        tls_crl_file_path: Some(path.to_string_lossy().into_owned()),
+        ..EnvConfig::default()
+    };
+    let inventory = TlsInventory::collect(Some(&env), None);
+
+    let entry = inventory
+        .entries
+        .iter()
+        .find(|entry| entry.material_kind == "crl")
+        .expect("the configured CRL source is inventoried");
+    assert_eq!(entry.crl_count, Some(1));
+    let next_update = entry
+        .next_update
+        .expect("a CRL entry must carry its nextUpdate (issue #4505)");
+    assert_eq!(
+        entry.days_until_next_update,
+        Some(5),
+        "days_until_next_update must be computed the same way days_until_expiry is"
+    );
+
+    let registry = MetricsRegistry::new();
+    registry.refresh_tls_certificate_inventory(&inventory);
+    let key = registry
+        .tls_revocation_gauges
+        .iter()
+        .map(|row| row.key().clone())
+        .find(|key| &*key.material_id == entry.id.as_str())
+        .expect("the CRL entry must produce a revocation gauge row");
+    assert_eq!(&*key.kind, "crl");
+    assert_eq!(&*key.source_kind, entry.source.kind.as_str());
+    let stored = registry
+        .tls_revocation_gauges
+        .get(&key)
+        .expect("gauge row")
+        .next_update_unix_seconds
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(stored, next_update.timestamp());
 }

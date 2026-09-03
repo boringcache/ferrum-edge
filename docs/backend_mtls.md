@@ -377,6 +377,20 @@ outbound:
 - **A candidate CRL outside its validity window is refused whole.** Startup
   fails; a live reload keeps the previously accepted CRL slot, backend pools, and
   health checks exactly as they were, and logs a redacted warning.
+- **CRL refresh is therefore a restart-blocking dependency.** "Startup fails"
+  above is literal and applies in every serving mode: a process that restarts
+  after the CRL's `nextUpdate` does not come back, so a forgotten refresh job
+  becomes a fleet-wide outage rather than one degraded pod. This is deliberate
+  — booting with an expired CRL would serve without revocation enforcement for
+  that issuer, which is fail-open. Keep `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true`
+  (the default) so a refreshed CRL is adopted without a restart, and refresh
+  the CRL before `nextUpdate`. Frontend surfaces need
+  `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`, which is **off** by default;
+  see [frontend_tls.md → CRL Policy](frontend_tls.md#crl-policy).
+- **Advance warning.** An accepted CRL whose soonest `nextUpdate` is within
+  `FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS` (default `30`, `0` disables) logs a
+  redacted `warn!`, and the deadline is exported as
+  `ferrum_tls_revocation_expiry_seconds` for alerting.
 - **Active HTTPS and gRPC health-check probes share this policy.** Probe tasks
   snapshot the same admitted `SharedCrlList` generation backend data-path
   pools use. Backend TLS live reload stores the new generation first, then

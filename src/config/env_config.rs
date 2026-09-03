@@ -3172,6 +3172,15 @@ pub struct EnvConfig {
     /// Expired certificates are rejected at startup/config-load time.
     /// Set to 0 to disable near-expiry warnings. (default: 30)
     pub tls_cert_expiry_warning_days: u64,
+    /// Number of days before revocation material (a CRL's `nextUpdate`, a
+    /// stapled OCSP response's `nextUpdate`) expires to emit a warning log.
+    /// One knob covers both: they are the same operator refresh loop.
+    ///
+    /// Expired revocation material is *refused*, at reload and at startup
+    /// alike (issue #4505), so this is the only advance notice an operator
+    /// gets before a forgotten refresh becomes a handshake outage that also
+    /// blocks restart. Set to 0 to disable near-expiry warnings. (default: 30)
+    pub tls_crl_expiry_warning_days: u64,
     /// Maximum age of the cached, non-secret TLS inventory snapshot that backs
     /// the `/metrics` certificate gauges. A scrape only ever reads the snapshot;
     /// when it is older than this bound the scrape schedules a single-flight
@@ -4010,6 +4019,7 @@ impl Default for EnvConfig {
             service_discovery_stale_policy: crate::config::types::SdStalePolicy::Withdraw,
             service_discovery_allow_unbounded_stale: false,
             tls_cert_expiry_warning_days: 30,
+            tls_crl_expiry_warning_days: 30,
             tls_inventory_snapshot_ttl_seconds: DEFAULT_SNAPSHOT_TTL_SECONDS,
             tls_early_data_methods: HashSet::new(),
             trusted_proxies: String::new(),
@@ -4606,6 +4616,7 @@ impl EnvConfig {
             tls_curves_legacy: Option<String> = "FERRUM_TLS_CURVES";
             tls_session_cache_size: usize = "FERRUM_TLS_SESSION_CACHE_SIZE" => 4096usize;
             tls_cert_expiry_warning_days: u64 = "FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS" => 30u64;
+            tls_crl_expiry_warning_days: u64 = "FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS" => 30u64;
             tls_inventory_snapshot_ttl_seconds: u64 = "FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS" => DEFAULT_SNAPSHOT_TTL_SECONDS, clamp(0u64, 86_400u64);
         }
 
@@ -5429,6 +5440,7 @@ impl EnvConfig {
             service_discovery_stale_policy,
             service_discovery_allow_unbounded_stale,
             tls_cert_expiry_warning_days,
+            tls_crl_expiry_warning_days,
             tls_inventory_snapshot_ttl_seconds,
             tls_early_data_methods,
             stream_proxy_bind_address,
