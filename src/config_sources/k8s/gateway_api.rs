@@ -364,8 +364,11 @@ pub(super) fn translate(
         // Response-amplification protection is always engaged: the translator
         // projects a finite controller default (8.0) unless a valid Ferrum
         // `UDPResponseAmplificationPolicy` wins, including an explicit
-        // dual-acknowledged unlimited override. Ordinary translation never
-        // leaves `udp_max_response_amplification_factor` unset.
+        // dual-acknowledged unlimited override, which is materialized as the
+        // `0` sentinel. Ordinary translation never leaves
+        // `udp_max_response_amplification_factor` unset — and neither does any
+        // other source: `Proxy::normalize_fields()` projects the same finite
+        // default onto every unset UDP/DTLS proxy.
         "UDPRoute" => {
             for proxy in l4_route_proxies(object, acc, BackendScheme::Udp)? {
                 acc.upsert_proxy(proxy, SourceKind::GatewayApi);

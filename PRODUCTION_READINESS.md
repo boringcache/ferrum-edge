@@ -81,6 +81,19 @@ reconciliations. They are **historical evidence**, not the live launch verdict.
 
 ## Deliberate decisions (do not "fix" without revisiting rationale)
 
+- **UDP response amplification is bounded by default on every source**: a
+  `udp`/`dtls` proxy that names no `udp_max_response_amplification_factor` is
+  normalized to the finite default `8.0` in `Proxy::normalize_fields()` —
+  file mode, database mode, the admin API, CP→DP distribution, mesh
+  materialization, and Gateway API `UDPRoute` translation alike (issue #4515).
+  UDP has no handshake, so an unbounded reply budget makes any
+  small-request/large-response backend a spoofed-source reflector; the default
+  must not depend on who authored the proxy. Unlimited is opt-in via the
+  explicit `0` sentinel, which is accepted only on UDP/DTLS proxies and emits a
+  startup warning on the affected listener. Do not restore "unset means
+  unlimited". Pinned by `tests/unit/config/udp_amplification_default_tests.rs`
+  and the two default/sentinel cases in
+  `tests/functional/functional_udp_proxy_test.rs`.
 - **Admin JWT `aud` unset ⇒ strict**: tokens carrying `aud` are rejected when
   FERRUM_ADMIN_JWT_AUDIENCE is unset (RFC 7519 §4.1.3, jsonwebtoken default, pre-existing
   behavior). Loosening would enable cross-service token replay under HS256 secret reuse.

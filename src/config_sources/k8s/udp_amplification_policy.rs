@@ -21,9 +21,8 @@ use super::{
 };
 use crate::config::types::Proxy;
 use crate::udp_amplification::{
-    GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR, MAX_UDP_AMPLIFICATION_FACTOR,
-    UDP_AMPLIFICATION_POLICY_GROUP, UDP_AMPLIFICATION_POLICY_KIND, factor_is_valid,
-    record_policy_invalid,
+    DEFAULT_UDP_AMPLIFICATION_FACTOR, MAX_UDP_AMPLIFICATION_FACTOR, UDP_AMPLIFICATION_POLICY_GROUP,
+    UDP_AMPLIFICATION_POLICY_KIND, factor_is_valid, record_policy_invalid,
 };
 
 const GATEWAY_API_GROUP: &str = "gateway.networking.k8s.io";
@@ -704,7 +703,12 @@ pub(crate) fn apply_to_generated_proxy(
     listen_port: u16,
 ) {
     let (factor, posture, parent_refs) = resolve_for_route(acc, object, listen_port);
-    proxy.udp_max_response_amplification_factor = factor;
+    // `None` out of the resolver is the dual-acknowledged `mode: Unlimited`
+    // override. Encode it as the explicit `0` sentinel so
+    // `Proxy::normalize_fields()` cannot later project the finite default over
+    // an override the operator deliberately requested. Resolution order,
+    // aggregation, and posture recording are unchanged.
+    proxy.udp_max_response_amplification_factor = Some(factor.unwrap_or(0.0));
     let route = K8sResourceKey::from_object(object);
     for parent_ref in parent_refs {
         acc.udp_amplification_route_postures
@@ -727,7 +731,7 @@ fn resolve_for_route(
         .collect();
     if matching.is_empty() {
         return (
-            Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR),
+            Some(DEFAULT_UDP_AMPLIFICATION_FACTOR),
             UdpAmplificationPosture::FiniteDefault,
             vec![String::new()],
         );
@@ -821,7 +825,7 @@ fn resolve_for_claim(
         return posture_from_body(&ValidPolicyBody { factor });
     }
     (
-        Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR),
+        Some(DEFAULT_UDP_AMPLIFICATION_FACTOR),
         UdpAmplificationPosture::FiniteDefault,
     )
 }
@@ -836,7 +840,7 @@ fn aggregate_shared_port_policies(
 ) -> (Option<f32>, UdpAmplificationPosture) {
     if resolutions.is_empty() {
         return (
-            Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR),
+            Some(DEFAULT_UDP_AMPLIFICATION_FACTOR),
             UdpAmplificationPosture::FiniteDefault,
         );
     }

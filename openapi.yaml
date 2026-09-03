@@ -9238,25 +9238,31 @@ components:
         udp_max_response_amplification_factor:
           type: [number, "null"]
           format: float
-          exclusiveMinimum: 0
+          minimum: 0
           maximum: 1024
           description: |
             Maximum allowed response amplification factor for UDP proxies.
-            When set, backend→client datagrams share one remaining payload-byte
-            budget per admitted client request (`payload_size * factor`,
-            cumulative across replies). A zero-length request receives an
-            explicit one-byte reply allowance so it cannot black-hole the
-            session; nonempty requests retain the exact configured payload
-            ratio. Every backend response datagram consumes at least one unit
-            of remaining budget, so a zero-length reply cannot bypass a finite
-            factor. This protects against UDP amplification attacks (e.g.,
-            spoofed-source reflection). Values must be finite, greater than 0,
-            and at most 1024. When omitted (default for hand-authored proxies),
-            no amplification cap is applied. Gateway API `UDPRoute` translation
-            never leaves this unset: it projects a finite controller default
-            of 8.0 unless a Ferrum `UDPResponseAmplificationPolicy` supplies a
-            finite override or an explicit dual-acknowledged unlimited mode.
-            Only applicable for `udp` / `dtls` proxies.
+            Backend→client datagrams share one remaining payload-byte budget
+            per admitted client request (`payload_size * factor`, cumulative
+            across replies). A zero-length request receives an explicit
+            one-byte reply allowance so it cannot black-hole the session;
+            nonempty requests retain the exact configured payload ratio. Every
+            backend response datagram consumes at least one unit of remaining
+            budget, so a zero-length reply cannot bypass a finite factor. This
+            protects against UDP amplification attacks (e.g., spoofed-source
+            reflection). Finite values must be greater than 0 and at most 1024.
+
+            **Omitting the field is not unlimited.** Every `udp` / `dtls` proxy
+            that leaves it unset is normalized to the finite default `8.0`,
+            whatever the configuration source (file, database, admin API,
+            CP→DP, mesh, Gateway API), so a UDP proxy is never an open
+            reflector by default. `0` is the explicit operator opt-out meaning
+            "no limit"; it is accepted only on `udp` / `dtls` proxies and the
+            affected listener logs a warning at startup. Gateway API `UDPRoute`
+            translation projects the same `8.0` default unless a Ferrum
+            `UDPResponseAmplificationPolicy` supplies a finite override or an
+            explicit dual-acknowledged unlimited mode, which is materialized as
+            `0`. Only applicable for `udp` / `dtls` proxies.
         allowed_methods:
           oneOf:
             - type: array

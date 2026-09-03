@@ -103,10 +103,13 @@ fn record_client_address_metadata_drop(
 }
 
 /// Admit one backend→client datagram against the session's remaining
-/// per-request amplification budget. Unlimited proxies (`factor == None`) skip
-/// the check. Empty responses still consume one unit of remaining budget
-/// (plain UDP, DTLS, and batched paths share this helper). Drops are
-/// rate-limited and never log client addresses, sizes, factors, or payload.
+/// per-request amplification budget. Unlimited proxies skip the check — both
+/// the explicit `Some(0.0)` operator opt-out and a `None` from a proxy that
+/// never ran `normalize_fields()` (a test fixture or an internal constructor),
+/// which must not start charging a budget it never had. Empty responses still
+/// consume one unit of remaining budget (plain UDP, DTLS, and batched paths
+/// share this helper). Drops are rate-limited and never log client addresses,
+/// sizes, factors, or payload.
 fn admit_udp_response(
     remaining: &AtomicU64,
     factor: Option<f32>,
@@ -114,7 +117,7 @@ fn admit_udp_response(
     proxy_id: &str,
     listen_port: u16,
 ) -> bool {
-    if factor.is_none() {
+    if crate::udp_amplification::factor_is_unlimited(factor) {
         return true;
     }
     if crate::udp_amplification::charge_response_budget(remaining, len) {
@@ -2792,6 +2795,28 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                  network path to the load balancer is protected"
             );
         }
+    }
+    // The explicit `0` sentinel turns the response-amplification guard off for
+    // this listener. Say so once at bind rather than leaving the only signal a
+    // process-wide `record_policy_unlimited()` counter: UDP has no handshake,
+    // so an unbounded reply budget makes this listener a spoofed-source
+    // reflector for any large-response backend. A `None` factor is an
+    // un-normalized internal proxy, not an operator choice, so it is silent —
+    // `Proxy::normalize_fields()` gives every configured UDP/DTLS proxy a
+    // finite default.
+    let startup_amplification_factor = request_epoch
+        .load()
+        .proxy_by_namespaced_id(&proxy_namespace, &proxy_id)
+        .and_then(|proxy| proxy.udp_max_response_amplification_factor);
+    if startup_amplification_factor.is_some_and(|factor| factor == 0.0) {
+        warn!(
+            proxy_id = %proxy_id,
+            listen_port = port,
+            "udp_max_response_amplification_factor is 0 on this udp/dtls listener — the response \
+             amplification guard is disabled, so a spoofed-source datagram can reflect an \
+             unbounded backend reply at the victim; set a finite factor unless this listener is \
+             unreachable from untrusted networks"
+        );
     }
     let session_shard_amount = udp_session_shard_amount(session_shard_amount);
     // so_busy_poll_us and udp_gro_enabled are used in #[cfg(target_os = "linux")] blocks below.
@@ -6577,7 +6602,7 @@ async fn handle_dtls_client_inner(
         .ok_or_else(|| anyhow::anyhow!("Proxy {proxy_namespace}/{proxy_id} not found"))?
         .clone();
     let idle_timeout = Duration::from_secs(proxy.udp_idle_timeout_seconds.max(1));
-    if proxy.udp_max_response_amplification_factor.is_none() {
+    if crate::udp_amplification::factor_is_unlimited(proxy.udp_max_response_amplification_factor) {
         crate::udp_amplification::record_policy_unlimited();
     }
     // Socket peer for reply routing and diagnostics; resolved client for
@@ -7837,7 +7862,7 @@ async fn create_session(
         (Some(tx), Some(rx))
     };
     let hook_ingress_queued_bytes = Arc::new(AtomicUsize::new(0));
-    if proxy.udp_max_response_amplification_factor.is_none() {
+    if crate::udp_amplification::factor_is_unlimited(proxy.udp_max_response_amplification_factor) {
         crate::udp_amplification::record_policy_unlimited();
     }
     let session = Arc::new(UdpSession {

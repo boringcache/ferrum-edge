@@ -2826,10 +2826,17 @@ pub struct Proxy {
     /// allowance so it cannot black-hole the session; nonempty requests retain
     /// the exact configured payload ratio. Every response datagram consumes at
     /// least one unit of remaining budget, so a zero-length reply cannot
-    /// bypass a finite factor. `None` (default for hand-authored proxies) =
-    /// no limit. Gateway API `UDPRoute` translation never leaves this unset:
-    /// it projects a finite controller default unless an explicit unsafe
-    /// override is attached.
+    /// bypass a finite factor.
+    ///
+    /// Unset is NOT unlimited: `normalize_fields()` projects
+    /// `DEFAULT_UDP_AMPLIFICATION_FACTOR` (`8.0`) onto every UDP/DTLS proxy
+    /// that leaves this `None`, whatever the configuration source, so a
+    /// file-, database-, admin-API-, CP→DP-, mesh-, or Gateway-API-authored
+    /// UDP proxy is never an open reflector by default. `0` is the explicit
+    /// operator opt-out meaning "no limit"; it emits a startup warning on the
+    /// affected listener. `None` survives normalization only for non-UDP
+    /// dispatch kinds and for proxies built by internal constructors that
+    /// never normalize.
     #[serde(default)]
     pub udp_max_response_amplification_factor: Option<f32>,
     /// TCP stream idle timeout in seconds. After this duration of no data
@@ -7409,6 +7416,21 @@ impl Proxy {
 
         self.resolve_dispatch_kind_fields();
 
+        // A UDP/DTLS proxy that names no amplification budget gets the finite
+        // default rather than "unlimited". UDP has no handshake, so an
+        // unbounded reply budget makes any small-request/large-response
+        // backend a spoofed-source reflector. This is the single choke point
+        // every configuration source passes through (file loaders, DB and
+        // Mongo row parsing, admin CRUD, DP gRPC apply, mesh materialization,
+        // the k8s reconciler), so the default cannot depend on who authored
+        // the proxy. Operators who genuinely need unlimited replies set the
+        // explicit `0` sentinel, which is preserved here. Non-UDP dispatch
+        // kinds are untouched and still normalize to `None`.
+        if self.dispatch_kind.is_udp() && self.udp_max_response_amplification_factor.is_none() {
+            self.udp_max_response_amplification_factor =
+                Some(crate::udp_amplification::DEFAULT_UDP_AMPLIFICATION_FACTOR);
+        }
+
         // Compile L4 stream match predicates once so the accept path stays
         // allocation-free. Invalid criteria clear the compiled form; validation
         // surfaces the error separately so we never run with a partial matcher.
@@ -8113,12 +8135,29 @@ impl Proxy {
 
         // UDP amplification factor validation. `<= 0.0` does not catch NaN;
         // non-finite and oversized values fail closed before listener bind.
-        if let Some(factor) = self.udp_max_response_amplification_factor
-            && !crate::udp_amplification::factor_is_valid(factor)
-        {
-            errors.push(format!(
-                "udp_max_response_amplification_factor must be a finite number greater than 0 and at most {MAX_UDP_AMPLIFICATION_FACTOR}"
-            ));
+        // `0` is the explicit "unlimited" opt-out and is admissible only on a
+        // UDP/DTLS proxy, where the guard actually runs. The dispatch kind is
+        // recomputed from the effective scheme rather than read from the
+        // stored field so validation is correct even when it is reached before
+        // `normalize_fields()`.
+        if let Some(factor) = self.udp_max_response_amplification_factor {
+            let udp = DispatchKind::from(self.effective_scheme()).is_udp();
+            let admissible = if udp {
+                crate::udp_amplification::factor_is_valid_or_unlimited(factor)
+            } else {
+                crate::udp_amplification::factor_is_valid(factor)
+            };
+            if !admissible {
+                errors.push(if udp {
+                    format!(
+                        "udp_max_response_amplification_factor must be 0 (explicitly unlimited) or a finite number greater than 0 and at most {MAX_UDP_AMPLIFICATION_FACTOR}"
+                    )
+                } else {
+                    format!(
+                        "udp_max_response_amplification_factor must be a finite number greater than 0 and at most {MAX_UDP_AMPLIFICATION_FACTOR}"
+                    )
+                });
+            }
         }
 
         // Allowed WebSocket origins validation
