@@ -2758,14 +2758,33 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         }
                         info!("Full configuration snapshot accepted from CP");
                     }
-                    ConfigApplyOutcome::Rejected { .. } => {
+                    ConfigApplyOutcome::Rejected { errors } => {
                         // Distinct from a fenced/refused snapshot: this one was
                         // admitted and failed to apply. Either way the applied
                         // config — and therefore its age — is unchanged (#3726).
                         crate::dp_config_freshness::record_snapshot_apply_failed();
+                        // Name WHY. The dominant cause is a plugin config the
+                        // CP admitted that this data plane cannot construct
+                        // (issue #4526); `plugin_cache::try_create_plugin`
+                        // reports the plugin name, config id, and constructor
+                        // error, and those messages arrive here. Without them
+                        // the operator sees a frozen fleet and no cause.
                         error!(
-                            "Full configuration snapshot rejected during apply; keeping previous config"
+                            cp_url,
+                            version = %update.version,
+                            validation_errors = ?errors,
+                            "Full configuration snapshot rejected during apply; keeping previous \
+                             config — this data plane is now frozen on its last-known-good \
+                             generation until the offending resource is repaired at the CP"
                         );
+                        // Sticky divergence, exactly as for a non-empty rejected
+                        // delta: this snapshot was admitted and failed, so the
+                        // served config no longer matches what the CP published.
+                        // `GET /cluster` on this DP is the only in-band place a
+                        // frozen fleet is visible — `ConfigSync.Subscribe` is
+                        // server-streaming with no acknowledgement, so the CP
+                        // cannot see it (issue #4526).
+                        update_state_config_diverged(connection_state, divergence_metrics);
                         return Ok(react_to_unusable_snapshot(subscription.base_applied));
                     }
                 }
