@@ -3339,6 +3339,12 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::classify_stream_error(error)
     }
 
+    /// The pre-copy (setup-phase) stream classifier the TCP accept loop uses
+    /// for DNS / dial / handshake / plugin-reject failures (issue #4536).
+    pub fn classify_stream_setup_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
+        crate::proxy::tcp_proxy::classify_stream_setup_error(error)
+    }
+
     /// Production typed emit for an opaque-TLS SNI peek refusal (issue #4407).
     pub fn sni_admission_refused_error_for_test(
         port: u16,
