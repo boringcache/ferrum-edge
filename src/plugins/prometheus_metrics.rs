@@ -5475,6 +5475,17 @@ pub fn render_dp_config_freshness_prometheus(
     );
 
     output.push_str(
+        "# HELP ferrum_dp_cp_admission_refused_total ConfigSync subscriptions the control plane refused with RESOURCE_EXHAUSTED because a CP gRPC stream admission budget is saturated. The CP is alive, so a refusal is recorded as reconnecting and never latches the stale-config bound.\n",
+    );
+    output.push_str("# TYPE ferrum_dp_cp_admission_refused_total counter\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_cp_admission_refused_total",
+        freshness.cp_admission_refused_total,
+        ns_label,
+    );
+
+    output.push_str(
         "# HELP ferrum_dp_config_snapshot_apply_failures_total CP snapshots that were admitted and then failed to apply since process start.\n",
     );
     output.push_str("# TYPE ferrum_dp_config_snapshot_apply_failures_total counter\n");

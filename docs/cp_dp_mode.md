@@ -149,6 +149,51 @@ broadcast subscription, config filtering/serialization, registry insertion, or
 response-channel allocation, and is released by an RAII guard on every
 termination path. Capacity refusals are gRPC `RESOURCE_EXHAUSTED`.
 
+**Sizing rule: one stream per DP *or per mesh workload*.** Every injected
+sidecar and every ambient node proxy holds one `MeshSubscribe` stream for its
+whole life, so these budgets count workloads, not control-plane clients. Size
+each one at **≥ fleet ÷ CP replicas**, with headroom for reconnect overlap
+during a rolling update (surged pods take new streams while the pods they
+replace still hold theirs). The shipped defaults — `8192` total, `4096` per
+namespace, `2048` per principal, `16384` distinct nodes — are chosen for that
+unit; the per-node ceiling stays at `4` because it is per node state key.
+
+Because `node_id` must equal the JWT `sub` for native mesh subscribers, the
+per-principal budget does not isolate one workload from another inside a
+shared-ServiceAccount fleet: all of them present one principal. Size it from
+the fleet size.
+
+The listener connection caps are a separate decision and are **not** raised
+with these: `FERRUM_CP_GRPC_MAX_CONNECTIONS` (`1024`) and
+`FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP` (`64`) are DoS bounds on sockets. The
+per-IP cap is the one to watch behind NAT or a Service with
+`externalTrafficPolicy: Cluster`: every subscriber then appears to the CP as
+one source address, so a fleet larger than 64 behind a single egress IP is
+refused at the *connection* layer before admission is ever consulted. Preserve
+the client address (`externalTrafficPolicy: Local`, a direct pod-to-pod CP
+Service, or per-node egress) rather than raising the per-IP cap by reflex.
+
+**Approaching a ceiling.** Each budget layer emits a rate-limited (at most once
+per 60s per layer) `warn!` naming the layer, its `FERRUM_XDS_MAX_*` variable,
+and the current/limit values once occupancy reaches 80% of the ceiling, so
+growth into a budget is visible before the first refusal. Scrape
+`ferrum_cp_grpc_active_streams`, `ferrum_cp_grpc_active_node_ids`, and
+`ferrum_cp_grpc_stream_admission_rejections_total` alongside it.
+
+**An admission refusal is not a dead control plane.** A saturated budget is
+answered with gRPC `RESOURCE_EXHAUSTED`, which is proof the CP is reachable and
+serving. The DP therefore records the refusal as *reconnecting*, not as
+authority loss: it does **not** latch the
+`FERRUM_DP_CONFIG_MAX_STALE_SECONDS` bound and does **not** trip
+`FERRUM_DP_CONFIG_STALE_ACTION=fail_closed` an hour later on a data plane whose
+only problem is that the CP would not seat it. The refusal is logged as an
+operator-actionable `error!` naming the saturated budget and counted by
+`ferrum_dp_cp_admission_refused_total`; the DP keeps serving last-known-good
+config and keeps rotating and retrying across `FERRUM_DP_CP_GRPC_URLS`. A DP
+that has *never* seated a stream is a different case: it starts with no
+authority at all, so a cold start that is refused from the beginning still
+degrades on the configured schedule and is not masked.
+
 The same budgets apply on a control plane even when `FERRUM_XDS_ENABLED=false`,
 because native ConfigSync and MeshSubscribe still occupy the slots. Under
 `FERRUM_MESH_PRODUCTION_MODE=true`, a `0` (unbounded) value is refused at
@@ -993,7 +1038,11 @@ in a failover set must use the same value.
 | `FERRUM_CP_GRPC_MAX_CONNECTIONS` | No | Max concurrent CP gRPC connections, admitted **before** any TLS/mTLS handshake work is allocated and held through the served HTTP/2 session (default `1024`; `0` = unlimited) |
 | `FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP` | No | Max concurrent CP gRPC connections from one source IP (default `64`; `0` disables). Must not exceed `FERRUM_CP_GRPC_MAX_CONNECTIONS` |
 | `FERRUM_CP_GRPC_MAX_STREAM_LIFETIME_SECONDS` | No | Finite maximum bearer-authenticated configuration-stream lifetime (default `3600`; range `60..=86400`; cannot be disabled). The verified token deadline may close the stream earlier |
-| `FERRUM_XDS_MAX_TOTAL_STREAMS` | No | Shared process ceiling for concurrent ConfigSync, MeshSubscribe, and ADS streams (default `1024`). Enforced on the CP even when ADS is disabled. `0` is unbounded and refused under production posture without `FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS=true` |
+| `FERRUM_XDS_MAX_TOTAL_STREAMS` | No | Shared process ceiling for concurrent ConfigSync, MeshSubscribe, and ADS streams (default `8192`). Enforced on the CP even when ADS is disabled. `0` is unbounded and refused under production posture without `FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS=true` |
+| `FERRUM_XDS_MAX_STREAMS_PER_NAMESPACE` | No | Concurrent configuration streams for one namespace/tenant (default `4096`), checked after the total budget. On a mesh-enabled namespace this is a **workload** count, not a tenant count |
+| `FERRUM_XDS_MAX_STREAMS_PER_PRINCIPAL` | No | Concurrent configuration streams for one authenticated principal — the JWT `sub` (default `2048`). Every DP or mesh workload sharing a ServiceAccount token presents the **same** principal, so size this against the fleet, not the tenant count |
+| `FERRUM_XDS_MAX_STREAMS_PER_NODE` | No | Concurrent configuration streams for one node state key — namespace + principal + `node_id` (default `4`). A healthy subscriber keeps one stream; the headroom tolerates reconnect overlap. This one is per node, not per fleet, and is unchanged by fleet growth |
+| `FERRUM_XDS_MAX_ACTIVE_NODES` | No | Distinct node state keys with at least one active stream (default `16384`). Also bounds the node-scoped snapshot / nonce / workload-identity / waypoint / scoping maps. Binds only when set **below** `FERRUM_XDS_MAX_TOTAL_STREAMS` (or when that is `0`); at the shipped defaults (`16384` > `8192`) the total-stream budget saturates first |
 | `FERRUM_ADMIN_JWT_SECRET` | Yes | JWT secret for the Admin API |
 | `FERRUM_DB_TYPE` | Yes | Database type (`postgres`, `mysql`, `sqlite`, or `mongodb`) |
 | `FERRUM_DB_URL` | Yes | Database connection URL |

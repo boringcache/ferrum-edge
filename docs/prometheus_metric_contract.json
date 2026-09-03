@@ -1739,6 +1739,18 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_dp_cp_admission_refused_total",
+    "type": "counter",
+    "help": "ConfigSync subscriptions the control plane refused with RESOURCE_EXHAUSTED because a CP gRPC stream admission budget is saturated. The CP is alive, so a refusal is recorded as reconnecting and never latches the stale-config bound.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "dp_config",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_edge_overhead_ms",
     "type": "histogram",
     "help": "Gateway overhead (excluding backend and plugins) in milliseconds.",
@@ -2642,7 +2654,7 @@
   {
     "name": "ferrum_mesh_config_stream_attempts_total",
     "type": "counter",
-    "help": "Completed mesh configuration-stream attempts by consumer protocol (native/xds/stock_xds) and closed-set outcome. A remote clean EOF is an endpoint failure, not a success. Local retirements (shutdown, tls_reload, credential_rotated, credential_source_invalid, credential_deadline, primary_retry) never rotate the endpoint or grow backoff. transport_failure is a dial failure while established_transport_failure is an already-open stream going dark; heartbeat_silence_timeout is the native application-silence bound, not an HTTP/2 keepalive timeout.",
+    "help": "Completed mesh configuration-stream attempts by consumer protocol (native/xds/stock_xds) and closed-set outcome. A remote clean EOF is an endpoint failure, not a success. Local retirements (shutdown, tls_reload, credential_rotated, credential_source_invalid, credential_deadline, primary_retry) never rotate the endpoint or grow backoff. transport_failure is a dial failure while established_transport_failure is an already-open stream going dark; heartbeat_silence_timeout is the native application-silence bound, not an HTTP/2 keepalive timeout. admission_refused is a CP stream-admission capacity/tenancy refusal (RESOURCE_EXHAUSTED): the control plane is alive and answering, so it is deliberately not a transport failure.",
     "labels": [
       "protocol",
       "outcome",

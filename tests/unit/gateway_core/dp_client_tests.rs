@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use ferrum_edge::grpc::dp_client::{
     DpCpConnectionState, GrpcJwtSecret, generate_dp_jwt, generate_dp_jwt_with_issuer,
+    subscribe_admission_refusal,
 };
 use serial_test::serial;
 
@@ -388,4 +389,61 @@ fn grpc_jwt_debug_never_renders_token_file_path_or_secret() {
         rendered.contains("token_file_configured: true"),
         "{rendered}"
     );
+}
+
+// ── CP admission refusal classification (issue #4531) ─────────────────────
+
+/// The CP's admission controller answers a saturated stream budget with
+/// `RESOURCE_EXHAUSTED`, and the subscribe call surfaces it through
+/// `anyhow::Error`. The classifier must recover the status so the caller can
+/// log the named budget and keep authority, instead of reporting a dead CP.
+#[test]
+fn resource_exhausted_subscribe_status_is_classified_as_an_admission_refusal() {
+    let error = anyhow::Error::from(tonic::Status::resource_exhausted(
+        "CP gRPC per-namespace concurrent configuration stream limit exceeded \
+         (FERRUM_XDS_MAX_STREAMS_PER_NAMESPACE)",
+    ));
+    let status = subscribe_admission_refusal(&error).expect("RESOURCE_EXHAUSTED is a refusal");
+    assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+    // The operator-actionable detail the log line depends on: the CP names the
+    // saturated budget verbatim in the status message.
+    assert!(
+        status
+            .message()
+            .contains("FERRUM_XDS_MAX_STREAMS_PER_NAMESPACE"),
+        "{}",
+        status.message()
+    );
+}
+
+/// Every other gRPC status stays an ordinary connection error, so the stale
+/// fence keeps latching on a control plane that is genuinely unusable.
+#[test]
+fn other_status_codes_are_not_admission_refusals() {
+    for code in [
+        tonic::Code::Unavailable,
+        tonic::Code::Unauthenticated,
+        tonic::Code::PermissionDenied,
+        tonic::Code::DeadlineExceeded,
+        tonic::Code::InvalidArgument,
+        tonic::Code::Internal,
+        tonic::Code::Unknown,
+    ] {
+        let error = anyhow::Error::from(tonic::Status::new(code, "nope"));
+        assert!(
+            subscribe_admission_refusal(&error).is_none(),
+            "{code:?} must not be treated as a capacity refusal"
+        );
+    }
+}
+
+/// A non-status error (transport, TLS, config) carries no gRPC code at all and
+/// must not be mistaken for a refusal.
+#[test]
+fn non_status_errors_are_not_admission_refusals() {
+    let error = anyhow::anyhow!("tcp connect error: connection refused");
+    assert!(subscribe_admission_refusal(&error).is_none());
+
+    let io = anyhow::Error::from(std::io::Error::other("broken pipe"));
+    assert!(subscribe_admission_refusal(&io).is_none());
 }

@@ -240,6 +240,7 @@ fn liveness_and_policy_outcomes_rotate_and_back_off() {
         MeshStreamAttempt::FirstSliceTimeout,
         MeshStreamAttempt::HeartbeatSilenceTimeout,
         MeshStreamAttempt::PolicyRejected,
+        MeshStreamAttempt::AdmissionRefused,
     ] {
         let disposition = attempt.disposition();
         assert!(disposition.advance_endpoint, "{:?}", attempt);
@@ -265,6 +266,7 @@ fn attempt_labels_are_a_closed_set() {
         MeshStreamAttempt::FirstSliceTimeout.as_metric_label(),
         MeshStreamAttempt::HeartbeatSilenceTimeout.as_metric_label(),
         MeshStreamAttempt::PolicyRejected.as_metric_label(),
+        MeshStreamAttempt::AdmissionRefused.as_metric_label(),
     ]);
     let mut sorted = labels.to_vec();
     sorted.sort_unstable();
@@ -2288,4 +2290,35 @@ fn mesh_runtime_config_parses_stock_xds_allow_plaintext_canonical_forms() {
             value
         );
     }
+}
+
+/// Issue #4531. A CP that answers `RESOURCE_EXHAUSTED` is demonstrably alive:
+/// its stream admission controller refused this workload for capacity or
+/// tenancy reasons and named the saturated budget in the status message.
+/// Collapsing that into `transport_failure` would tell an operator their
+/// control plane is unreachable and discard the only actionable detail, so the
+/// refusal is its own closed-set outcome — and, because it is not an
+/// established stream going dark, it is not a liveness failure either.
+#[test]
+fn admission_refusal_is_its_own_outcome_and_not_a_liveness_failure() {
+    let refused = MeshStreamAttempt::AdmissionRefused;
+    assert_eq!(refused.as_metric_label(), "admission_refused");
+    assert_ne!(
+        refused.as_metric_label(),
+        transport_failure(false, false).as_metric_label()
+    );
+    assert_ne!(
+        refused.as_metric_label(),
+        MeshStreamAttempt::PolicyRejected.as_metric_label()
+    );
+    assert!(!refused.is_liveness_failure());
+    assert!(refused.is_endpoint_failure());
+
+    // Rotate-and-retry, matching a no-progress transport failure: another CP
+    // replica may still have capacity, and a saturated one must not be hammered
+    // by the whole refused fleet at the initial delay.
+    let disposition = refused.disposition();
+    assert_eq!(disposition, transport_failure(false, false).disposition());
+    assert!(disposition.advance_endpoint);
+    assert!(disposition.increase_backoff);
 }

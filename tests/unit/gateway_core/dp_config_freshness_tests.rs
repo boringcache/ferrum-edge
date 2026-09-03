@@ -625,3 +625,93 @@ fn the_snapshot_projection_carries_no_unbounded_identifiers() {
     assert!(STALE_ACTION_LABELS.contains(&snapshot.stale_action));
     assert!(CP_AUTHORITY_LABELS.contains(&snapshot.cp_authority));
 }
+
+// ── CP admission refusal is not authority loss (issue #4531) ───────────────
+
+/// A `RESOURCE_EXHAUSTED` refusal proves the CP is alive and answering, so the
+/// DP client routes it to `record_cp_reconnecting` rather than
+/// `record_cp_authority_lost`. A previously-connected DP must therefore stay at
+/// `Reconnecting` and must NOT latch the max-stale bound, while an ordinary
+/// transport error on the same tracker still does.
+#[test]
+fn admission_refusal_keeps_a_connected_dp_reconnecting_without_latching() {
+    let epoch = epoch();
+    let freshness = DpConfigFreshness::new_at(epoch, MAX_STALE, StaleAction::FailClosed);
+    freshness.record_cp_connected_at(epoch);
+    freshness.record_snapshot_applied_at(epoch);
+
+    // The refusal path: count it, then record a reconnect (authority retained).
+    freshness.record_cp_admission_refused();
+    freshness.record_cp_reconnecting_at(at(epoch, 1));
+
+    let snapshot = freshness.evaluate_at(at(epoch, MAX_STALE.as_secs() + 60));
+    assert_eq!(snapshot.cp_authority, "reconnecting");
+    assert_eq!(snapshot.cp_admission_refused_total, 1);
+    assert!(
+        !snapshot.stale,
+        "an admission refusal must not latch the max-stale bound: the CP answered"
+    );
+    assert!(!snapshot.new_traffic_blocked);
+}
+
+/// The compensating signal is monotonic and independent of every other counter,
+/// so a suppressed authority loss stays visible on `/metrics`.
+#[test]
+fn admission_refusal_counter_is_monotonic_and_independent() {
+    let epoch = epoch();
+    let freshness = DpConfigFreshness::new_at(epoch, MAX_STALE, StaleAction::FailClosed);
+    assert_eq!(freshness.evaluate_at(epoch).cp_admission_refused_total, 0);
+
+    for expected in 1..=3 {
+        freshness.record_cp_admission_refused();
+        let snapshot = freshness.evaluate_at(epoch);
+        assert_eq!(snapshot.cp_admission_refused_total, expected);
+        assert_eq!(snapshot.rejected_total, 0);
+        assert_eq!(snapshot.apply_failed_total, 0);
+        assert_eq!(snapshot.applied_total, 0);
+    }
+}
+
+/// The same tracker still latches on a genuine transport error, so the
+/// refusal branch narrows nothing else.
+#[test]
+fn plain_transport_error_still_latches_after_an_admission_refusal() {
+    let epoch = epoch();
+    let freshness = DpConfigFreshness::new_at(epoch, MAX_STALE, StaleAction::FailClosed);
+    freshness.record_cp_connected_at(epoch);
+    freshness.record_snapshot_applied_at(epoch);
+
+    freshness.record_cp_admission_refused();
+    freshness.record_cp_reconnecting_at(at(epoch, 1));
+    assert!(!freshness.evaluate_at(at(epoch, 2)).stale);
+
+    // The next attempt is an ordinary connection error: authority is lost.
+    freshness.record_cp_authority_lost_at(at(epoch, 3));
+    let snapshot = freshness.evaluate_at(at(epoch, MAX_STALE.as_secs() + 1));
+    assert_eq!(snapshot.cp_authority, "lost");
+    assert!(snapshot.stale, "a dead CP must still latch the bound");
+    assert!(snapshot.new_traffic_blocked);
+    // The refusal counter is unaffected by the later transport failure.
+    assert_eq!(snapshot.cp_admission_refused_total, 1);
+}
+
+/// A DP that never connected is already `Lost`, so an admission refusal on a
+/// cold start cannot postpone the boundary: `record_cp_reconnecting` only
+/// promotes from `Connected`.
+#[test]
+fn admission_refusal_does_not_mask_a_cold_start_that_never_seated() {
+    let epoch = epoch();
+    let freshness = DpConfigFreshness::new_at(epoch, MAX_STALE, StaleAction::FailClosed);
+    assert_eq!(freshness.cp_authority(), CpAuthority::Lost);
+
+    freshness.record_cp_admission_refused();
+    freshness.record_cp_reconnecting_at(at(epoch, 1));
+
+    assert_eq!(freshness.cp_authority(), CpAuthority::Lost);
+    let snapshot = freshness.evaluate_at(at(epoch, MAX_STALE.as_secs() + 1));
+    assert!(
+        snapshot.stale,
+        "a cold start that never got seated still degrades on schedule"
+    );
+    assert_eq!(snapshot.cp_admission_refused_total, 1);
+}

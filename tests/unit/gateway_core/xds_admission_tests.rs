@@ -13,6 +13,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use ferrum_edge::grpc::admission::{CP_GRPC_NEAR_CEILING_PERCENT, cp_grpc_budget_is_near_ceiling};
 use ferrum_edge::xds::admission::{
     DEFAULT_XDS_FIRST_REQUEST_TIMEOUT_SECS, DEFAULT_XDS_MAX_ACTIVE_NODES,
     DEFAULT_XDS_MAX_NODE_ID_BYTES, DEFAULT_XDS_MAX_STREAMS_PER_NAMESPACE,
@@ -927,4 +928,128 @@ async fn aborting_a_permit_holding_task_returns_the_controller_to_baseline() {
     let _reused = controller
         .reserve_stream("ferrum", &principal)
         .expect("capacity is available again");
+}
+
+// ── Workload-scale defaults and the near-ceiling boundary (issue #4531) ────
+
+/// The shipped budgets are pinned as constants so a silent change is caught.
+///
+/// The sizing unit is one stream per DP **or per mesh workload**: every
+/// injected sidecar and every ambient node proxy holds one `MeshSubscribe`
+/// stream, so a per-DP-fleet number wedges pods in `Init:0/2` on a mesh
+/// install. The per-node ceiling is deliberately NOT part of the resizing —
+/// it is per node state key, not per fleet.
+#[test]
+fn shipped_stream_budgets_are_sized_per_mesh_workload() {
+    assert_eq!(DEFAULT_XDS_MAX_TOTAL_STREAMS, 8192);
+    assert_eq!(DEFAULT_XDS_MAX_STREAMS_PER_NAMESPACE, 4096);
+    assert_eq!(DEFAULT_XDS_MAX_STREAMS_PER_PRINCIPAL, 2048);
+    assert_eq!(DEFAULT_XDS_MAX_STREAMS_PER_NODE, 4);
+    assert_eq!(DEFAULT_XDS_MAX_ACTIVE_NODES, 16384);
+}
+
+/// The documented invariant: the total-stream budget saturates BEFORE the
+/// distinct-node ceiling, so the node-cardinality bound stays defense in depth
+/// and never becomes a surprise refusal on a large fleet.
+#[test]
+// The assertions below compare shipped `const` values on purpose: they pin the
+// documented ordering of the default budgets, so a constant edit that breaks it
+// fails this test rather than a reviewer's eye.
+#[allow(clippy::assertions_on_constants)]
+fn total_stream_budget_saturates_before_the_distinct_node_ceiling() {
+    assert!(
+        DEFAULT_XDS_MAX_ACTIVE_NODES > DEFAULT_XDS_MAX_TOTAL_STREAMS,
+        "max_active_nodes must exceed max_total_streams or it silently becomes the binding budget"
+    );
+    // The inner budgets stay below their enclosing scope, so precedence is
+    // meaningful rather than decorative.
+    assert!(DEFAULT_XDS_MAX_STREAMS_PER_NAMESPACE <= DEFAULT_XDS_MAX_TOTAL_STREAMS);
+    assert!(DEFAULT_XDS_MAX_STREAMS_PER_PRINCIPAL <= DEFAULT_XDS_MAX_STREAMS_PER_NAMESPACE);
+    assert!(DEFAULT_XDS_MAX_STREAMS_PER_NODE <= DEFAULT_XDS_MAX_STREAMS_PER_PRINCIPAL);
+}
+
+/// The 80% boundary is exact on both sides for every shipped layer, so the
+/// warning fires with real headroom left rather than at the first refusal.
+#[test]
+fn near_ceiling_boundary_is_exact_for_every_layer() {
+    assert_eq!(CP_GRPC_NEAR_CEILING_PERCENT, 80);
+
+    for limit in [
+        DEFAULT_XDS_MAX_TOTAL_STREAMS,
+        DEFAULT_XDS_MAX_STREAMS_PER_NAMESPACE,
+        DEFAULT_XDS_MAX_STREAMS_PER_PRINCIPAL,
+        DEFAULT_XDS_MAX_STREAMS_PER_NODE,
+        DEFAULT_XDS_MAX_ACTIVE_NODES,
+    ] {
+        // Ceiling division: the boundary is `current * 100 >= limit * 80`, so
+        // the smallest warning occupancy is `ceil(limit * 80 / 100)`.
+        let threshold = (limit * CP_GRPC_NEAR_CEILING_PERCENT).div_ceil(100);
+        assert!(
+            !cp_grpc_budget_is_near_ceiling(threshold - 1, limit),
+            "limit {limit}: occupancy {} is below 80% and must not warn",
+            threshold - 1
+        );
+        assert!(
+            cp_grpc_budget_is_near_ceiling(threshold, limit),
+            "limit {limit}: occupancy {threshold} is exactly 80% and must warn"
+        );
+        assert!(cp_grpc_budget_is_near_ceiling(limit, limit));
+    }
+}
+
+/// Small ceilings still land on the documented rounding: the boundary is
+/// `current * 100 >= limit * 80`, evaluated in integers.
+#[test]
+fn near_ceiling_boundary_rounds_deterministically_on_small_limits() {
+    // limit 4 → warn at 3.2, i.e. from 4 (3*100 = 300 < 320).
+    assert!(!cp_grpc_budget_is_near_ceiling(3, 4));
+    assert!(cp_grpc_budget_is_near_ceiling(4, 4));
+    // limit 5 → warn at 4 exactly (4*100 = 400 >= 400).
+    assert!(!cp_grpc_budget_is_near_ceiling(3, 5));
+    assert!(cp_grpc_budget_is_near_ceiling(4, 5));
+    // limit 1 → the first stream is already at the ceiling.
+    assert!(cp_grpc_budget_is_near_ceiling(1, 1));
+    assert!(!cp_grpc_budget_is_near_ceiling(0, 1));
+}
+
+/// A ceiling of `0` is the documented unbounded posture. There is no ceiling to
+/// approach, so it must never warn — at any occupancy, including saturating
+/// arithmetic extremes.
+#[test]
+fn unbounded_layer_never_reports_near_ceiling() {
+    for current in [0usize, 1, 1024, usize::MAX] {
+        assert!(
+            !cp_grpc_budget_is_near_ceiling(current, 0),
+            "an unbounded (0) budget has no ceiling to approach"
+        );
+    }
+    // A saturating occupancy against a finite ceiling is still near it, and
+    // must not panic on the internal multiplication.
+    assert!(cp_grpc_budget_is_near_ceiling(usize::MAX, 8192));
+}
+
+/// The reservation path stays correct with the warning wired in: occupancy
+/// accounting, refusal precedence, and permit release are unchanged.
+#[test]
+fn near_ceiling_warning_does_not_change_admission_outcomes() {
+    let controller = controller(XdsAdmissionLimits {
+        max_total_streams: 5,
+        ..generous()
+    });
+    let principal = principal_key("sub");
+    let mut permits = Vec::new();
+    for _ in 0..5 {
+        permits.push(
+            controller
+                .reserve_stream("ferrum", &principal)
+                .expect("within the total budget"),
+        );
+    }
+    assert_eq!(controller.active_streams(), 5);
+    assert!(matches!(
+        controller.reserve_stream("ferrum", &principal),
+        Err(XdsAdmissionRejection::TotalStreams)
+    ));
+    drop(permits);
+    assert_eq!(controller.active_streams(), 0);
 }

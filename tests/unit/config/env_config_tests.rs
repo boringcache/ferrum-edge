@@ -163,10 +163,12 @@ fn test_xds_enabled_defaults_false() {
             assert_eq!(config.xds_max_streams_per_node, 4);
             // Issue #3741: every aggregate ADS budget defaults to a finite
             // value; none may be silently unbounded.
-            assert_eq!(config.xds_max_total_streams, 1024);
-            assert_eq!(config.xds_max_streams_per_namespace, 512);
-            assert_eq!(config.xds_max_streams_per_principal, 256);
-            assert_eq!(config.xds_max_active_nodes, 2048);
+            // Sized per DP OR per mesh workload (issue #4531): every injected
+            // sidecar and ambient node proxy holds one MeshSubscribe stream.
+            assert_eq!(config.xds_max_total_streams, 8192);
+            assert_eq!(config.xds_max_streams_per_namespace, 4096);
+            assert_eq!(config.xds_max_streams_per_principal, 2048);
+            assert_eq!(config.xds_max_active_nodes, 16384);
             assert_eq!(config.xds_max_node_id_bytes, 253);
             assert_eq!(config.xds_first_request_timeout_seconds, 30);
             assert!(!config.xds_allow_unbounded_stream_limits);

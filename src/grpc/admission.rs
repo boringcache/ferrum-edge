@@ -55,8 +55,8 @@
 //! [`CpGrpcAdmissionRejection::metric_reason`] label.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
@@ -88,23 +88,31 @@ impl CpGrpcStreamSurface {
 
 /// Default ceiling on total concurrent long-lived configuration streams.
 ///
-/// Numerically matches the default CP gRPC connection ceiling
-/// (`FERRUM_CP_GRPC_MAX_CONNECTIONS`), but that ceiling bounds *connections*,
-/// not streams: one HTTP/2 connection multiplexes up to
-/// `FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS` (default 1000) concurrent ADS
-/// streams, so the transport budget does not bound ADS occupancy. This is the
-/// only aggregate CP configuration-stream bound.
-pub const DEFAULT_CP_GRPC_MAX_TOTAL_STREAMS: usize = 1024;
-/// Default ceiling on concurrent ADS streams for one namespace/tenant.
-pub const DEFAULT_CP_GRPC_MAX_STREAMS_PER_NAMESPACE: usize = 512;
-/// Default ceiling on concurrent ADS streams for one authenticated principal
-/// (JWT `sub`). Deliberately generous: fleets that share one credential across
-/// every DP present a single principal, and this must not become a surprise
-/// outage for them while still bounding one credential's aggregate footprint.
-pub const DEFAULT_CP_GRPC_MAX_STREAMS_PER_PRINCIPAL: usize = 256;
-/// Default per-node concurrent ADS stream ceiling. A healthy DP keeps a single
-/// ADS stream; the small headroom tolerates brief overlap during a client
-/// reconnect (old stream draining while the new one establishes).
+/// **The sizing unit is one stream per DP *or per mesh workload*** (issue
+/// #4531): every injected sidecar and every ambient node proxy holds one
+/// `MeshSubscribe` stream, so this budget counts workloads, not control-plane
+/// clients. It is deliberately *not* tied to the default CP gRPC connection
+/// ceiling (`FERRUM_CP_GRPC_MAX_CONNECTIONS`), which bounds *connections*, not
+/// streams: one HTTP/2 connection multiplexes up to
+/// `FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS` (default 1000) concurrent
+/// streams, so the transport budget does not bound stream occupancy. This is
+/// the only aggregate CP configuration-stream bound.
+pub const DEFAULT_CP_GRPC_MAX_TOTAL_STREAMS: usize = 8192;
+/// Default ceiling on concurrent configuration streams for one
+/// namespace/tenant. The unit is one stream per DP **or per mesh workload**, so
+/// this is a workload count for a mesh-enabled namespace, not a tenant count.
+pub const DEFAULT_CP_GRPC_MAX_STREAMS_PER_NAMESPACE: usize = 4096;
+/// Default ceiling on concurrent configuration streams for one authenticated
+/// principal (JWT `sub`). One stream per DP **or per mesh workload**, and every
+/// workload sharing a ServiceAccount token presents the SAME principal, so this
+/// must be sized against the fleet rather than against the tenant count. It
+/// still bounds one compromised credential's aggregate footprint.
+pub const DEFAULT_CP_GRPC_MAX_STREAMS_PER_PRINCIPAL: usize = 2048;
+/// Default per-node concurrent configuration stream ceiling. A healthy DP or
+/// mesh workload keeps a single stream; the small headroom tolerates brief
+/// overlap during a client reconnect (old stream draining while the new one
+/// establishes). Deliberately unchanged by the issue #4531 resizing: this one
+/// is per node state key, not per fleet.
 pub const DEFAULT_CP_GRPC_MAX_STREAMS_PER_NODE: usize = 4;
 /// Default ceiling on distinct active node state keys. Bounds the node-scoped
 /// maps (snapshot cache, nonce tracker, workload identity, waypoint, scoping).
@@ -115,10 +123,15 @@ pub const DEFAULT_CP_GRPC_MAX_STREAMS_PER_NODE: usize = 4;
 /// budget therefore only *binds* when it is set below
 /// [`DEFAULT_CP_GRPC_MAX_TOTAL_STREAMS`] / `FERRUM_XDS_MAX_TOTAL_STREAMS`, or when
 /// the total-stream budget is unbounded (`0`). At the shipped defaults
-/// (`2048` > `1024`) it is a defense-in-depth ceiling that the total-stream
+/// (`16384` > `8192`) it is a defense-in-depth ceiling that the total-stream
 /// budget reaches first — deliberately, so tightening the node map bound is an
 /// explicit operator choice rather than a surprise refusal on a large fleet.
-pub const DEFAULT_CP_GRPC_MAX_ACTIVE_NODES: usize = 2048;
+///
+/// The unit here is also one node state key per DP **or per mesh workload**.
+/// Because the total-stream budget saturates first, the node-scoped maps hold
+/// at most `DEFAULT_CP_GRPC_MAX_TOTAL_STREAMS` entries in practice, so raising
+/// this ceiling does not raise the resident node-map footprint on its own.
+pub const DEFAULT_CP_GRPC_MAX_ACTIVE_NODES: usize = 16384;
 /// Default maximum `Node.id` length in UTF-8 bytes. 253 is the DNS name
 /// ceiling, which covers every hostname / pod-identity shape Ferrum's own DP
 /// produces.
@@ -314,6 +327,77 @@ pub fn record_native_rejection(surface: CpGrpcStreamSurface, rejection: CpGrpcAd
     );
 }
 
+/// Occupancy (percent of the configured ceiling) at which a budget layer starts
+/// emitting the near-ceiling warning (issue #4531). Chosen so an operator sees
+/// the signal with meaningful headroom left rather than at the first refusal.
+pub const CP_GRPC_NEAR_CEILING_PERCENT: usize = 80;
+
+/// Minimum interval between near-ceiling warnings for ONE budget layer. The
+/// warning is a capacity-planning signal, not a per-stream event, so a fleet
+/// reconnect storm must not turn it into a log flood.
+const CP_GRPC_NEAR_CEILING_WARN_INTERVAL_MS: u64 = 60_000;
+
+/// True when `current` occupancy has reached [`CP_GRPC_NEAR_CEILING_PERCENT`]
+/// of `limit`. A `limit` of `0` is the documented "unbounded" posture and has
+/// no ceiling to approach, so it never warns.
+///
+/// Uses saturating integer arithmetic rather than floating point so the
+/// boundary is exact and cannot overflow on an operator-supplied ceiling.
+pub fn cp_grpc_budget_is_near_ceiling(current: usize, limit: usize) -> bool {
+    if limit == 0 {
+        return false;
+    }
+    current.saturating_mul(100) >= limit.saturating_mul(CP_GRPC_NEAR_CEILING_PERCENT)
+}
+
+/// One admission budget layer, for the rate-limited near-ceiling warning.
+///
+/// Every field of the emitted warning is a compile-time constant or an integer
+/// count: no namespace, principal, or node id ever reaches the log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CpGrpcBudgetLayer {
+    TotalStreams,
+    NamespaceStreams,
+    PrincipalStreams,
+    NodeStreams,
+    NodeCardinality,
+}
+
+impl CpGrpcBudgetLayer {
+    /// Dense index into the per-layer last-warned timestamps.
+    const COUNT: usize = 5;
+
+    fn index(self) -> usize {
+        match self {
+            Self::TotalStreams => 0,
+            Self::NamespaceStreams => 1,
+            Self::PrincipalStreams => 2,
+            Self::NodeStreams => 3,
+            Self::NodeCardinality => 4,
+        }
+    }
+
+    fn scope(self) -> &'static str {
+        match self {
+            Self::TotalStreams => "total_streams",
+            Self::NamespaceStreams => "namespace_streams",
+            Self::PrincipalStreams => "principal_streams",
+            Self::NodeStreams => "node_streams",
+            Self::NodeCardinality => "node_cardinality",
+        }
+    }
+
+    fn env_var(self) -> &'static str {
+        match self {
+            Self::TotalStreams => "FERRUM_XDS_MAX_TOTAL_STREAMS",
+            Self::NamespaceStreams => "FERRUM_XDS_MAX_STREAMS_PER_NAMESPACE",
+            Self::PrincipalStreams => "FERRUM_XDS_MAX_STREAMS_PER_PRINCIPAL",
+            Self::NodeStreams => "FERRUM_XDS_MAX_STREAMS_PER_NODE",
+            Self::NodeCardinality => "FERRUM_XDS_MAX_ACTIVE_NODES",
+        }
+    }
+}
+
 /// Operator-configured ADS admission budgets.
 ///
 /// `0` means "unbounded" for every count and for
@@ -413,6 +497,13 @@ struct CpGrpcAdmissionState {
     per_principal: DashMap<String, usize>,
     per_node: DashMap<String, usize>,
     active_nodes: AtomicUsize,
+    /// Monotonic base for the near-ceiling warn rate limiter. No wall clock
+    /// participates, so an NTP step cannot suppress or duplicate a warning.
+    warn_epoch: Instant,
+    /// Per-layer last-warned stamp, stored as `offset_ms + 1` so `0` means
+    /// "never warned". Plain atomics: the reservation path takes no lock and
+    /// allocates nothing for the common (not-near-ceiling) case.
+    near_ceiling_warned_ms: [AtomicU64; CpGrpcBudgetLayer::COUNT],
 }
 
 impl CpGrpcAdmissionController {
@@ -425,6 +516,8 @@ impl CpGrpcAdmissionController {
                 per_principal: DashMap::new(),
                 per_node: DashMap::new(),
                 active_nodes: AtomicUsize::new(0),
+                warn_epoch: Instant::now(),
+                near_ceiling_warned_ms: std::array::from_fn(|_| AtomicU64::new(0)),
             }),
         }
     }
@@ -508,28 +601,46 @@ impl CpGrpcAdmissionController {
         namespace: &str,
         principal_key: &str,
     ) -> Result<CpGrpcStreamPermit, CpGrpcAdmissionRejection> {
-        if !self.try_acquire_total() {
+        let Some(total_after) = self.try_acquire_total() else {
             return Err(CpGrpcAdmissionRejection::TotalStreams);
-        }
-        if !try_acquire_scope(
+        };
+        let Some(namespace_after) = try_acquire_scope(
             &self.inner.per_namespace,
             namespace,
             self.inner.limits.max_streams_per_namespace,
-        ) {
+        ) else {
             // Roll the outer reservation back so a refused stream leaves no
             // partial admission state behind.
             self.release_total();
             return Err(CpGrpcAdmissionRejection::NamespaceStreams);
-        }
-        if !try_acquire_scope(
+        };
+        let Some(principal_after) = try_acquire_scope(
             &self.inner.per_principal,
             principal_key,
             self.inner.limits.max_streams_per_principal,
-        ) {
+        ) else {
             release_scope(&self.inner.per_namespace, namespace);
             self.release_total();
             return Err(CpGrpcAdmissionRejection::PrincipalStreams);
-        }
+        };
+        // Capacity planning signal: warn once per minute per layer while there
+        // is still headroom, so a fleet that is growing into a budget is
+        // visible before the first `RESOURCE_EXHAUSTED` refusal (issue #4531).
+        self.warn_if_near_ceiling(
+            CpGrpcBudgetLayer::TotalStreams,
+            total_after,
+            self.inner.limits.max_total_streams,
+        );
+        self.warn_if_near_ceiling(
+            CpGrpcBudgetLayer::NamespaceStreams,
+            namespace_after,
+            self.inner.limits.max_streams_per_namespace,
+        );
+        self.warn_if_near_ceiling(
+            CpGrpcBudgetLayer::PrincipalStreams,
+            principal_after,
+            self.inner.limits.max_streams_per_principal,
+        );
         // Exact +1 tied to successful aggregate admission only — never a
         // load-then-store of live counters (that races under concurrent
         // reserve/release and can leave a stale exported gauge).
@@ -564,11 +675,12 @@ impl CpGrpcAdmissionController {
         Ok(permit)
     }
 
-    fn try_acquire_total(&self) -> bool {
+    /// Acquire one process-wide stream slot, returning total occupancy AFTER
+    /// the acquisition, or `None` when the process budget is saturated.
+    fn try_acquire_total(&self) -> Option<usize> {
         let max = self.inner.limits.max_total_streams;
         if max == 0 {
-            self.inner.total_streams.fetch_add(1, Ordering::AcqRel);
-            return true;
+            return Some(self.inner.total_streams.fetch_add(1, Ordering::AcqRel) + 1);
         }
         self.inner
             .total_streams
@@ -579,7 +691,8 @@ impl CpGrpcAdmissionController {
                     Some(current + 1)
                 }
             })
-            .is_ok()
+            .ok()
+            .map(|previous| previous + 1)
     }
 
     fn release_total(&self) {
@@ -598,12 +711,16 @@ impl CpGrpcAdmissionController {
     /// is owed.
     fn register_node(&self, node_key: &str) -> Result<(), CpGrpcAdmissionRejection> {
         let max = self.inner.limits.max_streams_per_node;
+        let node_streams_after;
+        let cardinality_after;
         match self.inner.per_node.entry(node_key.to_string()) {
             Entry::Occupied(mut entry) => {
                 if max != 0 && *entry.get() >= max {
                     return Err(CpGrpcAdmissionRejection::NodeStreams);
                 }
                 *entry.get_mut() += 1;
+                node_streams_after = *entry.get();
+                cardinality_after = None;
             }
             Entry::Vacant(entry) => {
                 // A brand-new node consumes a distinct-node slot. The slot is
@@ -611,22 +728,80 @@ impl CpGrpcAdmissionController {
                 // thread can insert the same key concurrently and the counter
                 // stays exact. Only an atomic is touched under the lock —
                 // never `DashMap::len()`, which would take every shard lock.
-                if !self.try_acquire_node_slot() {
+                let Some(nodes_after) = self.try_acquire_node_slot() else {
                     return Err(CpGrpcAdmissionRejection::NodeCardinality);
-                }
+                };
                 entry.insert(1);
+                node_streams_after = 1;
+                cardinality_after = Some(nodes_after);
                 // Exact +1 for a newly admitted distinct node key only.
                 crate::plugins::mesh::prometheus_helpers::adjust_cp_grpc_active_node_ids(1);
             }
         }
+        // Emitted after the entry lock is released: the warn path takes no
+        // shard lock and must not extend the critical section.
+        self.warn_if_near_ceiling(CpGrpcBudgetLayer::NodeStreams, node_streams_after, max);
+        if let Some(nodes_after) = cardinality_after {
+            self.warn_if_near_ceiling(
+                CpGrpcBudgetLayer::NodeCardinality,
+                nodes_after,
+                self.inner.limits.max_active_nodes,
+            );
+        }
         Ok(())
     }
 
-    fn try_acquire_node_slot(&self) -> bool {
+    /// Emit at most one near-ceiling warning per layer per
+    /// [`CP_GRPC_NEAR_CEILING_WARN_INTERVAL_MS`] milliseconds.
+    ///
+    /// The common path is two relaxed atomic loads and no allocation: a layer
+    /// below [`CP_GRPC_NEAR_CEILING_PERCENT`] returns before it reads the
+    /// clock, and a layer that already warned recently returns before it
+    /// formats anything.
+    fn warn_if_near_ceiling(&self, layer: CpGrpcBudgetLayer, current: usize, limit: usize) {
+        if !cp_grpc_budget_is_near_ceiling(current, limit) {
+            return;
+        }
+        if !self.claim_near_ceiling_warn(layer) {
+            return;
+        }
+        tracing::warn!(
+            scope = layer.scope(),
+            env_var = layer.env_var(),
+            current,
+            limit,
+            "CP gRPC configuration-stream budget is near its ceiling; raise the named budget or \
+             add CP replicas before subscriptions are refused with RESOURCE_EXHAUSTED. The sizing \
+             unit is one stream per DP or per mesh workload"
+        );
+    }
+
+    /// Rate-limit gate for one layer. Returns `true` for exactly one caller per
+    /// interval: the CAS makes concurrent reservations agree on a single winner
+    /// without a lock.
+    fn claim_near_ceiling_warn(&self, layer: CpGrpcBudgetLayer) -> bool {
+        let slot = &self.inner.near_ceiling_warned_ms[layer.index()];
+        let last = slot.load(Ordering::Relaxed);
+        // `offset_ms + 1`, so `0` is unambiguously "never warned".
+        // Saturating rather than wrapping: a u64 of milliseconds is ~584
+        // million years, so the clamp is unreachable and only keeps the stamp
+        // monotonic in the impossible case.
+        let now = u64::try_from(self.inner.warn_epoch.elapsed().as_millis())
+            .unwrap_or(u64::MAX - 1)
+            .saturating_add(1);
+        if last != 0 && now.saturating_sub(last) < CP_GRPC_NEAR_CEILING_WARN_INTERVAL_MS {
+            return false;
+        }
+        slot.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// Acquire one distinct-node slot, returning node cardinality AFTER the
+    /// acquisition, or `None` when the node-cardinality budget is saturated.
+    fn try_acquire_node_slot(&self) -> Option<usize> {
         let max = self.inner.limits.max_active_nodes;
         if max == 0 {
-            self.inner.active_nodes.fetch_add(1, Ordering::AcqRel);
-            return true;
+            return Some(self.inner.active_nodes.fetch_add(1, Ordering::AcqRel) + 1);
         }
         self.inner
             .active_nodes
@@ -637,7 +812,8 @@ impl CpGrpcAdmissionController {
                     Some(current + 1)
                 }
             })
-            .is_ok()
+            .ok()
+            .map(|previous| previous + 1)
     }
 
     /// Release one stream from a node state key. When it is the last stream,
@@ -688,20 +864,23 @@ impl CpGrpcAdmissionController {
     }
 }
 
-fn try_acquire_scope(map: &DashMap<String, usize>, key: &str, max: usize) -> bool {
+/// Acquire one slot in a keyed scope, returning the scope's occupancy AFTER the
+/// acquisition (so the caller can evaluate the near-ceiling boundary without a
+/// second map lookup), or `None` when the scope is saturated.
+fn try_acquire_scope(map: &DashMap<String, usize>, key: &str, max: usize) -> Option<usize> {
     match map.entry(key.to_string()) {
         Entry::Occupied(mut entry) => {
             if max != 0 && *entry.get() >= max {
-                return false;
+                return None;
             }
             *entry.get_mut() += 1;
-            true
+            Some(*entry.get())
         }
         // A first stream is always admitted, so a ceiling of 1 admits exactly
         // one concurrent stream.
         Entry::Vacant(entry) => {
             entry.insert(1);
-            true
+            Some(1)
         }
     }
 }
