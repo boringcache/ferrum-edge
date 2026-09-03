@@ -2841,12 +2841,129 @@ async fn utf16_body_rules_block_declared_endianness_and_keep_utf8_coverage() {
     assert!(matches!(benign_result, PluginResult::Continue));
     assert!(!monitored(&benign_ctx, "FE-SSRF-001"));
 
+    // A single dangling byte must not disable transcoding: WHATWG
+    // `TextDecoder`, `new String(b, "UTF-16LE")`, and .NET
+    // `Encoding.Unicode` all substitute U+FFFD and keep parsing, so the
+    // backend still sees the payload. Decode lossily and block.
     let mut truncated = encode_utf16(payload, false);
     truncated.pop();
     let (truncated_result, truncated_ctx) =
         scan_body_with_content_type(&plugin, "text/plain; charset=utf-16le", &truncated).await;
-    assert!(matches!(truncated_result, PluginResult::Continue));
-    assert!(!monitored(&truncated_ctx, "FE-SSRF-001"));
+    assert!(matches!(truncated_result, PluginResult::Reject { .. }));
+    assert!(monitored(&truncated_ctx, "FE-SSRF-001"));
+}
+
+#[tokio::test]
+async fn utf16_charset_bom_disagreement_scans_both_readings() {
+    let plugin = recommended_enforcing_waf();
+    let payload = "id=1 UNION SELECT password FROM users";
+    let form_le = "application/x-www-form-urlencoded; charset=utf-16le";
+
+    // `FE FF` is a UTF-16BE BOM, but the declaration says little-endian. A
+    // backend honouring the declared charset reads `FE FF` as the harmless
+    // noncharacter U+FFFE and then the payload, so dropping every view on the
+    // disagreement is a one-shot bypass. Both readings must be scanned.
+    let hostile = with_bom(&[0xFE, 0xFF], &encode_utf16(payload, false));
+    let (result, ctx) = scan_body_with_content_type(&plugin, form_le, &hostile).await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "declaration-honouring reading of a charset/BOM disagreement must be scanned"
+    );
+    assert!(monitored(&ctx, "FE-SQLI-001-B"));
+
+    // The BOM-honouring reading is still scanned too: here the declaration is
+    // little-endian while the body really is big-endian behind its BOM.
+    let bom_reading = with_bom(&[0xFE, 0xFF], &encode_utf16(payload, true));
+    let (bom_result, bom_ctx) = scan_body_with_content_type(&plugin, form_le, &bom_reading).await;
+    assert!(matches!(bom_result, PluginResult::Reject { .. }));
+    assert!(monitored(&bom_ctx, "FE-SQLI-001-B"));
+
+    let (benign_result, benign_ctx) = scan_body_with_content_type(
+        &plugin,
+        form_le,
+        &with_bom(&[0xFE, 0xFF], &encode_utf16("ordinary request body", false)),
+    )
+    .await;
+    assert!(matches!(benign_result, PluginResult::Continue));
+    assert!(!monitored(&benign_ctx, "FE-SQLI-001-B"));
+}
+
+#[tokio::test]
+async fn whatwg_utf16le_charset_labels_transcode_like_utf16le() {
+    let plugin = recommended_enforcing_waf();
+    let payload = "id=1 UNION SELECT password FROM users";
+    let body = encode_utf16(payload, false);
+
+    // WHATWG lists these as UTF-16LE labels. Before they were recognized the
+    // body was scanned as NUL-interleaved ASCII and no body-text rule matched.
+    for label in [
+        "utf-16le",
+        "unicode",
+        "ucs-2",
+        "iso-10646-ucs-2",
+        "unicodefeff",
+        "csunicode",
+    ] {
+        let content_type = format!("application/x-www-form-urlencoded; charset={label}");
+        let (result, ctx) = scan_body_with_content_type(&plugin, &content_type, &body).await;
+        assert!(
+            matches!(result, PluginResult::Reject { .. }),
+            "charset={label} must transcode like utf-16le"
+        );
+        assert!(monitored(&ctx, "FE-SQLI-001-B"), "charset={label}");
+    }
+
+    let (benign_result, benign_ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/x-www-form-urlencoded; charset=unicode",
+        &encode_utf16("ordinary request body", false),
+    )
+    .await;
+    assert!(matches!(benign_result, PluginResult::Continue));
+    assert!(!monitored(&benign_ctx, "FE-SQLI-001-B"));
+}
+
+#[tokio::test]
+async fn uninspectable_declared_charset_records_encoding_special() {
+    // FE-ENCODING-001 is opt-in-enforce, so name it explicitly to assert on
+    // the reject rather than only on the monitored hit.
+    let plugin = Waf::new(&json!({
+        "rule_modes": { "FE-ENCODING-001": "enforce" }
+    }))
+    .unwrap();
+
+    // UTF-7 encodes `<script>` as `+ADw-script+AD4-`: pure ASCII cover text
+    // that no body-text rule matches, while the backend parses a script tag.
+    // The WAF does not transcode UTF-7, so it reports the charset itself.
+    let (utf7_result, utf7_ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/x-www-form-urlencoded; charset=utf-7",
+        b"q=+ADw-script+AD4-",
+    )
+    .await;
+    assert!(matches!(utf7_result, PluginResult::Reject { .. }));
+    assert!(monitored(&utf7_ctx, "FE-ENCODING-001"));
+
+    for label in ["iso-2022-jp", "hz-gb-2312", "ibm037", "cp037"] {
+        let content_type = format!("application/x-www-form-urlencoded; charset={label}");
+        let (result, ctx) =
+            scan_body_with_content_type(&plugin, &content_type, b"q=+ADw-script+AD4-").await;
+        assert!(
+            matches!(result, PluginResult::Reject { .. }),
+            "charset={label} must be reported"
+        );
+        assert!(monitored(&ctx, "FE-ENCODING-001"), "charset={label}");
+    }
+
+    // An ordinary UTF-8 body with the same bytes is not flagged.
+    let (utf8_result, utf8_ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/json; charset=utf-8",
+        br#"{"q":"+ADw-script+AD4-"}"#,
+    )
+    .await;
+    assert!(matches!(utf8_result, PluginResult::Continue));
+    assert!(!monitored(&utf8_ctx, "FE-ENCODING-001"));
 }
 
 #[tokio::test]
@@ -2985,11 +3102,13 @@ async fn ambiguous_ffef0000_prefix_scans_both_utf32le_and_utf16le_readings() {
 }
 
 #[tokio::test]
-async fn utf32_malformed_bodies_retain_raw_lossy_scan() {
+async fn utf32_malformed_bodies_decode_lossily_and_still_block() {
     let plugin = recommended_enforcing_waf();
     let payload = "id=1 UNION SELECT password FROM users";
     let form_le = "application/x-www-form-urlencoded; charset=utf-32le";
 
+    // A trailing partial code unit substitutes one U+FFFD; the whole quads
+    // before it still decode, so the payload is inspected.
     let mut truncated = encode_utf32(payload, false);
     truncated.pop();
     assert!(
@@ -2998,34 +3117,43 @@ async fn utf32_malformed_bodies_retain_raw_lossy_scan() {
     );
     let (truncated_result, truncated_ctx) =
         scan_body_with_content_type(&plugin, form_le, &truncated).await;
-    assert!(matches!(truncated_result, PluginResult::Continue));
-    assert!(!monitored(&truncated_ctx, "FE-SQLI-001-B"));
+    assert!(matches!(truncated_result, PluginResult::Reject { .. }));
+    assert!(monitored(&truncated_ctx, "FE-SQLI-001-B"));
 
     // Surrogate-range code unit in the middle of an otherwise-valid payload.
+    // One malformed unit becomes U+FFFD rather than discarding every view.
     let mut surrogate_range = encode_utf32("id=1 ", false);
     surrogate_range.extend_from_slice(&0xD800u32.to_le_bytes());
     surrogate_range.extend_from_slice(&encode_utf32("UNION SELECT password FROM users", false));
     let (surrogate_result, surrogate_ctx) =
         scan_body_with_content_type(&plugin, form_le, &surrogate_range).await;
-    assert!(matches!(surrogate_result, PluginResult::Continue));
-    assert!(!monitored(&surrogate_ctx, "FE-SQLI-001-B"));
+    assert!(matches!(surrogate_result, PluginResult::Reject { .. }));
+    assert!(monitored(&surrogate_ctx, "FE-SQLI-001-B"));
 
-    // Lone surrogate: a single UTF-32 code unit in U+D800..=U+DFFF, then
-    // the attack payload. Fail closed on the whole body rather than
-    // skipping the surrogate and scanning the rest.
+    // Lone surrogate: a single UTF-32 code unit in U+D800..=U+DFFF, then the
+    // attack payload. Substitute and keep scanning the rest — refusing the
+    // whole body here is a one-byte bypass.
     let mut lone_surrogate = 0xDC00u32.to_le_bytes().to_vec();
     lone_surrogate.extend_from_slice(&encode_utf32(payload, false));
     let (lone_result, lone_ctx) =
         scan_body_with_content_type(&plugin, form_le, &lone_surrogate).await;
-    assert!(matches!(lone_result, PluginResult::Continue));
-    assert!(!monitored(&lone_ctx, "FE-SQLI-001-B"));
+    assert!(matches!(lone_result, PluginResult::Reject { .. }));
+    assert!(monitored(&lone_ctx, "FE-SQLI-001-B"));
 
     let mut over_max = encode_utf32("id=1 ", false);
     over_max.extend_from_slice(&0x110000u32.to_le_bytes());
     over_max.extend_from_slice(&encode_utf32("UNION SELECT password FROM users", false));
     let (over_result, over_ctx) = scan_body_with_content_type(&plugin, form_le, &over_max).await;
-    assert!(matches!(over_result, PluginResult::Continue));
-    assert!(!monitored(&over_ctx, "FE-SQLI-001-B"));
+    assert!(matches!(over_result, PluginResult::Reject { .. }));
+    assert!(monitored(&over_ctx, "FE-SQLI-001-B"));
+
+    // Lossy decoding must not manufacture hits: a benign malformed body is
+    // still allowed through.
+    let mut benign = encode_utf32("ordinary request body", false);
+    benign.pop();
+    let (benign_result, benign_ctx) = scan_body_with_content_type(&plugin, form_le, &benign).await;
+    assert!(matches!(benign_result, PluginResult::Continue));
+    assert!(!monitored(&benign_ctx, "FE-SQLI-001-B"));
 }
 
 #[tokio::test]
@@ -3073,8 +3201,11 @@ async fn utf32_transcoding_does_not_change_utf8_or_utf16_body_matches() {
     let (truncated_result, truncated_ctx) =
         scan_body_with_content_type(&plugin, "text/plain; charset=utf-16le", &truncated_utf16)
             .await;
-    assert!(matches!(truncated_result, PluginResult::Continue));
-    assert!(!monitored(&truncated_ctx, "FE-SSRF-001"));
+    // Lossy wide-charset decoding (issue #4519): a truncated trailing code unit
+    // becomes U+FFFD and the rest of the body is still inspected, so the
+    // attack text is seen and rejected instead of skipping the body.
+    assert!(matches!(truncated_result, PluginResult::Reject { .. }));
+    assert!(monitored(&truncated_ctx, "FE-SSRF-001"));
 
     let (binary_result, binary_ctx) = scan_body_with_content_type(
         &plugin,
@@ -3106,8 +3237,11 @@ async fn bare_utf32_charset_without_bom_blocks_both_endians() {
     truncated.pop();
     let (truncated_result, truncated_ctx) =
         scan_body_with_content_type(&plugin, form, &truncated).await;
-    assert!(matches!(truncated_result, PluginResult::Continue));
-    assert!(!monitored(&truncated_ctx, "FE-SQLI-001-B"));
+    // Lossy wide-charset decoding (issue #4519): a truncated trailing code unit
+    // becomes U+FFFD and the rest of the body is still inspected, so the
+    // attack text is seen and rejected instead of skipping the body.
+    assert!(matches!(truncated_result, PluginResult::Reject { .. }));
+    assert!(monitored(&truncated_ctx, "FE-SQLI-001-B"));
 }
 
 #[tokio::test]
@@ -3130,8 +3264,11 @@ async fn bare_utf16_charset_without_bom_blocks_both_endians() {
     truncated.pop();
     let (truncated_result, truncated_ctx) =
         scan_body_with_content_type(&plugin, form, &truncated).await;
-    assert!(matches!(truncated_result, PluginResult::Continue));
-    assert!(!monitored(&truncated_ctx, "FE-SQLI-001-B"));
+    // Lossy wide-charset decoding (issue #4519): a truncated trailing code unit
+    // becomes U+FFFD and the rest of the body is still inspected, so the
+    // attack text is seen and rejected instead of skipping the body.
+    assert!(matches!(truncated_result, PluginResult::Reject { .. }));
+    assert!(monitored(&truncated_ctx, "FE-SQLI-001-B"));
 }
 
 #[tokio::test]
@@ -7046,6 +7183,74 @@ fn on_body_too_large_openapi_runtime_parity() {
             "runtime must accept documented on_body_too_large value {value}"
         );
     }
+}
+
+// ── Issue #4519 coverage: BOM / declaration resolution paths ────────────────
+
+#[tokio::test]
+async fn utf32_declared_le_with_be_bom_scans_the_bom_honouring_reading() {
+    // The declaration (LE) and the BOM (BE) disagree: both readings are
+    // scanned, and the BOM-honouring one exposes the payload.
+    let plugin = recommended_enforcing_waf();
+    let payload = "id=1 UNION SELECT password FROM users";
+    let mut body = vec![0x00, 0x00, 0xFE, 0xFF];
+    body.extend(encode_utf32(payload, true));
+    let (result, ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/x-www-form-urlencoded; charset=utf-32le",
+        &body,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(monitored(&ctx, "FE-SQLI-001-B"));
+}
+
+#[tokio::test]
+async fn utf32_declared_le_with_matching_le_bom_resolves_to_one_reading() {
+    let plugin = recommended_enforcing_waf();
+    let payload = "id=1 UNION SELECT password FROM users";
+    let mut body = vec![0xFF, 0xFE, 0x00, 0x00];
+    body.extend(encode_utf32(payload, false));
+    let (result, ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/x-www-form-urlencoded; charset=utf-32le",
+        &body,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(monitored(&ctx, "FE-SQLI-001-B"));
+}
+
+#[tokio::test]
+async fn bare_utf32_charset_with_bom_resolves_from_the_bom() {
+    let plugin = recommended_enforcing_waf();
+    let payload = "id=1 UNION SELECT password FROM users";
+    let mut body = vec![0x00, 0x00, 0xFE, 0xFF];
+    body.extend(encode_utf32(payload, true));
+    let (result, ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/x-www-form-urlencoded; charset=utf-32",
+        &body,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(monitored(&ctx, "FE-SQLI-001-B"));
+}
+
+#[tokio::test]
+async fn identical_wide_readings_collapse_to_a_single_benign_view() {
+    // A bare utf-16 declaration with no BOM decodes both endiannesses; an
+    // all-zero body reads identically either way, collapses to one view, and
+    // keeps the raw/lossy scan — nothing here can trip a rule.
+    let plugin = recommended_enforcing_waf();
+    let body = vec![0u8; 8];
+    let (result, _ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/x-www-form-urlencoded; charset=utf-16",
+        &body,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Continue));
 }
 
 #[tokio::test]
