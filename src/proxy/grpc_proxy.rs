@@ -3761,7 +3761,7 @@ async fn open_hbone_grpc_sender(
 ///
 /// Deref/DerefMut to the sender, so every existing `ready()` / `send_request()`
 /// / `is_closed()` call site is unchanged.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct GrpcPooledSender {
     inner: http2::SendRequest<GrpcBody>,
     socket: Option<Arc<crate::proxy::backend_send_queue::BackendSocketHandle>>,

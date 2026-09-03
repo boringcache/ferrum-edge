@@ -73,7 +73,7 @@ thread_local! {
 /// Deref/DerefMut to the sender so every existing `ready()` / `send_request()` /
 /// `is_closed()` call site is unchanged; cloning is one `Arc` bump on top of
 /// hyper's own clone.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Http2Sender {
     inner: http2::SendRequest<DirectH2RequestBody>,
     socket: Option<Arc<crate::proxy::backend_send_queue::BackendSocketHandle>>,
