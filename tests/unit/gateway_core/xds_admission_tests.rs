@@ -952,6 +952,10 @@ fn shipped_stream_budgets_are_sized_per_mesh_workload() {
 /// distinct-node ceiling, so the node-cardinality bound stays defense in depth
 /// and never becomes a surprise refusal on a large fleet.
 #[test]
+// The assertions below compare shipped `const` values on purpose: they pin the
+// documented ordering of the default budgets, so a constant edit that breaks it
+// fails this test rather than a reviewer's eye.
+#[allow(clippy::assertions_on_constants)]
 fn total_stream_budget_saturates_before_the_distinct_node_ceiling() {
     assert!(
         DEFAULT_XDS_MAX_ACTIVE_NODES > DEFAULT_XDS_MAX_TOTAL_STREAMS,
