@@ -4823,7 +4823,11 @@ paths:
       description: |
         Replaces the proxy with the given body. The `id` field in the body is
         ignored — the path parameter is authoritative. `updated_at` is set
-        automatically.
+        automatically. This is a full replace: any field the body omits is
+        reset to its schema default. The one exception is `plugins` — an
+        omitted `plugins` key preserves the existing plugin associations
+        instead of detaching them; send `"plugins": []` to clear them
+        explicitly.
 
         In database mode a `200` means a covering `config_changes` generation
         is live on this process. If reload cannot apply, the API returns `503`
@@ -5605,6 +5609,17 @@ paths:
     put:
       operationId: updatePluginConfig
       summary: Update a plugin configuration
+      description: |
+        Replaces the plugin configuration with the given body. The `id` field in
+        the body is ignored — the path parameter is authoritative. This is a
+        full replace: any field the body omits is reset to its schema default.
+
+        `enabled` must be sent explicitly. Because its default is `true`, a body
+        that omits it would silently re-enable a deliberately disabled
+        configuration; such a body is rejected with `400` and nothing is
+        mutated. `POST /plugins/config` and `/batch` still default `enabled` to
+        `true` when the key is absent — a create has no prior state to
+        overwrite.
       tags: [Plugins]
       requestBody:
         required: true
@@ -5777,6 +5792,12 @@ paths:
     put:
       operationId: updateUpstream
       summary: Update an upstream
+      description: |
+        Replaces the upstream with the given body. The `id` field in the body is
+        ignored — the path parameter is authoritative. This is a full replace:
+        any field the body omits is reset to its schema default. `targets` is
+        required by the schema, so a body that omits it is rejected with `400`
+        rather than silently emptying the target list.
       tags: [Upstreams]
       requestBody:
         required: true
@@ -8935,7 +8956,13 @@ components:
           default: []
           items:
             $ref: "#/components/schemas/PluginAssociation"
-          description: Plugin configurations applied to this proxy
+          description: >-
+            Plugin configurations applied to this proxy. `PUT /proxies/{id}` is
+            presence-aware for this one field: an omitted `plugins` key
+            preserves the stored associations rather than detaching them (the
+            `default: []` would otherwise silently remove an authentication
+            plugin on a partial replace body). Send `"plugins": []` explicitly
+            to clear them; any present array replaces them wholesale.
         pool_idle_timeout_seconds:
           type: [integer, "null"]
           format: uint64
@@ -10592,6 +10619,10 @@ components:
           description: >-
             Whether the plugin is active. Disabled configs are stored but not
             constructed; enabling them performs full plugin-specific validation.
+            The `default: true` applies to `POST /plugins/config` only. `PUT
+            /plugins/config/{id}` is a full replace, so an omitted `enabled`
+            would silently re-enable a deliberately disabled config; the server
+            rejects such a body with `400` and requires the field explicitly.
         priority_override:
           type: [integer, "null"]
           minimum: 0

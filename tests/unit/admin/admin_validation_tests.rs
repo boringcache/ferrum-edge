@@ -1797,3 +1797,114 @@ fn test_consumer_update_preserves_partially_filtered_mtls_credentials() {
         "an edited mTLS value must remain an intentional replacement"
     );
 }
+
+// ---- PUT full-replace presence semantics (issue #4532) ----
+//
+// `AdminResource` is `pub(crate)`, so these assert the admission shape in
+// `src/admin/crud.rs`. End-to-end behaviour is covered by
+// `tests/integration/admin_cached_config_tests.rs`
+// (`plugin_config_put_without_enabled_is_rejected_and_row_stays_disabled`,
+// `plugin_config_post_without_enabled_is_still_accepted`, and
+// `proxy_put_omitting_plugins_preserves_associations_and_empty_array_clears_them`).
+
+#[test]
+fn raw_body_admission_is_action_aware_and_plugin_config_requires_enabled_on_put() {
+    let crud = include_str!("../../../src/admin/crud.rs");
+    assert!(
+        crud.contains("fn validate_raw_body(_body: &[u8], _action: WriteAction<'_>)"),
+        "the raw-body hook must see the write action so a rule can be PUT-only"
+    );
+    assert!(
+        crud.contains("R::validate_raw_body(body, action)"),
+        "the shared write path must pass its action to the raw-body hook"
+    );
+
+    let plugin_impl = crud
+        .find("impl AdminResource for PluginConfig {")
+        .expect("PluginConfig admission impl must exist");
+    let next_impl = crud[plugin_impl + 1..]
+        .find("\nimpl AdminResource for ")
+        .map(|offset| plugin_impl + 1 + offset)
+        .unwrap_or(crud.len());
+    let plugin_body = &crud[plugin_impl..next_impl];
+    assert!(
+        plugin_body.contains("fn validate_raw_body(body: &[u8], action: WriteAction<'_>)"),
+        "PluginConfig must override the raw-body hook"
+    );
+    assert!(
+        plugin_body.contains("let WriteAction::Update { .. } = action else {"),
+        "the presence rule must be scoped to PUT; POST keeps defaulting `enabled`"
+    );
+    assert!(
+        plugin_body.contains("!raw.contains_key(\"enabled\")"),
+        "an absent `enabled` key — not a false value — is what must be rejected"
+    );
+    assert!(
+        plugin_body.contains("'enabled' is required"),
+        "the 400 must name the field the caller has to send"
+    );
+}
+
+#[test]
+fn proxy_put_restores_absent_plugins_before_prepare_for_update() {
+    let crud = include_str!("../../../src/admin/crud.rs");
+    assert!(
+        crud.contains(
+            "fn restore_absent_update_fields(\n        &mut self,\n        _existing: &Self,"
+        ),
+        "the presence-aware repair hook must exist on the trait"
+    );
+    let call = crud
+        .find("resource.restore_absent_update_fields(existing, &raw)")
+        .expect("the update arm must run the presence-aware repair");
+    let prepare = crud[call..]
+        .find("resource.prepare_for_update(existing)")
+        .expect("prepare_for_update must follow in the same arm");
+    assert!(
+        prepare < 400,
+        "the repair must run immediately before prepare_for_update"
+    );
+
+    let proxy_impl = crud
+        .find("impl AdminResource for Proxy {")
+        .expect("Proxy admission impl must exist");
+    let next_impl = crud[proxy_impl + 1..]
+        .find("\nimpl AdminResource for ")
+        .map(|offset| proxy_impl + 1 + offset)
+        .unwrap_or(crud.len());
+    let proxy_body = &crud[proxy_impl..next_impl];
+    assert!(
+        proxy_body.contains("if !raw.contains_key(\"plugins\") {")
+            && proxy_body.contains("self.plugins = existing.plugins.clone();"),
+        "an absent `plugins` key must preserve the stored associations"
+    );
+}
+
+#[test]
+fn put_replace_semantics_are_documented_in_the_spec_and_admin_docs() {
+    let spec = include_str!("../../../openapi.yaml");
+    let docs = include_str!("../../../docs/admin_api.md");
+
+    assert!(
+        spec.contains("would silently re-enable a deliberately disabled"),
+        "openapi.yaml must state that a plugin-config PUT requires `enabled`"
+    );
+    assert!(
+        spec.contains("an omitted `plugins` key\n            preserves the stored associations"),
+        "openapi.yaml must state that an absent `plugins` preserves associations"
+    );
+    assert!(
+        docs.contains("## Replace semantics for `PUT`"),
+        "docs/admin_api.md must carry the replace-semantics section"
+    );
+    for statement in [
+        "**`PluginConfig.enabled` is required on `PUT`.**",
+        "**An omitted `Proxy.plugins` preserves the stored associations.**",
+        "**`Upstream.targets` is required by the schema**",
+    ] {
+        assert!(
+            docs.contains(statement),
+            "docs/admin_api.md must document {statement:?}"
+        );
+    }
+}
