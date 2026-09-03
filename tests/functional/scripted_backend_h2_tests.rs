@@ -3587,6 +3587,76 @@ async fn h2_reqwest_backend_write_timeout_maps_to_504() {
     );
 }
 
+// #4411: h2c frontend → the bundled HTTP client's HTTP/1.1 backend. 2 MiB with
+// no receive-window pin, so the upload pump reaches a clean EOS and only the
+// post-EOS send-queue drain bound can produce the 504. That bound reaches this
+// path only through vendored reqwest patch 004
+// (`docs/upstream-reqwest-patches/004-connection-established-fd/`).
+const H2_KERNEL_ABSORB_UPLOAD_BYTES: usize = 2 * 1024 * 1024;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_reqwest_kernel_absorb_write_timeout_maps_to_504() {
+    if !ferrum_edge::_test_support::send_queue_probe_supported() {
+        // No send-queue query on this target; `backend_read_timeout_ms` is the
+        // only bound, as documented next to `backend_write_timeout_ms`.
+        return;
+    }
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
+        .step(TcpStep::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn");
+
+    let write_timeout_ms: u64 = 800;
+    let yaml = http_timeout_access_log_yaml(backend_port, 8_000, write_timeout_ms, Value::Null);
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = Http2Client::h2c_prior_knowledge().expect("h2c client");
+    let started = Instant::now();
+    let resp = client
+        .as_reqwest()
+        .post(format!("{}/api/twrite", harness.proxy_base_url()))
+        .header("content-type", "application/octet-stream")
+        .header("expect", "")
+        .body(vec![b'x'; H2_KERNEL_ABSORB_UPLOAD_BYTES])
+        .send()
+        .await
+        .expect("gateway returns a response");
+    let elapsed = started.elapsed();
+    let status = resp.status();
+    let gateway_error = resp
+        .headers()
+        .get("x-gateway-error")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = resp.text().await.expect("body");
+
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "h2c kernel-absorbed never-read POST must be 504, got {status} body={body}"
+    );
+    assert_eq!(gateway_error.as_deref(), Some("backend_timeout"));
+    assert_eq!(body, r#"{"error":"Backend timeout"}"#);
+    assert_timeout_envelope(elapsed, write_timeout_ms);
+
+    let logs = harness
+        .wait_for_log_contains(&has_read_write_timeout_class, Duration::from_secs(5))
+        .await;
+    assert!(
+        has_read_write_timeout_class(&logs),
+        "write timeout must classify as read_write_timeout; logs:\n{logs}"
+    );
+}
+
 // #4055 direct-H2 pool: HTTPS backend with a 1-byte window that never reads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]

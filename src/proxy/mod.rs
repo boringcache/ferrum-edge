@@ -47568,6 +47568,14 @@ where
     let Some(pump) = pump else {
         return Ok(fut.await);
     };
+    // Issue #4411: the bundled HTTP client dials its backend socket on THIS
+    // task, inside `fut`, and reports it through the vendored
+    // connection-admission hook rather than handing the gateway a `TcpStream`.
+    // Arming the pump's slot as a task-local for exactly the span of this
+    // dispatch is what lets that hook publish into the right request's pump —
+    // and only that request's. Transports that publish their own socket have
+    // already filled the slot; it is write-once, so they still win.
+    let fut = backend_send_queue::with_reqwest_backend_socket_slot(pump.backend_socket_slot(), fut);
     tokio::pin!(fut);
     tokio::select! {
         biased;

@@ -118,6 +118,36 @@ impl BackendSocketHandle {
         None
     }
 
+    /// [`duplicate_from`](Self::duplicate_from) for a socket the gateway only
+    /// ever sees as a raw descriptor (issue #4411): the bundled HTTP client
+    /// reports its newly dialed backend socket to
+    /// [`crate::backend_conn_limit::ReqwestConnectionAdmission`] as an
+    /// `AsRawFd` value, never as a `TcpStream` it hands over.
+    ///
+    /// The descriptor is duplicated here, inside the reporting call, exactly as
+    /// [`duplicate_from`](Self::duplicate_from) duplicates an owned stream — so
+    /// nothing outside this call ever holds a bare fd number that the owning
+    /// transport could close and the kernel could recycle.
+    ///
+    /// # Safety contract
+    ///
+    /// `fd` must be open for the duration of this call. The vendored reqwest
+    /// hook guarantees that: it reports the descriptor after the dial resolved
+    /// and before the connection object is handed to hyper, with the connection
+    /// (and therefore the socket) alive and owned by the connector.
+    #[cfg(unix)]
+    pub fn duplicate_from_raw_fd(fd: std::os::fd::RawFd) -> Option<Arc<Self>> {
+        if !crate::socket_opts::send_queue_probe_supported() {
+            return None;
+        }
+        // SAFETY: see the safety contract above — the caller reports a
+        // descriptor its own live connection owns, and the borrow does not
+        // escape this expression.
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+        let fd = borrowed.try_clone_to_owned().ok()?;
+        Some(Arc::new(Self { fd }))
+    }
+
     /// Current send-queue depth in bytes, or `None` when the kernel refuses to
     /// answer (closed socket, unsupported platform).
     #[cfg(unix)]
@@ -234,4 +264,60 @@ pub(crate) async fn await_send_queue_stall(
             SendQueueVerdict::Stalled => return true,
         }
     }
+}
+
+// ── The bundled HTTP client's backend socket (issue #4411) ──────────────────
+//
+// Every other backend transport constructs its own `TcpStream`, so its
+// dispatcher can publish a [`BackendSocketHandle`] directly into the pump's
+// slot. The bundled HTTP client owns and hides its socket pool: the gateway
+// learns about a socket only through the vendored connection-admission hook
+// (`docs/upstream-reqwest-patches/004-connection-established-fd/`), which fires
+// deep inside the connector — with no reference to the request that caused the
+// dial.
+//
+// A task-local closes that gap without a registry. The connector is polled by
+// the very task that is awaiting this request's dispatch future, so scoping the
+// pump's slot around that future makes "the connection this request dialed" the
+// only thing the hook can publish into. It cannot mis-attribute: a task that
+// dialed nothing publishes nothing, and the slot is write-once.
+//
+// A request served on an ALREADY-POOLED connection dials nothing and therefore
+// arms no drain bound — `backend_read_timeout_ms` governs it, exactly as before
+// #4411. That is a residual, not a hole in the reported failure mode: a
+// connection whose send queue is stalled never completes its request, so it is
+// never returned to the idle pool, so every request against a backend that
+// accepts and never reads dials a fresh socket. It is documented next to
+// `backend_write_timeout_ms` in `docs/configuration.md`.
+tokio::task_local! {
+    static REQWEST_BACKEND_SOCKET: BackendSocketSlot;
+}
+
+/// Run `fut` with `slot` armed as the destination for any backend socket the
+/// bundled HTTP client dials while it is being polled.
+pub(crate) async fn with_reqwest_backend_socket_slot<F>(
+    slot: BackendSocketSlot,
+    fut: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    REQWEST_BACKEND_SOCKET.scope(slot, fut).await
+}
+
+/// Publish a newly dialed backend socket into the slot the current dispatch
+/// armed, duplicating the descriptor first.
+///
+/// A no-op outside an armed dispatch (warmup dials, admin-side clients, a
+/// request with no upload pump) and for a slot that is already filled.
+#[cfg(unix)]
+pub(crate) fn publish_reqwest_backend_socket(fd: std::os::fd::RawFd) {
+    let _ = REQWEST_BACKEND_SOCKET.try_with(|slot| {
+        if slot.get().is_some() {
+            return;
+        }
+        if let Some(handle) = BackendSocketHandle::duplicate_from_raw_fd(fd) {
+            let _ = slot.set(handle);
+        }
+    });
 }

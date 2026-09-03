@@ -430,12 +430,28 @@ impl UploadPumpJoin {
     /// rather than silently re-pointing a live watch at another connection.
     ///
     /// `None` is the ordinary case for a transport whose socket the gateway
-    /// does not own (reqwest, HBONE's tunnelled inner client): the drain bound
-    /// stays disarmed and `backend_read_timeout_ms` governs, as before.
+    /// does not own (HBONE's tunnelled inner client): the drain bound stays
+    /// disarmed and `backend_read_timeout_ms` governs, as before. The bundled
+    /// HTTP client reaches the same slot from the other side — see
+    /// [`backend_socket_slot`](Self::backend_socket_slot).
     pub(crate) fn bind_backend_socket(&mut self, socket: Option<Arc<BackendSocketHandle>>) {
         if let Some(socket) = socket {
             let _ = self.socket.set(socket);
         }
+    }
+
+    /// The same write-once slot, for a dispatcher that cannot hand over a
+    /// socket itself and must let the transport publish one (issue #4411).
+    ///
+    /// The bundled HTTP client never gives the gateway its `TcpStream`; its
+    /// connector reports a newly dialed socket through the vendored
+    /// connection-admission hook instead. `await_upload_write_watermark_first`
+    /// arms this slot as a task-local around the dispatch future so that hook
+    /// has somewhere to publish. Write-once semantics are unchanged: a
+    /// dispatcher that also calls [`bind_backend_socket`](Self::bind_backend_socket)
+    /// wins, and a second dial in the same scope is ignored.
+    pub(crate) fn backend_socket_slot(&self) -> BackendSocketSlot {
+        Arc::clone(&self.socket)
     }
 
     /// Ask the pump to stop if this handle is dropped without an explicit
@@ -868,7 +884,9 @@ where
     // transport must see the clean EOS and flush its last frames to the socket
     // before the drain is judged.
     let Some(socket) = socket.get() else {
-        // No socket was published for this dispatch (reqwest, tunnelled HBONE).
+        // No socket was published for this dispatch: a tunnelled HBONE upload,
+        // HTTP/3, or a bundled-HTTP-client request served on an ALREADY-POOLED
+        // connection (nothing was dialed, so patch 004's hook never fired).
         // Disarmed exactly as before #4411; `backend_read_timeout_ms` governs.
         return outcome;
     };
