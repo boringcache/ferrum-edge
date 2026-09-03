@@ -683,29 +683,52 @@ selection key, and SHA-1 remains admitted there. See
 [`docs/fips.md`](fips.md). Outside enforcement nothing changes, so ordinary
 deployments keep interoperating with responders that still sign with SHA-1.
 
-**Freshness is checked when the material is loaded, not per handshake.** The
-validity window above is evaluated while the `ServerConfig` candidate is being
-built — at startup, at config reload, and when a watched OCSP source's bytes
-change. An accepted staple is then served unchanged until one of those events
-happens again, so a response that passes `nextUpdate` while the gateway is
-running keeps being stapled.
+**Certificate binding is checked when the material is loaded, not per
+handshake; freshness is re-checked hourly.** The full validity window above is
+evaluated while the `ServerConfig` candidate is being built — at startup, at
+config reload, and when a watched OCSP source's bytes change. In addition, a
+background task re-evaluates the accepted `nextUpdate` of every served staple
+**once an hour**, and retires a staple that has reached it.
 
-The reason it keeps being stapled is that **Ferrum has no OCSP responder
-client**: nothing inside the gateway fetches a fresh response, so there is no
-event to re-validate against and dropping the staple unilaterally would only
-trade one failure mode (a stale staple strict clients reject) for another (no
-staple at all, which a must-staple certificate also fails). Staple refresh is
-therefore the operator's own fetch loop plus live reload. Refresh the OCSP
-source before `nextUpdate` elapses: with
+The re-check interval is a fixed constant, not an environment variable. It is
+not a policy choice — it is a bound on how long an expired staple could keep
+being served — and an hour is far inside the shortest window any responder
+issues, so a knob there would only be a way to disable the protection.
+
+**Dropping is the safe state, not a fallback.** Serving a response past its
+`nextUpdate` is strictly worse than serving none: a client that enforces staple
+validity — a browser with OCSP checking on, or a peer honouring a must-staple
+certificate — aborts the handshake outright on an expired response, whereas an
+absent staple falls back to that client's own revocation behaviour. The
+retirement is applied to the certificate resolver the listener already serves,
+so it takes effect on the next handshake for HTTP/1.1, HTTP/2, HTTP/3 and
+TCP+TLS at once, **whether or not `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` is
+set**, and without rebuilding or re-reading anything. An `admin` HTTPS listener
+behaves identically. The drop is logged as a `warn!` naming the redacted source,
+and the TLS inventory entry for that source reports the retirement instead of
+its stale `nextUpdate`, so the
+`ferrum_tls_revocation_expiry_seconds{kind="ocsp"}` row for it stops being
+exported rather than counting further and further negative for material nothing
+staples.
+
+**Refresh is still the operator's job.** Ferrum has **no OCSP responder
+client**: nothing inside the gateway fetches a fresh response, so re-attaching
+one is the operator's own fetch loop plus live reload. Refresh the OCSP source
+before `nextUpdate` elapses: with
 `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true` a file or provider source is
-re-read and re-validated as soon as its bytes change, and rewriting the source
-with a stale or otherwise invalid response is rejected while the previous
-known-good material keeps serving. Without live reload the only way to adopt a
-refreshed staple is a restart — and a restart after `nextUpdate` is refused by
-the same admission check, exactly as for CRLs above.
+re-read and re-validated as soon as its bytes change — including after a drop,
+which the ordinary reload path repairs by building a new resolver carrying the
+new response — and rewriting the source with a stale or otherwise invalid
+response is rejected while the previous known-good material keeps serving.
+Without live reload the only way to adopt a refreshed staple is a restart — and
+a restart after `nextUpdate` is refused by the same admission check, exactly as
+for CRLs above. A must-staple certificate has no working posture between the
+drop and one of those two events; the drop does not create that gap, it only
+stops hiding it behind a handshake failure the client blames on the response.
 
 A staple inside `FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS` of its `nextUpdate` logs a
-`warn!` at load and is exported as
+`warn!` at load, re-logs it on **every hourly re-check** while it stays inside
+the window — so the signal is not load-time only — and is exported as
 `ferrum_tls_revocation_expiry_seconds{kind="ocsp"}` on the authenticated
 `/metrics` surface.
 
