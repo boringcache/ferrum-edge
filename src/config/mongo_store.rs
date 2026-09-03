@@ -3568,6 +3568,57 @@ mod inner {
             Ok(())
         }
 
+        /// Best-effort inverse of [`Self::apply_proxy_association_plan`] for a
+        /// standalone deployment whose follow-up failed after the plan was
+        /// applied (issue #4611). The caller rolls the plugin-config document
+        /// back; this puts the junction back to match it, so a loader never
+        /// sees a proxy referencing a config that no longer exists or no
+        /// longer targets it. Failures are logged, not returned: the original
+        /// error is what the caller reports, and the association is then a
+        /// hand repair like every other standalone partial write.
+        async fn compensate_proxy_association_plan(
+            &self,
+            namespace: &str,
+            plugin_config_id: &str,
+            plan: &ProxyAssociationPlan,
+        ) {
+            if let Some(attach) = plan.attach.as_deref() {
+                let result = self
+                    .proxies()
+                    .update_one(
+                        doc! { "_id": attach, "namespace": namespace },
+                        doc! {
+                            "$pull": { "plugins": { "plugin_config_id": plugin_config_id } },
+                            "$set": { "updated_at": Utc::now().to_rfc3339() },
+                        },
+                    )
+                    .await;
+                if let Err(error) = result {
+                    warn!(
+                        "standalone plugin-config write failed after attaching the proxy association and the compensating detach also failed (namespace={namespace} plugin_config_id={plugin_config_id} proxy_id={attach}): {error}; repair the proxy's `plugins` array by hand"
+                    );
+                }
+            }
+            if !plan.detach.is_empty() {
+                let result = self
+                    .proxies()
+                    .update_many(
+                        doc! { "_id": { "$in": plan.detach.clone() }, "namespace": namespace },
+                        doc! {
+                            "$addToSet": { "plugins": { "plugin_config_id": plugin_config_id } },
+                            "$set": { "updated_at": Utc::now().to_rfc3339() },
+                        },
+                    )
+                    .await;
+                if let Err(error) = result {
+                    warn!(
+                        "standalone plugin-config write failed after detaching proxy associations and the compensating re-attach also failed (namespace={namespace} plugin_config_id={plugin_config_id} proxies={:?}): {error}; repair those proxies' `plugins` arrays by hand",
+                        plan.detach
+                    );
+                }
+            }
+        }
+
         async fn record_config_change_in_session(
             &self,
             session: &mut ClientSession,
@@ -10216,6 +10267,8 @@ mod inner {
                         }
                         .await;
                         if let Err(err) = followup {
+                            self.compensate_proxy_association_plan(&pc.namespace, &pc.id, &plan)
+                                .await;
                             self.rollback_standalone_created_document(
                                 "plugin_configs",
                                 &pc.namespace,
@@ -10390,6 +10443,8 @@ mod inner {
                         }
                         .await;
                         if let Err(err) = change_result {
+                            self.compensate_proxy_association_plan(&pc.namespace, &pc.id, &plan)
+                                .await;
                             self.rollback_standalone_updated_document(
                                 "plugin_configs",
                                 "plugin_config",
