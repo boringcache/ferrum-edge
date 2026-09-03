@@ -2001,6 +2001,30 @@ jobs:
           name: functional-tests-archive-${{ runner.os }}-${{ runner.arch }}
           path: .
 
+      # Issue #4600: an anonymous Docker Hub pull of `redis:7-alpine` failed a
+      # merge group with "unauthorized: authentication required". Pull with the
+      # repository's Docker Hub credentials when they are present, then log out
+      # in the same step so no push-capable token is on disk when the
+      # PR-controlled test binaries run below. Forks (no secrets) keep the
+      # anonymous pull.
+      - name: Pull the Redis image
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${DOCKERHUB_USERNAME}" ] && [ -n "${DOCKERHUB_TOKEN}" ]; then
+            trap 'docker logout >/dev/null 2>&1 || true' EXIT
+            printf '%s' "${DOCKERHUB_TOKEN}" | docker login --username "${DOCKERHUB_USERNAME}" --password-stdin
+          else
+            echo "::notice::Docker Hub credentials unavailable in this run; pulling redis:7-alpine anonymously"
+          fi
+          for attempt in 1 2 3; do
+            docker pull redis:7-alpine && break
+            [ "$attempt" -lt 3 ] || exit 1
+            sleep $((attempt * 10))
+          done
+
       - name: Start Redis
         run: |
           set -euo pipefail
