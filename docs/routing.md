@@ -161,6 +161,36 @@ proxies:
 - Stream proxies (`tcp`/`tcps`/`udp`/`dtls`) MUST NOT set `listen_path` — they route on `listen_port` only. A populated `listen_path` is rejected.
 - Two host-only proxies whose `hosts` overlap on the same effective `listen_port` are rejected (409 from admin API).
 
+## Outbound Host header
+
+The `Host` Ferrum sends to the backend is **not** the client's `Host` by default. On every backend
+transport — the reqwest HTTP/1.1 and HTTP/2 path, the direct-HTTP/2 pool, native gRPC, and native
+HTTP/3 — the outbound `Host` is the **full authority of the load-balanced target that was actually
+selected**, with a default port omitted:
+
+| Selected target | Backend scheme | Outbound `Host` |
+|---|---|---|
+| `api-backend:8080` | `http` | `api-backend:8080` |
+| `api-backend:80` | `http` | `api-backend` |
+| `api-backend:443` | `https` | `api-backend` |
+| `api-backend:8443` | `https` | `api-backend:8443` |
+| `::1` port `8443` (IPv6 literal) | `https` | `[::1]:8443` |
+
+Carrying the port matters for two reasons:
+
+- **Backend virtual-host selection and absolute redirects.** A backend listening on a non-default
+  port needs the port to pick the right virtual host and to build correct absolute `Location`
+  values.
+- **HTTP/2 protocol correctness.** On HTTP/2 the outbound `:authority` is derived from the backend
+  URL, which carries the port. RFC 9113 §8.3.1 requires `Host` and `:authority` to be the same
+  string; a hostname-only `Host` beside `:authority: api-backend:8443` is a protocol error that
+  strict backends answer with a stream reset (surfacing as a 502). On HTTP/1.1 the same mismatch
+  violates RFC 9112 §3.2.
+
+Set `preserve_host_header: true` on a proxy to forward the **client's** `Host` verbatim instead. In
+that mode Ferrum does not consult the selected target at all, and the backend sees exactly what the
+client sent.
+
 ## Exact Path Routing
 
 Prefix a `listen_path` with `=` to require a whole-path match:
