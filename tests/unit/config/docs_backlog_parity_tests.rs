@@ -15,6 +15,7 @@ const MULTICLUSTER_RUNBOOK: &str =
     include_str!("../../../docs/mesh_multicluster_federation_runbook.md");
 const SCRIPTED_BACKEND_PLAN: &str =
     include_str!("../../../docs/plans/test_framework_scripted_backends.md");
+const PLUGINS_DOC: &str = include_str!("../../../docs/plugins.md");
 const FEATURES: &str = include_str!("../../../FEATURES.md");
 const RATE_LIMITING_SRC: &str = include_str!("../../../src/plugins/rate_limiting.rs");
 
@@ -303,6 +304,18 @@ fn scripted_backend_plan_is_implemented_residual_record() {
     assert!(
         SCRIPTED_BACKEND_PLAN.contains("#2032"),
         "Phase-8 continuation closer #2032 must be recorded"
+    );
+}
+
+#[test]
+fn plugins_doc_documents_credential_storage_at_rest() {
+    assert!(
+        PLUGINS_DOC.contains("Credential storage at rest"),
+        "plugins doc must keep the credential-storage-at-rest section (#4545)"
+    );
+    assert!(
+        PLUGINS_DOC.contains("stored recoverable"),
+        "plugins doc must state that keyauth/jwt/hmac_auth secrets are stored recoverable"
     );
 }
 
