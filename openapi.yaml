@@ -292,7 +292,12 @@ paths:
         whose read, parse, validation, revision-gate admission, or proxy apply
         is rejected keeps the last known-good mesh slice / policy baseline and
         sets the flag, and the admin API stays read-only exactly as in file
-        mode). `config_rejected` is a sticky flag cleared only
+        mode). In database mode the flag also covers a full load that had to
+        QUARANTINE one or more stored plugin configs the shared plugin
+        construction gate refuses: those rows are omitted from the plugin cache
+        so the process still binds its admin listener and the offending row can
+        be repaired or deleted in-band, and `config_rejected` stays raised while
+        any load keeps quarantining. `config_rejected` is a sticky flag cleared only
         by an accepted authoritative full reload (Applied or Unchanged) — and,
         for the localized mesh sources, only once the proxy apply lifecycle
         accepts that exact recovery candidate, never on a provisional slice
@@ -31146,8 +31151,14 @@ components:
               type: boolean
               description: |
                 Sticky operator signal set when a non-empty ConfigSync DELTA is
-                rejected. Cleared only after an authoritative FULL_SNAPSHOT is
-                accepted. Last-known-good config continues to serve while true.
+                rejected, or when an admitted FULL_SNAPSHOT fails to apply (for
+                example a plugin config this data plane cannot construct).
+                Cleared only after an authoritative FULL_SNAPSHOT is accepted.
+                Last-known-good config continues to serve while true. Because
+                ConfigSync.Subscribe is server-streaming with no client
+                acknowledgement, this DP-side field — not the CP's
+                `last_sync_at`, which records only that the CP sent the update
+                — is the in-band signal that a data plane is frozen.
             config_diverged_since:
               type: [string, "null"]
               format: date-time

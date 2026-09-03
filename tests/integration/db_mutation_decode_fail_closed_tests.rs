@@ -296,3 +296,113 @@ async fn delete_proxy_rolls_back_when_orphaned_proxy_group_metadata_fails_to_dec
         "config_changes must be unchanged when orphan cleanup aborts the parent mutation"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #4526 — plugin construction is the real schema gate, and the two
+// consumers of a stored `plugin_configs` row must take OPPOSITE branches:
+//
+// * A serving-mode (`Runtime`) full load QUARANTINES an unconstructible row so
+//   `database` mode still reaches its admin listener and the row stays
+//   deletable in-band. Before this, `ProxyState::new` failed at
+//   `src/modes/database.rs` well before the admin listener bound.
+// * A `ControlPlane` load REJECTS the snapshot, so the CP can never broadcast a
+//   row that would freeze every DP on last-known-good with no ConfigSync
+//   acknowledgement to show it.
+// ---------------------------------------------------------------------------
+
+async fn insert_named_plugin(
+    store: &DatabaseStore,
+    id: &str,
+    plugin_name: &str,
+    config: &str,
+    ts: &str,
+) {
+    sqlx::query(
+        "INSERT INTO plugin_configs \
+         (id, namespace, plugin_name, config, scope, proxy_id, enabled, created_at, updated_at) \
+         VALUES (?, 'ferrum', ?, ?, 'global', NULL, 1, ?, ?)",
+    )
+    .bind(id)
+    .bind(plugin_name)
+    .bind(config)
+    .bind(ts)
+    .bind(ts)
+    .execute(&store.pool())
+    .await
+    .expect("plugin insert must succeed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn serving_load_quarantines_unconstructible_plugin_row_while_cp_load_rejects_it() {
+    let (store, _temp_dir) = sqlite_store().await;
+    let ts = Utc::now().to_rfc3339();
+
+    // The exact reproduction from issue #4526: a closed config object with a
+    // typo'd key. Admin write-time validation rejects new rows like this; this
+    // one is a direct insert, standing in for a row written by an older
+    // release before the constructor was tightened.
+    insert_named_plugin(
+        &store,
+        "rsl-typo",
+        "request_size_limiting",
+        r#"{"max_bytes":1024,"max_bytez":1}"#,
+        &ts,
+    )
+    .await;
+    insert_named_plugin(
+        &store,
+        "rsl-ok",
+        "request_size_limiting",
+        r#"{"max_bytes":2048}"#,
+        &ts,
+    )
+    .await;
+
+    // Serving mode: the load SUCCEEDS with the bad row quarantined, so startup
+    // continues to the admin listener instead of exiting.
+    let runtime_config = store
+        .load_full_config("ferrum")
+        .await
+        .expect("a serving-mode full load must not fail on an unconstructible plugin row");
+    let surviving: Vec<&str> = runtime_config
+        .plugin_configs
+        .iter()
+        .map(|pc| pc.id.as_str())
+        .collect();
+    assert_eq!(
+        surviving,
+        vec!["rsl-ok"],
+        "only the unconstructible row is dropped from the served snapshot"
+    );
+    assert_eq!(
+        runtime_config.quarantined_plugin_configs.len(),
+        1,
+        "the quarantine must be reported so database mode raises config_rejected"
+    );
+    assert!(
+        runtime_config.quarantined_plugin_configs[0].contains("rsl-typo")
+            && runtime_config.quarantined_plugin_configs[0].contains("request_size_limiting"),
+        "the quarantine message names the plugin and its config id: {:?}",
+        runtime_config.quarantined_plugin_configs
+    );
+
+    // Control plane: the SAME row is refused outright, so it is never
+    // broadcast to the data-plane fleet.
+    let cp_error = store
+        .load_full_config_for_purpose(
+            "ferrum",
+            ferrum_edge::config::db_backend::FullConfigLoadPurpose::ControlPlane,
+        )
+        .await
+        .expect_err("CP admission must refuse an unconstructible plugin config");
+    // The typed marker keeps the CP poll loop's admin API writable for in-band
+    // repair; its Display carries the rejecting-error count, and the individual
+    // messages (which name the plugin and its config id) are logged.
+    let rendered = format!("{cp_error:#}");
+    assert!(
+        rendered.contains("configuration validation failed")
+            && rendered.contains("1 rejecting error(s)"),
+        "CP admission must return the typed validation rejection for the unconstructible \
+         plugin row: {rendered}"
+    );
+}

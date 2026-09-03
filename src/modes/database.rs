@@ -1293,6 +1293,28 @@ pub async fn run(
                 cfg.proxies.len(),
                 cfg.consumers.len()
             );
+            // Issue #4526: the loader quarantined stored plugin rows the shared
+            // construction gate refuses instead of failing the whole load, so
+            // startup can reach the admin listener. Publish `config_rejected`
+            // for the same reason a rejected full snapshot does — the served
+            // config is knowingly not the stored one, and the admin API is the
+            // in-band repair path (issue #2158).
+            if !cfg.quarantined_plugin_configs.is_empty() {
+                startup_config_rejected = true;
+                for message in &cfg.quarantined_plugin_configs {
+                    error!(
+                        "Startup quarantined an unconstructible plugin config; \
+                         it is omitted from the plugin cache and must be deleted or \
+                         repaired through the admin API: {}",
+                        message
+                    );
+                }
+                error!(
+                    "Starting with {} quarantined plugin config(s) and config_rejected raised; \
+                     the admin API is served so the offending rows can be repaired in-band",
+                    cfg.quarantined_plugin_configs.len()
+                );
+            }
             (cfg, Some(cursor))
         }
         Err(e) => {
@@ -3271,6 +3293,12 @@ async fn try_publish_full_reload_after_gate(
         *last_change_cursor = None;
         return None;
     }
+    // Issue #4526: a full load that quarantined an unconstructible plugin row
+    // is served, but it is knowingly not the stored config. Carry that out of
+    // the moved candidate so the commit raises `config_rejected` instead of
+    // clearing it — otherwise an accepted quarantined reload would report the
+    // store as healthy while a plugin the operator configured is not running.
+    let quarantined_plugin_configs = new_config.quarantined_plugin_configs.len();
     let outcome = proxy_state.update_config(new_config);
     let committed = commit_full_reload_poll_state(
         commit_context,
@@ -3279,6 +3307,7 @@ async fn try_publish_full_reload_after_gate(
         cursor,
         config_rejected,
         runtime_config_apply,
+        quarantined_plugin_configs,
     );
     drop(topology_permit);
     // This is the ONE chokepoint through which an authoritative database FULL
@@ -3308,16 +3337,37 @@ fn commit_full_reload_poll_state(
     cursor: LiveApplyCursor,
     config_rejected: &AtomicBool,
     runtime_config_apply: &RuntimeConfigApply,
+    quarantined_plugin_configs: usize,
 ) -> bool {
+    // An accepted snapshot only proves the STORE is valid again when nothing
+    // was quarantined out of it. A load that dropped an unconstructible plugin
+    // row keeps `config_rejected` raised so `/health`, `/status`, and the
+    // operator see that the served config is not the stored one (issue #4526).
+    let raise_for_quarantine = || {
+        if quarantined_plugin_configs > 0 {
+            if !config_rejected.swap(true, Ordering::Relaxed) {
+                error!(
+                    "Database full reload applied with {} quarantined plugin config(s) ({}); \
+                     raising config_rejected — repair or delete the offending plugin config \
+                     through the admin API",
+                    quarantined_plugin_configs, context
+                );
+            }
+            return true;
+        }
+        false
+    };
     match outcome {
         proxy::ConfigApplyOutcome::Applied => {
             *last_change_cursor = Some(cursor);
             runtime_config_apply.record_accepted_cursor(cursor);
             info!("Configuration applied from database ({})", context);
-            crate::modes::clear_config_rejected_after_accepted_full_reload(
-                config_rejected,
-                context,
-            );
+            if !raise_for_quarantine() {
+                crate::modes::clear_config_rejected_after_accepted_full_reload(
+                    config_rejected,
+                    context,
+                );
+            }
             true
         }
         proxy::ConfigApplyOutcome::Unchanged => {
@@ -3326,11 +3376,14 @@ fn commit_full_reload_poll_state(
             debug!("Database configuration valid but unchanged ({})", context);
             // An Unchanged outcome still means the freshly-loaded FULL snapshot
             // passed loader validation and matches the running config, so the
-            // full snapshot is proven valid again.
-            crate::modes::clear_config_rejected_after_accepted_full_reload(
-                config_rejected,
-                context,
-            );
+            // full snapshot is proven valid again — unless the load had to
+            // quarantine a plugin row to get there.
+            if !raise_for_quarantine() {
+                crate::modes::clear_config_rejected_after_accepted_full_reload(
+                    config_rejected,
+                    context,
+                );
+            }
             true
         }
         proxy::ConfigApplyOutcome::Rejected { errors } => {
@@ -3932,6 +3985,7 @@ mod tests {
             cursor,
             &config_rejected,
             &runtime_config_apply,
+            0,
         );
 
         assert!(accepted);
@@ -3958,6 +4012,7 @@ mod tests {
             cursor,
             &config_rejected,
             &runtime_config_apply,
+            0,
         );
 
         assert!(accepted);
@@ -3987,6 +4042,7 @@ mod tests {
             LiveApplyCursor::new(1, 42),
             &config_rejected,
             &runtime_config_apply,
+            0,
         );
 
         assert!(!accepted);
@@ -4115,6 +4171,7 @@ mod tests {
             LiveApplyCursor::new(1, 2),
             &config_rejected,
             &runtime_config_apply,
+            0,
         );
         assert!(accepted);
         assert!(

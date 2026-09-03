@@ -2682,6 +2682,36 @@ impl DatabaseStore {
             .validate_hosts(ValidationAction::Warn)
             .run()?;
 
+        // Serving-mode repairability (issue #4526): plugin construction is the
+        // real schema gate for most plugins, and a stored row that no serving
+        // mode can construct used to abort `database` mode startup at
+        // `ProxyState::new` — before the admin listener bound — so the operator
+        // could not delete it in-band. Quarantine those rows here instead, so
+        // the process starts with the plugin omitted and the offending row
+        // still readable and deletable through the admin API. CP loads keep
+        // rejecting: an unconstructible row must never be broadcast.
+        if matches!(purpose, FullConfigLoadPurpose::Runtime) {
+            let quarantined =
+                crate::config::validation_pipeline::quarantine_unconstructible_plugin_configs(
+                    &mut config,
+                );
+            for message in &quarantined {
+                error!(
+                    "Database config: quarantined unconstructible plugin config — {}",
+                    message
+                );
+            }
+            if !quarantined.is_empty() {
+                error!(
+                    "Quarantined {} plugin config(s) during full config load; serving without \
+                     them and publishing config_rejected so they can be repaired through the \
+                     admin API",
+                    quarantined.len()
+                );
+            }
+            config.quarantined_plugin_configs = quarantined;
+        }
+
         let validation_errors = collect_rejecting_runtime_config_errors(&config);
         if !validation_errors.is_empty() {
             for message in &validation_errors {

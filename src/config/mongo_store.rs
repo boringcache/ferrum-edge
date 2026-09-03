@@ -7881,6 +7881,33 @@ mod inner {
                 error!("MongoDB config: {}", message);
             }
 
+            // Serving-mode repairability (issue #4526), parity with the SQL
+            // loader: quarantine stored plugin rows the shared construction
+            // gate refuses so `database` mode still reaches its admin listener
+            // and the offending row stays deletable in-band. CP loads keep
+            // rejecting so an unconstructible row is never broadcast.
+            if matches!(purpose, FullConfigLoadPurpose::Runtime) {
+                let quarantined =
+                    crate::config::validation_pipeline::quarantine_unconstructible_plugin_configs(
+                        &mut config,
+                    );
+                for message in &quarantined {
+                    error!(
+                        "MongoDB config: quarantined unconstructible plugin config — {}",
+                        message
+                    );
+                }
+                if !quarantined.is_empty() {
+                    error!(
+                        "Quarantined {} plugin config(s) during full config load; serving \
+                         without them and publishing config_rejected so they can be repaired \
+                         through the admin API",
+                        quarantined.len()
+                    );
+                }
+                config.quarantined_plugin_configs = quarantined;
+            }
+
             // Mongo does not run the SQL-side `ValidationPipeline`, but full
             // runtime loads must still fail closed on the same rejecting
             // validation contract used by SQL loads and CP updates. This
