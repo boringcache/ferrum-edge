@@ -1521,6 +1521,84 @@ async fn complete_h3_handshake(
     }
 }
 
+/// Why a pressure-driven HTTP/3 GOAWAY was raised, so the log line can name the
+/// tier that produced it (issue #4542).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum H3GoawayTrigger {
+    /// SIGTERM/SIGINT graceful shutdown (issue #4429).
+    Shutdown,
+    /// The overload manager's binary keepalive tier
+    /// (`OverloadState::disable_keepalive`).
+    KeepalivePressure,
+}
+
+/// Bound the wait for an accepted HTTP/3 stream's HEADERS frame (issue #4537 —
+/// the H3 half of #4152).
+///
+/// `h3::server::Connection::accept()` yields a `RequestResolver` as soon as the
+/// peer opens a bidi stream, **before** any HEADERS frame arrives, so
+/// `resolve_request()` is where a slowloris parks. QUIC `max_idle_timeout` does
+/// not bound it (any packet resets it) and these streams never reach
+/// `RequestGuard`, so request-tier shedding never sees them either. This is the
+/// H3 counterpart of hyper's `http1.header_read_timeout` and of the H2
+/// `frontend_admission::wait_pre_request_deadline`, and it reads the same
+/// `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` policy.
+///
+/// `header_deadline_seconds == 0` disables the bound, matching both of those.
+///
+/// On elapse the caller drops the returned-`None` future's resolver, and the
+/// **drop** is what reclaims the resource: `quinn::RecvStream::drop` issues
+/// `STOP_SENDING`, `quinn::SendStream::drop` issues `finish()`, which releases
+/// the QUIC stream slot, returns MAX_STREAMS credit, and frees the partial h3
+/// decoder buffer. The wire signal is therefore quinn's `STOP_SENDING(0)`
+/// rather than `H3_REQUEST_INCOMPLETE`: `FrameStream::reset` lives behind h3's
+/// `i-implement-a-third-party-backend-…` feature, which this build does not
+/// enable, so emitting the exact HTTP/3 code would require a new vendored h3
+/// patch. `Cargo.toml` already records that downgrade for the sibling teardown
+/// path; reclaiming the resource is the goal here, not the code on the wire.
+pub async fn await_h3_request_headers<F>(
+    resolve: F,
+    header_deadline_seconds: u64,
+) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    if header_deadline_seconds == 0 {
+        return Some(resolve.await);
+    }
+    tokio::time::timeout(
+        std::time::Duration::from_secs(header_deadline_seconds),
+        resolve,
+    )
+    .await
+    .ok()
+}
+
+/// Park until the overload manager raises the binary keepalive tier
+/// (issue #4542).
+///
+/// The watch marks the value current at subscribe time as already seen, so this
+/// only observes transitions. The recovery edge (`true -> false`) wakes the
+/// receiver as well and must not arm a GOAWAY — a GOAWAY is terminal for the
+/// connection and cannot be withdrawn.
+///
+/// A closed channel parks forever rather than returning: the sender lives in
+/// `OverloadState`, which this connection holds through `ProxyState`, so
+/// closure is unreachable in practice, and parking keeps a closed channel from
+/// turning the accept loop's `select!` arm into a busy loop.
+pub async fn h3_keepalive_pressure_raised(rx: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        match rx.changed().await {
+            Ok(()) => {
+                if *rx.borrow() {
+                    return;
+                }
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    }
+}
+
 /// Send HTTP/3 GOAWAY with `max_requests = 0` so the peer stops opening new
 /// streams while already-accepted streams remain eligible to finish.
 ///
@@ -1882,6 +1960,15 @@ async fn handle_h3_connection(
         h3_goaway_sent = true;
     }
 
+    // Issue #4537. Hoisted once per QUIC connection: a plain `u64` copy of an
+    // already-validated setting, so the per-stream path below adds no config
+    // read, no lock, and no allocation.
+    let header_deadline_seconds = state.env_config.http_header_read_timeout_seconds;
+    // Issue #4542. One receiver per connection, taken next to `shutdown_rx`.
+    // The accept loop parks on the transition, so expressing the overload
+    // keepalive tier on H3 costs no per-connection timer.
+    let mut keepalive_pressure_rx = state.overload.subscribe_keepalive_pressure();
+
     loop {
         // A QUIC early-data request and the TLS Connected event can become
         // ready in the same scheduler turn. Poll request acceptance first so a
@@ -1898,59 +1985,76 @@ async fn handle_h3_connection(
         // keeps this loop running until `accept()` returns `Ok(None)` so
         // already-accepted streams finish. Dropping `h3_conn` here would close
         // with H3_NO_ERROR immediately and truncate in-flight work.
-        let (accepted, handshake_succeeded, send_goaway) =
-            if let Some(completion_rx) = handshake_completion_rx.as_mut() {
-                tokio::select! {
-                    biased;
-                    accepted = h3_conn.accept() => {
-                        (Some(accepted), None, false)
-                    }
-                    completed = completion_rx => {
-                        (None, Some(completed.unwrap_or_default()), false)
-                    }
-                    _ = async {
-                        match client_trust_session.as_ref() {
-                            Some(session) => session.retired().await,
-                            None => std::future::pending().await,
-                        }
-                    } => {
-                        close_h3_connection_for_trust_withdrawal(
-                            &quinn_conn,
-                            canonical_peer,
-                        );
-                        break;
-                    }
-                    _ = shutdown_rx.changed(), if !h3_goaway_sent => {
-                        (None, None, true)
-                    }
+        let (accepted, handshake_succeeded, send_goaway) = if let Some(completion_rx) =
+            handshake_completion_rx.as_mut()
+        {
+            tokio::select! {
+                biased;
+                accepted = h3_conn.accept() => {
+                    (Some(accepted), None, None)
                 }
-            } else {
-                tokio::select! {
-                    biased;
-                    accepted = h3_conn.accept() => {
-                        (Some(accepted), None, false)
-                    }
-                    _ = async {
-                        match client_trust_session.as_ref() {
-                            Some(session) => session.retired().await,
-                            None => std::future::pending().await,
-                        }
-                    } => {
-                        close_h3_connection_for_trust_withdrawal(
-                            &quinn_conn,
-                            canonical_peer,
-                        );
-                        break;
-                    }
-                    _ = shutdown_rx.changed(), if !h3_goaway_sent => {
-                        (None, None, true)
-                    }
+                completed = completion_rx => {
+                    (None, Some(completed.unwrap_or_default()), None)
                 }
-            };
+                _ = async {
+                    match client_trust_session.as_ref() {
+                        Some(session) => session.retired().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    close_h3_connection_for_trust_withdrawal(
+                        &quinn_conn,
+                        canonical_peer,
+                    );
+                    break;
+                }
+                _ = shutdown_rx.changed(), if !h3_goaway_sent => {
+                    (None, None, Some(H3GoawayTrigger::Shutdown))
+                }
+                _ = h3_keepalive_pressure_raised(&mut keepalive_pressure_rx), if !h3_goaway_sent => {
+                    (None, None, Some(H3GoawayTrigger::KeepalivePressure))
+                }
+            }
+        } else {
+            tokio::select! {
+                biased;
+                accepted = h3_conn.accept() => {
+                    (Some(accepted), None, None)
+                }
+                _ = async {
+                    match client_trust_session.as_ref() {
+                        Some(session) => session.retired().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    close_h3_connection_for_trust_withdrawal(
+                        &quinn_conn,
+                        canonical_peer,
+                    );
+                    break;
+                }
+                _ = shutdown_rx.changed(), if !h3_goaway_sent => {
+                    (None, None, Some(H3GoawayTrigger::Shutdown))
+                }
+                _ = h3_keepalive_pressure_raised(&mut keepalive_pressure_rx), if !h3_goaway_sent => {
+                    (None, None, Some(H3GoawayTrigger::KeepalivePressure))
+                }
+            }
+        };
 
-        if send_goaway {
+        if let Some(trigger) = send_goaway {
             if send_h3_goaway(&mut h3_conn, canonical_peer).await {
                 h3_goaway_sent = true;
+                if trigger == H3GoawayTrigger::KeepalivePressure {
+                    // Issue #4542. One line per connection, on the rising edge
+                    // only — the latch above guarantees at most one.
+                    info!(
+                        peer = %canonical_peer,
+                        reason = "overload_keepalive_pressure",
+                        "HTTP/3 GOAWAY sent under overload keepalive pressure; refusing new \
+                         request streams while in-flight streams finish"
+                    );
+                }
                 continue;
             }
             break;
@@ -2024,7 +2128,30 @@ async fn handle_h3_connection(
                 let stream_client_trust = client_trust_session.clone();
                 let stream_shutdown = shutdown_rx.clone();
                 tokio::spawn(async move {
-                    match resolver.resolve_request().await {
+                    // Issue #4537: bound the wait for this stream's HEADERS
+                    // frame. See `await_h3_request_headers` for why dropping the
+                    // resolver is what reclaims the QUIC stream slot and the
+                    // partial h3 decoder buffer, and why the wire signal is
+                    // quinn's `STOP_SENDING(0)` rather than
+                    // `H3_REQUEST_INCOMPLETE`.
+                    let Some(resolved) = await_h3_request_headers(
+                        resolver.resolve_request(),
+                        header_deadline_seconds,
+                    )
+                    .await
+                    else {
+                        // `debug!`, not `warn!`/`error!` — for the same reason
+                        // the `HeaderTooBig` arm below is `debug!`: an
+                        // unauthenticated peer must not be able to drive
+                        // higher-severity logging one stream at a time.
+                        debug!(
+                            "HTTP/3 request headers did not arrive from {} within {}s \
+                             (FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS); dropping the stream",
+                            canonical_peer, header_deadline_seconds
+                        );
+                        return;
+                    };
+                    match resolved {
                         Ok((req, stream)) => {
                             if let Err(e) = handle_h3_request(
                                 req,

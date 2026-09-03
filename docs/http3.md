@@ -6,6 +6,7 @@ Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxi
 
 - [Listener and enablement](#listener-and-enablement)
 - [Graceful shutdown and GOAWAY](#graceful-shutdown-and-goaway)
+  - [GOAWAY under overload keepalive pressure (issue #4542)](#goaway-under-overload-keepalive-pressure-issue-4542)
 - [Dispatch model](#dispatch-model)
 - [Native H3 fast path](#native-h3-fast-path)
 - [Cross-protocol bridge](#cross-protocol-bridge)
@@ -18,6 +19,7 @@ Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxi
 - [WebSocket over HTTP/3 (RFC 9220 Extended CONNECT)](#websocket-over-http3-rfc-9220-extended-connect)
 - [CONNECT-UDP over HTTP/3 (RFC 9298)](#connect-udp-over-http3-rfc-9298)
 - [QUIC connection migration](#quic-connection-migration)
+- [Request-header arrival deadline (issue #4537)](#request-header-arrival-deadline-issue-4537)
 - [Header size limits](#header-size-limits)
   - [Declared frame-length bound and SETTINGS alignment (issue #4261)](#declared-frame-length-bound-and-settings-alignment-issue-4261)
 - [Flow-control window tuning](#flow-control-window-tuning)
@@ -112,6 +114,25 @@ and they observe the cloned process shutdown watch so drain can emit Close
 CONNECT-UDP tunnels that were already accepted keep relaying for the H3
 listener drain window. New CONNECT-UDP streams after GOAWAY are refused.
 `src/http3/connect_udp.rs` is otherwise unchanged.
+
+### GOAWAY under overload keepalive pressure (issue #4542)
+
+Process shutdown is not the only thing that raises a GOAWAY. The overload
+manager's first (pressure) tier — FD ≥ 0.80 / connections ≥ 0.85 / requests
+≥ 0.85 — is expressed on HTTP/1.1 and HTTP/2 as `Connection: close` on each
+response. HTTP/3 has no per-response equivalent, so each connection subscribes
+to an edge-triggered watch of `OverloadState::disable_keepalive` and sends the
+same one-shot `shutdown(0)` GOAWAY on the rising edge. The GOAWAY latch is
+shared with the shutdown path, so a connection receives at most one either way,
+and in-flight streams still finish.
+
+Only the binary flag drives it: `should_disable_keepalive_red()` is a
+per-response probabilistic sampler and a GOAWAY is per-connection and terminal,
+so sampling it would kill a random subset of connections outright rather than
+shrinking the population gracefully. Outside shutdown there is no drain
+deadline, so a peer that goes idle after a pressure-driven GOAWAY is bounded by
+`FERRUM_HTTP3_IDLE_TIMEOUT` (default 30 s) rather than closed immediately. See
+[docs/overload_manager.md](overload_manager.md) for the full ladder.
 
 ## Dispatch model
 
@@ -1391,6 +1412,36 @@ closed. This is deliberately not general policy reauthentication.
 The H3 connection loop detects QUIC connection migration (RFC 9000 §9) — a client that changes its local address mid-connection (common on mobile network handoffs between Wi-Fi and cellular) continues the same connection with a new 4-tuple. The loop compares `quinn::Connection::remote_address()` against a cached `SocketAddr` before each request dispatch; the comparison is two integer fields (IP + port) so the zero-allocation path is the common case. The formatted IP string (`Arc<str>`) is only re-created when the address actually changes.
 
 This ensures IP-based rate-limit keys and access logs reflect the client's current IP after migration, not the stale IP from connection establishment. Earlier code cached the address once per connection — that was a security issue where migrated clients bypassed per-IP rate limits, now fixed.
+
+## Request-header arrival deadline (issue #4537)
+
+Size is not the only unbounded dimension on an accepted stream — *time* is the
+other. `h3::server::Connection::accept()` yields a request resolver as soon as
+the peer opens a bidi stream, **before** any `HEADERS` frame arrives. Without a
+bound, a peer that completes the QUIC handshake, opens `FERRUM_HTTP3_MAX_STREAMS`
+streams (default 1000) and sends a partial `HEADERS` frame on each parks one task
+and one partial decoder buffer per stream for as long as it keeps the connection
+alive. QUIC `max_idle_timeout` does not bound it — any packet resets it — and
+these streams never reach `RequestGuard`, so `active_requests` and the overload
+request tier never see them either. The declared-frame ceiling above bounds how
+*much* one stream may buffer, not how *long*.
+
+The H3 frontend therefore applies `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS`
+(default `10`, `0` disables) to `resolve_request()`, the same policy HTTP/1.1
+takes through hyper's `header_read_timeout` and HTTP/2 takes through
+`frontend_admission::wait_pre_request_deadline` (issue #4152). The value is read
+once per QUIC connection, so nothing is added to the per-stream path.
+
+On elapse the resolver is dropped, and the drop is what reclaims the resource:
+`quinn::RecvStream::drop` issues `STOP_SENDING` and `quinn::SendStream::drop`
+issues `finish()`, releasing the QUIC stream slot, returning `MAX_STREAMS`
+credit, and freeing the partial decoder buffer. The wire signal is therefore
+quinn's `STOP_SENDING(0)` rather than `H3_REQUEST_INCOMPLETE`: h3's
+`FrameStream::reset` sits behind the `i-implement-a-third-party-backend-…`
+feature this build does not enable, so emitting the exact HTTP/3 code would need
+a new vendored patch. Reclaiming the resource is the goal; the code on the wire
+is not. The elapse is logged at `debug`, never `warn`/`error`, so an
+unauthenticated peer cannot drive higher-severity logging one stream at a time.
 
 ## Header size limits
 
