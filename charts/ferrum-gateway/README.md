@@ -27,10 +27,11 @@ node) or a per-tenant secret selected by `grpc.jwtKeyId`. See
 
 Tenancy enforcement spans both planes: set **`cp.requireNamespaceClaim: true`**
 and **`admin.requireNamespaceClaim: true`** together so CP↔DP gRPC JWTs and
-namespace-scoped admin routes both require an `ns` claim. Enabling only the CP
-flag does **not** constrain admin JWTs — any valid admin token remains global
-and `X-Ferrum-Namespace` is only a routing selector until the admin flag is
-also true. Both values render in `database`, `file`, `cp`, and `dp` modes (any
+namespace-scoped admin routes both require an `ns` claim on a **single-namespace**
+CP. A **multi-namespace** CP (`cp.namespaces` with more than one entry, or `*`)
+needs neither value: both planes engage the `ns` claim requirement automatically,
+and admin tokens without an `ns` claim are refused with `403` on namespace-scoped
+routes (including `/backup` and `/restore`). Both values render in `database`, `file`, `cp`, and `dp` modes (any
 mode that serves the admin API) and are reserved so `env` / `extraEnv` cannot
 desync them.
 
@@ -52,6 +53,12 @@ migrations; use the explicit Job for `status`, dry-run, and operator-controlled
   or `ghcr.io/ferrum-edge/ferrum-edge` (for example
   `--set image.tag=<tag>`). The mutable `latest` tag exists for evaluation but
   must not be used in production.
+- **Private registries.** `image.pullSecrets` is a list of Secret **names** in
+  the release namespace — each must already exist as a
+  `kubernetes.io/dockerconfigjson` Secret, the chart never creates one. The
+  names are attached to the gateway pod spec as `imagePullSecrets`:
+  `--set 'image.pullSecrets[0]=regcred'`. The default is `[]`, which renders no
+  `imagePullSecrets` key at all.
 - **Secrets are never generated or rendered into ConfigMaps.** Admin JWT, DB
   URL, and CP/DP gRPC JWT material come from inline values (dev only) or Secret
   references you own. The chart validates that database, cp, and dp modes have

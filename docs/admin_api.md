@@ -28,7 +28,11 @@ Admin JWTs must include `iss`, `sub`, `exp`, `iat`, `nbf`, `jti`, and a string `
 
 ### Per-namespace tenancy (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`)
 
-By default, admin JWTs are **global**: the `X-Ferrum-Namespace` header is a routing selector, not an authorization boundary — any valid Operator/Admin token can address any namespace. On multi-namespace deployments (e.g. a CP with `FERRUM_CP_NAMESPACES="prod,staging"`), set `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true` to make namespace-scoped admin routes require the JWT to carry an `ns` claim authorizing the requested namespace, mirroring the CP↔DP gRPC plane's `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM`:
+On a single-namespace deployment, admin JWTs are **global** by default: the `X-Ferrum-Namespace` header is a routing selector, not an authorization boundary — any valid Operator/Admin token can address any namespace. Setting `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true` makes namespace-scoped admin routes require the JWT to carry an `ns` claim authorizing the requested namespace.
+
+**Enforcement also engages automatically on a multi-namespace control plane.** When `FERRUM_CP_NAMESPACES` names more than one namespace (e.g. `"prod,staging"`) or is `*`, `cp` mode turns namespace-claim enforcement on for the admin plane regardless of `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` — the same rule the CP↔DP gRPC plane applies to `ConfigSync`, `MeshConfigSync`, and xDS streams. On such a CP, **admin tokens without an `ns` claim are refused with `403` on namespace-scoped routes**, including `GET /backup` (which serialises consumer credentials) and `POST /restore`. Mint admin tokens with an explicit `ns` claim before pointing them at a multi-namespace CP. `database`, `file`, `dp`, `mesh`, and `node_agent` modes have no CP scope and keep the flag's `false` default.
+
+Enforcement details, in either case:
 
 - The `ns` claim accepts the same shapes as the gRPC plane: a single string (`"ns": "prod"`) or an array of strings (`"ns": ["prod", "staging"]`).
 - A request whose `X-Ferrum-Namespace` (or the `ferrum` default when the header is omitted) is not in the token's `ns` set is rejected with `403 Forbidden`. With enforcement on, tokens without an `ns` claim are rejected on namespace-scoped routes — tenancy intent must be explicit.
@@ -37,7 +41,7 @@ By default, admin JWTs are **global**: the `X-Ferrum-Namespace` header is a rout
 - Other global surfaces (observability, `/cluster`, TLS management, backend capabilities, mesh introspection, `GET /plugins` type listing) remain unaffected: `X-Ferrum-Namespace` does not select a tenant there. Audit events for those fleet-global mutations (including TLS/ACME management and `POST /mesh/config-revision/reset`) are stored under the canonical default namespace (`ferrum`), not the request header. The same canonical bucket is used for an invalid `X-Ferrum-Namespace` and for an `ns`-claim denial, so a scoped caller cannot file a privileged record under another tenant.
 - Malformed `ns` claims (non-string entries, empty strings) are rejected at authentication time regardless of the flag — a garbled tenancy claim never widens access.
 
-With the flag off (default), behavior is unchanged and back-compatible.
+With enforcement off — the flag unset and the CP scope single-namespace — the namespace header remains a routing selector only.
 
 | Role | Access |
 | --- | --- |
@@ -731,9 +735,49 @@ Max credentials per type is controlled by `FERRUM_MAX_CREDENTIALS_PER_TYPE` (def
 
 Ordinary Consumer responses are a closed, fail-safe credential projection: they omit the entire `basicauth` credential type and every unknown/custom credential type, return only `identity` for `mtls_auth`, and replace each `keyauth.key`, `jwt.secret`, and `hmac_auth.secret` with the exact `[REDACTED]` marker. Extra fields on legacy known entries are dropped rather than echoed. Consumer audit diffs use the same closed projection (plus one stable marker for Basic credentials), so unknown/custom credential values are omitted there too. This response-only projection does not alter stored values: Consumer create/update and batch input still accept custom credential maps, and authenticated backup/restore preserves them unredacted for faithful recovery. Because that projection is closed, whole-Consumer `PUT` is non-destructive for the credential state it hides, so a read-modify-write round trip (GET a consumer, edit `acl_groups`, PUT the returned body) cannot silently destroy credentials. When a stored credential type the ordinary response does not emit at all — `basicauth`, any unknown/custom type, or an `mtls_auth` map whose entries the projection filtered out — is omitted from the request, the stored value is preserved; use `DELETE /consumers/{id}/credentials/{cred_type}` to remove it. If an `mtls_auth` map is only partially visible because some legacy entries or fields were filtered, submitting the exact projected array restores the complete stored map as well; supplying any different mTLS value remains an intentional wholesale replacement. Restored legacy-invalid hidden state fails validation rather than being silently deleted. Concretely, for the Basic case: When `basicauth` is omitted from the request, an existing Basic credential type is preserved; use `DELETE /consumers/{id}/credentials/basicauth` to remove it. That delete route accepts the five known types unconditionally and an unknown/custom type when the consumer actually stores it, so hidden types stay removable without opening a new credential-type namespace (an unknown type the consumer does not store returns `400`). A `keyauth`, `jwt`, or `hmac_auth` entry submitted as the exact `[REDACTED]` placeholder is restored from the stored entry at the same array index, so a round-tripped response cannot overwrite a live API key or shared secret with the placeholder string; entries carrying real values are written through, so rotation by `PUT` still works. For `jwt` and `hmac_auth` the restore uses the stored entry's canonical `secret` only, so a legacy row that still carries an ignored extra field such as `algorithm` does not fail an otherwise unrelated edit; `keyauth`, which has no single-field rule, is restored with every stored field. `[REDACTED]` is reserved for exactly this round trip: it is never accepted as a real `keyauth` `key`, `jwt` `secret`, or `hmac_auth` `secret` on any surface — create, whole-Consumer `PUT`, batch, restore, or the dedicated credential endpoints — and a placeholder submitted at an array index with no corresponding stored entry is rejected with `400` rather than stored, so the marker can never become live credential material. Credential type keys are likewise restricted at every write and restore boundary to one path-safe URI segment (1-64 ASCII letters, digits, underscores, or hyphens); keys that are empty or contain `/`, `%`, whitespace, control bytes, or other reserved URI characters are rejected, which guarantees that every stored credential type — including a hidden custom type only `PUT` preservation can create — remains addressable by `DELETE /consumers/{id}/credentials/{cred_type}`, a route that matches the raw path split on `/` without percent-decoding. Omitting a credential type the ordinary response does represent (`keyauth`, `jwt`, `hmac_auth`, `mtls_auth`) still removes it. The authenticated `/backup` endpoint is the only management response that intentionally returns unredacted Basic password hashes for faithful restoration. During active build-out, restore rejects legacy `basicauth` entries with extra fields: each entry must contain exactly one `password` or `password_hash` field.
 
+Redaction is a response projection only; it says nothing about the stored
+form. `keyauth` keys, `jwt` secrets, and `hmac_auth` secrets are
+stored recoverable in the configuration database — the row holds the same value the
+client presents, because verification needs it — while `basicauth` passwords
+are stored hashed under `FERRUM_BASIC_AUTH_HMAC_SECRET`. Anyone who can read
+the database, a replica, or a backup recovers every API key and shared secret.
+See [Credential storage at rest](plugins.md#credential-storage-at-rest) for the
+per-type breakdown and the mitigations.
+
 The OpenAPI document models these wire differences with separate Consumer surface schemas: `ConsumerCreate` is the create/batch request shape (write-only credential inputs, including plaintext `basicauth` `password`, and no `[REDACTED]` values), `ConsumerUpdate` is the `PUT` request shape (identical to `ConsumerCreate` except that `keyauth`, `jwt`, and `hmac_auth` entries may also be the exact `[REDACTED]` placeholder, so the server's own redacted response validates as an update body), `Consumer` is the ordinary redacted response shape (`basicauth` absent; `keyauth.key`, `jwt.secret`, and `hmac_auth.secret` carry the exact `[REDACTED]` placeholder), and `ConsumerBackup`/`ConsumerRestore` are the unredacted backup/restore shapes documented in [docs/admin_backup_restore.md](admin_backup_restore.md). Every composed Consumer surface closes unknown top-level fields (`unevaluatedProperties: false`), matching runtime `Consumer` serde `deny_unknown_fields` on create, update, batch, restore, and file/CP-DP config deserialization (SQL/Mongo loaders construct Consumers from typed columns/documents rather than accepting free-form top-level JSON). Credential mutation request bodies use `ConsumerCredentialInput`, the union of the per-type input entry schemas. Dedicated credential `PUT`/`POST` path parameters advertise only `BuiltInCredentialType` (`basicauth`, `keyauth`, `jwt`, `hmac_auth`, `mtls_auth`), matching runtime `ALLOWED_CREDENTIAL_TYPES`; type-level `DELETE` keeps the broader path-safe `CredentialTypeName` so custom maps remain removable.
 
 Consumer credential string maxima use Unicode character counts, matching OpenAPI `maxLength`: `basicauth.password`, `keyauth.key`, `hmac_auth.secret`, `jwt.secret`, and `mtls_auth.identity` are limited to 4096 characters and reject disallowed ASCII control bytes. HMAC secrets additionally require at least 32 non-whitespace characters. Consumer `jwt` credential entries support one key form: exactly one `secret` string (32-4096 characters) used for HS256 verification. Fields such as `algorithm`, `public_key`, `jwks`, and `jwks_uri` are rejected rather than ignored. RSA/EC/JWKS verification is configured through the separate `jwks_auth` plugin; it may map verified claims to a Consumer identity but does not read Consumer `jwt` credentials.
+
+## Replace semantics for `PUT`
+
+`PUT /proxies/{id}`, `PUT /upstreams/{id}` and `PUT /plugins/config/{id}` are
+**full replaces**: the body is deserialized into a fresh resource, so a field
+the body omits takes its schema default rather than the stored value. `POST`
+is unaffected — a create has no prior state to overwrite. Two fields whose
+default would otherwise silently change security state are handled explicitly:
+
+- **`PluginConfig.enabled` is required on `PUT`.** Its default is `true`, so an
+  omitted key would re-enable a deliberately disabled plugin config with a
+  `200`. A `PUT` body that is a JSON object without an `enabled` key is
+  rejected with `400` and nothing is mutated:
+  `{"error":"PUT is a full replace: 'enabled' is required (openapi.yaml declares it required). Send the field explicitly."}`.
+  `openapi.yaml` already lists `enabled` in the `PluginConfig` `required` set;
+  this makes the implementation match it. `POST /plugins/config` still defaults
+  `enabled` to `true` when the key is absent.
+- **An omitted `Proxy.plugins` preserves the stored associations.** Its default
+  is the empty list, so an omitted key would detach every plugin association —
+  including an authentication plugin — with a `200`. `PUT /proxies/{id}` is
+  therefore presence-aware for this one field, the same way `PUT
+  /namespaces/{name}` is for its fields. Send `"plugins": []` explicitly to
+  clear the associations; any present array replaces them wholesale.
+- **`Upstream.targets` is required by the schema**, so a `PUT
+  /upstreams/{id}` that omits it is already rejected with
+  `400 Invalid body: ...`. `Upstream` has no field of this class and needs no
+  special handling.
+
+Every other field on these three resources replaces normally: a `GET`-modify-`PUT`
+round trip is safe because the response serializes them, but a hand-authored or
+templated partial body will reset anything it leaves out to the schema default.
 
 ## Plugin Configs
 

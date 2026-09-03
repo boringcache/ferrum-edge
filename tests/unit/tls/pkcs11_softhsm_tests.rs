@@ -63,6 +63,7 @@ fn load_server_config(key_source: &str) -> Result<Arc<rustls::ServerConfig>, any
         false,
         &test_tls_policy(),
         30,
+        30,
         &[],
     )
 }

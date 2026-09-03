@@ -4,10 +4,30 @@
 {{- if and $obs.enabled (ne ($pm.enabled | toString) "false") }}
 {{- $bearer := $metrics.bearerToken | default dict -}}
 {{- $bearerSecret := $bearer.existingSecret | default dict -}}
+{{- $hasBearerSecret := not (empty $bearerSecret.name) -}}
+{{- $pmTls := $pm.tlsConfig | default dict -}}
+{{- /* A bearer credential is only ever attached to a verified HTTPS scrape:
+       FERRUM_METRICS_BEARER_TOKEN also unlocks full /health, /status and
+       /overload detail, and both DaemonSets run on the host network, so a
+       plaintext scrape would put the credential on the node network on every
+       interval. */ -}}
 {{- $first := true -}}
 {{- if .Values.ambient.enabled }}
 {{- $ambAdmin := include "ferrum-mesh.resolveComponentAdmin" (dict "component" "ambient" "env" (.Values.ambient.env | default dict) "admin" (.Values.ambient.admin | default dict)) | fromYaml -}}
-{{- if and (ne (toString $ambAdmin.port) "0") (not (include "ferrum-mesh.isLoopbackBind" $ambAdmin.bind)) }}
+{{- $ambHttps := include "ferrum-mesh.adminHttpsActive" (dict "resolved" $ambAdmin) -}}
+{{- $ambHttp := ne (toString $ambAdmin.port) "0" -}}
+{{- if and (or $ambHttp $ambHttps) (not (include "ferrum-mesh.isLoopbackBind" $ambAdmin.bind)) }}
+{{- if and $hasBearerSecret (not $ambHttps) -}}
+{{- fail "observability.metrics.podMonitor bearer authorization requires admin HTTPS on the ambient DaemonSet (ambient.admin.httpsPort>0 with ambient.admin.tls); the chart will not send the metrics bearer token over plaintext HTTP." -}}
+{{- end -}}
+{{- if and (or $hasBearerSecret (not $ambHttp)) $ambHttps -}}
+{{- if not $pmTls -}}
+{{- fail "observability.metrics.podMonitor scrapes admin over HTTPS but observability.metrics.podMonitor.tlsConfig is empty. Set observability.metrics.podMonitor.tlsConfig (for example ca.secret + serverName) so the scrape verifies the admin certificate." -}}
+{{- end -}}
+{{- end -}}
+{{- if and $hasBearerSecret ($pmTls.insecureSkipVerify | default false) -}}
+{{- fail "observability.metrics.podMonitor.tlsConfig.insecureSkipVerify cannot be true when bearer authorization is configured; the bearer token requires certificate verification." -}}
+{{- end -}}
 {{- $first = false }}
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
@@ -36,7 +56,12 @@ spec:
       app.kubernetes.io/instance: {{ .Release.Name }}
   podMetricsEndpoints:
     - path: /metrics
+      {{- if or $hasBearerSecret (not $ambHttp) }}
+      port: admin-https
+      scheme: https
+      {{- else }}
       port: admin-http
+      {{- end }}
       interval: {{ $pm.interval | default "30s" | quote }}
       scrapeTimeout: {{ $pm.scrapeTimeout | default "10s" | quote }}
       {{- if $bearerSecret.name }}
@@ -55,7 +80,22 @@ spec:
 {{- if and .Values.nodeAgent.enabled (.Values.nodeAgent.admin.enabled | default true) }}
 {{- $naBind := .Values.nodeAgent.admin.bindAddress | default "127.0.0.1" -}}
 {{- $naPort := toString (.Values.nodeAgent.admin.port | default "19090") -}}
-{{- if and (ne $naPort "0") (not (include "ferrum-mesh.isLoopbackBind" $naBind)) }}
+{{- $naHttpsPort := toString (.Values.nodeAgent.admin.httpsPort | default "0") -}}
+{{- $naTls := include "ferrum-mesh.nodeAgentAdminTlsConfigured" (.Values.nodeAgent.admin.tls | default dict) -}}
+{{- $naHttps := and (ne $naHttpsPort "0") $naTls -}}
+{{- $naHttp := ne $naPort "0" -}}
+{{- if and (or $naHttp $naHttps) (not (include "ferrum-mesh.isLoopbackBind" $naBind)) }}
+{{- if and $hasBearerSecret (not $naHttps) -}}
+{{- fail "observability.metrics.podMonitor bearer authorization requires admin HTTPS on the node-agent DaemonSet (nodeAgent.admin.httpsPort>0 with nodeAgent.admin.tls); the chart will not send the metrics bearer token over plaintext HTTP." -}}
+{{- end -}}
+{{- if and (or $hasBearerSecret (not $naHttp)) $naHttps -}}
+{{- if not $pmTls -}}
+{{- fail "observability.metrics.podMonitor scrapes admin over HTTPS but observability.metrics.podMonitor.tlsConfig is empty. Set observability.metrics.podMonitor.tlsConfig (for example ca.secret + serverName) so the scrape verifies the admin certificate." -}}
+{{- end -}}
+{{- end -}}
+{{- if and $hasBearerSecret ($pmTls.insecureSkipVerify | default false) -}}
+{{- fail "observability.metrics.podMonitor.tlsConfig.insecureSkipVerify cannot be true when bearer authorization is configured; the bearer token requires certificate verification." -}}
+{{- end -}}
 {{- if not $first }}
 ---
 {{- end }}
@@ -86,7 +126,12 @@ spec:
       app.kubernetes.io/instance: {{ .Release.Name }}
   podMetricsEndpoints:
     - path: /metrics
+      {{- if or $hasBearerSecret (not $naHttp) }}
+      port: admin-https
+      scheme: https
+      {{- else }}
       port: admin-http
+      {{- end }}
       interval: {{ $pm.interval | default "30s" | quote }}
       scrapeTimeout: {{ $pm.scrapeTimeout | default "10s" | quote }}
       {{- if $bearerSecret.name }}

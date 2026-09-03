@@ -135,7 +135,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 
 ### AI / LLM Plugins
 
-- **AI Federation** — HTTP-only, buffered/non-streaming AI gateway for 11 providers (OpenAI, Anthropic, Google Gemini/Vertex, Azure OpenAI, AWS Bedrock, Mistral, Cohere, xAI, DeepSeek, Meta Llama, Hugging Face). Clients send OpenAI Chat Completions JSON; the plugin translates supported native request shapes, authenticates with API keys, Google OAuth2, or AWS SigV4, and normalizes bounded responses back to OpenAI JSON before the ordinary backend transport is entered. Provider endpoints require HTTPS by default; a custom HTTP endpoint needs the explicit per-provider `allow_plaintext` opt-in. Supports model routing/mapping, priority fallback with separate pre-wire, ambiguous-outcome, and protocol-error controls, optional passive per-provider circuit breakers with one half-open probe, bounded provider/OAuth/request/normalized bodies, and bounded concurrent provider chains. Matched `"stream": true` requests return `501` unless the separate AI Stream Router claimed them; native gRPC/protobuf and provider response streaming are not supported. Writes token metadata for downstream rate limiting and logging
+- **AI Federation** — HTTP-only AI gateway, buffered by default, for 11 providers (OpenAI, Anthropic, Google Gemini/Vertex, Azure OpenAI, AWS Bedrock, Mistral, Cohere, xAI, DeepSeek, Meta Llama, Hugging Face). Clients send OpenAI Chat Completions JSON; the plugin translates supported native request shapes, authenticates with API keys, Google OAuth2, or AWS SigV4, and normalizes bounded responses back to OpenAI JSON before the ordinary backend transport is entered. Provider endpoints require HTTPS by default; a custom HTTP endpoint needs the explicit per-provider `allow_plaintext` opt-in. Supports model routing/mapping, priority fallback with separate pre-wire, ambiguous-outcome, and protocol-error controls, optional passive per-provider circuit breakers with one half-open probe, bounded provider/OAuth/request/normalized bodies, and bounded concurrent provider chains. The opt-in `streaming` block (disabled by default) adds a non-buffering path that commits ONE provider before the first byte and relays that provider's OpenAI-contract SSE incrementally; with streaming off or the matched provider ineligible, a `"stream": true` request still returns `501` unless the separate AI Stream Router claimed it. Native gRPC/protobuf is not supported. Writes token metadata for downstream rate limiting and logging
 - **AI Stream Router** — streaming counterpart to AI Federation that makes Ferrum an OpenAI-compatible **streaming** AI gateway. Claims only `"stream": true` OpenAI Chat Completions requests and preserves true end-to-end SSE streaming by rewriting the routing decision (`route_override_*`) instead of making an internal buffered call. Strips client credentials and injects the provider's; `openai`/`openai_compatible` providers pass through (optional `stream_options.include_usage` injection), `anthropic` requests are translated to the Messages API (including modern tool-call / tool-result history and legacy `function_call` / `role: "function"`) with Anthropic SSE normalized to OpenAI `chat.completion.chunk` events, and `google_gemini` requests are translated to Gemini/`streamGenerateContent` (Vertex-compatible) with native SSE and JSON array/object streams normalized the same way (content/role deltas, multi-candidate indexes, finish/safety/usage, function calls, bounded provider errors) under fail-closed premature-EOF / content-coding / size bounds. Re-asserts its provider credential boundary over the FINAL backend-visible header map and revalidates the final provider-visible model policy and route before dispatch, so a later `request_transformer` rule cannot leak a normal-backend secret to the provider, restore a client credential, or swap the routed model (GHSA-xhp5-hqj8-3mwg). Composes with AI Federation (which handles the non-streaming path), and stands `request_mirror`, `serverless_function`, `mcp_gateway`, and `mesh_route_dispatch` down on a claimed request, through a private typed claim rather than the public `ai_stream_router_claimed` observability marker
 - **AI Semantic Firewall** — semantic LLM request/response policy before provider routing/cache: built-in packs for prompt injection, jailbreaks, system prompt exfiltration, data exfiltration intent, indirect prompt injection, tool abuse, and response leakage, plus customer allow/deny topics, custom rules, dry-run rollout, fail-open/fail-closed provider behavior, and hashed audit metadata
 - **AI Token Metrics** — extract token usage (prompt, completion, total) from LLM responses (OpenAI, Anthropic, Google, Cohere, Mistral, Bedrock) into transaction metadata for downstream observability, with SSE streaming support for real-time token counting
@@ -255,7 +255,7 @@ All in-memory caches are bounded to prevent unbounded memory growth under advers
 - **Circuit breaker cache** — capped at `FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES` (default 10,000) with stale entry pruning on config reload
 - **Status code counters** — capped at `FERRUM_STATUS_COUNTS_MAX_ENTRIES` (default 200) with common codes pre-populated at startup
 - **Per-IP request counters** — periodic cleanup of zero-count entries via `FERRUM_PER_IP_CLEANUP_INTERVAL_SECONDS` (default 60s)
-- **Plugin caches** — response caching, AI semantic cache, request deduplication, SOAP nonce cache, LDAP auth cache, and rate limiting plugins all have configurable `max_entries` or `max_cache_entries` with TTL-based eviction and stale entry cleanup
+- **Plugin caches** — `max_entries` is configurable on `response_caching`, `ai_semantic_cache`, `request_deduplication`, and `api_chargeback`; `max_cache_entries` on `ldap_auth` and per provider on `oauth2_introspection` (`providers[].max_cache_entries`); the SOAP nonce cache uses `nonce.max_cache_size`. All are paired with TTL-based eviction and stale entry cleanup. The rate-limiting family (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, `graphql`, `grpc_method_router`) is different: it uses hardcoded entry ceilings (50,000-100,000) that are **not** configurable, and supplying `max_entries` to one of those plugins is rejected as an unknown config key
 - See [docs/cache_management.md](docs/cache_management.md) for the full cache inventory and tuning reference
 
 ## TLS & Security
@@ -275,6 +275,7 @@ All in-memory caches are bounded to prevent unbounded memory growth under advers
   - All versions: Content-Length non-numeric value rejection (RFC 9110 §8.6)
   - HTTP/1.x: Multiple Host header rejection
   - HTTP/1.1: missing Host header rejection (RFC 9112 §3.2.2; empty `Host:` is invalid; HTTP/1.0 and absolute-form request-targets that already carry an authority are not rejected)
+  - HTTP/1.1: absolute-form request-target authority disagreeing with the Host header rejected (RFC 9112 §3.2.1; scheme-default-port normalized, HTTP/1.0 not rejected)
   - HTTP/2 and HTTP/3: missing both `:authority` and Host rejection (RFC 9113 §8.3.1 / RFC 9114 §4.3.1; `:authority`-only and Host-only remain valid)
   - HTTP/2: TE header restricted to "trailers" only
   - All versions: TRACE method blocked (anti-XST)
@@ -282,7 +283,7 @@ All in-memory caches are bounded to prevent unbounded memory growth under advers
   - WebSocket: Sec-WebSocket-Key format validation (base64 16-byte nonce)
   - WebSocket: Per-proxy Origin validation (`allowed_ws_origins`) for CSWSH protection
 - Admin API security headers (X-Content-Type-Options, Cache-Control, X-Frame-Options)
-- HTTP/1.1 header read timeout for slowloris protection (`FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS`)
+- Request-header arrival timeout for slowloris protection on every frontend — HTTP/1.1, HTTP/2, and HTTP/3 (`FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS`; `0` disables)
 - Hop-by-hop header stripping per RFC 9110 §7.6.1 (including Proxy-Authenticate)
 - Backend egress / SSRF policy (`FERRUM_BACKEND_ALLOW_IPS` mode + `FERRUM_BACKEND_ALLOW_CIDRS`/`FERRUM_BACKEND_DENY_CIDRS` + a dangerous-range baseline) with three-layer enforcement (config-time, DNS-resolution-time, connection-time). **Secure by default**: cloud-metadata/link-local, multicast, and unspecified ranges are blocked even under the default `both` (loopback and RFC1918 stay reachable), so a fresh deployment is not an unrestricted SSRF bridge while internal-service backends still work. DNS-rebinding-safe — every fresh resolve and cache insertion is screened. See [docs/configuration.md](docs/configuration.md#backend-egress--ssrf-protection)
 - UDP response amplification protection (`udp_max_response_amplification_factor` per-proxy, cumulative per-request budget; Gateway API `UDPRoute` listeners get a finite default of 8.0 plus Ferrum `UDPResponseAmplificationPolicy`) with symmetric `on_udp_datagram` plugin hooks (client→backend and backend→client)
@@ -304,7 +305,7 @@ All in-memory caches are bounded to prevent unbounded memory growth under advers
 
 ## CLI
 
-- Five subcommands: `run` (foreground gateway), `validate` (config check), `reload` (SIGHUP), `health`, `version`
+- Six subcommands: `run` (foreground gateway), `validate` (config check), `reload` (SIGHUP — a config reload in file mode and in mesh mode with a local file/xDS config source; a logged no-op in every other mode), `health`, `version`, `ambient-udp-preflight` (privileged Ambient UDP node preflight)
 - Smart path defaults — `ferrum-edge run` works zero-config when `./ferrum.conf` and `./resources.yaml` exist
 - Mode inference — `--spec` auto-sets file mode when no mode is configured
 - Configuration precedence: CLI flag > env var > conf file > smart defaults > hardcoded defaults
@@ -319,7 +320,7 @@ All in-memory caches are bounded to prevent unbounded memory growth under advers
 - Database error masking in API responses (internal details logged, not exposed)
 - Batch operations and full config backup/restore
 - API Spec import — submit OpenAPI/Swagger documents to atomically provision proxy + upstream + plugins as a bundle (`POST /api-specs`); see [docs/api_specs.md](docs/api_specs.md)
-- Zero-downtime config reload via DB polling, SIGHUP, or CP push
+- Zero-downtime config reload via DB polling (database/cp modes), CP push over gRPC (dp mode), or SIGHUP (file mode, and mesh mode with a local file/xDS config source). Modes without a SIGHUP reload path log the signal and ignore it
 - Atomic config swap via ArcSwap (no partial config visible to requests)
 - Incremental database polling with indexed `updated_at` queries and full config validation
 
@@ -498,7 +499,7 @@ cargo build --release --features secrets-vault,secrets-aws
 
 ### Timeouts and Resilience
 
-Each individual cloud backend fetch (Vault, AWS, GCP, Azure) has a **30-second timeout**. If a secret provider is unreachable or slow, the gateway fails startup with a clear timeout error rather than hanging indefinitely. File-based secrets have no timeout since they are local filesystem reads.
+Every backend fetch is wrapped in the same per-fetch timeout envelope — the cloud backends (Vault, AWS, GCP, Azure) **and** local `_FILE` sources, so a blocked mount or FIFO cannot hang startup either. The bound is `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` (default 30 seconds); if a source is unreachable or slow, the gateway fails startup with a clear timeout error rather than hanging indefinitely. A non-regular `_FILE` source (FIFO, socket, device, or directory) is refused before any read, so it fails immediately instead of after the timeout. See [docs/configuration.md](docs/configuration.md) for the knob.
 
 ## Deployment
 

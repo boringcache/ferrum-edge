@@ -59,6 +59,60 @@ fn generate_local_mesh_jwt(node_id: &str) -> String {
     .expect("local mesh JWT should mint")
 }
 
+/// How far past its `exp` a near-expiry test token already is at mint time.
+///
+/// gRPC verification applies a mandatory 60s skew leeway
+/// (`GRPC_JWT_LEEWAY_SECONDS` in `src/grpc/auth.rs`) to `exp`, and
+/// `authorization_deadline_from_verified_claims` derives the stream's
+/// authorization lease from `exp + 60 - now_wall` measured against the
+/// monotonic admission instant. A token minted with `exp = now - 45` is
+/// therefore still admissible for `60 - 45 = 15s`, and its lease fires ~15s
+/// after the *mint*, independent of when admission happened: the `-(T - T0)`
+/// the wall clock contributes to `remaining` cancels the `+(T - T0)` that
+/// `admitted_at` contributes.
+///
+/// The offset trades admission grace against wall-clock cost, both inside the
+/// same 60s leeway. Raising it shrinks the grace window the client has to
+/// connect and establish the stream before the token stops being admissible at
+/// all; lowering it makes the lease wait — and therefore the test's wall-clock
+/// cost in the `mesh-protocols` integration shard — grow toward a minute.
+const EXPIRED_TOKEN_OFFSET_SECONDS: i64 = 45;
+
+/// Mint a test-only near-expiry gRPC bearer token.
+///
+/// The ordinary helpers (`dp_client::generate_dp_jwt_full*`) hard-code
+/// `exp = now + DP_JWT_TTL_SECONDS` (3540s), which puts the authorization lease
+/// about an hour out and makes `StreamAuthEndReason::Expired` unreachable in a
+/// test. This mints the same claim set with `exp` already
+/// [`EXPIRED_TOKEN_OFFSET_SECONDS`] in the past, so the token is admitted
+/// inside the verification leeway and its lease expires shortly afterwards.
+///
+/// `audience` is passed only for the MeshSubscribe surface, whose local policy
+/// is `Required(MESH_LOCAL_SUBSCRIBE_AUDIENCE)`; ConfigSync's policy forbids a
+/// reserved audience, so its token must carry no `aud` at all.
+fn generate_near_expiry_jwt(node_id: &str, audience: Option<&str>) -> String {
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    use serde_json::json;
+
+    let now = Utc::now().timestamp();
+    let mut claims = json!({
+        "sub": node_id,
+        "iat": now,
+        "exp": now - EXPIRED_TOKEN_OFFSET_SECONDS,
+        "iss": TEST_DEFAULT_ISSUER,
+        "role": "data_plane",
+    });
+    if let Some(audience) = audience {
+        claims["aud"] = json!(audience);
+    }
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+    )
+    .expect("near-expiry test JWT should mint")
+}
+
 /// Create a test Proxy entry.
 fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
     Proxy {
@@ -5799,6 +5853,19 @@ async fn open_configsync_stream(
     addr: SocketAddr,
     subject: &str,
 ) -> tonic::Streaming<ferrum_edge::grpc::proto::ConfigUpdate> {
+    let token =
+        dp_client::generate_dp_jwt_with_issuer(TEST_JWT_SECRET, subject, TEST_DEFAULT_ISSUER)
+            .unwrap();
+    open_configsync_stream_with_token(addr, subject, &token).await
+}
+
+/// `open_configsync_stream` with a caller-supplied bearer token, so a test can
+/// admit a stream on something other than the ordinary long-lived DP token.
+async fn open_configsync_stream_with_token(
+    addr: SocketAddr,
+    subject: &str,
+    token: &str,
+) -> tonic::Streaming<ferrum_edge::grpc::proto::ConfigUpdate> {
     let channel =
         tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{}", addr.port()))
             .unwrap()
@@ -5813,9 +5880,6 @@ async fn open_configsync_stream(
         real_ip_header: Some(String::new()),
         supports_heartbeat: true,
     });
-    let token =
-        dp_client::generate_dp_jwt_with_issuer(TEST_JWT_SECRET, subject, TEST_DEFAULT_ISSUER)
-            .unwrap();
     request.metadata_mut().insert(
         "authorization",
         tonic::metadata::MetadataValue::try_from(format!("Bearer {token}")).unwrap(),
@@ -5826,6 +5890,16 @@ async fn open_configsync_stream(
 async fn open_mesh_subscribe_stream(
     addr: SocketAddr,
     subject: &str,
+) -> tonic::Streaming<ferrum_edge::grpc::proto::MeshConfigUpdate> {
+    let token = generate_local_mesh_jwt(subject);
+    open_mesh_subscribe_stream_with_token(addr, subject, &token).await
+}
+
+/// `open_mesh_subscribe_stream` with a caller-supplied bearer token.
+async fn open_mesh_subscribe_stream_with_token(
+    addr: SocketAddr,
+    subject: &str,
+    token: &str,
 ) -> tonic::Streaming<ferrum_edge::grpc::proto::MeshConfigUpdate> {
     let channel =
         tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{}", addr.port()))
@@ -5846,7 +5920,6 @@ async fn open_mesh_subscribe_stream(
         remote_discovery: false,
         node_waypoint_capture_scoping: false,
     });
-    let token = generate_local_mesh_jwt(subject);
     request.metadata_mut().insert(
         "authorization",
         tonic::metadata::MetadataValue::try_from(format!("Bearer {token}")).unwrap(),
@@ -6039,11 +6112,17 @@ async fn native_stream_permits_release_on_normal_close_and_transport_reset() {
 /// Only one of the two authorization terminals can be made short here. The
 /// authorization lease deadline is derived from the bearer token's `exp`
 /// (`DP_JWT_TTL_SECONDS`, 3540s) plus the mandatory 60s verification leeway, so
-/// a stream minted by the ordinary DP/mesh token helpers cannot reach
+/// a stream minted by the *ordinary* DP/mesh token helpers cannot reach
 /// `StreamAuthEndReason::Expired` inside a test. The bound this test measures
 /// is therefore the server maximum lifetime, and the lease sits roughly an hour
 /// above it — the wide separation issue #4490 asked for, in the only direction
 /// the two bounds can actually be separated.
+///
+/// The opposite direction has its own test:
+/// `native_stream_permits_release_on_authorization_lease_expiry` (issue #4500)
+/// mints a near-expiry token with [`generate_near_expiry_jwt`] instead of
+/// shortening a server bound, which puts the lease ~15s out and the server
+/// maximum lifetime far above it.
 ///
 /// The flake in #4490 was consequently not lease-versus-lifetime but
 /// terminal-versus-establishment: at 150ms the bound could elapse before the
@@ -6141,6 +6220,69 @@ async fn native_stream_permits_release_on_server_max_lifetime() {
     drop(mesh_stream);
     wait_for_shared_active_streams(&harness.admission, 0).await;
     assert_eq!(harness.admission.active_nodes(), 0);
+}
+
+/// The other authorization terminal: the token-derived lease
+/// (`StreamAuthEndReason::Expired`), which #4474 named a test after and #4490 /
+/// #4499 proved that test never reached. Issue #4500 is this coverage.
+///
+/// The lease cannot be shortened by shortening a server bound — it is derived
+/// from the token. So both streams are admitted on near-expiry tokens
+/// ([`generate_near_expiry_jwt`], `exp = now - EXPIRED_TOKEN_OFFSET_SECONDS`):
+/// verification's mandatory 60s leeway still admits them for
+/// `60 - 45 = 15s`, and their lease fires ~15s after the mint. The server
+/// maximum lifetime is set to 120s so it sits far above the lease and the two
+/// bounds are separated in the direction under test — the inverse of
+/// `native_stream_permits_release_on_server_max_lifetime`.
+///
+/// Both streams are opened before either terminal is awaited, so the two ~15s
+/// waits overlap and the test costs ~15s of wall clock rather than ~30s.
+///
+/// Nothing else can fire first: the ConfigSync and MeshSubscribe application
+/// heartbeats are both 60s, and `CpGrpcAdmissionLimits::first_request_timeout`
+/// (30s by default) applies only to the xDS bidirectional loops, not to these
+/// server-streaming surfaces.
+#[tokio::test(flavor = "multi_thread")]
+async fn native_stream_permits_release_on_authorization_lease_expiry() {
+    let harness = start_native_admission_harness(
+        ferrum_edge::grpc::admission::CpGrpcAdmissionLimits::default(),
+        Duration::from_secs(120),
+    )
+    .await;
+
+    // Generous relative to the ~15s lease so a loaded CI runner cannot turn a
+    // slow terminal into a hang that reads as an unrelated failure.
+    let terminal_timeout =
+        Duration::from_secs(EXPIRED_TOKEN_OFFSET_SECONDS as u64) + Duration::from_secs(30);
+
+    let config_token = generate_near_expiry_jwt("config-lease-expiry", None);
+    let mut config_stream =
+        open_configsync_stream_with_token(harness.addr, "config-lease-expiry", &config_token).await;
+    assert!(expect_initial_snapshot("ConfigSync", config_stream.message().await).is_some());
+
+    let mesh_token =
+        generate_near_expiry_jwt("mesh-lease-expiry", Some(MESH_LOCAL_SUBSCRIBE_AUDIENCE));
+    let mut mesh_stream =
+        open_mesh_subscribe_stream_with_token(harness.addr, "mesh-lease-expiry", &mesh_token).await;
+    assert!(expect_initial_snapshot("MeshSubscribe", mesh_stream.message().await).is_some());
+
+    let config_status = timeout(terminal_timeout, config_stream.message())
+        .await
+        .expect("ConfigSync should reach the token-derived authorization lease")
+        .expect_err("the ConfigSync authorization lease should be terminal");
+    assert_stream_terminal("ConfigSync", &config_status, AUTHORIZATION_LEASE_TERMINAL);
+    drop(config_stream);
+
+    let mesh_status = timeout(terminal_timeout, mesh_stream.message())
+        .await
+        .expect("MeshSubscribe should reach the token-derived authorization lease")
+        .expect_err("the MeshSubscribe authorization lease should be terminal");
+    assert_stream_terminal("MeshSubscribe", &mesh_status, AUTHORIZATION_LEASE_TERMINAL);
+    drop(mesh_stream);
+
+    wait_for_shared_active_streams(&harness.admission, 0).await;
+    assert_eq!(harness.admission.active_nodes(), 0);
+    assert_eq!(harness.admission.tracked_principals(), 0);
 }
 
 struct SeverableNativeAdmissionServer {

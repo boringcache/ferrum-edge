@@ -260,6 +260,39 @@ DEDICATED_REQUIRED_CHECKS = {
             "multicluster_poller.withdrawal.retired_state_not_reinstalled",
         },
     },
+    ".github/workflows/fips-build.yml": {
+        "job": "fips-build",
+        "name": "FIPS Build & Test",
+        # Issue #4445 promoted the hosted FIPS aggregate to a required and
+        # publish-blocking context. Pin its complete `needs` set and every
+        # fail-closed step so a later change cannot keep the check name while
+        # dropping a producer, and pin the planner-verdict guards so an
+        # unusable relevance output cannot be reported as success.
+        "needs": {
+            "fips-plan",
+            "fips-compile",
+            "fips-claimed-checks",
+            "fips-clippy",
+            "fips-test-build",
+            "fips-test",
+        },
+        "contract": {
+            "if: needs.fips-plan.result != 'success'",
+            "needs.fips-plan.result == 'success' && "
+            "needs.fips-plan.outputs.relevant != 'true' && "
+            "needs.fips-plan.outputs.relevant != 'false'",
+            "needs.fips-plan.outputs.relevant == 'true' && "
+            "needs.fips-compile.result != 'success'",
+            "needs.fips-plan.outputs.relevant == 'true' && "
+            "needs.fips-claimed-checks.result != 'success'",
+            "needs.fips-plan.outputs.relevant == 'true' && "
+            "needs.fips-clippy.result != 'success'",
+            "needs.fips-plan.outputs.relevant == 'true' && "
+            "needs.fips-test-build.result != 'success'",
+            "needs.fips-plan.outputs.relevant == 'true' && "
+            "needs.fips-test.result != 'success'",
+        },
+    },
 }
 
 # The artifact validator is only a gate if it is reached with a SHA-pinned
@@ -306,6 +339,7 @@ DEDICATED_WORKFLOW_NAMES = {
     ".github/workflows/multicluster-poller-partition-live.yml": (
         "Multicluster Poller Partition Live"
     ),
+    ".github/workflows/fips-build.yml": "FIPS Build Policy",
 }
 
 # Every required status check owner must trigger on merge_group. Without that
@@ -323,6 +357,7 @@ REQUIRED_MERGE_GROUP_WORKFLOWS = {
         "Multicluster Poller Partition Live"
     ),
     ".github/workflows/ambient-host-udp-live.yml": "Ambient Host UDP Live",
+    ".github/workflows/fips-build.yml": "FIPS Build & Test",
 }
 
 # Issue #3908 migrated three optional live suites off pull-request-supplied

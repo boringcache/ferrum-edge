@@ -3172,6 +3172,15 @@ pub struct EnvConfig {
     /// Expired certificates are rejected at startup/config-load time.
     /// Set to 0 to disable near-expiry warnings. (default: 30)
     pub tls_cert_expiry_warning_days: u64,
+    /// Number of days before revocation material (a CRL's `nextUpdate`, a
+    /// stapled OCSP response's `nextUpdate`) expires to emit a warning log.
+    /// One knob covers both: they are the same operator refresh loop.
+    ///
+    /// Expired revocation material is *refused*, at reload and at startup
+    /// alike (issue #4505), so this is the only advance notice an operator
+    /// gets before a forgotten refresh becomes a handshake outage that also
+    /// blocks restart. Set to 0 to disable near-expiry warnings. (default: 30)
+    pub tls_crl_expiry_warning_days: u64,
     /// Maximum age of the cached, non-secret TLS inventory snapshot that backs
     /// the `/metrics` certificate gauges. A scrape only ever reads the snapshot;
     /// when it is older than this bound the scrape schedules a single-flight
@@ -3526,6 +3535,23 @@ pub struct EnvConfig {
     /// (socket peer, or forwarding headers only from `FERRUM_TRUSTED_PROXIES`).
     /// Default: 0 (disabled). When exceeded, upgrades are rejected with 503.
     pub websocket_max_connections_per_ip: u64,
+    /// Maximum concurrent TCP stream-proxy connections per effective source IP.
+    ///
+    /// Enforced in the TCP stream accept path *before* the frontend TLS
+    /// handshake and before any plugin hook runs, so one source cannot occupy a
+    /// listener's whole pre-handshake budget. The source is the same effective
+    /// client IP the stream context carries: the forwarded address when an
+    /// inbound PROXY-protocol header was accepted from a `FERRUM_TRUSTED_PROXIES`
+    /// peer, otherwise the socket peer. Default: 256. `0` = unlimited.
+    pub tcp_max_connections_per_ip: u64,
+    /// Maximum concurrent UDP/DTLS stream-proxy sessions per effective source IP.
+    ///
+    /// Enforced at session-slot reservation, alongside the listener-wide
+    /// `FERRUM_UDP_MAX_SESSIONS` bound, so one source cannot consume a
+    /// listener's whole session table with many source ports. The source is the
+    /// authenticated forwarded client when a datagram client-address envelope
+    /// was accepted, otherwise the socket peer. Default: 1024. `0` = unlimited.
+    pub udp_max_sessions_per_ip: u64,
 
     // ── Overload management ──────────────────────────────────────────────
     /// How often the overload monitor checks resource pressure in milliseconds.
@@ -4010,6 +4036,7 @@ impl Default for EnvConfig {
             service_discovery_stale_policy: crate::config::types::SdStalePolicy::Withdraw,
             service_discovery_allow_unbounded_stale: false,
             tls_cert_expiry_warning_days: 30,
+            tls_crl_expiry_warning_days: 30,
             tls_inventory_snapshot_ttl_seconds: DEFAULT_SNAPSHOT_TTL_SECONDS,
             tls_early_data_methods: HashSet::new(),
             trusted_proxies: String::new(),
@@ -4084,6 +4111,8 @@ impl Default for EnvConfig {
             server_http2_max_local_error_reset_streams: 256,
             websocket_max_connections: 20_000,
             websocket_max_connections_per_ip: 0,
+            tcp_max_connections_per_ip: 256,
+            udp_max_sessions_per_ip: 1024,
             overload_check_interval_ms: 1000,
             overload_fd_pressure_threshold: 0.80,
             overload_fd_critical_threshold: 0.95,
@@ -4606,6 +4635,7 @@ impl EnvConfig {
             tls_curves_legacy: Option<String> = "FERRUM_TLS_CURVES";
             tls_session_cache_size: usize = "FERRUM_TLS_SESSION_CACHE_SIZE" => 4096usize;
             tls_cert_expiry_warning_days: u64 = "FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS" => 30u64;
+            tls_crl_expiry_warning_days: u64 = "FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS" => 30u64;
             tls_inventory_snapshot_ttl_seconds: u64 = "FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS" => DEFAULT_SNAPSHOT_TTL_SECONDS, clamp(0u64, 86_400u64);
         }
 
@@ -4754,6 +4784,8 @@ impl EnvConfig {
             server_http2_max_local_error_reset_streams: usize = "FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS" => 256usize, max(1usize);
             websocket_max_connections: usize = "FERRUM_WEBSOCKET_MAX_CONNECTIONS" => 20_000usize;
             websocket_max_connections_per_ip: u64 = "FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP" => 0u64;
+            tcp_max_connections_per_ip: u64 = "FERRUM_TCP_MAX_CONNECTIONS_PER_IP" => 256u64;
+            udp_max_sessions_per_ip: u64 = "FERRUM_UDP_MAX_SESSIONS_PER_IP" => 1024u64;
             overload_check_interval_ms: u64 = "FERRUM_OVERLOAD_CHECK_INTERVAL_MS" => 1000u64, max(100u64);
             overload_fd_pressure_threshold: f64 = "FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD" => 0.80f64, clamp(0.0f64, 1.0f64);
             overload_fd_critical_threshold: f64 = "FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD" => 0.95f64, clamp(0.0f64, 1.0f64);
@@ -5429,6 +5461,7 @@ impl EnvConfig {
             service_discovery_stale_policy,
             service_discovery_allow_unbounded_stale,
             tls_cert_expiry_warning_days,
+            tls_crl_expiry_warning_days,
             tls_inventory_snapshot_ttl_seconds,
             tls_early_data_methods,
             stream_proxy_bind_address,
@@ -5505,6 +5538,8 @@ impl EnvConfig {
             server_http2_max_local_error_reset_streams,
             websocket_max_connections,
             websocket_max_connections_per_ip,
+            tcp_max_connections_per_ip,
+            udp_max_sessions_per_ip,
             overload_check_interval_ms,
             overload_fd_pressure_threshold,
             overload_fd_critical_threshold,
@@ -7550,6 +7585,109 @@ impl EnvConfig {
         // The datagram client-address envelope's MAC key (issue #3289).
         self.validate_datagram_proxy_protocol_secret()?;
 
+        // ACME auto-renewal that can never reach the listener (issue #4506).
+        self.validate_acme_renewal_reachability()?;
+
+        Ok(())
+    }
+
+    /// Refuse an ACME auto-renewal configuration whose renewed material can
+    /// never reach the serving listener.
+    ///
+    /// A successful renewal publishes new material into the ACME certificate
+    /// store and then calls
+    /// [`crate::tls::source::subscription::request_all_material_set_reloads`],
+    /// which notifies only the surfaces that registered a force-reload sender.
+    /// The frontend and admin HTTPS surfaces register theirs exclusively from
+    /// inside the live-reload watcher, and
+    /// [`crate::modes::tls_reload::prepare_proxy_frontend_tls`] does not build
+    /// that watcher when `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` is `false`
+    /// (its default). With auto-renew on and live reload off, renewals
+    /// therefore succeed in the store while every client keeps receiving the
+    /// previous leaf until it expires — HTTPS then fails with the correct
+    /// certificate already on disk.
+    ///
+    /// Fail closed rather than warn, consistent with the rest of the TLS
+    /// surface: automation that does not renew what clients see removes the
+    /// operator's reason to monitor expiry, so it must not start silently. The
+    /// condition is deliberately narrow — it fires only when auto-renew is on
+    /// **and** a served frontend/admin certificate or key source is actually an
+    /// `acme://` URI **and** the reload path for that surface is off. A
+    /// file-backed or externally-managed source is untouched, and so is a
+    /// deployment that simply leaves `FERRUM_ACME_AUTO_RENEW_ENABLED=false`.
+    ///
+    /// The admin HTTPS listener has no live-reload flag of its own: it shares
+    /// `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`
+    /// (`crate::modes::tls_reload::admin_frontend_live_reload_can_arm`), so
+    /// both surfaces are tested against the same flag.
+    ///
+    /// Gateway-API multi-certificate sources (`crate::tls::multi_cert`) are out
+    /// of scope here: they arrive in the CP config snapshot rather than in
+    /// `EnvConfig`, and the DP rebuilds the whole resolver on each delivery, so
+    /// they do not depend on the force-reload registry at all.
+    ///
+    /// The offending source is named in its redacted form
+    /// ([`crate::tls::source::CertSource::redacted_source_id`]); the raw
+    /// configured value never reaches the message.
+    pub fn validate_acme_renewal_reachability(&self) -> Result<(), String> {
+        use crate::tls::source::{CertSource, MaterialKind, SourceScheme};
+
+        if !self.acme_auto_renew_enabled {
+            return Ok(());
+        }
+        // Both surfaces gate on the same flag today. Kept as a per-surface
+        // tuple so a future admin-specific flag has one place to land.
+        let candidates: [(&str, Option<&String>, MaterialKind, bool); 4] = [
+            (
+                "FERRUM_FRONTEND_TLS_CERT_SOURCE",
+                self.frontend_tls_cert_path.as_ref(),
+                MaterialKind::Cert,
+                self.frontend_tls_live_reload_enabled,
+            ),
+            (
+                "FERRUM_FRONTEND_TLS_KEY_SOURCE",
+                self.frontend_tls_key_path.as_ref(),
+                MaterialKind::Key,
+                self.frontend_tls_live_reload_enabled,
+            ),
+            (
+                "FERRUM_ADMIN_TLS_CERT_SOURCE",
+                self.admin_tls_cert_path.as_ref(),
+                MaterialKind::Cert,
+                self.frontend_tls_live_reload_enabled,
+            ),
+            (
+                "FERRUM_ADMIN_TLS_KEY_SOURCE",
+                self.admin_tls_key_path.as_ref(),
+                MaterialKind::Key,
+                self.frontend_tls_live_reload_enabled,
+            ),
+        ];
+        for (variable, configured, kind, reload_enabled) in candidates {
+            if reload_enabled {
+                continue;
+            }
+            let Some(configured) = configured else {
+                continue;
+            };
+            let source = CertSource::parse(configured.as_str(), kind);
+            let is_acme =
+                matches!(&source, CertSource::Uri(uri) if uri.scheme == SourceScheme::Acme);
+            if !is_acme {
+                continue;
+            }
+            return Err(format!(
+                "FERRUM_ACME_AUTO_RENEW_ENABLED=true with {variable}={} requires \
+                 FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true. Renewed ACME material is \
+                 published into the certificate store and then offered to the TLS surfaces \
+                 that registered a force-reload sender; only the live-reload watcher \
+                 registers one, so with live reload disabled the listener would keep serving \
+                 the previous certificate until it expires. Set \
+                 FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true, or disable \
+                 FERRUM_ACME_AUTO_RENEW_ENABLED and renew out of band.",
+                source.redacted_source_id()
+            ));
+        }
         Ok(())
     }
 

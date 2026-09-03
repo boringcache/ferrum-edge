@@ -32,6 +32,14 @@ const MAX_JWK_COMPONENT_BYTES: usize = 16 * 1024;
 
 /// Default maximum age of the last validated non-empty remote JWKS.
 pub const DEFAULT_JWKS_MAX_STALE_SECONDS: u64 = 3_600;
+/// Default minimum spacing between on-demand JWKS refetches triggered by a
+/// token naming a `kid` the trusted snapshot does not contain.
+pub const DEFAULT_KID_MISS_REFRESH_COOLDOWN_SECONDS: u64 = 30;
+/// Hard ceiling for the configurable on-demand refetch cooldown.
+pub const MAX_KID_MISS_REFRESH_COOLDOWN_SECONDS: u64 = 3_600;
+
+/// Sentinel meaning "no on-demand refetch has ever been triggered".
+const KID_MISS_NEVER_TRIGGERED: u64 = u64::MAX;
 /// Hard ceiling for remote JWKS trust after the last validated non-empty fetch.
 pub const MAX_JWKS_MAX_STALE_SECONDS: u64 = 86_400;
 
@@ -156,6 +164,44 @@ struct JwksTrustPolicy {
     max_stale: Duration,
 }
 
+/// Bounded on-demand refetch trigger for an unknown JWT `kid`.
+///
+/// The verifier signals this from the request path when a token names a key
+/// identifier the trusted snapshot does not contain — the observable shape of
+/// an identity provider rotating its signing key. Signalling is synchronous,
+/// non-blocking, and allocation-free; the fetch itself happens on the store's
+/// background refresh task, so the triggering request still fails closed.
+struct KidMissTrigger {
+    /// Woken by [`JwksKeyStore::request_refresh_on_kid_miss`]; selected on by
+    /// the background refresh task alongside its periodic timer.
+    notify: Notify,
+    /// Minimum spacing between triggers, in milliseconds. `0` disables the
+    /// on-demand refetch entirely.
+    cooldown_ms: AtomicU64,
+    /// Monotonic tick (`crate::socket_opts::monotonic_now_ms`) of the last
+    /// admitted trigger, or [`KID_MISS_NEVER_TRIGGERED`]. Deliberately not
+    /// wall time: an NTP step must not be able to disable or spam the trigger.
+    last_trigger_ms: AtomicU64,
+    /// Triggers admitted through the cooldown. Sanitized observability for
+    /// tests and diagnostics: a count, never a `kid`.
+    admitted: AtomicU64,
+}
+
+impl KidMissTrigger {
+    fn new(cooldown: Duration) -> Self {
+        Self {
+            notify: Notify::new(),
+            cooldown_ms: AtomicU64::new(duration_to_millis(cooldown)),
+            last_trigger_ms: AtomicU64::new(KID_MISS_NEVER_TRIGGERED),
+            admitted: AtomicU64::new(0),
+        }
+    }
+}
+
+fn duration_to_millis(value: Duration) -> u64 {
+    u64::try_from(value.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Sanitized in-process health snapshot. It intentionally contains no URI,
 /// key identifier, token, claim, or key material.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -185,6 +231,8 @@ pub struct JwksKeyStore {
     /// scraping endpoint URLs.
     refresh_completions: Arc<AtomicU64>,
     refresh_notify: Arc<Notify>,
+    /// Rate-limited on-demand refetch trigger for an unknown JWT `kid`.
+    kid_miss: Arc<KidMissTrigger>,
 }
 
 /// Raw JWKS response from the endpoint.
@@ -315,6 +363,9 @@ impl JwksKeyStore {
             refreshable: true,
             refresh_completions: Arc::new(AtomicU64::new(0)),
             refresh_notify: Arc::new(Notify::new()),
+            kid_miss: Arc::new(KidMissTrigger::new(Duration::from_secs(
+                DEFAULT_KID_MISS_REFRESH_COOLDOWN_SECONDS,
+            ))),
         }
     }
 
@@ -342,6 +393,8 @@ impl JwksKeyStore {
             refreshable: false,
             refresh_completions: Arc::new(AtomicU64::new(0)),
             refresh_notify: Arc::new(Notify::new()),
+            // Inline stores never refetch; the trigger stays inert.
+            kid_miss: Arc::new(KidMissTrigger::new(Duration::ZERO)),
         })
     }
 
@@ -367,6 +420,73 @@ impl JwksKeyStore {
             refresh_interval,
             max_stale,
         }));
+    }
+
+    /// Install the effective on-demand refetch cooldown for this store.
+    ///
+    /// `Duration::ZERO` disables the unknown-`kid` refetch. Shared stores take
+    /// the most restrictive cooldown among their active consumers, so a
+    /// consumer that disables the behaviour disables it for the shared store.
+    pub fn configure_kid_miss_cooldown(&self, cooldown: Duration) {
+        self.kid_miss
+            .cooldown_ms
+            .store(duration_to_millis(cooldown), Ordering::Release);
+    }
+
+    /// Currently installed on-demand refetch cooldown.
+    #[allow(dead_code)] // external unit tests assert the effective policy
+    pub fn kid_miss_cooldown(&self) -> Duration {
+        Duration::from_millis(self.kid_miss.cooldown_ms.load(Ordering::Acquire))
+    }
+
+    /// Ask the background refresh task for one out-of-band JWKS fetch because
+    /// a token named a `kid` the trusted snapshot does not contain.
+    ///
+    /// Called from the request path: synchronous, non-blocking, and
+    /// allocation-free. At most one fetch is requested per cooldown window, so
+    /// a flood of tokens carrying random identifiers cannot become a fetch
+    /// storm against the identity provider. The caller does not await the
+    /// fetch — the request that observed the miss still fails closed, and a
+    /// later request verifies once the refreshed snapshot is published.
+    ///
+    /// No `kid`, token, claim, or key material is recorded or logged here.
+    #[inline]
+    pub fn request_refresh_on_kid_miss(&self) {
+        if !self.refreshable {
+            return;
+        }
+        let cooldown_ms = self.kid_miss.cooldown_ms.load(Ordering::Acquire);
+        if cooldown_ms == 0 {
+            return;
+        }
+        let now = crate::socket_opts::monotonic_now_ms();
+        let mut observed = self.kid_miss.last_trigger_ms.load(Ordering::Acquire);
+        loop {
+            if observed != KID_MISS_NEVER_TRIGGERED && now.saturating_sub(observed) < cooldown_ms {
+                return;
+            }
+            match self.kid_miss.last_trigger_ms.compare_exchange_weak(
+                observed,
+                now,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                // Exactly one concurrent caller wins the window and signals.
+                Ok(_) => break,
+                Err(current) => observed = current,
+            }
+        }
+        self.kid_miss.admitted.fetch_add(1, Ordering::Relaxed);
+        self.kid_miss.notify.notify_one();
+    }
+
+    /// Number of unknown-`kid` refetch triggers admitted through the cooldown.
+    ///
+    /// A count only — no key identifier, token, or claim is retained anywhere
+    /// on this path.
+    #[allow(dead_code)] // external unit tests assert the rate-limit contract
+    pub fn kid_miss_refresh_requests(&self) -> u64 {
+        self.kid_miss.admitted.load(Ordering::Relaxed)
     }
 
     /// Monotonic deadline when this remote store's retained keys become
@@ -684,14 +804,35 @@ impl JwksKeyStore {
                 // max-stale window the reconfiguration exists to honor.
                 // `unconstrained` keeps that first fetch from being fairness-
                 // delayed behind unrelated tasks under the full/coverage matrix.
-                if !(first_refresh && force_first_refresh) {
-                    tokio::time::sleep_until(next_refresh_at).await;
+                //
+                // Every pass AFTER the first also races the unknown-`kid`
+                // trigger. The notify arm registers no timer, so the
+                // paused-clock guarantee above is unchanged: a kid-miss wake is
+                // driven purely by the signalling request, not by virtual time.
+                // The first pass is deliberately excluded — it is already about
+                // to fetch, and a trigger raised before it runs is not lost:
+                // `notify_one` leaves a permit the next `notified()` consumes.
+                let mut woke_on_kid_miss = false;
+                if first_refresh {
+                    if !force_first_refresh {
+                        tokio::time::sleep_until(next_refresh_at).await;
+                    }
+                } else {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(next_refresh_at) => {}
+                        _ = store.kid_miss.notify.notified() => {
+                            woke_on_kid_miss = true;
+                        }
+                    }
                 }
                 let fetch_started_at = Instant::now();
 
                 let fetch_result = if first_refresh && !force_first_refresh {
                     store.fetch_keys_if_empty().await
                 } else {
+                    // A kid-miss wake always contacts the endpoint: skipping a
+                    // fetch because the snapshot still looks fresh is exactly
+                    // the stale state the trigger exists to escape.
                     store.fetch_keys().await
                 };
                 first_refresh = false;
@@ -701,19 +842,25 @@ impl JwksKeyStore {
                     warn!("JWKS background refresh failed: {}", e);
                 }
 
-                let fetch_completed_at = Instant::now();
-                next_refresh_at = next_refresh_deadline(
-                    fetch_started_at,
-                    fetch_completed_at,
-                    refresh_succeeded,
-                    interval,
-                    empty_store_retry_attempt,
-                );
+                // An on-demand fetch is strictly out of band. It leaves the
+                // periodic deadline and the empty-store retry backoff exactly
+                // as the scheduled cadence left them, so request-driven
+                // refetches can never tighten the configured interval.
+                if !woke_on_kid_miss {
+                    let fetch_completed_at = Instant::now();
+                    next_refresh_at = next_refresh_deadline(
+                        fetch_started_at,
+                        fetch_completed_at,
+                        refresh_succeeded,
+                        interval,
+                        empty_store_retry_attempt,
+                    );
 
-                if refresh_succeeded {
-                    empty_store_retry_attempt = 0;
-                } else {
-                    empty_store_retry_attempt = empty_store_retry_attempt.saturating_add(1);
+                    if refresh_succeeded {
+                        empty_store_retry_attempt = 0;
+                    } else {
+                        empty_store_retry_attempt = empty_store_retry_attempt.saturating_add(1);
+                    }
                 }
             }
         }))

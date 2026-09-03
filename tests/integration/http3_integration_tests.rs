@@ -415,6 +415,7 @@ async fn test_http3_proxy_state_creation() {
                     lb_cache,
                     dns_cache_for_sd,
                     hc,
+                    Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::default()),
                     ferrum_edge::plugins::PluginHttpClient::default(),
                     None,
                 ),
@@ -455,6 +456,8 @@ async fn test_http3_proxy_state_creation() {
         max_concurrent_requests_per_ip: 0,
         per_ip_websocket_sessions: None,
         websocket_max_connections_per_ip: 0,
+        per_ip_tcp_connections: None,
+        per_ip_udp_sessions: None,
         stream_listener_manager: slm,
         config_revision: ferrum_edge::proxy::ConfigRevisionNotifier::default(),
         started_at: std::time::Instant::now(),
@@ -741,6 +744,7 @@ async fn test_http3_full_integration() {
                     lb_cache,
                     dns_cache_for_sd,
                     hc,
+                    Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::default()),
                     ferrum_edge::plugins::PluginHttpClient::default(),
                     None,
                 ),
@@ -781,6 +785,8 @@ async fn test_http3_full_integration() {
         max_concurrent_requests_per_ip: 0,
         per_ip_websocket_sessions: None,
         websocket_max_connections_per_ip: 0,
+        per_ip_tcp_connections: None,
+        per_ip_udp_sessions: None,
         stream_listener_manager: slm,
         config_revision: ferrum_edge::proxy::ConfigRevisionNotifier::default(),
         started_at: std::time::Instant::now(),
@@ -2713,4 +2719,436 @@ async fn h3_pool_request_with_target_reuses_an_admitted_shard_when_the_cap_refus
     );
 
     drop(backend);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #4537 — request-header arrival deadline on the H3 frontend
+// Issue #4542 — the overload keepalive tier expressed as a one-shot GOAWAY
+//
+// These drive a miniature H3 server built from the SAME production primitives
+// the gateway's accept loop uses (`await_h3_request_headers`,
+// `h3_keepalive_pressure_raised`, `h3::server::Connection::shutdown(0)`), over
+// a real quinn connection with a real h3 client. `handle_h3_connection` itself
+// is private and needs a full `ProxyState`; what is under test here is the
+// stream-lifecycle behaviour, not the request pipeline.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct MiniH3Counters {
+    accepted: Arc<std::sync::atomic::AtomicUsize>,
+    resolved: Arc<std::sync::atomic::AtomicUsize>,
+    header_deadline_elapsed: Arc<std::sync::atomic::AtomicUsize>,
+    goaway_sent: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl MiniH3Counters {
+    fn new() -> Self {
+        Self {
+            accepted: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            resolved: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            header_deadline_elapsed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            goaway_sent: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    fn get(counter: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+        counter.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn bump(counter: &Arc<std::sync::atomic::AtomicUsize>) {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone)]
+struct MiniH3Options {
+    header_deadline_seconds: u64,
+    response_delay: std::time::Duration,
+    overload: Option<Arc<ferrum_edge::overload::OverloadState>>,
+}
+
+impl Default for MiniH3Options {
+    fn default() -> Self {
+        Self {
+            header_deadline_seconds: 1,
+            response_delay: std::time::Duration::ZERO,
+            overload: None,
+        }
+    }
+}
+
+/// Mirror of the production accept loop's stream lifecycle: bounded header
+/// arrival, latched GOAWAY, and a keepalive-pressure arm placed after the
+/// (here absent) shutdown arm under `biased;`.
+async fn run_mini_h3_connection(
+    connection: quinn::Connection,
+    options: MiniH3Options,
+    counters: MiniH3Counters,
+) {
+    let mut h3_conn: h3::server::Connection<h3_quinn::Connection, bytes::Bytes> =
+        match h3::server::builder()
+            .build(h3_quinn::Connection::new(connection))
+            .await
+        {
+            Ok(conn) => conn,
+            Err(_) => return,
+        };
+
+    let mut keepalive_pressure_rx = options
+        .overload
+        .as_ref()
+        .map(|overload| overload.subscribe_keepalive_pressure());
+    let mut goaway_sent = false;
+
+    loop {
+        let accepted = match keepalive_pressure_rx.as_mut() {
+            Some(rx) => tokio::select! {
+                biased;
+                accepted = h3_conn.accept() => Some(accepted),
+                _ = ferrum_edge::http3::server::h3_keepalive_pressure_raised(rx),
+                    if !goaway_sent => None,
+            },
+            None => Some(h3_conn.accept().await),
+        };
+
+        let Some(accepted) = accepted else {
+            if h3_conn.shutdown(0).await.is_ok() {
+                goaway_sent = true;
+                MiniH3Counters::bump(&counters.goaway_sent);
+                continue;
+            }
+            break;
+        };
+
+        match accepted {
+            Ok(Some(resolver)) => {
+                MiniH3Counters::bump(&counters.accepted);
+                let counters = counters.clone();
+                let options = options.clone();
+                tokio::spawn(async move {
+                    let Some(resolved) = ferrum_edge::http3::server::await_h3_request_headers(
+                        resolver.resolve_request(),
+                        options.header_deadline_seconds,
+                    )
+                    .await
+                    else {
+                        // The resolver is dropped here — that drop is what
+                        // releases the QUIC stream slot and the partial h3
+                        // decoder buffer (issue #4537).
+                        MiniH3Counters::bump(&counters.header_deadline_elapsed);
+                        return;
+                    };
+                    let Ok((_req, mut stream)) = resolved else {
+                        return;
+                    };
+                    MiniH3Counters::bump(&counters.resolved);
+                    if !options.response_delay.is_zero() {
+                        tokio::time::sleep(options.response_delay).await;
+                    }
+                    let Ok(response) = http::Response::builder().status(200).body(()) else {
+                        return;
+                    };
+                    let _ = stream.send_response(response).await;
+                    let _ = stream.finish().await;
+                });
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+}
+
+/// Bind a QUIC server endpoint and serve every inbound connection with the
+/// miniature H3 accept loop above.
+#[allow(clippy::type_complexity)]
+fn spawn_mini_h3_server(
+    fixture: &H3MtlsFixture,
+    options: MiniH3Options,
+) -> (
+    std::net::SocketAddr,
+    MiniH3Counters,
+    tokio::task::JoinHandle<()>,
+) {
+    let endpoint = h3_mtls_server_endpoint(fixture);
+    let addr = endpoint.local_addr().expect("server local addr");
+    let counters = MiniH3Counters::new();
+    let counters_for_task = counters.clone();
+    let handle = tokio::spawn(async move {
+        while let Some(incoming) = endpoint.accept().await {
+            let Ok(connection) = incoming.await else {
+                continue;
+            };
+            let options = options.clone();
+            let counters = counters_for_task.clone();
+            tokio::spawn(run_mini_h3_connection(connection, options, counters));
+        }
+    });
+    (addr, counters, handle)
+}
+
+/// Open one bidi stream carrying a HEADERS frame header that declares more
+/// payload than is ever delivered, and never finish it. This is the slowloris
+/// shape: `accept()` yields a resolver, `resolve_request()` never completes.
+async fn open_partial_headers_stream(
+    connection: &quinn::Connection,
+) -> (quinn::SendStream, quinn::RecvStream) {
+    let (mut send, recv) = connection.open_bi().await.expect("open bidi stream");
+    // HTTP/3 HEADERS frame: type 0x01, then a QUIC varint length of 1000, then
+    // only four payload bytes.
+    let frame: [u8; 7] = [0x01, 0x43, 0xE8, 0x00, 0x00, 0x00, 0x00];
+    send.write_all(&frame).await.expect("write partial HEADERS");
+    (send, recv)
+}
+
+/// Drive one QUIC + H3 client connection, returning the raw quinn connection
+/// (for hand-rolled streams), the h3 request sender, and the driver task.
+#[allow(clippy::type_complexity)]
+async fn connect_mini_h3_client(
+    fixture: &H3MtlsFixture,
+    addr: std::net::SocketAddr,
+) -> (
+    quinn::Endpoint,
+    quinn::Connection,
+    h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>,
+    tokio::task::JoinHandle<()>,
+) {
+    let endpoint = h3_mtls_client_endpoint(fixture);
+    let connection = endpoint
+        .connect(addr, "localhost")
+        .expect("start QUIC connect")
+        .await
+        .expect("QUIC handshake");
+    let (mut driver, send_request) = h3::client::new(h3_quinn::Connection::new(connection.clone()))
+        .await
+        .expect("h3 client");
+    let driver_task = tokio::spawn(async move {
+        let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+    });
+    (endpoint, connection, send_request, driver_task)
+}
+
+/// Fire one GET over an established h3 client session and read it to completion.
+async fn mini_h3_get(
+    send_request: &mut h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>,
+    path: &str,
+) -> Result<http::StatusCode, String> {
+    let request = http::Request::builder()
+        .method(http::Method::GET)
+        .uri(format!("https://localhost{path}"))
+        .body(())
+        .map_err(|e| format!("build request: {e}"))?;
+    let mut stream = send_request
+        .send_request(request)
+        .await
+        .map_err(|e| format!("send_request: {e}"))?;
+    stream
+        .finish()
+        .await
+        .map_err(|e| format!("finish request: {e}"))?;
+    let response = stream
+        .recv_response()
+        .await
+        .map_err(|e| format!("recv_response: {e}"))?;
+    Ok(response.status())
+}
+
+#[tokio::test]
+async fn h3_streams_that_never_deliver_headers_are_torn_down_at_the_deadline() {
+    init_crypto_provider();
+    let fixture = build_h3_mtls_fixture();
+    let (addr, counters, server) = spawn_mini_h3_server(
+        &fixture,
+        MiniH3Options {
+            header_deadline_seconds: 1,
+            ..MiniH3Options::default()
+        },
+    );
+
+    let (client_endpoint, connection, mut send_request, driver) =
+        connect_mini_h3_client(&fixture, addr).await;
+
+    // Park eight streams mid-HEADERS. Without issue #4537's bound every one of
+    // these holds a task and a partial decoder buffer for the life of the
+    // connection.
+    const PARKED_STREAMS: usize = 8;
+    let mut parked = Vec::with_capacity(PARKED_STREAMS);
+    for _ in 0..PARKED_STREAMS {
+        parked.push(open_partial_headers_stream(&connection).await);
+    }
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while MiniH3Counters::get(&counters.header_deadline_elapsed) < PARKED_STREAMS
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        MiniH3Counters::get(&counters.header_deadline_elapsed),
+        PARKED_STREAMS,
+        "every stream that never delivered HEADERS must be torn down at \
+         FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS"
+    );
+    assert_eq!(
+        MiniH3Counters::get(&counters.resolved),
+        0,
+        "a partial HEADERS frame must never resolve into a request"
+    );
+
+    // The connection itself survives: the deadline reclaims the stream, not the
+    // QUIC connection. A normal request on the SAME connection still works.
+    let status = mini_h3_get(&mut send_request, "/after-slowloris")
+        .await
+        .expect("a normal request on the same connection must still succeed");
+    assert_eq!(status, http::StatusCode::OK);
+    assert_eq!(MiniH3Counters::get(&counters.resolved), 1);
+
+    drop(parked);
+    client_endpoint.close(0u32.into(), b"done");
+    driver.abort();
+    server.abort();
+}
+
+#[tokio::test]
+async fn h3_header_arrival_deadline_of_zero_leaves_a_partial_stream_open() {
+    init_crypto_provider();
+    let fixture = build_h3_mtls_fixture();
+    let (addr, counters, server) = spawn_mini_h3_server(
+        &fixture,
+        MiniH3Options {
+            header_deadline_seconds: 0,
+            ..MiniH3Options::default()
+        },
+    );
+
+    let (client_endpoint, connection, _send_request, driver) =
+        connect_mini_h3_client(&fixture, addr).await;
+    let parked = open_partial_headers_stream(&connection).await;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while MiniH3Counters::get(&counters.accepted) == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        MiniH3Counters::get(&counters.accepted) >= 1,
+        "the partial-HEADERS stream must reach accept()"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+    assert_eq!(
+        MiniH3Counters::get(&counters.header_deadline_elapsed),
+        0,
+        "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS=0 must disable the bound, matching H1/H2"
+    );
+
+    drop(parked);
+    client_endpoint.close(0u32.into(), b"done");
+    driver.abort();
+    server.abort();
+}
+
+#[tokio::test]
+async fn h3_overload_keepalive_pressure_sends_one_goaway_and_still_admits_new_connections() {
+    init_crypto_provider();
+    let fixture = build_h3_mtls_fixture();
+    let overload = Arc::new(ferrum_edge::overload::OverloadState::new());
+    let (addr, counters, server) = spawn_mini_h3_server(
+        &fixture,
+        MiniH3Options {
+            header_deadline_seconds: 30,
+            // Long enough that the request below is provably in flight when
+            // pressure is raised.
+            response_delay: std::time::Duration::from_millis(750),
+            overload: Some(Arc::clone(&overload)),
+        },
+    );
+
+    let (client_endpoint, _connection, mut send_request, driver) =
+        connect_mini_h3_client(&fixture, addr).await;
+
+    // Start a request, let the server accept it, then raise pressure while it is
+    // still waiting on the response.
+    let mut in_flight = send_request
+        .send_request(
+            http::Request::builder()
+                .method(http::Method::GET)
+                .uri("https://localhost/in-flight")
+                .body(())
+                .expect("build request"),
+        )
+        .await
+        .expect("send in-flight request");
+    in_flight.finish().await.expect("finish in-flight request");
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while MiniH3Counters::get(&counters.resolved) == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        MiniH3Counters::get(&counters.resolved),
+        1,
+        "the in-flight request must be accepted before pressure is raised"
+    );
+
+    overload.publish_keepalive_pressure(true);
+
+    // The in-flight stream must still complete: GOAWAY stops NEW streams only.
+    let response = in_flight
+        .recv_response()
+        .await
+        .expect("an in-flight request must survive a pressure-driven GOAWAY");
+    assert_eq!(response.status(), http::StatusCode::OK);
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while MiniH3Counters::get(&counters.goaway_sent) == 0 && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        MiniH3Counters::get(&counters.goaway_sent),
+        1,
+        "raising the binary keepalive tier must send exactly one GOAWAY"
+    );
+
+    // New request streams on that connection are refused once the client has
+    // processed the GOAWAY.
+    let refuse_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut refused = false;
+    while tokio::time::Instant::now() < refuse_deadline {
+        if mini_h3_get(&mut send_request, "/after-goaway")
+            .await
+            .is_err()
+        {
+            refused = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        refused,
+        "after GOAWAY the peer must stop being able to open new request streams"
+    );
+
+    // Recovery must NOT produce a second GOAWAY — the watch is edge-triggered
+    // and the latch is one-shot per connection.
+    overload.publish_keepalive_pressure(false);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        MiniH3Counters::get(&counters.goaway_sent),
+        1,
+        "the `true -> false` recovery edge must not send a second GOAWAY"
+    );
+
+    // A brand-new connection is still admitted: only `reject_new_connections`
+    // (the critical tier) refuses those.
+    let (fresh_endpoint, _fresh_conn, mut fresh_send, fresh_driver) =
+        connect_mini_h3_client(&fixture, addr).await;
+    let status = mini_h3_get(&mut fresh_send, "/fresh-connection")
+        .await
+        .expect("the keepalive tier must not refuse new connections");
+    assert_eq!(status, http::StatusCode::OK);
+
+    fresh_endpoint.close(0u32.into(), b"done");
+    client_endpoint.close(0u32.into(), b"done");
+    fresh_driver.abort();
+    driver.abort();
+    server.abort();
 }

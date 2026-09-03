@@ -331,7 +331,22 @@ fn render_latency_histogram(
     let _ = writeln!(out, "{prefix}_{metric}_count {count}");
 }
 
+/// Every root `config` key `__mesh_bpf_metrics` reads. Unknown root keys fail
+/// closed at construction so a misspelled `prefix` cannot silently publish the
+/// default metric namespace while operator dashboards scrape the intended one.
+pub const MESH_BPF_METRICS_CONFIG_KEYS: &[&str] = &["prefix"];
+
 fn parse_config(config: &Value) -> Result<BpfMetricsConfig, String> {
+    // A non-object config keeps its existing behavior (the read below yields
+    // `None`, producing the default prefix).
+    if let Some(object) = config.as_object() {
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "config",
+            MESH_BPF_METRICS_CONFIG_KEYS,
+            "__mesh_bpf_metrics: ",
+        )?;
+    }
     let mut parsed = BpfMetricsConfig::default();
     if let Some(prefix) = config.get("prefix") {
         let prefix = prefix

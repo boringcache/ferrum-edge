@@ -38,7 +38,8 @@ use tracing::info;
 
 use super::PluginHttpClient;
 use super::jwks_store::{
-    JwksFailureClass, JwksKeyStore, JwksTrustState, redacted_jwks_uri, register_trust_change_hook,
+    DEFAULT_KID_MISS_REFRESH_COOLDOWN_SECONDS, JwksFailureClass, JwksKeyStore, JwksTrustState,
+    redacted_jwks_uri, register_trust_change_hook,
 };
 
 /// Effective requirements contributed by one active shared-store consumer.
@@ -46,13 +47,27 @@ use super::jwks_store::{
 pub struct JwksRefreshRequirement {
     pub refresh_interval: Duration,
     pub max_stale: Duration,
+    /// Minimum spacing between on-demand refetches triggered by an unknown
+    /// JWT `kid`. `Duration::ZERO` disables the on-demand refetch.
+    pub kid_miss_cooldown: Duration,
 }
 
 impl JwksRefreshRequirement {
+    /// Requirement with the default on-demand refetch cooldown.
     pub const fn new(refresh_interval: Duration, max_stale: Duration) -> Self {
         Self {
             refresh_interval,
             max_stale,
+            kid_miss_cooldown: Duration::from_secs(DEFAULT_KID_MISS_REFRESH_COOLDOWN_SECONDS),
+        }
+    }
+
+    /// Same requirement with an explicit unknown-`kid` refetch cooldown.
+    pub const fn with_kid_miss_cooldown(self, kid_miss_cooldown: Duration) -> Self {
+        Self {
+            refresh_interval: self.refresh_interval,
+            max_stale: self.max_stale,
+            kid_miss_cooldown,
         }
     }
 
@@ -60,7 +75,23 @@ impl JwksRefreshRequirement {
         Self {
             refresh_interval: self.refresh_interval.min(other.refresh_interval),
             max_stale: self.max_stale.min(other.max_stale),
+            kid_miss_cooldown: strictest_kid_miss_cooldown(
+                self.kid_miss_cooldown,
+                other.kid_miss_cooldown,
+            ),
         }
+    }
+}
+
+/// Most restrictive on-demand refetch policy of two consumers of one shared
+/// store. A consumer that disabled the refetch wins outright; otherwise the
+/// longer cooldown wins, because a shared store must never issue a fetch that
+/// some active consumer's policy forbids.
+fn strictest_kid_miss_cooldown(left: Duration, right: Duration) -> Duration {
+    if left.is_zero() || right.is_zero() {
+        Duration::ZERO
+    } else {
+        left.max(right)
     }
 }
 
@@ -512,11 +543,9 @@ pub fn trust_health_watch_generation_for_test() -> u64 {
 pub fn get_or_create_jwks_store(
     jwks_uri: &str,
     http_client: &PluginHttpClient,
-    refresh_interval: Duration,
-    max_stale: Duration,
+    requested: JwksRefreshRequirement,
 ) -> Arc<JwksKeyStore> {
     let cache = global_cache();
-    let requested = JwksRefreshRequirement::new(refresh_interval, max_stale);
 
     // Fast path: store already exists. A newly observed stricter interval or
     // maximum-stale requirement takes effect immediately; relaxation is
@@ -550,8 +579,9 @@ pub fn get_or_create_jwks_store(
             redacted_jwks_uri(jwks_uri)
         );
         let store = JwksKeyStore::new(jwks_uri.to_string(), http_client.clone());
-        store.configure_trust_policy(refresh_interval, max_stale);
-        let refresh_handle = store.start_background_refresh(refresh_interval);
+        store.configure_trust_policy(requested.refresh_interval, requested.max_stale);
+        store.configure_kid_miss_cooldown(requested.kid_miss_cooldown);
+        let refresh_handle = store.start_background_refresh(requested.refresh_interval);
         JwksCacheEntry {
             store: Arc::new(store),
             refresh_handle,
@@ -604,6 +634,9 @@ fn reconfigure_refresh_policy(
     entry
         .store
         .configure_trust_policy(requirement.refresh_interval, requirement.max_stale);
+    entry
+        .store
+        .configure_kid_miss_cooldown(requirement.kid_miss_cooldown);
     entry.refresh_handle.abort();
     entry.refresh_handle = entry
         .store
@@ -764,17 +797,11 @@ impl DiscoveryStoreCandidate {
     pub(crate) fn acquire(
         jwks_uri: &str,
         http_client: &PluginHttpClient,
-        refresh_interval: Duration,
-        max_stale: Duration,
+        requirement: JwksRefreshRequirement,
     ) -> Self {
         Self {
             jwks_uri: jwks_uri.to_string(),
-            store: Some(get_or_create_jwks_store(
-                jwks_uri,
-                http_client,
-                refresh_interval,
-                max_stale,
-            )),
+            store: Some(get_or_create_jwks_store(jwks_uri, http_client, requirement)),
         }
     }
 
@@ -860,6 +887,15 @@ pub fn cached_refresh_state(jwks_uri: &str) -> Option<(Duration, u64)> {
             entry.value().refresh_generation,
         )
     })
+}
+
+/// Return the shared store for a URI without creating or reviving an entry.
+#[doc(hidden)]
+#[allow(dead_code)] // exercised by external unit tests
+pub fn cached_store(jwks_uri: &str) -> Option<Arc<JwksKeyStore>> {
+    global_cache()
+        .get(jwks_uri)
+        .map(|entry| Arc::clone(&entry.value().store))
 }
 
 /// Return the current strict shared-store policy for diagnostics and tests.

@@ -189,8 +189,13 @@ admin:
   allowInsecureHttp: false
   # Require a JWT `ns` claim on namespace-scoped admin routes
   # (FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM). Set together with
-  # cp.requireNamespaceClaim for tenancy on both planes; enabling only the CP
-  # flag does not constrain admin JWTs.
+  # cp.requireNamespaceClaim for tenancy on a single-namespace CP.
+  #
+  # NOTE: this value is not needed on a multi-namespace control plane. When
+  # cp.namespaces lists more than one namespace (or "*"), the admin plane
+  # engages the `ns` claim requirement automatically, exactly as the CP/DP
+  # gRPC plane does, and admin tokens without an `ns` claim are refused with
+  # 403 on namespace-scoped routes (including /backup and /restore).
   requireNamespaceClaim: false
   # Admin JWT secret (FERRUM_ADMIN_JWT_SECRET). REQUIRED and >=32 chars for
   # database, cp, and dp modes. Optional for file (a random read-only secret is
@@ -307,6 +312,8 @@ cp:
   # Comma-separated namespaces this CP serves (FERRUM_CP_NAMESPACES). Optional.
   namespaces: ""
   # Require a JWT `ns` claim on namespace-scoped gRPC calls (FERRUM_CP_REQUIRE_NAMESPACE_CLAIM).
+  # Multi-namespace scopes (cp.namespaces with more than one entry, or "*")
+  # require `ns` claims automatically on both the gRPC and the admin plane.
   requireNamespaceClaim: false
   # In-container path to the namespace-bound CP/DP verification credentials
   # (FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH). Mount the JSON bundle yourself with
@@ -651,6 +658,11 @@ metrics:
     high5xxRatePerSecond: 1
     p99LatencyMs: 2000
     certExpiringSeconds: 604800
+    # Lead time on CRL / stapled-OCSP `nextUpdate` that fires
+    # FerrumGatewayRevocationMaterialExpiringSoon. Expired revocation material
+    # is refused at reload AND at startup, so this deadline also blocks pod
+    # restarts, not just new handshakes.
+    revocationExpiringSeconds: 604800
     databasePollStaleSeconds: 300
     upstreamUnhealthyRatio: 0.5
     # Frontend TLS handshake error rate (failures/s) that fires
@@ -661,6 +673,34 @@ metrics:
     # internet-facing listener, so 0 disables the alert. Set a rate that is
     # abnormal for your exposure to enable it.
     frontendTlsHandshakeErrorsPerSecond: 0
+    # How long FerrumGatewayDatabaseUnavailable must observe an unreachable
+    # configuration source before firing. Rendered verbatim as the alert's
+    # `for:` duration, so use Prometheus duration syntax ("5m", "90s").
+    databaseUnavailableFor: 5m
+    # Base URL for the per-alert `runbook_url` annotation. Every alert appends
+    # its own anchor (the GitHub heading slug of its section in
+    # docs/runbooks/gateway.md). Point this at your own fork/mirror if you
+    # maintain internal runbooks.
+    runbookBaseUrl: https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/runbooks/gateway.md
+  dashboards:
+    # When `metrics.enabled` is true, render a ConfigMap containing the bundled
+    # Grafana dashboards from `charts/ferrum-gateway/dashboards/*.json`. The
+    # ConfigMap carries the `grafana_dashboard: "1"` label that the Grafana
+    # sidecar (`kiwigrid/k8s-sidecar`) and the Grafana Operator both pick up
+    # automatically. Set to false if you manage dashboards out of band.
+    enabled: false
+    # Override the generated ConfigMap name (defaults to
+    # `<fullname>-dashboards`).
+    configMapName: ""
+    # Extra labels and annotations stamped on the dashboard ConfigMap. Useful
+    # for `grafana.com/folder`-style annotations or routing labels.
+    labels: {}
+    annotations: {}
+    # Sidecar label key/value override — only needed if your Grafana install
+    # uses a custom label (e.g. `grafana_dashboard_my-org`). The defaults are
+    # the upstream Grafana sidecar convention.
+    sidecarLabel: grafana_dashboard
+    sidecarLabelValue: "1"
 
 # Optional NetworkPolicy. Default off. When enabled, proxy and stream listener
 # ports stay reachable from any source while admin HTTP/HTTPS and CP gRPC ingress

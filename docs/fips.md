@@ -80,6 +80,17 @@ the module certificate's tested-platform list (see §"The module boundary").
 always audits the resolved feature graph. `FIPS Build & Test` compiles the
 locked `fips` binary, every claimed feature combination, clippy `-D warnings`,
 and the policy, key-admission, and frontend/backend/CP-DP handshake tests.
+
+`FIPS Build & Test` is **merge-blocking and publish-blocking** (issue #4445).
+It is one of the nine contexts branch protection and ruleset `20208307` require
+on `main`, so a red FIPS gate blocks the pull request and the merge queue, and
+it is an entry in `.github/required-publication-checks.json`, so the mutable
+`latest` release, the `latest` / `main-<sha>` Docker tags, and every immutable
+`v*` tag artifact fail closed unless it succeeded for the exact product SHA.
+The workflow runs unconditionally on every push to `main` with no `paths:`
+filter, and on that event `fips-plan` force-runs the full gate, so each product
+commit carries its own exact-SHA evidence. See `docs/ci_cd.md` ->
+"Required checks and merge queue" and "Publish-blocking required checks".
 Its relevance job validates the trusted-base planner blob's mode, size, path,
 and object ID, materializes those bytes at the literal checked-out planner
 path, and invokes only that statically inspectable path. It never executes a
@@ -182,7 +193,11 @@ multi-match child-directory layout, binds the attempt from `fips-test-identity`
 inside the bundle, and selects the newest attempt before validating the
 bundle, so a failed-job rerun can reuse the successful test-build
 prerequisite's earlier artifact. The required `FIPS Build & Test` aggregate depends on
-`fips-test-build` and fails closed if that producer does not succeed.
+`fips-test-build` and fails closed if that producer does not succeed. It runs
+with `if: always()`, so it reports `success` or `failure` on every pull
+request, merge-group, `main` push, and manual run and can never be skipped into
+success; `.github/scripts/verify_required_ci.py` pins its complete `needs` set
+and every fail-closed step.
 The pinned cache and artifact actions hold their GitHub Actions service
 credentials inside the action process;
 PR-controlled `run:` steps never receive those credentials. `setup-sccache`

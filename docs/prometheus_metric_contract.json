@@ -1006,6 +1006,18 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_circuit_breaker_cache_admission_refused_total",
+    "type": "counter",
+    "help": "Requests refused a cached breaker because the shared breaker cache was at its admission ceiling; each one ran on a transient breaker whose failures never accumulate.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "circuit_breaker",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_circuit_breaker_cache_entries",
     "type": "gauge",
     "help": "Circuit breakers resident in the shared breaker cache.",
@@ -1041,7 +1053,7 @@
     ],
     "subsystem": "circuit_breaker",
     "export_surface": "/metrics",
-    "bundled": "alert",
+    "bundled": "alert_and_dashboard",
     "emission": "when_series_present"
   },
   {
@@ -1187,7 +1199,7 @@
     ],
     "subsystem": "connection_pool",
     "export_surface": "/metrics",
-    "bundled": "documented_only",
+    "bundled": "dashboard",
     "emission": "conditional"
   },
   {
@@ -1199,7 +1211,7 @@
     ],
     "subsystem": "connection_pool",
     "export_surface": "/metrics",
-    "bundled": "documented_only",
+    "bundled": "dashboard",
     "emission": "conditional"
   },
   {
@@ -1496,6 +1508,18 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_database_config_source_connected",
+    "type": "gauge",
+    "help": "Whether the configuration database (database mode) or the control plane's backing database (cp mode) is currently reachable and usable: 1 connected, 0 unavailable.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "database_polling",
+    "export_surface": "/metrics",
+    "bundled": "alert_and_dashboard",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_database_delta_backoff_bucket",
     "type": "gauge",
     "help": "Current rejected-delta retry backoff bucket. Exactly one bucket is 1.",
@@ -1555,6 +1579,19 @@
     "subsystem": "database_polling",
     "export_surface": "/metrics",
     "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_database_poll_failures_total",
+    "type": "counter",
+    "help": "Database/CP config poll failures by bounded reason.",
+    "labels": [
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "database_polling",
+    "export_surface": "/metrics",
+    "bundled": "dashboard",
     "emission": "conditional"
   },
   {
@@ -1626,7 +1663,7 @@
     ],
     "subsystem": "dp_config",
     "export_surface": "/metrics",
-    "bundled": "documented_only",
+    "bundled": "dashboard",
     "emission": "conditional"
   },
   {
@@ -1650,7 +1687,7 @@
     ],
     "subsystem": "dp_config",
     "export_surface": "/metrics",
-    "bundled": "documented_only",
+    "bundled": "dashboard",
     "emission": "conditional"
   },
   {
@@ -1705,6 +1742,18 @@
     "name": "ferrum_dp_config_stale_transitions_total",
     "type": "counter",
     "help": "Transitions into the stale state since process start.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "dp_config",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_dp_cp_admission_refused_total",
+    "type": "counter",
+    "help": "ConfigSync subscriptions the control plane refused with RESOURCE_EXHAUSTED because a CP gRPC stream admission budget is saturated. The CP is alive, so a refusal is recorded as reconnecting and never latches the stale-config bound.",
     "labels": [
       "namespace"
     ],
@@ -2617,7 +2666,7 @@
   {
     "name": "ferrum_mesh_config_stream_attempts_total",
     "type": "counter",
-    "help": "Completed mesh configuration-stream attempts by consumer protocol (native/xds/stock_xds) and closed-set outcome. A remote clean EOF is an endpoint failure, not a success. Local retirements (shutdown, tls_reload, credential_rotated, credential_source_invalid, credential_deadline, primary_retry) never rotate the endpoint or grow backoff. transport_failure is a dial failure while established_transport_failure is an already-open stream going dark; heartbeat_silence_timeout is the native application-silence bound, not an HTTP/2 keepalive timeout.",
+    "help": "Completed mesh configuration-stream attempts by consumer protocol (native/xds/stock_xds) and closed-set outcome. A remote clean EOF is an endpoint failure, not a success. Local retirements (shutdown, tls_reload, credential_rotated, credential_source_invalid, credential_deadline, primary_retry) never rotate the endpoint or grow backoff. transport_failure is a dial failure while established_transport_failure is an already-open stream going dark; heartbeat_silence_timeout is the native application-silence bound, not an HTTP/2 keepalive timeout. admission_refused is a CP stream-admission capacity/tenancy refusal (RESOURCE_EXHAUSTED): the control plane is alive and answering, so it is deliberately not a transport failure.",
     "labels": [
       "protocol",
       "outcome",
@@ -3969,7 +4018,7 @@
     ],
     "subsystem": "overload",
     "export_surface": "/metrics",
-    "bundled": "documented_only",
+    "bundled": "dashboard",
     "emission": "conditional"
   },
   {
@@ -4032,7 +4081,7 @@
     ],
     "subsystem": "overload",
     "export_surface": "/metrics",
-    "bundled": "alert",
+    "bundled": "alert_and_dashboard",
     "emission": "conditional"
   },
   {
@@ -4627,6 +4676,21 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_tls_revocation_expiry_seconds",
+    "type": "gauge",
+    "help": "Seconds until the revocation material nextUpdate. Negative means expired; expired material is refused at reload and at startup.",
+    "labels": [
+      "material_id",
+      "kind",
+      "source_kind",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "alert",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_tls_source_fetch_duration_seconds",
     "type": "histogram",
     "help": "TLS material source fetch duration in seconds.",
@@ -4797,7 +4861,7 @@
     ],
     "subsystem": "upstream_health",
     "export_surface": "/metrics",
-    "bundled": "alert",
+    "bundled": "alert_and_dashboard",
     "emission": "when_series_present"
   },
   {
@@ -4811,7 +4875,7 @@
     ],
     "subsystem": "upstream_health",
     "export_surface": "/metrics",
-    "bundled": "alert",
+    "bundled": "alert_and_dashboard",
     "emission": "when_series_present"
   },
   {

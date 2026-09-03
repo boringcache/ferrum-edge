@@ -15,6 +15,7 @@ concerns are handled by dedicated layers and the WAF does not duplicate them:
 | Concern | Handled by |
 | --- | --- |
 | Missing or empty HTTP/1.1 `Host` (RFC 9112 §3.2.2) | core proxy `check_protocol_headers()` (HTTP/1.0 and absolute-form URI authority are not rejected; HTTP/2/3 `:authority` is `check_host_authority_consistency()`) |
+| HTTP/1.1 absolute-form request-target authority disagreeing with `Host` (RFC 9112 §3.2.1) | core proxy `check_protocol_headers()` (shared `host_authority_disagreement()` comparison with the HTTP/2/3 rule; HTTP/1.0 is out of scope) |
 | Request smuggling (CL/TE conflicts, duplicate Content-Length) | bounded proxy-frontend HTTP/1 wire framing guard + core proxy `check_protocol_headers()` + Hyper parsing |
 | Missing both HTTP/2 and HTTP/3 `:authority` and `Host` (RFC 9113 §8.3.1 / RFC 9114 §4.3.1) | core proxy `check_host_authority_consistency()` (`:authority`-only and Host-only remain valid; Extended CONNECT is `:authority`-only) |
 | Header/URI/body size limits | `FERRUM_MAX_*` env vars, `request_size_limiting` |
@@ -165,14 +166,45 @@ one reading would leave the other unscanned. A charset that does name UTF-32
 reading is used. `00 00 FE FF` is not a UTF-16 BOM prefix and is
 unambiguous. Bare `charset=utf-16` / `charset=utf-32` with no
 BOM does not invent an endianness (IANA leaves both unspecified without a
-BOM). Both little-endian and big-endian decodes are attempted; each view
-that decodes cleanly is scanned by the request-body rules, and the existing
-raw/lossy view is still scanned. If neither endianness decodes, only the
-raw/lossy view remains. Malformed or truncated UTF-16 or UTF-32 — including
-a length that is not a multiple of the code-unit size, code units in the
-surrogate range `U+D800..=U+DFFF`, or UTF-32 units above `U+10FFFF` — is
-never partially decoded or allowed to panic; that endian is omitted and the
-raw/lossy inspection view is retained.
+BOM). Both little-endian and big-endian decodes are scanned by the
+request-body rules, and the existing raw/lossy view is still scanned. Bare
+`utf-16` / `utf-32` stays endianness-unspecified rather than defaulting to
+little-endian as WHATWG does, which is the more conservative choice.
+
+Wide decoding is **lossy**. A malformed code unit — a length that is not a
+multiple of the code-unit size, an unpaired surrogate, or a UTF-32 unit in
+`U+D800..=U+DFFF` or above `U+10FFFF` — is replaced by `U+FFFD` and decoding
+continues, matching what browsers (`TextDecoder`), the JVM
+(`new String(bytes, "UTF-16LE")`), and .NET (`Encoding.Unicode`) do. Refusing
+the whole view instead would let one hostile byte — for example a
+`charset=utf-16le` body with its last byte removed — disable body-text
+inspection while the backend still parsed the payload. This mirrors the lossy
+UTF-8 path.
+
+When the declared charset and the BOM **disagree** (for example
+`charset=utf-16le` on a body prefixed with the UTF-16BE mark `FE FF`), both
+readings are scanned: the declaration-honouring reading decodes the whole
+body including the BOM bytes — which is what a backend trusting
+`Content-Type` sees, reading `FE FF` as the noncharacter `U+FFFE` — and the
+BOM-honouring reading decodes the body after the mark. The raw/lossy view is
+kept as well. Dropping every view on a disagreement was a one-shot bypass.
+
+The full WHATWG UTF-16LE label set is recognized, not just `utf-16le` /
+`utf16le`: `unicode`, `unicodefeff`, `ucs-2`, `iso-10646-ucs-2`, and
+`csunicode` all transcode. `unicodefffe` remains UTF-16BE.
+
+A body that declares a charset the WAF cannot transcode at all records
+**FE-ENCODING-001** instead of being scanned as ASCII cover text. These
+encodings can represent ASCII payloads in bytes that no rule matches — UTF-7
+writes `<script>` as `+ADw-script+AD4-`. The flagged families are UTF-7
+(`utf-7`, `unicode-1-1-utf-7`, `csunicode11utf7`), the ISO-2022 escape-shift
+encodings (`iso-2022-jp`, `iso-2022-kr`, `iso-2022-cn`, `csiso2022jp`,
+`csiso2022kr`), `hz-gb-2312`, and EBCDIC (`ibm037`, `cp037`, `ibm500`,
+`cp500`, `ibm1047`, `cp1047`, `ebcdic-cp-us`). The list is explicit, so
+single-byte ASCII-superset charsets (`iso-8859-1`, `windows-1252`,
+Shift_JIS, GBK, Big5) are unaffected. FE-ENCODING-001 is opt-in-enforce, so
+this reports by default and blocks only when the rule is set to `enforce`;
+the raw/lossy scan still runs alongside it.
 
 Query matching is per decoded parameter value, not the raw whole URI. Query
 **values** (each `&`/`=`-split component — never the structural delimiters,
@@ -247,7 +279,7 @@ and `rule_overrides`. Categories:
 
 | Category | Rules | Notes |
 | --- | --- | --- |
-| `sqli` | FE-SQLI-001..005 plus FE-SQLI-001-B..003-B | UNION/tautology/stacked (001–003) are level 1 across decoded query values and admitted request bodies; body mirrors use the exact query patterns. Comment-token (004) is query-only level 2; SQLSTATE (005) is body-only level 2. |
+| `sqli` | FE-SQLI-001..005 plus FE-SQLI-001-B..004-B | UNION/tautology/stacked (001–003) are level 1 across decoded query values and admitted request bodies; body mirrors use the exact query patterns. Those three accept either whitespace **or a bounded inline `/*…*/` comment** between SQL tokens, so `UNION/**/SELECT` and `;/**/DROP` are caught at level 1; the tautology rule also accepts an unspaced `\|\|` (`1'\|\|1=1`). The comment body is bounded, so a comment longer than the bound falls through to the comment-token catch-alls: 004 (query) and 004-B (body) are both level 2. SQLSTATE (005) is body-only level 2. |
 | `nosqli` | FE-NOSQL-001 (operator key), FE-NOSQL-002 (bracket operator, L2) | |
 | `command_injection` | FE-CMD-001..003 | shell-substitution (003) is level 2 |
 | `jndi_injection` | FE-JNDI-001-{B,Q,H}, FE-JNDI-002-{B,Q,H} | **Log4Shell**; direct lookup is Critical/level 1 across body, query, and header; nested-obfuscation is level 2 |
@@ -409,6 +441,25 @@ suppresses the hit while an ordinary `<script>…</script>` payload still blocks
 Request-body inspection is on by default for `POST`/`PUT`/`PATCH` with an
 inspectable `Content-Type` (`body_methods`, `body_content_types`). Multipart and
 binary bodies are opt-in (`inspect_multipart`, `inspect_binary_body`).
+
+The `Content-Type` is matched on its lowercased base media type with parameters
+stripped. RFC 6839 structured-syntax suffixes map onto their base family and
+re-check the same allowlist: a base type ending in `+json` is treated as
+`application/json`, and one ending in `+xml` as `application/xml` /`text/xml`.
+So `application/vnd.api+json`, `application/ld+json`,
+`application/merge-patch+json` and `application/json-patch+json` are inspected
+whenever `application/json` is in `body_content_types`, and
+`application/atom+xml` or `application/soap+xml` whenever either
+`application/xml` or `text/xml` is. This matters because mainstream backends
+(Spring's `MappingJackson2HttpMessageConverter`, ASP.NET Core's
+`SystemTextJsonInputFormatter`) parse `application/*+json` as JSON, so without
+the suffix rule one header token would defeat every body rule.
+
+The suffix rule reuses the configured allowlist rather than adding hidden types:
+if you remove `application/json` from `body_content_types`, `+json` types are
+excluded too, and a plugin configured with only `text/plain` inspects neither.
+`text/json` is in the default allowlist as an explicit entry, since it carries no
+suffix to key off.
 
 Response inspection is **off by default**. Enable `response_inspection` (and
 `response_body_inspection` for body rules) to run the disclosure and
@@ -752,7 +803,7 @@ fire, then switch to `enforce`.
 | `max_scan_bytes` | int | `1048576` | body scan cap |
 | `on_body_too_large` | enum | `fail_closed` | `fail_closed` / `scan_truncated` / `skip` / `block` |
 | `body_methods` | string[] | `[POST,PUT,PATCH]` | methods whose bodies are scanned |
-| `body_content_types` | string[] | see code | inspectable content types |
+| `body_content_types` | string[] | `[application/json, text/json, application/x-www-form-urlencoded, application/xml, text/xml, text/plain, text/html]` | inspectable base content types; `+json` / `+xml` suffixed types match via their base family |
 | `inspect_multipart` | bool | `false` | scan multipart bodies |
 | `inspect_binary_body` | bool | `false` | scan bodies with unknown/binary type |
 | `disallowed_methods` | string[] | `[]` | methods flagged by FE-METHOD-001 |

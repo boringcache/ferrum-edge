@@ -1,6 +1,7 @@
 {{- include "ferrum-mesh.validateControlPlaneInputs" . -}}
 {{- include "ferrum-mesh.validateCrds" . -}}
 {{- include "ferrum-mesh.validateInjectorTrust" . -}}
+{{- include "ferrum-mesh.validateInjectorKubeVersion" . -}}
 {{- include "ferrum-mesh.validateServingShutdowns" . -}}
 {{- include "ferrum-mesh.validateObservability" . -}}
 {{- if .Values.controlPlane.enabled -}}
@@ -25,6 +26,9 @@
        malformed FERRUM_ADMIN_ALLOWED_CIDRS entry in every mode. */ -}}
 {{- include "ferrum-mesh.validatePlaintextAdmin" (dict "component" "ambient" "resolved" (include "ferrum-mesh.resolveComponentAdmin" (dict "component" "ambient" "env" (.Values.ambient.env | default dict) "admin" (.Values.ambient.admin | default dict)) | fromYaml) "hardFail" false "probes" .Values.ambient.probes) -}}
 {{- include "ferrum-mesh.failReservedEnv" (dict "label" "ambient.env" "env" .Values.ambient.env "names" (list "FERRUM_SHUTDOWN_DRAIN_SECONDS" "FERRUM_SHUTDOWN_PREDRAIN_SECONDS" "FERRUM_METRICS_BEARER_TOKEN" "FERRUM_METRICS_ALLOWED_CIDRS")) -}}
+{{- end -}}
+{{- if .Values.injector.enabled -}}
+{{- include "ferrum-mesh.failReservedEnv" (dict "label" "injector.env" "env" .Values.injector.env "names" (list "FERRUM_SHUTDOWN_DRAIN_SECONDS" "FERRUM_SHUTDOWN_PREDRAIN_SECONDS")) -}}
 {{- end -}}
 {{- if .Values.nodeAgent.enabled -}}
 {{- include "ferrum-mesh.validateAdminBind" (dict "component" "nodeAgent" "bind" (.Values.nodeAgent.admin.bindAddress | default "127.0.0.1")) -}}

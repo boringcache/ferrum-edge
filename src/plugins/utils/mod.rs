@@ -52,6 +52,7 @@ pub mod token_extract;
 pub mod transformer_gate;
 pub mod udp_endpoint;
 pub mod validation_diagnostics;
+pub mod xml_bounds;
 
 pub use batching_logger::{
     BatchConfig, BatchingLogger, BatchingLoggerHandle, BatchingLoggerPermit,

@@ -606,6 +606,11 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
+    # Issue #4600: the job normally finishes in 16-19 minutes. Without a bound a
+    # single hung testcontainers case (a stalled image pull or a ClickHouse HTTP
+    # call with no deadline) held the job for the 6-hour default and, inside the
+    # merge queue, cost the whole group its budget. Fail fast instead.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
@@ -1150,11 +1155,51 @@ jobs:
         # Policy: docs/dependency-policy.md.
         run: cargo deny check advisories bans sources licenses
 
+      - name: cargo-deny (eBPF workspace)
+        # Same BLOCKING gate over `ebpf/Cargo.toml`, a SEPARATE [workspace] with
+        # its own lockfile. Its `ferrum-ebpf` member (aya-ebpf / aya-log-ebpf and
+        # their transitive tree) never enters the root graph — the root crate
+        # path-depends only on `ferrum-ebpf-common` — so the step above cannot
+        # see it. That object is compiled by the `ebpf-builder` stage in
+        # Dockerfile and ships in the published `-ebpf` / `-ebpf-tools` images,
+        # where the mesh chart runs it privileged on the host network. `--config
+        # deny.toml` reuses the root policy so the two allowlists cannot drift.
+        # Policy: docs/dependency-policy.md.
+        # `--allow advisory-not-detected`: the shared deny.toml ignore list is
+        # scoped to the root graph (mongodb/aws/sqlx paths that the eBPF workspace
+        # never pulls in); with `unused-ignored-advisory = "deny"` those entries
+        # would otherwise fail this run for not matching anything here.
+        run: >-
+          cargo deny --manifest-path ebpf/Cargo.toml
+          check --allow advisory-not-detected --config deny.toml advisories bans sources licenses
+
+      - name: Advisory-exception expiry self-test
+        # The [expires:] convention is a repo rule cargo-deny knows nothing
+        # about, so the checker is the only thing enforcing it. Run its synthetic
+        # fixtures first: a checker that silently stopped rejecting an untokened
+        # or expired exception would otherwise pass this job forever.
+        run: bash scripts/check_advisory_expiry.sh --self-test
+
       - name: Advisory-exception expiry
-        # cargo-deny accepts ignores without the repo's [expires:] convention, so
-        # validate it here too: a PR that adds a malformed or already-expired
-        # exception is rejected at PR time, not only by the weekly workflow.
+        # cargo-deny accepts ignores and license exceptions without the repo's
+        # [expires:] convention, so validate it here too: a PR that adds a
+        # malformed or already-expired exception is rejected at PR time, not only
+        # by the weekly workflow.
         run: bash scripts/check_advisory_expiry.sh
+
+      - name: Third-party license inventory
+        # Crate -> license listing from the LOCKED graph, produced on every PR
+        # alongside the gate that enforces the allowlist, so a reviewer can see
+        # exactly what the tree ships under. `cargo deny list` compiles nothing.
+        run: cargo deny list --format json --layout crate > third-party-licenses.json
+
+      - name: Upload third-party license inventory
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: third-party-licenses
+          path: third-party-licenses.json
+          retention-days: 30
 
       - name: Vendored-patch lifecycle parity
         # Fails when docs/vendored-patch-lifecycle.json drifts from Cargo.toml,
@@ -1995,6 +2040,30 @@ jobs:
         with:
           name: functional-tests-archive-${{ runner.os }}-${{ runner.arch }}
           path: .
+
+      # Issue #4600: an anonymous Docker Hub pull of `redis:7-alpine` failed a
+      # merge group with "unauthorized: authentication required". Pull with the
+      # repository's Docker Hub credentials when they are present, then log out
+      # in the same step so no push-capable token is on disk when the
+      # PR-controlled test binaries run below. Forks (no secrets) keep the
+      # anonymous pull.
+      - name: Pull the Redis image
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${DOCKERHUB_USERNAME}" ] && [ -n "${DOCKERHUB_TOKEN}" ]; then
+            trap 'docker logout >/dev/null 2>&1 || true' EXIT
+            printf '%s' "${DOCKERHUB_TOKEN}" | docker login --username "${DOCKERHUB_USERNAME}" --password-stdin
+          else
+            echo "::notice::Docker Hub credentials unavailable in this run; pulling redis:7-alpine anonymously"
+          fi
+          for attempt in 1 2 3; do
+            docker pull redis:7-alpine && break
+            [ "$attempt" -lt 3 ] || exit 1
+            sleep $((attempt * 10))
+          done
 
       - name: Start Redis
         run: |
@@ -3174,6 +3243,46 @@ jobs:
             echo "::error title=SleepAction accepted on Kubernetes 1.28::preStop.sleep requires 1.29+ or shutdownPreStopSeconds=0"
             exit 1
           fi
+          # Injector shutdown + native-sidecar kubeVersion floor (#4512/#4534).
+          # The injector is a failurePolicy=Fail webhook, so both its drain
+          # window and its 1.29 floor are cluster-wide fail-closed surfaces.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --kube-version 1.29.0 \
+            --set injector.enabled=true \
+            --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
+            --set injector.tls.secretName=ferrum-mesh-injector-tls \
+            --set nodeAgent.enabled=true \
+            --set ambient.enabled=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-injector.yaml"
+          # No --kube-version at all: the helm-template 1.20 sentinel must not be
+          # mistaken for a real pre-1.29 cluster, or every client-side/GitOps
+          # render of an injector-enabled release would fail.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set injector.enabled=true \
+            --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
+            --set injector.tls.secretName=ferrum-mesh-injector-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-injector-no-kube-version.yaml"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --kube-version 1.27.0 \
+            --set injector.enabled=true \
+            --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
+            --set injector.tls.secretName=ferrum-mesh-injector-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-injector-kube-1.27.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-injector-kube-1.27.err"; then
+            echo "::error title=Native-sidecar injection accepted on Kubernetes 1.27::initContainers[].restartPolicy needs 1.29+ and has no ordinary-container fallback"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --kube-version 1.29.0 \
+            --set injector.enabled=true \
+            --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
+            --set injector.tls.secretName=ferrum-mesh-injector-tls \
+            --set injector.terminationGracePeriodSeconds=40 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-injector-low-grace.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-injector-low-grace.err"; then
+            echo "::error title=Under-budget injector grace accepted::injector.terminationGracePeriodSeconds must cover preStop + drain + process-exit slack"
+            exit 1
+          fi
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             -f ./charts/ferrum-mesh/examples/development-values.yaml \
             --set controlPlane.shutdownDrainSeconds=0 \
@@ -3222,6 +3331,125 @@ jobs:
             --set ambient.admin.bindAddress=0.0.0.0 \
             --set nodeAgent.admin.bindAddress=0.0.0.0 \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs.yaml"
+          # A metrics bearer credential is only ever attached to a verified
+          # HTTPS scrape (issue #4509): FERRUM_METRICS_BEARER_TOKEN also unlocks
+          # full /health, /status and /overload detail, and both DaemonSets run
+          # host-network, so a plaintext scrape leaks it on the node network.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ca.enabled=true \
+            --set eastWest.enabled=true \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set observability.enabled=true \
+            --set observability.metrics.bearerToken.existingSecret.name=mesh-metrics-bearer \
+            --set observability.metrics.serviceMonitor.tlsConfig.ca.secret.name=mesh-scrape-ca \
+            --set observability.metrics.serviceMonitor.tlsConfig.ca.secret.key=ca.crt \
+            --set observability.metrics.podMonitor.tlsConfig.ca.secret.name=mesh-scrape-ca \
+            --set observability.metrics.podMonitor.tlsConfig.ca.secret.key=ca.crt \
+            --set controlPlane.admin.bindAddress=0.0.0.0 \
+            --set-string 'controlPlane.admin.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
+            --set controlPlane.admin.httpsPort=9443 \
+            --set controlPlane.admin.tls.enabled=true \
+            --set controlPlane.admin.tls.secretName=cp-admin-tls \
+            --set ca.admin.bindAddress=0.0.0.0 \
+            --set-string 'ca.admin.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
+            --set ca.admin.httpsPort=9443 \
+            --set ca.admin.tls.enabled=true \
+            --set ca.admin.tls.secretName=ca-admin-tls \
+            --set eastWest.admin.bindAddress=0.0.0.0 \
+            --set eastWest.admin.httpsPort=9443 \
+            --set eastWest.admin.tls.enabled=true \
+            --set eastWest.admin.tls.secretName=ew-admin-tls \
+            --set ambient.admin.bindAddress=0.0.0.0 \
+            --set ambient.admin.httpsPort=9444 \
+            --set ambient.admin.tls.enabled=true \
+            --set ambient.admin.tls.secretName=ambient-admin-tls \
+            --set nodeAgent.admin.bindAddress=0.0.0.0 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=na-admin-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-bearer-https.yaml"
+          # Bearer + plaintext-only admin must fail closed.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ca.enabled=true \
+            --set eastWest.enabled=true \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set observability.enabled=true \
+            --set observability.metrics.bearerToken.existingSecret.name=mesh-metrics-bearer \
+            --set observability.metrics.serviceMonitor.tlsConfig.ca.secret.name=mesh-scrape-ca \
+            --set observability.metrics.serviceMonitor.tlsConfig.ca.secret.key=ca.crt \
+            --set observability.metrics.podMonitor.tlsConfig.ca.secret.name=mesh-scrape-ca \
+            --set observability.metrics.podMonitor.tlsConfig.ca.secret.key=ca.crt \
+            --set controlPlane.admin.bindAddress=0.0.0.0 \
+            --set-string 'controlPlane.admin.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
+            --set ca.admin.bindAddress=0.0.0.0 \
+            --set-string 'ca.admin.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
+            --set eastWest.admin.bindAddress=0.0.0.0 \
+            --set ambient.admin.bindAddress=0.0.0.0 \
+            --set nodeAgent.admin.bindAddress=0.0.0.0 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-bearer-plaintext.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-bearer-plaintext.err"; then
+            echo "::error title=Metrics bearer accepted over plaintext admin::a bearer scrape must require admin HTTPS"
+            exit 1
+          fi
+          # Bearer + HTTPS with insecureSkipVerify must fail closed.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set observability.enabled=true \
+            --set observability.metrics.bearerToken.existingSecret.name=mesh-metrics-bearer \
+            --set observability.metrics.serviceMonitor.tlsConfig.ca.secret.name=mesh-scrape-ca \
+            --set observability.metrics.serviceMonitor.tlsConfig.ca.secret.key=ca.crt \
+            --set observability.metrics.serviceMonitor.tlsConfig.insecureSkipVerify=true \
+            --set observability.metrics.podMonitor.tlsConfig.ca.secret.name=mesh-scrape-ca \
+            --set observability.metrics.podMonitor.tlsConfig.ca.secret.key=ca.crt \
+            --set controlPlane.admin.bindAddress=0.0.0.0 \
+            --set-string 'controlPlane.admin.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
+            --set controlPlane.admin.httpsPort=9443 \
+            --set controlPlane.admin.tls.enabled=true \
+            --set controlPlane.admin.tls.secretName=cp-admin-tls \
+            --set ambient.admin.bindAddress=0.0.0.0 \
+            --set ambient.admin.httpsPort=9444 \
+            --set ambient.admin.tls.enabled=true \
+            --set ambient.admin.tls.secretName=ambient-admin-tls \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.bindAddress=0.0.0.0 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=na-admin-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-bearer-insecure.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-bearer-insecure.err"; then
+            echo "::error title=insecureSkipVerify accepted with bearer::a bearer scrape requires certificate verification"
+            exit 1
+          fi
+          # Bearer + HTTPS with an EMPTY tlsConfig must fail closed.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set observability.enabled=true \
+            --set observability.metrics.bearerToken.existingSecret.name=mesh-metrics-bearer \
+            --set controlPlane.admin.bindAddress=0.0.0.0 \
+            --set-string 'controlPlane.admin.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
+            --set controlPlane.admin.httpsPort=9443 \
+            --set controlPlane.admin.tls.enabled=true \
+            --set controlPlane.admin.tls.secretName=cp-admin-tls \
+            --set ambient.admin.bindAddress=0.0.0.0 \
+            --set ambient.admin.httpsPort=9444 \
+            --set ambient.admin.tls.enabled=true \
+            --set ambient.admin.tls.secretName=ambient-admin-tls \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.bindAddress=0.0.0.0 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=na-admin-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-bearer-no-tlsconfig.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-bearer-no-tlsconfig.err"; then
+            echo "::error title=Empty tlsConfig accepted for an HTTPS scrape::an HTTPS scrape must verify the admin certificate"
+            exit 1
+          fi
           # Strict admin/metrics IP+CIDR validation ported from ferrum-gateway.
           # Each of these renders cleanly under a permissive approximation and
           # then CrashLoops (or has the admin accept loop silently drop the
@@ -3432,6 +3660,27 @@ jobs:
             --set-string controlPlane.env.FERRUM_ADMIN_ALLOWED_CIDRS=127.0.0.0/8 \
             --set-string controlPlane.env.FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-admin-env-override.yaml"
+          # image.pullSecrets is a list of Secret NAMES (strings) and must reach
+          # EVERY mesh pod spec, including both CNI uninstall-hook pods (they run
+          # the Ferrum image, so a private registry would hang the uninstall).
+          # The chart defaults to [], so without an explicit render neither the
+          # schema nor the template shape is ever exercised (#4510).
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set 'image.pullSecrets[0]=regcred' \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.cni.enabled=true \
+            --set ca.enabled=true \
+            --set eastWest.enabled=true \
+            --set injector.enabled=true \
+            --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-image-pull-secrets.yaml"
+          # The default install must render no imagePullSecrets key at all.
+          if grep -Fq 'imagePullSecrets' "$RUNNER_TEMP/ferrum-helm-results/default-rendered.yaml"; then
+            echo "::error title=Default mesh render carries imagePullSecrets::image.pullSecrets defaults to [] and must render nothing"
+            exit 1
+          fi
           python3 -I .github/scripts/verify_mesh_production_readiness.py \
             --results-dir "$RUNNER_TEMP/ferrum-helm-results"
 
@@ -3498,6 +3747,34 @@ jobs:
             exit 1
           fi
           grep -Fq 'name: FERRUM_FILE_CONFIG_PATH' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"
+          # image.pullSecrets is a list of Secret NAMES (strings). The schema
+          # used to declare object items, so the documented string form was
+          # rejected outright and the schema-valid object form rendered
+          # `- name: map[name:regcred]` (#4510). The default is [], so only an
+          # explicit render exercises either surface.
+          if grep -Fq 'imagePullSecrets' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"; then
+            echo "::error title=Default gateway render carries imagePullSecrets::image.pullSecrets defaults to [] and must render nothing"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set 'image.pullSecrets[0]=regcred' \
+            --set 'image.pullSecrets[1]=mirror-creds' \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/pull-secrets-rendered.yaml"
+          grep -Fq '      imagePullSecrets:' "$RUNNER_TEMP/ferrum-gateway-helm-results/pull-secrets-rendered.yaml"
+          grep -Fq '        - name: regcred' "$RUNNER_TEMP/ferrum-gateway-helm-results/pull-secrets-rendered.yaml"
+          grep -Fq '        - name: mirror-creds' "$RUNNER_TEMP/ferrum-gateway-helm-results/pull-secrets-rendered.yaml"
+          # The object form must now be REJECTED by the schema, so a stale
+          # values file cannot silently render an unresolvable Secret name.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set 'image.pullSecrets[0].name=regcred' \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/pull-secrets-object.out" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/pull-secrets-object.err"; then
+            echo "::error title=Object-form gateway pull secret accepted::image.pullSecrets items must be Secret names (strings)"
+            exit 1
+          fi
+          grep -E 'pullSecrets|want string|got object' \
+            "$RUNNER_TEMP/ferrum-gateway-helm-results/pull-secrets-object.err" \
+            "$RUNNER_TEMP/ferrum-gateway-helm-results/pull-secrets-object.out"
           # GatewayConfig deserialization requires all four top-level lists (version,
           # proxies, consumers, plugin_configs) with no serde defaults, so the default
           # inline ConfigMap must emit consumers/plugin_configs or the pod fails to boot.
@@ -4742,6 +5019,54 @@ jobs:
             "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-prom-rule-rendered.yaml" \
             "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-prometheus-rules.yaml"
           promtool check rules "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-prometheus-rules.yaml"
+          # Issue #4547: every shipped alert must carry a runbook_url annotation.
+          # Rendered in database mode so the mode-gated config alerts are present.
+          helm template ferrum-db ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=database \
+            --set database.type=sqlite \
+            --set metrics.enabled=true \
+            --set metrics.alerts.enabled=true \
+            --set metrics.serviceMonitor.enabled=false \
+            --set metrics.allowedCidrs=10.0.0.0/8 \
+            --set metrics.alerts.frontendTlsHandshakeErrorsPerSecond=5 \
+            --set admin.jwtSecret.existingSecret.name=ferrum-gateway-credentials \
+            --set database.existingSecret.name=ferrum-db \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-runbooks.yaml"
+          python3 -I .github/scripts/extract_rendered_prometheus_rules.py \
+            "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-runbooks.yaml" \
+            "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-runbooks-rules.yaml"
+          promtool check rules "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-runbooks-rules.yaml"
+          alert_count="$(grep -c '^\s*- alert:' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-runbooks-rules.yaml")"
+          runbook_count="$(grep -c 'runbook_url:' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-runbooks-rules.yaml")"
+          if [ "$alert_count" -eq 0 ] || [ "$alert_count" != "$runbook_count" ]; then
+            echo "::error title=Gateway alert without a runbook_url::${alert_count} alerts but ${runbook_count} runbook_url annotations"
+            exit 1
+          fi
+          grep -Fq 'FerrumGatewayDatabaseUnavailable' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-runbooks-rules.yaml"
+          grep -Fq 'ferrum_database_config_source_connected' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-runbooks-rules.yaml"
+          # Issue #4547: the bundled Grafana dashboards render only when opted in.
+          # `--show-only` on a template that produces nothing exits non-zero with
+          # "could not find template" — that IS the pass condition.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set metrics.enabled=true \
+            --set metrics.serviceMonitor.enabled=false \
+            --set metrics.allowedCidrs=10.0.0.0/8 \
+            --show-only templates/observability-dashboards-configmap.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/dashboards-default.out" 2>&1; then
+            echo "::error title=Dashboards ConfigMap rendered by default::metrics.dashboards.enabled defaults to false"
+            exit 1
+          fi
+          grep -Fq 'could not find template' "$RUNNER_TEMP/ferrum-gateway-helm-results/dashboards-default.out"
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set metrics.enabled=true \
+            --set metrics.serviceMonitor.enabled=false \
+            --set metrics.allowedCidrs=10.0.0.0/8 \
+            --set metrics.dashboards.enabled=true \
+            --show-only templates/observability-dashboards-configmap.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/dashboards-enabled.yaml"
+          grep -Fq 'kind: ConfigMap' "$RUNNER_TEMP/ferrum-gateway-helm-results/dashboards-enabled.yaml"
+          grep -Fq 'grafana_dashboard: "1"' "$RUNNER_TEMP/ferrum-gateway-helm-results/dashboards-enabled.yaml"
+          grep -Fq 'gateway-overview.json' "$RUNNER_TEMP/ferrum-gateway-helm-results/dashboards-enabled.yaml"
           # Issue #4289: database poll freshness must not render in file/dp modes.
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set metrics.enabled=true \
@@ -5308,7 +5633,8 @@ jobs:
     # Byte-frozen by the trusted Cross build policy
     # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
     # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
-    # issue #3902 decides where each half of it runs. This is its entire
+    # issue #3902 decides where each half of it runs, and issue #4442 decides
+    # which targets it covers. This is its entire
     # permitted shape. Every command, action pin, toolchain pin, tool version,
     # target name, and libFuzzer bound below is part of the contract, so a pull
     # request cannot widen the budget, change the target list, add a step, or
@@ -5316,9 +5642,9 @@ jobs:
     #
     # Lane split (#3902, narrowed by #4238): the deterministic property smoke
     # stays the required gate and runs on pull_request AND merge_group. The
-    # six-target, sanitizer-instrumented libFuzzer build spends roughly 39
-    # minutes compiling to buy roughly 48 seconds of fuzzing, so it runs only
-    # on the push to `main` and on manual dispatch.
+    # sanitizer-instrumented libFuzzer build spends roughly 39 minutes
+    # compiling to buy under a minute of fuzzing, so it runs only on the push
+    # to `main` and on manual dispatch.
     #
     # #3902 took it off the pull-request path for cost. #4238 takes it off the
     # merge_group path for blast radius: a hosted-runner reclamation (exit 143)
@@ -5327,6 +5653,15 @@ jobs:
     # ejected change. Discovery coverage is unchanged -- every merged change is
     # still fuzzed at byte-identical bounds by the push to `main` that follows
     # it, which is also the only event permitted to populate this lane's cache.
+    #
+    # Target inventory (#4442): `datagram_client_address` is the seventh smoke
+    # target. It is invoked on its own rather than from the six-target loop
+    # because its documented input budget is 64 KiB
+    # (`fuzz_support::MAX_FUZZ_INPUT_BYTES`) rather than the loop's 4 KiB, and
+    # the scheduled sanitizer lane already fuzzes it at that ceiling. A parser
+    # whose length boundaries are reachable in one required lane and not the
+    # other is not actually scheduled. Every other bound is byte-identical to
+    # the loop's.
     name: Fuzz Smoke
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
@@ -5423,6 +5758,14 @@ jobs:
               -timeout=2 \
               -rss_limit_mb=1024
           done
+
+          echo "Fuzz smoke target: datagram_client_address"
+          cargo fuzz run --codegen-units 16 datagram_client_address -- \
+            -runs=512 \
+            -max_total_time=8 \
+            -max_len=65536 \
+            -timeout=2 \
+            -rss_limit_mb=1024
           echo "Fuzz sanitizer lane seconds: $((SECONDS - sanitizer_started))"
 
       - name: Report fuzz lane compiler-cache telemetry
@@ -5431,7 +5774,7 @@ jobs:
           set -euo pipefail
 
           if [ "$GITHUB_EVENT_NAME" = "push" ] || [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "Fuzz lane shape: property gate plus the six-target sanitizer budget"
+            echo "Fuzz lane shape: property gate plus the seven-target sanitizer budget"
           else
             echo "Fuzz lane shape: deterministic property gate only"
           fi
@@ -6249,6 +6592,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.ci-plan.outputs.binary-matrix) }}
+    # Identity pins for the published x86_64 GNU producer (issue #4423).
+    # `build_linux_gnu_sysroot.sh` and `smoke_linux_gnu_baseline.sh` refuse to
+    # run when these disagree with `.github/linux-gnu-abi.toml`, and the
+    # trusted Cross policy holds both these literals and that contract file to
+    # its own hardcoded constants. The PR-editable TOML is therefore no longer
+    # the sole source of truth for the image identity on a publishing path.
+    env:
+      LINUX_GNU_SYSROOT_IMAGE: almalinux@sha256:4a87d2615a770506e204c27d6248ac97f4df67f4e41e2e9c47c81f0ed0be98cb
+      LINUX_GNU_SMOKE_FLOOR_IMAGE: almalinux@sha256:1c718a4cd7bab3bdb069ddbbd1eb593a390e6932d51d0048a2f6556303bafba7
+      LINUX_GNU_SMOKE_UBUNTU2204_IMAGE: ubuntu@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc
+      LINUX_GNU_PROTOC_SHA256: ed8fca87a11c888fed329d6a59c34c7d436165f662a2c875246ddb1ac2b6dd50
     # merge_group: macOS compile-gates with cargo check (queue binaries are
     # discarded). Linux and Windows keep a linked pr-build; Windows MSVC/NASM
     # linkage is the unique failure mode check cannot see. rust-cache keys
@@ -6257,6 +6611,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable

@@ -30,6 +30,16 @@ docker build -t ferrum-edge:v0.1.0 .
 docker build -t myregistry.azurecr.io/ferrum-edge:latest .
 ```
 
+### Base Image Pinning
+
+Every image reference in `Dockerfile`, `Dockerfile.release`, `Dockerfile.test`,
+and `Dockerfile.ebpf-tools-layer` — `FROM` lines and the `ARG <NAME>=<image>`
+defaults their `FROM ${VAR}` stages expand — is pinned by `@sha256:` digest, so
+a local `docker build` pulls exactly the bytes CI and the published images were
+built from. Two CI gates enforce it and two automations refresh it; see
+[dependency-policy.md → Container build inputs](dependency-policy.md#container-build-inputs-enforcement-and-refresh).
+Never drop a digest to pick up a base-image fix by tag — bump the digest instead.
+
 ### Image Details
 
 The Dockerfile uses a **multi-stage build** for optimal size:
@@ -313,11 +323,14 @@ FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true
 FERRUM_CP_DP_GRPC_JWT_SECRET=change-me-to-a-32-character-grpc-secret
 ```
 
-> **Note**: The prebuilt release image (`Dockerfile.release`) bakes
-> `FERRUM_LOG_LEVEL=warn` as its default so that startup operability warnings
-> (FD soft-cap floor, plaintext-admin guard, pending plugin migrations) are
-> visible out of the box. Override with `-e FERRUM_LOG_LEVEL=<level>` for
-> quieter (`error`) or more verbose (`info`/`debug`/`trace`) logging.
+> **Note**: Every published image family bakes `FERRUM_LOG_LEVEL=warn` as its
+> default — the standard image built from `Dockerfile.release` and the `-ebpf` /
+> `-ebpf-tools` images built from the root `Dockerfile` — so that startup
+> operability warnings (FD soft-cap floor, plaintext-admin guard, pending plugin
+> migrations, TLS expiry, capture degradation) are visible out of the box. A local
+> `docker build -f Dockerfile .` therefore reproduces the published default.
+> Override with `-e FERRUM_LOG_LEVEL=<level>` for quieter (`error`) or more
+> verbose (`info`/`debug`/`trace`) logging.
 
 ### Setting Variables in Docker
 

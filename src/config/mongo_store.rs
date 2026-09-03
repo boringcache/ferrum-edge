@@ -3597,14 +3597,25 @@ mod inner {
                 })
                 .sort(doc! { "sequence": -1 })
                 .await?;
+            // Same accepted shapes as every other `sequence` reader, but the
+            // retention watermark keeps its original strictly-positive
+            // requirement: a zero retained sequence is still a malformed row.
             let retained_sequence = match retained_doc.as_ref().and_then(|doc| doc.get("sequence"))
             {
-                Some(Bson::Int64(value)) if *value > 0 => Some(*value),
-                Some(Bson::Int32(value)) if *value > 0 => Some(*value as i64),
-                Some(other) => anyhow::bail!(
-                    "MongoDB config_changes row has invalid sequence: {:?}",
-                    other
-                ),
+                Some(value) => {
+                    let sequence = mongo_change_sequence_from_bson(Some(value), "sequence")?;
+                    let sequence = i64::try_from(sequence).map_err(|_| {
+                        anyhow::anyhow!(
+                            "MongoDB config_changes row has invalid 'sequence': expected a positive integral number"
+                        )
+                    })?;
+                    if sequence <= 0 {
+                        anyhow::bail!(
+                            "MongoDB config_changes row has invalid 'sequence': expected a positive integral number"
+                        );
+                    }
+                    Some(sequence)
+                }
                 None => None,
             };
             if let Some(retained_sequence) = retained_sequence {
@@ -7529,6 +7540,42 @@ mod inner {
         }
     }
 
+    /// Decode a `config_changes.sequence` value (or an aggregated `max_sequence`).
+    ///
+    /// Accepts `Int64`, `Int32`, and an integral non-negative `Double` — the
+    /// default numeric type a `mongosh` `insertOne({sequence: 5, ...})` writes
+    /// unless the operator spells `NumberLong(5)`. Negative, non-integral,
+    /// non-finite, and out-of-exact-range doubles are rejected; the double arm
+    /// is bounded at 2^53 so precision loss can never admit a wrong sequence,
+    /// and no unchecked `as u64` float cast is performed.
+    ///
+    /// Error text names the field and the expected shape only — never the BSON
+    /// payload — so a malformed document cannot leak resource identifiers into
+    /// logs (issue #4530).
+    fn mongo_change_sequence_from_bson(
+        value: Option<&Bson>,
+        field: &'static str,
+    ) -> Result<u64, anyhow::Error> {
+        /// Largest double that still round-trips exactly through an integer.
+        const MAX_EXACT_DOUBLE_SEQUENCE: f64 = 9_007_199_254_740_992.0;
+
+        match value {
+            Some(Bson::Int64(value)) if *value >= 0 => Ok(*value as u64),
+            Some(Bson::Int32(value)) if *value >= 0 => Ok(*value as u64),
+            Some(Bson::Double(value))
+                if value.is_finite()
+                    && *value >= 0.0
+                    && value.fract() == 0.0
+                    && *value <= MAX_EXACT_DOUBLE_SEQUENCE =>
+            {
+                Ok(*value as u64)
+            }
+            _ => anyhow::bail!(
+                "MongoDB config_changes row has invalid '{field}': expected a non-negative integral number"
+            ),
+        }
+    }
+
     /// Decode one `config_changes` document the same way replica-set incremental
     /// polling does. Typed failures return `Err` so the poller cannot fold the
     /// sequence into `sequence_cursor` and skip the record forever.
@@ -7538,11 +7585,7 @@ mod inner {
     pub(crate) fn decode_mongo_config_change_record(
         doc: &Document,
     ) -> Result<MongoConfigChangeRecord, anyhow::Error> {
-        let sequence = match doc.get("sequence") {
-            Some(Bson::Int64(value)) if *value >= 0 => *value as u64,
-            Some(Bson::Int32(value)) if *value >= 0 => *value as u64,
-            _ => anyhow::bail!("MongoDB config_changes row has invalid sequence"),
-        };
+        let sequence = mongo_change_sequence_from_bson(doc.get("sequence"), "sequence")?;
         let resource_type = mongo_config_change_required_str(doc, "resource_type")?;
         if resource_type.is_empty() {
             anyhow::bail!("MongoDB config_changes row has empty resource_type");
@@ -8086,14 +8129,7 @@ mod inner {
             let Some(doc) = doc else {
                 return Ok(0);
             };
-            match doc.get("sequence") {
-                Some(Bson::Int64(value)) if *value >= 0 => Ok(*value as u64),
-                Some(Bson::Int32(value)) if *value >= 0 => Ok(*value as u64),
-                other => anyhow::bail!(
-                    "MongoDB config_changes row has invalid sequence: {:?}",
-                    other
-                ),
-            }
+            mongo_change_sequence_from_bson(doc.get("sequence"), "sequence")
         }
 
         async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error> {
@@ -8109,14 +8145,8 @@ mod inner {
             let mut total: u64 = 0;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
-                let ns_max = match doc.get("max_sequence") {
-                    Some(Bson::Int64(value)) if *value >= 0 => *value as u64,
-                    Some(Bson::Int32(value)) if *value >= 0 => *value as u64,
-                    other => anyhow::bail!(
-                        "MongoDB config_changes row has invalid sequence: {:?}",
-                        other
-                    ),
-                };
+                let ns_max =
+                    mongo_change_sequence_from_bson(doc.get("max_sequence"), "max_sequence")?;
                 total = total.checked_add(ns_max).ok_or_else(|| {
                     anyhow::anyhow!("all-scope config-change sequence overflowed u64")
                 })?;

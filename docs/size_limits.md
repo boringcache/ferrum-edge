@@ -6,7 +6,7 @@ Ferrum Edge enforces configurable size limits on request headers, request bodies
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `FERRUM_MAX_HEADER_SIZE_BYTES` | `usize` | `32768` (32KB) | Maximum total size of all request headers combined. Enforced at both the hyper protocol layer (HTTP/1.1 `max_buf_size`, HTTP/2 `max_header_list_size`) and the application layer. |
+| `FERRUM_MAX_HEADER_SIZE_BYTES` | `usize` | `32768` (32KB) | Maximum total size of all request headers combined. Enforced at both the hyper protocol layer (HTTP/1.1 `max_buf_size`, HTTP/2 `max_header_list_size`) and the application layer. **Maximum accepted value `768000`**; a larger value is a startup error because the HTTP/3 frontend could not advertise it without exceeding `http::HeaderMap`'s 24,576-entry construction ceiling (see [HTTP/3 header size limits](http3.md#header-size-limits)). |
 | `FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES` | `usize` | `16384` (16KB) | Maximum size of any single request header (name + value in bytes). Prevents individual oversized headers. |
 | `FERRUM_MAX_HEADER_COUNT` | `usize` | `100` | Maximum number of request headers allowed. Set to `0` for unlimited. |
 | `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` | `usize` | `10485760` (10MB) | Maximum request body size. Set to `0` for unlimited. Checked via `Content-Length` header (fast reject) and enforced during body collection / streaming (`http_body_util::Limited`, `SizeLimitedIncoming` on direct-H2). Nonzero values do not disqualify the multiplexed direct-H2 pool. |
@@ -47,6 +47,30 @@ This provides a second line of defense and enables per-header size limits that h
 Request body limits are enforced in two stages:
 1. **Content-Length fast path**: If the `Content-Length` header exceeds `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`, the request is rejected immediately (413) without reading any body data.
 2. **Streaming enforcement**: Uses `http_body_util::Limited` to wrap the body stream. If the body exceeds the limit during collection, the stream is aborted and a 413 is returned.
+
+### `Expect: 100-continue`
+
+Ferrum answers `Expect: 100-continue` itself and never forwards the expectation
+to the origin.
+
+The gateway's own HTTP/1.1 server (hyper) writes the interim `100 Continue`
+response when the request body is first polled — on Ferrum's paths that is at
+backend dispatch, after the authentication and authorization plugin phases have
+run. `expect` is therefore part of the canonical backend-request strip set
+(`is_backend_request_strip_header` in `src/proxy/headers.rs`), so it is removed
+on every backend transport: reqwest HTTP/1.1, direct HTTP/2, gRPC, native
+HTTP/3, and HBONE.
+
+Forwarding the expectation would buy nothing — the reqwest/hyper *client* has no
+`Expect` support, and the gateway has already solicited the body — while making
+an origin `417 Expectation Failed` (or a `401`/`413` the origin would have
+returned before the body) cost a full upload through the gateway, plus a full
+buffer whenever retry replay forces request buffering.
+
+Body admission is unaffected: the `Content-Length` fast path and the streaming
+`Limited` wrapper in Layer 3 apply exactly as they do to a request without an
+expectation. A gateway-authored `413` for a declared oversize body is still
+returned from the `Content-Length` fast path without reading body bytes.
 
 ### Layer 4: Response Body Enforcement
 

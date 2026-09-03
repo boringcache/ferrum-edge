@@ -225,8 +225,22 @@ request-target — the guard writes a static `400 Bad Request` directly on the
 connection and closes it. Hyper never sees those requests and does not generate
 its empty-bodied automatic `400`. The response uses the same JSON envelope
 handler-layer protocol rejects use: `Content-Type: application/json`, a fixed
-`{"error":"..."}` body matching `check_protocol_headers()`,
-`X-Gateway-Error: request_error`, and `Connection: close`.
+`{"error":"..."}` body matching `check_protocol_headers()`, and
+`Connection: close`. Like the handler-layer protocol `400`s, it carries **no**
+`X-Gateway-Error`: that header is the closed seven-token client-facing
+vocabulary below, which names why a *backend* attempt failed, and none of its
+tokens describes a client-caused `400` (issue #4543). The parse reject names
+itself only in its `warn`-level log line (`parse_reject_class`,
+`parse_reject_hint`, `peer_addr`).
+
+Each parse-layer reject is counted. The guard tallies the envelopes it wrote on
+the connection and the connection handler drains that tally into
+`record_request(.., 400)` once the hyper connection resolves, so a conflicting
+`Content-Length` — a request-smuggling probe — appears in the gateway's request
+and status counters, `/metrics/runtime`, and the admin status map. It does not
+produce a `ferrum_requests_total{proxy_id,method,...}` series or a transaction
+log row: a pre-parse reject has no `RequestContext`, no matched proxy, no method
+and no `proxy_id`, and never reaches a plugin cache.
 
 Admitted (well-formed) HTTP/1 requests keep the existing in-place observe path
 and the same vectored writes as on `main`; the connection I/O type Hyper is

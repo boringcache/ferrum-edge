@@ -4,6 +4,8 @@
 {{- if and $obs.enabled (ne ($sm.enabled | toString) "false") }}
 {{- $bearer := $metrics.bearerToken | default dict -}}
 {{- $bearerSecret := $bearer.existingSecret | default dict -}}
+{{- $hasBearerSecret := not (empty $bearerSecret.name) -}}
+{{- $smTls := $sm.tlsConfig | default dict -}}
 {{- $workloads := list -}}
 {{- if .Values.controlPlane.enabled -}}
 {{- $workloads = append $workloads (dict "name" "ferrum-mesh-control-plane" "component" "controlPlane" "env" (.Values.controlPlane.env | default dict) "admin" (.Values.controlPlane.admin | default dict)) -}}
@@ -14,10 +16,16 @@
 {{- if .Values.eastWest.enabled -}}
 {{- $workloads = append $workloads (dict "name" "ferrum-mesh-east-west" "component" "eastWest" "env" (.Values.eastWest.env | default dict) "admin" (.Values.eastWest.admin | default dict)) -}}
 {{- end -}}
-{{- $state := dict "count" 0 -}}
+{{- /* The ServiceMonitor carries ONE endpoint for every selected metrics
+       Service, so the port name and the scheme have to hold for all of them:
+       a scraped component publishes admin-http only when it has a plaintext
+       listener, and admin-https only when a nonzero httpsPort has complete TLS
+       material. Both sides are therefore an AND across the selected set. */ -}}
+{{- $state := dict "count" 0 "http" true "https" true "missing" "" -}}
 {{- range $workloads }}
 {{- $resolved := include "ferrum-mesh.resolveComponentAdmin" (dict "component" .component "env" .env "admin" .admin) | fromYaml -}}
-{{- if and (ne (toString $resolved.port) "0") (not (include "ferrum-mesh.isLoopbackBind" $resolved.bind)) }}
+{{- $httpsActive := include "ferrum-mesh.adminHttpsActive" (dict "resolved" $resolved) -}}
+{{- if and (or (ne (toString $resolved.port) "0") $httpsActive) (not (include "ferrum-mesh.isLoopbackBind" $resolved.bind)) }}
 {{- if gt (int $state.count) 0 }}
 ---
 {{- end }}
@@ -35,14 +43,41 @@ spec:
     app.kubernetes.io/name: {{ .name }}
     app.kubernetes.io/instance: {{ $.Release.Name }}
   ports:
+    {{- if ne (toString $resolved.port) "0" }}
     - name: admin-http
       port: {{ $resolved.port }}
       targetPort: admin-http
       protocol: TCP
+    {{- end }}
+    {{- if $httpsActive }}
+    - name: admin-https
+      port: {{ $resolved.httpsPort }}
+      targetPort: admin-https
+      protocol: TCP
+    {{- end }}
 {{- $_ := set $state "count" (add (int $state.count) 1) }}
+{{- if eq (toString $resolved.port) "0" }}{{- $_ := set $state "http" false }}{{- end }}
+{{- if not $httpsActive }}
+{{- $_ := set $state "https" false }}
+{{- $_ := set $state "missing" (printf "%s%s " (toString $state.missing) .component) }}
+{{- end }}
 {{- end }}
 {{- end }}
 {{- if gt (int $state.count) 0 }}
+{{- /* A bearer credential is only ever attached to a verified HTTPS scrape:
+       FERRUM_METRICS_BEARER_TOKEN also unlocks full /health, /status and
+       /overload detail, so it must never cross the network in cleartext. */ -}}
+{{- if and $hasBearerSecret (not $state.https) -}}
+{{- fail (printf "observability.metrics.serviceMonitor bearer authorization requires admin HTTPS on every scraped mesh component (<component>.admin.httpsPort>0 with <component>.admin.tls); the chart will not send the metrics bearer token over plaintext HTTP. Missing HTTPS: %s" (trim (toString $state.missing))) -}}
+{{- end -}}
+{{- if and (or $hasBearerSecret (not $state.http)) $state.https -}}
+{{- if not $smTls -}}
+{{- fail "observability.metrics.serviceMonitor scrapes admin over HTTPS but observability.metrics.serviceMonitor.tlsConfig is empty. Set observability.metrics.serviceMonitor.tlsConfig (for example ca.secret + serverName) so the scrape verifies the admin certificate." -}}
+{{- end -}}
+{{- end -}}
+{{- if and $hasBearerSecret ($smTls.insecureSkipVerify | default false) -}}
+{{- fail "observability.metrics.serviceMonitor.tlsConfig.insecureSkipVerify cannot be true when bearer authorization is configured; the bearer token requires certificate verification." -}}
+{{- end -}}
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
@@ -71,7 +106,12 @@ spec:
       app.kubernetes.io/instance: {{ .Release.Name }}
   endpoints:
     - path: /metrics
+      {{- if or $hasBearerSecret (not $state.http) }}
+      port: admin-https
+      scheme: https
+      {{- else }}
       port: admin-http
+      {{- end }}
       interval: {{ $sm.interval | default "30s" | quote }}
       scrapeTimeout: {{ $sm.scrapeTimeout | default "10s" | quote }}
       {{- if $bearerSecret.name }}

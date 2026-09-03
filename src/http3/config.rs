@@ -81,13 +81,59 @@ pub const H3_MIN_FIELD_SECTION_SIZE: usize = 16 * 1024;
 /// while still bounding what one stream can buffer.
 const H3_BUFFERED_FRAME_LEN_HEADROOM: u64 = 2;
 
+/// `http::HeaderMap`'s largest constructible capacity, in entries (issue #4538).
+///
+/// `HeaderMap::with_capacity(n)` is `try_with_capacity(n).expect(..)`, and
+/// `try_with_capacity` computes `to_raw_capacity(n) = n + n / 3`, rounds it up
+/// with `checked_next_power_of_two()`, and refuses once the result exceeds
+/// `MAX_SIZE = 1 << 15`. So `24_576` -> raw `32_768` -> `32_768` (accepted) and
+/// `24_577` -> raw `32_769` -> `65_536` (refused). The ceiling is 24,576
+/// entries, NOT the 32,768 `MAX_SIZE` constant it is derived from.
+///
+/// The vendored h3 builds every request and response head with
+/// `HeaderMap::with_capacity(headers.len())` on the RAW decoded field vector
+/// (`vendor/h3-0.0.8-ferrum-patched/src/proto/headers.rs`, `impl
+/// TryFrom<Vec<HeaderField>> for Header`), before any per-field validation and
+/// before Ferrum's own 431 check. A decoded field count above this ceiling
+/// therefore aborts the whole gateway process under `panic = "abort"`.
+pub const H3_HEADER_MAP_MAX_FIELDS: u64 = 24_576;
+
+/// Margin, in fields, held below [`H3_HEADER_MAP_MAX_FIELDS`].
+///
+/// QPACK's per-field accounting is a *minimum* of 32 bytes, so a byte cap
+/// derived from it is already conservative; the margin covers pseudo-header
+/// expansion in `Header::try_from` and any future change to the accounting
+/// constant, and keeps the derived byte cap a round number.
+const H3_FIELD_COUNT_MARGIN: u64 = 576;
+
+/// QPACK `ESTIMATED_OVERHEAD_BYTES` — the RFC 9204 per-field accounting floor
+/// (`vendor/h3-0.0.8-ferrum-patched/src/qpack/field.rs`). The QPACK decoder
+/// bounds only the accumulated `mem_size`, never the field count, and each
+/// field accounts `name.len() + value.len() + 32`, so the number of fields
+/// handed to `Header::try_from` is exactly bounded by `floor(max_size / 32)`.
+const H3_QPACK_PER_FIELD_ACCOUNTING_BYTES: u64 = 32;
+
+/// Absolute decoded-size cap, in bytes, for ANY H3 field section — frontend
+/// request policy and backend response policy alike (issue #4538).
+///
+/// Derived from the real bound rather than restated: at 32 accounted bytes per
+/// field, `(24_576 - 576) * 32` = 768,000 bytes admits at most 24,000 decoded
+/// fields, which is 576 below [`H3_HEADER_MAP_MAX_FIELDS`]. Every field section
+/// the QPACK decoder can hand to `Header::try_from` is therefore constructible,
+/// so the `expect` inside `HeaderMap::with_capacity` is unreachable from the
+/// network.
+pub const H3_FIELD_SECTION_SIZE_CAP: u64 =
+    (H3_HEADER_MAP_MAX_FIELDS - H3_FIELD_COUNT_MARGIN) * H3_QPACK_PER_FIELD_ACCOUNTING_BYTES;
+
 /// Absolute decoded-size cap for an H3 backend response field section.
 ///
-/// QPACK accounts at least 32 bytes per decoded field, so keeping this below
-/// `32 * 32_768` also keeps the decoded field count below `HeaderMap`'s fixed
-/// 32,768-entry capacity even when the operator configures a very large request
-/// header policy.
-pub const H3_BACKEND_RESPONSE_FIELD_SECTION_SIZE_CAP: u64 = 1024 * 1024 - 1;
+/// The backend response policy is bounded by the same field-count ceiling as
+/// the frontend request policy: a hostile or compromised upstream is as able to
+/// emit 24,577 empty QPACK literals as an unauthenticated client is.
+pub const H3_BACKEND_RESPONSE_FIELD_SECTION_SIZE_CAP: u64 = H3_FIELD_SECTION_SIZE_CAP;
+
+const _: () = assert!(H3_FIELD_SECTION_SIZE_CAP <= QUIC_VARINT_MAX_U64);
+const _: () = assert!(H3_MIN_FIELD_SECTION_SIZE as u64 <= H3_FIELD_SECTION_SIZE_CAP);
 
 /// The `SETTINGS_MAX_FIELD_SECTION_SIZE` the HTTP/3 frontend advertises, in
 /// bytes, derived from `FERRUM_MAX_HEADER_SIZE_BYTES` (issue #4261).
@@ -98,14 +144,21 @@ pub const H3_BACKEND_RESPONSE_FIELD_SECTION_SIZE_CAP: u64 = 1024 * 1024 - 1;
 /// after a complete QPACK decode.
 ///
 /// Clamped into the QUIC varint range: the value travels the wire as a varint,
-/// so an unrepresentable one could not be advertised at all. Clamping only ever
-/// NARROWS, never widens; [`validate_h3_field_section_limits`] refuses a
-/// configuration where that clamp would silently change the operator's policy.
+/// so an unrepresentable one could not be advertised at all. Also capped at
+/// [`H3_FIELD_SECTION_SIZE_CAP`] so the decoded field count stays below
+/// [`H3_HEADER_MAP_MAX_FIELDS`] (issue #4538) — without that cap an
+/// unauthenticated client could drive the vendored h3 into
+/// `HeaderMap::with_capacity`'s `expect`, which is a process abort.
+///
+/// Both clamps only ever NARROW, never widen;
+/// [`validate_h3_field_section_limits`] refuses a configuration where either
+/// would silently change the operator's policy.
 pub fn h3_max_field_section_size(max_header_size_bytes: usize) -> u64 {
     let floored = max_header_size_bytes.max(H3_MIN_FIELD_SECTION_SIZE);
     u64::try_from(floored)
         .unwrap_or(QUIC_VARINT_MAX_U64)
         .min(QUIC_VARINT_MAX_U64)
+        .min(H3_FIELD_SECTION_SIZE_CAP)
 }
 
 /// The receive-side ceiling, in bytes, on the DECLARED payload length of a
@@ -128,9 +181,11 @@ pub fn h3_max_buffered_frame_len(max_header_size_bytes: usize) -> u64 {
 /// This is deliberately distinct from the frontend request-header policy: an
 /// upstream response may legitimately be larger than the configured request
 /// limit. It must nevertheless be finite because QPACK can expand a compact
-/// encoded block into enough fields to exceed `http::HeaderMap`'s capacity.
-/// Using the already-bounded non-`DATA` frame ceiling preserves that response
-/// headroom while stopping hostile expansion during QPACK decoding.
+/// encoded block into enough fields to exceed `http::HeaderMap`'s largest
+/// constructible capacity ([`H3_HEADER_MAP_MAX_FIELDS`]). Using the
+/// already-bounded non-`DATA` frame ceiling preserves that response headroom,
+/// and [`H3_BACKEND_RESPONSE_FIELD_SECTION_SIZE_CAP`] stops hostile expansion
+/// short of the field-count ceiling during QPACK decoding.
 pub fn h3_backend_response_max_field_section_size(max_header_size_bytes: usize) -> u64 {
     h3_max_buffered_frame_len(max_header_size_bytes).min(H3_BACKEND_RESPONSE_FIELD_SECTION_SIZE_CAP)
 }
@@ -143,6 +198,14 @@ pub fn h3_backend_response_max_field_section_size(max_header_size_bytes: usize) 
 /// buffered-frame ceiling would no longer be the operator's policy. That is a
 /// configuration error, not something to absorb: the H1 and H2 frontends would
 /// still enforce the configured value and the three frontends would disagree.
+///
+/// The same contract now covers the field-count bound (issue #4538): a header
+/// policy above [`H3_FIELD_SECTION_SIZE_CAP`] is capped by
+/// [`h3_max_field_section_size`] rather than advertised, for the same reason —
+/// the advertised SETTINGS would no longer be the operator's policy. Whichever
+/// of the two bounds is tighter decides; the field-count cap always is, so the
+/// varint branch is kept only so the arithmetic reason survives a future change
+/// to either constant.
 pub fn validate_h3_field_section_limits(max_header_size_bytes: usize) -> Result<(), String> {
     // The ceiling is the widest derived value, so bounding it bounds both.
     let representable = u64::try_from(max_header_size_bytes.max(H3_MIN_FIELD_SECTION_SIZE))
@@ -159,7 +222,23 @@ pub fn validate_h3_field_section_limits(max_header_size_bytes: usize) -> Result<
             QUIC_VARINT_MAX_U64 / H3_BUFFERED_FRAME_LEN_HEADROOM
         ));
     }
-    Ok(())
+
+    let within_field_count_bound = u64::try_from(max_header_size_bytes)
+        .is_ok_and(|configured| configured <= H3_FIELD_SECTION_SIZE_CAP);
+    if within_field_count_bound {
+        return Ok(());
+    }
+
+    Err(format!(
+        "FERRUM_MAX_HEADER_SIZE_BYTES ({max_header_size_bytes}) is too large for the HTTP/3 \
+         frontend: it must be at most {H3_FIELD_SECTION_SIZE_CAP} bytes. QPACK accounts at \
+         least {H3_QPACK_PER_FIELD_ACCOUNTING_BYTES} bytes per decoded field and bounds only \
+         the accumulated size, so a larger field-section policy would admit more than \
+         {H3_HEADER_MAP_MAX_FIELDS} decoded fields, which is more than `http::HeaderMap` can \
+         be constructed with. Above this bound the advertised \
+         SETTINGS_MAX_FIELD_SECTION_SIZE would have to be capped and would no longer be the \
+         operator's policy."
+    ))
 }
 
 /// Return true when an H3 response DATA chunk is already large enough to send

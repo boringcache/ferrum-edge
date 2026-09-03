@@ -5,6 +5,8 @@ image:
   # --set image.tag=<tag>). latest is mutable and for evaluation only.
   tag: ""
   pullPolicy: IfNotPresent
+  # Names of imagePullSecrets to attach to the pod.
+  pullSecrets: []
 
 namespace: ferrum
 
@@ -173,6 +175,25 @@ controlPlane:
     httpPort: 9000
     allowInsecureHttp: false
     allowedCidrs: ""
+    # Admin HTTPS port. Default 0 keeps existing HTTP-only installs unchanged
+    # (the binary default is 9443, so the chart must pin 0 until TLS is opted
+    # in). Set a nonzero port together with admin.tls below for HTTPS-only
+    # (httpPort=0) or dual-listener operation. A metrics bearer scrape is only
+    # ever attached to this HTTPS listener, never to httpPort.
+    httpsPort: 0
+    # Optional admin TLS Secret mount. Uses the shared FERRUM_ADMIN_TLS_*
+    # contract, the same shape nodeAgent.admin.tls uses. When enabled with a
+    # secretName the chart mounts cert/key (and optional client CA / CRL)
+    # read-only and sets the matching PATH env vars. Incomplete or invalid
+    # combinations fail at helm render; do not store PEM material in values.
+    tls:
+      enabled: false
+      secretName: ""
+      mountPath: /etc/ferrum/tls/admin
+      certKey: tls.crt
+      keyKey: tls.key
+      clientCaKey: ""
+      crlKey: ""
   # Graceful shutdown (issue #4266). terminationGracePeriodSeconds must cover
   # preStop + preDrain + drain + 6s pool + 5s background + clamp(drain,5,60)s
   # audit + 2s observability + 5s finalizer slack (docs/graceful_shutdown.md).
@@ -311,6 +332,25 @@ injector:
       initialDelaySeconds: 5
       periodSeconds: 10
       override: {}
+  # Graceful shutdown (issue #4512). The injector is the one mesh workload whose
+  # loss is fail-closed cluster-wide: with failurePolicy: Fail a /mutate call
+  # that lands on a terminating replica is connection-refused and the apiserver
+  # rejects the pod CREATE in every namespace the namespaceSelector admits.
+  #
+  # The budget is NOT the additive serving budget. FERRUM_MODE=injector runs no
+  # transport-pool/background/audit/observability stages: it waits up to
+  # FERRUM_SHUTDOWN_DRAIN_SECONDS for in-flight admission connections and then
+  # returns. So terminationGracePeriodSeconds must cover
+  # preStop + drain + a small process-exit slack, and render fails below that.
+  #
+  # shutdownPreStopSeconds is readiness periodSeconds (10) x the Kubernetes
+  # default failureThreshold (3) = the endpoint-removal budget, matching
+  # charts/ferrum-gateway/values.yaml. SleepAction preStop requires Kubernetes
+  # 1.29+ -- which the injector already requires for native-sidecar injection,
+  # so there is no older-cluster remediation here beyond injector.enabled=false.
+  shutdownDrainSeconds: 30
+  shutdownPreStopSeconds: 30
+  terminationGracePeriodSeconds: 65
 
 ambient:
   # Requires nodeAgent.enabled=true. Ambient always shares the node-local
@@ -437,6 +477,25 @@ ambient:
     httpPort: 9000
     allowInsecureHttp: false
     allowedCidrs: ""
+    # Admin HTTPS port. Default 0 keeps existing HTTP-only installs unchanged
+    # (the binary default is 9443, so the chart must pin 0 until TLS is opted
+    # in). Set a nonzero port together with admin.tls below for HTTPS-only
+    # (httpPort=0) or dual-listener operation. A metrics bearer scrape is only
+    # ever attached to this HTTPS listener, never to httpPort.
+    httpsPort: 0
+    # Optional admin TLS Secret mount. Uses the shared FERRUM_ADMIN_TLS_*
+    # contract, the same shape nodeAgent.admin.tls uses. When enabled with a
+    # secretName the chart mounts cert/key (and optional client CA / CRL)
+    # read-only and sets the matching PATH env vars. Incomplete or invalid
+    # combinations fail at helm render; do not store PEM material in values.
+    tls:
+      enabled: false
+      secretName: ""
+      mountPath: /etc/ferrum/tls/admin
+      certKey: tls.crt
+      keyKey: tls.key
+      clientCaKey: ""
+      crlKey: ""
   shutdownDrainSeconds: 30
   shutdownPreStopSeconds: 30
   shutdownPreDrainSeconds: 0
@@ -498,6 +557,25 @@ eastWest:
     httpPort: 9000
     allowInsecureHttp: false
     allowedCidrs: ""
+    # Admin HTTPS port. Default 0 keeps existing HTTP-only installs unchanged
+    # (the binary default is 9443, so the chart must pin 0 until TLS is opted
+    # in). Set a nonzero port together with admin.tls below for HTTPS-only
+    # (httpPort=0) or dual-listener operation. A metrics bearer scrape is only
+    # ever attached to this HTTPS listener, never to httpPort.
+    httpsPort: 0
+    # Optional admin TLS Secret mount. Uses the shared FERRUM_ADMIN_TLS_*
+    # contract, the same shape nodeAgent.admin.tls uses. When enabled with a
+    # secretName the chart mounts cert/key (and optional client CA / CRL)
+    # read-only and sets the matching PATH env vars. Incomplete or invalid
+    # combinations fail at helm render; do not store PEM material in values.
+    tls:
+      enabled: false
+      secretName: ""
+      mountPath: /etc/ferrum/tls/admin
+      certKey: tls.crt
+      keyKey: tls.key
+      clientCaKey: ""
+      crlKey: ""
   probes:
     startup:
       enabled: true
@@ -573,6 +651,25 @@ ca:
     httpPort: 9000
     allowInsecureHttp: false
     allowedCidrs: ""
+    # Admin HTTPS port. Default 0 keeps existing HTTP-only installs unchanged
+    # (the binary default is 9443, so the chart must pin 0 until TLS is opted
+    # in). Set a nonzero port together with admin.tls below for HTTPS-only
+    # (httpPort=0) or dual-listener operation. A metrics bearer scrape is only
+    # ever attached to this HTTPS listener, never to httpPort.
+    httpsPort: 0
+    # Optional admin TLS Secret mount. Uses the shared FERRUM_ADMIN_TLS_*
+    # contract, the same shape nodeAgent.admin.tls uses. When enabled with a
+    # secretName the chart mounts cert/key (and optional client CA / CRL)
+    # read-only and sets the matching PATH env vars. Incomplete or invalid
+    # combinations fail at helm render; do not store PEM material in values.
+    tls:
+      enabled: false
+      secretName: ""
+      mountPath: /etc/ferrum/tls/admin
+      certKey: tls.crt
+      keyKey: tls.key
+      clientCaKey: ""
+      crlKey: ""
   shutdownDrainSeconds: 30
   shutdownPreStopSeconds: 30
   shutdownPreDrainSeconds: 0
@@ -675,6 +772,12 @@ observability:
 
 nodeAgent:
   enabled: false
+  # SIGTERM-to-SIGKILL floor only, and 30 is the Kubernetes default, so this is
+  # behaviour-preserving. There is deliberately no nodeAgent.shutdownDrainSeconds
+  # and no node-agent preStop: node_agent mode never reads
+  # FERRUM_SHUTDOWN_DRAIN_SECONDS, and the DaemonSet sits behind no Service, so a
+  # preStop sleep would delay node drains for no endpoint-propagation benefit.
+  terminationGracePeriodSeconds: 30
   env: {}
   # Empty repository/tag inherit the top-level image repository/tag. When
   # captureMode=ebpf, the template automatically appends "-ebpf" to the

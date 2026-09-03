@@ -45,3 +45,103 @@ fn frontend_client_ca_does_not_toggle_backend_or_admin_no_verify_flags() {
     assert!(!config.admin_tls_no_verify);
     assert!(config.admin_tls_client_ca_bundle_path.is_none());
 }
+
+// ===========================================================================
+// Issue #4506: ACME auto-renewal that can never reach the serving listener
+// ===========================================================================
+//
+// Renewed ACME material is published into the certificate store and then
+// offered to the TLS surfaces that registered a force-reload sender. Only the
+// frontend live-reload watcher registers one, and it is not built when
+// `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` is false (its default). The
+// combination is refused at startup rather than served as a silent no-op.
+
+const ACME_CERT_SOURCE: &str = "acme://certificates/edge-cert#cert";
+const ACME_KEY_SOURCE: &str = "acme://certificates/edge-cert#key";
+
+fn acme_frontend(auto_renew: bool, live_reload: bool) -> EnvConfig {
+    EnvConfig {
+        acme_auto_renew_enabled: auto_renew,
+        frontend_tls_live_reload_enabled: live_reload,
+        frontend_tls_cert_path: Some(ACME_CERT_SOURCE.to_string()),
+        frontend_tls_key_path: Some(ACME_KEY_SOURCE.to_string()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn acme_renewal_reachability_accepts_auto_renew_disabled() {
+    acme_frontend(false, false)
+        .validate_acme_renewal_reachability()
+        .expect("auto-renew off never publishes material, so nothing can go unserved");
+}
+
+#[test]
+fn acme_renewal_reachability_accepts_a_non_acme_source() {
+    let config = EnvConfig {
+        acme_auto_renew_enabled: true,
+        frontend_tls_live_reload_enabled: false,
+        frontend_tls_cert_path: Some("/etc/ferrum/frontend.crt".to_string()),
+        frontend_tls_key_path: Some("/etc/ferrum/frontend.key".to_string()),
+        admin_tls_cert_path: Some("/etc/ferrum/admin.crt".to_string()),
+        admin_tls_key_path: Some("/etc/ferrum/admin.key".to_string()),
+        ..Default::default()
+    };
+
+    config
+        .validate_acme_renewal_reachability()
+        .expect("a file-backed serving source is not renewed by the ACME scheduler");
+}
+
+#[test]
+fn acme_renewal_reachability_accepts_live_reload_enabled() {
+    acme_frontend(true, true)
+        .validate_acme_renewal_reachability()
+        .expect("the live-reload watcher registers the force-reload sender the renewal needs");
+}
+
+#[test]
+fn acme_renewal_reachability_rejects_an_unserviceable_frontend_source() {
+    let error = acme_frontend(true, false)
+        .validate_acme_renewal_reachability()
+        .expect_err("renewals would land in the store and never reach the listener");
+
+    assert!(
+        error.contains("FERRUM_ACME_AUTO_RENEW_ENABLED"),
+        "the diagnostic must name the renewal flag: {error}"
+    );
+    assert!(
+        error.contains("FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED"),
+        "the diagnostic must name the reload flag the operator has to set: {error}"
+    );
+    assert!(
+        error.contains("acme://certificates/edge-cert"),
+        "the diagnostic must name the offending source: {error}"
+    );
+}
+
+/// The admin HTTPS listener has no live-reload flag of its own — it shares
+/// `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` — so an `acme://` admin source is
+/// refused on exactly the same terms.
+#[test]
+fn acme_renewal_reachability_rejects_an_unserviceable_admin_source() {
+    let config = EnvConfig {
+        acme_auto_renew_enabled: true,
+        frontend_tls_live_reload_enabled: false,
+        admin_tls_cert_path: Some(ACME_CERT_SOURCE.to_string()),
+        admin_tls_key_path: Some(ACME_KEY_SOURCE.to_string()),
+        ..Default::default()
+    };
+
+    let error = config
+        .validate_acme_renewal_reachability()
+        .expect_err("the admin listener has the same unregistered-surface gap");
+    assert!(
+        error.contains("FERRUM_ADMIN_TLS_CERT_SOURCE"),
+        "the diagnostic must name the admin variable that carries the source: {error}"
+    );
+    assert!(
+        error.contains("FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED"),
+        "the admin surface shares the frontend live-reload flag: {error}"
+    );
+}

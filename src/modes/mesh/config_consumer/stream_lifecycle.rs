@@ -258,6 +258,15 @@ pub enum MeshStreamAttempt {
     /// unsolicited resource type). Staying attached would only let it keep
     /// serving refused state.
     PolicyRejected,
+    /// The control plane answered the subscribe RPC with `RESOURCE_EXHAUSTED`:
+    /// one of its gRPC stream admission budgets (total / per-namespace /
+    /// per-principal / per-node / distinct-node) is saturated (issue #4531).
+    ///
+    /// Deliberately distinct from [`Self::TransportFailure`]: the control plane
+    /// is demonstrably alive and answering, and the status message names the
+    /// exact budget an operator must raise. The rotate-and-retry disposition is
+    /// the same, because another configured CP replica may still have capacity.
+    AdmissionRefused,
 }
 
 impl MeshStreamAttempt {
@@ -278,6 +287,7 @@ impl MeshStreamAttempt {
             Self::FirstSliceTimeout => "first_slice_timeout",
             Self::HeartbeatSilenceTimeout => "heartbeat_silence_timeout",
             Self::PolicyRejected => "policy_rejected",
+            Self::AdmissionRefused => "admission_refused",
         }
     }
 
@@ -333,6 +343,14 @@ impl MeshStreamAttempt {
             | Self::FirstSliceTimeout
             | Self::HeartbeatSilenceTimeout
             | Self::PolicyRejected => MeshStreamDisposition {
+                advance_endpoint: true,
+                increase_backoff: true,
+            },
+            // Same disposition as a no-progress transport failure: rotate to
+            // the next configured CP (a replica may still have capacity) and
+            // grow the bounded backoff, so a saturated control plane is not
+            // hammered by the whole refused fleet at the initial delay.
+            Self::AdmissionRefused => MeshStreamDisposition {
                 advance_endpoint: true,
                 increase_backoff: true,
             },

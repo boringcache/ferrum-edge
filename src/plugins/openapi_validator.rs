@@ -83,6 +83,21 @@ const XML_NAMESPACE_CONFLICT_DETAIL: &str =
     "XML elements sharing a local name across namespaces cannot be represented unambiguously";
 const XML_COMMENT_IN_VALUE_DETAIL: &str =
     "XML element contains a comment inside its character data";
+const XML_DEPTH_DETAIL: &str = "XML document nesting exceeds the supported depth";
+/// XML document bounds, split across three layers because no single one is
+/// sufficient:
+///
+/// * `XML_MAX_DEPTH` is screened over the raw bytes *before* `roxmltree` sees
+///   them. `roxmltree`'s own tokenizer is recursive per nesting level
+///   (`parse_element` -> `parse_content` -> `parse_element`), so a node limit
+///   alone still lets a deeply nested document overflow the worker stack
+///   inside the parser.
+/// * `XML_MAX_NODES` bounds the parser's arena allocation (same value
+///   `body_validator` uses).
+/// * `XML_MAX_DEPTH` is re-applied as an explicit budget threaded through this
+///   file's own recursive walkers, as defence in depth.
+const XML_MAX_DEPTH: usize = 256;
+const XML_MAX_NODES: u32 = 100_000;
 /// Fixed-cardinality multipart / scalar conversion diagnostics. Neither the
 /// rejected value nor the payload-chosen part name is interpolated.
 const MULTIPART_DISPOSITION_TYPE_DETAIL: &str =
@@ -2567,16 +2582,140 @@ fn body_to_schema_instance(
     binary_body_to_schema_instance(decoded.as_ref(), schema)
 }
 
+/// Single pass over the raw document bytes rejecting element nesting deeper
+/// than `max_depth`, run *before* the document reaches `roxmltree`, whose
+/// tokenizer recurses once per nesting level. Every delimiter inspected is
+/// ASCII, so byte indexing cannot split a UTF-8 sequence. Constructs that may
+/// legally contain a bare `<` or `>` (comments, CDATA, processing
+/// instructions, DOCTYPE, quoted attribute values) are skipped rather than
+/// counted, so a legitimate document is never rejected. An unterminated
+/// construct simply ends the scan; `roxmltree` rejects such a document itself.
+fn xml_nesting_depth_within_limit(body: &str, max_depth: usize) -> bool {
+    let bytes = body.as_bytes();
+    let mut index = 0usize;
+    let mut depth = 0usize;
+    while index < bytes.len() {
+        if bytes[index] != b'<' {
+            index += 1;
+            continue;
+        }
+        let rest = &bytes[index..];
+        if rest.starts_with(b"<!--") {
+            match find_subslice(&bytes[index + 4..], b"-->") {
+                Some(offset) => index += 4 + offset + 3,
+                None => return true,
+            }
+            continue;
+        }
+        if rest.starts_with(b"<![CDATA[") {
+            match find_subslice(&bytes[index + 9..], b"]]>") {
+                Some(offset) => index += 9 + offset + 3,
+                None => return true,
+            }
+            continue;
+        }
+        if rest.starts_with(b"<?") {
+            match find_subslice(&bytes[index + 2..], b"?>") {
+                Some(offset) => index += 2 + offset + 2,
+                None => return true,
+            }
+            continue;
+        }
+        if rest.starts_with(b"<!") {
+            // DOCTYPE and friends. `allow_dtd` is false, so `roxmltree` rejects
+            // the document regardless; skipping conservatively cannot make the
+            // screen unsound.
+            match bytes[index + 2..].iter().position(|byte| *byte == b'>') {
+                Some(offset) => index += 2 + offset + 1,
+                None => return true,
+            }
+            continue;
+        }
+        if rest.starts_with(b"</") {
+            depth = depth.saturating_sub(1);
+            match bytes[index + 2..].iter().position(|byte| *byte == b'>') {
+                Some(offset) => index += 2 + offset + 1,
+                None => return true,
+            }
+            continue;
+        }
+        depth += 1;
+        if depth > max_depth {
+            return false;
+        }
+        // Advance to the tag's closing `>`, quote-aware: a `>` inside a quoted
+        // attribute value does not terminate the tag.
+        let mut cursor = index + 1;
+        let mut quote: Option<u8> = None;
+        let mut last_significant: Option<u8> = None;
+        let mut terminated = false;
+        while cursor < bytes.len() {
+            let byte = bytes[cursor];
+            match quote {
+                Some(open) => {
+                    if byte == open {
+                        quote = None;
+                    }
+                    last_significant = Some(byte);
+                }
+                None => {
+                    if byte == b'"' || byte == b'\'' {
+                        quote = Some(byte);
+                        last_significant = Some(byte);
+                    } else if byte == b'>' {
+                        terminated = true;
+                        break;
+                    } else if !byte.is_ascii_whitespace() {
+                        last_significant = Some(byte);
+                    }
+                }
+            }
+            cursor += 1;
+        }
+        if !terminated {
+            return true;
+        }
+        if last_significant == Some(b'/') {
+            // Self-closing element: it opened and closed in one tag.
+            depth = depth.saturating_sub(1);
+        }
+        index = cursor + 1;
+    }
+    true
+}
+
+/// First index of `needle` within `haystack`, or `None`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 fn xml_body_to_value(
     body: &str,
     schema: &Value,
     conversion: &ConversionPlan,
 ) -> Result<Value, String> {
+    // Bound nesting over the raw bytes first: `roxmltree`'s tokenizer recurses
+    // once per open element, so an unbounded document overflows the worker
+    // stack inside `parse` before any node limit or walk budget is reached.
+    if !xml_nesting_depth_within_limit(body, XML_MAX_DEPTH) {
+        return Err(XML_DEPTH_DETAIL.to_string());
+    }
     // The `roxmltree` error rendering quotes the offending source token, so it
     // is reduced to a fixed well-formedness category before it can reach a
     // client body or transaction metadata (`GHSA-5p2h-fq6q-gwh9`).
-    let doc = roxmltree::Document::parse(body)
-        .map_err(|error| format!("Invalid XML body: {}", xml_error_category(&error)))?;
+    let doc = roxmltree::Document::parse_with_options(
+        body,
+        roxmltree::ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: XML_MAX_NODES,
+        },
+    )
+    .map_err(|error| format!("Invalid XML body: {}", xml_error_category(&error)))?;
     let root = doc.root_element();
     let expected_root = xml_name(schema, None);
     let expected_namespace = xml_namespace(schema);
@@ -2589,20 +2728,24 @@ fn xml_body_to_value(
         // (`GHSA-5p2h-fq6q-gwh9`). Matching still uses the schema metadata.
         return Err("XML root element does not match the configured schema".to_string());
     }
-    xml_node_to_value(root, schema, conversion)
+    xml_node_to_value(root, schema, conversion, 0)
 }
 
 fn xml_node_to_value(
     node: roxmltree::Node<'_, '_>,
     schema: &Value,
     conversion: &ConversionPlan,
+    depth: usize,
 ) -> Result<Value, String> {
+    if depth > XML_MAX_DEPTH {
+        return Err(XML_DEPTH_DETAIL.to_string());
+    }
     if conversion.accepts_array(schema) {
         let item_schema = array_item_schema_for_conversion(schema, conversion);
         let values = node
             .children()
             .filter(roxmltree::Node::is_element)
-            .map(|child| xml_node_to_value(child, item_schema, conversion))
+            .map(|child| xml_node_to_value(child, item_schema, conversion, depth + 1))
             .collect::<Result<Vec<_>, _>>()?;
         return Ok(Value::Array(values));
     }
@@ -2634,7 +2777,8 @@ fn xml_node_to_value(
                     conversion,
                     &mut modeled_names,
                 );
-                let values = xml_array_values(node, property_name, property_schema, conversion)?;
+                let values =
+                    xml_array_values(node, property_name, property_schema, conversion, depth)?;
                 if !values.is_empty() {
                     out.insert(property_name.clone(), Value::Array(values));
                 }
@@ -2650,7 +2794,7 @@ fn xml_node_to_value(
                 [child] => {
                     out.insert(
                         property_name.clone(),
-                        xml_node_to_value(*child, property_schema, conversion)?,
+                        xml_node_to_value(*child, property_schema, conversion, depth + 1)?,
                     );
                 }
                 _ => {
@@ -2713,8 +2857,8 @@ fn xml_node_to_value(
                 .pattern_property_schema(object_schema, name)
                 .or_else(|| additional_schema.flatten());
             let value = match member_schema {
-                Some(schema) => xml_node_to_value(child, schema, conversion)?,
-                _ => generic_xml_node_to_value(child)?,
+                Some(schema) => xml_node_to_value(child, schema, conversion, depth + 1)?,
+                _ => generic_xml_node_to_value(child, depth + 1)?,
             };
             match out.get_mut(name) {
                 Some(Value::Array(values)) => values.push(value),
@@ -2741,7 +2885,11 @@ fn xml_array_values(
     property_name: &str,
     property_schema: &Value,
     conversion: &ConversionPlan,
+    depth: usize,
 ) -> Result<Vec<Value>, String> {
+    if depth > XML_MAX_DEPTH {
+        return Err(XML_DEPTH_DETAIL.to_string());
+    }
     let item_schema = array_item_schema_for_conversion(property_schema, conversion);
     let (item_namespace, item_local) =
         xml_array_item_name(property_name, property_schema, item_schema);
@@ -2765,14 +2913,24 @@ fn xml_array_values(
                 item_local,
                 "array item",
             )? {
-                values.push(xml_node_to_value(child, item_schema, conversion)?);
+                values.push(xml_node_to_value(
+                    child,
+                    item_schema,
+                    conversion,
+                    depth + 1,
+                )?);
             }
         }
     } else {
         for child in
             child_elements_matching_fail_closed(node, item_namespace, item_local, "array item")?
         {
-            values.push(xml_node_to_value(child, item_schema, conversion)?);
+            values.push(xml_node_to_value(
+                child,
+                item_schema,
+                conversion,
+                depth + 1,
+            )?);
         }
     }
     Ok(values)
@@ -2873,7 +3031,10 @@ fn xml_mixed_content_text(node: roxmltree::Node<'_, '_>) -> Result<Option<String
     Ok((!trimmed.is_empty()).then_some(trimmed))
 }
 
-fn generic_xml_node_to_value(node: roxmltree::Node<'_, '_>) -> Result<Value, String> {
+fn generic_xml_node_to_value(node: roxmltree::Node<'_, '_>, depth: usize) -> Result<Value, String> {
+    if depth > XML_MAX_DEPTH {
+        return Err(XML_DEPTH_DETAIL.to_string());
+    }
     let mut out = serde_json::Map::new();
     let mut attribute_locals = HashSet::new();
     for attr in node.attributes() {
@@ -2916,7 +3077,7 @@ fn generic_xml_node_to_value(node: roxmltree::Node<'_, '_>) -> Result<Value, Str
         } else {
             element_names.insert(local.to_string(), namespace.map(str::to_string));
         }
-        let value = generic_xml_node_to_value(child)?;
+        let value = generic_xml_node_to_value(child, depth + 1)?;
         match out.get_mut(local) {
             Some(Value::Array(values)) => values.push(value),
             Some(existing) => {

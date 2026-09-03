@@ -128,17 +128,29 @@ COPY ebpf ./ebpf
 # Declare FEATURES only after the shared apt + manifest layers so the default
 # `cloud-secrets` image and the `cloud-secrets,ebpf` image reuse that work.
 ARG FEATURES
+ARG TARGETARCH
+
+# Issue #4602: the release profile is fat LTO with a single codegen unit, and
+# the final `ferrum-edge` bin-crate compile under that profile exhausts the
+# hosted arm64 runner ("cannot allocate memory" after 57 minutes in the v0.9.0
+# release run). Images built from source on arm64 therefore use thin LTO with
+# parallel codegen units; the amd64 image and the native release binaries keep
+# the fat-LTO profile. Both cargo invocations below must see the same profile
+# or the dependency cache layer is invalidated by the fingerprint change.
+ENV FERRUM_ARM64_RELEASE_PROFILE_ENV="CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16"
 
 # Create a dummy main.rs to build dependencies only
 RUN mkdir src && \
     echo 'fn main() { println!("dummy"); }' > src/main.rs && \
+    if [ "${TARGETARCH}" = "arm64" ]; then export ${FERRUM_ARM64_RELEASE_PROFILE_ENV}; fi && \
     cargo build --features "${FEATURES}" --release 2>/dev/null || true && \
     rm -rf src
 
 # ── Build the real binary ───────────────────────────────────────────────
 COPY src ./src
 # Touch main.rs so cargo knows it changed (not the dummy)
-RUN touch src/main.rs && cargo build --features "${FEATURES}" --release
+RUN if [ "${TARGETARCH}" = "arm64" ]; then export ${FERRUM_ARM64_RELEASE_PROFILE_ENV}; fi && \
+    touch src/main.rs && cargo build --features "${FEATURES}" --release
 
 # Stage 2: common distroless runtime. It intentionally has no shell, package
 # manager, eBPF ELF, or `ip` executable.
@@ -150,10 +162,12 @@ WORKDIR /app
 COPY --from=builder --chown=65532:65532 /build/target/release/ferrum-edge /app/ferrum-edge
 COPY --from=builder --chown=65532:65532 /build/target/release/ferrum-cni /app/ferrum-cni
 
-# Set environment variables
+# Set environment variables. `FERRUM_LOG_LEVEL` defaults to `warn` so the startup
+# operability warnings stay visible; every published runtime stage must agree with
+# `Dockerfile.release` and `docs/configuration.md`. See `docs/docker.md`.
 ENV PATH="/app:${PATH}" \
     FERRUM_MODE=database \
-    FERRUM_LOG_LEVEL=error \
+    FERRUM_LOG_LEVEL=warn \
     FERRUM_PROXY_HTTP_PORT=8000 \
     FERRUM_PROXY_HTTPS_PORT=8443 \
     FERRUM_ADMIN_HTTP_PORT=9000 \
@@ -250,9 +264,12 @@ COPY --from=builder /build/target/release/ferrum-cni /app/ferrum-cni
 COPY --from=ebpf-builder \
     /build/ebpf/target/bpfel-unknown-none/release/ferrum-ebpf /app/bpf/ferrum-ebpf
 
+# `FERRUM_LOG_LEVEL` defaults to `warn` so the startup operability warnings stay
+# visible; every published runtime stage must agree with `Dockerfile.release`
+# and `docs/configuration.md`. See `docs/docker.md`.
 ENV PATH="/app:${PATH}" \
     FERRUM_MODE=database \
-    FERRUM_LOG_LEVEL=error \
+    FERRUM_LOG_LEVEL=warn \
     FERRUM_PROXY_HTTP_PORT=8000 \
     FERRUM_PROXY_HTTPS_PORT=8443 \
     FERRUM_ADMIN_HTTP_PORT=9000 \

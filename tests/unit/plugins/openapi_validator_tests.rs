@@ -9060,3 +9060,250 @@ fn h1_h2_and_h3_run_the_same_client_contract_phase() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// XML document nesting bounds (issue #4520)
+//
+// `roxmltree`'s tokenizer recurses once per open element, so the depth screen
+// runs over the raw bytes before `Document::parse` ever sees them. These tests
+// therefore run safely under the default test profile's 2 MiB thread stack.
+// ---------------------------------------------------------------------------
+
+const XML_DEPTH_ERROR: &str = "XML document nesting exceeds the supported depth";
+
+/// `<root>` wrapping `levels` nested `<a>` elements.
+fn nested_xml_document(levels: usize) -> String {
+    format!(
+        "<root>{}{}</root>",
+        "<a>".repeat(levels),
+        "</a>".repeat(levels)
+    )
+}
+
+fn free_form_xml_request_plugin() -> OpenapiValidator {
+    OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/xml",
+            "path_regex": "^/xml$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "root"}
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn deeply_nested_xml_request_body_is_rejected_not_crashed() {
+    let plugin = free_form_xml_request_plugin();
+    let bomb = format!(
+        "<root>{}{}</root>",
+        "<a>".repeat(100_000),
+        "</a>".repeat(100_000)
+    );
+
+    let mut ctx = post_ctx("/xml");
+    ctx.headers = content_type_headers("application/xml");
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &content_type_headers("application/xml"),
+                bomb.as_bytes(),
+            )
+            .await,
+        Some(400),
+    );
+    assert!(
+        request_error(&ctx).is_some_and(|error| error.contains(XML_DEPTH_ERROR)),
+        "depth rejection must carry the payload-free depth reason, got {:?}",
+        request_error(&ctx)
+    );
+
+    // The same bomb through the `Content-Encoding` decode path: a few KB of
+    // gzip expands to the full document before conversion runs.
+    let mut headers = content_type_headers("application/xml");
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let mut ctx = post_ctx("/xml");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &gzip_bytes(bomb.as_bytes()))
+            .await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
+async fn xml_nesting_bound_accepts_legal_depth_and_rejects_beyond_it() {
+    let plugin = free_form_xml_request_plugin();
+
+    let mut ctx = post_ctx("/xml");
+    ctx.headers = content_type_headers("application/xml");
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &content_type_headers("application/xml"),
+                nested_xml_document(199).as_bytes(),
+            )
+            .await,
+    );
+
+    let mut ctx = post_ctx("/xml");
+    ctx.headers = content_type_headers("application/xml");
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &content_type_headers("application/xml"),
+                nested_xml_document(299).as_bytes(),
+            )
+            .await,
+        Some(400),
+    );
+    assert!(
+        request_error(&ctx).is_some_and(|error| error.contains(XML_DEPTH_ERROR)),
+        "300-level document must be refused by the depth bound, got {:?}",
+        request_error(&ctx)
+    );
+}
+
+#[tokio::test]
+async fn xml_depth_screen_does_not_false_reject_legal_constructs() {
+    let plugin = free_form_xml_request_plugin();
+    let self_closing = format!("<root>{}</root>", "<a/>".repeat(500));
+    let bodies = [
+        // A `>` inside a quoted attribute value does not close the tag.
+        r#"<root attr="a>b"><a>x</a></root>"#.to_string(),
+        r#"<root attr='a>b'><a>x</a></root>"#.to_string(),
+        // Comment and CDATA payloads that look like deep nesting.
+        "<root><!-- <a><b><c> --><a>x</a></root>".to_string(),
+        "<root><a><![CDATA[<b><c><d>]]></a></root>".to_string(),
+        // XML declaration plus a processing instruction.
+        r#"<?xml version="1.0"?><root><?target <a><b> ?><a>x</a></root>"#.to_string(),
+        // Self-closing elements never accumulate depth.
+        self_closing,
+    ];
+
+    for body in bodies {
+        let mut ctx = post_ctx("/xml");
+        ctx.headers = content_type_headers("application/xml");
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &content_type_headers("application/xml"),
+                    body.as_bytes(),
+                )
+                .await,
+        );
+    }
+}
+
+#[tokio::test]
+async fn deeply_nested_xml_response_body_is_rejected() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/xml",
+            "path_regex": "^/xml$",
+            "responses": {
+                "200": {
+                    "application/xml": {"type": "object", "xml": {"name": "root"}}
+                }
+            }
+        }]
+    }))
+    .unwrap();
+
+    let mut ctx = post_ctx("/xml");
+    assert_continue(
+        plugin
+            .on_final_response_body(
+                &mut ctx,
+                200,
+                &content_type_headers("application/xml"),
+                nested_xml_document(199).as_bytes(),
+            )
+            .await,
+    );
+
+    let mut ctx = post_ctx("/xml");
+    assert_reject(
+        plugin
+            .on_final_response_body(
+                &mut ctx,
+                200,
+                &content_type_headers("application/xml"),
+                nested_xml_document(299).as_bytes(),
+            )
+            .await,
+        Some(502),
+    );
+}
+
+#[tokio::test]
+async fn deeply_nested_xml_multipart_part_is_rejected() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/upload",
+            "path_regex": "^/upload$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "type": "object",
+                        "required": ["doc"],
+                        "properties": {
+                            "doc": {"type": "object", "xml": {"name": "root"}}
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let multipart_type = "multipart/form-data; boundary=abc";
+    let part = |document: &str| {
+        format!(
+            "--abc\r\nContent-Disposition: form-data; name=\"doc\"\r\nContent-Type: application/xml\r\n\r\n{document}\r\n--abc--\r\n"
+        )
+    };
+
+    let mut ctx = post_ctx("/upload");
+    ctx.headers = content_type_headers(multipart_type);
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &content_type_headers(multipart_type),
+                part(&nested_xml_document(199)).as_bytes(),
+            )
+            .await,
+    );
+
+    let mut ctx = post_ctx("/upload");
+    ctx.headers = content_type_headers(multipart_type);
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &content_type_headers(multipart_type),
+                part(&nested_xml_document(299)).as_bytes(),
+            )
+            .await,
+        Some(400),
+    );
+    assert!(
+        request_error(&ctx).is_some_and(|error| error.contains(XML_DEPTH_ERROR)),
+        "multipart XML part must be refused by the depth bound, got {:?}",
+        request_error(&ctx)
+    );
+}

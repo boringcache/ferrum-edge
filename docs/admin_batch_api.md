@@ -503,12 +503,12 @@ Each resource in the batch is validated before any database writes. If validatio
 | Status | Condition | Applied? |
 |--------|-----------|----------|
 | 201 | Whole graph committed | Yes, in full |
-| 400 | Invalid JSON body, unknown top-level envelope key, or graph validation failed | No |
+| 400 | Invalid JSON body, unknown top-level envelope key, or graph validation failed — payload problems only, never a database failure | No |
 | 403 | Admin API is in read-only mode | No |
 | 409 | A resource conflicts with an existing resource or with another resource in the same request (duplicate ID, name, listen path, or consumer identity) | No |
 | 500 | Server-side resource preparation failed, including a missing or weak `FERRUM_BASIC_AUTH_HMAC_SECRET` for plaintext Basic credentials | No |
 | 501 | The configured database deployment cannot provide the all-or-nothing guarantee (standalone MongoDB) — refused before any mutation | No |
-| 503 | No database available, a reference-check lookup failed, the datastore write failed, or the namespace config-admission lease lapsed before commit | No |
+| 503 | No database available, a reference-check lookup or candidate-validation load failed, the datastore write failed, or the namespace config-admission lease lapsed before commit | No |
 
 Every non-`201` status leaves the namespace as it was, so retrying the same
 payload is safe. `409`, `501`, and the datastore/lease `503`s are raised by the
@@ -518,6 +518,16 @@ before persistence keep their shared shapes: `400` returns `error` +
 admission-unavailable body; a database error while validating references
 returns `503` with the redacted `db_error_response` body. No failure body
 ever carries `created` counts.
+
+A database failure anywhere in the validation phase is a retryable `503`, never
+a `400`. This covers the reference lookups and, since issue #4527, the four
+candidate-validation loads that run before them — transaction-log schema,
+consumer credentials, mTLS compatibility, and the plugin graph. The plugin-graph
+load is the first database call for any batch carrying `plugin_configs`, so a
+Terraform/GitOps caller that previously read `400 "Batch validation failed"`
+during a pool exhaustion and abandoned the work now sees the retryable status.
+`400` is reserved for payload problems, which are the only failures a retry of
+the identical body cannot fix.
 
 **One residual case the server cannot decide.** If the database acknowledges the
 commit but the acknowledgement is lost in transit, the transaction is durable

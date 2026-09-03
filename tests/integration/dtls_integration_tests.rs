@@ -627,6 +627,7 @@ async fn test_dtls_pem_cert_handshake() {
         key_path.to_str().unwrap(),
         None,
         &[],
+        None,
     )
     .expect("build frontend config");
 
@@ -858,7 +859,7 @@ async fn test_dtls_server_transmits_intermediate_to_root_only_client() {
     let key_path = write_pem(&temp_dir, "server.key", &leaf.key_pem);
     let root_path = write_pem(&temp_dir, "root.pem", &root.cert_pem);
     let frontend_config =
-        ferrum_edge::dtls::build_frontend_dtls_config(&cert_path, &key_path, None, &[])
+        ferrum_edge::dtls::build_frontend_dtls_config(&cert_path, &key_path, None, &[], None)
             .expect("build chained frontend");
     let server = Arc::new(
         ferrum_edge::dtls::DtlsServer::bind(
@@ -893,6 +894,7 @@ async fn test_dtls_server_transmits_intermediate_to_root_only_client() {
         "localhost",
         false,
         &Arc::new(Vec::new()),
+        None,
         None,
     )
     .expect("build root-only client config");
@@ -932,6 +934,7 @@ async fn test_frontend_dtls_config_disables_client_auth_without_ca() {
         key_path.to_str().unwrap(),
         None,
         &[],
+        None,
     )
     .expect("build frontend config");
 
@@ -1015,7 +1018,7 @@ async fn test_backend_dtls_verification_rejects_hostname_mismatch() {
     let ca_path = write_pem(&temp_dir, "ca.pem", &ca.cert_pem);
 
     let frontend_config =
-        ferrum_edge::dtls::build_frontend_dtls_config(&cert_path, &key_path, None, &[])
+        ferrum_edge::dtls::build_frontend_dtls_config(&cert_path, &key_path, None, &[], None)
             .expect("build frontend config");
     let server = Arc::new(
         ferrum_edge::dtls::DtlsServer::bind("127.0.0.1:0".parse().unwrap(), frontend_config)
@@ -1035,6 +1038,7 @@ async fn test_backend_dtls_verification_rejects_hostname_mismatch() {
         &proxy.backend_host,
         false,
         &std::sync::Arc::new(Vec::new()),
+        None,
         None,
     )
     .unwrap();

@@ -25,6 +25,22 @@ RESTRICTED = (
     "ferrum-mesh-east-west",
 )
 
+# Every workload that runs a Ferrum image and therefore needs the chart-level
+# image.pullSecrets on a private registry (#4510). Both CNI uninstall-hook pods
+# are included on purpose: they run the Ferrum image, so a missing pull secret
+# hangs `helm uninstall` behind an ImagePullBackOff on the node whose CNI chain
+# is being removed.
+PULL_SECRET_WORKLOADS = (
+    ("ferrum-mesh-control-plane", "Deployment"),
+    ("ferrum-mesh-ca", "Deployment"),
+    ("ferrum-mesh-east-west", "Deployment"),
+    ("ferrum-mesh-injector", "Deployment"),
+    ("ferrum-mesh-ambient", "DaemonSet"),
+    ("ferrum-mesh-node-agent", "DaemonSet"),
+    ("ferrum-mesh-cni-cleanup", "DaemonSet"),
+    ("ferrum-mesh-cni-cleanup-wait", "Job"),
+)
+
 
 def fail(title: str, detail: str) -> None:
     print(f"::error title={title}::{detail}")
@@ -321,19 +337,13 @@ def validate_serving_podspecs(results_dir: Path) -> None:
         "node-agent must not render serving preStop",
     )
 
-    injector = resource_document(rendered, "ferrum-mesh-injector", "Deployment")
-    forbid_text(
-        injector,
-        "FERRUM_SHUTDOWN_DRAIN_SECONDS",
-        "Injector serving drain",
-        "injector is a webhook, not a Ferrum serving mode; do not apply drain env",
-    )
-    forbid_text(
-        injector,
-        "preStop:",
-        "Injector preStop",
-        "injector must not render the serving SleepAction drain contract",
-    )
+    # The injector DOES take the drain contract (issue #4512): FERRUM_MODE=injector
+    # reads FERRUM_SHUTDOWN_DRAIN_SECONDS and waits that long for in-flight
+    # admission connections, and its failurePolicy=Fail webhook needs the
+    # preStop endpoint-propagation window. Its positive shape (grace period,
+    # SleepAction preStop, drain env rendered exactly once) is asserted by
+    # validate_injector_shutdown; only node-agent stays drain-free above.
+    resource_document(rendered, "ferrum-mesh-injector", "Deployment")
     print("mesh serving podspecs ok")
 
 
@@ -406,6 +416,109 @@ def validate_zero_drain(results_dir: Path) -> None:
         "shutdownPreStopSeconds=0 must omit lifecycle.preStop entirely",
     )
     print("mesh zero-drain render ok")
+
+
+def validate_injector_shutdown(results_dir: Path) -> None:
+    rendered = require_capture(results_dir, "mesh-prod-injector.yaml").read_text(
+        encoding="utf-8"
+    )
+    injector = resource_document(rendered, "ferrum-mesh-injector", "Deployment")
+    require_scalar(
+        injector,
+        "terminationGracePeriodSeconds",
+        "65",
+        "Injector grace period missing",
+        "ferrum-mesh-injector must render terminationGracePeriodSeconds: 65 "
+        "(preStop 30 + drain 30 + 5s process-exit slack); it is a "
+        "failurePolicy=Fail webhook, so a terminating replica rejects pod CREATE",
+    )
+    require_text(
+        injector,
+        "preStop:",
+        "Injector preStop missing",
+        "ferrum-mesh-injector must render lifecycle.preStop (SleepAction) so "
+        "kube-proxy endpoint removal finishes before the listener closes",
+    )
+    prestop = re.search(r"(?ms)^\s+preStop:\s*\n(?:\s+.*\n){0,6}", injector)
+    if prestop is None or "sleep:" not in prestop.group(0):
+        fail(
+            "Injector preStop is not a SleepAction",
+            "distroless has no shell; the injector preStop must use sleep",
+        )
+    if not re.search(r"seconds:\s*30", prestop.group(0)):
+        fail(
+            "Injector preStop seconds missing",
+            "ferrum-mesh-injector must render injector.shutdownPreStopSeconds (30)",
+        )
+    drain = env_value(injector, "FERRUM_SHUTDOWN_DRAIN_SECONDS")
+    if drain != "30":
+        fail(
+            "Injector drain env missing",
+            f"ferrum-mesh-injector must render FERRUM_SHUTDOWN_DRAIN_SECONDS=30, got {drain!r}",
+        )
+    occurrences = env_occurrences(injector, "FERRUM_SHUTDOWN_DRAIN_SECONDS")
+    if occurrences != 1:
+        fail(
+            "Injector drain env duplicated",
+            "FERRUM_SHUTDOWN_DRAIN_SECONDS must render exactly once "
+            f"(got {occurrences}); injector.env overrides are rejected at render",
+        )
+    node_agent = resource_document(rendered, "ferrum-mesh-node-agent", "DaemonSet")
+    require_scalar(
+        node_agent,
+        "terminationGracePeriodSeconds",
+        "30",
+        "Node-agent grace period missing",
+        "ferrum-mesh-node-agent must render terminationGracePeriodSeconds: 30 "
+        "(the Kubernetes default, made explicit and validated)",
+    )
+    forbid_text(
+        node_agent,
+        "preStop:",
+        "Node-agent preStop rendered",
+        "node_agent mode has no drain stage and sits behind no Service; a "
+        "preStop sleep would only delay node drains",
+    )
+    forbid_text(
+        node_agent,
+        "FERRUM_SHUTDOWN_DRAIN_SECONDS",
+        "Node-agent drain env rendered",
+        "node_agent mode never reads FERRUM_SHUTDOWN_DRAIN_SECONDS",
+    )
+    sentinel = require_capture(
+        results_dir, "mesh-prod-injector-no-kube-version.yaml"
+    ).read_text(encoding="utf-8")
+    resource_document(sentinel, "ferrum-mesh-injector", "Deployment")
+    kube = require_capture(
+        results_dir, "mesh-prod-injector-kube-1.27.err"
+    ).read_text(encoding="utf-8")
+    if "1.29" not in kube or "SidecarContainers" not in kube:
+        fail(
+            "Native-sidecar Kubernetes guard missing",
+            "--kube-version 1.27.0 with injector.enabled=true must refuse render "
+            "and name Kubernetes 1.29 plus the 1.28 SidecarContainers feature gate",
+        )
+    if "injector.enabled=false" not in kube:
+        fail(
+            "Native-sidecar remediation missing",
+            "the <1.29 injector guard must name injector.enabled=false as the "
+            "only option on an older cluster (there is no container fallback)",
+        )
+    low = require_capture(
+        results_dir, "mesh-prod-injector-low-grace.err"
+    ).read_text(encoding="utf-8")
+    if "injector.terminationGracePeriodSeconds" not in low:
+        fail(
+            "Injector low-grace refusal missing",
+            "an under-budget injector grace period must fail render and name "
+            "injector.terminationGracePeriodSeconds",
+        )
+    if "preStop 30s" not in low or "drain 30s" not in low:
+        fail(
+            "Injector budget arithmetic missing",
+            "the injector refusal must spell out preStop + drain + process-exit slack",
+        )
+    print("mesh injector/node-agent shutdown ok")
 
 
 def validate_optional_crds_off(results_dir: Path) -> None:
@@ -539,7 +652,84 @@ def validate_observability(results_dir: Path) -> None:
         "Stale-config alert metric missing",
         "FerrumMeshControlPlaneConfigStale must still reference the freshness timestamp",
     )
+    validate_metrics_bearer_https(results_dir)
     print("mesh observability scrape path ok")
+
+
+def validate_metrics_bearer_https(results_dir: Path) -> None:
+    """A metrics bearer credential is only ever attached to a verified HTTPS scrape.
+
+    FERRUM_METRICS_BEARER_TOKEN is not scrape-only: a match also unlocks full
+    /health, /status and /overload detail, and both mesh DaemonSets run on the
+    host network, so a plaintext scrape puts the credential on the node network
+    on every interval (issue #4509, the ferrum-gateway rule from #4316).
+    """
+    rendered = require_capture(
+        results_dir, "mesh-prod-obs-bearer-https.yaml"
+    ).read_text(encoding="utf-8")
+    sm = resource_document(rendered, "ferrum-mesh-metrics", "ServiceMonitor")
+    for needle in ("port: admin-https", "scheme: https", "type: Bearer"):
+        require_text(
+            sm,
+            needle,
+            "Credentialed ServiceMonitor is not HTTPS",
+            f"a bearer ServiceMonitor scrape must carry {needle}",
+        )
+    forbid_text(
+        sm,
+        "port: admin-http\n",
+        "Credentialed ServiceMonitor scrapes plaintext",
+        "a bearer scrape must never select the plaintext admin port",
+    )
+    for svc_name in (
+        "ferrum-mesh-control-plane-metrics",
+        "ferrum-mesh-ca-metrics",
+        "ferrum-mesh-east-west-metrics",
+    ):
+        svc = resource_document(rendered, svc_name, "Service")
+        require_text(
+            svc,
+            "targetPort: admin-https",
+            "Metrics Service missing HTTPS port",
+            f"{svc_name} must publish admin-https for a credentialed scrape",
+        )
+    for pm_name in (
+        "ferrum-mesh-ambient-metrics",
+        "ferrum-mesh-node-agent-metrics",
+    ):
+        pm = resource_document(rendered, pm_name, "PodMonitor")
+        for needle in ("port: admin-https", "scheme: https", "type: Bearer"):
+            require_text(
+                pm,
+                needle,
+                "Credentialed PodMonitor is not HTTPS",
+                f"{pm_name} must carry {needle}",
+            )
+        forbid_text(
+            pm,
+            "port: admin-http\n",
+            "Credentialed PodMonitor scrapes plaintext",
+            f"{pm_name} must never select the plaintext admin port",
+        )
+    require_stderr(
+        results_dir,
+        "mesh-prod-obs-bearer-plaintext.err",
+        ("bearer", "admin HTTPS", "plaintext"),
+        "Bearer over plaintext admin accepted",
+    )
+    require_stderr(
+        results_dir,
+        "mesh-prod-obs-bearer-insecure.err",
+        ("insecureSkipVerify",),
+        "insecureSkipVerify accepted with a bearer scrape",
+    )
+    require_stderr(
+        results_dir,
+        "mesh-prod-obs-bearer-no-tlsconfig.err",
+        ("tlsConfig is empty",),
+        "Empty tlsConfig accepted for an HTTPS scrape",
+    )
+    print("mesh metrics bearer HTTPS-only scrape policy ok")
 
 
 def require_stderr(results_dir: Path, relative: str, needles: tuple[str, ...], title: str) -> None:
@@ -853,6 +1043,40 @@ def validate_udp_cleanup_upgrade(results_dir: Path) -> None:
     print("mesh UDP cleanup upgrade capabilities ok")
 
 
+def validate_image_pull_secrets(results_dir: Path) -> None:
+    """Chart-level image.pullSecrets must reach every Ferrum pod spec.
+
+    The value is a list of Secret NAMES (strings), matching the gateway chart
+    and values.schema.json. The chart default is [], so this render is the only
+    thing that exercises either surface; a workload that quietly dropped the
+    block would ImagePullBackOff on the first private-registry install.
+    """
+    rendered = require_capture(
+        results_dir, "mesh-image-pull-secrets.yaml"
+    ).read_text(encoding="utf-8")
+    for name, kind in PULL_SECRET_WORKLOADS:
+        doc = resource_document(rendered, name, kind)
+        require_text(
+            doc,
+            "      imagePullSecrets:\n        - name: regcred\n",
+            "Mesh workload missing imagePullSecrets",
+            f"{kind}/{name} must render image.pullSecrets as `- name: regcred`",
+        )
+        entries = len(re.findall(r"(?m)^\s*- name: regcred\s*$", doc))
+        if entries != 1:
+            fail(
+                "Mesh workload imagePullSecrets count wrong",
+                f"{kind}/{name} rendered regcred {entries} times; expected exactly 1",
+            )
+        forbid_text(
+            doc,
+            "map[name:",
+            "Mesh imagePullSecrets rendered a Go map",
+            f"{kind}/{name} stringified an object entry; items are Secret names",
+        )
+    print("mesh image pull secrets ok")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -869,6 +1093,7 @@ def main() -> int:
     validate_cni_no_drain(results_dir)
     validate_refusals(results_dir)
     validate_zero_drain(results_dir)
+    validate_injector_shutdown(results_dir)
     validate_optional_crds_off(results_dir)
     validate_observability(results_dir)
     validate_strict_admin_validation(results_dir)
@@ -877,6 +1102,7 @@ def main() -> int:
     validate_admin_env_override(results_dir)
     validate_node_waypoint_ebpf_caps(results_dir)
     validate_udp_cleanup_upgrade(results_dir)
+    validate_image_pull_secrets(results_dir)
     print("mesh production-readiness ok")
     return 0
 

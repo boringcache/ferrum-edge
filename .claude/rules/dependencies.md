@@ -99,19 +99,25 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   still compared byte for byte, and the wiring cannot be removed once adopted. A
   committed `.cargo/config[.toml]` below the repository root is rejected
   outright.
-- The `fuzz-smoke` job carries TWO admitted generations for issue #3902
+- The `fuzz-smoke` job carries TWO admitted generations, now for issue #4442
   (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first): `CI_FUZZ_SMOKE_RETIRED_JOB`
-  ran the six-target libFuzzer budget on every pull request with caching
-  disabled; `CI_FUZZ_SMOKE_JOB` keeps the deterministic property smoke as the
-  required pull-request gate, moves the budget to `merge_group` / push to `main`
-  / `workflow_dispatch`, and admits `./.github/actions/setup-sccache` plus a
-  `main`-push-only `save-if` cache (`pull_request`, fork, `merge_group`, and
-  `workflow_dispatch` restore but never publish a `fuzz-smoke` cache). The
+  is #4238's shape — the deterministic property smoke as the required
+  `pull_request`/`merge_group` gate, the six-target libFuzzer budget on push to
+  `main` / `workflow_dispatch` only, and `./.github/actions/setup-sccache` plus
+  a `main`-push-only `save-if` cache (`pull_request`, fork, `merge_group`, and
+  `workflow_dispatch` restore but never publish a `fuzz-smoke` cache);
+  `CI_FUZZ_SMOKE_JOB` adds a seventh bounded invocation for
+  `datagram_client_address` at `-max_len=65536`, that target's documented 64 KiB
+  budget, so one hostile-UDP parser's length boundaries are reachable in BOTH
+  required lanes rather than only the scheduled one. The
   transition is exact on both ends and
   one-way — withholding is symmetric, so `admitted_fuzz_smoke_removal_errors` is
   what refuses a revert. `CI_FUZZ_SMOKE_BOUNDED_BUDGET` must appear exactly once
-  in every generation, so a generation can never move the lane and relax its
-  bounds at the same time. Delete the retired generation once the adopted one is
+  in every generation and `CI_FUZZ_SMOKE_DATAGRAM_BUDGET` exactly once in the
+  adopted one, so a generation can never move or extend the lane and relax its
+  bounds at the same time. `FUZZ_WORKFLOW` carries the same target in the
+  scheduled matrix and the literal shell allowlist. Delete the retired
+  generation once the adopted one is
   on `main`. See `docs/ci_cd.md` → "Admitted `fuzz-smoke` lane-split
   generation".
 - `release.yml` is admitted in exactly two shapes
@@ -149,36 +155,54 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   Source and destination are bound inside `verify_trusted_local_action.py`; the
   candidate cannot supply a digest. Retire the pair after #3910 is the trusted
   base.
-- The published x86_64 GNU producers carry an admitted generation pair each
-  (`CI_JOB_GENERATION_TRANSITIONS`): `ci.yml`'s `build-binaries` and
-  `release.yml`'s `build-release-binaries` move their ONE x86_64 GNU matrix
-  cell from a native `ubuntu-latest` `cargo build` to the digest-pinned
-  AlmaLinux 8.10 sysroot builder, and gain an ABI/oldest-baseline gate over
-  the staged, checksummed `release-assets/` files they are about to upload
-  (issue #4301). One producer, one artifact identity: the scanned bytes ARE
-  the published bytes, so `create-release`, the `.sha256` sidecars, the
-  `latest` prerelease, and the container image inputs cannot describe a
-  binary that was never verified. The digest withholding is backed by an
-  absolute check, `linux_gnu_producer_contract_errors`, which binds as soon
-  as the repository references
-  `.github/scripts/build_linux_gnu_sysroot.sh` and rejects a producer that
-  native-compiles x86_64 GNU, scans a `target/x86_64-unknown-linux-gnu/...`
-  rebuild, gates after the upload, or shares the canonical artifact name with
-  a second uploader. Reverting either producer to its native text is refused
-  outright. The ARM64 Cross producer, its command/environment/image freeze,
-  and every publication `needs` graph are untouched; ARM64 is scanned as
-  published by `verify-linux-gnu-abi-aarch64` /
-  `verify-latest-linux-gnu-abi-aarch64` and joined by the existing retraction
-  gates, which is the only shape available while both its producer and its
-  consumers are frozen. Retire both pairs once they are on `main`. See
-  `docs/ci_cd.md` → "Admitted CI job SHA-256 generation transitions".
+- The published x86_64 GNU producers — `ci.yml`'s `build-binaries` and
+  `release.yml`'s `build-release-binaries` — build their ONE x86_64 GNU matrix
+  cell in the digest-pinned AlmaLinux 8.10 sysroot rather than natively on a
+  moving `ubuntu-latest`, and gate the staged, checksummed `release-assets/`
+  files on an ABI/oldest-baseline scan before uploading them (issue #4301).
+  One producer, one artifact identity: the scanned bytes ARE the published
+  bytes, so `create-release`, the `.sha256` sidecars, the `latest` prerelease,
+  and the container image inputs cannot describe a binary that was never
+  verified. Their #4301 `CI_JOB_GENERATION_TRANSITIONS` pairs are RETIRED
+  (both destinations are on `main`, and issue #4423 moved both jobs again
+  direct-to-`main`); the standing control is the absolute check
+  `linux_gnu_producer_contract_errors`, which binds as soon as the repository
+  references `.github/scripts/build_linux_gnu_sysroot.sh` and rejects a
+  producer that native-compiles x86_64 GNU, scans a
+  `target/x86_64-unknown-linux-gnu/...` rebuild, gates after the upload,
+  shares the canonical artifact name with a second uploader, omits the
+  job-level identity pins, or checks out with `persist-credentials` left on.
+  The ARM64 Cross producer, its command/environment/image freeze, and every
+  publication `needs` graph are untouched; ARM64 is scanned as published by
+  `verify-linux-gnu-abi-aarch64` / `verify-latest-linux-gnu-abi-aarch64` and
+  joined by the existing retraction gates, which is the only shape available
+  while both its producer and its consumers are frozen. See `docs/ci_cd.md` →
+  "Published x86_64 GNU producer contract (standing)".
+- The GNU sysroot BUILD IMAGE and the protoc archive are pinned by IDENTITY,
+  not just by form (issue #4423). `.github/linux-gnu-abi.toml` is
+  PR-editable and `verify_linux_gnu_abi.py` runs from the pull request's own
+  checkout, so the TOML cannot be the control. Both producer jobs pin
+  `LINUX_GNU_SYSROOT_IMAGE`, `LINUX_GNU_PROTOC_SHA256`,
+  `LINUX_GNU_SMOKE_FLOOR_IMAGE`, and `LINUX_GNU_SMOKE_UBUNTU2204_IMAGE` in
+  their job-level `env:` — the shell scripts refuse to run when those
+  disagree with the TOML — and `verify_cross_build_policy.py` hardcodes the
+  expected image references, the protoc digest, and the required
+  `https://github.com/protocolbuffers/protobuf/releases/download/` URL
+  prefix. `linux_gnu_producer_contract_errors` holds the `env:` literals to
+  those constants absolutely, and `linux_gnu_contract_pin_errors` re-validates
+  the TOML from the trusted base checkout (`--linux-gnu-contract`, whose
+  default is deliberately not supplied by `cross-build-policy.yml`). A
+  deliberate image or protoc bump therefore moves the constants, both `env:`
+  blocks, and the TOML in one direct-to-`main` commit. See `docs/ci_cd.md` →
+  "GNU sysroot identity pins".
 - Cross-sensitive `ci.yml` jobs `ci-plan`, `test`, and `performance-regression`
   carry temporary SHA-256 generation pairs (`CI_JOB_GENERATION_TRANSITIONS`)
   for PRs #3913 and #3911, the three per-suite live gates (`ebpf-live`,
   `netns-capture-live`, `two-cluster-mesh-live`) carry pairs for PR #3915's
   planner-gate split (adopted digests pinned against #3915's latest-main merge
-  `d95ea4796`). PR #3916's `build-binaries` pair is retired; that job's pair is
-  now the issue #4301 one above. `setup-rust-ci/action.yml` carries a two-step
+  `d95ea4796`). The `build-binaries` / `build-release-binaries` pairs (PRs
+  #3916 and #4355) are all retired; those two jobs carry no transition pair.
+  `setup-rust-ci/action.yml` carries a two-step
   trusted-base chain (`LOCAL_ACTION_GENERATION_TRANSITIONS`): #3889's landed
   `fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda` moving to
   the cache-budget generation
@@ -217,13 +241,26 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 
 ## Advisory Gate
 
-- `cargo deny check advisories bans sources` is BLOCKING on every PR
+- `cargo deny check advisories bans sources licenses` is BLOCKING on every PR
   (`dependency-audit` job in `.github/workflows/ci.yml`) and re-runs weekly in
   `.github/workflows/dependency-audit.yml`.
+- The gate covers BOTH workspaces: the root graph, and `ebpf/Cargo.toml` via
+  `cargo deny --manifest-path ebpf/Cargo.toml check --config deny.toml ...`, in the per-PR
+  job and the weekly workflow alike. `ferrum-ebpf` is not in the root graph but
+  its object ships in the published `-ebpf` / `-ebpf-tools` images and runs
+  privileged on the host network. One shared `deny.toml` — never add
+  `ebpf/deny.toml`.
 - Every `[advisories.ignore]` in `deny.toml` needs a rationale and an
   `[expires:YYYY-MM-DD]` token; `scripts/check_advisory_expiry.sh` fails the
   weekly run once a date passes. Do not silence an advisory without both.
-- Licenses are intentionally not part of the gate yet (see `deny.toml` header).
+- `[licenses.exceptions]` entries are time-boxed the same way, enforced by the
+  same script on both workflows. cargo-deny accepts no `reason` field there, so
+  the `# owner: <name> — <rationale> [expires:YYYY-MM-DD]` token goes in a
+  comment immediately preceding (or trailing) the entry, one per entry. Both
+  workflows run `scripts/check_advisory_expiry.sh --self-test` first, and also
+  publish the locked-graph `third-party-licenses` inventory artifact.
+- Licenses ARE part of the blocking gate (since #4468): the `[licenses]`
+  allowlist and `confidence-threshold` in `deny.toml` fail CI.
 - A CVE in a vendored crate's lineage follows the emergency procedure in
   `docs/dependency-policy.md` (re-vendor on the fixed version or retire); a plain
   `cargo update` cannot reach a `[patch.crates-io]`-pinned crate.

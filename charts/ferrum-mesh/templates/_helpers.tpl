@@ -12,6 +12,24 @@ invalid CP settings so an unusable control-plane pod is not rendered.
 {{- printf "%s:%s" .Values.image.repository (include "ferrum-mesh.imageTag" .) -}}
 {{- end -}}
 
+{{/*
+Chart-level imagePullSecrets block for a mesh pod spec. Emits nothing when
+image.pullSecrets is empty, so the default install renders no key at all. The
+six-space indentation is baked in because every mesh pod spec places this at
+podSpec depth, immediately after serviceAccountName; the rendered shape is
+identical to charts/ferrum-gateway/templates/deployment.yaml. Entries are
+Secret names (strings), matching the gateway chart and values.schema.json.
+Context: root.
+*/}}
+{{- define "ferrum-mesh.imagePullSecrets" -}}
+{{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ . }}
+        {{- end }}
+{{- end }}
+{{- end -}}
+
 {{- define "ferrum-mesh.resolveImageTag" -}}
 {{- $override := trim (toString (.override | default "")) -}}
 {{- if $override -}}
@@ -231,8 +249,10 @@ bare, which breaks frozen NodeWaypoint chart assertions).
 {{- end -}}
 
 {{/*
-Resolve whether node-agent admin TLS Secret mounts are fully configured.
-Returns the string "true" or empty.
+Resolve whether an admin TLS Secret mount is fully configured. Shared by the
+node-agent DaemonSet and by `ferrum-mesh.resolveComponentAdmin` for the serving
+components, so the two admin TLS surfaces cannot diverge on what "configured"
+means. Returns the string "true" or empty.
 */}}
 {{- define "ferrum-mesh.nodeAgentAdminTlsConfigured" -}}
 {{- $tls := . | default dict -}}
@@ -501,10 +521,13 @@ trim, lowercase, accept true/false/1/0 only. Returns canonical "true" or
 Resolve the admin listener for a serving component. First-class
 `<component>.admin` is the chart-managed source; an explicit env map entry
 still wins so existing ambient.env.FERRUM_ADMIN_* collision tests and live
-suites keep working. All FOUR admin keys are resolved here, because
+suites keep working. All FIVE resolved admin keys are resolved here, because
 `ferrum-mesh.adminEnv` renders exclusively from this result and every workload
 env loop filters those keys out. Returns YAML dict: port, bind, probeHost,
-allowInsecureHttp, allowInsecureHttpFromEnv, allowedCidrs.
+allowInsecureHttp, allowInsecureHttpFromEnv, allowedCidrs, httpsPort,
+tlsConfigured, tlsMount, tlsSecretName, tlsMountPath, tlsCertKey, tlsKeyKey,
+tlsClientCaKey, tlsCrlKey, tlsCertPath, tlsKeyPath, tlsClientCaPath,
+tlsCrlPath.
 */}}
 {{- define "ferrum-mesh.resolveComponentAdmin" -}}
 {{- $env := .env | default dict -}}
@@ -551,13 +574,148 @@ allowInsecureHttp, allowInsecureHttpFromEnv, allowedCidrs.
 {{- if hasKey $env "FERRUM_ADMIN_ALLOWED_CIDRS" -}}
 {{- $allowedCidrs = toString (index $env "FERRUM_ADMIN_ALLOWED_CIDRS") -}}
 {{- end -}}
-{{- dict "port" $port "bind" $bind "probeHost" (include "ferrum-mesh.adminProbeHost" $bind) "allowInsecureHttp" $allowInsecureHttp "allowInsecureHttpFromEnv" $allowInsecureHttpFromEnv "allowedCidrs" $allowedCidrs | toYaml -}}
+{{- /* Admin HTTPS. Default 0: an existing HTTP-only install must keep rendering
+       byte-identically, so FERRUM_ADMIN_HTTPS_PORT is emitted only once a
+       non-zero port is opted into (the binary opens no HTTPS socket without
+       TLS material either way). An explicit env entry still wins, exactly as
+       it does for FERRUM_ADMIN_HTTP_PORT. */ -}}
+{{- $httpsPort := "0" -}}
+{{- if not (kindIs "invalid" $admin.httpsPort) -}}
+{{- $httpsPort = toString $admin.httpsPort -}}
+{{- end -}}
+{{- if hasKey $env "FERRUM_ADMIN_HTTPS_PORT" -}}
+{{- $httpsPort = toString (index $env "FERRUM_ADMIN_HTTPS_PORT") -}}
+{{- end -}}
+{{- $tls := $admin.tls | default dict -}}
+{{- $tlsMount := include "ferrum-mesh.nodeAgentAdminTlsConfigured" $tls -}}
+{{- $tlsMountPath := trimSuffix "/" ($tls.mountPath | default "/etc/ferrum/tls/admin") -}}
+{{- $tlsCertKey := $tls.certKey | default "tls.crt" -}}
+{{- $tlsKeyKey := $tls.keyKey | default "tls.key" -}}
+{{- $tlsClientCaKey := $tls.clientCaKey | default "" -}}
+{{- $tlsCrlKey := $tls.crlKey | default "" -}}
+{{- $label := .component | default "admin" -}}
+{{- if and $tls.enabled (not $tls.secretName) -}}
+{{- fail (printf "%s.admin.tls.enabled=true requires %s.admin.tls.secretName" $label $label) -}}
+{{- end -}}
+{{- if and $tls.secretName (not $tls.enabled) -}}
+{{- fail (printf "%s.admin.tls.secretName is set but %s.admin.tls.enabled is false; enable TLS or clear secretName" $label $label) -}}
+{{- end -}}
+{{- if and $tlsClientCaKey (not $tlsMount) -}}
+{{- fail (printf "%s.admin.tls.clientCaKey requires a complete admin TLS Secret mount (enabled + secretName + certKey + keyKey)" $label) -}}
+{{- end -}}
+{{- if and $tlsCrlKey (not $tlsMount) -}}
+{{- fail (printf "%s.admin.tls.crlKey requires a complete admin TLS Secret mount (enabled + secretName + certKey + keyKey)" $label) -}}
+{{- end -}}
+{{- $tlsCertPath := "" -}}
+{{- $tlsKeyPath := "" -}}
+{{- $tlsClientCaPath := "" -}}
+{{- $tlsCrlPath := "" -}}
+{{- if $tlsMount -}}
+{{- $tlsCertPath = printf "%s/%s" $tlsMountPath $tlsCertKey -}}
+{{- $tlsKeyPath = printf "%s/%s" $tlsMountPath $tlsKeyKey -}}
+{{- if $tlsClientCaKey -}}
+{{- $tlsClientCaPath = printf "%s/%s" $tlsMountPath $tlsClientCaKey -}}
+{{- end -}}
+{{- if $tlsCrlKey -}}
+{{- $tlsCrlPath = printf "%s/%s" $tlsMountPath $tlsCrlKey -}}
+{{- end -}}
+{{- end -}}
+{{- /* An operator-supplied FERRUM_ADMIN_TLS_{CERT,KEY}_PATH pair (the only way
+       ambient could serve admin HTTPS before `<component>.admin.tls` existed)
+       still counts as a configured HTTPS listener. Those env entries flow
+       through the workload env loop unchanged; only the chart-managed mount
+       renders paths from `ferrum-mesh.adminEnv`, so the key can never be
+       emitted twice. */ -}}
+{{- $envTlsPair := and (hasKey $env "FERRUM_ADMIN_TLS_CERT_PATH") (hasKey $env "FERRUM_ADMIN_TLS_KEY_PATH") -}}
+{{- if and $tlsMount $envTlsPair -}}
+{{- fail (printf "%s.admin.tls and %s.env.FERRUM_ADMIN_TLS_{CERT,KEY}_PATH both configure the admin certificate; keep one source" $label $label) -}}
+{{- end -}}
+{{- $tlsConfigured := "" -}}
+{{- if or $tlsMount $envTlsPair -}}
+{{- $tlsConfigured = "true" -}}
+{{- end -}}
+{{- if and $tlsMount (eq $httpsPort "0") -}}
+{{- fail (printf "%s.admin.tls is configured but %s.admin.httpsPort=0; set a nonzero httpsPort or disable admin.tls" $label $label) -}}
+{{- end -}}
+{{- if and (ne $httpsPort "0") (not $tlsConfigured) -}}
+{{- fail (printf "%s.admin.httpsPort is nonzero but admin TLS is incomplete; set %s.admin.tls.enabled=true with secretName (and certKey/keyKey) or set httpsPort=0" $label $label) -}}
+{{- end -}}
+{{- if and (ne $port "0") (ne $httpsPort "0") (eq $port $httpsPort) -}}
+{{- fail (printf "%s.admin.httpPort and %s.admin.httpsPort both use %s; set distinct ports or disable one listener (httpPort/httpsPort=0)" $label $label $port) -}}
+{{- end -}}
+{{- dict "port" $port "bind" $bind "probeHost" (include "ferrum-mesh.adminProbeHost" $bind) "allowInsecureHttp" $allowInsecureHttp "allowInsecureHttpFromEnv" $allowInsecureHttpFromEnv "allowedCidrs" $allowedCidrs "httpsPort" $httpsPort "tlsConfigured" $tlsConfigured "tlsMount" $tlsMount "tlsSecretName" ($tls.secretName | default "") "tlsMountPath" $tlsMountPath "tlsCertKey" $tlsCertKey "tlsKeyKey" $tlsKeyKey "tlsClientCaKey" $tlsClientCaKey "tlsCrlKey" $tlsCrlKey "tlsCertPath" $tlsCertPath "tlsKeyPath" $tlsKeyPath "tlsClientCaPath" $tlsClientCaPath "tlsCrlPath" $tlsCrlPath | toYaml -}}
+{{- end -}}
+
+{{/*
+Admin HTTPS container port for a serving component. Rendered only when a
+non-zero httpsPort is opted into; the PodMonitor/ServiceMonitor name this port,
+so an HTTPS-only workload without it would have no scrapable endpoint at all.
+Dict: resolved.
+*/}}
+{{- define "ferrum-mesh.adminHttpsPort" -}}
+{{- $resolved := .resolved -}}
+{{- if ne (toString $resolved.httpsPort) "0" -}}
+- name: admin-https
+  containerPort: {{ $resolved.httpsPort }}
+  protocol: TCP
+{{- end -}}
+{{- end -}}
+
+{{/*
+Read-only admin TLS Secret mount for a serving component. Mirrors the
+node-agent DaemonSet mount (defaultMode 288 = 0440) so the two admin TLS
+surfaces cannot diverge. Dict: resolved.
+*/}}
+{{- define "ferrum-mesh.adminTlsVolumeMount" -}}
+{{- $resolved := .resolved -}}
+{{- if $resolved.tlsMount -}}
+- name: admin-tls
+  mountPath: {{ $resolved.tlsMountPath | quote }}
+  readOnly: true
+{{- end -}}
+{{- end -}}
+
+{{- define "ferrum-mesh.adminTlsVolume" -}}
+{{- $resolved := .resolved -}}
+{{- if $resolved.tlsMount -}}
+- name: admin-tls
+  secret:
+    secretName: {{ $resolved.tlsSecretName | quote }}
+    defaultMode: 288
+    items:
+      - key: {{ $resolved.tlsCertKey | quote }}
+        path: {{ $resolved.tlsCertKey | quote }}
+      - key: {{ $resolved.tlsKeyKey | quote }}
+        path: {{ $resolved.tlsKeyKey | quote }}
+      {{- if $resolved.tlsClientCaKey }}
+      - key: {{ $resolved.tlsClientCaKey | quote }}
+        path: {{ $resolved.tlsClientCaKey | quote }}
+      {{- end }}
+      {{- if $resolved.tlsCrlKey }}
+      - key: {{ $resolved.tlsCrlKey | quote }}
+        path: {{ $resolved.tlsCrlKey | quote }}
+      {{- end }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Whether a component's admin HTTPS listener will actually bind: a non-zero
+httpsPort AND complete TLS material. Returns "true" or empty. Dict: resolved.
+*/}}
+{{- define "ferrum-mesh.adminHttpsActive" -}}
+{{- $resolved := .resolved -}}
+{{- if and (ne (toString $resolved.httpsPort) "0") $resolved.tlsConfigured -}}
+true
+{{- end -}}
 {{- end -}}
 
 {{/*
 Chart-managed admin env for a serving component.
 
-This helper is the ONLY renderer of the four admin env keys: every workload
+This helper is the ONLY renderer of the five resolved admin env keys
+(FERRUM_ADMIN_HTTP_PORT, FERRUM_ADMIN_BIND_ADDRESS,
+FERRUM_ALLOW_INSECURE_ADMIN_HTTP, FERRUM_ADMIN_ALLOWED_CIDRS,
+FERRUM_ADMIN_HTTPS_PORT): every workload
 template that includes it also filters them out of its own `env` map loop (the
 ambient DaemonSet included), so an explicit `<workload>.env.FERRUM_ADMIN_*`
 entry reaches the container through `ferrum-mesh.resolveComponentAdmin` — which
@@ -581,6 +739,24 @@ this helper skipped it, not at all.
 {{- if $cidrs }}
 - name: FERRUM_ADMIN_ALLOWED_CIDRS
   value: {{ $cidrs | quote }}
+{{- end }}
+{{- if ne (toString $resolved.httpsPort) "0" }}
+- name: FERRUM_ADMIN_HTTPS_PORT
+  value: {{ $resolved.httpsPort | quote }}
+{{- end }}
+{{- if $resolved.tlsCertPath }}
+- name: FERRUM_ADMIN_TLS_CERT_PATH
+  value: {{ $resolved.tlsCertPath | quote }}
+- name: FERRUM_ADMIN_TLS_KEY_PATH
+  value: {{ $resolved.tlsKeyPath | quote }}
+{{- if $resolved.tlsClientCaPath }}
+- name: FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH
+  value: {{ $resolved.tlsClientCaPath | quote }}
+{{- end }}
+{{- if $resolved.tlsCrlPath }}
+- name: FERRUM_TLS_CRL_FILE_PATH
+  value: {{ $resolved.tlsCrlPath | quote }}
+{{- end }}
 {{- end }}
 {{- end -}}
 
@@ -632,6 +808,31 @@ logged; inline value is for lab installs only.
 {{- end -}}
 
 {{/*
+SleepAction preStop support gate. lifecycle.preStop.sleep is Kubernetes 1.29+
+(GA in 1.30) and is silently pruned by older API servers, so every workload
+that renders it shares this one guard rather than copying the version parse.
+Dict: root, component (string), preStop (seconds).
+*/}}
+{{- define "ferrum-mesh.validateSleepActionSupported" -}}
+{{- $root := .root -}}
+{{- $component := .component -}}
+{{- $preStop := int (.preStop | default 0) -}}
+{{- if gt $preStop 0 -}}
+{{- $major := atoi (regexReplaceAll "[^0-9].*$" ($root.Capabilities.KubeVersion.Major | toString) "") -}}
+{{- $minor := atoi (regexReplaceAll "[^0-9].*$" ($root.Capabilities.KubeVersion.Minor | toString) "") -}}
+{{- /* helm template without --kube-version advertises 1.20.0. That sentinel is
+     not a real cluster; skip so GitOps/client renders still emit the 1.29+
+     SleepAction default. --kube-version 1.28.0 and real <1.29 clusters fail. */ -}}
+{{- $helmTemplateDefault := and (eq $major 1) (eq $minor 20) -}}
+{{- $sleepUnsupported := and (not $helmTemplateDefault) (or (lt $major 1) (and (eq $major 1) (lt $minor 29))) -}}
+{{- if $sleepUnsupported -}}
+{{- $kube := $root.Capabilities.KubeVersion.Version | default (printf "v%d.%d" $major $minor) -}}
+{{- fail (printf "%s.shutdownPreStopSeconds=%d renders lifecycle.preStop.sleep (SleepAction), which requires Kubernetes 1.29+ (GA in 1.30). This cluster reports %s. Set %s.shutdownPreStopSeconds=0 to omit the hook and raise %s.shutdownPreDrainSeconds to at least readiness failureThreshold × periodSeconds so kube-proxy endpoint removal can finish after SIGTERM while /health already reports not-ready." $component $preStop $kube $component $component) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Full additive post-SIGTERM shutdown budget (docs/graceful_shutdown.md):
   drain + 6s transport pool + 5s background + clamp(drain,5,60)s audit
   + 2s observability + 5s finalizer slack.
@@ -659,17 +860,79 @@ clock. Dict: root, component (string), values (component values).
 {{- if lt (int $grace) $minGrace -}}
 {{- fail (printf "%s.terminationGracePeriodSeconds (%d) must be at least %d (preStop %ds + preDrain %ds + shutdown budget %ds, where the shutdown budget is drain %ds + transport pool 6s + background 5s + audit %ds + observability 2s + finalizer slack 5s); a null shutdownDrainSeconds uses the binary's 30s default" $component (int $grace) $minGrace $preStop $preDrain $shutdownBudget $effectiveDrain $auditBudget) -}}
 {{- end -}}
-{{- if gt $preStop 0 -}}
-{{- $major := atoi (regexReplaceAll "[^0-9].*$" ($root.Capabilities.KubeVersion.Major | toString) "") -}}
-{{- $minor := atoi (regexReplaceAll "[^0-9].*$" ($root.Capabilities.KubeVersion.Minor | toString) "") -}}
+{{- include "ferrum-mesh.validateSleepActionSupported" (dict "root" $root "component" $component "preStop" $preStop) -}}
+{{- end -}}
+
+{{/*
+Webhook (injector) shutdown budget. FERRUM_MODE=injector runs none of the
+serving shutdown stages: run() reads FERRUM_SHUTDOWN_DRAIN_SECONDS and, on the
+shutdown broadcast, waits up to that long for in-flight admission connections
+before aborting the accept tasks and returning (src/modes/injector.rs). So the
+budget is preStop + drain + a small process-exit slack, NOT the additive
+serving budget. Dict: root, component (string), values (component values).
+*/}}
+{{- define "ferrum-mesh.validateWebhookShutdown" -}}
+{{- $root := .root -}}
+{{- $component := .component -}}
+{{- $v := .values | default dict -}}
+{{- $drain := $v.shutdownDrainSeconds -}}
+{{- $effectiveDrain := 30 -}}
+{{- if not (kindIs "invalid" $drain) -}}{{- $effectiveDrain = int $drain -}}{{- end -}}
+{{- $preStop := int ($v.shutdownPreStopSeconds | default 0) -}}
+{{- $exitSlack := 5 -}}
+{{- $minGrace := add $preStop (add $effectiveDrain $exitSlack) -}}
+{{- $grace := $v.terminationGracePeriodSeconds -}}
+{{- if kindIs "invalid" $grace -}}
+{{- fail (printf "%s.terminationGracePeriodSeconds is required when the workload is enabled (minimum %d = preStop %ds + drain %ds + process-exit slack %ds)" $component $minGrace $preStop $effectiveDrain $exitSlack) -}}
+{{- end -}}
+{{- if lt (int $grace) $minGrace -}}
+{{- fail (printf "%s.terminationGracePeriodSeconds (%d) must be at least %d (preStop %ds + drain %ds + process-exit slack %ds); the injector is a failurePolicy=Fail webhook, so a replica that stops accepting /mutate while it is still a live Endpoint makes the apiserver reject pod CREATE in every selected namespace. A null %s.shutdownDrainSeconds uses the binary's 30s default" $component (int $grace) $minGrace $preStop $effectiveDrain $exitSlack $component) -}}
+{{- end -}}
+{{- include "ferrum-mesh.validateSleepActionSupported" (dict "root" $root "component" $component "preStop" $preStop) -}}
+{{- end -}}
+
+{{/*
+Node-agent shutdown floor. node_agent mode never reads
+FERRUM_SHUTDOWN_DRAIN_SECONDS and the DaemonSet sits behind no Service, so
+there is no drain stage or endpoint-propagation window to budget for; the only
+honest requirement is a non-zero grace period so teardown is not SIGKILLed
+immediately. Dict: component (string), values (component values).
+*/}}
+{{- define "ferrum-mesh.validateNodeAgentShutdown" -}}
+{{- $component := .component -}}
+{{- $v := .values | default dict -}}
+{{- $grace := $v.terminationGracePeriodSeconds -}}
+{{- if kindIs "invalid" $grace -}}
+{{- fail (printf "%s.terminationGracePeriodSeconds is required when the workload is enabled (minimum 1; node_agent has no drain stage, so this is only the SIGTERM-to-SIGKILL floor)" $component) -}}
+{{- end -}}
+{{- if lt (int $grace) 1 -}}
+{{- fail (printf "%s.terminationGracePeriodSeconds (%d) must be at least 1; node_agent has no drain stage, but 0 SIGKILLs the pod immediately and abandons capture teardown" $component (int $grace)) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Native-sidecar Kubernetes floor for the injector (issue #4534). The webhook
+emits Ferrum only as a Kubernetes native sidecar --
+spec.initContainers[].restartPolicy: Always -- with no ordinary-container
+fallback (src/modes/injector.rs). Kubernetes <=1.27 rejects that field outright
+and 1.28 requires the SidecarContainers feature gate, so with
+failurePolicy: Fail the webhook mutates the pod, the apiserver then rejects it,
+and every pod CREATE in a selected namespace fails. Deliberately NOT a
+Chart.yaml kubeVersion: constraint -- the rest of the chart still installs on
+older clusters with injector.enabled=false.
+*/}}
+{{- define "ferrum-mesh.validateInjectorKubeVersion" -}}
+{{- if .Values.injector.enabled -}}
+{{- $major := atoi (regexReplaceAll "[^0-9].*$" (.Capabilities.KubeVersion.Major | toString) "") -}}
+{{- $minor := atoi (regexReplaceAll "[^0-9].*$" (.Capabilities.KubeVersion.Minor | toString) "") -}}
 {{- /* helm template without --kube-version advertises 1.20.0. That sentinel is
-     not a real cluster; skip so GitOps/client renders still emit the 1.29+
-     SleepAction default. --kube-version 1.28.0 and real <1.29 clusters fail. */ -}}
+     not a real cluster; skip it so GitOps/client-side renders still work.
+     --kube-version 1.27.0 and real <1.29 clusters fail. */ -}}
 {{- $helmTemplateDefault := and (eq $major 1) (eq $minor 20) -}}
-{{- $sleepUnsupported := and (not $helmTemplateDefault) (or (lt $major 1) (and (eq $major 1) (lt $minor 29))) -}}
-{{- if $sleepUnsupported -}}
-{{- $kube := $root.Capabilities.KubeVersion.Version | default (printf "v%d.%d" $major $minor) -}}
-{{- fail (printf "%s.shutdownPreStopSeconds=%d renders lifecycle.preStop.sleep (SleepAction), which requires Kubernetes 1.29+ (GA in 1.30). This cluster reports %s. Set %s.shutdownPreStopSeconds=0 to omit the hook and raise %s.shutdownPreDrainSeconds to at least readiness failureThreshold × periodSeconds so kube-proxy endpoint removal can finish after SIGTERM while /health already reports not-ready." $component $preStop $kube $component $component) -}}
+{{- $sidecarUnsupported := and (not $helmTemplateDefault) (or (lt $major 1) (and (eq $major 1) (lt $minor 29))) -}}
+{{- if $sidecarUnsupported -}}
+{{- $kube := .Capabilities.KubeVersion.Version | default (printf "v%d.%d" $major $minor) -}}
+{{- fail (printf "injector.enabled=true requires Kubernetes 1.29+. The webhook injects Ferrum as a native sidecar (spec.initContainers[].restartPolicy: Always) and there is no ordinary-container fallback; 1.27 and earlier reject that field and 1.28 needs the SidecarContainers feature gate. This cluster reports %s. With injector.failurePolicy=Fail the apiserver would reject every pod CREATE in a selected namespace, so set injector.enabled=false on this cluster (the rest of the chart installs unchanged) or upgrade the cluster to 1.29+" $kube) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -686,6 +949,12 @@ clock. Dict: root, component (string), values (component values).
 {{- end -}}
 {{- if .Values.ambient.enabled -}}
 {{- include "ferrum-mesh.validateShutdown" (dict "root" . "component" "ambient" "values" .Values.ambient) -}}
+{{- end -}}
+{{- if .Values.injector.enabled -}}
+{{- include "ferrum-mesh.validateWebhookShutdown" (dict "root" . "component" "injector" "values" .Values.injector) -}}
+{{- end -}}
+{{- if .Values.nodeAgent.enabled -}}
+{{- include "ferrum-mesh.validateNodeAgentShutdown" (dict "component" "nodeAgent" "values" .Values.nodeAgent) -}}
 {{- end -}}
 {{- end -}}
 
@@ -880,42 +1149,45 @@ falls back to liveHandler exactly as renderProbes does).
 {{- if include "ferrum-mesh.isLoopbackBind" $cpAdmin.bind -}}
 {{- fail "observability.metrics.serviceMonitor.enabled=true with controlPlane.enabled=true requires a non-loopback controlPlane.admin.bindAddress (e.g. 0.0.0.0 or ::); loopback-bound admin is not reachable through a Service" -}}
 {{- end -}}
-{{- if eq (toString $cpAdmin.port) "0" -}}
-{{- fail "observability.metrics.serviceMonitor.enabled=true with controlPlane.enabled=true requires a non-zero controlPlane.admin.httpPort so Prometheus can scrape /metrics" -}}
+{{- if and (eq (toString $cpAdmin.port) "0") (not (include "ferrum-mesh.adminHttpsActive" (dict "resolved" $cpAdmin))) -}}
+{{- fail "observability.metrics.serviceMonitor.enabled=true with controlPlane.enabled=true requires a non-zero controlPlane.admin.httpPort, or a non-zero controlPlane.admin.httpsPort with controlPlane.admin.tls configured, so Prometheus can scrape /metrics" -}}
 {{- end -}}
 {{- end -}}
 {{- if and $smOn .Values.ca.enabled -}}
 {{- if include "ferrum-mesh.isLoopbackBind" $caAdmin.bind -}}
 {{- fail "observability.metrics.serviceMonitor.enabled=true with ca.enabled=true requires a non-loopback ca.admin.bindAddress (e.g. 0.0.0.0 or ::); loopback-bound admin is not reachable through a Service" -}}
 {{- end -}}
-{{- if eq (toString $caAdmin.port) "0" -}}
-{{- fail "observability.metrics.serviceMonitor.enabled=true with ca.enabled=true requires a non-zero ca.admin.httpPort so Prometheus can scrape /metrics" -}}
+{{- if and (eq (toString $caAdmin.port) "0") (not (include "ferrum-mesh.adminHttpsActive" (dict "resolved" $caAdmin))) -}}
+{{- fail "observability.metrics.serviceMonitor.enabled=true with ca.enabled=true requires a non-zero ca.admin.httpPort, or a non-zero ca.admin.httpsPort with ca.admin.tls configured, so Prometheus can scrape /metrics" -}}
 {{- end -}}
 {{- end -}}
 {{- if and $smOn .Values.eastWest.enabled -}}
 {{- if include "ferrum-mesh.isLoopbackBind" $ewAdmin.bind -}}
 {{- fail "observability.metrics.serviceMonitor.enabled=true with eastWest.enabled=true requires a non-loopback eastWest.admin.bindAddress (e.g. 0.0.0.0 or ::); loopback-bound admin is not reachable through a Service" -}}
 {{- end -}}
-{{- if eq (toString $ewAdmin.port) "0" -}}
-{{- fail "observability.metrics.serviceMonitor.enabled=true with eastWest.enabled=true requires a non-zero eastWest.admin.httpPort so Prometheus can scrape /metrics" -}}
+{{- if and (eq (toString $ewAdmin.port) "0") (not (include "ferrum-mesh.adminHttpsActive" (dict "resolved" $ewAdmin))) -}}
+{{- fail "observability.metrics.serviceMonitor.enabled=true with eastWest.enabled=true requires a non-zero eastWest.admin.httpPort, or a non-zero eastWest.admin.httpsPort with eastWest.admin.tls configured, so Prometheus can scrape /metrics" -}}
 {{- end -}}
 {{- end -}}
 {{- if and $pmOn .Values.ambient.enabled -}}
 {{- if include "ferrum-mesh.isLoopbackBind" $ambAdmin.bind -}}
 {{- fail "observability.metrics.podMonitor.enabled=true with ambient.enabled=true requires a non-loopback ambient.admin.bindAddress (e.g. 0.0.0.0); hostNetwork loopback is not reachable from Prometheus" -}}
 {{- end -}}
-{{- if eq (toString $ambAdmin.port) "0" -}}
-{{- fail "observability.metrics.podMonitor.enabled=true with ambient.enabled=true requires a non-zero ambient.admin.httpPort so Prometheus can scrape /metrics" -}}
+{{- if and (eq (toString $ambAdmin.port) "0") (not (include "ferrum-mesh.adminHttpsActive" (dict "resolved" $ambAdmin))) -}}
+{{- fail "observability.metrics.podMonitor.enabled=true with ambient.enabled=true requires a non-zero ambient.admin.httpPort, or a non-zero ambient.admin.httpsPort with ambient.admin.tls configured, so Prometheus can scrape /metrics" -}}
 {{- end -}}
 {{- end -}}
 {{- if and $pmOn .Values.nodeAgent.enabled (.Values.nodeAgent.admin.enabled | default true) -}}
 {{- $naBind := .Values.nodeAgent.admin.bindAddress | default "127.0.0.1" -}}
 {{- $naPort := toString (.Values.nodeAgent.admin.port | default "19090") -}}
+{{- $naHttpsPort := toString (.Values.nodeAgent.admin.httpsPort | default "0") -}}
+{{- $naTls := include "ferrum-mesh.nodeAgentAdminTlsConfigured" (.Values.nodeAgent.admin.tls | default dict) -}}
+{{- $naHttpsActive := and (ne $naHttpsPort "0") $naTls -}}
 {{- if include "ferrum-mesh.isLoopbackBind" $naBind -}}
 {{- fail "observability.metrics.podMonitor.enabled=true with nodeAgent.enabled=true requires a non-loopback nodeAgent.admin.bindAddress (e.g. 0.0.0.0); hostNetwork loopback is not reachable from Prometheus" -}}
 {{- end -}}
-{{- if eq $naPort "0" -}}
-{{- fail "observability.metrics.podMonitor.enabled=true with nodeAgent.enabled=true requires a non-zero nodeAgent.admin.port so Prometheus can scrape /metrics" -}}
+{{- if and (eq $naPort "0") (not $naHttpsActive) -}}
+{{- fail "observability.metrics.podMonitor.enabled=true with nodeAgent.enabled=true requires a non-zero nodeAgent.admin.port, or a non-zero nodeAgent.admin.httpsPort with nodeAgent.admin.tls configured, so Prometheus can scrape /metrics" -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

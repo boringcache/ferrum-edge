@@ -78,6 +78,12 @@ threads-required = "num-test-threads"
 [[profile.default.overrides]]
 filter = 'binary(=service_integration)'
 test-group = 'service-integration-serial'
+# Issue #4600: every case here talks to a disposable container over the network
+# and the slowest healthy case finishes in well under two minutes. Report a case
+# as slow after 60 s and kill it after 15 periods (15 minutes) so a stalled image
+# pull or an unbounded ClickHouse request fails the case instead of holding the
+# whole job open for its 6-hour default timeout.
+slow-timeout = { period = "60s", terminate-after = 15 }
 
 [[profile.default.overrides]]
 filter = 'binary(=secrets_functional)'

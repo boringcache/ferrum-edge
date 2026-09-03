@@ -78,6 +78,28 @@ registry before install. Override with a published tag on the command line or in
 your values file (for example `--set image.tag=<published-tag>`). The mutable
 `latest` tag exists for evaluation but must not be used in production.
 
+Because that override is mandatory, a mirrored or private registry is the
+common case. Both charts expose `image.pullSecrets` as a list of Secret
+**names** in the release namespace; each Secret must already exist (type
+`kubernetes.io/dockerconfigjson`) — neither chart creates one:
+
+```bash
+kubectl -n ferrum create secret docker-registry regcred \
+  --docker-server=registry.internal.example \
+  --docker-username=<user> --docker-password=<token>
+
+helm install ferrum ./charts/ferrum-gateway -n ferrum \
+  --set image.repository=registry.internal.example/ferrum-edge \
+  --set image.tag=<published-tag> \
+  --set 'image.pullSecrets[0]=regcred'
+```
+
+The names are rendered as `imagePullSecrets` on every pod spec the chart owns —
+for `charts/ferrum-mesh` that includes both CNI uninstall-hook pods, which run
+the Ferrum image and would otherwise strand `helm uninstall` in
+`ImagePullBackOff`. The default is `[]`, which renders no `imagePullSecrets`
+key at all.
+
 Per-mode quickstarts:
 
 ```bash
@@ -145,6 +167,20 @@ gateway alerts. Enabling metrics does not change `admin.bindAddress` — expose
 admin explicitly (`admin.bindAddress` + `admin.service.enabled`) and restrict
 access with a `NetworkPolicy`. Scrapers must be authorized via metrics bearer
 token or allowed CIDR; see [`charts/ferrum-gateway/README.md`](../charts/ferrum-gateway/README.md#metrics-and-prometheus).
+
+Every rendered alert carries a `runbook_url` annotation pointing at its section
+in [`docs/runbooks/gateway.md`](runbooks/gateway.md) — symptom, first checks
+against `/live`, `/health`, `/status`, `/overload`, `/metrics`,
+`/backend-capabilities`, and `/cluster`, likely causes, remediation, and
+escalation for each shipped alert. Repoint the whole set at an internal mirror
+with `metrics.alerts.runbookBaseUrl`.
+
+Setting `metrics.dashboards.enabled=true` additionally renders a `ConfigMap`
+containing the bundled Grafana dashboards from
+`charts/ferrum-gateway/dashboards/`, labeled `grafana_dashboard: "1"` for the
+Grafana sidecar (`kiwigrid/k8s-sidecar`) and the Grafana Operator. Override the
+label with `metrics.dashboards.sidecarLabel` /
+`metrics.dashboards.sidecarLabelValue`.
 
 `/metrics` also requires a globally scoped `prometheus_metrics` plugin in the
 gateway configuration; without it the endpoint returns an empty exposition:
@@ -433,7 +469,12 @@ emits Ferrum as a Kubernetes **native sidecar** (`spec.initContainers` with
 application containers wait until the proxy is serving, and an injected Job can
 finish without an operator killing Ferrum. **Minimum Kubernetes version is
 1.29** (native sidecars enabled by default; 1.28 needs the `SidecarContainers`
-feature gate). There is no ordinary-container fallback. HTTP `httpGet` and TCP
+feature gate). There is no ordinary-container fallback, so with
+`injector.enabled=true` the `charts/ferrum-mesh` chart refuses to render below
+1.29 (`ferrum-mesh.validateInjectorKubeVersion`) rather than let a
+`failurePolicy: Fail` webhook mutate pods the apiserver will then reject. The
+chart carries no `Chart.yaml: kubeVersion:` constraint, so everything else still
+installs on an older cluster with `injector.enabled=false`. HTTP `httpGet` and TCP
 `tcpSocket` probe ports on every container in the pod are added to the inbound
 capture exclusion set; `exec`/`grpc` probes are not. Unresolved named probe
 ports fail admission. See [docs/mesh.md](mesh.md#sidecar-container).
@@ -484,8 +525,17 @@ optional `FERRUM_SHUTDOWN_PREDRAIN_SECONDS`, native `preStop.sleep`, and
 mode, which honors the pre-drain window on its admin and CP-gRPC accept loops,
 so the `<1.29` remediation (`shutdownPreStopSeconds: 0` plus a raised
 `shutdownPreDrainSeconds`) is a real contract there and not just a rendered env.
-The injector webhook, node-agent, and one-shot CNI uninstall hooks do not
-receive any of it. Restricted-compatible `securityContext` / non-empty
+One-shot CNI uninstall hooks receive none of it.
+The **injector** receives its own smaller version: `FERRUM_SHUTDOWN_DRAIN_SECONDS`
+(30), `preStop.sleep` (30s, the readiness `failureThreshold × periodSeconds`
+endpoint-removal budget), and `terminationGracePeriodSeconds: 65` — preStop +
+drain + 5s process-exit slack, validated at render. `injector` mode runs none of
+the serving shutdown stages, so the additive serving budget does not apply; the
+window matters because a `/mutate` call landing on a terminating replica is
+connection-refused and fails pod CREATE cluster-wide. The **node-agent** renders
+`terminationGracePeriodSeconds` (30) only: `node_agent` mode never reads
+`FERRUM_SHUTDOWN_DRAIN_SECONDS` and the DaemonSet sits behind no Service, so a
+preStop sleep would only delay node drains. Restricted-compatible `securityContext` / non-empty
 `resources` apply to control plane, CA, and east-west; ambient keeps
 host-network datapath capabilities after dropping ALL, and its
 `securityContext` is a constrained explicit surface
@@ -515,6 +565,57 @@ Prometheus Operator `ServiceMonitor`, and `PodMonitor`s for the host-network
 ambient and node-agent DaemonSets. Alerts and monitors fail render without a
 scrape credential. `FerrumMeshControlPlaneConfigStale` does not use `absent()`
 for optional mesh emitters.
+
+A metrics bearer credential is only ever attached to a **verified HTTPS**
+scrape. `FERRUM_METRICS_BEARER_TOKEN` also unlocks full `/health`, `/status`,
+and `/overload` diagnostic detail, and both mesh DaemonSets run on the host
+network, so a plaintext scrape would put the credential on the node network on
+every interval. With `observability.metrics.bearerToken.existingSecret.name`
+set, the `ServiceMonitor` and both `PodMonitor` endpoints select
+`port: admin-https` with `scheme: https` and the monitor's `tlsConfig`, and the
+chart fails render when a scraped component has no usable HTTPS admin listener,
+when the selected `tlsConfig` is empty, or when `tlsConfig.insecureSkipVerify`
+is `true` alongside the credential. An `observability.metrics.allowedCidrs`-only
+scrape carries no credential and may stay on plaintext `admin-http`.
+
+Admin HTTPS uses one shape on every mesh workload —
+`<component>.admin.httpsPort` (default `0`) plus `<component>.admin.tls`
+(`enabled`, `secretName`, `mountPath`, `certKey`, `keyKey`, optional
+`clientCaKey` / `crlKey`) for `controlPlane`, `ca`, `eastWest`, and `ambient`,
+and the pre-existing `nodeAgent.admin.httpsPort` / `nodeAgent.admin.tls`. The
+chart mounts the Secret read-only and renders `FERRUM_ADMIN_HTTPS_PORT` with the
+matching `FERRUM_ADMIN_TLS_*` paths; setting `admin.httpPort: 0` alongside it
+makes the component HTTPS-only.
+
+```yaml
+observability:
+  enabled: true
+  metrics:
+    bearerToken:
+      existingSecret:
+        name: mesh-metrics-bearer
+    serviceMonitor:
+      tlsConfig:
+        ca:
+          secret:
+            name: mesh-scrape-ca
+            key: ca.crt
+        serverName: ferrum-mesh-control-plane-metrics.ferrum.svc
+    podMonitor:
+      tlsConfig:
+        ca:
+          secret:
+            name: mesh-scrape-ca
+            key: ca.crt
+
+controlPlane:
+  admin:
+    bindAddress: 0.0.0.0
+    httpsPort: 9443
+    tls:
+      enabled: true
+      secretName: cp-admin-tls
+```
 
 Example: disable control-plane probes, or replace injector readiness with HTTPS:
 
@@ -907,6 +1008,59 @@ spec:
         - protocol: TCP
           port: 50051
 ```
+
+### CP configuration-stream budgets (size them per workload)
+
+`ConfigSync.Subscribe`, `MeshConfigSync.MeshSubscribe`, and both ADS methods
+draw from one layered CP admission controller. **The sizing unit is one stream
+per DP *or per mesh workload***: every injected sidecar and every ambient node
+proxy holds one `MeshSubscribe` stream for its whole life, so on a mesh install
+these budgets count pods, not control-plane clients.
+
+| Budget | Env var | Default |
+|---|---|---|
+| Total streams per CP process | `FERRUM_XDS_MAX_TOTAL_STREAMS` | `8192` |
+| Streams per namespace/tenant | `FERRUM_XDS_MAX_STREAMS_PER_NAMESPACE` | `4096` |
+| Streams per authenticated principal (JWT `sub`) | `FERRUM_XDS_MAX_STREAMS_PER_PRINCIPAL` | `2048` |
+| Streams per node state key | `FERRUM_XDS_MAX_STREAMS_PER_NODE` | `4` |
+| Distinct active node state keys | `FERRUM_XDS_MAX_ACTIVE_NODES` | `16384` |
+
+Size each at **≥ fleet ÷ CP replicas**, with headroom for reconnect overlap: a
+rolling update surges new pods that take new streams while the pods they replace
+still hold theirs. Two shapes deserve explicit attention:
+
+- **Shared ServiceAccount.** Native mesh subscribers must present
+  `node_id == JWT sub`, so every workload projecting the same ServiceAccount
+  token presents ONE principal to the CP. `FERRUM_XDS_MAX_STREAMS_PER_PRINCIPAL`
+  is then a fleet bound, not a tenancy bound — size it from the fleet.
+- **NAT / `externalTrafficPolicy: Cluster`.** The *connection* caps
+  (`FERRUM_CP_GRPC_MAX_CONNECTIONS`, default `1024`, and
+  `FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP`, default `64`) are separate DoS bounds
+  and are deliberately not raised with the stream budgets. Behind a NAT gateway
+  or a Service that rewrites the source address, every subscriber appears to the
+  CP as one IP, so a fleet larger than `64` is refused at the connection layer
+  before admission is consulted. Preserve the client address
+  (`externalTrafficPolicy: Local`, a direct pod-to-pod CP Service, or per-node
+  egress) rather than raising a per-IP DoS bound by reflex.
+
+Each layer emits a rate-limited `warn!` (at most once per 60s per layer) naming
+the layer, its `FERRUM_XDS_MAX_*` variable, and the current/limit values once
+occupancy reaches 80% of the ceiling; alert on
+`ferrum_cp_grpc_active_streams` / `ferrum_cp_grpc_active_node_ids` approaching
+the configured limits and on
+`ferrum_cp_grpc_stream_admission_rejections_total`.
+
+A refused subscriber is **not** a data-plane outage: a `RESOURCE_EXHAUSTED`
+refusal proves the CP is alive, so the DP records it as *reconnecting*, keeps
+serving last-known-good configuration, keeps retrying, and does not latch
+`FERRUM_DP_CONFIG_MAX_STALE_SECONDS` / trip
+`FERRUM_DP_CONFIG_STALE_ACTION=fail_closed`. Watch
+`ferrum_dp_cp_admission_refused_total` for it. A native sidecar that has never
+received a slice is the exception that still hurts immediately: its
+`startupProbe` cannot pass, and because the sidecar is `initContainers[0]` the
+pod wedges in `Init:0/2` — which is what an undersized per-namespace budget
+looks like during a rollout. See
+[cp_dp_mode.md](cp_dp_mode.md) and [mesh.md](mesh.md#xds-ads-admission-budgets).
 
 ### Mesh config ordering across CP replicas
 

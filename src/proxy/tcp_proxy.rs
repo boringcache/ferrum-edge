@@ -45,6 +45,7 @@ use crate::plugins::{
 use crate::proxy::stream_error::{
     StreamSetupError, StreamSetupKind, find_stream_setup_error, stream_dns_setup_error,
 };
+use crate::proxy::{LoadBalancerConnectionGuard, stream_lb_accounting_target};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 use crate::retry::ErrorClass;
 
@@ -1724,6 +1725,17 @@ pub struct TcpProxyMetrics {
     /// counters): those stay per listener so `/overload` and the stream metric
     /// snapshot keep reporting per-listener activity.
     pub backend_inflight: Arc<BackendConnectionLimiter>,
+    /// Gateway-wide per-effective-source-IP connection admission
+    /// (`FERRUM_TCP_MAX_CONNECTIONS_PER_IP`, issue #4544).
+    ///
+    /// A HANDLE to the ONE map `ProxyState` owns, for the same reason as
+    /// `backend_inflight`: a per-listener copy would let one source hold `max`
+    /// connections on every listener. `Default` is the disabled dimension.
+    pub per_ip_admission: crate::proxy::PerIpStreamAdmission,
+    /// Connections refused at accept because the effective source IP already
+    /// held `FERRUM_TCP_MAX_CONNECTIONS_PER_IP` connections. Fixed cardinality:
+    /// one listener-local counter, never labelled by client address.
+    pub per_ip_rejections: AtomicU64,
 }
 
 impl TcpProxyMetrics {
@@ -1733,7 +1745,10 @@ impl TcpProxyMetrics {
     /// Every spawned stream listener is constructed this way so raw TCP shares
     /// the destination ceiling with WebSocket, the pooled transports, and
     /// reqwest. Observability counters remain listener-local.
-    pub fn with_backend_conn_limit(backend_inflight: Arc<BackendConnectionLimiter>) -> Self {
+    pub fn with_backend_conn_limit(
+        backend_inflight: Arc<BackendConnectionLimiter>,
+        per_ip_admission: crate::proxy::PerIpStreamAdmission,
+    ) -> Self {
         // Fields are listed rather than filled from `..Self::default()`: the
         // derived `Default` builds a whole private `BackendConnectionLimiter`
         // (a `DashMap` with `max(64, cpus * 16)` shards) only to drop it
@@ -1746,7 +1761,27 @@ impl TcpProxyMetrics {
             bytes_out: AtomicU64::new(0),
             splice_bytes_transferred: AtomicU64::new(0),
             backend_inflight,
+            per_ip_admission,
+            per_ip_rejections: AtomicU64::new(0),
         }
+    }
+}
+
+/// Emit a rate-limited warning for a connection refused by the per-source-IP
+/// admission bound (first refusal, then every 100th).
+///
+/// Deliberately omits the client address: this is a hostile-source path, so the
+/// log record must stay fixed-cardinality just like the counter it reads.
+fn record_tcp_per_ip_rejection(metrics: &TcpProxyMetrics, proxy_id: &str, listen_port: u16) {
+    let n = metrics.per_ip_rejections.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(100) {
+        warn!(
+            proxy_id = %proxy_id,
+            listen_port,
+            limit = metrics.per_ip_admission.max,
+            rejections = n,
+            "TCP connection refused before the frontend handshake: per-source-IP connection limit reached"
+        );
     }
 }
 
@@ -2570,6 +2605,32 @@ async fn run_tcp_accept_loop(
                         }
                     } else {
                         (direct_client_ip.clone(), remote_addr.port(), None)
+                    };
+
+                    // Per-source-IP admission bound (issue #4544). Keyed on the
+                    // EFFECTIVE client IP: the forwarded source when a trusted
+                    // inbound PROXY-protocol header was accepted just above,
+                    // the canonicalized socket peer otherwise — so a trusted L4
+                    // balancer is not collapsed into one source.
+                    //
+                    // Placed here, before `handle_tcp_connection`, so a refused
+                    // connection reaches NO frontend TLS handshake, NO
+                    // `on_stream_connect` plugin chain, and NO backend dial.
+                    // That is the gap the opt-in `tcp_connection_throttle`
+                    // plugin cannot close: its `on_stream_connect` hook runs
+                    // AFTER the handshake on `tcp_tls` proxies, so it can never
+                    // bound concurrent pre-handshake state from one source.
+                    //
+                    // The guard is held for the whole connection task, so every
+                    // close path (relay exit, handshake failure, cancellation,
+                    // panic) releases the slot.
+                    let _per_ip_guard = match metrics.per_ip_admission.try_acquire(&client_ip) {
+                        Ok(guard) => guard,
+                        Err(crate::proxy::PerIpLimitExceeded) => {
+                            record_tcp_per_ip_rejection(&metrics, &proxy_id, port);
+                            drop(stream); // TCP RST/FIN before any handshake byte
+                            return;
+                        }
                     };
 
                     // Node-waypoint per-pod policy scoping (parity with the
@@ -3741,6 +3802,49 @@ async fn handle_tcp_connection_inner(
         (params, cb_info)
     };
 
+    // Least-connection accounting parity with the HTTP relay path (issue
+    // #4514). Without this every stream target reports zero active connections
+    // forever and `least_connections` pins every TCP connection to the first
+    // healthy target. Held across the dial and the whole relay, so the end
+    // event fires on normal close, plugin reject, connect failure, task
+    // cancellation, and panic unwind.
+    //
+    // Direct-backend proxies (`upstream_id == None`) own no balancer, so the
+    // guard is constructed in its no-op form rather than special-cased.
+    let lb_balancer = proxy.upstream_id.as_deref().and_then(|upstream_id| {
+        crate::proxy::mesh_tcp_egress::connection_balancer(
+            &epoch.load_balancer,
+            &proxy.namespace,
+            upstream_id,
+        )
+    });
+    // Latency sampling from the dial is PASSIVE, and follows the same precedence
+    // rule the HTTP path uses (`backend_dispatch`): active health-check probes
+    // give controlled, comparable RTTs and win outright, so passive connect
+    // samples are recorded only when no active probes are running for this
+    // upstream.
+    let lb_passive_latency = lb_balancer.is_some()
+        && proxy.upstream_id.as_deref().is_some_and(|upstream_id| {
+            !health_checker.has_running_active_probes(&proxy.namespace, upstream_id)
+        });
+    let arm_lb_guard = |host: &str, port: u16, policy_port: u16| {
+        LoadBalancerConnectionGuard::new(
+            lb_balancer
+                .is_some()
+                .then(|| Arc::new(stream_lb_accounting_target(host, port, policy_port))),
+            lb_balancer.clone(),
+        )
+    };
+    // Reassigned on every connect-phase target rotation below: the right-hand
+    // side increments the new target before the previous guard's `Drop`
+    // decrements the abandoned one, so a retried connection never leaves a
+    // permanent +1 behind.
+    let mut _lb_guard = arm_lb_guard(
+        &params.backend_host,
+        params.backend_port,
+        params.backend_policy_port,
+    );
+
     enforce_mesh_tcp_outbound_target(
         mesh_outbound_enforcement,
         stream_ctx.listen_port,
@@ -4025,6 +4129,10 @@ async fn handle_tcp_connection_inner(
                 connect_backend_plain(addr, connect_timeout, params.tcp_fastopen_enabled, overload)
             },
         );
+        // Same stream latency sampling as the terminating path (issue #4514).
+        // Passthrough never rotates targets, so the initial guard's target is
+        // still the dialled one here.
+        let dial_started = Instant::now();
         let bounded_connect =
             within_stream_auth_deadline(stream_auth_deadline, connect_attempt).await;
         let (mut backend_stream, addr) = match bounded_connect {
@@ -4054,6 +4162,13 @@ async fn handle_tcp_connection_inner(
                     crate::dns::CandidateConnectError::Failed { source, .. } => source,
                 })
                 .inspect_err(|_| {
+                    if lb_passive_latency && let Some(balancer) = lb_balancer.as_ref() {
+                        balancer.record_failed_attempt(&stream_lb_accounting_target(
+                            &params.backend_host,
+                            params.backend_port,
+                            params.backend_policy_port,
+                        ));
+                    }
                     if let Some(ref cb_config) = cb_info.cb_config {
                         let cb = circuit_breaker_cache.get_or_create(
                             &cb_info.namespace,
@@ -4065,6 +4180,16 @@ async fn handle_tcp_connection_inner(
                     }
                 })?,
         };
+        if lb_passive_latency && let Some(balancer) = lb_balancer.as_ref() {
+            balancer.record_latency(
+                &stream_lb_accounting_target(
+                    &params.backend_host,
+                    params.backend_port,
+                    params.backend_policy_port,
+                ),
+                dial_started.elapsed().as_micros() as u64,
+            );
+        }
         backend_info.backend_resolved_ip = Some(addr.ip().to_string());
 
         // Apply DR `connectionPool.tcp.tcpKeepalive` on the freshly connected
@@ -4751,6 +4876,10 @@ async fn handle_tcp_connection_inner(
                             current_host = next.0;
                             current_port = next.1;
                             current_policy_port = next.2;
+                            // Re-arm stream connection accounting on the new target before the
+                            // previous guard drops the abandoned one (issue #4514).
+                            _lb_guard =
+                                arm_lb_guard(&current_host, current_port, current_policy_port);
                             current_cb_info = TcpConnCbInfo {
                                 namespace: current_cb_info.namespace.clone(),
                                 cb_config: current_cb_info.cb_config.clone(),
@@ -4849,6 +4978,9 @@ async fn handle_tcp_connection_inner(
                     current_host = next.0;
                     current_port = next.1;
                     current_policy_port = next.2;
+                    // Re-arm stream connection accounting on the new target before the
+                    // previous guard drops the abandoned one (issue #4514).
+                    _lb_guard = arm_lb_guard(&current_host, current_port, current_policy_port);
                     current_cb_info = TcpConnCbInfo {
                         namespace: current_cb_info.namespace.clone(),
                         cb_config: current_cb_info.cb_config.clone(),
@@ -4948,6 +5080,9 @@ async fn handle_tcp_connection_inner(
                     current_host = next.0;
                     current_port = next.1;
                     current_policy_port = next.2;
+                    // Re-arm stream connection accounting on the new target before the
+                    // previous guard drops the abandoned one (issue #4514).
+                    _lb_guard = arm_lb_guard(&current_host, current_port, current_policy_port);
                     current_cb_info = TcpConnCbInfo {
                         namespace: current_cb_info.namespace.clone(),
                         cb_config: current_cb_info.cb_config.clone(),
@@ -5059,6 +5194,9 @@ async fn handle_tcp_connection_inner(
         // backend) from being written on behalf of an expired credential or a
         // withdrawn trust decision; a half-completed dial is dropped, closing
         // the socket, rather than finished.
+        // One clock read for the dial; `least_latency` on streams is otherwise
+        // fed only by active health-check probe RTT (issue #4514).
+        let dial_started = Instant::now();
         let bounded_connect =
             within_stream_setup_bounds(stream_auth_deadline, client_trust_session, connect_attempt)
                 .await;
@@ -5089,6 +5227,16 @@ async fn handle_tcp_connection_inner(
 
         match connect_result {
             Ok((_stream, addr)) => {
+                if lb_passive_latency && let Some(balancer) = lb_balancer.as_ref() {
+                    balancer.record_latency(
+                        &stream_lb_accounting_target(
+                            &current_host,
+                            current_port,
+                            current_policy_port,
+                        ),
+                        dial_started.elapsed().as_micros() as u64,
+                    );
+                }
                 backend_info.backend_resolved_ip = Some(addr.ip().to_string());
                 // Connection succeeded — break out of retry loop with the
                 // address, carrying the inflight guard so the per-target
@@ -5096,6 +5244,13 @@ async fn handle_tcp_connection_inner(
                 break (addr, _stream, backend_inflight_guard_attempt);
             }
             Err(e) => {
+                if lb_passive_latency && let Some(balancer) = lb_balancer.as_ref() {
+                    balancer.record_failed_attempt(&stream_lb_accounting_target(
+                        &current_host,
+                        current_port,
+                        current_policy_port,
+                    ));
+                }
                 record_cb_failure(circuit_breaker_cache, proxy_id, &current_cb_info);
                 if can_retry
                     && attempt < max_retries
@@ -5123,6 +5278,9 @@ async fn handle_tcp_connection_inner(
                     current_host = next.0;
                     current_port = next.1;
                     current_policy_port = next.2;
+                    // Re-arm stream connection accounting on the new target before the
+                    // previous guard drops the abandoned one (issue #4514).
+                    _lb_guard = arm_lb_guard(&current_host, current_port, current_policy_port);
                     current_cb_info = TcpConnCbInfo {
                         namespace: current_cb_info.namespace.clone(),
                         cb_config: current_cb_info.cb_config.clone(),
@@ -5772,16 +5930,21 @@ fn tcp_port_lane_selection_supported(
     else {
         return Ok(false);
     };
-    let unsupported_algorithm = match override_config.algorithm {
-        Some(crate::config::types::LoadBalancerAlgorithm::LeastConnections) => Some("LEAST_CONN"),
-        Some(crate::config::types::LoadBalancerAlgorithm::LeastLatency) => Some("LEAST_LATENCY"),
-        _ => None,
-    };
-    if let Some(algorithm) = unsupported_algorithm {
+    // `LEAST_CONN` is supported here: both stream paths now hold a
+    // `LoadBalancerConnectionGuard` for the connection/session lifetime (issue
+    // #4514), and `select_for_port` reads the balancer-level active-connection
+    // counters those guards feed. `LEAST_LATENCY` stays refused uniformly on
+    // stream proxies: UDP/DTLS has no per-request RTT sample, so a per-port
+    // latency lane would be fed on TCP and silently inert on UDP.
+    if matches!(
+        override_config.algorithm,
+        Some(crate::config::types::LoadBalancerAlgorithm::LeastLatency)
+    ) {
         return Err(StreamSetupError::new(
             StreamSetupKind::UnsupportedStreamPolicy,
             format!(
-                "for TCP port {port}: per-port {algorithm} requires stream load-balancer accounting"
+                "for TCP port {port}: per-port LEAST_LATENCY requires stream latency sampling on \
+                 every dispatch path"
             ),
         )
         .into());
@@ -6605,7 +6768,7 @@ mod backend_target_selection_tests {
     }
 
     #[test]
-    fn resolve_backend_target_rejects_tcp_port_lane_for_least_connections() {
+    fn resolve_backend_target_engages_tcp_port_lane_for_least_connections() {
         let mut config = config_with_two_targets();
         config.upstreams[0].algorithm = crate::config::types::LoadBalancerAlgorithm::RoundRobin;
         config.upstreams[0].port_overrides.insert(
@@ -6623,15 +6786,15 @@ mod backend_target_selection_tests {
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
-        let err = resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
-            .expect_err("per-port LEAST_CONN must be rejected explicitly");
-        let setup = find_stream_setup_error(&err).expect("typed stream setup error");
+        let (_host, _port, _policy_port, port_lane, _health_port_scope) =
+            resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
+                .expect("per-port LEAST_CONN is supported once stream accounting exists");
 
-        assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
-        assert!(
-            setup.message.contains("per-port LEAST_CONN"),
-            "error should make the unsupported policy explicit: {}",
-            setup.message
+        assert_eq!(
+            port_lane,
+            Some(5432),
+            "per-port LEAST_CONN must engage the port lane now that TCP connections \
+             feed the balancer's active-connection counters (issue #4514)"
         );
     }
 
@@ -6660,10 +6823,62 @@ mod backend_target_selection_tests {
 
         assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
         assert!(
-            setup.message.contains("per-port LEAST_LATENCY"),
+            setup
+                .message
+                .contains("per-port LEAST_LATENCY requires stream latency sampling"),
             "error should make the unsupported policy explicit: {}",
             setup.message
         );
+    }
+
+    /// The whole change rests on one assumption: a synthetic target carrying
+    /// only the dialled `host:port` keys the same accounting slot the real
+    /// selected target does, so the guard can be built without threading the
+    /// selected `UpstreamTarget` through `resolve_backend_target`.
+    #[test]
+    fn stream_lb_accounting_target_keys_the_selected_targets_counter() {
+        let mut config = config_with_two_targets();
+        let mut proxy = proxy_with_subset(None);
+        proxy.upstream_id = Some("orders".to_string());
+        config.proxies.push(proxy);
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies.pop().expect("proxy pushed above");
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let (host, port, policy_port, _port_lane, _health_port_scope) =
+            resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
+                .expect("target selected");
+
+        let balancer = snapshot
+            .balancer(&proxy.namespace, "orders")
+            .expect("balancer for upstream");
+        let synthetic = stream_lb_accounting_target(&host, port, policy_port);
+        balancer.record_connection_start(&synthetic);
+
+        let selected = config.upstreams[0]
+            .targets
+            .iter()
+            .find(|t| t.host == host && t.port == port)
+            .expect("synthetic target must correspond to a configured target");
+        let expected_key = crate::load_balancer::target_host_port_key(selected);
+        let counted = balancer
+            .active_connections
+            .get(expected_key.as_str())
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            counted,
+            Some(1),
+            "synthetic accounting target must increment the selected target's counter \
+             ({expected_key})"
+        );
+
+        balancer.record_connection_end(&synthetic);
+        let counted = balancer
+            .active_connections
+            .get(expected_key.as_str())
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(counted, Some(0), "guard drop must return the gauge to zero");
     }
 
     #[test]

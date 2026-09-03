@@ -302,13 +302,13 @@ fn test_check_cert_expiry_for_validation_valid_cert_succeeds() {
 
 #[test]
 fn test_load_crls_none_returns_empty() {
-    let result = load_crls(None).unwrap();
+    let result = load_crls(None, 30).unwrap();
     assert!(result.is_empty());
 }
 
 #[test]
 fn test_load_crls_nonexistent_file_fails() {
-    let result = load_crls(Some("/nonexistent/crl.pem"));
+    let result = load_crls(Some("/nonexistent/crl.pem"), 30);
     assert!(result.is_err());
     let message = result.unwrap_err().to_string();
     assert!(
@@ -323,7 +323,7 @@ fn test_load_crls_empty_file_fails() {
     let dir = TempDir::new().unwrap();
     let path = write_pem(&dir, "empty.pem", "");
 
-    let result = load_crls(Some(&path));
+    let result = load_crls(Some(&path), 30);
     assert!(result.is_err());
     assert!(
         result
@@ -338,7 +338,7 @@ fn test_load_crls_invalid_content_fails() {
     let dir = TempDir::new().unwrap();
     let path = write_pem(&dir, "bad_crl.pem", "not a CRL");
 
-    let result = load_crls(Some(&path));
+    let result = load_crls(Some(&path), 30);
     assert!(result.is_err());
     assert!(
         result
@@ -581,8 +581,16 @@ fn test_load_tls_config_basic_no_client_auth() {
     let env = default_env_config();
     let policy = TlsPolicy::from_env_config(&env).unwrap();
 
-    let result =
-        tls::load_tls_config_with_client_auth(&cert_path, &key_path, None, false, &policy, 30, &[]);
+    let result = tls::load_tls_config_with_client_auth(
+        &cert_path,
+        &key_path,
+        None,
+        false,
+        &policy,
+        30,
+        30,
+        &[],
+    );
     assert!(result.is_ok());
 }
 
@@ -594,8 +602,16 @@ fn test_load_tls_config_accepts_inline_cert_source() {
     let env = default_env_config();
     let policy = TlsPolicy::from_env_config(&env).unwrap();
 
-    let result =
-        tls::load_tls_config_with_client_auth(&cert_pem, &key_pem, None, false, &policy, 30, &[]);
+    let result = tls::load_tls_config_with_client_auth(
+        &cert_pem,
+        &key_pem,
+        None,
+        false,
+        &policy,
+        30,
+        30,
+        &[],
+    );
     assert!(result.is_ok());
 }
 
@@ -625,6 +641,7 @@ fn test_load_tls_config_rejects_unparseable_ocsp_response_source() {
         false,
         &policy,
         30,
+        30,
         &[],
     );
     let error = result.expect_err("arbitrary bytes are not a stapled OCSP response");
@@ -652,6 +669,7 @@ fn test_load_tls_config_rejects_empty_ocsp_response_source() {
         false,
         &policy,
         30,
+        30,
         &[],
     );
     assert!(result.is_err());
@@ -677,6 +695,7 @@ fn test_load_tls_config_with_client_auth_ca() {
         false,
         &policy,
         30,
+        30,
         &[],
     );
     assert!(result.is_ok());
@@ -693,8 +712,16 @@ fn test_load_tls_config_no_verify_mode() {
     let env = default_env_config();
     let policy = TlsPolicy::from_env_config(&env).unwrap();
 
-    let result =
-        tls::load_tls_config_with_client_auth(&cert_path, &key_path, None, true, &policy, 30, &[]);
+    let result = tls::load_tls_config_with_client_auth(
+        &cert_path,
+        &key_path,
+        None,
+        true,
+        &policy,
+        30,
+        30,
+        &[],
+    );
     assert!(result.is_ok());
 }
 
@@ -710,6 +737,7 @@ fn test_load_tls_config_missing_cert_fails() {
         None,
         false,
         &policy,
+        30,
         30,
         &[],
     );
@@ -727,8 +755,16 @@ fn test_load_tls_config_expired_cert_fails() {
     let env = default_env_config();
     let policy = TlsPolicy::from_env_config(&env).unwrap();
 
-    let result =
-        tls::load_tls_config_with_client_auth(&cert_path, &key_path, None, false, &policy, 30, &[]);
+    let result = tls::load_tls_config_with_client_auth(
+        &cert_path,
+        &key_path,
+        None,
+        false,
+        &policy,
+        30,
+        30,
+        &[],
+    );
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("expired"));
 }
@@ -751,6 +787,7 @@ fn test_load_tls_config_empty_ca_bundle_fails() {
         Some(&ca_path),
         false,
         &policy,
+        30,
         30,
         &[],
     );
@@ -819,6 +856,7 @@ fn test_enable_early_data_keeps_https_frontend_disabled() {
         false,
         &base_policy,
         30,
+        30,
         &[],
     )
     .unwrap();
@@ -854,6 +892,7 @@ fn test_enable_early_data_zero_is_noop() {
         None,
         false,
         &base_policy,
+        30,
         30,
         &[],
     )

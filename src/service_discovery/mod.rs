@@ -16,6 +16,7 @@ pub mod http_body;
 pub mod kubernetes;
 pub mod mesh;
 
+use crate::circuit_breaker::CircuitBreakerCache;
 use crate::config::types::{
     GatewayConfig, LoadBalancerAlgorithm, MAX_TARGET_WEIGHT, SdProvider, ServiceDiscoveryConfig,
     Upstream, UpstreamTarget,
@@ -433,6 +434,11 @@ pub struct ServiceDiscoveryManager {
     request_epoch: Option<Arc<RequestEpochStore>>,
     dns_cache: DnsCache,
     health_checker: Arc<HealthChecker>,
+    /// Shared breaker cache, so a publication that retires targets reclaims
+    /// their breaker entries in the same pass that reclaims their health
+    /// state (issue #4516). Without it, SD churn accumulates dead entries
+    /// until the admission ceiling silently disables circuit breaking.
+    circuit_breaker_cache: Arc<CircuitBreakerCache>,
     /// Shared HTTP client for Kubernetes and Consul discovery calls.
     /// Inherits the gateway's pool config, DNS cache, trust store, and
     /// `FERRUM_TLS_NO_VERIFY` setting.
@@ -447,6 +453,7 @@ impl ServiceDiscoveryManager {
         load_balancer_cache: Arc<LoadBalancerCache>,
         dns_cache: DnsCache,
         health_checker: Arc<HealthChecker>,
+        circuit_breaker_cache: Arc<CircuitBreakerCache>,
         http_client: PluginHttpClient,
         request_epoch: Option<Arc<RequestEpochStore>>,
     ) -> Self {
@@ -456,6 +463,7 @@ impl ServiceDiscoveryManager {
             request_epoch,
             dns_cache,
             health_checker,
+            circuit_breaker_cache,
             http_client,
             next_generation: AtomicU64::new(1),
         }
@@ -785,6 +793,7 @@ impl ServiceDiscoveryManager {
             hash_on: upstream.hash_on.clone(),
             dns_cache: self.dns_cache.clone(),
             health_checker: self.health_checker.clone(),
+            circuit_breaker_cache: self.circuit_breaker_cache.clone(),
             poll_interval_seconds: poll_interval,
             staleness: spec.staleness,
         });
@@ -857,6 +866,7 @@ pub(crate) struct DiscoveryTaskContext {
     hash_on: Option<String>,
     dns_cache: DnsCache,
     health_checker: Arc<HealthChecker>,
+    circuit_breaker_cache: Arc<CircuitBreakerCache>,
     poll_interval_seconds: u64,
     staleness: DiscoveryStaleness,
 }
@@ -1074,6 +1084,7 @@ pub fn spawn_supervised_discovery_task_for_test(
     lb_cache: Arc<LoadBalancerCache>,
     request_epoch: Option<Arc<RequestEpochStore>>,
     health_checker: Arc<HealthChecker>,
+    circuit_breaker_cache: Arc<CircuitBreakerCache>,
     dns_cache: DnsCache,
     static_targets: Vec<UpstreamTarget>,
     algorithm: LoadBalancerAlgorithm,
@@ -1099,6 +1110,7 @@ pub fn spawn_supervised_discovery_task_for_test(
         hash_on: None,
         dns_cache,
         health_checker,
+        circuit_breaker_cache,
         poll_interval_seconds,
         staleness,
     });
@@ -1180,6 +1192,7 @@ pub fn staleness_expiry_probe_for_test(
     lb_cache: Arc<LoadBalancerCache>,
     request_epoch: Option<Arc<RequestEpochStore>>,
     health_checker: Arc<HealthChecker>,
+    circuit_breaker_cache: Arc<CircuitBreakerCache>,
     dns_cache: DnsCache,
     static_targets: Vec<UpstreamTarget>,
     algorithm: LoadBalancerAlgorithm,
@@ -1206,6 +1219,7 @@ pub fn staleness_expiry_probe_for_test(
         hash_on: None,
         dns_cache,
         health_checker,
+        circuit_breaker_cache,
         poll_interval_seconds,
         staleness,
     });
@@ -1814,6 +1828,7 @@ pub(crate) async fn apply_discovered_snapshot(
     shutdown_rx: &Option<tokio::sync::watch::Receiver<bool>>,
     dns_cache: &DnsCache,
     health_checker: &HealthChecker,
+    circuit_breaker_cache: &CircuitBreakerCache,
     lifecycle: Option<&DiscoveryLifecycle>,
     // Supervised task context, when one exists. Carries the staleness policy
     // and the withdrawal inputs that keep the deadline armed across
@@ -2047,6 +2062,7 @@ pub(crate) async fn apply_discovered_snapshot(
                 algorithm,
                 hash_on,
                 health_checker,
+                circuit_breaker_cache,
             ) {
                 Ok(()) => FencedInstall::Published,
                 Err(error) => FencedInstall::Failed(error),
@@ -2110,10 +2126,14 @@ pub(crate) async fn apply_discovered_snapshot(
     DiscoveryApplyControl::Continue
 }
 
-/// Publish a merged target set and prune health state that no longer applies.
+/// Publish a merged target set and prune the per-target state that no longer
+/// applies: active/passive health, and the circuit breakers for every proxy
+/// that routes to this upstream.
 ///
 /// Shared by ordinary snapshot publication and by staleness withdrawal so both
-/// paths install through the same epoch/load-balancer contract.
+/// paths install through the same epoch/load-balancer contract. Withdrawal
+/// releases breakers too: a withdrawn target is not live, so retaining its
+/// admission slot is the same leak (issue #4516).
 #[allow(clippy::too_many_arguments)]
 fn install_merged_targets(
     upstream_namespace: &str,
@@ -2124,6 +2144,7 @@ fn install_merged_targets(
     algorithm: crate::config::types::LoadBalancerAlgorithm,
     hash_on: &Option<String>,
     health_checker: &HealthChecker,
+    circuit_breaker_cache: &CircuitBreakerCache,
 ) -> Result<(), String> {
     if let Some(epoch_store) = request_epoch {
         let _published = epoch_store.update_load_balancer(
@@ -2159,6 +2180,15 @@ fn install_merged_targets(
             proxy_targets_discovered_upstream(proxy, upstream_namespace, upstream_id)
         }) {
             health_checker.remove_stale_passive_targets_for_proxy(
+                &proxy.namespace,
+                &proxy.id,
+                merged,
+            );
+            // Same iteration, same merged slice: the breaker layer and the
+            // passive-health layer can never disagree about which proxies
+            // target this upstream, and retired targets release their breaker
+            // admission slots without waiting for a config delta (#4516).
+            circuit_breaker_cache.prune_stale_targets_for_proxy(
                 &proxy.namespace,
                 &proxy.id,
                 merged,
@@ -2321,6 +2351,7 @@ async fn run_discovery_loop(
                     &shutdown_rx,
                     &ctx.dns_cache,
                     &ctx.health_checker,
+                    &ctx.circuit_breaker_cache,
                     Some(&lifecycle),
                     Some(ctx.as_ref()),
                 )
@@ -2431,6 +2462,7 @@ fn apply_staleness_expiry(
             ctx.algorithm,
             &ctx.hash_on,
             &ctx.health_checker,
+            &ctx.circuit_breaker_cache,
         ) {
             Ok(()) => WithdrawalAttempt::Published,
             Err(error) => WithdrawalAttempt::Failed(error),

@@ -34,8 +34,8 @@ Why publication cannot simply be one gate: ci.yml's `main-publish-gate` job and
 the `needs`/`if` of `latest-release`, `docker`, and `docker-manifest` are frozen
 byte-for-byte by `.github/scripts/verify_cross_build_policy.py`, a protected
 trusted-policy file no pull request may modify. The frozen array therefore keeps
-carrying three of the eight contexts, while `Tests` is carried by the publishing
-jobs' in-run dependency. The remaining four are carried by the
+carrying three of the nine contexts, while `Tests` is carried by the publishing
+jobs' in-run dependency. The remaining five are carried by the
 `main-publication-required-checks` job hosted in
 `gateway-api-conformance.yml` -- a workflow whose RUN CONCLUSION the frozen
 array already requires to be successful for the exact SHA. The single-valued

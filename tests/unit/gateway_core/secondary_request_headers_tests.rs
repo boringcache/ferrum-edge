@@ -9,7 +9,7 @@
 use ferrum_edge::plugins::RequestContext;
 use ferrum_edge::proxy::headers::{
     BACKEND_REQUEST_STRIP_HEADER_NAMES, PROXY_GENERATED_FORWARDING_HEADER_NAMES,
-    SecondaryRequestHostPolicy, filter_secondary_request_headers,
+    SecondaryRequestHostPolicy, filter_secondary_request_headers, is_backend_request_strip_header,
     is_secondary_request_strip_header, is_untrusted_real_ip_header,
     synthesize_grpc_te_trailers_if_needed,
 };
@@ -60,6 +60,42 @@ fn secondary_filter_strips_every_canonical_backend_and_forwarding_name() {
             "secondary filter must strip proxy-owned `{name}`: {out:?}"
         );
     }
+}
+
+/// Issue #4546: `Expect: 100-continue` is satisfied by Ferrum's own HTTP/1
+/// server (hyper writes the interim response when the request body is first
+/// polled), and the reqwest/hyper client has no `Expect` support, so the
+/// expectation must never reach the origin. One predicate entry covers every
+/// backend transport: the reqwest, direct-H2, gRPC, HTTP/3 and HBONE builders
+/// all dispatch through `is_backend_request_strip_header`.
+#[test]
+fn backend_request_strip_covers_expect_continue() {
+    assert!(is_backend_request_strip_header("expect"));
+    assert!(BACKEND_REQUEST_STRIP_HEADER_NAMES.contains(&"expect"));
+
+    // The predicate takes a lowercased name; the boundaries that call it
+    // lowercase first, so a wire-cased `Expect` is stripped just the same.
+    assert!(is_secondary_request_strip_header(
+        "Expect",
+        &[],
+        SecondaryRequestHostPolicy::Preserve,
+        PEER_TRUSTED,
+    ));
+
+    let mut headers = HashMap::new();
+    headers.insert("Expect".to_string(), "100-continue".to_string());
+    headers.insert("x-keep".to_string(), "ok".to_string());
+    let out = filter_secondary_request_headers(
+        &headers,
+        SecondaryRequestHostPolicy::Preserve,
+        PEER_TRUSTED,
+        &[],
+    );
+    assert!(
+        !out.iter().any(|(k, _)| k.eq_ignore_ascii_case("expect")),
+        "Expect must not survive onto a secondary request: {out:?}"
+    );
+    assert!(out.iter().any(|(k, _)| k == "x-keep"));
 }
 
 #[test]

@@ -4258,6 +4258,16 @@ paths:
         contention, a lapsed admission lease, and a failed datastore write —
         all retryable with the identical payload.
 
+        A database failure during the validation phase is likewise a `503`,
+        never a `400`, and returns the redacted database-unavailable body
+        (`{"error": "Database unavailable — operation failed"}` with no
+        `validation_errors`). This covers the reference lookups and the four
+        candidate-validation loads that run before them — transaction-log
+        schema, consumer credentials, mTLS compatibility, and the plugin graph
+        (the first database call for any batch carrying `plugin_configs`).
+        `400` is reserved for payload problems: the failures a retry of the
+        identical body cannot fix.
+
         One residual case is not decidable by the server: if the commit itself
         is acknowledged but the acknowledgement is lost in transit, the batch
         is reported as a `503` even though the graph is durable. A retry of the
@@ -4823,7 +4833,11 @@ paths:
       description: |
         Replaces the proxy with the given body. The `id` field in the body is
         ignored — the path parameter is authoritative. `updated_at` is set
-        automatically.
+        automatically. This is a full replace: any field the body omits is
+        reset to its schema default. The one exception is `plugins` — an
+        omitted `plugins` key preserves the existing plugin associations
+        instead of detaching them; send `"plugins": []` to clear them
+        explicitly.
 
         In database mode a `200` means a covering `config_changes` generation
         is live on this process. If reload cannot apply, the API returns `503`
@@ -5605,6 +5619,17 @@ paths:
     put:
       operationId: updatePluginConfig
       summary: Update a plugin configuration
+      description: |
+        Replaces the plugin configuration with the given body. The `id` field in
+        the body is ignored — the path parameter is authoritative. This is a
+        full replace: any field the body omits is reset to its schema default.
+
+        `enabled` must be sent explicitly. Because its default is `true`, a body
+        that omits it would silently re-enable a deliberately disabled
+        configuration; such a body is rejected with `400` and nothing is
+        mutated. `POST /plugins/config` and `/batch` still default `enabled` to
+        `true` when the key is absent — a create has no prior state to
+        overwrite.
       tags: [Plugins]
       requestBody:
         required: true
@@ -5777,6 +5802,12 @@ paths:
     put:
       operationId: updateUpstream
       summary: Update an upstream
+      description: |
+        Replaces the upstream with the given body. The `id` field in the body is
+        ignored — the path parameter is authoritative. This is a full replace:
+        any field the body omits is reset to its schema default. `targets` is
+        required by the schema, so a body that omits it is rejected with `400`
+        rather than silently emptying the target list.
       tags: [Upstreams]
       requestBody:
         required: true
@@ -8385,6 +8416,17 @@ components:
         days_until_expiry:
           type: integer
           format: int64
+        next_update:
+          type: string
+          format: date-time
+          description: >-
+            nextUpdate of this entry's revocation material: the soonest across a CRL
+            bundle, or the earliest SingleResponse for a stapled OCSP response. Absent
+            for every other material kind.
+        days_until_next_update:
+          type: integer
+          format: int64
+          description: Whole days until `next_update`, computed the same way as `days_until_expiry`.
         fingerprint_sha256:
           type: string
           description: SHA-256 fingerprint of the leaf certificate. Not populated for private keys.
@@ -8935,7 +8977,13 @@ components:
           default: []
           items:
             $ref: "#/components/schemas/PluginAssociation"
-          description: Plugin configurations applied to this proxy
+          description: >-
+            Plugin configurations applied to this proxy. `PUT /proxies/{id}` is
+            presence-aware for this one field: an omitted `plugins` key
+            preserves the stored associations rather than detaching them (the
+            `default: []` would otherwise silently remove an authentication
+            plugin on a partial replace body). Send `"plugins": []` explicitly
+            to clear them; any present array replaces them wholesale.
         pool_idle_timeout_seconds:
           type: [integer, "null"]
           format: uint64
@@ -9211,25 +9259,31 @@ components:
         udp_max_response_amplification_factor:
           type: [number, "null"]
           format: float
-          exclusiveMinimum: 0
+          minimum: 0
           maximum: 1024
           description: |
             Maximum allowed response amplification factor for UDP proxies.
-            When set, backend→client datagrams share one remaining payload-byte
-            budget per admitted client request (`payload_size * factor`,
-            cumulative across replies). A zero-length request receives an
-            explicit one-byte reply allowance so it cannot black-hole the
-            session; nonempty requests retain the exact configured payload
-            ratio. Every backend response datagram consumes at least one unit
-            of remaining budget, so a zero-length reply cannot bypass a finite
-            factor. This protects against UDP amplification attacks (e.g.,
-            spoofed-source reflection). Values must be finite, greater than 0,
-            and at most 1024. When omitted (default for hand-authored proxies),
-            no amplification cap is applied. Gateway API `UDPRoute` translation
-            never leaves this unset: it projects a finite controller default
-            of 8.0 unless a Ferrum `UDPResponseAmplificationPolicy` supplies a
-            finite override or an explicit dual-acknowledged unlimited mode.
-            Only applicable for `udp` / `dtls` proxies.
+            Backend→client datagrams share one remaining payload-byte budget
+            per admitted client request (`payload_size * factor`, cumulative
+            across replies). A zero-length request receives an explicit
+            one-byte reply allowance so it cannot black-hole the session;
+            nonempty requests retain the exact configured payload ratio. Every
+            backend response datagram consumes at least one unit of remaining
+            budget, so a zero-length reply cannot bypass a finite factor. This
+            protects against UDP amplification attacks (e.g., spoofed-source
+            reflection). Finite values must be greater than 0 and at most 1024.
+
+            **Omitting the field is not unlimited.** Every `udp` / `dtls` proxy
+            that leaves it unset is normalized to the finite default `8.0`,
+            whatever the configuration source (file, database, admin API,
+            CP→DP, mesh, Gateway API), so a UDP proxy is never an open
+            reflector by default. `0` is the explicit operator opt-out meaning
+            "no limit"; it is accepted only on `udp` / `dtls` proxies and the
+            affected listener logs a warning at startup. Gateway API `UDPRoute`
+            translation projects the same `8.0` default unless a Ferrum
+            `UDPResponseAmplificationPolicy` supplies a finite override or an
+            explicit dual-acknowledged unlimited mode, which is materialized as
+            `0`. Only applicable for `udp` / `dtls` proxies.
         allowed_methods:
           oneOf:
             - type: array
@@ -10592,6 +10646,10 @@ components:
           description: >-
             Whether the plugin is active. Disabled configs are stored but not
             constructed; enabling them performs full plugin-specific validation.
+            The `default: true` applies to `POST /plugins/config` only. `PUT
+            /plugins/config/{id}` is a full replace, so an omitted `enabled`
+            would silently re-enable a deliberately disabled config; the server
+            rejects such a body with `400` and requires the field explicitly.
         priority_override:
           type: [integer, "null"]
           minimum: 0
@@ -16228,7 +16286,27 @@ components:
         - forced_full_reloads_total
         - recoveries_total
         - last_resource_category
+        - config_source_connected
+        - poll_failures_by_reason
       properties:
+        config_source_connected:
+          type: boolean
+          description: |
+            Whether the configuration source (the database in `database` mode,
+            the control plane's backing database in `cp` mode) is currently
+            reachable and usable. The same shared flag `/health` reports as
+            `database.available` and the admin API uses to gate writes, and the
+            source of the `ferrum_database_config_source_connected` gauge.
+        poll_failures_by_reason:
+          type: object
+          description: |
+            Poll failures keyed by the closed reason set `connectivity`,
+            `validation_rejected`, `migration_gate`. Every reason is always
+            present. Reasons are compile-time labels, never derived from a
+            backend error string.
+          additionalProperties:
+            type: integer
+            format: int64
         rejected_deltas_total:
           type: integer
           format: int64
@@ -19635,6 +19713,24 @@ components:
             Maximum monotonic age of the last validated non-empty remote JWKS.
             Cached keys fail closed at this deadline even if refreshes keep
             failing or return empty. Zero is invalid and cannot disable expiry.
+        kid_miss_refresh_cooldown_seconds:
+          type: integer
+          format: uint64
+          minimum: 0
+          maximum: 3600
+          default: 30
+          description: >-
+            Minimum spacing between out-of-band JWKS refetches triggered by a
+            token naming a kid the trusted key set does not contain — the
+            observable shape of an identity-provider key rotation. At most one
+            fetch is issued per window, so tokens carrying random identifiers
+            cannot become a fetch storm. The triggering request is never
+            blocked on the fetch and still fails closed; a later request
+            verifies once the refreshed key set is published. A token with a
+            missing or empty kid triggers nothing. Zero disables the on-demand
+            refetch, leaving jwks_refresh_interval_secs as the only recovery
+            path. Shared stores use the most restrictive value requested by
+            active consumers (disabled wins, otherwise the longest cooldown).
         sync_mode:
           type: string
           enum: [local, redis]
@@ -20557,6 +20653,7 @@ components:
         exact destination Service and waypoint Gateway/GatewayClass identity — construction-time
         retention is OR over the attachment list and never widens a targeted
         policy onto another destination. See `docs/mesh.md`.
+      additionalProperties: false
       properties:
         mesh_slice:
           type: object
@@ -20742,6 +20839,7 @@ components:
         explicit `host:port` pairs, `host:*` (any explicit Host port), and
         wildcard hosts (`*.example.com`, `*.example.com:443`,
         `*.example.com:*`). Empty registry fails closed.
+      additionalProperties: false
       properties:
         registry:
           type: array
@@ -21350,6 +21448,7 @@ components:
         `custom_tags`, `custom_header_tags`, and `custom_env_tags` combined. The
         individual `maxProperties: 32` bounds remain for generated clients, but
         the cross-property combined total cannot be expressed mechanically.
+      additionalProperties: false
       properties:
         node_id:
           type: string
@@ -21614,6 +21713,84 @@ components:
           description: |
             Service name attached to exported spans. Defaults to the
             workload's service when omitted.
+        deployment_environment:
+          type: string
+          description: |
+            `deployment.environment` resource attribute stamped on exported
+            spans. Read by the shared OTel exporter options off this same
+            root config object.
+        batch_size:
+          type: integer
+          description: |
+            Span export batch size. Read by the shared OTel exporter options
+            off this same root config object.
+        flush_interval_ms:
+          type: integer
+          description: |
+            Span export flush interval in milliseconds. Read by the shared
+            OTel exporter options off this same root config object.
+        buffer_capacity:
+          type: integer
+          description: |
+            Maximum buffered spans awaiting export. Read by the shared OTel
+            exporter options off this same root config object.
+        buffer_max_bytes:
+          type: integer
+          description: |
+            Maximum retained bytes of buffered spans. Read by the shared OTel
+            exporter options off this same root config object.
+        max_retries:
+          type: integer
+          description: |
+            Span export retry attempts. Read by the shared OTel exporter
+            options off this same root config object.
+        retry_delay_ms:
+          type: integer
+          description: |
+            Delay between span export retries, in milliseconds. Read by the
+            shared OTel exporter options off this same root config object.
+        disable_span_reporting:
+          type: boolean
+          description: |
+            Alias for `span_reporting_disabled`, accepted for parity with the
+            Istio Telemetry CRD field name. Ignored when
+            `span_reporting_disabled` is present.
+        disableSpanReporting:
+          type: boolean
+          description: |
+            camelCase alias for `span_reporting_disabled`, accepted for parity
+            with the Istio Telemetry CRD field name. Ignored when either
+            snake_case spelling is present.
+        direction_emit:
+          type: object
+          additionalProperties: false
+          properties:
+            server:
+              type: boolean
+            client:
+              type: boolean
+          description: |
+            Which traffic directions emit telemetry, translated from
+            `Telemetry.tracing[].match.mode`. Defaults to server-only.
+        _effective_mesh_authz_baggage_gates:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            properties:
+              trusted_hbone_assertors:
+                type: array
+                items:
+                  type: object
+              trust_domain_aliases:
+                type: array
+                items:
+                  type: string
+          description: |
+            Internal mesh-injection field: an exact copy of every enabled
+            global `mesh_authz` baggage gate, evaluated as a fail-closed
+            conjunction. Not operator-facing; direct instances configure
+            `trusted_hbone_assertors` / `trust_domain_aliases` instead.
 
     MeshBpfMetricsConfig:
       type: object
@@ -21624,6 +21801,7 @@ components:
         surface. Mesh mode auto-injects it when BPF metrics are available;
         operator-managed plugin configs should not create names prefixed
         with `__`.
+      additionalProperties: false
       properties:
         prefix:
           type: string
@@ -22337,11 +22515,16 @@ components:
                     maxLength: 512
                     description: >-
                       Literal byte-prefix of the request Origin header
-                      (case-sensitive), e.g. "https://app.". A prefix that does
-                      not constrain the host (missing `://` or empty authority,
-                      such as "https://" or "h") is effectively universal: it
-                      is admitted without credentials but cannot be combined
-                      with allow_credentials.
+                      (case-sensitive), e.g. "https://app.". Matching is an
+                      unbounded starts_with with no origin parse, so a prefix
+                      constrains the host ONLY when it terminates at an origin
+                      boundary — the form "scheme://host:" (trailing port
+                      separator, any port). Every other shape, including a bare
+                      "https://app.example.com" (which also matches
+                      "https://app.example.com.evil.net"), "https://app.",
+                      "https://app.example.com:8443", "https://" and "h", is
+                      effectively universal: admitted without credentials, but
+                      it cannot be combined with allow_credentials.
                   regex:
                     type: string
                     minLength: 1
@@ -22408,9 +22591,12 @@ components:
             wildcard origins (native `"*"` / `{exact: "*"}` logs a warning and
             disables credentials), opaque exact `null`, and an effectively
             universal prefix or regex (refused at config load rather than
-            silently weakened). A
-            prefix must constrain the host (`://` plus at least one host
-            character); a regex must not match `null` or every origin of a scheme.
+            silently weakened). A prefix must terminate at an origin boundary —
+            only the `scheme://host:` form pins the host, because prefix
+            matching is an unbounded starts_with; a regex must not match `null`
+            or every origin of a scheme (universality is probed against
+            reserved DNS-shaped origins, so a hostname-character-class pattern
+            such as `https://[\w.-]+` is effectively universal).
         max_age:
           type: integer
           format: uint64
@@ -24004,8 +24190,21 @@ components:
           type: array
           items:
             type: string
+          description: >-
+            Base media types whose request/response bodies are eligible for
+            inspection. Matching is on the lowercased base type with parameters
+            stripped. RFC 6839 structured-syntax suffixes map onto their base
+            family and re-check this list: a type ending in `+json` (for example
+            `application/vnd.api+json` or `application/ld+json`) is inspected
+            when `application/json` is listed, and one ending in `+xml` (for
+            example `application/atom+xml`) when either `application/xml` or
+            `text/xml` is listed. The suffix rule reuses this allowlist rather
+            than adding hidden types, so removing `application/json` also
+            excludes `+json` types. `multipart/*` is governed by
+            `inspect_multipart`; anything else by `inspect_binary_body`.
           default:
             - application/json
+            - text/json
             - application/x-www-form-urlencoded
             - application/xml
             - text/xml

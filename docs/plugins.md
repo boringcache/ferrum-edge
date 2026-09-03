@@ -2244,6 +2244,7 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 | `sync_mode` | String | `local` or `redis` (default `local`). `redis` is required by, and only valid with, at least one provider declaring `dpop_replay_scope: shared` |
 | `redis_url`, `redis_tls`, `redis_key_prefix`, `redis_pool_size`, `redis_connect_timeout_seconds`, `redis_health_check_interval_seconds`, `redis_username`, `redis_password` | — | Shared Redis connectivity for the DPoP replay authority. Same semantics as every other Redis-backed plugin. The default key prefix is `{FERRUM_NAMESPACE}:jwks_auth:{plugin-config-id}` |
 | `jwks_max_stale_seconds` | u64 | Maximum age of the last validated non-empty remote JWKS (default: `3600`, max: `86400`). `0` is invalid and cannot disable fail-closed expiry |
+| `kid_miss_refresh_cooldown_seconds` | u64 | Minimum spacing between out-of-band JWKS refetches triggered by an unknown JWT `kid` (default: `30`, max: `3600`). `0` disables the on-demand refetch |
 
 Claim values are auto-detected as space-delimited strings (OAuth2 standard), JSON arrays, or nested objects via dot-notation paths.
 Claim header fan-out refuses reserved hop-by-hop, authorization, host, and consumer identity headers.
@@ -2252,6 +2253,8 @@ Unknown top-level, provider, and custom-header-location fields are rejected so m
 Remote discovery documents are capped at 128 KiB and JWKS responses at 1 MiB/256 keys, with bounded key components. A valid non-empty JWKS atomically replaces the key map, refreshes the monotonic trust deadline, clears failure state, and can restore authentication after expiry. Empty 200 responses, malformed or oversized bodies, non-2xx status, and transport/DNS/TLS/timeout failures retain last-known-good material only for the finite grace window and use a bounded accelerated retry cadence; after the deadline, verification refuses the retained material without deleting diagnostic/recovery state. JWKs are accepted for signature verification only when `use` is absent or `sig` and `key_ops` is absent or includes `verify`; contradictory operation metadata is rejected. Signing keys without a non-empty `kid` are unusable, and a JWKS with duplicate usable `kid` values is rejected rather than choosing one by response order.
 
 JWT header `kid` is required and binding. A missing `kid`, an empty `kid`, or a `kid` that is not in the selected provider's current trusted JWKS is rejected with the same generic 401 (`{"error":"Invalid or unrecognized JWT"}`) as any other invalid token. There is no all-keys fallback: a known `kid` selects only that key, so a token signed by a different published key is still rejected. Ferrum never logs token data, key material, claims, or attacker-controlled `kid` values.
+
+A token naming a non-empty `kid` the trusted key set does not contain also triggers **at most one out-of-band JWKS fetch per `kid_miss_refresh_cooldown_seconds` window**, so an identity-provider key rotation recovers in seconds instead of waiting out `jwks_refresh_interval_secs`. The triggering request still fails closed — it never blocks on the fetch — and a later request verifies once the refreshed key set is published. A missing or empty `kid` triggers nothing, and the cooldown bounds tokens carrying random identifiers to one fetch per window. The out-of-band fetch is strictly additional: it never shortens the periodic refresh cadence or the empty-store retry backoff. Because `oidc_relying_party` and mesh `MeshRequestAuthentication` injection consume the same shared store, they inherit the behaviour without a knob of their own; a shared store honours the most restrictive cooldown among its active consumers (disabled wins, otherwise the longest window).
 
 Authenticated `/metrics` exposes only fixed-cardinality aggregate JWKS state for **active remote** stores: `fresh`, `grace`, or `expired`, maximum trust age per state, and closed refresh-failure classes. It never labels a series with a JWKS/discovery URL, `kid`, token, claim, or key material. Authenticated `/health`/`/status` mirror the same closed-set counts under `jwks_trust`; unauthenticated probes see only coarse readiness effects (grace → degraded+ready, expired → unavailable+not-ready, none → neutral) from an O(1) cached aggregate. Choose the maximum-stale window as an explicit availability-versus-revocation trade-off; production deployments should keep it short enough for emergency key removal to take effect within their incident-response objective.
 
@@ -2409,6 +2412,49 @@ and unknown `kid` values are rejected with a generic invalid-ID-token error;
 there is no all-keys fallback. A known `kid` with a bad signature under that
 key is also rejected. Token data, key material, claims, and attacker-controlled
 `kid` values are never logged.
+
+### Credential storage at rest
+
+Ferrum stores consumer credentials in the configuration database (the
+`consumers.credentials` JSON column on SQL, the equivalent document field on
+MongoDB). Only `basicauth` is hashed. The other three secret-bearing credential
+types are **stored recoverable** — the database row holds the same value the
+client presents — because their verification schemes need the original value,
+not a one-way digest of it. This is inherent to the schemes, not a defect, but
+it is not parity with `basicauth` and it changes the threat model for anyone
+who can read the database, a replica, or a backup file.
+
+| Credential type | Stored form | Why | What a database read recovers |
+|---|---|---|---|
+| `basicauth` | `hmac_sha256:<64 lowercase hex>`, derived under `FERRUM_BASIC_AUTH_HMAC_SECRET` | Verification only has to compare hashes | Nothing directly usable without the server-side HMAC secret |
+| `keyauth` | The API key verbatim | The presented key is matched against the stored key by indexed lookup | Every API key, immediately replayable against the gateway |
+| `jwt` | The HS256 shared secret verbatim | HS256 verification needs the signing key itself | Every shared secret; the reader can forge accepted tokens |
+| `hmac_auth` | The shared secret verbatim | The request HMAC is recomputed from the secret | Every shared secret; the reader can forge accepted signatures |
+| `mtls_auth` | The certificate identity string only | Matching is on identity, not on a secret | No private key material — none is ever stored |
+
+The admin API's `[REDACTED]` projection and the `/backup` endpoint's unredacted
+export are both *response* behaviors; neither changes what the database row
+contains. See [Consumer credential redaction](admin_api.md#consumers) and
+[docs/admin_backup_restore.md](admin_backup_restore.md).
+
+**Mitigations**
+
+- Require TLS to the configuration database with `FERRUM_DB_TLS_MODE` (plus the
+  `FERRUM_DB_TLS_CA_CERT_PATH`, `FERRUM_DB_TLS_CLIENT_CERT_PATH`, and
+  `FERRUM_DB_TLS_CLIENT_KEY_PATH` material where the deployment uses database
+  mTLS), and enable the database engine's own at-rest encryption for the volume
+  holding the `consumers` table or collection.
+- Treat `/backup` output as credential material: it carries the same recoverable
+  values the database already holds. See
+  [docs/admin_backup_restore.md](admin_backup_restore.md).
+- Prefer schemes that keep no verifier-side secret where the deployment allows
+  it: [`jwks_auth`](#jwks_auth) with asymmetric issuer keys (the gateway holds
+  only public keys) and [`mtls_auth`](#mtls_auth) (the gateway holds only an
+  identity string).
+- Rotate without downtime through the multi-credential array endpoints —
+  `PUT`/`POST`/`DELETE /consumers/{id}/credentials/{type}` — so a suspected
+  database exposure can be remediated by adding a new credential, rolling
+  clients over, and deleting the old entry.
 
 ### `jwt_auth`
 
@@ -2914,6 +2960,7 @@ On top of that ordering:
 - Duplicate Reference URIs are rejected. The X.509 Reference ceiling is **8**; SAML accepts exactly one Reference, targeting the enclosing assertion's own id.
 - One bounded id index is built per message after the structure is settled, replacing a full-envelope scan per Reference. The independent raw start-tag scan is likewise a single pass covering every referenced id at once.
 - Every canonicalization is charged against an aggregate per-message byte budget of `2 × decoded body length` (floor 64 KiB), counting both the source subtree walked and the canonical bytes emitted. An over-budget message is refused before the work is done.
+- Element nesting is bounded to **256 levels**, screened over the raw envelope bytes before the document reaches `roxmltree`, whose tokenizer recurses once per open element: the 65 536-node parser budget bounds a *wide* document but cannot stop a deeply nested one from exhausting the worker stack inside the parser itself. An over-depth envelope is refused as malformed XML with a fixed diagnostic that echoes no envelope bytes. The separate 256-level canonicalization budget still bounds the post-parse walk.
 
 #### X.509 must protect the backend-visible Body
 
@@ -3401,6 +3448,8 @@ Rejects HTTP-family requests whose `Host` / `:authority` destination is not in a
 | `reject_status` | u16 | `502` | HTTP 4xx/5xx status returned for unknown destinations. Use `404` when you want to mask policy details. |
 | `outbound_listen_ports` | u16[] | `[]` | Optional frontend listener ports where the registry applies. Mesh auto-injection sets this to the outbound capture listener so inbound sidecar/ambient traffic is not gated by outbound policy. Empty applies wherever the plugin runs. Port `0` is rejected at construction; use `[]` for intentional global scope. |
 
+Unknown top-level keys are rejected at construction (for example a misspelled `regsitry` cannot silently leave the registry empty and admit every destination).
+
 Bare-host registry entries match only requests whose Host header omits an explicit port. `host:port` entries match only that exact port. `host:*` entries match any explicit Host port; mesh-generated registries use this marker for services, ServiceEntries, or workload addresses with no declared ports so known destinations remain reachable when callers include `Host: service:9080`. One-label wildcards (`*.example.com`) are indexed by suffix so lookup cost does not grow with unrelated wildcard count. Decision metrics use fixed `host` buckets (`<admit_explicit>`, `<admit_wildcard>`, `<denied>`).
 
 ### `tcp_connection_throttle`
@@ -3806,7 +3855,7 @@ Handles Cross-Origin Resource Sharing at the gateway level.
 | `allowed_methods` | String[] | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Preflight-only allowed methods; not evaluated on actual requests |
 | `allowed_headers` | String[] | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Preflight-only allowed request headers; not evaluated on actual requests |
 | `exposed_headers` | String[] | `[]` | Response headers exposed to browser JavaScript |
-| `allow_credentials` | bool | `false` | Send `Access-Control-Allow-Credentials: true`. Exact `*` drops credentials; opaque exact `null` and an effectively universal prefix or regex are refused. |
+| `allow_credentials` | bool | `false` | Send `Access-Control-Allow-Credentials: true`. Exact `*` drops credentials; opaque exact `null` and an effectively universal prefix or regex are refused. A credentialed prefix must be the host-bounded `scheme://host:` form, because prefix matching is an unbounded `starts_with`. |
 | `max_age` | u64 | `86400` | Preflight cache duration in seconds |
 | `preflight_continue` | bool | `false` | Pass allowed preflights to the backend while replacing its CORS fields with the complete gateway-authoritative policy. |
 | `unmatched_preflights` | `forward` \| `ignore` | — | Istio projection marker preserving unmatched and omitted-field semantics; mutually exclusive with `preflight_continue`. |
@@ -4697,7 +4746,7 @@ layered decode variants used for bodies, not raw whole-URI text.
 | `response_inspection` | bool | `false` | Inspect response headers and, when enabled separately, response bodies. |
 | `response_body_inspection` | bool | `false` | Enable response body rules. |
 | `body_methods` | string[] | `["POST","PUT","PATCH"]` | Methods eligible for request body buffering and scanning. |
-| `body_content_types` | string[] | JSON, form, XML, text, HTML | MIME types eligible for body scanning. Parameters such as `; charset=utf-8` are ignored. |
+| `body_content_types` | string[] | JSON (`application/json`, `text/json`), form, XML, text, HTML | Base MIME types eligible for body scanning. Parameters such as `; charset=utf-8` are ignored and matching is case-insensitive. RFC 6839 structured-syntax suffixes map onto their base family and re-check this list: `+json` types (`application/vnd.api+json`, `application/ld+json`, …) are inspected when `application/json` is listed, and `+xml` types when either `application/xml` or `text/xml` is. The suffix rule reuses this allowlist rather than adding hidden types. |
 | `inspect_multipart` | bool | `false` | Inspect `multipart/*` bodies. |
 | `inspect_binary_body` | bool | `false` | Inspect bodies whose content type is not in `body_content_types`. |
 | `max_scan_bytes` | usize | `1048576` | Maximum bytes scanned from each body. Must be greater than zero. |
@@ -4966,7 +5015,7 @@ The audit follows only schema-bearing positions for the selected draft, includin
 
 Client-visible schema failures never echo the rejected value. A request failure names the failing allowlisted keyword and a bounded instance location (`/items/#/id`, where `#` is the fixed numeric-segment marker); a response failure names only the keyword, so an upstream body's shape is not described back to the client. Raw schema paths, configured XML names, and hostile content-coding tokens are never emitted.
 
-**XML validation**: bodies are parsed with `roxmltree`, a maintained namespace-aware, non-fetching XML parser, so well-formedness means what the XML specification says it means: exactly one document element, valid XML `Name` syntax, correct attribute grammar with quoted and unique attributes, valid characters, declared entity references, and no character data outside the root. The exact original UTF-8 text is passed to the parser without `trim()` or other whitespace normalization, so only XML 1.0 whitespace is accepted around the document. Malformed declarations, unterminated constructs, and quote-aware `>` handling follow the parser's contract. The parser is bounded to 100000 nodes.
+**XML validation**: bodies are parsed with `roxmltree`, a maintained namespace-aware, non-fetching XML parser, so well-formedness means what the XML specification says it means: exactly one document element, valid XML `Name` syntax, correct attribute grammar with quoted and unique attributes, valid characters, declared entity references, and no character data outside the root. The exact original UTF-8 text is passed to the parser without `trim()` or other whitespace normalization, so only XML 1.0 whitespace is accepted around the document. Malformed declarations, unterminated constructs, and quote-aware `>` handling follow the parser's contract. The parser is bounded to 100000 nodes, and element nesting is bounded to 256 levels, screened over the raw body bytes before the parser sees them — `roxmltree`'s tokenizer recurses once per open element, so the node budget alone cannot stop a deeply nested body from exhausting the worker stack inside the parser. Tags appearing inside comments, CDATA sections, processing instructions, and quoted attribute values do not count toward that depth, and the over-depth rejection is a fixed diagnostic that echoes no body bytes.
 
 Two policy guards run before parsing: the configured `<!ENTITY` declaration cap (`xml_max_entities`) with nested-entity rejection (`xml_reject_nested_entities`), and unconditional rejection of external `SYSTEM` / `PUBLIC` identifiers on either the DOCTYPE external subset or an entity declaration. Ferrum accepts no external identifier and never resolves one. The guard is quote/comment/CDATA-aware, so keyword-looking literal text is not misclassified. Internal DTD subsets remain permitted so the entity knobs stay authoritative; the parser still applies its own billion-laughs limits (expansion depth 10, 255 references per reference).
 
@@ -5004,7 +5053,7 @@ Validates request and response bodies against operation schemas generated from a
 | `error_response.content_type` | string | `application/problem+json` | Content type of generated error bodies |
 | `error_truncate_chars` | integer | `1024` | Size bound on the validation diagnostic written to metadata and problem bodies. Only ever narrows: the effective cap is `min(error_truncate_chars, 256)`. It is not a confidentiality control — diagnostics carry no payload bytes to reveal. |
 
-`openapi_validator` compiles path regexes and JSON Schemas at config-load time. It only buffers matching HTTP proxy requests/responses (plus schema-less matching responses when strict missing-schema enforcement requires inspection), decodes complete `Content-Encoding` chains (`gzip` / `br`, including stacked lists such as `gzip, br`) in reverse application order under `max_body_bytes`, maps XML according to OpenAPI `xml` metadata, validates form fields and multipart file metadata (including bounded RFC 5987/8187 `filename*`), supports OpenAPI response wildcard statuses such as `4XX`, and records `openapi_validator.*` metadata for logging. The imported REQUEST contract is decided in the dedicated `validate_client_request_body_contract` lifecycle phase over the original client representation, before any `before_proxy` hook or request-body transformer can add, remove, rename, coerce, or replace fields (`GHSA-896v-jx23-9g6p`); `on_final_request_body` remains the backend-contract fallback when this validator did not select over the pristine client view but can select after a `before_proxy` route override or header/target rewrite, and an instance that already decided never charges the same request twice. Unknown-operation admission (`fail_on_unknown_operation`) is rejected in `before_proxy`, not deferred to that fallback. HBONE CONNECT is not a fallback path: tunnel bytes are not an HTTP request body, and the proxy short-circuits into the HBONE relay before any final-request-body hook. Buffering for that phase is selected from the matched operation alone — never from a `Content-Type` a client can omit or mismatch, and not from a method allowlist — and in `block` mode a missing required body fails closed with `error_response.request_status_code` while a nonempty body with no applicable declared media type fails closed with `error_response.unsupported_media_type_status_code` (`GHSA-6p78-6x8c-9g9x`). Request `Accept` and internal streaming markers cannot waive response validation. If a matching operation with response schemas receives a pristine backend `text/event-stream`, the plugin records an uninspectable response mismatch before header commit: `block` returns the configured response error (502 by default), while `log_only` records the mismatch and permits the stream. Missing, ambiguous, or later-relabeled types stay on the normal validation path. Direct plugin creation is allowed only for proxy-scoped plugins whose proxy has an attached API spec.
+`openapi_validator` compiles path regexes and JSON Schemas at config-load time. It only buffers matching HTTP proxy requests/responses (plus schema-less matching responses when strict missing-schema enforcement requires inspection), decodes complete `Content-Encoding` chains (`gzip` / `br`, including stacked lists such as `gzip, br`) in reverse application order under `max_body_bytes`, maps XML according to OpenAPI `xml` metadata (bounded to 100000 parser nodes and 256 levels of element nesting, the latter screened over the raw bytes before parsing), validates form fields and multipart file metadata (including bounded RFC 5987/8187 `filename*`), supports OpenAPI response wildcard statuses such as `4XX`, and records `openapi_validator.*` metadata for logging. The imported REQUEST contract is decided in the dedicated `validate_client_request_body_contract` lifecycle phase over the original client representation, before any `before_proxy` hook or request-body transformer can add, remove, rename, coerce, or replace fields (`GHSA-896v-jx23-9g6p`); `on_final_request_body` remains the backend-contract fallback when this validator did not select over the pristine client view but can select after a `before_proxy` route override or header/target rewrite, and an instance that already decided never charges the same request twice. Unknown-operation admission (`fail_on_unknown_operation`) is rejected in `before_proxy`, not deferred to that fallback. HBONE CONNECT is not a fallback path: tunnel bytes are not an HTTP request body, and the proxy short-circuits into the HBONE relay before any final-request-body hook. Buffering for that phase is selected from the matched operation alone — never from a `Content-Type` a client can omit or mismatch, and not from a method allowlist — and in `block` mode a missing required body fails closed with `error_response.request_status_code` while a nonempty body with no applicable declared media type fails closed with `error_response.unsupported_media_type_status_code` (`GHSA-6p78-6x8c-9g9x`). Request `Accept` and internal streaming markers cannot waive response validation. If a matching operation with response schemas receives a pristine backend `text/event-stream`, the plugin records an uninspectable response mismatch before header commit: `block` returns the configured response error (502 by default), while `log_only` records the mismatch and permits the stream. Missing, ambiguous, or later-relabeled types stay on the normal validation path. Direct plugin creation is allowed only for proxy-scoped plugins whose proxy has an attached API spec.
 
 Config admission is closed: unknown keys at the root and in `bypass`, `error_response`, each `operations[]` entry, and `request_body` are rejected at construction with a spelling suggestion; explicit `null` cannot stand in for an omitted non-null field; and free-form media/status map keys are shape-validated. (`null` values in `bypass.header_present` intentionally mean “match any value.”) Response selection is status-first — an exact status precludes wildcard-range and `default` fallback, media selection happens only inside the selected response object, and an empty backend or gateway-generated synthetic body is parsed against the selected schema except for HEAD / 1xx / 204 / 205 / 304. Validation diagnostics are payload-free by construction on both sides (`GHSA-5p2h-fq6q-gwh9`): the client problem `detail` and the `openapi_validator.request_error` / `.response_error` metadata every logging plugin exports carry only a compiled-in failure category, an allowlisted JSON Schema keyword, and — request side only — a bounded instance location whose object-member segments survive only when the configured schema declares them as JSON properties (numeric pointer segments render as `#`; any other member name renders as `~`; depth, segment count, and total length are capped). No rejected instance value, expected `enum` / `const` constant, raw schema path (`$defs` / reference names), raw `jsonschema` or `roxmltree` rendering, configured XML name/namespace, hostile content-coding token, backend `Content-Type`, request target, or payload-chosen XML / form / multipart name is ever formatted into them. Response-side conversion and decode failures collapse further, to a single fixed sentence, because even the class of failure describes an upstream representation the client was never entitled to observe. There is no raw-diagnostic escape hatch in configuration or tracing.
 
@@ -7417,11 +7466,13 @@ Adds Istio/GAMMA workload identity labels to request, stream, and log metadata, 
 
 HBONE `source.principal` attribution uses the same trusted-assertor relation as `mesh_authz`. Direct / user-created instances honor that relation from this plugin's own `trusted_hbone_assertors` / `trust_domain_aliases` config. Mesh injection additionally stamps an internal `_effective_mesh_authz_baggage_gates` list that is an exact, fail-closed conjunction of every enabled global `mesh_authz` baggage gate PluginCache will execute (including a force-injected reserved `__mesh_authz` under transparent inbound capture). Disabled operator rows are omitted; each gate keeps its own absent/null/default, explicit `[]`, and alias contract; a sibling cannot silently widen another gate. Malformed or over-bound internal lists fail construction. See [Trusted HBONE Assertors](mesh.md#trusted-hbone-assertors).
 
+Unknown top-level keys are rejected at construction (for example a misspelled `trusted_hbone_asserters` cannot silently restore the built-in assertor defaults and undo a `trusted_hbone_assertors: []` lockdown).
+
 See [Mesh Observability](mesh.md#observability) for metric names, service graph aggregation, and tracing behavior.
 
 ### `__mesh_bpf_metrics`
 
-Reserved internal plugin auto-injected only for mesh `NodeWaypoint` topology. It exposes TCP-layer BPF SOCK_OPS counters and fixed-bucket SRTT, SYN-to-ACK, and captured accept-to-first-application-byte latency histograms on the Prometheus scrape surface. Operator-managed plugin configs should not create names prefixed with `__`.
+Reserved internal plugin auto-injected only for mesh `NodeWaypoint` topology. It exposes TCP-layer BPF SOCK_OPS counters and fixed-bucket SRTT, SYN-to-ACK, and captured accept-to-first-application-byte latency histograms on the Prometheus scrape surface. Operator-managed plugin configs should not create names prefixed with `__`. Unknown top-level keys are rejected at construction (for example a misspelled `prefx` cannot silently publish the default metric namespace).
 
 See [BPF SOCK_OPS observability](mesh.md#bpf-sock_ops-observability-gap-sc3) for emitted counters, histogram bucket bounds, and the node-agent/process split.
 

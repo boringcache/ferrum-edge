@@ -204,6 +204,15 @@ pub struct TlsCertGaugeKey {
     pub source_kind: Arc<str>,
 }
 
+/// TLS revocation-material inventory gauge key (issue #4505).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TlsRevocationGaugeKey {
+    pub material_id: Arc<str>,
+    /// `crl` or `ocsp` — the inventory's own material kind, a closed set.
+    pub kind: Arc<str>,
+    pub source_kind: Arc<str>,
+}
+
 /// TLS source refresh counter key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TlsSourceRefreshKey {
@@ -262,6 +271,29 @@ impl TlsCertGaugeValues {
             .not_before_unix_seconds
             .swap(not_before_unix_seconds, Ordering::Relaxed);
         old_not_after != not_after_unix_seconds || old_not_before != not_before_unix_seconds
+    }
+}
+
+/// Scrape-time revocation-material inventory gauge value (issue #4505).
+pub struct TlsRevocationGaugeValues {
+    pub next_update_unix_seconds: CachePadded<AtomicI64>,
+}
+
+impl TlsRevocationGaugeValues {
+    fn new(next_update_unix_seconds: i64) -> Self {
+        Self {
+            next_update_unix_seconds: CachePadded::new(AtomicI64::new(next_update_unix_seconds)),
+        }
+    }
+
+    /// Update the absolute `nextUpdate` timestamp and report whether the
+    /// inventory materially changed. Relative seconds are derived only during
+    /// an uncached render, exactly as the certificate gauges do, so one
+    /// wall-clock second cannot defeat the render cache.
+    fn update(&self, next_update_unix_seconds: i64) -> bool {
+        self.next_update_unix_seconds
+            .swap(next_update_unix_seconds, Ordering::Relaxed)
+            != next_update_unix_seconds
     }
 }
 
@@ -856,6 +888,11 @@ pub struct MetricsRegistry {
     /// scrape path (issue #2410). Labels are derived from configured resources,
     /// never from request input.
     pub tls_cert_gauges: DashMap<TlsCertGaugeKey, TlsCertGaugeValues>,
+    /// TLS revocation-material (`crl` / `ocsp`) `nextUpdate` gauges, refreshed
+    /// from the same non-secret inventory snapshot as `tls_cert_gauges`
+    /// (issue #4505). Expired revocation material is refused at reload AND at
+    /// startup, so this is the recurring lead-time signal an alert reads.
+    pub tls_revocation_gauges: DashMap<TlsRevocationGaugeKey, TlsRevocationGaugeValues>,
     /// Freshness of the cached TLS inventory snapshot backing `tls_cert_gauges`:
     /// `(collected_at unix seconds, configured max age seconds)`. `None` until
     /// the first background collection publishes a snapshot.
@@ -1010,6 +1047,7 @@ impl MetricsRegistry {
             mesh_outbound_registry_decisions: DashMap::new(),
             mesh_outbound_registry_stream_decisions: DashMap::new(),
             tls_cert_gauges: DashMap::new(),
+            tls_revocation_gauges: DashMap::new(),
             tls_inventory_freshness: ArcSwap::from_pointee(None),
             tls_source_refresh_counter: DashMap::new(),
             tls_source_fetch_duration_buckets: DashMap::new(),
@@ -1907,6 +1945,41 @@ impl MetricsRegistry {
         let old_len = self.tls_cert_gauges.len();
         self.tls_cert_gauges.retain(|key, _| seen.contains(key));
         changed |= self.tls_cert_gauges.len() != old_len;
+
+        // Revocation material (issue #4505). A separate pass rather than a
+        // branch inside the loop above: a CRL or OCSP entry carries no
+        // `not_after`, so it never reaches that loop's body, and its label set
+        // is the material identity rather than the certificate's serving
+        // surfaces.
+        let mut seen_revocation = std::collections::HashSet::new();
+        for entry in &inventory.entries {
+            let Some(next_update) = entry.next_update else {
+                continue;
+            };
+            if !matches!(entry.material_kind.as_str(), "crl" | "ocsp") {
+                continue;
+            }
+            let key = TlsRevocationGaugeKey {
+                material_id: Arc::from(entry.id.as_str()),
+                kind: Arc::from(entry.material_kind.as_str()),
+                source_kind: Arc::from(entry.source.kind.as_str()),
+            };
+            seen_revocation.insert(key.clone());
+            match self.tls_revocation_gauges.entry(key) {
+                dashmap::mapref::entry::Entry::Occupied(existing) => {
+                    changed |= existing.get().update(next_update.timestamp());
+                }
+                dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                    vacant.insert(TlsRevocationGaugeValues::new(next_update.timestamp()));
+                    changed = true;
+                }
+            }
+        }
+        let old_revocation_len = self.tls_revocation_gauges.len();
+        self.tls_revocation_gauges
+            .retain(|key, _| seen_revocation.contains(key));
+        changed |= self.tls_revocation_gauges.len() != old_revocation_len;
+
         if changed {
             self.render_cache.store(Arc::new(None));
         }
@@ -3218,6 +3291,7 @@ impl MetricsRegistry {
                 .sum::<usize>()
                 * 240
             + self.tls_cert_gauges.len() * 260
+            + self.tls_revocation_gauges.len() * 200
             + self.tls_source_refresh_counter.len() * 220
             + self.tls_source_fetch_duration_buckets.len() * 700
             + self.tls_source_fetch_failure_counter.len() * 220
@@ -4409,6 +4483,29 @@ impl MetricsRegistry {
             }
         }
 
+        if !self.tls_revocation_gauges.is_empty() {
+            let now_ts = Utc::now().timestamp();
+            output.push_str(
+                "# HELP ferrum_tls_revocation_expiry_seconds Seconds until the revocation material nextUpdate. Negative means expired; expired material is refused at reload and at startup.\n",
+            );
+            output.push_str("# TYPE ferrum_tls_revocation_expiry_seconds gauge\n");
+            for entry in self.tls_revocation_gauges.iter() {
+                let key = entry.key();
+                let material_id = escape_label_value(&key.material_id);
+                let kind = escape_label_value(&key.kind);
+                let source_kind = escape_label_value(&key.source_kind);
+                let expiry = entry
+                    .value()
+                    .next_update_unix_seconds
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(now_ts);
+                output.push_str(&format!(
+                    "ferrum_tls_revocation_expiry_seconds{{material_id=\"{}\",kind=\"{}\",source_kind=\"{}\"{}}} {}\n",
+                    material_id, kind, source_kind, ns_label, expiry
+                ));
+            }
+        }
+
         if let Some((collected_at, max_age_seconds)) = **self.tls_inventory_freshness.load() {
             // Explicit, bounded freshness for the cached snapshot the
             // certificate gauges are rendered from (issue #2410). Alerts read
@@ -4652,6 +4749,39 @@ impl MetricsRegistry {
                 snapshot.recoveries_total,
                 &ns_label,
             );
+
+            // Availability of the configuration source itself (issue #4528).
+            // `ferrum_database_poll_last_completed_timestamp_seconds` below
+            // advances on every normally completed poll outcome — including a
+            // handled error — because it detects poll-task death (issue
+            // #2986), so it cannot double as an outage signal. This gauge is
+            // the outage signal.
+            output.push_str(
+                "# HELP ferrum_database_config_source_connected Whether the configuration database (database mode) or the control plane's backing database (cp mode) is currently reachable and usable: 1 connected, 0 unavailable.\n",
+            );
+            output.push_str("# TYPE ferrum_database_config_source_connected gauge\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_database_config_source_connected",
+                u64::from(snapshot.config_source_connected),
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_database_poll_failures_total Database/CP config poll failures by bounded reason.\n",
+            );
+            output.push_str("# TYPE ferrum_database_poll_failures_total counter\n");
+            for reason in crate::modes::database::DATABASE_POLL_FAILURE_REASON_LABELS {
+                let count = snapshot
+                    .poll_failures_by_reason
+                    .get(reason)
+                    .copied()
+                    .unwrap_or(0);
+                output.push_str(&format!(
+                    "ferrum_database_poll_failures_total{{reason=\"{}\"{}}} {}\n",
+                    reason, ns_label, count
+                ));
+            }
 
             output.push_str(
                 "# HELP ferrum_database_poll_last_completed_timestamp_seconds Unix timestamp of the most recently completed database/CP config poll attempt (including empty success).\n",
@@ -5345,6 +5475,17 @@ pub fn render_dp_config_freshness_prometheus(
     );
 
     output.push_str(
+        "# HELP ferrum_dp_cp_admission_refused_total ConfigSync subscriptions the control plane refused with RESOURCE_EXHAUSTED because a CP gRPC stream admission budget is saturated. The CP is alive, so a refusal is recorded as reconnecting and never latches the stale-config bound.\n",
+    );
+    output.push_str("# TYPE ferrum_dp_cp_admission_refused_total counter\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_cp_admission_refused_total",
+        freshness.cp_admission_refused_total,
+        ns_label,
+    );
+
+    output.push_str(
         "# HELP ferrum_dp_config_snapshot_apply_failures_total CP snapshots that were admitted and then failed to apply since process start.\n",
     );
     output.push_str("# TYPE ferrum_dp_config_snapshot_apply_failures_total counter\n");
@@ -5930,6 +6071,8 @@ mod tests {
                 not_before: Some(not_before),
                 not_after: Some(not_after),
                 days_until_expiry: Some(30),
+                next_update: None,
+                days_until_next_update: None,
                 fingerprint_sha256: Some("abc123".to_string()),
                 certificate_count: Some(1),
                 crl_count: None,

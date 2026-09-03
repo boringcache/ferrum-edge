@@ -46,6 +46,9 @@ FIPS_PLANNER_PATH = ".github/scripts/ci_runtime_plan.py"
 NODE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "node-waypoint-ebpf-live.yml"
 AMBIENT_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ambient-host-udp-live.yml"
 DOCKERFILE = REPO_ROOT / "Dockerfile"
+DOCKERFILE_RELEASE = REPO_ROOT / "Dockerfile.release"
+DOCKERFILE_EBPF_TOOLS_LAYER = REPO_ROOT / "Dockerfile.ebpf-tools-layer"
+DOCKERFILE_TEST = REPO_ROOT / "Dockerfile.test"
 SETUP_RUST = REPO_ROOT / ".github" / "actions" / "setup-rust-ci" / "action.yml"
 SETUP_SCCACHE = REPO_ROOT / ".github" / "actions" / "setup-sccache" / "action.yml"
 SETUP_FAST_LINKER = REPO_ROOT / ".github" / "actions" / "setup-fast-linker" / "action.yml"
@@ -3869,6 +3872,127 @@ def builder_arg_features_is_after_apt(dockerfile: str) -> bool:
     return apt >= 0 and features > apt
 
 
+DOCUMENTED_LOG_LEVEL_DEFAULT = "warn"
+
+
+def ferrum_log_level_assignments(dockerfile: str) -> list[str]:
+    """Every `FERRUM_LOG_LEVEL=<value>` baked into a Dockerfile's runtime ENV.
+
+    The assignments live inside multi-line `ENV ... \\` continuations, so match
+    the assignment token itself rather than a line that starts with `ENV`.
+    """
+
+    return re.findall(r"\bFERRUM_LOG_LEVEL=([^\s\\]+)", dockerfile)
+
+
+def check_dockerfile_log_level(
+    label: str, dockerfile: str, failures: list[str]
+) -> None:
+    """Every published runtime image must bake the documented log-level default."""
+
+    values = ferrum_log_level_assignments(dockerfile)
+    require(
+        bool(values),
+        f"{label} must bake a FERRUM_LOG_LEVEL default; found none (a rename or "
+        "deletion must fail closed, not pass vacuously)",
+        failures,
+    )
+    offenders = sorted({value for value in values if value != DOCUMENTED_LOG_LEVEL_DEFAULT})
+    require(
+        not offenders,
+        f"{label} sets FERRUM_LOG_LEVEL={', '.join(offenders)}; every published "
+        f"runtime stage must use '{DOCUMENTED_LOG_LEVEL_DEFAULT}' so the startup "
+        "operability warnings stay visible (docs/configuration.md, docs/docker.md)",
+        failures,
+    )
+
+
+DIGEST_PINNED_REFERENCE = re.compile(r"@sha256:[0-9a-f]{64}$")
+DIGESTLESS_BASES = frozenset({"scratch"})
+
+
+def _arg_value_looks_like_image(value: str) -> bool:
+    """Whether an `ARG NAME=<value>` default names a registry image.
+
+    Version and checksum defaults (`6.15.0-1`, a bare hex SHA-256) carry neither
+    a registry path nor a tag, so they are not build inputs this contract binds.
+    """
+
+    if "${" in value:
+        return False
+    if "/" in value:
+        return True
+    return re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*:[^\s]+", value) is not None
+
+
+def dockerfile_image_references(dockerfile: str) -> list[tuple[int, str, str]]:
+    """Every registry image reference a Dockerfile pulls, as (line, kind, ref).
+
+    `FROM <stage>` targets that name an earlier `AS` alias are internal edges,
+    and `FROM ${VAR}` is an indirection whose `ARG` default is bound instead, so
+    neither is a registry input.
+    """
+
+    stages: set[str] = set()
+    references: list[tuple[int, str, str]] = []
+    for number, line in enumerate(dockerfile.splitlines(), start=1):
+        stripped = line.strip()
+        from_match = re.fullmatch(
+            r"FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+(\S+))?",
+            stripped,
+            re.IGNORECASE,
+        )
+        if from_match is not None:
+            target, alias = from_match.group(1), from_match.group(2)
+            internal = target.lower() in stages or target.startswith("${")
+            if not internal and target.lower() not in DIGESTLESS_BASES:
+                references.append((number, "FROM", target))
+            if alias:
+                stages.add(alias.lower())
+            continue
+        arg_match = re.fullmatch(r"ARG\s+([A-Za-z_][A-Za-z0-9_]*)=(\S+)", stripped)
+        if arg_match is not None and _arg_value_looks_like_image(arg_match.group(2)):
+            references.append((number, f"ARG {arg_match.group(1)}", arg_match.group(2)))
+    return references
+
+
+def check_dockerfile_image_pins(
+    label: str, dockerfile: str, failures: list[str]
+) -> None:
+    """Every container build input must be pinned by immutable digest.
+
+    A tag is mutable: the bytes a published image was built from would not be
+    recoverable, and a compromised or silently re-pushed tag would reach the
+    release images with nothing failing. `scratch` is the sole exception.
+    """
+
+    references = dockerfile_image_references(dockerfile)
+    require(
+        bool(references),
+        f"{label} must declare at least one registry image reference; found none "
+        "(a rewrite must fail closed, not pass this contract vacuously)",
+        failures,
+    )
+    for number, kind, reference in references:
+        require(
+            DIGEST_PINNED_REFERENCE.search(reference) is not None,
+            f"{label}:{number} {kind} uses the unpinned image reference "
+            f"'{reference}'; every container build input must carry an "
+            "@sha256:<64 hex> digest (docs/dependency-policy.md -> "
+            "'Container build inputs')",
+            failures,
+        )
+        require(
+            not (
+                "@sha256:" not in reference
+                and reference.rsplit(":", 1)[-1] == "latest"
+            ),
+            f"{label}:{number} {kind} uses the mutable tag '{reference}'; "
+            "':latest' is only admissible alongside an @sha256: digest",
+            failures,
+        )
+
+
 def workflow_permissions_are_read_only(text: str) -> bool:
     """Require one explicit top-level permissions map with no write grants."""
 
@@ -4879,6 +5003,20 @@ def check_dockerfile(failures: list[str]) -> None:
         "runtime-ebpf target must remain",
         failures,
     )
+    release = DOCKERFILE_RELEASE.read_text(encoding="utf-8")
+    ebpf_tools_layer = DOCKERFILE_EBPF_TOOLS_LAYER.read_text(encoding="utf-8")
+    check_dockerfile_log_level("Dockerfile", dockerfile, failures)
+    check_dockerfile_log_level("Dockerfile.release", release, failures)
+    check_dockerfile_log_level(
+        "Dockerfile.ebpf-tools-layer", ebpf_tools_layer, failures
+    )
+    for label, text in (
+        ("Dockerfile", dockerfile),
+        ("Dockerfile.release", release),
+        ("Dockerfile.test", DOCKERFILE_TEST.read_text(encoding="utf-8")),
+        ("Dockerfile.ebpf-tools-layer", ebpf_tools_layer),
+    ):
+        check_dockerfile_image_pins(label, text, failures)
 
 
 def self_test() -> int:
@@ -4918,6 +5056,99 @@ def self_test() -> int:
             "ARG FEATURES\n"
         ),
         "self-test: a non-rust builder base must not satisfy the contract",
+        failures,
+    )
+    log_level_warn = (
+        'ENV PATH="/app:${PATH}" \\\n'
+        "    FERRUM_MODE=database \\\n"
+        "    FERRUM_LOG_LEVEL=warn \\\n"
+        "    FERRUM_PROXY_HTTP_PORT=8000\n"
+    )
+    log_level_error = log_level_warn.replace(
+        "FERRUM_LOG_LEVEL=warn", "FERRUM_LOG_LEVEL=error"
+    )
+    log_level_absent = "\n".join(
+        line
+        for line in log_level_warn.splitlines()
+        if "FERRUM_LOG_LEVEL" not in line
+    )
+    log_level_failures: list[str] = []
+    check_dockerfile_log_level("synthetic", log_level_warn, log_level_failures)
+    require(
+        not log_level_failures,
+        "self-test: FERRUM_LOG_LEVEL=warn should pass",
+        failures,
+    )
+    log_level_failures = []
+    check_dockerfile_log_level("synthetic", log_level_error, log_level_failures)
+    require(
+        len(log_level_failures) == 1
+        and "FERRUM_LOG_LEVEL=error" in log_level_failures[0],
+        "self-test: FERRUM_LOG_LEVEL=error should fail and name the value",
+        failures,
+    )
+    log_level_failures = []
+    check_dockerfile_log_level("synthetic", log_level_absent, log_level_failures)
+    require(
+        len(log_level_failures) == 1 and "found none" in log_level_failures[0],
+        "self-test: a missing FERRUM_LOG_LEVEL assignment must fail closed",
+        failures,
+    )
+    pinned_dockerfile = (
+        "ARG RUNTIME_BASE=gcr.io/distroless/cc-debian13:nonroot@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "ARG IPROUTE2_VERSION=6.15.0-1\n"
+        "FROM rust:latest@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS builder\n"
+        "FROM ${RUNTIME_BASE} AS runtime-base\n"
+        "FROM runtime-base AS runtime\n"
+        "FROM scratch AS empty\n"
+    )
+    pin_failures: list[str] = []
+    check_dockerfile_image_pins("synthetic", pinned_dockerfile, pin_failures)
+    require(
+        not pin_failures,
+        "self-test: fully digest-pinned Dockerfile should pass",
+        failures,
+    )
+    require(
+        [kind for _, kind, _ in dockerfile_image_references(pinned_dockerfile)]
+        == ["ARG RUNTIME_BASE", "FROM"],
+        "self-test: stage-name FROM, ${VAR} indirection, scratch, and version "
+        "ARG defaults must not be treated as registry references",
+        failures,
+    )
+    pin_failures = []
+    check_dockerfile_image_pins(
+        "synthetic",
+        pinned_dockerfile.replace(f"FROM rust:latest@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "FROM rust:latest"),
+        pin_failures,
+    )
+    require(
+        len(pin_failures) == 2
+        and any("unpinned image reference" in failure for failure in pin_failures)
+        and any("mutable tag" in failure for failure in pin_failures),
+        "self-test: an unpinned FROM must fail closed as both unpinned and mutable",
+        failures,
+    )
+    pin_failures = []
+    check_dockerfile_image_pins(
+        "synthetic",
+        pinned_dockerfile.replace(
+            f"ARG RUNTIME_BASE=gcr.io/distroless/cc-debian13:nonroot@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "ARG RUNTIME_BASE=gcr.io/distroless/cc-debian13:nonroot",
+        ),
+        pin_failures,
+    )
+    require(
+        len(pin_failures) == 1 and "ARG RUNTIME_BASE" in pin_failures[0],
+        "self-test: an unpinned ARG image default must fail closed",
+        failures,
+    )
+    pin_failures = []
+    check_dockerfile_image_pins("synthetic", "FROM scratch\n", pin_failures)
+    require(
+        len(pin_failures) == 1 and "found none" in pin_failures[0],
+        "self-test: scratch is digest-less by design but cannot satisfy the "
+        "contract on its own",
         failures,
     )
     sample = (
@@ -5337,7 +5568,7 @@ def self_test() -> int:
     )
 
     scalar_count_decoy = real_fips.replace(
-        "    branches: [main]\n",
+        "    branches:\n      - main\n",
         "    branches:\n"
         "      - main\n"
         "      - |\n"

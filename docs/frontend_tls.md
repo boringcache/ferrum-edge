@@ -491,6 +491,31 @@ are listed at the end of this section.
   A CRL that expires while the gateway is running therefore stops authorizing
   **new** handshakes on every surface it is installed on, without a reload and
   without a restart. Keep the CRL refreshed ahead of its own `nextUpdate`.
+- **CRL refresh is a restart-blocking dependency.** The same refusal applies at
+  **startup**, not only at reload: `FERRUM_TLS_CRL_FILE_PATH` /
+  `FERRUM_TLS_CRL_SOURCE` is loaded during startup in every serving mode
+  (database, file, cp, dp, mesh, node_agent) and an expired record fails that
+  load, so the process exits instead of booting. A pod that restarts after
+  `nextUpdate` — rolling deploy, node drain, OOM kill — does not come back, and
+  a forgotten CRL refresh job is therefore a fleet-wide outage rather than a
+  single-pod incident. This is deliberate (see
+  [PRODUCTION_READINESS.md](../PRODUCTION_READINESS.md) → "Deliberate
+  decisions"): booting with an expired CRL would serve without revocation
+  enforcement for that issuer, which is fail-open. Two things are required of
+  an operator: refresh the CRL before `nextUpdate`, and/or set
+  `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true` (and
+  `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true` for backend surfaces) so a
+  refreshed copy is adopted without a restart. Live reload is **off by
+  default**, so without it the only way to pick up a new CRL is a restart —
+  which the expired one blocks.
+- **A lead-time warning is the advance signal.** Every accepted CRL source
+  whose soonest `nextUpdate` falls within `FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS`
+  (default `30`, `0` disables) logs a `warn!` naming the redacted source id and
+  the remaining days. The same knob covers stapled OCSP responses — one refresh
+  loop, one deadline. The recurring signal is the Prometheus gauge
+  `ferrum_tls_revocation_expiry_seconds{material_id,kind,source_kind}`, which
+  the bundled chart alerts on as `FerrumGatewayRevocationMaterialExpiringSoon`
+  (`metrics.alerts.revocationExpiringSeconds`, default 7 days).
 
 ### What admission enforces
 
@@ -663,11 +688,26 @@ validity window above is evaluated while the `ServerConfig` candidate is being
 built — at startup, at config reload, and when a watched OCSP source's bytes
 change. An accepted staple is then served unchanged until one of those events
 happens again, so a response that passes `nextUpdate` while the gateway is
-running keeps being stapled. Refresh the OCSP source before `nextUpdate`
-elapses: with `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true` a file or provider
-source is re-read and re-validated as soon as its bytes change, and rewriting
-the source with a stale or otherwise invalid response is rejected while the
-previous known-good material keeps serving.
+running keeps being stapled.
+
+The reason it keeps being stapled is that **Ferrum has no OCSP responder
+client**: nothing inside the gateway fetches a fresh response, so there is no
+event to re-validate against and dropping the staple unilaterally would only
+trade one failure mode (a stale staple strict clients reject) for another (no
+staple at all, which a must-staple certificate also fails). Staple refresh is
+therefore the operator's own fetch loop plus live reload. Refresh the OCSP
+source before `nextUpdate` elapses: with
+`FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true` a file or provider source is
+re-read and re-validated as soon as its bytes change, and rewriting the source
+with a stale or otherwise invalid response is rejected while the previous
+known-good material keeps serving. Without live reload the only way to adopt a
+refreshed staple is a restart — and a restart after `nextUpdate` is refused by
+the same admission check, exactly as for CRLs above.
+
+A staple inside `FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS` of its `nextUpdate` logs a
+`warn!` at load and is exported as
+`ferrum_tls_revocation_expiry_seconds{kind="ocsp"}` on the authenticated
+`/metrics` surface.
 
 **Diagnostics.** Rejections name the redacted source identifier and the
 structural reason. They never contain certificate bytes, response bytes, private
@@ -1294,7 +1334,7 @@ The gateway supports fine-grained control over TLS protocol versions, cipher sui
 | **Inbound** | Proxy HTTPS, Admin HTTPS, HTTP/3 (QUIC) listeners |
 | **Outbound** | HTTP/1.1 and HTTP/2 backends (reqwest), hyper HTTP/2 pool, gRPC (grpcs://) backends, WebSocket (wss://) backends, TCP-TLS stream backends, HTTP/3 QUIC backends |
 
-> **Note:** DTLS (UDP-TLS) uses `dimpl` which has its own cipher negotiation independent of rustls. These TLS policy settings do not affect DTLS connections. `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` and `FERRUM_TLS_SESSION_CACHE_SIZE` only apply to inbound listeners.
+> **Note:** DTLS (UDP-TLS) uses `dimpl`, which has its own cipher negotiation independent of rustls. Since issue #4507 the version, cipher-suite and key-exchange-group settings are translated into that vocabulary and applied to every DTLS surface (frontend listener, live-reload rebuild, generated NodeWaypoint listeners, backend client) — see [DTLS and the TLS policy](tcp_udp_proxy.md#dtls-and-the-tls-policy) for the mapping and for the one dimension that does not carry over (`ECDHE-RSA-*` suites, which DTLS cannot authenticate). `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` and `FERRUM_TLS_SESSION_CACHE_SIZE` remain rustls-only: they apply to inbound TCP/QUIC listeners and have no DTLS equivalent.
 
 ### Environment Variables
 
@@ -1440,6 +1480,50 @@ When using load balancers:
 3. Issue client certificates to authorized clients
 4. Update client applications to present certificates
 5. Gradually enforce mTLS (start with optional, then required)
+
+## ACME Auto-Renewal Requires Frontend TLS Live Reload
+
+`FERRUM_ACME_AUTO_RENEW_ENABLED=true` renews certificates **into the ACME
+certificate store**. Getting the renewed leaf in front of clients is a separate
+step, and it is not automatic:
+
+1. A successful renewal commits the new material under the lease fence and then
+   asks every TLS surface that registered a *force-reload sender* to rebuild.
+2. Only surfaces with a registered sender are notified; an unregistered surface
+   is silently skipped.
+3. The proxy HTTPS/H2/H3 and admin HTTPS surfaces register their sender
+   **exclusively from inside the frontend live-reload watcher**, and that watcher
+   is not built at all when `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` is `false`
+   (its default).
+
+With auto-renew on and live reload off, renewals therefore succeed in the logs
+and in `acme-certificates.json` while every client keeps receiving the previous
+leaf — until it expires and HTTPS fails with the correct certificate already on
+disk.
+
+Ferrum **refuses to start** in that configuration rather than serving it. When
+`FERRUM_ACME_AUTO_RENEW_ENABLED=true` and any of `FERRUM_FRONTEND_TLS_CERT_SOURCE`,
+`FERRUM_FRONTEND_TLS_KEY_SOURCE`, `FERRUM_ADMIN_TLS_CERT_SOURCE`, or
+`FERRUM_ADMIN_TLS_KEY_SOURCE` resolves to an `acme://` URI, startup and
+`ferrum-edge validate` fail unless `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`.
+The message names both variables and the offending source. Either set the
+live-reload flag, or turn auto-renew off and renew out of band. The admin HTTPS
+listener has no live-reload flag of its own: it shares
+`FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` with the proxy frontend.
+
+A file-backed, `managed://`, or provider-URI serving source is unaffected — the
+ACME scheduler does not renew it — and so is a deployment that simply leaves
+`FERRUM_ACME_AUTO_RENEW_ENABLED=false`.
+
+Gateway-API multi-certificate listeners are outside this check: their
+certificates arrive in the control-plane config snapshot and the data plane
+rebuilds the whole SNI resolver on each delivery, so they never depend on the
+force-reload registry.
+
+As a residual safety net for anything the startup check cannot see (a surface
+registered later, or a sender that has since closed), a renewal that commits new
+material but reaches no surface logs a `warn!` naming the certificate; a renewal
+that does reach one logs the accepted surfaces at `info!`.
 
 ## Managed TLS And ACME Across Multiple Replicas
 

@@ -856,6 +856,102 @@ mod mongo_incremental_poll_contract {
     }
 
     #[test]
+    fn integral_double_sequence_decodes_and_advances_the_cursor() {
+        // `mongosh insertOne({sequence: 5, ...})` writes a BSON Double unless the
+        // operator spells `NumberLong(5)`. That row must decode, not wedge both
+        // incremental polling and the full-reload repair path (issue #4530).
+        let mut doubled = well_formed_change_doc(5, "upstream-a", "upsert");
+        doubled.insert("sequence", Bson::Double(5.0));
+
+        let change = decode_mongo_config_change_record(&doubled)
+            .expect("an integral non-negative Double sequence must decode");
+        assert_eq!(change.sequence, 5);
+
+        let cursor = poll_cursor(0, &[doubled])
+            .expect("a Double sequence row must not abort the incremental poll");
+        assert_eq!(cursor, 5);
+    }
+
+    #[test]
+    fn non_integral_and_negative_double_sequences_are_rejected_without_leaking_content() {
+        for (label, value) in [("fractional", 5.5_f64), ("negative", -1.0_f64)] {
+            let mut malformed = well_formed_change_doc(5, "malformed-upstream", "delete");
+            malformed.insert("sequence", Bson::Double(value));
+
+            let Err(error) = decode_mongo_config_change_record(&malformed) else {
+                panic!("a {label} Double sequence must fail closed, but it decoded");
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains("invalid 'sequence'"),
+                "{label} sequence error must name the field, got: {message}"
+            );
+            assert!(
+                !message.contains("5.5")
+                    && !message.contains("-1")
+                    && !message.contains("malformed-upstream")
+                    && !message.contains("delete"),
+                "{label} sequence error must not log record content: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_exact_range_double_sequence_is_rejected() {
+        // Beyond 2^53 a double no longer names exactly one integer, so accepting
+        // it could admit a silently wrong sequence.
+        let mut malformed = well_formed_change_doc(5, "upstream-a", "upsert");
+        malformed.insert("sequence", Bson::Double(9_007_199_254_740_994.0));
+        let error = decode_mongo_config_change_record(&malformed)
+            .expect_err("a Double beyond 2^53 must fail closed");
+        assert!(
+            error.to_string().contains("invalid 'sequence'"),
+            "out-of-range sequence must fail closed, got: {error}"
+        );
+    }
+
+    #[test]
+    fn string_sequence_is_still_rejected_by_the_watermark_reader() {
+        // The full-reload fallback tolerance depends on this shape: a string
+        // `sequence` is exactly what makes `latest_change_sequence` fail while
+        // the resource collections themselves remain readable.
+        let mut malformed = well_formed_change_doc(5, "upstream-a", "upsert");
+        malformed.insert("sequence", Bson::String("5".to_string()));
+        let error = decode_mongo_config_change_record(&malformed)
+            .expect_err("a string sequence must fail closed");
+        assert!(
+            error.to_string().contains("invalid 'sequence'"),
+            "string sequence must fail closed, got: {error}"
+        );
+    }
+
+    #[test]
+    fn every_sequence_reader_shares_the_widened_decoder() {
+        for marker in [
+            "async fn latest_change_sequence(&self",
+            "async fn latest_global_change_sequence(&self",
+            "async fn compact_config_changes(&self",
+        ] {
+            let start = MONGO_STORE_SOURCE
+                .find(marker)
+                .unwrap_or_else(|| panic!("{marker} must exist"));
+            let tail = &MONGO_STORE_SOURCE[start + marker.len()..];
+            let end = tail
+                .find("\n        async fn ")
+                .unwrap_or_else(|| panic!("{marker} must be followed by another method"));
+            let body = &MONGO_STORE_SOURCE[start..start + marker.len() + end];
+            assert!(
+                body.contains("mongo_change_sequence_from_bson"),
+                "{marker} must decode sequences through the shared helper:\n{body}"
+            );
+            assert!(
+                !body.contains("invalid sequence: {:?}"),
+                "{marker} must not interpolate the BSON payload into its error:\n{body}"
+            );
+        }
+    }
+
+    #[test]
     fn mongo_incremental_loader_uses_fail_closed_decoder_before_cursor_update() {
         let marker = "        async fn load_incremental_config";
         let start = MONGO_STORE_SOURCE
@@ -881,4 +977,40 @@ mod mongo_incremental_poll_contract {
             "typed decode failure must abort with ? before the cursor updates:\n{body}"
         );
     }
+}
+
+/// The full reload is the repair path an incremental-poll failure falls back to,
+/// so an unreadable `config_changes` watermark must not abort it (issue #4530).
+/// A poisoned `sequence` (a BSON Double before this fix, a string still today)
+/// otherwise fails both readers and the gateway can never publish fresh config.
+#[tokio::test(flavor = "multi_thread")]
+async fn full_reload_publishes_when_the_change_watermark_read_fails() {
+    use ferrum_edge::_test_support::{
+        database_mode_load_full_config_with_sequence_for_test,
+        database_store_set_latest_change_sequence_fault_for_test,
+    };
+    use ferrum_edge::config::db_backend::DatabaseBackend;
+    use std::sync::Arc;
+
+    let (store, _temp_dir) = sqlite_store().await;
+    store
+        .create_upstream(&test_upstream("upstream-a", "10.0.0.1", 8080))
+        .await
+        .expect("upstream insert must succeed");
+
+    database_store_set_latest_change_sequence_fault_for_test(&store, true);
+    let db: Arc<dyn DatabaseBackend> = Arc::new(store);
+
+    let (config, sequence) = database_mode_load_full_config_with_sequence_for_test(&db, "ferrum")
+        .await
+        .expect("full reload must still publish when the watermark read fails");
+
+    assert_eq!(
+        sequence, 0,
+        "an unreadable watermark must degrade to 0, not abort the reload"
+    );
+    assert!(
+        config.upstreams.iter().any(|u| u.id == "upstream-a"),
+        "the reload must carry fresh config, not a stale snapshot"
+    );
 }

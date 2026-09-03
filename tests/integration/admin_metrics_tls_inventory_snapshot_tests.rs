@@ -98,6 +98,8 @@ impl TlsInventoryCollector for CountingInventoryCollector {
                 not_before: Some(Utc::now() - ChronoDuration::days(1)),
                 not_after: Some(self.not_after),
                 days_until_expiry: Some(30),
+                next_update: None,
+                days_until_next_update: None,
                 fingerprint_sha256: Some("a".repeat(64)),
                 certificate_count: Some(1),
                 crl_count: None,

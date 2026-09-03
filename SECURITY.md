@@ -2,15 +2,22 @@
 
 ## Supported Versions
 
-The following versions of Ferrum Edge are currently receiving security updates:
+Ferrum Edge is pre-release. `Cargo.toml` declares version `0.9.0` and **no `v*`
+release tag has been cut yet**, so there is no released line to support and no
+previous minor to fall back to.
 
-| Version | Supported          |
-| ------- | ------------------ |
-| Latest release | :white_check_mark: |
-| Previous minor | :white_check_mark: |
-| Older versions | :x:                |
+| Version | Status | Security updates |
+| ------- | ------ | ---------------- |
+| `main` / `0.9.0` (pre-release) | active build-out; breaking changes expected | :white_check_mark: fixed on `main` |
+| `latest` rolling prerelease (built from `main`) | evaluation only, not for production | :white_check_mark: via the next rolling build |
+| Any tagged `v*` release | none exists yet | — |
 
-We recommend always running the latest release to ensure you have the most recent security patches.
+Until the first `v*` tag, run a pinned build from `main` and update it to take a
+security fix; there is no backport target. The support window per minor, the
+deprecation notice period, and the security-fix backport policy that will apply
+from 1.0 are in
+[docs/support_policy.md](docs/support_policy.md) — the values there are
+**proposed** until that first tag.
 
 ## Reporting a Vulnerability
 
@@ -63,6 +70,11 @@ Include the following information:
 7. **Keep dependencies updated**: Monitor for security advisories
 8. **Enable audit logging**: Track administrative changes
 9. **Run with minimal privileges**: Don't run as root in containers
+10. **Protect the configuration database and its backups**: Consumer API keys
+    (`keyauth`) and shared secrets (`jwt`, `hmac_auth`) are stored recoverable
+    at rest so the gateway can verify them; only Basic passwords are hashed.
+    A database, replica, or backup read recovers them. See
+    [Credential storage at rest](docs/plugins.md#credential-storage-at-rest).
 
 ### Security Features
 
@@ -80,6 +92,8 @@ Ferrum Edge includes several security-focused features:
 ### Security Hardening
 
 See the following documentation for detailed security configuration:
+- [Production hardening checklist](docs/hardening.md) — start here
+- [Threat model](docs/threat_model.md) — trust boundaries, controls, and documented residuals
 - [Frontend TLS/mTLS](docs/frontend_tls.md)
 - [Backend mTLS](docs/backend_mtls.md)
 - [Database TLS](docs/database_tls.md)
@@ -104,9 +118,10 @@ process for vendored crates** — is documented in
 
 Key controls:
 
-- **Blocking advisory gate.** `cargo deny check advisories bans sources` runs on
-  every PR (`.github/workflows/ci.yml`). A RUSTSEC advisory not explicitly
-  time-boxed in `deny.toml` fails the build.
+- **Blocking advisory gate.** `cargo deny check advisories bans sources licenses`
+  runs on every PR (`.github/workflows/ci.yml`), once over the root workspace and
+  once over the separate `ebpf/Cargo.toml` workspace with the same `deny.toml`. A
+  RUSTSEC advisory not explicitly time-boxed in `deny.toml` fails the build.
 - **Weekly re-check.** `.github/workflows/dependency-audit.yml` re-runs the gate
   against the latest advisory database, fails on expired exceptions, and reports
   when a vendored patch has merged upstream so it can be retired. This is why a

@@ -6,6 +6,7 @@ Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxi
 
 - [Listener and enablement](#listener-and-enablement)
 - [Graceful shutdown and GOAWAY](#graceful-shutdown-and-goaway)
+  - [GOAWAY under overload keepalive pressure (issue #4542)](#goaway-under-overload-keepalive-pressure-issue-4542)
 - [Dispatch model](#dispatch-model)
 - [Native H3 fast path](#native-h3-fast-path)
 - [Cross-protocol bridge](#cross-protocol-bridge)
@@ -18,6 +19,7 @@ Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxi
 - [WebSocket over HTTP/3 (RFC 9220 Extended CONNECT)](#websocket-over-http3-rfc-9220-extended-connect)
 - [CONNECT-UDP over HTTP/3 (RFC 9298)](#connect-udp-over-http3-rfc-9298)
 - [QUIC connection migration](#quic-connection-migration)
+- [Request-header arrival deadline (issue #4537)](#request-header-arrival-deadline-issue-4537)
 - [Header size limits](#header-size-limits)
   - [Declared frame-length bound and SETTINGS alignment (issue #4261)](#declared-frame-length-bound-and-settings-alignment-issue-4261)
 - [Flow-control window tuning](#flow-control-window-tuning)
@@ -112,6 +114,25 @@ and they observe the cloned process shutdown watch so drain can emit Close
 CONNECT-UDP tunnels that were already accepted keep relaying for the H3
 listener drain window. New CONNECT-UDP streams after GOAWAY are refused.
 `src/http3/connect_udp.rs` is otherwise unchanged.
+
+### GOAWAY under overload keepalive pressure (issue #4542)
+
+Process shutdown is not the only thing that raises a GOAWAY. The overload
+manager's first (pressure) tier — FD ≥ 0.80 / connections ≥ 0.85 / requests
+≥ 0.85 — is expressed on HTTP/1.1 and HTTP/2 as `Connection: close` on each
+response. HTTP/3 has no per-response equivalent, so each connection subscribes
+to an edge-triggered watch of `OverloadState::disable_keepalive` and sends the
+same one-shot `shutdown(0)` GOAWAY on the rising edge. The GOAWAY latch is
+shared with the shutdown path, so a connection receives at most one either way,
+and in-flight streams still finish.
+
+Only the binary flag drives it: `should_disable_keepalive_red()` is a
+per-response probabilistic sampler and a GOAWAY is per-connection and terminal,
+so sampling it would kill a random subset of connections outright rather than
+shrinking the population gracefully. Outside shutdown there is no drain
+deadline, so a peer that goes idle after a pressure-driven GOAWAY is bounded by
+`FERRUM_HTTP3_IDLE_TIMEOUT` (default 30 s) rather than closed immediately. See
+[docs/overload_manager.md](overload_manager.md) for the full ladder.
 
 ## Dispatch model
 
@@ -1392,6 +1413,36 @@ The H3 connection loop detects QUIC connection migration (RFC 9000 §9) — a cl
 
 This ensures IP-based rate-limit keys and access logs reflect the client's current IP after migration, not the stale IP from connection establishment. Earlier code cached the address once per connection — that was a security issue where migrated clients bypassed per-IP rate limits, now fixed.
 
+## Request-header arrival deadline (issue #4537)
+
+Size is not the only unbounded dimension on an accepted stream — *time* is the
+other. `h3::server::Connection::accept()` yields a request resolver as soon as
+the peer opens a bidi stream, **before** any `HEADERS` frame arrives. Without a
+bound, a peer that completes the QUIC handshake, opens `FERRUM_HTTP3_MAX_STREAMS`
+streams (default 1000) and sends a partial `HEADERS` frame on each parks one task
+and one partial decoder buffer per stream for as long as it keeps the connection
+alive. QUIC `max_idle_timeout` does not bound it — any packet resets it — and
+these streams never reach `RequestGuard`, so `active_requests` and the overload
+request tier never see them either. The declared-frame ceiling above bounds how
+*much* one stream may buffer, not how *long*.
+
+The H3 frontend therefore applies `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS`
+(default `10`, `0` disables) to `resolve_request()`, the same policy HTTP/1.1
+takes through hyper's `header_read_timeout` and HTTP/2 takes through
+`frontend_admission::wait_pre_request_deadline` (issue #4152). The value is read
+once per QUIC connection, so nothing is added to the per-stream path.
+
+On elapse the resolver is dropped, and the drop is what reclaims the resource:
+`quinn::RecvStream::drop` issues `STOP_SENDING` and `quinn::SendStream::drop`
+issues `finish()`, releasing the QUIC stream slot, returning `MAX_STREAMS`
+credit, and freeing the partial decoder buffer. The wire signal is therefore
+quinn's `STOP_SENDING(0)` rather than `H3_REQUEST_INCOMPLETE`: h3's
+`FrameStream::reset` sits behind the `i-implement-a-third-party-backend-…`
+feature this build does not enable, so emitting the exact HTTP/3 code would need
+a new vendored patch. Reclaiming the resource is the goal; the code on the wire
+is not. The elapse is logged at `debug`, never `warn`/`error`, so an
+unauthenticated peer cannot drive higher-severity logging one stream at a time.
+
 ## Header size limits
 
 The H3 listener enforces its own per-header and total-header size limits:
@@ -1432,18 +1483,42 @@ malicious or compromised H3 backend can declare an enormous HEADERS, unknown,
 CONTROL, or PUSH frame the same way a frontend client can; QUIC flow control
 does not bound accumulation on either side. Backend clients also set a distinct
 decoded response field-section ceiling to the smaller of the buffered
-non-`DATA` frame ceiling and 1 MiB − 1. The buffered-frame ceiling is twice
-the frontend request policy; the absolute cap keeps QPACK's 32-byte-per-field accounting from
-producing enough decoded fields to panic `http::HeaderMap` at its fixed
-32,768-entry limit when an operator configures a very large request limit.
-This preserves response headroom without leaving QPACK expansion or decoded
-field count effectively unbounded.
+non-`DATA` frame ceiling and the absolute field-section cap of **768,000 bytes**
+(issue #4538). The buffered-frame ceiling is twice the frontend request policy;
+the absolute cap keeps QPACK's 32-byte-per-field accounting from producing more
+decoded fields than `http::HeaderMap` can be constructed with. This preserves
+response headroom without leaving QPACK expansion or decoded field count
+effectively unbounded.
+
+### The 768,000-byte field-section cap (issue #4538)
+
+`http::HeaderMap::with_capacity(n)` is `try_with_capacity(n).expect(..)`, and
+`try_with_capacity` computes `n + n / 3`, rounds it up to the next power of two,
+and refuses once the result exceeds `MAX_SIZE = 1 << 15`. The real construction
+ceiling is therefore **24,576 entries**, not 32,768: `24_576` yields `32_768`
+(accepted) and `24_577` yields `65_536` (refused). The vendored `h3` builds every
+request and response head with `HeaderMap::with_capacity(headers.len())` on the
+raw decoded field vector, before any per-field validation and before Ferrum's own
+`431` check, so a decoded field count above 24,576 aborts the whole gateway
+process under `panic = "abort"`.
+
+QPACK bounds only the accumulated field-section size, never the field count, and
+accounts `name + value + 32` bytes per field, so the admitted field count is
+exactly `field_section_size / 32`. Both H3 field-section policies — the
+frontend request policy and the backend response policy — are therefore capped at
+`(24_576 − 576) × 32 = 768,000` bytes, which admits at most 24,000
+decoded fields. The 576-field margin covers pseudo-header expansion.
+
+The cap applies to the **frontend** policy as well as the backend one: with a
+sufficiently large `FERRUM_MAX_HEADER_SIZE_BYTES`, an unauthenticated H3 client
+could otherwise send 24,577 empty QPACK literals (~60–75 KB on the wire) and
+kill the process.
 
 | Value | Source | Effect |
 |---|---|---|
-| Frontend `SETTINGS_MAX_FIELD_SECTION_SIZE` | `FERRUM_MAX_HEADER_SIZE_BYTES`, floored at 16 KiB, clamped into the QUIC varint range | Advertised to the client, and enforced by frontend QPACK decoding. Before this the listener advertised `VarInt::MAX` (2^62-1) while enforcing the configured limit only after a complete decode. |
+| Frontend `SETTINGS_MAX_FIELD_SECTION_SIZE` | `FERRUM_MAX_HEADER_SIZE_BYTES`, floored at 16 KiB, capped at 768,000 bytes, clamped into the QUIC varint range | Advertised to the client, and enforced by frontend QPACK decoding. Before this the listener advertised `VarInt::MAX` (2^62-1) while enforcing the configured limit only after a complete decode. |
 | Buffered non-`DATA` frame ceiling | 2x the frontend field-section size | On frontend and pooled backend connections, a frame whose **declared** payload length exceeds it is refused before a single payload byte is buffered. |
-| Backend decoded response field-section ceiling | The smaller of the buffered non-`DATA` frame ceiling and 1 MiB − 1 | On pooled backend connections, QPACK decoding stops before a compact response can expand into enough fields to exceed `http::HeaderMap`'s 32,768-entry capacity (QPACK accounts 32 bytes per decoded field). |
+| Backend decoded response field-section ceiling | The smaller of the buffered non-`DATA` frame ceiling and 768,000 bytes | On pooled backend connections, QPACK decoding stops before a compact response can expand into more fields than `http::HeaderMap` can be constructed with (24,576 entries; QPACK accounts 32 bytes per decoded field). |
 
 **Failure posture.** The refusal happens as soon as the frame's type and length
 varints are decoded — before the payload is stored and before the decoder arms
@@ -1480,7 +1555,12 @@ header policy that H1/H2 backends do not share.
 varints. `EnvConfig::validate` refuses a `FERRUM_MAX_HEADER_SIZE_BYTES` whose
 derived ceiling would not fit in one, rather than silently clamping the policy
 into a bound the operator never configured (which would also make the H3
-frontend disagree with H1 and H2 about the same setting).
+frontend disagree with H1 and H2 about the same setting). For the same reason it
+also refuses a `FERRUM_MAX_HEADER_SIZE_BYTES` above **768,000** bytes: above
+that bound the advertised `SETTINGS_MAX_FIELD_SECTION_SIZE` would have to be
+capped and would no longer be the operator's policy. This is a **breaking**
+startup-validation change for anyone who had configured a header policy above
+768,000 bytes.
 
 This bound lives in the vendored `h3` crate; see
 [`docs/upstream-h3-patches/005-max-buffered-frame-len/`](upstream-h3-patches/005-max-buffered-frame-len/README.md)

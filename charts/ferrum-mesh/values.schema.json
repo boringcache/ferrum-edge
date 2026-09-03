@@ -24,6 +24,14 @@
             "IfNotPresent",
             "Never"
           ]
+        },
+        "pullSecrets": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Names of imagePullSecrets to attach to the pod. Each entry is the name of an existing Secret of type kubernetes.io/dockerconfigjson in the release namespace."
         }
       }
     },
@@ -452,6 +460,19 @@
         "probes": {
           "$ref": "#/definitions/workloadProbes"
         },
+        "shutdownDrainSeconds": {
+          "$ref": "#/definitions/shutdownSeconds",
+          "description": "FERRUM_SHUTDOWN_DRAIN_SECONDS for injector mode: seconds the webhook waits for in-flight admission connections after SIGTERM. Counts against terminationGracePeriodSeconds."
+        },
+        "shutdownPreStopSeconds": {
+          "$ref": "#/definitions/shutdownSeconds",
+          "description": "Seconds of native lifecycle.preStop.sleep before SIGTERM, covering kube-proxy endpoint removal for the failurePolicy=Fail webhook. Requires Kubernetes 1.29+ (already the injector floor); 0 omits the hook. Counts against terminationGracePeriodSeconds."
+        },
+        "terminationGracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Must be at least shutdownPreStopSeconds + shutdownDrainSeconds + 5s process-exit slack. Injector mode runs none of the serving shutdown stages, so the additive serving budget does not apply."
+        },
         "topologySpreadConstraints": {
           "type": "array",
           "description": "Optional Kubernetes TopologySpreadConstraint list. When unset and replicas >= 2, the chart spreads pods across kubernetes.io/hostname. An explicit empty list disables the default.",
@@ -830,6 +851,11 @@
         "enabled": {
           "type": "boolean"
         },
+        "terminationGracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "SIGTERM-to-SIGKILL floor for the node-agent DaemonSet. node_agent mode has no drain stage and the DaemonSet sits behind no Service, so there is deliberately no shutdownDrainSeconds and no preStop here."
+        },
         "env": {
           "type": "object",
           "description": "Free-form node-agent env map.",
@@ -1177,6 +1203,47 @@
         },
         "allowedCidrs": {
           "type": "string"
+        },
+        "httpsPort": {
+          "description": "Admin HTTPS listen port. Default 0 disables HTTPS until admin.tls is configured. Accepts integer or numeric string so Helm --set-string still validates.",
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            {
+              "type": "string",
+              "pattern": "^[0-9]{1,5}$"
+            }
+          ]
+        },
+        "tls": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "secretName": {
+              "type": "string"
+            },
+            "mountPath": {
+              "type": "string"
+            },
+            "certKey": {
+              "type": "string"
+            },
+            "keyKey": {
+              "type": "string"
+            },
+            "clientCaKey": {
+              "type": "string"
+            },
+            "crlKey": {
+              "type": "string"
+            }
+          }
         }
       }
     },

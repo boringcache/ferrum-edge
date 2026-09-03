@@ -2110,7 +2110,7 @@ pub(crate) fn should_bypass_h2_coalesce_for_large_response(
 
 /// Keep H2 transport header-list enforcement from resetting the stream before
 /// Ferrum's configured total-header validator can produce a protocol-aware 431.
-fn h2_parser_max_header_list_size(max_header_size_bytes: usize) -> u32 {
+pub(crate) fn h2_parser_max_header_list_size(max_header_size_bytes: usize) -> u32 {
     const MIN_H2_HEADER_LIST_SIZE: usize = 16 * 1024;
 
     max_header_size_bytes
@@ -4819,19 +4819,23 @@ impl Drop for PerIpRequestGuard {
     }
 }
 
-/// RAII guard that decrements the per-source WebSocket session counter on drop.
+/// RAII guard that decrements a per-source concurrency counter on drop.
 ///
-/// Created after the global `FERRUM_WEBSOCKET_MAX_CONNECTIONS` permit is taken
-/// and moved into the upgraded session task so every disconnect path (relay
-/// exit, upgrade failure, cancellation, panic) releases the slot. Independent
-/// of [`PerIpRequestGuard`], which is deliberately dropped at the upgrade
-/// boundary so a long-lived session does not block ordinary HTTP requests.
-pub struct PerIpWebSocketGuard {
+/// Shared by every long-lived per-source admission dimension: upgraded
+/// WebSocket sessions (`FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP`), TCP stream
+/// connections (`FERRUM_TCP_MAX_CONNECTIONS_PER_IP`) and UDP/DTLS stream
+/// sessions (`FERRUM_UDP_MAX_SESSIONS_PER_IP`). Created after the surface's
+/// global permit is taken and moved into the owning connection/session task so
+/// every exit path (relay exit, upgrade failure, cancellation, panic) releases
+/// the slot. Independent of [`PerIpRequestGuard`], which is deliberately
+/// dropped at the upgrade boundary so a long-lived session does not block
+/// ordinary HTTP requests.
+pub struct PerIpConnectionGuard {
     pub ip: String,
     pub counts: Arc<dashmap::DashMap<String, AtomicU64>>,
 }
 
-impl Drop for PerIpWebSocketGuard {
+impl Drop for PerIpConnectionGuard {
     fn drop(&mut self) {
         if let Some(entry) = self.counts.get(&self.ip) {
             entry.value().fetch_sub(1, Ordering::Relaxed);
@@ -4839,10 +4843,70 @@ impl Drop for PerIpWebSocketGuard {
     }
 }
 
-/// Sentinel returned when a resolved client IP already holds
-/// `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP` upgraded sessions.
+/// Sentinel returned when a resolved client IP already holds that surface's
+/// full per-source budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PerIpWebSocketLimitExceeded;
+pub struct PerIpLimitExceeded;
+
+/// Per-source admission counters plus the limit for one stream-listener family.
+///
+/// Handed to every spawned TCP/UDP stream listener so the whole gateway shares
+/// ONE counter map per family — a per-listener copy would make the effective
+/// ceiling `max` per listener rather than `max` per source. The map is owned by
+/// [`ProxyState`], which also registers it with
+/// [`ProxyState::start_per_ip_cleanup_task`] so stale zero-count entries are
+/// swept. `Default` is the disabled dimension, which is what standalone/test
+/// listener constructors get.
+#[derive(Clone, Default)]
+pub struct PerIpStreamAdmission {
+    /// `None` when the dimension is disabled (`max == 0` at startup).
+    pub counts: Option<Arc<dashmap::DashMap<String, AtomicU64>>>,
+    /// `0` = unlimited.
+    pub max: u64,
+}
+
+impl PerIpStreamAdmission {
+    /// Try to admit one connection/session for `ip`.
+    ///
+    /// `Ok(None)` means the dimension is disabled. The returned guard must
+    /// outlive the admitted connection/session.
+    pub fn try_acquire(
+        &self,
+        ip: &str,
+    ) -> Result<Option<PerIpConnectionGuard>, PerIpLimitExceeded> {
+        try_acquire_per_ip_slot(self.counts.as_ref(), ip, self.max)
+    }
+}
+
+/// Build the synthetic [`UpstreamTarget`] that keys stream load-balancer
+/// accounting for an already-resolved backend (issue #4514).
+///
+/// `LoadBalancer::find_target_key` resolves a target purely by the `host:port`
+/// string `write_target_host_port_key` builds, so a target carrying only the
+/// dialled host/port keys exactly the same active-connection counter and
+/// latency EWMA slot the real selected target does. This is the same
+/// reconstruction `tcp_proxy::try_next_target` already uses for its retry
+/// exclude, and it lets the stream paths account for a connection without
+/// threading the selected target through `resolve_backend_target` (and its
+/// call sites).
+pub(crate) fn stream_lb_accounting_target(
+    host: &str,
+    port: u16,
+    policy_port: u16,
+) -> UpstreamTarget {
+    UpstreamTarget {
+        host: host.to_string(),
+        port,
+        // Stamp the effective policy lane the dial used, matching the retry
+        // exclude. Irrelevant to the `host:port` accounting key, but it keeps
+        // the two reconstructions identical.
+        service_port_policy_key: Some(policy_port),
+        weight: 1,
+        path: None,
+        tags: std::collections::HashMap::new(),
+        locality: None,
+    }
+}
 
 /// RAII guard for load-balancer connection accounting on upgraded sessions.
 ///
@@ -4870,6 +4934,42 @@ impl Drop for LoadBalancerConnectionGuard {
     fn drop(&mut self) {
         if let (Some(target), Some(balancer)) = (self.target.as_ref(), self.balancer.as_ref()) {
             balancer.record_connection_end(target);
+        }
+    }
+}
+
+/// RAII guard that records a load-balancer failed attempt for a stream target
+/// unless it is explicitly disarmed (issue #4514).
+///
+/// UDP session setup has many `?` early returns after the backend target is
+/// selected (circuit breaker open, socket bind/connect, DTLS handshake,
+/// NodeWaypoint ownership re-checks). Recording the penalty from `Drop` keeps
+/// the accounting exactly-once across all of them without threading an error
+/// path through each one; the committed session disarms it.
+pub(crate) struct StreamLbSetupFailureGuard {
+    target: Option<Arc<UpstreamTarget>>,
+    balancer: Option<Arc<LoadBalancer>>,
+}
+
+impl StreamLbSetupFailureGuard {
+    pub(crate) fn new(
+        target: Option<Arc<UpstreamTarget>>,
+        balancer: Option<Arc<LoadBalancer>>,
+    ) -> Self {
+        Self { target, balancer }
+    }
+
+    /// The session reached a committed state; no failure penalty is owed.
+    pub(crate) fn disarm(&mut self) {
+        self.target = None;
+        self.balancer = None;
+    }
+}
+
+impl Drop for StreamLbSetupFailureGuard {
+    fn drop(&mut self) {
+        if let (Some(target), Some(balancer)) = (self.target.as_ref(), self.balancer.as_ref()) {
+            balancer.record_failed_attempt(target);
         }
     }
 }
@@ -6348,6 +6448,15 @@ pub struct ProxyState {
     /// 0 = disabled. Keyed on the same trusted-proxy-resolved `client_ip` as
     /// [`Self::per_ip_request_counts`].
     pub websocket_max_connections_per_ip: u64,
+    /// Per-effective-source-IP concurrent TCP stream-proxy connection counters.
+    /// `None` when `FERRUM_TCP_MAX_CONNECTIONS_PER_IP=0` (unlimited). Handed to
+    /// every spawned TCP stream listener through
+    /// [`stream_listener::StreamListenerManager::attach_per_ip_stream_admission`]
+    /// so one map bounds the whole gateway rather than one per listener.
+    pub per_ip_tcp_connections: Option<Arc<dashmap::DashMap<String, AtomicU64>>>,
+    /// Per-effective-source-IP concurrent UDP/DTLS stream-proxy session
+    /// counters. `None` when `FERRUM_UDP_MAX_SESSIONS_PER_IP=0` (unlimited).
+    pub per_ip_udp_sessions: Option<Arc<dashmap::DashMap<String, AtomicU64>>>,
     /// Manages TCP/UDP stream proxy listeners (dedicated port per proxy).
     pub stream_listener_manager: Arc<stream_listener::StreamListenerManager>,
     /// Monotonic counter bumped once per successful config publication.
@@ -8649,7 +8758,10 @@ impl ProxyState {
     }
 
     fn reload_backend_tls_material(&self) -> Result<(), anyhow::Error> {
-        let active_crls = crate::tls::load_crls(self.env_config.tls_crl_file_path.as_deref())?;
+        let active_crls = crate::tls::load_crls(
+            self.env_config.tls_crl_file_path.as_deref(),
+            self.env_config.tls_crl_expiry_warning_days,
+        )?;
         let validated = self.validate_backend_tls_material(active_crls.as_ref().as_slice())?;
         // Publish the admitted CRL generation before restarting health probes
         // so replacement tasks snapshot this exact generation. A refused
@@ -8718,8 +8830,10 @@ impl ProxyState {
         // Validate the complete candidate (cert/key/optional client-CA/CRLs)
         // as one generation BEFORE publishing anything. A failure keeps the
         // last accepted generation on every listener.
-        let active_crls = match crate::tls::load_crls(self.env_config.tls_crl_file_path.as_deref())
-        {
+        let active_crls = match crate::tls::load_crls(
+            self.env_config.tls_crl_file_path.as_deref(),
+            self.env_config.tls_crl_expiry_warning_days,
+        ) {
             Ok(crls) => crls,
             Err(err) => {
                 self.stream_listener_manager
@@ -8732,6 +8846,7 @@ impl ProxyState {
             &key_path,
             client_ca_cert_path.as_deref(),
             active_crls.as_ref().as_slice(),
+            self.tls_policy.as_deref(),
         ) {
             Ok(config) => config,
             Err(err) => {
@@ -9082,7 +9197,10 @@ impl ProxyState {
         let global_pool_config = PoolConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
         let tls_policy_arc = tls_policy.map(Arc::new);
         warn_if_h3_backend_tls_policy_incompatible(&config, tls_policy_arc.as_deref());
-        let crls = crate::tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
+        let crls = crate::tls::load_crls(
+            env_config.tls_crl_file_path.as_deref(),
+            env_config.tls_crl_expiry_warning_days,
+        )?;
         let shared_crls = crate::tls::shared_crl_list(crls.clone());
         let backend_svid_generation = Arc::new(AtomicU64::new(0));
         let (backend_svid_rotation_tx, backend_svid_rotation_rx) =
@@ -9189,6 +9307,12 @@ impl ProxyState {
         // pool discoverability.
         let mesh_trust_registry = mesh_trust_registry::MeshTrustRegistry::new();
         hbone_pool.attach_mesh_trust_registry(mesh_trust_registry.clone());
+        // Bound the response header block an SVID-holding HBONE peer may push
+        // back, under the operator's own `FERRUM_MAX_HEADER_SIZE_BYTES` policy
+        // (floored at 16 KiB). Without this the raw-`h2` client keeps `h2`'s
+        // 16 MiB default — 1,024x every sibling backend transport.
+        hbone_pool
+            .attach_max_header_list_size(h2_parser_max_header_list_size(max_header_size_bytes));
         mesh_mtls_pool.attach_mesh_trust_registry(mesh_trust_registry.clone());
         let backend_capabilities = Arc::new(BackendCapabilityRegistry::with_shard_amount(
             pool_shard_amount,
@@ -9324,6 +9448,7 @@ impl ProxyState {
             load_balancer_cache.clone(),
             dns_cache.clone(),
             health_checker.clone(),
+            circuit_breaker_cache.clone(),
             plugin_http_client,
             Some(request_epoch.clone()),
         ));
@@ -9520,6 +9645,30 @@ impl ProxyState {
             env_config_arc.datagram_proxy_protocol_secret.clone(),
         );
 
+        // Per-source admission for the stream listeners (issue #4544). Built
+        // here and attached before the first `reconcile()` so every spawned
+        // TCP/UDP listener shares ONE counter map per family: a per-listener
+        // copy would make the effective ceiling `max` per listener instead of
+        // `max` per source. `None` when the dimension is disabled (`0`).
+        let tcp_max_connections_per_ip = env_config_arc.tcp_max_connections_per_ip;
+        let udp_max_sessions_per_ip = env_config_arc.udp_max_sessions_per_ip;
+        let per_ip_tcp_connections: Option<Arc<dashmap::DashMap<String, AtomicU64>>> =
+            (tcp_max_connections_per_ip > 0)
+                .then(|| Arc::new(dashmap::DashMap::with_shard_amount(pool_shard_amount)));
+        let per_ip_udp_sessions: Option<Arc<dashmap::DashMap<String, AtomicU64>>> =
+            (udp_max_sessions_per_ip > 0)
+                .then(|| Arc::new(dashmap::DashMap::with_shard_amount(pool_shard_amount)));
+        stream_listener_manager.attach_per_ip_stream_admission(
+            PerIpStreamAdmission {
+                counts: per_ip_tcp_connections.clone(),
+                max: tcp_max_connections_per_ip,
+            },
+            PerIpStreamAdmission {
+                counts: per_ip_udp_sessions.clone(),
+                max: udp_max_sessions_per_ip,
+            },
+        );
+
         let state = Self {
             config: config_arc,
             request_epoch,
@@ -9601,6 +9750,8 @@ impl ProxyState {
                 None
             },
             websocket_max_connections_per_ip,
+            per_ip_tcp_connections,
+            per_ip_udp_sessions,
             stream_listener_manager,
             config_revision: ConfigRevisionNotifier::new(),
             started_at: Instant::now(),
@@ -9681,18 +9832,19 @@ impl ProxyState {
     }
 
     /// Start a background task that periodically removes stale zero-count
-    /// entries from `per_ip_request_counts` and `per_ip_websocket_sessions`.
+    /// entries from `per_ip_request_counts`, `per_ip_websocket_sessions`,
+    /// `per_ip_tcp_connections` and `per_ip_udp_sessions`.
     /// Normally entries are cleaned via the RAII drop of
-    /// [`PerIpRequestGuard`] / [`PerIpWebSocketGuard`], but this sweep catches
+    /// [`PerIpRequestGuard`] / [`PerIpConnectionGuard`], but this sweep catches
     /// edge cases (e.g., task cancellation without guard drop).
     ///
     /// Returns `Some(JoinHandle)` when either per-IP map is enabled so the
     /// caller can join the task during the background-task drain phase of
     /// graceful shutdown. Returns `None` when both
     /// `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP=0` and
-    /// `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP=0` (no tracking, no task to
-    /// spawn). The task exits cleanly on `shutdown_rx` change so it doesn't
-    /// wedge shutdown — consistent with `start_backend_capability_refresh_task`,
+    /// `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP=0` and both stream-listener
+    /// per-source caps are `0` (no tracking, no task to spawn). The task exits
+    /// cleanly on `shutdown_rx` change so it doesn't wedge shutdown — consistent with `start_backend_capability_refresh_task`,
     /// `dns_cache.start_background_refresh_with_shutdown`, and the overload /
     /// metrics monitors.
     pub fn start_per_ip_cleanup_task(
@@ -9704,6 +9856,16 @@ impl ProxyState {
             maps.push(counts.clone());
         }
         if let Some(counts) = self.per_ip_websocket_sessions.as_ref() {
+            maps.push(counts.clone());
+        }
+        // Stream-listener per-source admission maps (issue #4544). Their
+        // `PerIpConnectionGuard`s are released by the TCP connection task and by
+        // the UDP session's `release_session_guards`; this sweep only reclaims
+        // the map entries those decrements leave at zero.
+        if let Some(counts) = self.per_ip_tcp_connections.as_ref() {
+            maps.push(counts.clone());
+        }
+        if let Some(counts) = self.per_ip_udp_sessions.as_ref() {
             maps.push(counts.clone());
         }
         if maps.is_empty() {
@@ -13585,6 +13747,7 @@ async fn handle_connection(
     let (stream, h1_framing_signals) = h1_framing_guard::H1FramingGuardIo::new(
         stream,
         http1_parser_max_buf_size(state.max_header_size_bytes),
+        Some(remote_addr),
     );
     let io = TokioIo::new(stream);
 
@@ -13640,6 +13803,12 @@ async fn handle_connection(
     let admission = frontend_admission::FrontendAdmission::new();
     let service_admission = Arc::clone(&admission);
     let service_h1_framing_signals = Arc::clone(&h1_framing_signals);
+    // Issue #4543: the parse-layer `400`s are written straight to the socket
+    // from inside `poll_read`, so they never reach `record_request` through the
+    // service. Kept out of the service closure (which moves `state`) so the
+    // count can be drained once after the connection resolves.
+    let post_conn_state = Arc::clone(&state);
+    let post_conn_signals = Arc::clone(&h1_framing_signals);
     let svc = service_fn(move |req: Request<Incoming>| {
         service_admission.mark();
         let state = Arc::clone(&state);
@@ -13749,6 +13918,17 @@ async fn handle_connection(
         }
     };
 
+    // Issue #4543: each HTTP/1 parse-layer reject answered a request hyper never
+    // saw, so nothing on the service path counted it. Drain the connection's
+    // reject count here and record one `400` apiece, which puts a smuggling
+    // probe (a conflicting `Content-Length`) into the gateway's request and
+    // status counters, `/metrics/runtime`, and the admin status map instead of
+    // leaving it with no metric at all.
+    let parse_rejects = post_conn_signals.take_parse_rejects();
+    for _ in 0..parse_rejects {
+        record_request(&post_conn_state, 400);
+    }
+
     if let Err(e) = result {
         let err_string = e.to_string();
         if is_client_disconnect_error(&err_string) {
@@ -13845,7 +14025,28 @@ pub fn try_acquire_per_ip_websocket_session(
     counts: Option<&Arc<dashmap::DashMap<String, AtomicU64>>>,
     ip: &str,
     max: u64,
-) -> Result<Option<PerIpWebSocketGuard>, PerIpWebSocketLimitExceeded> {
+) -> Result<Option<PerIpConnectionGuard>, PerIpLimitExceeded> {
+    try_acquire_per_ip_slot(counts, ip, max)
+}
+
+/// Try to admit one long-lived unit of work for `ip` against a per-source
+/// budget.
+///
+/// The shared primitive behind every per-source admission dimension —
+/// WebSocket sessions, TCP stream connections and UDP/DTLS stream sessions.
+///
+/// `counts == None` or `max == 0` means the dimension is disabled (`Ok(None)`).
+/// The increment happens BEFORE the comparison and the guard is constructed
+/// before the overflow branch, so concurrent acquirers can never both observe
+/// room that only one of them has: an over-limit acquirer drops its own
+/// increment and is refused (fail closed). Source identity is the caller's
+/// resolved effective client IP — forwarding evidence must already have been
+/// accepted only from a trusted peer.
+pub fn try_acquire_per_ip_slot(
+    counts: Option<&Arc<dashmap::DashMap<String, AtomicU64>>>,
+    ip: &str,
+    max: u64,
+) -> Result<Option<PerIpConnectionGuard>, PerIpLimitExceeded> {
     let Some(counts) = counts else {
         return Ok(None);
     };
@@ -13858,13 +14059,13 @@ pub fn try_acquire_per_ip_websocket_session(
             .or_insert_with(|| AtomicU64::new(0));
         count.value().fetch_add(1, Ordering::Relaxed) + 1
     };
-    let guard = PerIpWebSocketGuard {
+    let guard = PerIpConnectionGuard {
         ip: ip.to_string(),
         counts: counts.clone(),
     };
     if current > max {
         drop(guard);
-        Err(PerIpWebSocketLimitExceeded)
+        Err(PerIpLimitExceeded)
     } else {
         Ok(Some(guard))
     }
@@ -21568,6 +21769,7 @@ async fn handle_tls_connection(
             let (io, signals) = h1_framing_guard::MaybeH1FramingGuardIo::observed(
                 tls_stream,
                 http1_parser_max_buf_size(state.max_header_size_bytes),
+                Some(remote_addr),
             );
             (io, Some(signals))
         };
@@ -21624,6 +21826,11 @@ async fn handle_tls_connection(
     let header_read_timeout_seconds = state.env_config.http_header_read_timeout_seconds;
     let admission = frontend_admission::FrontendAdmission::new();
     let service_admission = Arc::clone(&admission);
+    // Issue #4543: see the plaintext handler. `h1_framing_signals` is moved
+    // into `service_h1_framing_signals` below, so clone the handle (and the
+    // state the service closure also moves) first.
+    let post_conn_state = Arc::clone(&state);
+    let post_conn_signals = h1_framing_signals.clone();
     let service_h1_framing_signals = h1_framing_signals;
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         service_admission.mark();
@@ -21759,6 +21966,19 @@ async fn handle_tls_connection(
         }
     };
     drop(client_trust_guard);
+
+    // Issue #4543: each HTTP/1 parse-layer reject answered a request hyper never
+    // saw, so nothing on the service path counted it. Drain the connection's
+    // reject count here and record one `400` apiece, which puts a smuggling
+    // probe (a conflicting `Content-Length`) into the gateway's request and
+    // status counters, `/metrics/runtime`, and the admin status map instead of
+    // leaving it with no metric at all.
+    if let Some(signals) = post_conn_signals.as_ref() {
+        let parse_rejects = signals.take_parse_rejects();
+        for _ in 0..parse_rejects {
+            record_request(&post_conn_state, 400);
+        }
+    }
 
     if let Err(e) = result {
         let err_string = e.to_string();
@@ -39423,6 +39643,24 @@ pub fn build_backend_url(
     )
 }
 
+/// The URL scheme [`build_backend_url_with_target`] renders into the outbound
+/// backend URL for this dispatch.
+///
+/// A function of TLS-vs-plaintext only. gRPC and WebSocket use the same
+/// `http`/`https` wire scheme — the flavor only changes the request's
+/// content-type / Upgrade header, not the URL scheme. Stream kinds never
+/// reach the URL builder but fall through safely.
+///
+/// Shared with the reqwest `Host` builders so the scheme that decides
+/// default-port omission in [`outbound_host_header_value`] is the same one
+/// the URL (and therefore hyper's `:authority`) was actually built with.
+fn backend_url_scheme_for_dispatch(proxy: &Proxy) -> &'static str {
+    match proxy.dispatch_kind {
+        DispatchKind::HttpPool | DispatchKind::TcpRaw | DispatchKind::UdpRaw => "http",
+        DispatchKind::HttpsPool | DispatchKind::TcpTls | DispatchKind::UdpDtls => "https",
+    }
+}
+
 /// Build backend URL using a specific host and port (for load-balanced targets).
 ///
 /// `strip_len` is the number of bytes to strip from the start of `incoming_path`
@@ -39443,16 +39681,7 @@ pub fn build_backend_url_with_target(
 ) -> String {
     use std::fmt::Write;
 
-    // URL scheme is a function of TLS-vs-plaintext only. gRPC and WebSocket
-    // use the same `http`/`https` wire scheme — the flavor only changes the
-    // request's content-type / Upgrade header, not the URL scheme. Stream
-    // kinds never reach this builder but we fall through safely for them.
-    let scheme = match proxy.dispatch_kind {
-        DispatchKind::HttpPool => "http",
-        DispatchKind::HttpsPool => "https",
-        DispatchKind::TcpRaw | DispatchKind::UdpRaw => "http",
-        DispatchKind::TcpTls | DispatchKind::UdpDtls => "https",
-    };
+    let scheme = backend_url_scheme_for_dispatch(proxy);
 
     with_backend_path_parts(
         proxy,
@@ -40156,6 +40385,16 @@ pub(crate) async fn proxy_to_backend_retry(
     let effective_host = upstream_target
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
+    // The port half of the same selection. `Host` must carry the FULL outbound
+    // authority, not a bare hostname: reqwest builds its URL from
+    // `build_backend_url_with_target`, so hyper's `:authority` is
+    // `host:port` for a non-default port. A hostname-only `Host` is an
+    // RFC 9112 §3.2 violation on H1 (hyper-util's `set_host` is
+    // `entry(HOST).or_insert_with(..)`, so Ferrum's value wins) and an
+    // RFC 9113 §8.3.1 disagreement on H2 (issues #4410, #4539).
+    let effective_port = upstream_target
+        .map(|t| t.port)
+        .unwrap_or(proxy.backend_port);
 
     // Re-screen the (possibly LB-rotated) retry target: reqwest skips the
     // DnsCacheResolver for IP literals, so a denied literal reached via retry
@@ -40375,9 +40614,19 @@ pub(crate) async fn proxy_to_backend_retry(
                 if proxy.preserve_host_header {
                     req_builder = req_builder.header("Host", v.as_str());
                 } else {
-                    // Use upstream target host when load balancing, so SNI-based
-                    // ingress routers see the correct Host header for the target.
-                    req_builder = req_builder.header("Host", effective_host);
+                    // Use the upstream target's FULL authority when load
+                    // balancing, so SNI-based ingress routers see the correct
+                    // Host for the target and `Host` agrees with the
+                    // `:authority` hyper derives from the reqwest URL
+                    // (issues #4410, #4539). Default ports are omitted, so a
+                    // conventional 80/443 backend is byte-identical to the
+                    // previous hostname-only value.
+                    let outbound_host = outbound_host_header_value(
+                        effective_host,
+                        effective_port,
+                        Some(backend_url_scheme_for_dispatch(proxy)),
+                    );
+                    req_builder = req_builder.header("Host", &*outbound_host);
                 }
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
@@ -40407,7 +40656,12 @@ pub(crate) async fn proxy_to_backend_retry(
     // value. The backend must never see the TLS server name merely because it
     // was used for SNI.
     if sni_reqwest_dial.is_some() && !headers.contains_key("host") {
-        req_builder = req_builder.header("Host", effective_host);
+        let outbound_host = outbound_host_header_value(
+            effective_host,
+            effective_port,
+            Some(backend_url_scheme_for_dispatch(proxy)),
+        );
+        req_builder = req_builder.header("Host", &*outbound_host);
     }
 
     // Add proxy-managed forwarding metadata.
@@ -42584,6 +42838,12 @@ async fn proxy_to_backend(
     let effective_host = upstream_target
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
+    // The port half of the same selection; see `proxy_to_backend_retry` for
+    // why outbound `Host` must be the full authority rather than a bare
+    // hostname (issues #4410, #4539).
+    let effective_port = upstream_target
+        .map(|t| t.port)
+        .unwrap_or(proxy.backend_port);
 
     // A Unix backend's `host:port` is only a schema-compatible carrier. It is
     // never resolved or dialed: the reserved target tag below is re-admitted
@@ -43699,9 +43959,19 @@ async fn proxy_to_backend(
                 if proxy.preserve_host_header {
                     req_builder = req_builder.header("Host", v.as_str());
                 } else {
-                    // Use upstream target host when load balancing, so SNI-based
-                    // ingress routers see the correct Host header for the target.
-                    req_builder = req_builder.header("Host", effective_host);
+                    // Use the upstream target's FULL authority when load
+                    // balancing, so SNI-based ingress routers see the correct
+                    // Host for the target and `Host` agrees with the
+                    // `:authority` hyper derives from the reqwest URL
+                    // (issues #4410, #4539). Default ports are omitted, so a
+                    // conventional 80/443 backend is byte-identical to the
+                    // previous hostname-only value.
+                    let outbound_host = outbound_host_header_value(
+                        effective_host,
+                        effective_port,
+                        Some(backend_url_scheme_for_dispatch(proxy)),
+                    );
+                    req_builder = req_builder.header("Host", &*outbound_host);
                 }
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
@@ -43731,7 +44001,12 @@ async fn proxy_to_backend(
     // value. The backend must never see the TLS server name merely because it
     // was used for SNI.
     if sni_reqwest_dial.is_some() && !headers.contains_key("host") {
-        req_builder = req_builder.header("Host", effective_host);
+        let outbound_host = outbound_host_header_value(
+            effective_host,
+            effective_port,
+            Some(backend_url_scheme_for_dispatch(proxy)),
+        );
+        req_builder = req_builder.header("Host", &*outbound_host);
     }
 
     // Add proxy-managed forwarding metadata.
@@ -45776,6 +46051,44 @@ fn outbound_h2_authority(uri: &hyper::Uri) -> Option<&str> {
     Some(authority_str)
 }
 
+/// Outbound `Host` for a backend selected as `host` + `port`.
+///
+/// Same rule as [`outbound_h2_authority`], expressed over the SELECTED
+/// TARGET instead of a parsed URI: an explicit default port (80 for
+/// `http`/`ws`, 443 for `https`/`wss`) is omitted, any other port is
+/// appended. Used by the transports that never parse an outbound
+/// `hyper::Uri` before writing `Host` — the reqwest HTTP/1.1 + HTTP/2
+/// builders and the two native-HTTP/3 backend header builders — so all
+/// four emit the same authority the direct-H2 pool and native gRPC do
+/// (issues #4410, #4539). Deriving from `(host, port)` rather than
+/// re-parsing `backend_url` keeps the dispatch hot path free of a URI
+/// parse.
+///
+/// Borrows on the default-port path, which is the common case, so the hot
+/// path adds no allocation there. Otherwise `{host}:{port}`, with an
+/// unbracketed IPv6 literal bracketed first (shared with the HBONE/Unix
+/// builders via [`hbone_pool::authority_for_host_port`], which is also what
+/// `build_backend_url_with_target` renders into the URL authority, so `Host`
+/// and reqwest's `:authority` agree byte for byte).
+pub(crate) fn outbound_host_header_value<'a>(
+    host: &'a str,
+    port: u16,
+    scheme: Option<&str>,
+) -> Cow<'a, str> {
+    // Parsing the shared table's literal (`"80"` / `"443"`) rather than
+    // re-spelling it here is what keeps this helper and
+    // `outbound_h2_authority` from drifting on the default-port set.
+    if default_port_for_scheme(scheme).and_then(|p| p.parse::<u16>().ok()) == Some(port) {
+        // Render exactly as `build_backend_url_with_target` renders the URL
+        // authority, so an unbracketed IPv6 target host still yields a
+        // parseable authority (`::1` -> `[::1]`), matching what
+        // `outbound_h2_authority` returns after stripping `:443` from
+        // `[::1]:443`. Borrows for every non-IPv6 host, i.e. the hot path.
+        return url_render_host(host);
+    }
+    Cow::Owned(hbone_pool::authority_for_host_port(host, port))
+}
+
 /// Rewrite `uri`'s authority so Hyper's `:authority` equals `authority`.
 ///
 /// Returns `true` when they already agree or the rewrite succeeded. A URI
@@ -45955,6 +46268,37 @@ pub fn normalize_request_authority_for_signing(
     normalize_authority_for_consistency(value, scheme).filter(|authority| !authority.is_empty())
 }
 
+/// Compare a `Host` field value against a request-target authority under
+/// scheme-default-port normalization.
+///
+/// Returns `None` when the two agree (or the URI carries no authority);
+/// otherwise the JSON error body to return. Shared by the H2/H3
+/// `:authority` rule (`check_host_authority_consistency`) and the HTTP/1.1
+/// absolute-form rule in `check_protocol_headers_with_wire_framing`, so the
+/// two cannot drift apart on either the comparison or the wording.
+///
+/// The `Host` value is validated even when the URI carries no authority: an
+/// unparseable `Host` cannot select a vhost. Callers that must not reject a
+/// bare origin-form request gate the call on `uri.authority().is_some()`.
+fn host_authority_disagreement(host: &str, uri: &hyper::Uri) -> Option<&'static str> {
+    let scheme = uri.scheme_str();
+    let Some(host) = normalize_authority_for_consistency(host, scheme) else {
+        return Some(r#"{"error":"Host header contains invalid authority"}"#);
+    };
+
+    // `?` here is the "no URI authority, nothing to compare" exit: the
+    // function's `None` means "agrees".
+    let authority = uri.authority()?;
+    let Some(authority) = normalize_authority_for_consistency(authority.as_str(), scheme) else {
+        return Some(r#"{"error":"Request authority contains invalid authority"}"#);
+    };
+    if host != authority {
+        return Some(r#"{"error":"Host header and request authority disagree"}"#);
+    }
+
+    None
+}
+
 /// Validate HTTP/2 and HTTP/3 `Host`/`:authority` consistency before routing.
 ///
 /// RFC 9113 §8.3.1 and RFC 9114 §4.3.1 require a request to include either
@@ -45996,22 +46340,7 @@ pub fn check_host_authority_consistency(
     let Ok(host) = host.to_str() else {
         return Some(r#"{"error":"Host header contains invalid characters"}"#);
     };
-    let scheme = uri.scheme_str();
-    let Some(host) = normalize_authority_for_consistency(host, scheme) else {
-        return Some(r#"{"error":"Host header contains invalid authority"}"#);
-    };
-
-    if let Some(authority) = uri.authority() {
-        let Some(authority) = normalize_authority_for_consistency(authority.as_str(), scheme)
-        else {
-            return Some(r#"{"error":"Request authority contains invalid authority"}"#);
-        };
-        if host != authority {
-            return Some(r#"{"error":"Host header and request authority disagree"}"#);
-        }
-    }
-
-    None
+    host_authority_disagreement(host, uri)
 }
 
 /// Validate protocol-level header constraints to block smuggling and desync attacks.
@@ -46035,8 +46364,17 @@ pub fn check_host_authority_consistency(
 ///    (`GET http://host/path HTTP/1.1`) carry the authority on the URI
 ///    (`uri.authority()`) and are accepted without a Host field. An empty
 ///    Host value (`Host:` with no tokens) is present but invalid and MUST 400
-///    on HTTP/1.1. HTTP/2 and HTTP/3 are not checked here; they use
-///    `:authority`, governed by `check_host_authority_consistency()`.
+///    on HTTP/1.1. When an HTTP/1.1 absolute-form request-target carries an
+///    authority *and* a Host field is present, the two must agree under
+///    scheme-default-port normalization (`host_authority_disagreement()`);
+///    disagreement is a 400, matching the HTTP/2 / HTTP/3 `:authority` rule.
+///    RFC 9112 §3.2.1 has a recipient route on the request-target authority
+///    and ignore Host, so a disagreeing pair would let an upstream hop
+///    authorize one authority while Ferrum selects the other. HTTP/1.0 is out
+///    of scope for both the missing-Host and the disagreement rule: RFC 9112
+///    §3.2.2 does not require a Host field on HTTP/1.0. HTTP/2 and HTTP/3 are
+///    not checked here; they use `:authority`, governed by
+///    `check_host_authority_consistency()`.
 ///
 /// 4. **Transfer-Encoding rejection** (HTTP/2 and HTTP/3): RFC 9113 §8.2.2 and
 ///    RFC 9114 §4.2 forbid this HTTP/1.x framing header on multiplexed protocols.
@@ -46157,8 +46495,29 @@ fn check_protocol_headers_with_wire_framing(
                     // it is an invalid field value. RFC 9112 §3.2.2 also MUST
                     // 400 invalid Host values, and an empty Host cannot select
                     // a vhost (it would otherwise fall through to catch-all).
+                    // This stays ahead of the absolute-form comparison below:
+                    // "present but invalid" is a distinct, already-specified
+                    // rejection from "present and disagreeing".
                     if trim_ows(value.as_bytes()).is_empty() {
                         return Some(r#"{"error":"Host header contains invalid empty value"}"#);
+                    }
+                    // Absolute-form (`GET http://host/path HTTP/1.1`) carries
+                    // an authority on the request-target as well. RFC 9112
+                    // §3.2.1 requires a recipient to route on the
+                    // request-target's authority and ignore Host; Ferrum
+                    // routes on Host (with the target authority only as a
+                    // fallback), so a disagreeing pair lets a compliant
+                    // upstream hop authorize one authority while Ferrum
+                    // selects another. Reject rather than pick a side, which
+                    // matches the H2/H3 `:authority` rule and keeps one rule
+                    // across all three protocols.
+                    if uri.authority().is_some() {
+                        let Ok(host) = value.to_str() else {
+                            return Some(r#"{"error":"Host header contains invalid characters"}"#);
+                        };
+                        if let Some(error) = host_authority_disagreement(host, uri) {
+                            return Some(error);
+                        }
                     }
                 }
             }
@@ -52527,6 +52886,11 @@ struct Http3BackendHeaderContext<'a> {
     client_ip: &'a str,
     xff_append_ip: &'a str,
     effective_host: &'a str,
+    /// Port half of the same LB selection as `effective_host`. Outbound
+    /// `Host` carries the full authority (default ports omitted) so a
+    /// non-default-port H3 backend can still do vhost selection and emit
+    /// correct absolute redirects (issue #4539).
+    effective_port: u16,
     request_is_secure: bool,
     inbound_version: hyper::Version,
     content_length: Option<&'a str>,
@@ -52571,10 +52935,16 @@ fn build_http3_backend_headers(
                 // `handle_proxy_request_inner` synthesis above) would
                 // forward the client's external authority to an H3-native
                 // backend even when `preserve_host_header == false`.
-                let host_value = if proxy.preserve_host_header {
-                    value.as_str()
+                // HTTP/3 is TLS-only, so the default-port rule is the
+                // `https` one: 443 is omitted, any other port is appended.
+                let host_value: Cow<'_, str> = if proxy.preserve_host_header {
+                    Cow::Borrowed(value.as_str())
                 } else {
-                    ctx.effective_host
+                    outbound_host_header_value(
+                        ctx.effective_host,
+                        ctx.effective_port,
+                        Some("https"),
+                    )
                 };
                 if let Ok(hv) = host_value.parse::<hyper::header::HeaderValue>() {
                     http3_headers.push((hyper::header::HOST, hv));
@@ -52694,6 +53064,11 @@ async fn proxy_to_backend_http3(
     let effective_host = upstream_target
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
+    // Port half of the same selection, for the outbound `Host` authority
+    // (issue #4539).
+    let effective_port = upstream_target
+        .map(|t| t.port)
+        .unwrap_or(proxy.backend_port);
     // Enforce the backend egress policy for a literal-IP backend before dialing.
     // The native H3 pool self-resolves via the shared DNS cache — whose
     // literal fast path is canonical `IpAddr::parse` (non-canonical spellings go
@@ -52776,6 +53151,7 @@ async fn proxy_to_backend_http3(
                         client_ip,
                         xff_append_ip,
                         effective_host,
+                        effective_port,
                         request_is_secure,
                         inbound_version,
                         content_length: headers.get("content-length").map(String::as_str),
@@ -53195,6 +53571,7 @@ async fn proxy_to_backend_http3(
             client_ip,
             xff_append_ip,
             effective_host,
+            effective_port,
             request_is_secure,
             inbound_version,
             content_length: request_content_length.as_deref(),
@@ -53902,6 +54279,7 @@ async fn proxy_to_backend_http3_retry(
             client_ip,
             xff_append_ip,
             effective_host,
+            effective_port,
             request_is_secure,
             inbound_version,
             content_length: None,
@@ -58539,6 +58917,7 @@ mod tests {
                 client_ip: "203.0.113.44",
                 xff_append_ip: "127.0.0.1",
                 effective_host: "backend.internal",
+                effective_port: 443,
                 request_is_secure: false,
                 inbound_version: hyper::Version::HTTP_11,
                 content_length: None,
@@ -58585,6 +58964,7 @@ mod tests {
                 client_ip: "127.0.0.1",
                 xff_append_ip: "127.0.0.1",
                 effective_host: "backend.internal",
+                effective_port: 443,
                 request_is_secure: false,
                 inbound_version: hyper::Version::HTTP_11,
                 content_length: None,
@@ -58620,6 +59000,7 @@ mod tests {
                 client_ip: "203.0.113.9",
                 xff_append_ip: "10.0.0.7",
                 effective_host: "h3-backend.example",
+                effective_port: 443,
                 request_is_secure: true,
                 inbound_version: hyper::Version::HTTP_2,
                 content_length: None,
@@ -58668,6 +59049,7 @@ mod tests {
                 client_ip: "203.0.113.9",
                 xff_append_ip: "10.0.0.7",
                 effective_host: "h3-backend.example",
+                effective_port: 443,
                 request_is_secure: true,
                 inbound_version: hyper::Version::HTTP_11,
                 content_length: None,
@@ -58711,6 +59093,7 @@ mod tests {
                 client_ip: "203.0.113.9",
                 xff_append_ip: "10.0.0.7",
                 effective_host: "h3-backend.example",
+                effective_port: 443,
                 request_is_secure: true,
                 inbound_version: hyper::Version::HTTP_11,
                 content_length: None,

@@ -75,6 +75,12 @@ pub const DATABASE_DELTA_RESOURCE_CATEGORY_LABELS: [&str; 6] = [
 ];
 pub const DATABASE_DELTA_BACKOFF_BUCKET_LABELS: [&str; 6] =
     ["none", "lt_5s", "lt_30s", "lt_5m", "gte_5m", "max"];
+/// Closed, compile-time label set for `ferrum_database_poll_failures_total`.
+///
+/// Never derived from an error string: a hostile or merely verbose backend
+/// error must not be able to grow `/metrics` cardinality (issue #4528).
+pub const DATABASE_POLL_FAILURE_REASON_LABELS: [&str; 3] =
+    ["connectivity", "validation_rejected", "migration_gate"];
 const PLUGIN_MIGRATIONS_RECONCILED: u8 = 0;
 const PLUGIN_MIGRATIONS_NEED_RECONCILE: u8 = 1;
 const PLUGIN_MIGRATIONS_RECONCILING: u8 = 2;
@@ -110,6 +116,15 @@ pub struct DatabaseDeltaPollMetricsSnapshot {
     /// Unix millis companion for Prometheus gauges; omitted from JSON.
     #[serde(skip)]
     pub last_poll_completed_at_unix_ms: u64,
+    /// Whether the configuration source (database in `database` mode, the
+    /// backing database in `cp` mode) is currently reachable. Mirrors the
+    /// shared `db_available` flag the poll loop and `AdminState` already use,
+    /// so this can never drift from the admin API's view (issue #4528).
+    pub config_source_connected: bool,
+    /// Poll failures keyed by the closed
+    /// [`DATABASE_POLL_FAILURE_REASON_LABELS`] set. Every reason is always
+    /// present so the exported series set is stable.
+    pub poll_failures_by_reason: BTreeMap<&'static str, u64>,
     pub degraded: Option<DatabaseDeltaPollDegraded>,
     /// Backend-native config-change watcher state (issue #3330). `None` unless
     /// a watcher was started for this process. Present only as a reload-latency
@@ -146,6 +161,15 @@ pub struct DatabaseDeltaPollMetrics {
     last_resource_category: AtomicU8,
     /// Unix millis of last completed poll outcome; `0` means never completed.
     last_poll_completed_at_unix_ms: AtomicU64,
+    /// The *same* `Arc<AtomicBool>` the poll loop and `AdminState` hold, so
+    /// `ferrum_database_config_source_connected` is the admin API's
+    /// `db_available` rather than a second copy that can drift (issue #4528).
+    /// [`Default`] owns a fresh flag for tests and for callers that have no
+    /// poll loop.
+    config_source_connected: Arc<AtomicBool>,
+    poll_failures_connectivity: AtomicU64,
+    poll_failures_validation_rejected: AtomicU64,
+    poll_failures_migration_gate: AtomicU64,
     degraded: ArcSwap<Option<DatabaseDeltaPollDegraded>>,
     /// Shared with the optional backend config-change watcher task. Stays
     /// "not enabled" (and absent from every output surface) unless a watcher
@@ -170,6 +194,10 @@ impl Default for DatabaseDeltaPollMetrics {
             recoveries_total: AtomicU64::new(0),
             last_resource_category: AtomicU8::new(DatabaseDeltaResourceCategory::None as u8),
             last_poll_completed_at_unix_ms: AtomicU64::new(0),
+            config_source_connected: Arc::new(AtomicBool::new(true)),
+            poll_failures_connectivity: AtomicU64::new(0),
+            poll_failures_validation_rejected: AtomicU64::new(0),
+            poll_failures_migration_gate: AtomicU64::new(0),
             degraded: ArcSwap::from_pointee(None),
             change_stream: Arc::new(ConfigChangeWatcherHealth::new()),
         }
@@ -177,6 +205,50 @@ impl Default for DatabaseDeltaPollMetrics {
 }
 
 impl DatabaseDeltaPollMetrics {
+    /// Share the poll loop's live `db_available` flag with the metrics
+    /// registry so `ferrum_database_config_source_connected` reports exactly
+    /// what the admin API reports, with no extra call sites to keep in sync.
+    pub fn with_config_source_flag(flag: Arc<AtomicBool>) -> Self {
+        Self {
+            config_source_connected: flag,
+            ..Self::default()
+        }
+    }
+
+    /// Bounded, lock-free poll-failure counter.
+    ///
+    /// Distinct from [`Self::record_poll_completed`], which advances on every
+    /// normally completed poll outcome (including handled errors) because its
+    /// job is detecting poll-*task death* (issue #2986). This counter is the
+    /// outcome signal.
+    pub fn record_poll_failure(&self, reason: DatabasePollFailureReason) {
+        self.counter_for_failure_reason(reason)
+            .fetch_add(1, Ordering::Relaxed);
+        invalidate_database_delta_poll_metrics_cache();
+    }
+
+    /// Mark the configuration source unreachable/unusable and count the
+    /// failure in one call, so the gauge and the counter cannot drift apart.
+    pub fn record_config_source_unavailable(&self, reason: DatabasePollFailureReason) {
+        self.config_source_connected.store(false, Ordering::Relaxed);
+        self.record_poll_failure(reason);
+    }
+
+    /// Lock-free read of the shared config-source availability flag.
+    pub fn config_source_connected(&self) -> bool {
+        self.config_source_connected.load(Ordering::Relaxed)
+    }
+
+    fn counter_for_failure_reason(&self, reason: DatabasePollFailureReason) -> &AtomicU64 {
+        match reason {
+            DatabasePollFailureReason::Connectivity => &self.poll_failures_connectivity,
+            DatabasePollFailureReason::ValidationRejected => {
+                &self.poll_failures_validation_rejected
+            }
+            DatabasePollFailureReason::MigrationGate => &self.poll_failures_migration_gate,
+        }
+    }
+
     fn record_rejection(
         &self,
         category: DatabaseDeltaResourceCategory,
@@ -292,6 +364,15 @@ impl DatabaseDeltaPollMetrics {
                 .map(|ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
         };
 
+        let mut poll_failures_by_reason = BTreeMap::new();
+        for reason in DatabasePollFailureReason::ALL {
+            poll_failures_by_reason.insert(
+                reason.as_str(),
+                self.counter_for_failure_reason(reason)
+                    .load(Ordering::Relaxed),
+            );
+        }
+
         DatabaseDeltaPollMetricsSnapshot {
             rejected_deltas_total: self.rejected_deltas_total.load(Ordering::Relaxed),
             rejected_deltas_by_resource_category,
@@ -311,6 +392,8 @@ impl DatabaseDeltaPollMetrics {
             .as_str(),
             last_poll_completed_at,
             last_poll_completed_at_unix_ms: last_poll_ms,
+            config_source_connected: self.config_source_connected(),
+            poll_failures_by_reason,
             degraded: self.degraded(),
             change_stream: self.change_stream.snapshot(),
         }
@@ -372,6 +455,35 @@ impl DatabaseDeltaResourceCategory {
             5 => Self::Mixed,
             _ => Self::None,
         }
+    }
+}
+
+/// Compile-time reason for a database/CP config-poll failure.
+///
+/// Mirrors [`DATABASE_POLL_FAILURE_REASON_LABELS`] index for index.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DatabasePollFailureReason {
+    /// The backend could not be reached, or a reload against a reachable
+    /// backend failed for a reason the call site cannot classify further.
+    Connectivity = 0,
+    /// A reachable backend served a snapshot the runtime-config validation
+    /// contract rejected.
+    ValidationRejected = 1,
+    /// Deferred core or custom-plugin migrations blocked recovery, so the
+    /// loaded configuration must not be published.
+    MigrationGate = 2,
+}
+
+impl DatabasePollFailureReason {
+    pub const ALL: [Self; 3] = [
+        Self::Connectivity,
+        Self::ValidationRejected,
+        Self::MigrationGate,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        DATABASE_POLL_FAILURE_REASON_LABELS[self as usize]
     }
 }
 
@@ -1886,7 +1998,12 @@ pub async fn run(
     // repaired in-band (issue #2158). Cleared only by an accepted authoritative
     // full reload.
     let config_rejected = Arc::new(AtomicBool::new(startup_config_rejected));
-    let database_delta_poll_metrics = Arc::new(DatabaseDeltaPollMetrics::default());
+    // Share the live `db_available` flag (created above) so
+    // `ferrum_database_config_source_connected` is the same atomic the admin
+    // API reports, not a second copy that can drift (issue #4528).
+    let database_delta_poll_metrics = Arc::new(DatabaseDeltaPollMetrics::with_config_source_flag(
+        db_available.clone(),
+    ));
     crate::plugins::prometheus_metrics::global_registry()
         .set_database_delta_poll_metrics(database_delta_poll_metrics.clone());
 
@@ -2466,12 +2583,17 @@ pub async fn run(
                                             "full reload after DB DNS reconnect",
                                         )
                                         .await;
+                                        database_delta_poll_metrics_for_poll
+                                            .record_poll_failure(DatabasePollFailureReason::ValidationRejected);
                                     } else {
                                         error!(
                                             "Authoritative primary full config reload failed after DB DNS reconnect; keeping existing config and retrying: {}",
                                             e
                                         );
-                                        db_available_poll.store(false, Ordering::Relaxed);
+                                        database_delta_poll_metrics_for_poll
+                                            .record_config_source_unavailable(
+                                                DatabasePollFailureReason::Connectivity,
+                                            );
                                     }
                                     runtime_config_apply_poll.nudge_if_waiters_pending();
                                     database_delta_poll_metrics_for_poll.record_poll_completed();
@@ -2506,6 +2628,12 @@ pub async fn run(
                                     )
                                     .await
                                     {
+                                        // Deferred core/custom-plugin migrations blocked
+                                        // publication; the helper already flipped the shared
+                                        // availability flag (issue #4528).
+                                        database_delta_poll_metrics_for_poll.record_poll_failure(
+                                            DatabasePollFailureReason::MigrationGate,
+                                        );
                                         runtime_config_apply_poll.nudge_if_waiters_pending();
                                         database_delta_poll_metrics_for_poll.record_poll_completed();
                                         continue;
@@ -2644,6 +2772,8 @@ pub async fn run(
                                                                 "rejected-delta escalation full reload",
                                                             )
                                                             .await;
+                                                            database_delta_poll_metrics_for_poll
+                                                                .record_poll_failure(DatabasePollFailureReason::ValidationRejected);
                                                         } else {
                                                             warn!(
                                                                 "Authoritative primary full reload failed after repeated rejected delta; keeping last known-good runtime config: {}",
@@ -2715,11 +2845,13 @@ pub async fn run(
                                                                                     "rejected-delta escalation failover reload",
                                                                                 )
                                                                                 .await;
+                                                                                database_delta_poll_metrics_for_poll
+                                                                                    .record_poll_failure(DatabasePollFailureReason::ValidationRejected);
                                                                             } else {
-                                                                                db_available_poll.store(
-                                                                                    false,
-                                                                                    Ordering::Relaxed,
-                                                                                );
+                                                                                database_delta_poll_metrics_for_poll
+                                                                                    .record_config_source_unavailable(
+                                                                                        DatabasePollFailureReason::Connectivity,
+                                                                                    );
                                                                                 warn!(
                                                                                     "Authoritative failover full reload also failed after repeated rejected delta; keeping last known-good runtime config: {}",
                                                                                     e2
@@ -2729,8 +2861,10 @@ pub async fn run(
                                                                     }
                                                                 }
                                                                 Err(e2) => {
-                                                                    db_available_poll
-                                                                        .store(false, Ordering::Relaxed);
+                                                                    database_delta_poll_metrics_for_poll
+                                                                        .record_config_source_unavailable(
+                                                                            DatabasePollFailureReason::Connectivity,
+                                                                        );
                                                                     warn!(
                                                                         "Database failover reconnect failed after rejected-delta escalation reload error: {}",
                                                                         e2
@@ -2831,6 +2965,8 @@ pub async fn run(
                                                     "full fallback reload",
                                                 )
                                                 .await;
+                                                database_delta_poll_metrics_for_poll
+                                                    .record_poll_failure(DatabasePollFailureReason::ValidationRejected);
                                             } else {
                                                 match db_poll
                                                     .try_failover_reconnect(&db_url_for_reconnect)
@@ -2890,9 +3026,13 @@ pub async fn run(
                                                                         "failover full reload",
                                                                     )
                                                                     .await;
+                                                                    database_delta_poll_metrics_for_poll
+                                                                        .record_poll_failure(DatabasePollFailureReason::ValidationRejected);
                                                                 } else {
-                                                                    db_available_poll
-                                                                        .store(false, Ordering::Relaxed);
+                                                                    database_delta_poll_metrics_for_poll
+                                                                        .record_config_source_unavailable(
+                                                                            DatabasePollFailureReason::Connectivity,
+                                                                        );
                                                                     warn!(
                                                                         "Authoritative primary failover reload also failed (using cached): {}",
                                                                         e3
@@ -2902,7 +3042,10 @@ pub async fn run(
                                                         }
                                                     }
                                                     Err(_) => {
-                                                        db_available_poll.store(false, Ordering::Relaxed);
+                                                        database_delta_poll_metrics_for_poll
+                                                            .record_config_source_unavailable(
+                                                                DatabasePollFailureReason::Connectivity,
+                                                            );
                                                         warn!(
                                                             "Authoritative primary full config reload also failed (using cached): {}",
                                                             e2
@@ -2956,8 +3099,13 @@ pub async fn run(
                                             "initial full poll",
                                         )
                                         .await;
+                                        database_delta_poll_metrics_for_poll
+                                            .record_poll_failure(DatabasePollFailureReason::ValidationRejected);
                                     } else {
-                                        db_available_poll.store(false, Ordering::Relaxed);
+                                        database_delta_poll_metrics_for_poll
+                                            .record_config_source_unavailable(
+                                                DatabasePollFailureReason::Connectivity,
+                                            );
                                         warn!(
                                             "Authoritative primary full config reload failed (using cached): {}",
                                             e
@@ -3055,14 +3203,32 @@ pub async fn run(
     Ok(())
 }
 
-async fn load_full_config_with_sequence(
+pub(crate) async fn load_full_config_with_sequence(
     db: &Arc<dyn DatabaseBackend>,
     namespace: &str,
 ) -> Result<(GatewayConfig, LiveApplyCursor), anyhow::Error> {
     let topology_permit = db.acquire_write_topology_permit().await;
     let topology_epoch = topology_permit.topology_epoch();
     db.maybe_apply_deferred_migrations().await?;
-    let sequence = db.latest_change_sequence(namespace).await?;
+    // The full reload is the repair path for a poisoned change log, so it must
+    // not be gated on the same `config_changes` field that broke incremental
+    // polling (issue #4530). A `0` watermark makes the next incremental poll
+    // re-read the retained change log — bounded by
+    // `CHANGE_LOG_RETAIN_PER_NAMESPACE` — which is strictly better than leaving
+    // the process unable to publish fresh config at all.
+    let sequence = match db.latest_change_sequence(namespace).await {
+        Ok(sequence) => sequence,
+        Err(error) => {
+            warn!(
+                namespace = %namespace,
+                error = %error,
+                "full reload could not read the config_changes watermark; continuing with \
+                 sequence 0 so the reload still publishes (the next incremental poll re-reads \
+                 the retained change log)"
+            );
+            0
+        }
+    };
     let config = db.load_full_config(namespace).await?;
     drop(topology_permit);
     Ok((config, LiveApplyCursor::new(topology_epoch, sequence)))

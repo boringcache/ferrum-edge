@@ -130,6 +130,7 @@ proxies:
 Behavior:
 
 - Every request whose Host header matches `api.example.com` routes to `api-backend:8080`, regardless of path.
+- An HTTP/1.1 **absolute-form** request-target (`GET http://host/path HTTP/1.1`) whose authority disagrees with the `Host` field is rejected with **400** before routing, matching the HTTP/2 / HTTP/3 `Host`/`:authority` agreement rule. RFC 9112 §3.2.1 has a recipient route on the request-target authority and ignore `Host`, while Ferrum routes on `Host`, so a disagreeing pair would let an upstream hop authorize one host tier while Ferrum selects another. Absolute-form *without* a `Host` field is still accepted and routes on the target authority; HTTP/1.0 is unaffected (RFC 9112 §3.2.2 does not require `Host` on 1.0).
 - Request path is forwarded **unchanged** (there is no prefix to strip). `strip_listen_path: true` is a silent no-op.
 - `backend_path`, if set, still prepends to the forwarded path.
 - Host-only is the **last** tier within a host group — any exact path or regex match wins first. This lets you pin `/api/v2/*` to one backend and everything else on the same host to a different backend:
@@ -159,6 +160,36 @@ proxies:
 - Optional HTTP-family `listen_port` scopes the route to that frontend port. In `file`/`database`/`dp` mode the gateway binds a real socket for every declared HTTP-family `listen_port` (see `docs/gateway_api_conformance.md`), in addition to `FERRUM_PROXY_HTTP_PORT`/`FERRUM_PROXY_HTTPS_PORT`. When the whole table declares exactly one listen port of the request's protocol class, the global process bind also serves it (the Service-fronted projection of `:80`/`:443`); with two or more same-class ports only an exact listener match serves. Distinct ports do not conflict on the same hosts+path. Omit `listen_port` for port-agnostic matching.
 - Stream proxies (`tcp`/`tcps`/`udp`/`dtls`) MUST NOT set `listen_path` — they route on `listen_port` only. A populated `listen_path` is rejected.
 - Two host-only proxies whose `hosts` overlap on the same effective `listen_port` are rejected (409 from admin API).
+
+## Outbound Host header
+
+The `Host` Ferrum sends to the backend is **not** the client's `Host` by default. On every backend
+transport — the reqwest HTTP/1.1 and HTTP/2 path, the direct-HTTP/2 pool, native gRPC, and native
+HTTP/3 — the outbound `Host` is the **full authority of the load-balanced target that was actually
+selected**, with a default port omitted:
+
+| Selected target | Backend scheme | Outbound `Host` |
+|---|---|---|
+| `api-backend:8080` | `http` | `api-backend:8080` |
+| `api-backend:80` | `http` | `api-backend` |
+| `api-backend:443` | `https` | `api-backend` |
+| `api-backend:8443` | `https` | `api-backend:8443` |
+| `::1` port `8443` (IPv6 literal) | `https` | `[::1]:8443` |
+
+Carrying the port matters for two reasons:
+
+- **Backend virtual-host selection and absolute redirects.** A backend listening on a non-default
+  port needs the port to pick the right virtual host and to build correct absolute `Location`
+  values.
+- **HTTP/2 protocol correctness.** On HTTP/2 the outbound `:authority` is derived from the backend
+  URL, which carries the port. RFC 9113 §8.3.1 requires `Host` and `:authority` to be the same
+  string; a hostname-only `Host` beside `:authority: api-backend:8443` is a protocol error that
+  strict backends answer with a stream reset (surfacing as a 502). On HTTP/1.1 the same mismatch
+  violates RFC 9112 §3.2.
+
+Set `preserve_host_header: true` on a proxy to forward the **client's** `Host` verbatim instead. In
+that mode Ferrum does not consult the selected target at all, and the backend sees exactly what the
+client sent.
 
 ## Exact Path Routing
 

@@ -1083,6 +1083,10 @@ impl MeshMtlsConnectionPool {
             self.trust_registry(),
             MeshTransportKind::MeshMtls,
             None,
+            // The Sidecar mesh-mTLS CONNECT tunnel shares the raw-`h2` dial with
+            // Ambient HBONE, so it inherits the same receive-side header-block
+            // bound: hyper's 16 KiB, never `h2`'s 16 MiB default.
+            crate::proxy::hbone_pool::HBONE_DEFAULT_MAX_HEADER_LIST_SIZE,
         )
         .await?;
         tokio::time::timeout(
@@ -1194,6 +1198,10 @@ impl MeshMtlsConnectionPool {
             self.trust_registry(),
             MeshTransportKind::MeshMtls,
             None,
+            // The Sidecar mesh-mTLS CONNECT tunnel shares the raw-`h2` dial with
+            // Ambient HBONE, so it inherits the same receive-side header-block
+            // bound: hyper's 16 KiB, never `h2`'s 16 MiB default.
+            crate::proxy::hbone_pool::HBONE_DEFAULT_MAX_HEADER_LIST_SIZE,
         )
         .await?;
         tokio::time::timeout(
@@ -1314,6 +1322,10 @@ impl MeshMtlsConnectionPool {
             self.trust_registry(),
             MeshTransportKind::MeshMtls,
             None,
+            // The Sidecar mesh-mTLS CONNECT tunnel shares the raw-`h2` dial with
+            // Ambient HBONE, so it inherits the same receive-side header-block
+            // bound: hyper's 16 KiB, never `h2`'s 16 MiB default.
+            crate::proxy::hbone_pool::HBONE_DEFAULT_MAX_HEADER_LIST_SIZE,
         )
         .await?;
         tokio::time::timeout(

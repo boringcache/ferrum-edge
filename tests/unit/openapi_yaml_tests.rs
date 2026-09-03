@@ -3236,6 +3236,20 @@ fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
         json!(ferrum_edge::plugins::jwks_auth::MAX_JWKS_MAX_STALE_SECONDS)
     );
     assert_eq!(
+        schema["properties"]["kid_miss_refresh_cooldown_seconds"]["default"],
+        json!(ferrum_edge::plugins::jwks_auth::DEFAULT_KID_MISS_REFRESH_COOLDOWN_SECONDS)
+    );
+    assert_eq!(
+        schema["properties"]["kid_miss_refresh_cooldown_seconds"]["maximum"],
+        json!(ferrum_edge::plugins::jwks_auth::MAX_KID_MISS_REFRESH_COOLDOWN_SECONDS)
+    );
+    // Zero must stay admissible: it is the documented way to disable the
+    // on-demand refetch, not an invalid value.
+    assert_eq!(
+        schema["properties"]["kid_miss_refresh_cooldown_seconds"]["minimum"],
+        json!(0)
+    );
+    assert_eq!(
         schema["properties"]["providers"]["items"]["properties"]["dpop_replay_max_entries"]["default"],
         json!(ferrum_edge::plugins::jwks_auth::DEFAULT_DPOP_REPLAY_MAX_ENTRIES)
     );
@@ -3271,6 +3285,7 @@ fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
     assert!(guide.contains("maximum `86400`"));
     assert!(guide.contains("`0` is invalid"));
     assert!(guide.contains("| `jwks_auth` | `jwks_max_stale_seconds` | `3600` |"));
+    assert!(guide.contains("| `jwks_auth` | `kid_miss_refresh_cooldown_seconds` | `30` |"));
     assert!(!guide.contains("| `jwks_auth` | `cache_ttl_seconds`"));
 }
 
@@ -10774,5 +10789,57 @@ fn live_applied_mutations_declare_config_cursor_on_success_deferred_and_committe
             !response_declares_config_cursor_header(&spec, response_503),
             "{method} {path} ({operation_id}) 503 is not a live-apply outcome and must not declare the cursor"
         );
+    }
+}
+
+/// Issue #4525 closed the four `src/plugins/mesh/` plugin roots against
+/// unknown keys. Each now carries the same obligation every other closed
+/// plugin root does: an `additionalProperties: false` schema whose declared
+/// properties are exactly the runtime allowlist. Without this guard a new
+/// runtime key silently becomes an undocumented field the Admin API rejects,
+/// or a documented field the runtime refuses — and mesh slice apply would
+/// fail closed on the injected config.
+#[test]
+fn mesh_plugin_config_roots_are_closed_and_match_openapi() {
+    use ferrum_edge::plugins::mesh::authz::MESH_AUTHZ_CONFIG_KEYS;
+    use ferrum_edge::plugins::mesh::bpf_metrics::MESH_BPF_METRICS_CONFIG_KEYS;
+    use ferrum_edge::plugins::mesh::workload_metrics::WORKLOAD_METRICS_CONFIG_KEYS;
+
+    // `mesh_outbound_registry` closes its root with
+    // `#[serde(deny_unknown_fields)]` on `OutboundRegistryConfig`, so its
+    // key set is the struct's serde field names rather than a const.
+    const MESH_OUTBOUND_REGISTRY_FIELDS: &[&str] = &[
+        "registry",
+        "reject_status",
+        "outbound_listen_ports",
+        "namespace",
+    ];
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for (schema_name, runtime_keys) in [
+        ("MeshAuthzConfig", MESH_AUTHZ_CONFIG_KEYS),
+        ("WorkloadMetricsConfig", WORKLOAD_METRICS_CONFIG_KEYS),
+        ("MeshOutboundRegistryConfig", MESH_OUTBOUND_REGISTRY_FIELDS),
+        ("MeshBpfMetricsConfig", MESH_BPF_METRICS_CONFIG_KEYS),
+    ] {
+        let schema = spec
+            .pointer(&format!("/components/schemas/{schema_name}"))
+            .unwrap_or_else(|| panic!("{schema_name} component exists"));
+        assert_eq!(
+            schema["additionalProperties"],
+            json!(false),
+            "{schema_name} must reject undeclared properties"
+        );
+
+        let schema_fields: BTreeSet<&str> = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{schema_name} properties"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let runtime_fields: BTreeSet<&str> = runtime_keys.iter().copied().collect();
+        assert_eq!(schema_fields, runtime_fields, "{schema_name} key drift");
     }
 }

@@ -151,6 +151,25 @@ pub mod _test_support {
         Some((host, authority))
     }
 
+    /// Outbound `Host` the reqwest (HTTP/1.1 + HTTP/2) and native-HTTP/3
+    /// backend builders emit for a target selected as `host` + `port`.
+    ///
+    /// Thin wrapper over `proxy::outbound_host_header_value`, the shared
+    /// helper those four builders call (issue #4539). `scheme` is the
+    /// scheme the outbound URL was built with — `https` for every H3
+    /// backend. An explicit default port (80 for `http`/`ws`, 443 for
+    /// `https`/`wss`) is omitted; any other port is appended, with an
+    /// unbracketed IPv6 literal bracketed first. `preserve_host_header`
+    /// is not modelled here: when it is on, all four builders forward the
+    /// client's Host verbatim and never reach this helper.
+    pub fn outbound_host_header_for_target_for_test(
+        host: &str,
+        port: u16,
+        scheme: Option<&str>,
+    ) -> String {
+        crate::proxy::outbound_host_header_value(host, port, scheme).into_owned()
+    }
+
     /// Native-gRPC mesh-mTLS outbound `Host` / `:authority` after
     /// `mesh_mtls_dispatch_authority` plus Host-only sync.
     ///
@@ -1381,6 +1400,7 @@ pub mod _test_support {
         shutdown_rx: &Option<tokio::sync::watch::Receiver<bool>>,
         dns_cache: &crate::dns::DnsCache,
         health_checker: &crate::health_check::HealthChecker,
+        circuit_breaker_cache: &crate::circuit_breaker::CircuitBreakerCache,
     ) -> DiscoveryApplyControlForTest {
         apply_service_discovery_snapshot_inner(
             upstream_namespace,
@@ -1397,6 +1417,7 @@ pub mod _test_support {
             shutdown_rx,
             dns_cache,
             health_checker,
+            circuit_breaker_cache,
             // No supervised task generation behind this seam: external tests
             // drive the pipeline directly, so there is no lifecycle entry to
             // fence or to advance the staleness anchor on.
@@ -1425,6 +1446,7 @@ pub mod _test_support {
         shutdown_rx: &Option<tokio::sync::watch::Receiver<bool>>,
         dns_cache: &crate::dns::DnsCache,
         health_checker: &crate::health_check::HealthChecker,
+        circuit_breaker_cache: &crate::circuit_breaker::CircuitBreakerCache,
         lifecycle_key: &str,
         generation: u64,
     ) -> DiscoveryApplyControlForTest {
@@ -1443,6 +1465,7 @@ pub mod _test_support {
             shutdown_rx,
             dns_cache,
             health_checker,
+            circuit_breaker_cache,
             Some(crate::service_discovery::DiscoveryLifecycle::new(
                 lifecycle_key.to_string(),
                 generation,
@@ -1467,6 +1490,7 @@ pub mod _test_support {
         shutdown_rx: &Option<tokio::sync::watch::Receiver<bool>>,
         dns_cache: &crate::dns::DnsCache,
         health_checker: &crate::health_check::HealthChecker,
+        circuit_breaker_cache: &crate::circuit_breaker::CircuitBreakerCache,
         lifecycle: Option<crate::service_discovery::DiscoveryLifecycle>,
     ) -> DiscoveryApplyControlForTest {
         match crate::service_discovery::apply_discovered_snapshot(
@@ -1484,6 +1508,7 @@ pub mod _test_support {
             shutdown_rx,
             dns_cache,
             health_checker,
+            circuit_breaker_cache,
             lifecycle.as_ref(),
             // No supervised task context behind this seam: staleness expiry
             // during publication preparation is covered against the live
@@ -2001,9 +2026,11 @@ pub mod _test_support {
             crate::plugins::utils::jwks_cache::DiscoveryStoreCandidate::acquire(
                 jwks_uri,
                 &http_client,
-                refresh_interval,
-                Duration::from_secs(
-                    crate::plugins::utils::jwks_store::DEFAULT_JWKS_MAX_STALE_SECONDS,
+                crate::plugins::utils::jwks_cache::JwksRefreshRequirement::new(
+                    refresh_interval,
+                    Duration::from_secs(
+                        crate::plugins::utils::jwks_store::DEFAULT_JWKS_MAX_STALE_SECONDS,
+                    ),
                 ),
             ),
         )
@@ -5517,6 +5544,19 @@ pub mod _test_support {
         fail: bool,
     ) {
         store.set_latest_change_sequence_fault_for_test(fail);
+    }
+
+    /// Run the database-mode full-reload helper. Proves the reload still
+    /// publishes when the `config_changes` watermark read fails, so the repair
+    /// path is not gated on the same corrupt field (issue #4530). Returns the
+    /// loaded config and the cursor sequence the reload committed.
+    pub async fn database_mode_load_full_config_with_sequence_for_test(
+        db: &std::sync::Arc<dyn crate::config::db_backend::DatabaseBackend>,
+        namespace: &str,
+    ) -> Result<(crate::config::types::GatewayConfig, u64), anyhow::Error> {
+        let (config, cursor) =
+            crate::modes::database::load_full_config_with_sequence(db, namespace).await?;
+        Ok((config, cursor.sequence))
     }
 
     // ── config/mongo_store: Admin write-topology / publication test seams ────

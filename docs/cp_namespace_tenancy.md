@@ -11,7 +11,9 @@ restriction with three coordinated changes:
    DP only ever receives its own namespace's config.
 3. A **JWT tenancy claim** (`ns`) that pins which namespaces a token bearer
    is authorised to subscribe to, independent of the CP scope. The claim is
-   automatically required for `Set` and `All` scopes.
+   automatically required for `Set` and `All` scopes — on the CP↔DP gRPC
+   config plane and, since issue #4529, on the REST admin plane too, so both
+   planes treat namespace as the same authorisation boundary.
 
 This document is the operator guide for adopting it. The pre-T2-A
 single-namespace deployment path is the default and remains byte-identical
@@ -26,12 +28,21 @@ when neither new env var is set.
 | `FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH` | unset | **CP side.** Path to the namespace-bound verification credentials described in [Trust binding](#trust-binding-ghsa-3f2j-wwqw-grmg). **Required for `Set` and `All` scopes** — a multi-namespace CP refuses to start with only `FERRUM_CP_DP_GRPC_JWT_SECRET`. |
 | `FERRUM_CP_DP_GRPC_JWT_KEY_ID` | unset | **DP / mesh / xDS client side.** JWS `kid` stamped on self-minted tokens, selecting which trust-bundle credential verifies them. |
 | `FERRUM_DP_CP_GRPC_TOKEN_FILE` | unset | **DP / mesh / xDS client side.** Path to an externally issued bearer token presented instead of minting one. The node then holds no signing key at all. |
-| `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` | `false` | REST-plane counterpart (issue #2120): when `true`, namespace-scoped **admin API** routes require the admin JWT (signed with `FERRUM_ADMIN_JWT_SECRET`) to carry an `ns` claim authorizing the `X-Ferrum-Namespace` value; violations are 403. Same claim shapes as the gRPC plane. Without it, admin JWTs are global and the namespace header is only a routing selector — set both flags for tenancy enforcement on both planes. See `docs/admin_api.md`. |
+| `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` | `false` (forced on for `Set`/`All` scopes) | REST-plane counterpart (issue #2120): when `true`, namespace-scoped **admin API** routes require the admin JWT (signed with `FERRUM_ADMIN_JWT_SECRET`) to carry an `ns` claim authorizing the `X-Ferrum-Namespace` value; violations are 403. Same claim shapes as the gRPC plane. Like `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM`, this remains optional only for `Single` scope: `Set` and `All` scopes engage admin enforcement automatically (issue #4529), so admin tokens without an `ns` claim are refused on namespace-scoped routes. See `docs/admin_api.md`. |
 
 On Kubernetes, `charts/ferrum-gateway` exposes both tenancy flags as first-class
 values: `cp.requireNamespaceClaim` and `admin.requireNamespaceClaim` (default
-`false` each). Set both when adopting multi-tenant CP scope; enabling only the CP
-value does not constrain admin JWTs.
+`false` each). Neither value is needed to obtain enforcement on a multi-namespace
+CP: setting `cp.namespaces` to more than one namespace (or `*`) engages the `ns`
+claim requirement on both the gRPC and the admin plane on its own. The values
+remain the way to require `ns` claims on a **single-namespace** CP.
+
+> **Breaking on adoption.** Pointing an existing admin token at a CP whose
+> `FERRUM_CP_NAMESPACES` names multiple namespaces now returns `403` on
+> namespace-scoped admin routes (`/proxies`, `/consumers`, `/upstreams`,
+> `/plugins/config`, `/api-specs`, `/batch`, `/backup`, `/restore`, `/audit`)
+> unless the token carries an `ns` claim. Re-mint operator tokens with `ns`
+> before widening the CP scope.
 
 Both vars live in `[cp_dp]` of `ferrum.conf` next to
 `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`. The scope is also surfaced in the

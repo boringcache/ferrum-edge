@@ -76,7 +76,7 @@ through the Admin API in database mode).
 | `tcp_idle_timeout_seconds` | `u64` | (global) | TCP idle timeout override. When omitted, uses `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` (default 300s). 0 = disabled |
 | `stream_proxy_protocol` | `bool` | `false` | Enable inbound PROXY protocol: the v1/v2 connection header on `tcp`/`tcp_tls` (see [Inbound PROXY Protocol](#inbound-proxy-protocol)), or the per-datagram v2 DGRAM envelope on `udp`/`dtls` (see [Datagram Client-Address Metadata](#datagram-client-address-metadata-udp--dtls)). |
 | `udp_idle_timeout_seconds` | `u64` | `60` | UDP session idle timeout before cleanup |
-| `udp_max_response_amplification_factor` | `f32` | unset (hand-authored) / `8.0` (Gateway API UDPRoute) | Cumulative per-request backend→client payload-byte budget of `request_payload_size × factor`. A zero-length request receives only a one-byte response allowance; nonempty requests retain the exact configured payload ratio. Every backend response datagram consumes at least one unit of remaining budget, so a zero-length reply cannot bypass a finite factor. Finite values must be `> 0` and `≤ 1024`. `None` disables the guard (hand-authored only, or an explicit Gateway API unsafe override). |
+| `udp_max_response_amplification_factor` | `f32` | `8.0` (every configuration source) | Cumulative per-request backend→client payload-byte budget of `request_payload_size × factor`. A zero-length request receives only a one-byte response allowance; nonempty requests retain the exact configured payload ratio. Every backend response datagram consumes at least one unit of remaining budget, so a zero-length reply cannot bypass a finite factor. Finite values must be `> 0` and `≤ 1024`. **Omitting the field is not unlimited**: every `udp`/`dtls` proxy that leaves it unset is normalized to `8.0`. `0` is the explicit unlimited opt-out and logs a warning on the affected listener at startup. |
 
 ### Synthetic `listen_path`
 
@@ -393,6 +393,36 @@ This provides full encryption: DTLS client → gateway (DTLS termination) → ga
   keys remain inside the selected cryptographic provider and follow that
   provider's secret-memory lifecycle.
 
+### DTLS and the TLS policy
+
+`FERRUM_TLS_MIN_VERSION`, `FERRUM_TLS_MAX_VERSION`, `FERRUM_TLS_CIPHER_SUITES` and
+`FERRUM_TLS_KEY_EXCHANGE_GROUPS` (alias `FERRUM_TLS_CURVES`) are documented as applying
+"inbound + outbound". Since issue #4507 that includes every DTLS surface: the frontend
+DTLS listener, the DTLS live-reload rebuild, the generated NodeWaypoint DTLS listeners,
+and the backend DTLS client. The policy is resolved once at startup (and again on each
+reload) and applied to the DTLS configuration before any listener can serve.
+
+| Policy dimension | DTLS mapping |
+| --- | --- |
+| Protocol versions | One-for-one: TLS 1.2 ↔ DTLS 1.2, TLS 1.3 ↔ DTLS 1.3. `FERRUM_TLS_MIN_VERSION=1.3` leaves the listener with no negotiable DTLS 1.2 suite, so a DTLS 1.2 client's handshake fails |
+| TLS 1.3 cipher suites | `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384` and `TLS_CHACHA20_POLY1305_SHA256` map exactly onto their DTLS 1.3 counterparts |
+| TLS 1.2 cipher suites | `ECDHE-ECDSA-AES128-GCM-SHA256`, `ECDHE-ECDSA-AES256-GCM-SHA384` and `ECDHE-ECDSA-CHACHA20-POLY1305` map exactly onto their DTLS 1.2 counterparts |
+| `ECDHE-RSA-*` | No DTLS counterpart. DTLS authenticates with ECDSA P-256/P-384 certificates only, so an RSA-authenticated suite could never be negotiated on a DTLS surface. Naming one alongside its ECDSA sibling costs nothing; a selection whose **entire** TLS 1.2 half is `ECDHE-RSA-*` is refused at startup rather than silently losing DTLS 1.2 |
+| Key-exchange groups | One-for-one. X25519, secp256r1 and secp384r1 are exactly the groups the DTLS stack implements |
+
+Nothing is dropped silently. A policy that leaves a DTLS surface with no usable cipher
+suite for any enabled version, or that names a suite or group with no DTLS equivalent, is
+a startup (or reload) failure whose message names both the offending value and the DTLS
+surface — a listener that can never complete a handshake is not a listener.
+
+One DTLS client is deliberately not covered: the `udp_logging` plugin's DTLS log-sink
+client (`src/plugins/udp_logging.rs`). It is a plugin-owned observability egress rather
+than a proxy datapath surface, and plugin configuration carries no gateway `TlsPolicy`; it
+keeps the DTLS stack's own defaults.
+
+FIPS enforcement refuses DTLS outright, so this mapping only ever applies to non-FIPS
+deployments.
+
 ### Trust Store Model
 
 The gateway uses separate trust stores for TCP and UDP encryption:
@@ -459,6 +489,13 @@ proxies:
     backend_scheme: tcp
     upstream_id: "postgres-cluster"
 ```
+
+Every upstream algorithm applies on the stream family. `least_connections` is
+accounted per TCP connection and per UDP/DTLS session, so it distributes rather
+than pinning; `least_latency` is fed by active health-check probe RTT and, on
+TCP, by the backend connect RTT (passive, and only while no active probes run). Per-port DestinationRule `LEAST_LATENCY`
+overrides are the one exception and are refused on stream proxies — see
+[Stream-family proxies](load_balancing.md#stream-family-proxies-tcp--udp--dtls).
 
 ## Health Checks
 
@@ -806,6 +843,30 @@ alerts and non-`close_notify` warning alerts are classified by
 `classify_ktls_control_record`, because rustls exposes no API for emitting an
 arbitrary alert mid-session. The live half of that contract is case 6 above.
 
+## Per-source admission
+
+Both stream listeners bound how much of a listener one source IP may hold, independently of the listener-wide budgets (`FERRUM_UDP_MAX_SESSIONS`, the overload thresholds). Without this bound a single many-source-port or spoofed-source client fills a listener's whole budget alone and takes the listener down for every other client.
+
+| Variable | Default | Enforced |
+|----------|---------|----------|
+| `FERRUM_TCP_MAX_CONNECTIONS_PER_IP` | `256` | In the TCP accept path, **before** the frontend TLS handshake |
+| `FERRUM_UDP_MAX_SESSIONS_PER_IP` | `1024` | At UDP/DTLS session-slot reservation |
+
+`0` means unlimited for either variable.
+
+**TCP ordering.** The bound is applied as soon as the connection's effective client IP is known and **before** `handle_tcp_connection` runs, so a refused connection reaches no frontend TLS handshake, no `on_stream_connect` plugin chain, and no backend dial — the socket is closed at accept. This is the gap the opt-in `tcp_connection_throttle` plugin cannot close: its `on_stream_connect` hook runs *after* the handshake on `tcp_tls` proxies, so it can never bound concurrent pre-handshake state from one source. The plugin remains available and unchanged for policy-level throttling on top of this bound.
+
+**UDP/DTLS ordering.** The per-source bound shares one admission point and one release path with the listener-wide `FERRUM_UDP_MAX_SESSIONS` bound, so neither slot can be taken without the other and neither can leak. The session's slot is released exactly once with its other per-session guards on idle expiry, authorization-lifetime expiry, backend teardown, and listener shutdown.
+
+**Effective source.** Both bounds key on the *effective* client IP, never the raw socket peer alone:
+
+- TCP: the forwarded source address when an inbound PROXY-protocol header was accepted from a peer in `FERRUM_TRUSTED_PROXIES`, otherwise the canonicalized socket peer.
+- UDP/DTLS: the authenticated forwarded client when a datagram client-address envelope was accepted, otherwise the socket peer.
+
+A trusted L4 load balancer in front of the gateway is therefore not collapsed into a single source. IPv4-mapped IPv6 peers are folded to one canonical representation, so a dual-stack listener cannot be used to double a source's budget.
+
+**Observability.** Each listener keeps a fixed-cardinality rejection counter and emits a rate-limited warning (first refusal, then every 100th) naming the proxy, the listen port, and the limit. Client addresses are deliberately never logged or used as a metric label on these paths.
+
 ## UDP Session Management
 
 UDP is connectionless, so the gateway tracks sessions by client source address (`SocketAddr`). Each unique client gets a dedicated backend socket for reply routing.
@@ -818,7 +879,7 @@ UDP is connectionless, so the gateway tracks sessions by client source address (
 - **Reply routing**: Each session spawns a receiver task that forwards backend replies back to the correct client
 - **Datagram hook concurrency / backpressure**: When any plugin opts into `on_udp_datagram`, each established session gets one bounded client→backend ingress worker (not one task per datagram). The shared listener recv/drain loop only enqueues onto that per-session FIFO and never awaits potentially I/O-bound hooks (for example Redis-backed `udp_rate_limiting` or `fault_injection` delays). Per-session ordering is preserved. Queue depth is capped at 256 datagrams and retained payload is capped at 256 KiB per session, with an additional 16 MiB retained-payload cap across the listener; both byte budgets remain charged while a dequeued payload is held by an in-flight hook/forward future, so one slow hook per session cannot escape the aggregate limit. Overload **fails closed** by dropping the datagram (it is never forwarded without running required hooks). Drops increment the listener's `hook_ingress_drops` counter and emit a rate-limited warning (first drop, then every 100th) without per-client label cardinality. Session stop/expiry wakes an idle worker by dropping the ingress sender, cancels an in-flight hook through a dedicated notification, and drains any residual queue without running hooks or forwarding. It also re-checks stop/expired after each receive and after the hook await so a late plugin return cannot forward into an expired session. Sessions without datagram hooks keep the inline forward path. Backend→client hooks remain on the existing per-session reply task.
 - **Reply send buffers (Linux)**: Each plain-UDP session keeps a `sendmmsg` fallback batch and an optional GSO accumulator. `sendmmsg` slot buffers are allocated lazily at a 2 KiB preferred size (`SEND_MMSG_SLOT_SIZE`) instead of eagerly reserving `64 × 65535` (~4.2 MiB) per session. Datagrams larger than the slot size — including the full valid UDP maximum — use the existing pktinfo-aware direct-send path; GSO same-size batching and sendmmsg fallback remain unchanged for ordinary traffic.
-- **Response amplification guard**: When `udp_max_response_amplification_factor` is set, every backend→client datagram **charges** a remaining payload-byte budget established by the latest admitted client request (`request_payload_size × factor`). Several replies that are each under that product still fail closed once their **sum** exceeds it. A legal zero-length request gets an explicit one-byte reply allowance instead of an unusable zero budget; positive-length requests receive no floor or extra allowance. A zero-length response still consumes one unit of remaining budget so a finite factor cannot admit an unbounded packet count; nonempty responses charge their payload size exactly. The budget lives on the UDP session (not the selected backend), so weighted multi-backend selection cannot reset or multiply it. Invalid, zero, negative, non-finite, and factors above 1024 are rejected at config admission. `None` means unlimited and is valid only for hand-authored proxies or an explicit Gateway API unsafe override.
+- **Response amplification guard**: When `udp_max_response_amplification_factor` is set, every backend→client datagram **charges** a remaining payload-byte budget established by the latest admitted client request (`request_payload_size × factor`). Several replies that are each under that product still fail closed once their **sum** exceeds it. A legal zero-length request gets an explicit one-byte reply allowance instead of an unusable zero budget; positive-length requests receive no floor or extra allowance. A zero-length response still consumes one unit of remaining budget so a finite factor cannot admit an unbounded packet count; nonempty responses charge their payload size exactly. The budget lives on the UDP session (not the selected backend), so weighted multi-backend selection cannot reset or multiply it. Negative, non-finite, and factors above 1024 are rejected at config admission. The guard is on by DEFAULT on every configuration source — file mode, database mode, the admin API, CP→DP distribution, mesh materialization, and Gateway API `UDPRoute` translation all normalize an unset factor to `8.0` in `Proxy::normalize_fields()`, so a UDP proxy is never an open reflector because of who authored it. `0` is the explicit operator opt-out meaning unlimited; it is accepted only on `udp`/`dtls` proxies, and the affected listener emits a startup warning naming its `proxy_id` and `listen_port` (`ferrum-edge validate` exits before listener bind, so it does not surface that warning). A Gateway API dual-acknowledged `mode: Unlimited` override is materialized as the same `0` sentinel.
 - **Reply-source selection (`FERRUM_UDP_PKTINFO_ENABLED=auto`, Linux)**: On wildcard / multi-homed binds, `IP_PKTINFO` / `IPV6_PKTINFO` captures the per-datagram local destination address (and interface index) on recv and reuses it as the reply source on send. This saves one kernel routing lookup per `sendmsg` flush (combined with `UDP_SEGMENT`/GSO in a single cmsg buffer) and ensures replies exit the same interface the client targeted — important for NAT-sensitive middleboxes, anycast, and scoped IPv6 (link-local `fe80::/10`, where the ifindex is required to disambiguate the source zone). The captured address is stored per-session via `OnceLock` on the first datagram that exposes pktinfo; subsequent datagrams reuse it lock-free. When pktinfo is active, the recv loop uses `readable() + recvmmsg` instead of `recv_from`, so the first datagram of each wakeup also surfaces cmsg — one-shot UDP flows (e.g. DNS) get the correct reply source even when the drain loop never fires.
 
 ### Mesh UDP capture is a separate datapath
@@ -999,7 +1060,9 @@ Notes:
 | `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` | `10` | Seconds allowed for frontend TCP+TLS and UDP+DTLS handshakes, and for the opaque-TLS SNI ClientHello peek. `0` disables; use only when an upstream load balancer enforces an equivalent pre-handshake deadline |
 | `FERRUM_STREAM_SNI_PLAINTEXT_FALLBACK` | `false` | Whether an [opaque-TLS SNI listener](#opaque-tls-sni-routing) may send provably non-TLS opening bytes to its declared catch-all route instead of closing the connection. Enable only for a port deliberately shared with direct plaintext TCP clients. Never applies to a ClientHello that timed out, exceeded the 16 KiB peek bound, ended early, was malformed, or named an unrepresentable host — those always fail closed |
 | `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` | `300` | Default TCP idle timeout (5 min). Per-proxy `tcp_idle_timeout_seconds` overrides. 0 = disabled |
+| `FERRUM_TCP_MAX_CONNECTIONS_PER_IP` | `256` | Maximum concurrent TCP stream-proxy connections per effective source IP; `0` = unlimited. See [Per-source admission](#per-source-admission) |
 | `FERRUM_UDP_MAX_SESSIONS` | `10000` | Maximum concurrent UDP sessions per proxy |
+| `FERRUM_UDP_MAX_SESSIONS_PER_IP` | `1024` | Maximum concurrent UDP/DTLS stream-proxy sessions per effective source IP; `0` = unlimited. See [Per-source admission](#per-source-admission) |
 | `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | `10` | Interval between UDP session cleanup sweeps |
 | `FERRUM_ADAPTIVE_BATCH_LIMIT_DEFAULT` | `6000` | Datagrams drained per UDP recv wakeup when adaptive batching is **disabled** (`FERRUM_ADAPTIVE_BATCH_LIMIT_ENABLED=false`), and the initial value before a proxy's first traffic sample. When adaptation is enabled (default) the per-proxy limit then moves across fixed internal tiers (64 / 256 / 2000 / 6000) by observed traffic and is **not** capped by this value. Raising it increases the disabled/initial limit |
 

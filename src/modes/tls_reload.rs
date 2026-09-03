@@ -282,13 +282,14 @@ fn build_proxy_rebuild_fn(
     crl_source_value: Option<String>,
 ) -> FrontendTlsRebuildFn {
     let warning_days = env_config.tls_cert_expiry_warning_days;
+    let revocation_warning_days = env_config.tls_crl_expiry_warning_days;
     let ktls_could_be_enabled = env_config.ktls_enabled.could_be_enabled();
     let policy = tls_policy.clone();
     let startup_crls = crls.clone();
 
     Box::new(move || -> Result<FrontendTlsRebuilt, anyhow::Error> {
         let active_crls = match crl_source_value.as_deref() {
-            Some(source) => tls::load_crls(Some(source))?,
+            Some(source) => tls::load_crls(Some(source), revocation_warning_days)?,
             None => startup_crls.clone(),
         };
         let candidate = tls::load_frontend_tls_candidate(
@@ -299,6 +300,7 @@ fn build_proxy_rebuild_fn(
             false,
             &policy,
             warning_days,
+            revocation_warning_days,
             &active_crls,
             Some(ClientTrustScope::ProxyFrontend),
         )?;
@@ -618,12 +620,13 @@ fn build_admin_rebuild_fn(
 ) -> FrontendTlsRebuildFn {
     let admin_no_verify = env_config.admin_tls_no_verify;
     let warning_days = env_config.tls_cert_expiry_warning_days;
+    let revocation_warning_days = env_config.tls_crl_expiry_warning_days;
     let policy = tls_policy.clone();
     let startup_crls = crls.clone();
 
     Box::new(move || -> Result<FrontendTlsRebuilt, anyhow::Error> {
         let active_crls = match crl_source_value.as_deref() {
-            Some(source) => tls::load_crls(Some(source))?,
+            Some(source) => tls::load_crls(Some(source), revocation_warning_days)?,
             None => startup_crls.clone(),
         };
         let candidate = tls::load_frontend_tls_candidate(
@@ -634,6 +637,7 @@ fn build_admin_rebuild_fn(
             admin_no_verify,
             &policy,
             warning_days,
+            revocation_warning_days,
             &active_crls,
             Some(ClientTrustScope::AdminHttps),
         )?;
@@ -670,6 +674,9 @@ pub struct DpOperatorClientTrust {
     client_ca_value: String,
     crl_source_value: Option<String>,
     startup_crls: CrlList,
+    /// `FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS`, carried so the watcher's rebuild
+    /// closure can warn on a near-expiry CRL without holding `EnvConfig`.
+    revocation_warning_days: u64,
 }
 
 /// Runtime wiring the DP operator client-trust watcher publishes into.
@@ -731,7 +738,13 @@ pub fn prepare_dp_operator_client_trust(
     // list the CP snapshot loader compiles into its own verifier — rather than
     // re-reading `FERRUM_TLS_CRL_FILE_PATH` here. A second read could observe a
     // different generation than the material actually in service.
-    let client_trust = match load_dp_operator_client_trust(&client_ca_value, None, crls) {
+    let revocation_warning_days = env_config.tls_crl_expiry_warning_days;
+    let client_trust = match load_dp_operator_client_trust(
+        &client_ca_value,
+        None,
+        crls,
+        revocation_warning_days,
+    ) {
         Ok(client_trust) => client_trust,
         Err(error) => {
             anyhow::bail!(
@@ -767,6 +780,7 @@ pub fn prepare_dp_operator_client_trust(
         client_ca_value,
         crl_source_value,
         startup_crls: crls.clone(),
+        revocation_warning_days,
     }))
 }
 
@@ -792,6 +806,7 @@ pub fn spawn_dp_operator_client_trust_watcher(
         client_ca_value,
         crl_source_value,
         startup_crls,
+        revocation_warning_days,
     } = prepared;
     let DpOperatorClientTrustWiring {
         pairing,
@@ -820,6 +835,7 @@ pub fn spawn_dp_operator_client_trust_watcher(
                         &client_ca_value,
                         crl_source_value.as_deref(),
                         &startup_crls,
+                        revocation_warning_days,
                     ) {
                         Ok(accepted) => accepted,
                         Err(error) => {
@@ -856,9 +872,10 @@ fn load_dp_operator_client_trust(
     client_ca_value: &str,
     crl_source_value: Option<&str>,
     startup_crls: &CrlList,
+    revocation_warning_days: u64,
 ) -> Result<AcceptedClientTrust, anyhow::Error> {
     let active_crls = match crl_source_value {
-        Some(source) => tls::load_crls(Some(source))?,
+        Some(source) => tls::load_crls(Some(source), revocation_warning_days)?,
         None => startup_crls.clone(),
     };
     let candidate = tls::build_client_cert_verifier_candidate(client_ca_value, &active_crls)?;

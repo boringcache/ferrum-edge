@@ -1283,18 +1283,58 @@ pub async fn start_dp_client_with_stream_timings(
                 connection_error_outcome(received_config)
             }
             Err(e) => {
-                error!(
-                    "CP [{}/{}] connection error ({}): {}",
-                    backoff.current_cp_index + 1,
-                    cp_count,
-                    cp_url,
-                    e
-                );
-                // A failed connect/subscribe attempt is the authority-loss
-                // signal the bound latches on.
-                update_state_disconnected(&connection_state, cp_url, is_primary, false);
-                // Pre-stream connect/subscribe failures never delivered config.
-                ConfigSyncAttemptOutcome::ConnectionError
+                if let Some(status) = subscribe_admission_refusal(&e) {
+                    // The CP answered. A `RESOURCE_EXHAUSTED` Subscribe status
+                    // is a capacity/tenancy refusal by the CP gRPC stream
+                    // admission controller, and its message names the exact
+                    // saturated budget (see `CpGrpcAdmissionRejection::
+                    // into_native_status`). Reporting it as a dead CP would be
+                    // wrong twice: the operator loses the only actionable
+                    // detail, and the stale fence latches on a control plane
+                    // that is demonstrably alive.
+                    error!(
+                        cp_url = %cp_url,
+                        cp_index = backoff.current_cp_index + 1,
+                        cp_count,
+                        status = %status.message(),
+                        "CP [{}/{}] REFUSED the ConfigSync subscription for capacity/tenancy \
+                         reasons ({}): the control plane is reachable and answering, but a CP \
+                         gRPC stream admission budget is saturated. Raise the budget named in \
+                         the status message (the sizing unit is one stream per DP or per mesh \
+                         workload) or add CP replicas. Last-known-good configuration keeps \
+                         serving and this DP keeps retrying",
+                        backoff.current_cp_index + 1,
+                        cp_count,
+                        cp_url
+                    );
+                    crate::dp_config_freshness::record_cp_admission_refused();
+                    // `authority_retained = true` routes to
+                    // `record_cp_reconnecting()` instead of
+                    // `record_cp_authority_lost()`, so an admission refusal
+                    // cannot latch the configured max-stale bound.
+                    //
+                    // This protects a RUNNING DP only. A DP that has never
+                    // connected is already `CpAuthority::Lost` (the tracker
+                    // starts there and `record_cp_reconnecting` only promotes
+                    // from `Connected` — `dp_config_freshness.rs`), so a cold
+                    // start that never got seated still degrades on schedule
+                    // and is not masked by this branch.
+                    update_state_disconnected(&connection_state, cp_url, is_primary, true);
+                    ConfigSyncAttemptOutcome::AdmissionRefused
+                } else {
+                    error!(
+                        "CP [{}/{}] connection error ({}): {}",
+                        backoff.current_cp_index + 1,
+                        cp_count,
+                        cp_url,
+                        e
+                    );
+                    // A failed connect/subscribe attempt is the authority-loss
+                    // signal the bound latches on.
+                    update_state_disconnected(&connection_state, cp_url, is_primary, false);
+                    // Pre-stream connect/subscribe failures never delivered config.
+                    ConfigSyncAttemptOutcome::ConnectionError
+                }
             }
         };
 
@@ -1306,6 +1346,7 @@ pub async fn start_dp_client_with_stream_timings(
         if matches!(
             attempt_outcome,
             ConfigSyncAttemptOutcome::ConnectionError
+                | ConfigSyncAttemptOutcome::AdmissionRefused
                 | ConfigSyncAttemptOutcome::CleanCloseWithoutConfig
                 | ConfigSyncAttemptOutcome::StaleSnapshotFenced
                 | ConfigSyncAttemptOutcome::InvalidSubscriptionBase
@@ -1381,6 +1422,7 @@ pub async fn start_dp_client_with_stream_timings(
         if matches!(
             attempt_outcome,
             ConfigSyncAttemptOutcome::ConnectionError
+                | ConfigSyncAttemptOutcome::AdmissionRefused
                 | ConfigSyncAttemptOutcome::CleanCloseWithoutConfig
                 | ConfigSyncAttemptOutcome::StaleSnapshotFenced
                 | ConfigSyncAttemptOutcome::InvalidSubscriptionBase
@@ -1483,6 +1525,21 @@ pub async fn wait_optional_tls_reload(
     }
 }
 
+/// Recognise a CP gRPC stream *admission refusal* inside a Subscribe error
+/// (issue #4531).
+///
+/// `connect_and_subscribe_*` returns `anyhow::Error`, so the underlying
+/// `tonic::Status` survives only as a downcast target. `RESOURCE_EXHAUSTED` is
+/// the code the CP's admission controller returns for every saturated stream
+/// budget (`CpGrpcAdmissionRejection::into_native_status`), and the status
+/// message names the exact `FERRUM_XDS_MAX_*` variable. Every other status code
+/// and every non-status error stays an ordinary connection error.
+pub fn subscribe_admission_refusal(error: &anyhow::Error) -> Option<&tonic::Status> {
+    error
+        .downcast_ref::<tonic::Status>()
+        .filter(|status| status.code() == tonic::Code::ResourceExhausted)
+}
+
 /// Helper: mark connection state as disconnected with the last attempted CP target.
 ///
 /// `authority_retained` classifies the stream end for the bounded-config-age
@@ -1496,6 +1553,13 @@ pub async fn wait_optional_tls_reload(
 /// a refused delta — is a real loss of authority, and the bound may latch on it
 /// the moment the applied snapshot reaches its configured maximum age. There is
 /// deliberately no grace period on top of that maximum.
+///
+/// One more disconnect is classified as authority-retained (issue #4531): a
+/// Subscribe answered with `RESOURCE_EXHAUSTED`. That status is proof the CP is
+/// alive and answering — it is its stream admission controller refusing this
+/// subscriber for capacity/tenancy reasons — so latching a data-plane outage on
+/// it would fail closed on a control plane that is working. See
+/// [`subscribe_admission_refusal`].
 fn update_state_disconnected(
     connection_state: &Option<Arc<ArcSwap<DpCpConnectionState>>>,
     cp_url: &str,
@@ -1848,6 +1912,7 @@ fn stage_frontend_tls_snapshot(
                     false,
                     tls_policy,
                     proxy_state.env_config.tls_cert_expiry_warning_days,
+                    proxy_state.env_config.tls_crl_expiry_warning_days,
                     proxy_state.crls.as_ref().as_slice(),
                     handshake_scope,
                 )

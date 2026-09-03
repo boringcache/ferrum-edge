@@ -24,9 +24,10 @@ Ferrum Edge is a lightweight, extensible edge proxy designed for modern microser
 - **Built-in plugin system**: Authentication, authorization, OPA policy decisions, adaptive concurrency, WAF content threat detection, OpenAPI contract validation, rate limiting, fault injection, compression, response security headers, SSE stream handling, transformation, response mocking, spec exposure, serverless functions, AI/LLM-specific plugins (including AI federation for multi-provider routing), MCP / Agent Tool Gateway routing, A2A agent gateway observability/policy, load testing, API chargeback, and observability
 - **Eight operating modes**: Database, File, Control Plane, Data Plane, Mesh, Injector, Node Agent, and Migrate
 - **Lock-free hot path**: All request-path reads use `ArcSwap` or `DashMap` — no mutexes on the proxy path
-- **Zero-downtime config reloads**: Atomic config swap via DB polling, SIGHUP, or CP push
+- **Zero-downtime config reloads**: Atomic config swap via DB polling (database/cp), CP push (dp), or SIGHUP (file mode, and mesh with a local file/xDS config source — other modes log and ignore SIGHUP)
 - **Service mesh**: Six topologies (sidecar, ambient, **Experimental** node waypoint, service waypoint, east-west gateway, egress), native MeshSubscribe, xDS ADS, or localized file config consumption, SPIFFE identity, HBONE, transparent DNS proxy, mesh authorization, REGISTRY_ONLY outbound policy, and Istio/GAMMA RED metrics. See [docs/mesh.md](docs/mesh.md)
 - **Runtime observability**: JWT-gated `/metrics/runtime` JSON snapshot with system/process state, HTTP status windows, error classes, DNS outcomes, backend pool churn, TCP resets, log counters, and overload state
+- **Operable alerts**: the `ferrum-gateway` chart ships Prometheus alerts and Grafana dashboards, and every alert links a first-response procedure in [docs/runbooks/gateway.md](docs/runbooks/gateway.md)
 - **Kubernetes mesh translation**: Gateway API and Istio VirtualService route splits, Istio AuthorizationPolicy/RequestAuthentication/PeerAuthentication, and sidecar injection webhook
 
 For the full feature list, see [FEATURES.md](FEATURES.md).
@@ -72,7 +73,7 @@ ferrum-edge version
 
 Download from [GitHub Releases](https://github.com/ferrum-edge/ferrum-edge/releases) for Linux x86_64/ARM64 and macOS x86_64/ARM64. Releases ship raw platform binaries plus adjacent `.sha256` checksum files (for example `ferrum-edge-linux-x86_64` and `ferrum-edge-linux-x86_64.sha256`).
 
-Pin an explicit release tag in download URLs. Ferrum's moving `latest` tag is published as a prerelease, while GitHub's `/releases/latest` redirect and the `releases/latest` API endpoint skip prereleases. Use `/releases/download/<tag>/…` or `gh release download <tag>` instead. No immutable `vX.Y.Z` semver release is published yet; pick the tag shown on the [Releases](https://github.com/ferrum-edge/ferrum-edge/releases) page and avoid pinning production to the mutable `latest` prerelease.
+Pin an explicit release tag in download URLs. Ferrum's moving `latest` tag is published as a prerelease, while GitHub's `/releases/latest` redirect and the `releases/latest` API endpoint skip prereleases. Use `/releases/download/<tag>/…` or `gh release download <tag>` instead. Pick the current immutable `vX.Y.Z` semver tag from the [Releases](https://github.com/ferrum-edge/ferrum-edge/releases) page, and do not pin production to the mutable `latest` prerelease.
 
 ```bash
 # Example: Linux x86_64
@@ -500,8 +501,15 @@ Ferrum also **won the E2E TLS /api/users test outright** — 29,808 req/s, the h
 
 ## Documentation
 
+Start at the [documentation index](docs/README.md) — every document under
+`docs/`, grouped by audience.
+
 | Topic | Link |
 |-------|------|
+| Documentation index | [docs/README.md](docs/README.md) |
+| Production hardening checklist | [docs/hardening.md](docs/hardening.md) |
+| Threat model | [docs/threat_model.md](docs/threat_model.md) |
+| Support, versioning & deprecation policy | [docs/support_policy.md](docs/support_policy.md) |
 | Full configuration reference | [docs/configuration.md](docs/configuration.md) |
 | Plugin reference | [docs/plugins.md](docs/plugins.md) |
 | Transaction log schema customization | [docs/log_schema.md](docs/log_schema.md) |

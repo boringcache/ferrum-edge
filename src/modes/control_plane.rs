@@ -2037,6 +2037,19 @@ pub async fn run(
             "CP namespace authorization requires JWT `ns` claims for ConfigSync, MeshConfigSync, and xDS streams"
         );
     }
+    // The REST admin plane engages the same tenancy boundary as the gRPC config
+    // plane (issue #4529). A multi-namespace scope authorizes no bearer against
+    // every tenant it serves, so `GET /backup` (which serialises consumer
+    // credentials) and `POST /restore` must not accept a token that the gRPC
+    // plane would already refuse. Derived once here and carried into
+    // `AdminState.admin_require_namespace_claim` below.
+    let admin_namespace_claim_required =
+        cp_scope.namespace_claim_required(env_config.admin_require_namespace_claim);
+    if admin_namespace_claim_required && !env_config.admin_require_namespace_claim {
+        info!(
+            "Admin namespace-scoped routes require a JWT `ns` claim because this CP serves multiple namespaces (FERRUM_CP_NAMESPACES); admin tokens without an `ns` claim are refused on those routes"
+        );
+    }
 
     // Discover the initial namespace list. For `Single`/`Set` this is the
     // explicit set; for `All` we query the DB and re-discover on every poll
@@ -2426,7 +2439,7 @@ pub async fn run(
         read_only: env_config.admin_read_only,
         admin_audit_enabled: env_config.admin_audit_enabled,
         admin_audit_fallback_dir: None,
-        admin_require_namespace_claim: env_config.admin_require_namespace_claim,
+        admin_require_namespace_claim: admin_namespace_claim_required,
         startup_ready: Some(startup_ready.clone()),
         serving_degraded: Some(serving_degraded.clone()),
         serving_listener_failures: None,
@@ -3017,8 +3030,14 @@ pub async fn run(
     // Poll freshness + bounded rejection metrics (CP registers the same type as
     // database mode so authenticated `/health` and `/metrics` can expose
     // `last_poll_completed_at` — issue #2986).
-    let database_delta_poll_metrics =
-        Arc::new(crate::modes::database::DatabaseDeltaPollMetrics::default());
+    // Share the live `db_available` flag so
+    // `ferrum_database_config_source_connected` is the same atomic the admin
+    // API reports, not a second copy that can drift (issue #4528).
+    let database_delta_poll_metrics = Arc::new(
+        crate::modes::database::DatabaseDeltaPollMetrics::with_config_source_flag(
+            db_available.clone(),
+        ),
+    );
     crate::plugins::prometheus_metrics::global_registry()
         .set_database_delta_poll_metrics(database_delta_poll_metrics.clone());
     let database_delta_poll_metrics_for_poll = database_delta_poll_metrics.clone();
@@ -3233,12 +3252,18 @@ pub async fn run(
                                         "full reload after DB DNS reconnect",
                                     )
                                     .await;
+                                    database_delta_poll_metrics_for_poll.record_poll_failure(
+                                        crate::modes::database::DatabasePollFailureReason::ValidationRejected,
+                                    );
                                 } else {
                                     error!(
                                         "Authoritative primary full config reload failed after DB DNS reconnect; keeping existing config and retrying: {}",
                                         e
                                     );
-                                    db_available_poll.store(false, Ordering::Relaxed);
+                                    database_delta_poll_metrics_for_poll
+                                        .record_config_source_unavailable(
+                                            crate::modes::database::DatabasePollFailureReason::Connectivity,
+                                        );
                                 }
                                 database_delta_poll_metrics_for_poll.record_poll_completed();
                                 continue;
@@ -3450,6 +3475,9 @@ pub async fn run(
                                             "incremental validation",
                                         )
                                         .await;
+                                        database_delta_poll_metrics_for_poll.record_poll_failure(
+                                            crate::modes::database::DatabasePollFailureReason::ValidationRejected,
+                                        );
                                     }
                                     if decision.should_escalate {
                                         error!(
@@ -3515,6 +3543,9 @@ pub async fn run(
                                                         "rejected-delta escalation full reload",
                                                     )
                                                     .await;
+                                                    database_delta_poll_metrics_for_poll.record_poll_failure(
+                                                        crate::modes::database::DatabasePollFailureReason::ValidationRejected,
+                                                    );
                                                 } else {
                                                     warn!(
                                                         "Authoritative full reload failed after repeated CP delta rejection; keeping the last accepted cursors and cached config: {}",
@@ -3675,6 +3706,9 @@ pub async fn run(
                                                 "full fallback reload",
                                             )
                                             .await;
+                                            database_delta_poll_metrics_for_poll.record_poll_failure(
+                                                crate::modes::database::DatabasePollFailureReason::ValidationRejected,
+                                            );
                                             database_delta_poll_metrics_for_poll.record_poll_completed();
                                             continue;
                                         }
@@ -3763,8 +3797,14 @@ pub async fn run(
                                                                 "failover full reload",
                                                             )
                                                             .await;
+                                                            database_delta_poll_metrics_for_poll.record_poll_failure(
+                                                                crate::modes::database::DatabasePollFailureReason::ValidationRejected,
+                                                            );
                                                         } else {
-                                                            db_available_poll.store(false, Ordering::Relaxed);
+                                                            database_delta_poll_metrics_for_poll
+                                                                .record_config_source_unavailable(
+                                                                    crate::modes::database::DatabasePollFailureReason::Connectivity,
+                                                                );
                                                             warn!(
                                                                 "Authoritative primary failover reload also failed (serving cached): {}",
                                                                 e3
@@ -3774,7 +3814,10 @@ pub async fn run(
                                                 }
                                             }
                                             Err(_) => {
-                                                db_available_poll.store(false, Ordering::Relaxed);
+                                                database_delta_poll_metrics_for_poll
+                                                    .record_config_source_unavailable(
+                                                        crate::modes::database::DatabasePollFailureReason::Connectivity,
+                                                    );
                                                 warn!(
                                                     "Authoritative primary full config reload also failed (serving cached): {}",
                                                     e2

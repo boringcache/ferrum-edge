@@ -431,6 +431,17 @@ pub fn render_circuit_breakers(output: &mut String, cache: &CircuitBreakerCache,
     );
 
     output.push_str(
+        "# HELP ferrum_circuit_breaker_cache_admission_refused_total Requests refused a cached breaker because the shared breaker cache was at its admission ceiling; each one ran on a transient breaker whose failures never accumulate.\n",
+    );
+    output.push_str("# TYPE ferrum_circuit_breaker_cache_admission_refused_total counter\n");
+    push_scalar(
+        output,
+        "ferrum_circuit_breaker_cache_admission_refused_total",
+        ns_label,
+        cache.admission_refused_total(),
+    );
+
+    output.push_str(
         "# HELP ferrum_circuit_breaker_cache_max_entries Admission ceiling for the shared breaker cache; new keys are refused at this count.\n",
     );
     output.push_str("# TYPE ferrum_circuit_breaker_cache_max_entries gauge\n");

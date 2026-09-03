@@ -26,9 +26,9 @@ over production traffic.** File-mode config version bumps still use in-memory or
 `FERRUM_MODE=migrate` config migration; that is separate from the database
 baseline contract above.
 
-## Breaking Changes Since 0.9.0
+## Breaking changes in 0.9.0
 
-Every current `[Unreleased]` `BREAKING` changelog entry is listed here exactly once, with its issue number and the operator action that entry already states. Several of these fail **silently** at cutover (HMAC clients get `401`, WAF `literal` rules stop matching folded spellings, backends stop seeing client-supplied XFF hops) rather than refusing config load. Read this section before the per-mode procedures below.
+Every `BREAKING` changelog entry in the `[0.9.0]` release is listed here exactly once, with its issue number and the operator action that entry already states. Several of these fail **silently** at cutover (HMAC clients get `401`, WAF `literal` rules stop matching folded spellings, backends stop seeing client-supplied XFF hops) rather than refusing config load. Read this section before the per-mode procedures below.
 
 ### Backend mTLS handshake without a client certificate is pre-wire (issue [#4406](https://github.com/ferrum-edge/ferrum-edge/issues/4406))
 
@@ -1169,7 +1169,7 @@ FERRUM_MODE=file \
 
 ### Pre-Upgrade Checklist
 
-- [ ] Read [Breaking Changes Since 0.9.0](#breaking-changes-since-090) and the release notes for breaking changes, deprecated fields, and new required fields
+- [ ] Read [Breaking changes in 0.9.0](#breaking-changes-in-090) and the release notes for breaking changes, deprecated fields, and new required fields
 - [ ] For database/CP modes during build-out: plan a
       [fresh-database rebuild](#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb)
       (`GET /backup` → fresh `V001` baseline → `POST /restore`); keep the old

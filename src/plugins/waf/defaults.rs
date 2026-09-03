@@ -9,10 +9,44 @@ const EVENT_HANDLER: &str = r"(?i)\bon(?:error|load|click|dblclick|mouseover|mou
 
 /// Level-1 SQLi signatures shared by query and body rules. Keeping one pattern
 /// per attack shape prevents the body mirrors from drifting broader than the
-/// established query-side false-positive posture.
-const SQLI_UNION_SELECT: &str = r"(?i)\bunion\s+(?:all\s+)?select\b";
-const SQLI_BOOLEAN_TAUTOLOGY: &str = r#"(?i)(?:\bor\b|\|\|)\s+['"]?\d+['"]?\s*=\s*['"]?\d+"#;
-const SQLI_STACKED_STATEMENT: &str = r"(?i);\s*(?:drop|insert|update|delete|alter)\b";
+/// established query-side false-positive posture: the `-B` mirrors reuse these
+/// exact patterns, so the separator below is the only widening they receive.
+///
+/// SQL engines treat an inline `/*…*/` comment as token whitespace, so
+/// `UNION/**/SELECT` and `;/**/DROP` are accepted by MySQL, PostgreSQL and
+/// MSSQL while a plain `\s` class cannot match them. The layered decoder never
+/// sees these payloads either — `has_decodable_marker` triggers only on `%`,
+/// `+`, `\` and `&`, none of which a `/**/` payload has to contain — so the
+/// separator has to live in the pattern itself. Every SQL token boundary in
+/// these three signatures therefore uses the shared shape
+///
+/// ```text
+/// (?:\s|/\*(?s:.){0,64}?\*/)
+/// ```
+///
+/// written out inline in each pattern (Rust `const` concatenation is not worth
+/// the ceremony here) — keep the three copies identical. `(?s:.)` makes the
+/// comment body newline-tolerant; the `{0,64}?` bound keeps the compiled
+/// finite-automaton program bounded, matching the house style of the other
+/// bounded patterns in this file, which range `{0,80}`..`{1,200}`
+/// (`FE-JNDI-002-*`, `FE-CMD-003`, `FE-SSTI-001`). The bound is deliberately
+/// small: it is not a security parameter, because an attacker who cares can
+/// always write one more comment character at *any* bound. What it does buy is
+/// a narrow false-positive window between the two SQL tokens, and a compiled
+/// program in line with what this `RegexSet` already carries — the separator
+/// appears five times across the three signatures in each of the query and body
+/// sets, and these sets are built once and matched on the request path. A
+/// comment body longer than 64 characters is the accepted residual: the "any
+/// comment token" catch-alls `FE-SQLI-004` (query) and `FE-SQLI-004-B` (body)
+/// cover it at paranoia 2, where their false-positive cost is acceptable.
+const SQLI_UNION_SELECT: &str =
+    r"(?i)\bunion(?:\s|/\*(?s:.){0,64}?\*/)+(?:all(?:\s|/\*(?s:.){0,64}?\*/)+)?select\b";
+/// The `||` branch accepts *zero* separators so the canonical unspaced
+/// `1'||1=1` matches; the `or` branch keeps requiring at least one so a token
+/// like `orX` cannot hit.
+const SQLI_BOOLEAN_TAUTOLOGY: &str = r#"(?i)(?:\bor\b(?:\s|/\*(?s:.){0,64}?\*/)+|\|\|(?:\s|/\*(?s:.){0,64}?\*/)*)['"]?\d+['"]?\s*=\s*['"]?\d+"#;
+const SQLI_STACKED_STATEMENT: &str =
+    r"(?i);(?:\s|/\*(?s:.){0,64}?\*/)*(?:drop|insert|update|delete|alter)\b";
 
 /// High-confidence query prototype-pollution tokens. Query keys and values
 /// each get a rule because they are separate WAF targets; every mirror runs
@@ -120,6 +154,11 @@ pub fn default_rules() -> Vec<WafRule> {
         rp("FE-SQLI-001-B", "UNION SELECT SQL injection (body)", "sqli", Severity::High, RuleTarget::BodyText, SQLI_UNION_SELECT, 1),
         rp("FE-SQLI-002-B", "Boolean tautology SQL injection (body)", "sqli", Severity::High, RuleTarget::BodyText, SQLI_BOOLEAN_TAUTOLOGY, 1),
         rp("FE-SQLI-003-B", "Stacked SQL statement (body)", "sqli", Severity::High, RuleTarget::BodyText, SQLI_STACKED_STATEMENT, 1),
+        // Body-side "any comment token" catch-all mirroring `FE-SQLI-004`.
+        // The bounded `{0,64}` comment body in the level-1 signatures above
+        // leaves a residual evasion behind a longer comment; the query side
+        // already had this backstop at paranoia 2 and the body side had none.
+        rp("FE-SQLI-004-B", "SQL comment token (body)", "sqli", Severity::Medium, RuleTarget::BodyText, r"(?i)(?:--[\s-]|/\*|\*/)", 2),
         // --- Traversal / LFI / SSRF parity across body and query ---
         // SSRF query mirrors stay on QueryValues (decoded parameter values),
         // not FullUrl, so a path token like `/v10.1.2.3` is not a substring
@@ -144,8 +183,8 @@ pub fn default_rules() -> Vec<WafRule> {
             // comment tokens, shell substitution, any-URL-in-param, JWT-shaped
             // response tokens, SQLSTATE in request bodies. The broad SSTI
             // marker is superseded at level 1 by FE-SSTI-002/003.
-            "FE-SSTI-001" | "FE-SQLI-004" | "FE-SQLI-005" | "FE-CMD-003"
-            | "FE-RFI-001" | "FE-DATA-LEAK-005" => {
+            "FE-SSTI-001" | "FE-SQLI-004" | "FE-SQLI-004-B" | "FE-SQLI-005"
+            | "FE-CMD-003" | "FE-RFI-001" | "FE-DATA-LEAK-005" => {
                 rule.paranoia_min = rule.paranoia_min.max(2)
             }
             // Very loud / low signal: bare XPath function probe.

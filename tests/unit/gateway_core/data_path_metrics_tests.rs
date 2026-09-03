@@ -233,6 +233,12 @@ fn breaker_transitions_render_per_state_without_a_target_label() {
         out.contains("ferrum_circuit_breaker_cache_max_entries{namespace=\"ferrum\"} 64"),
         "{out}"
     );
+    assert!(
+        out.contains(
+            "ferrum_circuit_breaker_cache_admission_refused_total{namespace=\"ferrum\"} 0"
+        ),
+        "ceiling pressure must be observable even while zero (#4516):\n{out}"
+    );
 
     // Two per-target breakers collapse to exactly three per-proxy series.
     assert_eq!(samples(&out, "ferrum_circuit_breakers").len(), 3);

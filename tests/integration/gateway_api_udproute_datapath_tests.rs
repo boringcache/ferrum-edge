@@ -383,6 +383,7 @@ async fn try_serve_translated_config(
             circuit_breaker_cache: Arc::clone(&circuit_breaker_cache),
             crls: Arc::new(Vec::new()),
             backend_tls_reload_epoch: Arc::new(AtomicU64::new(0)),
+            tls_policy: None,
             started,
             sni_proxy_ids: None,
             adaptive_buffer: Arc::clone(&adaptive_buffer),

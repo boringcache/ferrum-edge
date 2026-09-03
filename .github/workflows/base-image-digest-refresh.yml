@@ -1,0 +1,132 @@
+# Refreshes the `@sha256:` digests pinning Ferrum's container build inputs.
+#
+# `verify_ci_runtime_cache.py` (`check_dockerfile_image_pins`) requires every
+# `FROM` and `ARG` image reference in the four Dockerfiles to carry an immutable
+# digest. A pin that nothing refreshes ages silently: base-image CVE fixes never
+# arrive. Dependabot's docker ecosystem reads `FROM` lines only, so the
+# `ARG <NAME>=<image>:<tag>@sha256:...` defaults — which is every input of
+# `Dockerfile.ebpf-tools-layer` and both runtime bases of `Dockerfile` — need
+# this job.
+#
+# The rewrite is digest-preserving by construction: it resolves the digest the
+# reference's own tag points at today and substitutes it. It never removes a
+# digest, never changes an image or tag, and opens an ordinary pull request that
+# the full required CI (multi-arch build, FIPS, eBPF, ABI scan, chart smoke)
+# gates like any other change.
+name: Base Image Digest Refresh
+
+on:
+  schedule:
+    # Mondays 05:00 UTC, ahead of the weekly Dependabot run.
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: base-image-digest-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    name: Resolve and propose current base image digests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: true
+
+      - name: Resolve current digests
+        id: resolve
+        env:
+          DOCKERFILES: "Dockerfile Dockerfile.release Dockerfile.test Dockerfile.ebpf-tools-layer"
+        run: |
+          set -euo pipefail
+          changed=""
+          # Every pinned reference in the governed Dockerfiles, deduplicated.
+          refs="$(grep -hoE '[A-Za-z0-9][A-Za-z0-9./_-]*:[A-Za-z0-9][A-Za-z0-9._-]*@sha256:[0-9a-f]{64}' \
+            ${DOCKERFILES} | sort -u)"
+          if [ -z "${refs}" ]; then
+            echo "::error::no digest-pinned image references found; the refresh must fail closed"
+            exit 1
+          fi
+          for ref in ${refs}; do
+            tagged="${ref%@*}"
+            current="${ref##*@}"
+            resolved="$(docker buildx imagetools inspect "${tagged}" \
+              --format '{{json .Manifest.Digest}}' | tr -d '"')"
+            case "${resolved}" in
+              sha256:[0-9a-f][0-9a-f]*) ;;
+              *)
+                echo "::error::could not resolve a manifest digest for ${tagged} (got '${resolved}')"
+                exit 1
+                ;;
+            esac
+            if [ "${resolved}" = "${current}" ]; then
+              echo "up to date: ${tagged} -> ${resolved}"
+              continue
+            fi
+            echo "refresh: ${tagged} ${current} -> ${resolved}"
+            for file in ${DOCKERFILES}; do
+              sed -i "s|${tagged}@${current}|${tagged}@${resolved}|g" "${file}"
+            done
+            changed="${changed}- \`${tagged}\`: \`${current}\` -> \`${resolved}\`\n"
+          done
+          if [ -z "${changed}" ]; then
+            echo "updated=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          echo "updated=true" >> "${GITHUB_OUTPUT}"
+          {
+            echo "body<<PR_BODY_EOF"
+            echo "## Summary"
+            echo
+            echo "Automated refresh of the digest pins on Ferrum's container build inputs."
+            echo "Each reference keeps its image and tag; only the digest its tag currently"
+            echo "resolves to changed."
+            echo
+            echo "## Changes"
+            echo
+            printf '%b' "${changed}"
+            echo
+            echo "## Test plan"
+            echo
+            echo "Normal required CI on this pull request: multi-arch image build, FIPS,"
+            echo "eBPF, the GNU ABI scan, and the Helm chart smoke."
+            echo
+            echo "Refs #4444"
+            echo "PR_BODY_EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Verify the pin contract still holds
+        if: steps.resolve.outputs.updated == 'true'
+        run: python3 .github/scripts/verify_ci_runtime_cache.py
+
+      - name: Open or update the refresh pull request
+        if: steps.resolve.outputs.updated == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_BODY: ${{ steps.resolve.outputs.body }}
+          BRANCH: deps/base-image-digests
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "${BRANCH}"
+          git add Dockerfile Dockerfile.release Dockerfile.test Dockerfile.ebpf-tools-layer
+          git commit -m "deps: refresh container base image digests"
+          git push --force origin "${BRANCH}"
+          if [ -n "$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[].number')" ]; then
+            gh pr edit "${BRANCH}" --body "${PR_BODY}"
+          else
+            gh pr create \
+              --base main \
+              --head "${BRANCH}" \
+              --title "deps: refresh container base image digests" \
+              --body "${PR_BODY}" \
+              --label dependencies
+          fi

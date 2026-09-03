@@ -74,11 +74,23 @@ define_header_name_set! {
     /// - **`x-grpc-web-mode`:** internal grpc_web plugin marker used only between
     ///   request header and body plugin phases; never forward to the backend.
     ///
+    /// - **`expect`:** the gateway has already satisfied the expectation. Hyper's
+    ///   HTTP/1 *server* writes the interim `100 Continue` itself when the
+    ///   request body is first polled, so the client was told to send the body
+    ///   before the origin was consulted. Reqwest/hyper's *client* has no
+    ///   `Expect` support, so forwarding the expectation cannot buy the
+    ///   round-trip back — it only makes an origin `417 Expectation Failed`
+    ///   (or a `401`/`413` the origin would have returned before the body) cost
+    ///   a full upload the gateway already solicited, plus a full buffer
+    ///   whenever retries force buffering. On H2/H3 frontends the header is
+    ///   meaningless to forward at all (issue #4546).
+    ///
     /// `name` is expected to be lowercase.
     pub fn is_backend_request_strip_header;
     [
         "connection",
         "content-length",
+        "expect",
         "keep-alive",
         "proxy-authorization",
         "proxy-connection",
@@ -1982,7 +1994,7 @@ mod tests {
         // only pins the documented closed-set size so accidental inventory
         // edits remain visible in review. Secondary builders call the
         // predicates directly and do not re-list these names.
-        assert_eq!(BACKEND_REQUEST_STRIP_HEADER_NAMES.len(), 11);
+        assert_eq!(BACKEND_REQUEST_STRIP_HEADER_NAMES.len(), 12);
         assert_eq!(PROXY_GENERATED_FORWARDING_HEADER_NAMES.len(), 3);
     }
 

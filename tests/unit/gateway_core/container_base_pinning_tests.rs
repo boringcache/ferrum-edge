@@ -9,6 +9,13 @@ const PRODUCTION_DOCKERFILES: &[(&str, &str)] = &[
         include_str!("../../../Dockerfile.release"),
     ),
     ("Dockerfile.test", include_str!("../../../Dockerfile.test")),
+    // The eBPF tools layer builds a published `-ebpf-tools` image, so it is as
+    // production as the other three. Omitting it is how `BASE_IMAGE` kept a
+    // digest-less default while this gate reported green.
+    (
+        "Dockerfile.ebpf-tools-layer",
+        include_str!("../../../Dockerfile.ebpf-tools-layer"),
+    ),
 ];
 
 const FLOATING_RUST_TAGS: &[&str] = &["latest", "stable", "nightly", "beta"];

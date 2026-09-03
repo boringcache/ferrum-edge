@@ -1344,7 +1344,7 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
 
     if !MESH_CONFIG_STREAM_ATTEMPTS.is_empty() {
         output.push_str(
-            "# HELP ferrum_mesh_config_stream_attempts_total Completed mesh configuration-stream attempts by consumer protocol (native/xds/stock_xds) and closed-set outcome. A remote clean EOF is an endpoint failure, not a success. Local retirements (shutdown, tls_reload, credential_rotated, credential_source_invalid, credential_deadline, primary_retry) never rotate the endpoint or grow backoff. transport_failure is a dial failure while established_transport_failure is an already-open stream going dark; heartbeat_silence_timeout is the native application-silence bound, not an HTTP/2 keepalive timeout.\n",
+            "# HELP ferrum_mesh_config_stream_attempts_total Completed mesh configuration-stream attempts by consumer protocol (native/xds/stock_xds) and closed-set outcome. A remote clean EOF is an endpoint failure, not a success. Local retirements (shutdown, tls_reload, credential_rotated, credential_source_invalid, credential_deadline, primary_retry) never rotate the endpoint or grow backoff. transport_failure is a dial failure while established_transport_failure is an already-open stream going dark; heartbeat_silence_timeout is the native application-silence bound, not an HTTP/2 keepalive timeout. admission_refused is a CP stream-admission capacity/tenancy refusal (RESOURCE_EXHAUSTED): the control plane is alive and answering, so it is deliberately not a transport failure.\n",
         );
         output.push_str("# TYPE ferrum_mesh_config_stream_attempts_total counter\n");
         for entry in MESH_CONFIG_STREAM_ATTEMPTS.iter() {

@@ -1588,3 +1588,53 @@ fn qualified_removal_from_a_foreign_namespace_is_never_requalified() {
     assert_eq!(filter_incremental_to_namespace(&mut delta, "production"), 4);
     assert!(delta.is_empty());
 }
+
+// ── AdmissionRefused backoff/failover disposition (issue #4531) ───────────
+
+/// An admission refusal must keep rotating and retrying exactly like a
+/// connection error: the CP is alive but full, and another configured replica
+/// may still have capacity. Only the *authority* handling differs, and that
+/// lives in the DP client, not here.
+#[test]
+fn admission_refused_rotates_and_accumulates_like_a_connection_error() {
+    let cp_count = 3;
+    let mut refused = MultiCpBackoffState::new();
+    let mut connection_error = MultiCpBackoffState::new();
+
+    for _ in 0..(cp_count * 3) {
+        assert!(advance_multi_cp_backoff(
+            &mut refused,
+            cp_count,
+            ConfigSyncAttemptOutcome::AdmissionRefused
+        ));
+        assert!(advance_multi_cp_backoff(
+            &mut connection_error,
+            cp_count,
+            ConfigSyncAttemptOutcome::ConnectionError
+        ));
+        grow_backoff_after_failure_sleep(&mut refused);
+        grow_backoff_after_failure_sleep(&mut connection_error);
+        assert_eq!(refused, connection_error);
+    }
+
+    assert!(
+        refused.full_cycle_count > 0,
+        "a refused DP must keep cycling through every configured CP"
+    );
+}
+
+/// A single-CP DP still sleeps and grows backoff rather than hot-looping
+/// against a saturated control plane.
+#[test]
+fn admission_refused_still_sleeps_with_one_cp() {
+    let mut state = MultiCpBackoffState::new();
+    let initial = state.backoff_secs;
+    assert!(advance_multi_cp_backoff(
+        &mut state,
+        1,
+        ConfigSyncAttemptOutcome::AdmissionRefused
+    ));
+    assert_eq!(state.current_cp_index, 0);
+    grow_backoff_after_failure_sleep(&mut state);
+    assert!(state.backoff_secs > initial);
+}

@@ -415,3 +415,196 @@ async fn test_oversized_refresh_retains_last_known_good_keys() {
     assert!(store.fetch_keys().await.is_err());
     assert!(has_trusted_key(&store, "k1"));
 }
+
+// ─── Unknown-`kid` on-demand refetch (issue #4508) ──────────────────────────
+
+fn rsa_jwks_with_kid(public_key_pem: &[u8], kid: &str) -> serde_json::Value {
+    super::jwks_auth_support::build_rsa_jwks_from_pem_with_kid(public_key_pem, kid)
+}
+
+/// Serve `first` once, then `second` for every later fetch.
+async fn rotating_jwks_server(
+    first: serde_json::Value,
+    second: serde_json::Value,
+) -> wiremock::MockServer {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/jwks"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(first))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/jwks"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(second))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    server
+}
+
+async fn received_requests(server: &wiremock::MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .map(|requests| requests.len())
+        .unwrap_or(0)
+}
+
+/// The background refresh task selects on the unknown-`kid` trigger, so a
+/// rotated signing key becomes trusted without waiting out the refresh
+/// interval. The interval here is an hour: only the on-demand path can
+/// produce the second fetch.
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test]
+async fn unknown_kid_trigger_refetches_before_the_refresh_interval_elapses() {
+    let v1 = rsa_jwks_with_kid(
+        include_bytes!("../../../tests/fixtures/test_rsa_public.pem"),
+        "key-v1",
+    );
+    let v2 = rsa_jwks_with_kid(
+        include_bytes!("../../../tests/fixtures/test_rsa_public_other.pem"),
+        "key-v2",
+    );
+    let server = rotating_jwks_server(v1, v2).await;
+
+    let store = JwksKeyStore::new(
+        format!("{}/jwks", server.uri()),
+        PluginHttpClient::default(),
+    );
+    let interval = Duration::from_secs(3_600);
+    store.configure_trust_policy(interval, Duration::from_secs(3_600));
+    store.configure_kid_miss_cooldown(Duration::from_secs(30));
+    let refresh = store.start_background_refresh(interval);
+
+    // The task's own first pass publishes v1.
+    while !has_trusted_key(&store, "key-v1") {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!has_trusted_key(&store, "key-v2"));
+
+    let before = store.refresh_completions();
+    store.request_refresh_on_kid_miss();
+    assert_eq!(store.kid_miss_refresh_requests(), 1);
+    store.wait_for_refresh_completion_after(before).await;
+
+    assert!(
+        has_trusted_key(&store, "key-v2"),
+        "the rotated key must be trusted without advancing the refresh interval"
+    );
+    refresh.abort();
+}
+
+/// A flood of tokens naming random unknown identifiers is bounded to one
+/// upstream fetch per cooldown window.
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test]
+async fn unknown_kid_triggers_are_bounded_to_one_fetch_per_cooldown_window() {
+    let v1 = rsa_jwks_with_kid(
+        include_bytes!("../../../tests/fixtures/test_rsa_public.pem"),
+        "key-v1",
+    );
+    let v2 = rsa_jwks_with_kid(
+        include_bytes!("../../../tests/fixtures/test_rsa_public_other.pem"),
+        "key-v2",
+    );
+    let server = rotating_jwks_server(v1, v2).await;
+
+    let store = JwksKeyStore::new(
+        format!("{}/jwks", server.uri()),
+        PluginHttpClient::default(),
+    );
+    let interval = Duration::from_secs(3_600);
+    store.configure_trust_policy(interval, Duration::from_secs(3_600));
+    store.configure_kid_miss_cooldown(Duration::from_secs(600));
+    let refresh = store.start_background_refresh(interval);
+
+    while !has_trusted_key(&store, "key-v1") {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let after_startup = received_requests(&server).await;
+
+    let before = store.refresh_completions();
+    for _ in 0..64 {
+        store.request_refresh_on_kid_miss();
+    }
+    assert_eq!(
+        store.kid_miss_refresh_requests(),
+        1,
+        "the cooldown must admit exactly one trigger per window"
+    );
+    store.wait_for_refresh_completion_after(before).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(
+        received_requests(&server).await,
+        after_startup + 1,
+        "64 unknown identifiers inside one cooldown window must cost one fetch"
+    );
+    refresh.abort();
+}
+
+/// A zero cooldown disables the on-demand refetch entirely.
+#[tokio::test]
+async fn zero_cooldown_disables_the_unknown_kid_refetch() {
+    let store = JwksKeyStore::new(
+        "https://idp.example.com/jwks".to_string(),
+        PluginHttpClient::default(),
+    );
+    store.configure_kid_miss_cooldown(Duration::ZERO);
+    for _ in 0..8 {
+        store.request_refresh_on_kid_miss();
+    }
+    assert_eq!(store.kid_miss_refresh_requests(), 0);
+}
+
+/// An inline store has nothing to refetch; the trigger is inert.
+#[tokio::test]
+async fn inline_store_never_admits_an_unknown_kid_refetch() {
+    let jwks = rsa_jwks_with_kid(
+        include_bytes!("../../../tests/fixtures/test_rsa_public.pem"),
+        "key-v1",
+    );
+    let store = JwksKeyStore::from_inline_jwks(&jwks.to_string()).expect("inline JWKS");
+    store.request_refresh_on_kid_miss();
+    assert_eq!(store.kid_miss_refresh_requests(), 0);
+    assert_eq!(store.kid_miss_cooldown(), Duration::ZERO);
+}
+
+/// An on-demand fetch is out of band: it never pulls the periodic refresh
+/// into a tighter loop.
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test]
+async fn an_on_demand_fetch_does_not_shorten_the_periodic_schedule() {
+    let jwks = rsa_jwks_with_kid(
+        include_bytes!("../../../tests/fixtures/test_rsa_public.pem"),
+        "key-v1",
+    );
+    let server = rotating_jwks_server(jwks.clone(), jwks).await;
+    let store = JwksKeyStore::new(
+        format!("{}/jwks", server.uri()),
+        PluginHttpClient::default(),
+    );
+    let interval = Duration::from_secs(3_600);
+    store.configure_trust_policy(interval, Duration::from_secs(3_600));
+    store.configure_kid_miss_cooldown(Duration::from_millis(1));
+    let refresh = store.start_background_refresh(interval);
+
+    while !has_trusted_key(&store, "key-v1") {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let after_startup = received_requests(&server).await;
+
+    let before = store.refresh_completions();
+    store.request_refresh_on_kid_miss();
+    store.wait_for_refresh_completion_after(before).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(
+        received_requests(&server).await,
+        after_startup + 1,
+        "the periodic deadline must survive an out-of-band fetch unchanged"
+    );
+    refresh.abort();
+}

@@ -3049,3 +3049,117 @@ fn consecutive_mode_timer_cannot_strand_republished_generation_after_remove() {
         (1, 1)
     );
 }
+
+// ── Active-probe timer: jitter + MissedTickBehavior::Delay (issue #4518) ─────
+//
+// One probe task is spawned per (upstream, target). Before #4518 the task used
+// a bare `tokio::time::interval(interval)`: every target fired at t=0 and on an
+// exact grid (a synchronised burst, re-formed on every reload), and the default
+// `Burst` behaviour handed back every missed tick to a probe that outlived its
+// interval, collapsing the `threshold x interval` ejection window.
+
+fn probe_target_key(index: usize) -> String {
+    format!("ferrum|api-upstream::backend-{index}.example.com:8080")
+}
+
+#[test]
+fn active_probe_offsets_are_distinct_and_bounded_by_one_interval() {
+    let interval = Duration::from_secs(10);
+    let offsets: Vec<Duration> = (0..8)
+        .map(|i| {
+            ferrum_edge::health_check::probe_timer_for_test::start_offset(
+                &probe_target_key(i),
+                interval,
+            )
+        })
+        .collect();
+
+    for (i, offset) in offsets.iter().enumerate() {
+        assert!(
+            *offset < interval,
+            "target {i} offset {offset:?} must land inside one interval"
+        );
+    }
+
+    let mut sorted = offsets.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        offsets.len(),
+        "8 targets must not share a first-probe instant: {offsets:?}"
+    );
+}
+
+#[test]
+fn active_probe_offset_is_stable_across_reconstructions() {
+    // A reload re-spawns every probe task. The offset must be re-derived, not
+    // re-drawn, or the whole fleet re-synchronises on a different grid.
+    let interval = Duration::from_secs(10);
+    let key = probe_target_key(3);
+    let first = ferrum_edge::health_check::probe_timer_for_test::start_offset(&key, interval);
+    let second = ferrum_edge::health_check::probe_timer_for_test::start_offset(&key, interval);
+    assert_eq!(first, second);
+
+    // Distinct keys, same interval: a different phase, still deterministic.
+    let other = ferrum_edge::health_check::probe_timer_for_test::start_offset(
+        &probe_target_key(4),
+        interval,
+    );
+    assert_ne!(first, other);
+}
+
+#[test]
+fn active_probe_offset_is_zero_for_a_zero_interval() {
+    assert_eq!(
+        ferrum_edge::health_check::probe_timer_for_test::start_offset(
+            &probe_target_key(0),
+            Duration::ZERO
+        ),
+        Duration::ZERO
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn active_probe_first_tick_is_delayed_by_the_targets_offset() {
+    let interval = Duration::from_secs(10);
+    let key = probe_target_key(0);
+    let offset = ferrum_edge::health_check::probe_timer_for_test::start_offset(&key, interval);
+    assert!(!offset.is_zero(), "fixture key must produce a real offset");
+
+    let start = tokio::time::Instant::now();
+    let mut timer = ferrum_edge::health_check::probe_timer_for_test::timer(&key, interval);
+    timer.tick().await;
+    // Unjittered, this first tick would complete at t=0.
+    assert_eq!(tokio::time::Instant::now() - start, offset);
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_active_probe_yields_one_follow_up_tick_not_a_burst() {
+    let interval = Duration::from_secs(10);
+    let key = probe_target_key(1);
+    let mut timer = ferrum_edge::health_check::probe_timer_for_test::timer(&key, interval);
+
+    timer.tick().await;
+
+    // A probe that runs for 2 x interval misses one scheduled tick.
+    tokio::time::advance(interval * 2).await;
+
+    // Delay hands back exactly one tick immediately...
+    let resumed = tokio::time::Instant::now();
+    timer.tick().await;
+    assert_eq!(tokio::time::Instant::now(), resumed);
+
+    // ...and then re-anchors a full interval out. Under `Burst` this second
+    // tick would also be immediate, and `consecutive_failures` would reach
+    // `unhealthy_threshold` in far less than `threshold x interval`.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), timer.tick())
+            .await
+            .is_err(),
+        "Burst catch-up tick leaked through: probes ran back to back"
+    );
+
+    tokio::time::advance(interval).await;
+    timer.tick().await;
+}

@@ -168,6 +168,15 @@ fn start_gateway_with_dtls(
     http_port: u16,
     dtls_env: Option<&GatewayDtlsEnv>,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+    start_gateway_with_dtls_and_env(config_path, http_port, dtls_env, &[])
+}
+
+fn start_gateway_with_dtls_and_env(
+    config_path: &str,
+    http_port: u16,
+    dtls_env: Option<&GatewayDtlsEnv>,
+    extra_env: &[(&str, &str)],
+) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     // Use http_port + 1000 as admin port to avoid collisions
     let admin_port = http_port + 1000;
     let mut cmd = std::process::Command::new(gateway_binary_path());
@@ -183,6 +192,9 @@ fn start_gateway_with_dtls(
     if let Some(dtls) = dtls_env {
         cmd.env("FERRUM_DTLS_CERT_PATH", &dtls.cert_path)
             .env("FERRUM_DTLS_KEY_PATH", &dtls.key_path);
+    }
+    for (k, v) in extra_env {
+        cmd.env(k, v);
     }
 
     configure_coverage_gateway_command(&mut cmd);
@@ -913,6 +925,124 @@ plugin_configs: []
     response_server.abort();
 }
 
+/// Issue #4515: a hand-authored `udp` proxy that names NO amplification factor
+/// is bounded, not an open reflector. `Proxy::normalize_fields()` projects the
+/// finite default (`8.0`) onto every configuration source, so a 4-byte request
+/// buys a 32-byte reply budget and a 16 KiB backend response is dropped.
+#[ignore]
+#[tokio::test]
+async fn test_udp_proxy_without_explicit_factor_bounds_amplification_by_default() {
+    let backend_port = 19840u16;
+    let proxy_port = 19841u16;
+    let gateway_http_port = 18224u16;
+
+    let large_response = vec![b'z'; 16384];
+    let response_server =
+        start_udp_fixed_response_server(backend_port, large_response.clone()).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    write_config(
+        &config_path,
+        &format!(
+            r#"
+version: "1"
+proxies:
+  - id: "udp-default-amplification-guard"
+    listen_port: {proxy_port}
+    backend_scheme: udp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+
+consumers: []
+plugin_configs: []
+"#
+        ),
+    );
+
+    let mut gateway =
+        start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
+    sleep(Duration::from_secs(3)).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client
+        .connect(format!("127.0.0.1:{}", proxy_port))
+        .await
+        .unwrap();
+
+    let mut buf = vec![0u8; 65535];
+    client.send(b"tiny").await.expect("Failed to send");
+    let dropped = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf)).await;
+    assert!(
+        dropped.is_err(),
+        "a udp proxy with no explicit factor must still bound the reply: a 4-byte request \
+         cannot draw a 16 KiB response"
+    );
+
+    shutdown_gateway(&mut gateway);
+    response_server.abort();
+}
+
+/// Mirror of the above: `udp_max_response_amplification_factor: 0` is the
+/// explicit operator opt-out, so the same oversized reply is delivered.
+#[ignore]
+#[tokio::test]
+async fn test_udp_proxy_zero_factor_sentinel_disables_the_amplification_guard() {
+    let backend_port = 19842u16;
+    let proxy_port = 19843u16;
+    let gateway_http_port = 18225u16;
+
+    let large_response = vec![b'z'; 16384];
+    let response_server =
+        start_udp_fixed_response_server(backend_port, large_response.clone()).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    write_config(
+        &config_path,
+        &format!(
+            r#"
+version: "1"
+proxies:
+  - id: "udp-unlimited-amplification"
+    listen_port: {proxy_port}
+    backend_scheme: udp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    udp_max_response_amplification_factor: 0
+
+consumers: []
+plugin_configs: []
+"#
+        ),
+    );
+
+    let mut gateway =
+        start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
+    sleep(Duration::from_secs(3)).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client
+        .connect(format!("127.0.0.1:{}", proxy_port))
+        .await
+        .unwrap();
+
+    let mut buf = vec![0u8; 65535];
+    client.send(b"tiny").await.expect("Failed to send");
+    let n = tokio::time::timeout(Duration::from_secs(5), client.recv(&mut buf))
+        .await
+        .expect("explicitly unlimited reply timed out")
+        .expect("recv error");
+    assert_eq!(
+        &buf[..n],
+        large_response.as_slice(),
+        "the 0 sentinel must deliver the oversized reply the finite default would drop"
+    );
+
+    shutdown_gateway(&mut gateway);
+    response_server.abort();
+}
+
 /// Test 6: DTLS backend — send plain UDP datagrams through the gateway,
 /// which encrypts them via DTLS to a DTLS echo server backend.
 ///
@@ -1288,6 +1418,102 @@ plugin_configs: []
     dtls_echo.abort();
 }
 
+/// Issue #4507: `FERRUM_TLS_MIN_VERSION` reaches the frontend DTLS listener.
+///
+/// The gateway's TLS policy is documented as applying "inbound + outbound".
+/// Before #4507 the DTLS builders never received it, so a listener under
+/// `FERRUM_TLS_MIN_VERSION=1.3` still completed a DTLS 1.2 handshake. Here the
+/// client offers DTLS 1.2 only (its DTLS 1.3 suite list is empty) and must be
+/// refused. The positive control is the existing
+/// `test_udp_proxy_frontend_dtls_termination`, whose default-version client
+/// completes against the same listener shape.
+#[ignore]
+#[tokio::test]
+async fn test_frontend_dtls_refuses_dtls_1_2_when_policy_minimum_is_1_3() {
+    let backend_port = 19878u16;
+    let proxy_port = 19879u16;
+    let gateway_http_port = 18278u16;
+
+    let echo_server = start_udp_echo_server(backend_port).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    let (cert_path, key_path) = generate_test_dtls_cert(&temp_dir);
+
+    write_config(
+        &config_path,
+        &format!(
+            r#"
+version: "1"
+proxies:
+  - id: "frontend-dtls-min-13"
+    listen_port: {proxy_port}
+    frontend_tls: true
+    backend_scheme: udp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    udp_idle_timeout_seconds: 30
+
+consumers: []
+plugin_configs: []
+"#
+        ),
+    );
+
+    let dtls_env = GatewayDtlsEnv {
+        cert_path: cert_path.clone(),
+        key_path: key_path.clone(),
+    };
+    let mut gateway = start_gateway_with_dtls_and_env(
+        config_path.to_str().unwrap(),
+        gateway_http_port,
+        Some(&dtls_env),
+        &[("FERRUM_TLS_MIN_VERSION", "1.3")],
+    )
+    .expect("Failed to start gateway");
+    sleep(Duration::from_secs(3)).await;
+
+    // A client with no DTLS 1.3 suites can only offer DTLS 1.2.
+    let no_dtls13: &[dimpl::crypto::Dtls13CipherSuite] = &[];
+    let client_config = dimpl::Config::builder()
+        .require_client_certificate(false)
+        .dtls13_cipher_suites(no_dtls13)
+        .build()
+        .expect("build DTLS 1.2-only client config");
+
+    let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client_socket
+        .connect(format!("127.0.0.1:{}", proxy_port))
+        .await
+        .unwrap();
+    let params = ferrum_edge::dtls::BackendDtlsParams {
+        config: std::sync::Arc::new(client_config),
+        certificate: dimpl::certificate::generate_self_signed_certificate()
+            .expect("generate ephemeral cert")
+            .into(),
+        server_name: None,
+        server_cert_verifier: None,
+        connect_timeout_ms: 5_000,
+    };
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        ferrum_edge::dtls::DtlsConnection::connect(client_socket, params),
+    )
+    .await;
+
+    let completed = matches!(outcome, Ok(Ok(_)));
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_server.abort();
+
+    assert!(
+        !completed,
+        "a DTLS 1.2-only client must not complete a handshake against a listener whose \
+         FERRUM_TLS_MIN_VERSION is 1.3"
+    );
+}
+
 // ============================================================================
 // DTLS Client Helper
 // ============================================================================
@@ -1578,4 +1804,240 @@ fn generate_test_dtls_cert(temp_dir: &TempDir) -> (String, String) {
         cert_path.to_str().unwrap().to_string(),
         key_path.to_str().unwrap().to_string(),
     )
+}
+
+/// Start a UDP echo server that prefixes every reply with `tag`, so a client can
+/// tell which backend served its session.
+async fn start_tagged_udp_echo_server(
+    port: u16,
+    tag: &'static [u8],
+) -> tokio::task::JoinHandle<()> {
+    let handle = tokio::spawn(async move {
+        let socket = UdpSocket::bind(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap_or_else(|_| panic!("Failed to bind tagged UDP echo server on port {}", port));
+
+        let mut buf = vec![0u8; 65535];
+        let mut reply = Vec::with_capacity(65535);
+        while let Ok((len, src)) = socket.recv_from(&mut buf).await {
+            reply.clear();
+            reply.extend_from_slice(tag);
+            reply.extend_from_slice(&buf[..len]);
+            let _ = socket.send_to(&reply, src).await;
+        }
+    });
+    sleep(Duration::from_millis(200)).await;
+    handle
+}
+
+/// `least_connections` must distribute UDP sessions across every healthy target
+/// (issue #4514).
+///
+/// Before stream load-balancer accounting existed, no UDP path incremented the
+/// balancer's active-connection gauge, so `select_least_connections_*` saw every
+/// target at zero and its strict `<` tie-break returned the first healthy target
+/// for every session — all 30 source ports landed on backend A.
+///
+/// Each client socket keeps its session alive (the idle timeout is far longer
+/// than the test), and every session is echo-verified before the next client
+/// starts, so the gauge for the chosen target is provably armed before the next
+/// selection runs.
+#[ignore]
+#[tokio::test]
+async fn test_udp_proxy_least_connections_distributes_across_targets() {
+    let backend_a_port = 19840u16;
+    let backend_b_port = 19841u16;
+    let backend_c_port = 19842u16;
+    let proxy_port = 19843u16;
+    let gateway_http_port = 18230u16;
+
+    let backend_a = start_tagged_udp_echo_server(backend_a_port, b"A:").await;
+    let backend_b = start_tagged_udp_echo_server(backend_b_port, b"B:").await;
+    let backend_c = start_tagged_udp_echo_server(backend_c_port, b"C:").await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    write_config(
+        &config_path,
+        &format!(
+            r#"
+version: "1"
+proxies:
+  - id: "udp-least-conn"
+    listen_port: {proxy_port}
+    backend_scheme: udp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_a_port}
+    upstream_id: "udp-least-conn-upstream"
+    udp_idle_timeout_seconds: 120
+
+upstreams:
+  - id: "udp-least-conn-upstream"
+    algorithm: least_connections
+    targets:
+      - host: "127.0.0.1"
+        port: {backend_a_port}
+      - host: "127.0.0.1"
+        port: {backend_b_port}
+      - host: "127.0.0.1"
+        port: {backend_c_port}
+
+consumers: []
+plugin_configs: []
+"#
+        ),
+    );
+
+    // Warmup dials would land on the balancer before the test's own sessions
+    // and skew the distribution.
+    let mut gateway = start_gateway_with_extra_env(
+        config_path.to_str().unwrap(),
+        gateway_http_port,
+        &[("FERRUM_POOL_WARMUP_ENABLED", "false")],
+    )
+    .expect("Failed to start");
+    sleep(Duration::from_secs(3)).await;
+
+    const SESSIONS: usize = 30;
+    // Held open for the whole loop: a released session would decrement the gauge
+    // and let the algorithm re-pin.
+    let mut held = Vec::with_capacity(SESSIONS);
+    let mut hits_a = 0u32;
+    let mut hits_b = 0u32;
+    let mut hits_c = 0u32;
+
+    for i in 0..SESSIONS {
+        // A distinct ephemeral source port per client is a distinct UDP session.
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .connect(format!("127.0.0.1:{}", proxy_port))
+            .await
+            .unwrap();
+        let payload = format!("session-{i}");
+        client.send(payload.as_bytes()).await.expect("send payload");
+
+        let mut buf = vec![0u8; 1024];
+        let n = tokio::time::timeout(Duration::from_secs(5), client.recv(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("session {i} recv timed out"))
+            .unwrap_or_else(|error| panic!("session {i} recv failed: {error}"));
+        assert!(n >= 2, "session {i} reply too short: {n}");
+        match &buf[..2] {
+            b"A:" => hits_a += 1,
+            b"B:" => hits_b += 1,
+            b"C:" => hits_c += 1,
+            other => panic!("unexpected tag for session {i}: {other:?}"),
+        }
+        held.push(client);
+    }
+
+    assert_eq!(hits_a + hits_b + hits_c, SESSIONS as u32);
+    assert!(
+        hits_a > 0 && hits_b > 0 && hits_c > 0,
+        "least_connections must use every healthy target, got A={hits_a} B={hits_b} C={hits_c}"
+    );
+
+    drop(held);
+    shutdown_gateway(&mut gateway);
+    backend_a.abort();
+    backend_b.abort();
+    backend_c.abort();
+}
+
+/// `FERRUM_UDP_MAX_SESSIONS_PER_IP` must bound how many concurrent UDP sessions
+/// one source IP can hold, independently of the listener-wide
+/// `FERRUM_UDP_MAX_SESSIONS` budget (issue #4544).
+///
+/// A UDP session is keyed on the client's full tuple, so before this bound
+/// existed a single client could open a distinct session per source port and
+/// fill the whole session table alone. Each session is echo-verified before the
+/// next source port is used, so the admitted session's per-source slot is
+/// provably held when the next reservation runs.
+#[ignore]
+#[tokio::test]
+async fn test_udp_proxy_per_source_ip_session_limit() {
+    let backend_port = 19844u16;
+    let proxy_port = 19845u16;
+    let gateway_http_port = 18231u16;
+
+    let echo_server = start_udp_echo_server(backend_port).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    write_config(
+        &config_path,
+        &format!(
+            r#"
+version: "1"
+proxies:
+  - id: "udp-per-ip"
+    listen_port: {proxy_port}
+    backend_scheme: udp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    udp_idle_timeout_seconds: 120
+
+consumers: []
+plugin_configs: []
+"#
+        ),
+    );
+
+    let mut gateway = start_gateway_with_extra_env(
+        config_path.to_str().unwrap(),
+        gateway_http_port,
+        &[
+            ("FERRUM_UDP_MAX_SESSIONS_PER_IP", "4"),
+            ("FERRUM_POOL_WARMUP_ENABLED", "false"),
+        ],
+    )
+    .expect("Failed to start");
+    sleep(Duration::from_secs(3)).await;
+
+    const ATTEMPTS: usize = 8;
+    const LIMIT: usize = 4;
+    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    // Held open for the whole loop: a released session would return its
+    // per-source slot and let a later attempt in.
+    let mut established = Vec::new();
+    let mut refused = 0usize;
+
+    for i in 0..ATTEMPTS {
+        // A distinct ephemeral source port from the SAME source IP is a
+        // distinct UDP session but the same per-source budget.
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.connect(&proxy_addr).await.unwrap();
+        let payload = format!("session-{i}");
+        client.send(payload.as_bytes()).await.expect("send payload");
+
+        let mut buf = vec![0u8; 1024];
+        match tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf)).await {
+            Ok(Ok(n)) => {
+                assert_eq!(
+                    &buf[..n],
+                    payload.as_bytes(),
+                    "session {i} echoed the wrong payload"
+                );
+                established.push(client);
+            }
+            // Over-cap datagrams are dropped at slot reservation: no session,
+            // no backend socket, so no reply ever arrives.
+            _ => refused += 1,
+        }
+    }
+
+    assert_eq!(
+        established.len(),
+        LIMIT,
+        "exactly FERRUM_UDP_MAX_SESSIONS_PER_IP sessions from one source must be established"
+    );
+    assert_eq!(
+        refused,
+        ATTEMPTS - LIMIT,
+        "every session past the per-source cap must be refused at slot reservation"
+    );
+
+    drop(established);
+    shutdown_gateway(&mut gateway);
+    echo_server.abort();
 }
