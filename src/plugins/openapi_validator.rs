@@ -44,10 +44,10 @@ use crate::util::unknown_keys::reject_unknown_keys;
 use super::utils::content_encoding::{DecodeLimits, decode_content_encoding};
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
 use super::utils::validation_diagnostics::{
-use super::utils::xml_bounds::xml_nesting_depth_within_limit;
     MAX_DIAGNOSTIC_CHARS, SafeFieldNames, bound_detail, safe_keyword, safe_location,
     schema_violation_detail, xml_error_category,
 };
+use super::utils::xml_bounds::xml_nesting_depth_within_limit;
 use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext};
 
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
