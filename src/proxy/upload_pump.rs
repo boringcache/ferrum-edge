@@ -233,13 +233,28 @@ fn pump_terminal_error(outcome: UploadPumpOutcome) -> BoxError {
 /// unconditional abort here would cancel the #4411 bound before it could ever
 /// fire. The watch is self-bounding: it ends on a drained queue, an
 /// unanswerable socket, a cancellation, or the write watermark.
+///
+/// The state check alone is not enough: hyper's HTTP/1 length-delimited
+/// encoder ends the message on its OWN eof — the moment the last declared byte
+/// is written — and drops the body without polling it for the trailing end of
+/// stream. That drop can land before the pump has read the client's end of
+/// stream and published `Completed`, so the guard also honours
+/// [`UploadPumpSource`]'s `Drop`, which suppresses the abort when every byte
+/// the client declared has already crossed the bridge: such a transport is done
+/// consuming, not gone.
 struct AbortPumpOnDrop {
     handle: tokio::task::JoinHandle<()>,
     terminal: Arc<AtomicU8>,
+    /// Set by [`UploadPumpSource`]'s `Drop` when the transport released the
+    /// body only after taking every declared byte.
+    suppressed: bool,
 }
 
 impl Drop for AbortPumpOnDrop {
     fn drop(&mut self) {
+        if self.suppressed {
+            return;
+        }
         if self
             .terminal
             .compare_exchange(
@@ -273,6 +288,25 @@ pub struct UploadPumpSource {
     delivered: u64,
     ended: bool,
     reported_error: bool,
+}
+
+impl Drop for UploadPumpSource {
+    fn drop(&mut self) {
+        // A transport that releases the body only after taking every byte the
+        // client declared has finished consuming it, not abandoned it: hyper's
+        // HTTP/1 length-delimited encoder does exactly this without polling
+        // for the trailing end of stream. The pump is then at most one
+        // iteration from publishing `Completed` — and, for a live
+        // `backend_write_timeout_ms`, it still owns the post-EOS send-queue
+        // drain judgment (issue #4411). Aborting here would cancel that bound
+        // on precisely the uploads it exists for: the ones the peer's kernel
+        // absorbed whole and never read. A body released early — fewer bytes
+        // delivered than declared, or no declared length at all — keeps the
+        // abort, exactly as before.
+        if self.ended || self.initial_hint.exact() == Some(self.delivered) {
+            self._abort.suppressed = true;
+        }
+    }
 }
 
 impl UploadPumpSource {
@@ -679,6 +713,7 @@ where
             _abort: AbortPumpOnDrop {
                 handle,
                 terminal: Arc::clone(&terminal),
+                suppressed: false,
             },
             initial_hint,
             write_start: consumer_write_start,
@@ -800,6 +835,18 @@ where
     let write_idle_dur = Duration::from_millis(write_timeout_ms);
     let mut write_idle = write_configured.then(|| Box::pin(tokio::time::sleep(write_idle_dur)));
     let outcome = 'pump: loop {
+        // A client body that already reports end of stream — every declared
+        // byte has crossed the bridge — is complete without another poll, and
+        // without another permit. Recognising it here matters for a
+        // length-delimited HTTP/1 backend transport: hyper drops the body the
+        // moment it has written the last declared byte, so a pump that first
+        // reserved bridge capacity would observe a closed channel and report
+        // `ConsumerGone` for an upload that was in fact delivered whole (issue
+        // #4411). Unknown lengths and pending trailers stay on the polling path
+        // below, where the body's own `None` is the only end of stream.
+        if http_body::Body::is_end_stream(&body) {
+            break 'pump UploadPumpOutcome::Completed;
+        }
         // Reserve capacity BEFORE reading the client, so a transport that
         // stops draining stops the read rather than filling a buffer.
         if write_armed
