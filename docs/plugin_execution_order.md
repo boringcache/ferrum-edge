@@ -865,7 +865,7 @@ before the trailer section reaches a backend:
   back; anything unprovable fails closed and no trailer block is sent.
 
 Removed from the trailer section: RFC 9110 §7.6.1 request-direction hop-by-hop
-and framing fields (`connection`, `keep-alive`, `proxy-authorization`,
+and framing fields (`connection`, `expect`, `keep-alive`, `proxy-authorization`,
 `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`,
 `content-length`); reserved gateway assertions (`x-consumer-username`,
 `x-consumer-custom-id`, `x-geo-country`); Ferrum-owned names (`x-ferrum-*`,

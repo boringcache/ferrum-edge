@@ -21,6 +21,19 @@
 //! requests. A well-formed head takes the same in-place observe path and the
 //! same vectored writes as on `main`. Other Hyper parse failures the scanner
 //! cannot name stay Hyper's empty-bodied `400`.
+//!
+//! The envelope carries the same shape as a handler-layer protocol reject
+//! (`Content-Type: application/json`, a fixed `{"error":"..."}` body,
+//! `Connection: close`) and, like them, carries **no** `X-Gateway-Error`.
+//! That header is a closed seven-token client-facing vocabulary
+//! ([`crate::retry::HTTP_OBSERVABILITY_ERROR_CLASSES`]) describing why a
+//! *backend* attempt failed; none of its tokens describes a client-caused
+//! `400`, so a parse reject names itself only in the log field and in the
+//! `400` it is counted under (issue #4543).
+//!
+//! Each envelope written is counted on `H1FramingSignals::parse_rejects` and
+//! drained by the connection handler into `record_request(.., 400)`, so a
+//! request-smuggling probe is not observability dark matter.
 
 use std::io;
 use std::pin::Pin;
@@ -52,9 +65,9 @@ const _: () = {
     assert!(JSON_MALFORMED_HTTP_REQUEST.len() == 34);
 };
 
-const ENVELOPE_CONFLICTING_CONTENT_LENGTH: &[u8] = b"HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 67\r\nconnection: close\r\nx-gateway-error: request_error\r\n\r\n{\"error\":\"Multiple Content-Length headers with conflicting values\"}";
-const ENVELOPE_HTTP10_TRANSFER_ENCODING: &[u8] = b"HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 55\r\nconnection: close\r\nx-gateway-error: request_error\r\n\r\n{\"error\":\"HTTP/1.0 does not support Transfer-Encoding\"}";
-const ENVELOPE_MALFORMED_HTTP_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 34\r\nconnection: close\r\nx-gateway-error: request_error\r\n\r\n{\"error\":\"Malformed HTTP request\"}";
+const ENVELOPE_CONFLICTING_CONTENT_LENGTH: &[u8] = b"HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 67\r\nconnection: close\r\n\r\n{\"error\":\"Multiple Content-Length headers with conflicting values\"}";
+const ENVELOPE_HTTP10_TRANSFER_ENCODING: &[u8] = b"HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 55\r\nconnection: close\r\n\r\n{\"error\":\"HTTP/1.0 does not support Transfer-Encoding\"}";
+const ENVELOPE_MALFORMED_HTTP_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 34\r\nconnection: close\r\n\r\n{\"error\":\"Malformed HTTP request\"}";
 
 pub(super) fn envelope_for_hint(hint: u8) -> &'static [u8] {
     match hint {
@@ -123,6 +136,12 @@ pub(super) struct H1FramingSignals {
     unknown: AtomicBool,
     observation_disabled: AtomicBool,
     parse_reject_hint: AtomicU8,
+    /// Parse-reject envelopes written on this connection, drained once by the
+    /// connection handler after the hyper `select!` resolves so each reject is
+    /// counted as a `400` in the gateway's request/status counters (#4543).
+    /// Incremented on the cold reject path only, never in `poll_read`'s fast
+    /// path.
+    parse_rejects: AtomicU64,
 }
 
 impl H1FramingSignals {
@@ -135,6 +154,7 @@ impl H1FramingSignals {
             unknown: AtomicBool::new(false),
             observation_disabled: AtomicBool::new(false),
             parse_reject_hint: AtomicU8::new(PARSE_HINT_NONE),
+            parse_rejects: AtomicU64::new(0),
         }
     }
 
@@ -148,6 +168,17 @@ impl H1FramingSignals {
             Ordering::Release,
             Ordering::Relaxed,
         );
+    }
+
+    fn record_parse_reject(&self) {
+        self.parse_rejects.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Drains the parse-reject count, returning the number of envelopes written
+    /// since the last drain. Called once per connection after hyper's
+    /// `select!` resolves; the swap keeps the drain idempotent.
+    pub(super) fn take_parse_rejects(&self) -> u64 {
+        self.parse_rejects.swap(0, Ordering::Relaxed)
     }
 
     fn take_parse_reject_hint(&self) -> u8 {
@@ -279,11 +310,24 @@ pub(super) struct H1FramingGuardIo<T> {
     /// malformed request. A malformed request pipelined behind a response
     /// falls back to Hyper's own empty-bodied `400`, the same documented
     /// residual as the parse failures the scanner cannot name.
+    ///
+    /// An interim `100 Continue` that hyper writes for an `Expect:
+    /// 100-continue` request also sets this flag, one request earlier than a
+    /// completed response would. The resulting behaviour is the residual above
+    /// — a *pipelined* malformed request behind an already-started response
+    /// falls back to hyper's own `400` — so the arming rule is unchanged.
     wrote_response_bytes: bool,
+    /// Peer address, logged with a parse reject so a request-smuggling probe is
+    /// attributable. `None` only in unit tests that drive the adapter directly.
+    peer_addr: Option<std::net::SocketAddr>,
 }
 
 impl<T> H1FramingGuardIo<T> {
-    pub(super) fn new(inner: T, max_head_bytes: usize) -> (Self, Arc<H1FramingSignals>) {
+    pub(super) fn new(
+        inner: T,
+        max_head_bytes: usize,
+        peer_addr: Option<std::net::SocketAddr>,
+    ) -> (Self, Arc<H1FramingSignals>) {
         let signals = Arc::new(H1FramingSignals::new());
         (
             Self {
@@ -292,6 +336,7 @@ impl<T> H1FramingGuardIo<T> {
                 signals: Arc::clone(&signals),
                 parse_reject: ParseRejectWrite::Idle,
                 wrote_response_bytes: false,
+                peer_addr,
             },
             signals,
         )
@@ -303,11 +348,16 @@ impl<T: AsyncWrite + Unpin> H1FramingGuardIo<T> {
         if !self.parse_reject.is_idle() {
             return;
         }
+        // `parse_reject_class` is a *log* field, deliberately not the
+        // client-facing `X-Gateway-Error` header token: that header is a closed
+        // seven-token vocabulary and the envelope carries none of them (#4543).
         tracing::warn!(
-            gateway_error = "request_error",
+            parse_reject_class = "request_error",
             parse_reject_hint = hint,
+            peer_addr = ?self.peer_addr.map(|addr| addr.ip()),
             "Rejected HTTP/1 request before Hyper parse"
         );
+        self.signals.record_parse_reject();
         self.signals.disable_observation();
         self.parse_reject = ParseRejectWrite::Writing {
             envelope: envelope_for_hint(hint),
@@ -483,8 +533,12 @@ pub(super) enum MaybeH1FramingGuardIo<T> {
 }
 
 impl<T> MaybeH1FramingGuardIo<T> {
-    pub(super) fn observed(inner: T, max_head_bytes: usize) -> (Self, Arc<H1FramingSignals>) {
-        let (guard, signals) = H1FramingGuardIo::new(inner, max_head_bytes);
+    pub(super) fn observed(
+        inner: T,
+        max_head_bytes: usize,
+        peer_addr: Option<std::net::SocketAddr>,
+    ) -> (Self, Arc<H1FramingSignals>) {
+        let (guard, signals) = H1FramingGuardIo::new(inner, max_head_bytes, peer_addr);
         (Self::Observed(Box::new(guard)), signals)
     }
 
@@ -1550,7 +1604,6 @@ mod tests {
         );
         let conflicting_text = std::str::from_utf8(conflicting).expect("utf-8 envelope");
         assert!(conflicting_text.contains("content-type: application/json"));
-        assert!(conflicting_text.contains("x-gateway-error: request_error"));
         assert!(conflicting_text.contains("connection: close"));
 
         let http10_te = envelope_for_hint(PARSE_HINT_HTTP10_TRANSFER_ENCODING);
@@ -1564,6 +1617,23 @@ mod tests {
             envelope_body(malformed),
             JSON_MALFORMED_HTTP_REQUEST.as_bytes()
         );
+
+        // Issue #4543: `X-Gateway-Error` is a closed seven-token client-facing
+        // vocabulary for backend-attempt failures. The parse-layer `400` is
+        // client-caused and carries none of them, exactly like the
+        // handler-layer protocol `400`s built by `build_response`.
+        for envelope in [conflicting, http10_te, malformed] {
+            let head = envelope
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|idx| &envelope[..idx])
+                .expect("envelope must include a head");
+            let head_text = std::str::from_utf8(head).expect("utf-8 head");
+            assert!(
+                !head_text.to_ascii_lowercase().contains("x-gateway-error"),
+                "parse-reject envelope must not carry X-Gateway-Error: {head_text}"
+            );
+        }
     }
 
     /// Minimal duplex used to drive `H1FramingGuardIo` directly: `reads` are
@@ -1621,7 +1691,7 @@ mod tests {
     /// Read the guard once per queued chunk and report what reached the socket.
     fn drive(io_reads: &[&[u8]], preceding_response: Option<&[u8]>) -> Vec<u8> {
         let (mut guard, _signals) =
-            H1FramingGuardIo::new(MockIo::new(io_reads), TEST_MAX_HEAD_BYTES);
+            H1FramingGuardIo::new(MockIo::new(io_reads), TEST_MAX_HEAD_BYTES, None);
         let mut cx = Context::from_waker(std::task::Waker::noop());
 
         if let Some(response) = preceding_response {

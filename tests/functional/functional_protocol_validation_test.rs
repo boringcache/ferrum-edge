@@ -56,6 +56,7 @@
 //! - `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` rejection on H1 and H2
 //! - `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` rejection on H1 and H2
 //! - Request-side hop-by-hop header stripping (backend must not see `Transfer-Encoding`)
+//! - `Expect: 100-continue` is answered by the gateway and never forwarded to the backend
 //! - HTTP/2 request-side hop-by-hop header stripping (backend must not see valid H2 `TE`)
 //! - Response-side hop-by-hop header stripping (client must not see `Proxy-Authenticate`,
 //!   `Keep-Alive`, `Trailer`, etc. from the backend) on H1, H2, and H3
@@ -263,19 +264,41 @@ where
     R: tokio::io::AsyncRead + Unpin,
 {
     // Status line (with timeout so malformed requests that the gateway silently
-    // drops still fail fast instead of hanging)
-    let mut status_line = Vec::new();
-    let _ = tokio::time::timeout(
-        Duration::from_secs(5),
-        reader.read_until(b'\n', &mut status_line),
-    )
-    .await;
-    let status_str = String::from_utf8_lossy(&status_line);
-    let status_code = status_str
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(0);
+    // drops still fail fast instead of hanging). A `1xx` interim response —
+    // hyper's `100 Continue` for `Expect: 100-continue` (issue #4546) — is
+    // consumed with its (empty) header block so callers always observe the
+    // final response.
+    let status_code = loop {
+        let mut status_line = Vec::new();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            reader.read_until(b'\n', &mut status_line),
+        )
+        .await;
+        let status_str = String::from_utf8_lossy(&status_line);
+        let code = status_str
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(0);
+        if !(100..200).contains(&code) {
+            break code;
+        }
+        loop {
+            let mut line = Vec::new();
+            let read_result =
+                tokio::time::timeout(Duration::from_secs(2), reader.read_until(b'\n', &mut line))
+                    .await;
+            let n = match read_result {
+                Ok(Ok(n)) => n,
+                _ => 0,
+            };
+            let line_str = String::from_utf8_lossy(&line);
+            if n == 0 || line_str.trim_end_matches(['\r', '\n']).is_empty() {
+                break;
+            }
+        }
+    };
 
     // Headers
     let mut headers = Vec::new();
@@ -741,7 +764,10 @@ async fn functional_protocol_validation_http10_plus_te_rejected() {
     assert_eq!(resp.status_code, 400, "body={}", resp.body);
     assert_eq!(resp.body, ERROR_BODY);
     assert_eq!(raw_header(&resp, "content-type"), Some("application/json"));
-    assert_eq!(raw_header(&resp, "x-gateway-error"), Some("request_error"));
+    // Issue #4543: the parse-layer 400 carries no `X-Gateway-Error` — that
+    // header is a closed vocabulary for backend-attempt failures, and a
+    // client-caused 400 names itself only in the log field and the 400 count.
+    assert_eq!(raw_header(&resp, "x-gateway-error"), None);
     assert_eq!(raw_header(&resp, "connection"), Some("close"));
 
     h.cleanup();
@@ -927,7 +953,10 @@ async fn functional_protocol_validation_multiple_content_length_conflicting() {
     assert_eq!(resp.status_code, 400, "body={}", resp.body);
     assert_eq!(resp.body, ERROR_BODY);
     assert_eq!(raw_header(&resp, "content-type"), Some("application/json"));
-    assert_eq!(raw_header(&resp, "x-gateway-error"), Some("request_error"));
+    // Issue #4543: the parse-layer 400 carries no `X-Gateway-Error` — that
+    // header is a closed vocabulary for backend-attempt failures, and a
+    // client-caused 400 names itself only in the log field and the 400 count.
+    assert_eq!(raw_header(&resp, "x-gateway-error"), None);
     assert_eq!(raw_header(&resp, "connection"), Some("close"));
 
     h.cleanup();
@@ -991,7 +1020,10 @@ async fn functional_protocol_validation_non_utf8_request_target_rejected() {
     assert_eq!(resp.status_code, 400, "body={}", resp.body);
     assert_eq!(resp.body, ERROR_BODY);
     assert_eq!(raw_header(&resp, "content-type"), Some("application/json"));
-    assert_eq!(raw_header(&resp, "x-gateway-error"), Some("request_error"));
+    // Issue #4543: the parse-layer 400 carries no `X-Gateway-Error` — that
+    // header is a closed vocabulary for backend-attempt failures, and a
+    // client-caused 400 names itself only in the log field and the 400 count.
+    assert_eq!(raw_header(&resp, "x-gateway-error"), None);
     assert_eq!(raw_header(&resp, "connection"), Some("close"));
 
     h.cleanup();
@@ -3120,6 +3152,47 @@ async fn functional_protocol_validation_request_te_stripped_before_backend() {
             "backend MUST NOT see hop-by-hop header '{hop}'; reflected={reflected}"
         );
     }
+
+    h.cleanup();
+}
+
+/// Issue #4546: `Expect: 100-continue` is satisfied by the gateway's own HTTP/1
+/// server — hyper writes the interim `100 Continue` when the request body is
+/// first polled — and the reqwest/hyper *client* has no `Expect` support. The
+/// expectation must therefore never reach the origin: forwarding it would make
+/// an origin `417` (or a pre-body `401`/`413`) cost a full upload the gateway
+/// has already solicited.
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_expect_continue_not_forwarded_to_backend() {
+    let h = Harness::new(false).await;
+
+    let body = "hello-expect";
+    let raw = format!(
+        "POST / HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n\
+         Expect: 100-continue\r\n\
+         Content-Type: text/plain\r\n\
+         Content-Length: {len}\r\n\
+         \r\n\
+         {body}",
+        len = body.len(),
+    );
+    let resp = send_raw_h1(h.proxy_port, raw.as_bytes()).await;
+
+    assert_eq!(
+        resp.status_code, 200,
+        "Expect: 100-continue request must still be proxied; body={}",
+        resp.body
+    );
+
+    // The backend reflects the request headers it saw as JSON.
+    let reflected: serde_json::Value = serde_json::from_str(&resp.body)
+        .unwrap_or_else(|e| panic!("backend body not JSON: {} ({e})", resp.body));
+    assert!(
+        reflected.get("expect").is_none(),
+        "backend MUST NOT see the `Expect` header; reflected={reflected}"
+    );
 
     h.cleanup();
 }

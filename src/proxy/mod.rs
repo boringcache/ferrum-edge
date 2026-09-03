@@ -13666,6 +13666,7 @@ async fn handle_connection(
     let (stream, h1_framing_signals) = h1_framing_guard::H1FramingGuardIo::new(
         stream,
         http1_parser_max_buf_size(state.max_header_size_bytes),
+        Some(remote_addr),
     );
     let io = TokioIo::new(stream);
 
@@ -13721,6 +13722,12 @@ async fn handle_connection(
     let admission = frontend_admission::FrontendAdmission::new();
     let service_admission = Arc::clone(&admission);
     let service_h1_framing_signals = Arc::clone(&h1_framing_signals);
+    // Issue #4543: the parse-layer `400`s are written straight to the socket
+    // from inside `poll_read`, so they never reach `record_request` through the
+    // service. Kept out of the service closure (which moves `state`) so the
+    // count can be drained once after the connection resolves.
+    let post_conn_state = Arc::clone(&state);
+    let post_conn_signals = Arc::clone(&h1_framing_signals);
     let svc = service_fn(move |req: Request<Incoming>| {
         service_admission.mark();
         let state = Arc::clone(&state);
@@ -13829,6 +13836,17 @@ async fn handle_connection(
             }
         }
     };
+
+    // Issue #4543: each HTTP/1 parse-layer reject answered a request hyper never
+    // saw, so nothing on the service path counted it. Drain the connection's
+    // reject count here and record one `400` apiece, which puts a smuggling
+    // probe (a conflicting `Content-Length`) into the gateway's request and
+    // status counters, `/metrics/runtime`, and the admin status map instead of
+    // leaving it with no metric at all.
+    let parse_rejects = post_conn_signals.take_parse_rejects();
+    for _ in 0..parse_rejects {
+        record_request(&post_conn_state, 400);
+    }
 
     if let Err(e) = result {
         let err_string = e.to_string();
@@ -21649,6 +21667,7 @@ async fn handle_tls_connection(
             let (io, signals) = h1_framing_guard::MaybeH1FramingGuardIo::observed(
                 tls_stream,
                 http1_parser_max_buf_size(state.max_header_size_bytes),
+                Some(remote_addr),
             );
             (io, Some(signals))
         };
@@ -21705,6 +21724,11 @@ async fn handle_tls_connection(
     let header_read_timeout_seconds = state.env_config.http_header_read_timeout_seconds;
     let admission = frontend_admission::FrontendAdmission::new();
     let service_admission = Arc::clone(&admission);
+    // Issue #4543: see the plaintext handler. `h1_framing_signals` is moved
+    // into `service_h1_framing_signals` below, so clone the handle (and the
+    // state the service closure also moves) first.
+    let post_conn_state = Arc::clone(&state);
+    let post_conn_signals = h1_framing_signals.clone();
     let service_h1_framing_signals = h1_framing_signals;
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         service_admission.mark();
@@ -21840,6 +21864,19 @@ async fn handle_tls_connection(
         }
     };
     drop(client_trust_guard);
+
+    // Issue #4543: each HTTP/1 parse-layer reject answered a request hyper never
+    // saw, so nothing on the service path counted it. Drain the connection's
+    // reject count here and record one `400` apiece, which puts a smuggling
+    // probe (a conflicting `Content-Length`) into the gateway's request and
+    // status counters, `/metrics/runtime`, and the admin status map instead of
+    // leaving it with no metric at all.
+    if let Some(signals) = post_conn_signals.as_ref() {
+        let parse_rejects = signals.take_parse_rejects();
+        for _ in 0..parse_rejects {
+            record_request(&post_conn_state, 400);
+        }
+    }
 
     if let Err(e) = result {
         let err_string = e.to_string();

@@ -1571,9 +1571,13 @@ fn h1_parse_envelope_bytes_match_check_protocol_headers_messages() {
         std::str::from_utf8(envelope_body(malformed)).expect("json body"),
         r#"{"error":"Malformed HTTP request"}"#
     );
+    // Issue #4543: the parse-reject envelope carries no `X-Gateway-Error` — that
+    // header is a closed seven-token backend-attempt vocabulary, and a
+    // client-caused 400 names none of them (matches the handler-layer 400s).
     assert!(
-        std::str::from_utf8(conflicting)
+        !std::str::from_utf8(conflicting)
             .expect("utf-8 envelope")
-            .contains("x-gateway-error: request_error")
+            .to_ascii_lowercase()
+            .contains("x-gateway-error")
     );
 }
