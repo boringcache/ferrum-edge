@@ -4186,6 +4186,114 @@ impl DatabaseStore {
         result
     }
 
+    /// Reconcile the `proxy_plugins` junction for a proxy-scoped plugin config
+    /// write, inside the caller's transaction (issue #4611).
+    ///
+    /// `scope: "proxy"` + `proxy_id` is the operator's *attachment* intent, but
+    /// the runtime only applies a plugin config the target proxy lists in its
+    /// association array (`docs/plugins.md`). Writing only `plugin_configs`
+    /// therefore committed a config that `GET /proxies/{id}` reported as
+    /// unattached and that the proxy never applied, while the write surface
+    /// answered `201`/`200`. Both sides now move together.
+    ///
+    /// Reconciliation is validity-driven, so it also repairs a scope/`proxy_id`
+    /// move:
+    /// - `proxy` — the only valid association is `proxy_id`; every other
+    ///   association is invalid config (`GatewayConfig::validate` rejects a
+    ///   proxy referencing a config targeted at a different proxy) and is
+    ///   removed.
+    /// - `global` — a global config must not be associated with any proxy, so
+    ///   every association is removed.
+    /// - `proxy_group` — associations are operator-managed via `proxy.plugins`
+    ///   and any proxy may reference the config, so existing rows are left
+    ///   alone. Stripping them would make the config an orphan that
+    ///   [`Self::cleanup_orphaned_proxy_group_plugins`] deletes on the next
+    ///   proxy write.
+    ///
+    /// Returns the proxies whose association set actually changed, so the
+    /// caller can bump `updated_at` and record their `config_changes` rows.
+    async fn sync_proxy_scoped_plugin_association_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        plugin_config_id: &str,
+        scope: &PluginScope,
+        proxy_id: Option<&str>,
+    ) -> Result<Vec<String>, anyhow::Error> {
+        if *scope == PluginScope::ProxyGroup {
+            return Ok(Vec::new());
+        }
+        let desired = match scope {
+            PluginScope::Proxy => proxy_id,
+            _ => None,
+        };
+
+        // Every association row must decode before destructive mutation: a
+        // silently dropped row would leave an invalid association behind while
+        // the write reported success (same contract as `delete_plugin_config`).
+        let existing_rows: Vec<AnyRow> =
+            sqlx::query(&self.q("SELECT proxy_id FROM proxy_plugins WHERE plugin_config_id = ?"))
+                .bind(plugin_config_id)
+                .fetch_all(&mut **tx)
+                .await?;
+        let attached: Vec<String> = existing_rows
+            .iter()
+            .map(|row| {
+                row.try_get::<String, _>("proxy_id").map_err(|e| {
+                    anyhow::Error::from(e).context(
+                        "operation=sync_proxy_scoped_plugin_association resource=proxy_plugins column=proxy_id: failed to decode association row required for proxy attachment",
+                    )
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
+        let mut touched: Vec<String> = Vec::new();
+        let detach_sql =
+            self.q("DELETE FROM proxy_plugins WHERE proxy_id = ? AND plugin_config_id = ?");
+        for current in &attached {
+            if desired == Some(current.as_str()) {
+                continue;
+            }
+            sqlx::query(&detach_sql)
+                .bind(current)
+                .bind(plugin_config_id)
+                .execute(&mut **tx)
+                .await?;
+            touched.push(current.clone());
+        }
+
+        if let Some(desired) = desired
+            && !attached.iter().any(|current| current.as_str() == desired)
+        {
+            sqlx::query(
+                &self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)"),
+            )
+            .bind(desired)
+            .bind(plugin_config_id)
+            .execute(&mut **tx)
+            .await?;
+            touched.push(desired.to_string());
+        }
+
+        if !touched.is_empty() {
+            // Advance `updated_at` so the incremental poller / CP broadcast
+            // publishes the proxy whose plugin set just changed.
+            let touch_ts = Utc::now().to_rfc3339();
+            let touch_sql =
+                self.q("UPDATE proxies SET updated_at = ? WHERE id = ? AND namespace = ?");
+            for proxy in &touched {
+                sqlx::query(&touch_sql)
+                    .bind(&touch_ts)
+                    .bind(proxy)
+                    .bind(namespace)
+                    .execute(&mut **tx)
+                    .await?;
+            }
+        }
+
+        Ok(touched)
+    }
+
     pub async fn create_plugin_config(&self, pc: &PluginConfig) -> Result<(), anyhow::Error> {
         let start = Instant::now();
         let config_json = serde_json::to_string(&pc.config)?;
@@ -4215,8 +4323,26 @@ impl DatabaseStore {
         .await?;
         self.record_config_change_tx(&mut tx, &pc.namespace, "plugin_config", &pc.id, "upsert")
             .await?;
+        // Attach/re-home/detach the proxy association in the same transaction
+        // so a committed proxy-scoped write is actually applied (issue #4611).
+        let touched_proxies = self
+            .sync_proxy_scoped_plugin_association_tx(
+                &mut tx,
+                &pc.namespace,
+                &pc.id,
+                &pc.scope,
+                pc.proxy_id.as_deref(),
+            )
+            .await?;
+        for proxy_id in &touched_proxies {
+            self.record_config_change_tx(&mut tx, &pc.namespace, "proxy", proxy_id, "upsert")
+                .await?;
+        }
         if pc.scope == PluginScope::Proxy
             && let Some(proxy_id) = pc.proxy_id.as_deref()
+            && !touched_proxies
+                .iter()
+                .any(|touched| touched.as_str() == proxy_id)
         {
             self.record_config_change_tx(&mut tx, &pc.namespace, "proxy", proxy_id, "upsert")
                 .await?;
@@ -4279,8 +4405,26 @@ impl DatabaseStore {
         .await?;
         self.record_config_change_tx(&mut tx, &pc.namespace, "plugin_config", &pc.id, "upsert")
             .await?;
+        // Attach/re-home/detach the proxy association in the same transaction
+        // so a committed proxy-scoped write is actually applied (issue #4611).
+        let touched_proxies = self
+            .sync_proxy_scoped_plugin_association_tx(
+                &mut tx,
+                &pc.namespace,
+                &pc.id,
+                &pc.scope,
+                pc.proxy_id.as_deref(),
+            )
+            .await?;
+        for proxy_id in &touched_proxies {
+            self.record_config_change_tx(&mut tx, &pc.namespace, "proxy", proxy_id, "upsert")
+                .await?;
+        }
         if pc.scope == PluginScope::Proxy
             && let Some(proxy_id) = pc.proxy_id.as_deref()
+            && !touched_proxies
+                .iter()
+                .any(|touched| touched.as_str() == proxy_id)
         {
             self.record_config_change_tx(&mut tx, &pc.namespace, "proxy", proxy_id, "upsert")
                 .await?;
