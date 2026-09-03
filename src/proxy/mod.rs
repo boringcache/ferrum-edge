@@ -6454,15 +6454,9 @@ pub struct ProxyState {
     /// [`stream_listener::StreamListenerManager::attach_per_ip_stream_admission`]
     /// so one map bounds the whole gateway rather than one per listener.
     pub per_ip_tcp_connections: Option<Arc<dashmap::DashMap<String, AtomicU64>>>,
-    /// Maximum concurrent TCP stream-proxy connections per effective source IP.
-    /// 0 = unlimited.
-    pub tcp_max_connections_per_ip: u64,
     /// Per-effective-source-IP concurrent UDP/DTLS stream-proxy session
     /// counters. `None` when `FERRUM_UDP_MAX_SESSIONS_PER_IP=0` (unlimited).
     pub per_ip_udp_sessions: Option<Arc<dashmap::DashMap<String, AtomicU64>>>,
-    /// Maximum concurrent UDP/DTLS stream-proxy sessions per effective source
-    /// IP. 0 = unlimited.
-    pub udp_max_sessions_per_ip: u64,
     /// Manages TCP/UDP stream proxy listeners (dedicated port per proxy).
     pub stream_listener_manager: Arc<stream_listener::StreamListenerManager>,
     /// Monotonic counter bumped once per successful config publication.
@@ -9741,9 +9735,7 @@ impl ProxyState {
             },
             websocket_max_connections_per_ip,
             per_ip_tcp_connections,
-            tcp_max_connections_per_ip,
             per_ip_udp_sessions,
-            udp_max_sessions_per_ip,
             stream_listener_manager,
             config_revision: ConfigRevisionNotifier::new(),
             started_at: Instant::now(),
