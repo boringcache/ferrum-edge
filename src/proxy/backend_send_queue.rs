@@ -338,6 +338,11 @@ pub(crate) fn publish_reqwest_backend_socket(fd: std::os::fd::RawFd) {
 /// `_test_support::post_eos_drain_diagnostics`, so an in-process acceptance
 /// test that misses the drain bound can say WHICH link never happened instead
 /// of only reporting the elapsed time.
+///
+/// `#[allow(dead_code)]`: the snapshot side is reached only through
+/// `_test_support`, and the binary target recompiles this module without the
+/// test crates that call it.
+#[allow(dead_code)]
 pub(crate) mod diagnostics {
     #[cfg(debug_assertions)]
     use std::sync::atomic::{AtomicU64, Ordering};

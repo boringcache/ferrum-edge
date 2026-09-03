@@ -130,6 +130,12 @@ const PUMP_CANCELLED: u8 = 3;
 const PUMP_AUTHORIZATION_EXPIRED: u8 = 4;
 const PUMP_CONSUMER_GONE: u8 = 5;
 const PUMP_WRITE_TIMEOUT: u8 = 6;
+/// Transient marker, never an outcome: the transport released the body only
+/// after taking every declared byte (issue #4411). Set by
+/// [`UploadPumpSource`]'s `Drop` in place of `PUMP_CONSUMER_GONE`, read by the
+/// pump when the bridge closes, and overwritten by the pump's own terminal.
+/// `code_outcome` maps it to `None` like any unknown code.
+const PUMP_CONSUMER_DONE: u8 = 7;
 
 /// Terminal state of one gateway-owned upload pump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,6 +311,16 @@ impl Drop for UploadPumpSource {
         // abort, exactly as before.
         if self.ended || self.initial_hint.exact() == Some(self.delivered) {
             self._abort.suppressed = true;
+            // Tell the pump WHY its bridge is about to close, so a closed
+            // channel reads as completion rather than as a consumer that went
+            // away. `RUNNING` only: a pump that already settled keeps its own
+            // outcome, and the pump overwrites this marker with its terminal.
+            let _ = self.terminal.compare_exchange(
+                PUMP_RUNNING,
+                PUMP_CONSUMER_DONE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
         }
     }
 }
@@ -835,18 +851,6 @@ where
     let write_idle_dur = Duration::from_millis(write_timeout_ms);
     let mut write_idle = write_configured.then(|| Box::pin(tokio::time::sleep(write_idle_dur)));
     let outcome = 'pump: loop {
-        // A client body that already reports end of stream — every declared
-        // byte has crossed the bridge — is complete without another poll, and
-        // without another permit. Recognising it here matters for a
-        // length-delimited HTTP/1 backend transport: hyper drops the body the
-        // moment it has written the last declared byte, so a pump that first
-        // reserved bridge capacity would observe a closed channel and report
-        // `ConsumerGone` for an upload that was in fact delivered whole (issue
-        // #4411). Unknown lengths and pending trailers stay on the polling path
-        // below, where the body's own `None` is the only end of stream.
-        if http_body::Body::is_end_stream(&body) {
-            break 'pump UploadPumpOutcome::Completed;
-        }
         // Reserve capacity BEFORE reading the client, so a transport that
         // stops draining stops the read rather than filling a buffer.
         if write_armed
@@ -873,6 +877,16 @@ where
             }
             reserved = sender.reserve() => match reserved {
                 Ok(permit) => permit,
+                // A closed bridge is the consumer going away — unless the
+                // consumer released the body only after taking every declared
+                // byte (issue #4411). hyper's HTTP/1 length-delimited encoder
+                // does exactly that, without polling for the trailing end of
+                // stream, so the client body's own `None` is never observed
+                // here; the delivered upload is complete all the same, and the
+                // post-EOS drain judgment below still runs for it.
+                Err(_) if terminal.load(Ordering::Acquire) == PUMP_CONSUMER_DONE => {
+                    break 'pump UploadPumpOutcome::Completed;
+                }
                 Err(_) => break 'pump UploadPumpOutcome::ConsumerGone,
             },
         };
