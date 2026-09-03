@@ -1943,3 +1943,101 @@ plugin_configs: []
     backend_b.abort();
     backend_c.abort();
 }
+
+/// `FERRUM_UDP_MAX_SESSIONS_PER_IP` must bound how many concurrent UDP sessions
+/// one source IP can hold, independently of the listener-wide
+/// `FERRUM_UDP_MAX_SESSIONS` budget (issue #4544).
+///
+/// A UDP session is keyed on the client's full tuple, so before this bound
+/// existed a single client could open a distinct session per source port and
+/// fill the whole session table alone. Each session is echo-verified before the
+/// next source port is used, so the admitted session's per-source slot is
+/// provably held when the next reservation runs.
+#[ignore]
+#[tokio::test]
+async fn test_udp_proxy_per_source_ip_session_limit() {
+    let backend_port = 19844u16;
+    let proxy_port = 19845u16;
+    let gateway_http_port = 18231u16;
+
+    let echo_server = start_udp_echo_server(backend_port).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    write_config(
+        &config_path,
+        &format!(
+            r#"
+version: "1"
+proxies:
+  - id: "udp-per-ip"
+    listen_port: {proxy_port}
+    backend_scheme: udp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    udp_idle_timeout_seconds: 120
+
+consumers: []
+plugin_configs: []
+"#
+        ),
+    );
+
+    let mut gateway = start_gateway_with_extra_env(
+        config_path.to_str().unwrap(),
+        gateway_http_port,
+        &[
+            ("FERRUM_UDP_MAX_SESSIONS_PER_IP", "4"),
+            ("FERRUM_POOL_WARMUP_ENABLED", "false"),
+        ],
+    )
+    .expect("Failed to start");
+    sleep(Duration::from_secs(3)).await;
+
+    const ATTEMPTS: usize = 8;
+    const LIMIT: usize = 4;
+    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    // Held open for the whole loop: a released session would return its
+    // per-source slot and let a later attempt in.
+    let mut established = Vec::new();
+    let mut refused = 0usize;
+
+    for i in 0..ATTEMPTS {
+        // A distinct ephemeral source port from the SAME source IP is a
+        // distinct UDP session but the same per-source budget.
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.connect(&proxy_addr).await.unwrap();
+        let payload = format!("session-{i}");
+        client.send(payload.as_bytes()).await.expect("send payload");
+
+        let mut buf = vec![0u8; 1024];
+        match tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf)).await {
+            Ok(Ok(n)) => {
+                assert_eq!(
+                    &buf[..n],
+                    payload.as_bytes(),
+                    "session {i} echoed the wrong payload"
+                );
+                established.push(client);
+            }
+            // Over-cap datagrams are dropped at slot reservation: no session,
+            // no backend socket, so no reply ever arrives.
+            _ => refused += 1,
+        }
+    }
+
+    assert_eq!(
+        established.len(),
+        LIMIT,
+        "exactly FERRUM_UDP_MAX_SESSIONS_PER_IP sessions from one source must be established"
+    );
+    assert_eq!(
+        refused,
+        ATTEMPTS - LIMIT,
+        "every session past the per-source cap must be refused at slot reservation"
+    );
+
+    drop(established);
+    shutdown_gateway(&mut gateway);
+    echo_server.abort();
+}

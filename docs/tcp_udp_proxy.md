@@ -843,6 +843,30 @@ alerts and non-`close_notify` warning alerts are classified by
 `classify_ktls_control_record`, because rustls exposes no API for emitting an
 arbitrary alert mid-session. The live half of that contract is case 6 above.
 
+## Per-source admission
+
+Both stream listeners bound how much of a listener one source IP may hold, independently of the listener-wide budgets (`FERRUM_UDP_MAX_SESSIONS`, the overload thresholds). Without this bound a single many-source-port or spoofed-source client fills a listener's whole budget alone and takes the listener down for every other client.
+
+| Variable | Default | Enforced |
+|----------|---------|----------|
+| `FERRUM_TCP_MAX_CONNECTIONS_PER_IP` | `256` | In the TCP accept path, **before** the frontend TLS handshake |
+| `FERRUM_UDP_MAX_SESSIONS_PER_IP` | `1024` | At UDP/DTLS session-slot reservation |
+
+`0` means unlimited for either variable.
+
+**TCP ordering.** The bound is applied as soon as the connection's effective client IP is known and **before** `handle_tcp_connection` runs, so a refused connection reaches no frontend TLS handshake, no `on_stream_connect` plugin chain, and no backend dial — the socket is closed at accept. This is the gap the opt-in `tcp_connection_throttle` plugin cannot close: its `on_stream_connect` hook runs *after* the handshake on `tcp_tls` proxies, so it can never bound concurrent pre-handshake state from one source. The plugin remains available and unchanged for policy-level throttling on top of this bound.
+
+**UDP/DTLS ordering.** The per-source bound shares one admission point and one release path with the listener-wide `FERRUM_UDP_MAX_SESSIONS` bound, so neither slot can be taken without the other and neither can leak. The session's slot is released exactly once with its other per-session guards on idle expiry, authorization-lifetime expiry, backend teardown, and listener shutdown.
+
+**Effective source.** Both bounds key on the *effective* client IP, never the raw socket peer alone:
+
+- TCP: the forwarded source address when an inbound PROXY-protocol header was accepted from a peer in `FERRUM_TRUSTED_PROXIES`, otherwise the canonicalized socket peer.
+- UDP/DTLS: the authenticated forwarded client when a datagram client-address envelope was accepted, otherwise the socket peer.
+
+A trusted L4 load balancer in front of the gateway is therefore not collapsed into a single source. IPv4-mapped IPv6 peers are folded to one canonical representation, so a dual-stack listener cannot be used to double a source's budget.
+
+**Observability.** Each listener keeps a fixed-cardinality rejection counter and emits a rate-limited warning (first refusal, then every 100th) naming the proxy, the listen port, and the limit. Client addresses are deliberately never logged or used as a metric label on these paths.
+
 ## UDP Session Management
 
 UDP is connectionless, so the gateway tracks sessions by client source address (`SocketAddr`). Each unique client gets a dedicated backend socket for reply routing.
@@ -1036,7 +1060,9 @@ Notes:
 | `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` | `10` | Seconds allowed for frontend TCP+TLS and UDP+DTLS handshakes, and for the opaque-TLS SNI ClientHello peek. `0` disables; use only when an upstream load balancer enforces an equivalent pre-handshake deadline |
 | `FERRUM_STREAM_SNI_PLAINTEXT_FALLBACK` | `false` | Whether an [opaque-TLS SNI listener](#opaque-tls-sni-routing) may send provably non-TLS opening bytes to its declared catch-all route instead of closing the connection. Enable only for a port deliberately shared with direct plaintext TCP clients. Never applies to a ClientHello that timed out, exceeded the 16 KiB peek bound, ended early, was malformed, or named an unrepresentable host — those always fail closed |
 | `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` | `300` | Default TCP idle timeout (5 min). Per-proxy `tcp_idle_timeout_seconds` overrides. 0 = disabled |
+| `FERRUM_TCP_MAX_CONNECTIONS_PER_IP` | `256` | Maximum concurrent TCP stream-proxy connections per effective source IP; `0` = unlimited. See [Per-source admission](#per-source-admission) |
 | `FERRUM_UDP_MAX_SESSIONS` | `10000` | Maximum concurrent UDP sessions per proxy |
+| `FERRUM_UDP_MAX_SESSIONS_PER_IP` | `1024` | Maximum concurrent UDP/DTLS stream-proxy sessions per effective source IP; `0` = unlimited. See [Per-source admission](#per-source-admission) |
 | `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | `10` | Interval between UDP session cleanup sweeps |
 | `FERRUM_ADAPTIVE_BATCH_LIMIT_DEFAULT` | `6000` | Datagrams drained per UDP recv wakeup when adaptive batching is **disabled** (`FERRUM_ADAPTIVE_BATCH_LIMIT_ENABLED=false`), and the initial value before a proxy's first traffic sample. When adaptation is enabled (default) the per-proxy limit then moves across fixed internal tiers (64 / 256 / 2000 / 6000) by observed traffic and is **not** capped by this value. Raising it increases the disabled/initial limit |
 

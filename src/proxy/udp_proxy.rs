@@ -183,6 +183,47 @@ pub struct UdpProxyMetrics {
     /// Bounds the per-listener rate of the metadata-drop warning so a hostile
     /// flood cannot turn one dropped datagram into one log record.
     client_address_metadata_warn: crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+    /// Gateway-wide per-effective-source-IP session admission
+    /// (`FERRUM_UDP_MAX_SESSIONS_PER_IP`, issue #4544).
+    ///
+    /// A HANDLE to the ONE map `ProxyState` owns: a per-listener copy would let
+    /// one source hold `max` sessions on every listener. `Default` is the
+    /// disabled dimension, which is what standalone/test constructors get.
+    pub per_ip_admission: crate::proxy::PerIpStreamAdmission,
+    /// Sessions refused at slot reservation because the effective source IP
+    /// already held `FERRUM_UDP_MAX_SESSIONS_PER_IP` sessions. Fixed
+    /// cardinality: one listener-local counter, never labelled by client
+    /// address.
+    pub per_ip_rejections: AtomicU64,
+}
+
+impl UdpProxyMetrics {
+    /// Build listener metrics carrying the gateway-wide per-source-IP session
+    /// admission handle. Observability counters remain listener-local.
+    pub fn with_per_ip_admission(per_ip_admission: crate::proxy::PerIpStreamAdmission) -> Self {
+        Self {
+            per_ip_admission,
+            ..Default::default()
+        }
+    }
+}
+
+/// Emit a rate-limited warning for a session refused by the per-source-IP
+/// admission bound (first refusal, then every 100th).
+///
+/// Deliberately omits the client address: this is a hostile-source path, so the
+/// log record must stay fixed-cardinality just like the counter it reads.
+fn record_udp_per_ip_rejection(metrics: &UdpProxyMetrics, proxy_id: &str, listen_port: u16) {
+    let n = metrics.per_ip_rejections.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(100) {
+        warn!(
+            proxy_id = %proxy_id,
+            listen_port,
+            limit = metrics.per_ip_admission.max,
+            rejections = n,
+            "UDP/DTLS session refused: per-source-IP session limit reached"
+        );
+    }
 }
 
 /// A UDP session tracking a single client's connection to a backend.
@@ -326,6 +367,17 @@ struct UdpSession {
     /// caches cannot pin the gauge past session expiry, and so there is exactly
     /// one eager release path rather than two.
     lb_guard: std::sync::Mutex<Option<LoadBalancerConnectionGuard>>,
+    /// RAII guard holding this session's per-effective-source-IP slot
+    /// (`FERRUM_UDP_MAX_SESSIONS_PER_IP`, issue #4544). `None` when the
+    /// dimension is disabled.
+    ///
+    /// Released through the SAME take-before-final-removal path as
+    /// [`Self::overload_guard`] and [`Self::lb_guard`]
+    /// ([`Self::release_session_guards`]), so the counter cannot leak on idle
+    /// expiry, authorization-lifetime expiry, or listener shutdown, and a
+    /// listener-local session cache cannot pin a source's budget past session
+    /// expiry.
+    per_ip_guard: std::sync::Mutex<Option<crate::proxy::PerIpConnectionGuard>>,
     /// Bounded client→backend ingress channel for sessions that run
     /// `on_udp_datagram` hooks. The shared listener recv loop enqueues here
     /// (never awaits hooks) so a slow Redis/I/O-bound plugin for one client
@@ -562,11 +614,11 @@ impl UdpSession {
         Some(termination)
     }
 
-    /// Eagerly release both per-session RAII guards — the global overload
-    /// connection count and the load balancer's active-connection gauge for the
-    /// selected target. One function so the two can never diverge; both are
-    /// idempotent, and both are also released by `Drop` if a teardown path
-    /// never reaches here.
+    /// Eagerly release every per-session RAII guard — the global overload
+    /// connection count, the load balancer's active-connection gauge for the
+    /// selected target, and the per-source-IP session slot. One function so
+    /// they can never diverge; all are idempotent, and all are also released by
+    /// `Drop` if a teardown path never reaches here.
     fn release_session_guards(&self) {
         let mut guard = self
             .overload_guard
@@ -578,6 +630,11 @@ impl UdpSession {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         lb_guard.take();
+        let mut per_ip_guard = self
+            .per_ip_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        per_ip_guard.take();
     }
 
     /// Drop the hook-ingress sender so an idle per-session worker wakes from
@@ -1491,11 +1548,23 @@ fn is_udp_dtls_idle_timeout(error: &anyhow::Error) -> bool {
 struct UdpSessionSlotReservation {
     metrics: Arc<UdpProxyMetrics>,
     active: bool,
+    /// Per-effective-source-IP slot taken by the SAME admission call that took
+    /// the listener-wide slot (issue #4544). `None` when the dimension is
+    /// disabled. Handed to the created session through
+    /// [`Self::take_per_ip_guard`] so the counter follows the session's
+    /// exactly-once release discipline; if the session is never created it
+    /// drops here with the reservation.
+    per_ip: Option<crate::proxy::PerIpConnectionGuard>,
 }
 
 impl UdpSessionSlotReservation {
     fn disarm(&mut self) {
         self.active = false;
+    }
+
+    /// Transfer the per-source slot to the session that is about to be built.
+    fn take_per_ip_guard(&mut self) -> Option<crate::proxy::PerIpConnectionGuard> {
+        self.per_ip.take()
     }
 }
 
@@ -1507,9 +1576,21 @@ impl Drop for UdpSessionSlotReservation {
     }
 }
 
+/// Reserve one session slot against BOTH the listener-wide
+/// `FERRUM_UDP_MAX_SESSIONS` bound and the per-effective-source-IP
+/// `FERRUM_UDP_MAX_SESSIONS_PER_IP` bound (issue #4544).
+///
+/// One admission point and one release path for the two dimensions, so neither
+/// can be taken without the other: the listener slot is claimed first, and a
+/// per-source refusal releases it before returning. `client_ip` is the
+/// EFFECTIVE source — the authenticated forwarded client when a datagram
+/// client-address envelope was accepted, the socket peer otherwise.
 fn reserve_udp_session_slot(
     metrics: &Arc<UdpProxyMetrics>,
     max_sessions: usize,
+    client_ip: &str,
+    proxy_id: &str,
+    listen_port: u16,
 ) -> Result<UdpSessionSlotReservation, anyhow::Error> {
     let prev = metrics.active_sessions.fetch_add(1, Ordering::Relaxed);
     if prev >= max_sessions as u64 {
@@ -1519,11 +1600,24 @@ fn reserve_udp_session_slot(
             max_sessions
         ));
     }
-
-    Ok(UdpSessionSlotReservation {
+    let mut reservation = UdpSessionSlotReservation {
         metrics: Arc::clone(metrics),
         active: true,
-    })
+        per_ip: None,
+    };
+    match metrics.per_ip_admission.try_acquire(client_ip) {
+        Ok(guard) => reservation.per_ip = guard,
+        Err(crate::proxy::PerIpLimitExceeded) => {
+            record_udp_per_ip_rejection(metrics, proxy_id, listen_port);
+            // `reservation` releases the listener-wide slot on drop.
+            return Err(anyhow::anyhow!(
+                "UDP per-source session limit reached ({}), dropping datagram",
+                metrics.per_ip_admission.max
+            ));
+        }
+    }
+
+    Ok(reservation)
 }
 
 fn udp_session_shard_amount(override_value: usize) -> usize {
@@ -4349,7 +4443,20 @@ async fn process_new_session_datagram(
         ));
     }
 
-    let mut reservation = reserve_udp_session_slot(metrics, max_sessions)?;
+    // One admission point for BOTH the listener-wide `FERRUM_UDP_MAX_SESSIONS`
+    // bound and the per-effective-source-IP `FERRUM_UDP_MAX_SESSIONS_PER_IP`
+    // bound (issue #4544). `identity.resolved()` is the authenticated forwarded
+    // client when a datagram client-address envelope was accepted upstream of
+    // here, and the socket peer otherwise — no envelope is re-parsed.
+    let admission_client_ip = udp_session_client_ip(identity.resolved());
+    let mut reservation = reserve_udp_session_slot(
+        metrics,
+        max_sessions,
+        &admission_client_ip,
+        view.proxy.id.as_str(),
+        listen_port,
+    )?;
+    let per_ip_guard = reservation.take_per_ip_guard();
 
     let session = create_session(
         &epoch,
@@ -4382,6 +4489,7 @@ async fn process_new_session_datagram(
         &auth_latch,
         &first_datagram_metadata,
         progress,
+        per_ip_guard,
     )
     .await?;
     reservation.disarm();
@@ -4984,22 +5092,44 @@ async fn start_dtls_frontend_listener(
                     continue;
                 }
 
-                // Atomically reserve a session slot. Epoch lookup and the full
-                // `on_stream_connect` admission chain run inside the per-client
-                // task below (TCP accept-loop isolation parity) so a slow or
-                // hung stream-connect plugin cannot stall `server.accept()`.
-                let prev = metrics.active_sessions.fetch_add(1, Ordering::Relaxed);
-                if prev >= max_sessions as u64 {
-                    metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
-                    warn!(
-                        proxy_id = %proxy_id,
-                        client = %udp_client_log_addr(client_addr),
-                        "DTLS session limit reached ({}), rejecting connection",
-                        max_sessions
-                    );
-                    client_conn.close().await;
-                    continue;
-                }
+                // Atomically reserve a session slot against BOTH the
+                // listener-wide `FERRUM_UDP_MAX_SESSIONS` bound and the
+                // per-effective-source-IP `FERRUM_UDP_MAX_SESSIONS_PER_IP`
+                // bound (issue #4544) — the same admission point plain UDP
+                // uses. Epoch lookup and the full `on_stream_connect` admission
+                // chain run inside the per-client task below (TCP accept-loop
+                // isolation parity) so a slow or hung stream-connect plugin
+                // cannot stall `server.accept()`.
+                //
+                // The reservation is MOVED into that task and released by its
+                // `Drop` on every exit path, so no exit needs its own
+                // decrement. `forwarded_client_addr` is the authenticated
+                // forwarded client the DTLS driver already accepted; the socket
+                // peer otherwise. No envelope is re-parsed here.
+                let admission_identity = DatagramClientIdentity {
+                    socket_peer: client_addr,
+                    forwarded: client_conn.forwarded_client_addr,
+                };
+                let admission_client_ip =
+                    udp_session_client_ip(admission_identity.resolved());
+                let reservation = match reserve_udp_session_slot(
+                    &metrics,
+                    max_sessions,
+                    &admission_client_ip,
+                    &proxy_id,
+                    port,
+                ) {
+                    Ok(reservation) => reservation,
+                    Err(e) => {
+                        warn!(
+                            proxy_id = %proxy_id,
+                            "Rejecting DTLS connection: {}",
+                            e
+                        );
+                        client_conn.close().await;
+                        continue;
+                    }
+                };
 
                 // Spawn per-client handler. Epoch lookup + stream-connect
                 // admission run inside the task (main's accept-loop isolation);
@@ -5024,11 +5154,14 @@ async fn start_dtls_frontend_listener(
                 let connected_mono = Instant::now();
                 let connected_at = chrono::Utc::now();
                 tokio::spawn(async move {
+                    // Owns the listener-wide session slot AND the per-source-IP
+                    // slot for the whole handler; `Drop` releases both on every
+                    // exit path below (issue #4544).
+                    let _session_slot = reservation;
                     let epoch = handler_request_epoch.load();
                     let Some(proxy) = epoch
                         .proxy_by_namespaced_id(&handler_proxy_namespace, &handler_proxy_id)
                     else {
-                        handler_metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
                         client_conn.close().await;
                         warn!(
                             namespace = %handler_proxy_namespace,
@@ -5168,9 +5301,6 @@ async fn start_dtls_frontend_listener(
                                 "DTLS connection rejected by plugin"
                             );
                             client_conn.close().await;
-                            handler_metrics
-                                .active_sessions
-                                .fetch_sub(1, Ordering::Relaxed);
                             return;
                         }
                         DtlsStreamConnectOutcome::TrustWithdrawn => {
@@ -5190,9 +5320,6 @@ async fn start_dtls_frontend_listener(
                                 "Refusing accepted DTLS session: frontend client-certificate trust was withdrawn"
                             );
                             client_conn.close().await;
-                            handler_metrics
-                                .active_sessions
-                                .fetch_sub(1, Ordering::Relaxed);
                             return;
                         }
                     }
@@ -5373,10 +5500,6 @@ async fn start_dtls_frontend_listener(
                             }
                         }
                     }
-
-                    handler_metrics
-                        .active_sessions
-                        .fetch_sub(1, Ordering::Relaxed);
                 });
             }
             join_result = &mut server_task => {
@@ -7542,6 +7665,10 @@ async fn create_session(
     auth_latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
     setup_metadata: &std::sync::Mutex<std::collections::HashMap<String, String>>,
     progress: &mut UdpSetupProgress,
+    // Per-effective-source-IP slot already taken by `reserve_udp_session_slot`
+    // (issue #4544), transferred onto the session so it is released exactly
+    // once through `release_session_guards`.
+    per_ip_guard: Option<crate::proxy::PerIpConnectionGuard>,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
     let UdpSessionEpochView {
         proxy,
@@ -7928,6 +8055,7 @@ async fn create_session(
             overload,
         ))),
         lb_guard: std::sync::Mutex::new(Some(lb_guard)),
+        per_ip_guard: std::sync::Mutex::new(per_ip_guard),
         hook_ingress_tx: std::sync::Mutex::new(hook_ingress_tx),
         hook_ingress_queued_bytes,
         hook_ingress_stop_notify: Arc::new(tokio::sync::Notify::new()),
@@ -9346,6 +9474,7 @@ impl UdpAuthorizationSessionProbe {
                 &overload,
             ))),
             lb_guard: std::sync::Mutex::new(None),
+            per_ip_guard: std::sync::Mutex::new(None),
             hook_ingress_tx: std::sync::Mutex::new(hook_ingress_tx),
             hook_ingress_queued_bytes: Arc::new(AtomicUsize::new(0)),
             hook_ingress_stop_notify: Arc::new(tokio::sync::Notify::new()),
@@ -9653,6 +9782,7 @@ mod tests {
             // stays empty for unit tests that exercise summary emission only.
             overload_guard: std::sync::Mutex::new(None),
             lb_guard: std::sync::Mutex::new(None),
+            per_ip_guard: std::sync::Mutex::new(None),
             hook_ingress_tx: std::sync::Mutex::new(None),
             hook_ingress_queued_bytes: Arc::new(AtomicUsize::new(0)),
             hook_ingress_stop_notify: Arc::new(tokio::sync::Notify::new()),
@@ -10875,7 +11005,7 @@ backend_tls_verify_server_cert: false
 
         // At the cap: a new source must be reported as over-capacity so the recv
         // loop drops it before creating a pending gate or running policy.
-        let reservation = reserve_udp_session_slot(&metrics, 1).unwrap();
+        let reservation = reserve_udp_session_slot(&metrics, 1, "198.51.100.1", "p", 9000).unwrap();
         assert_eq!(metrics.active_sessions.load(Ordering::Relaxed), 1);
         assert!(
             super::udp_active_session_cap_reached(&metrics, 1),
@@ -10901,7 +11031,8 @@ backend_tls_verify_server_cert: false
         let metrics = Arc::new(super::UdpProxyMetrics::default());
 
         {
-            let _reservation = reserve_udp_session_slot(&metrics, 1).unwrap();
+            let _reservation =
+                reserve_udp_session_slot(&metrics, 1, "198.51.100.1", "p", 9000).unwrap();
             assert_eq!(metrics.active_sessions.load(Ordering::Relaxed), 1);
         }
 
@@ -10915,7 +11046,8 @@ backend_tls_verify_server_cert: false
     #[test]
     fn udp_session_slot_reservation_disarm_transfers_slot_to_session() {
         let metrics = Arc::new(super::UdpProxyMetrics::default());
-        let mut reservation = reserve_udp_session_slot(&metrics, 1).unwrap();
+        let mut reservation =
+            reserve_udp_session_slot(&metrics, 1, "198.51.100.1", "p", 9000).unwrap();
         reservation.disarm();
         drop(reservation);
 
@@ -10978,6 +11110,7 @@ backend_tls_verify_server_cert: false
                 state,
             ))),
             lb_guard: std::sync::Mutex::new(None),
+            per_ip_guard: std::sync::Mutex::new(None),
             hook_ingress_tx: std::sync::Mutex::new(None),
             hook_ingress_queued_bytes: Arc::new(AtomicUsize::new(0)),
             hook_ingress_stop_notify: Arc::new(tokio::sync::Notify::new()),

@@ -1591,3 +1591,110 @@ plugin_configs: []
     backend_b.abort();
     backend_c.abort();
 }
+
+/// `FERRUM_TCP_MAX_CONNECTIONS_PER_IP` must bound how many concurrent TCP
+/// stream-proxy connections one source IP can hold, and must do so at accept —
+/// before the frontend handshake, the `on_stream_connect` chain, and the
+/// backend dial (issue #4544).
+///
+/// Before this bound existed the only stream-listener limits were global, so a
+/// single client could occupy a listener's whole budget and take it down for
+/// every other source. Each connection is echo-verified before the next is
+/// opened, so the admitted connection's guard is provably armed before the next
+/// acceptance decision runs.
+#[ignore]
+#[tokio::test]
+async fn test_tcp_proxy_per_source_ip_connection_limit() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = listener.local_addr().unwrap().port();
+    let backend = start_tcp_echo_server_on(listener).await;
+
+    let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry_extra_env(
+        |proxy_port| {
+            format!(
+                r#"
+version: "1"
+proxies:
+  - id: "tcp-per-ip"
+    listen_port: {proxy_port}
+    backend_scheme: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+
+consumers: []
+plugin_configs: []
+"#
+            )
+        },
+        None,
+        None,
+        &[
+            ("FERRUM_TCP_MAX_CONNECTIONS_PER_IP", "4"),
+            // A warmup dial is a backend connection, not a frontend one, but
+            // keep it off so nothing races the accept-path assertions.
+            ("FERRUM_POOL_WARMUP_ENABLED", "false"),
+        ],
+    )
+    .await;
+
+    /// Open one connection from `source_ip` and report whether the gateway
+    /// relayed for it. A refused connection is closed at accept, so the echo
+    /// round-trip fails (EOF or write error) rather than returning bytes.
+    async fn try_relay(source_ip: &str, proxy_port: u16) -> Option<tokio::net::TcpStream> {
+        let socket = tokio::net::TcpSocket::new_v4().expect("client socket");
+        socket
+            .bind(format!("{source_ip}:0").parse().expect("source addr"))
+            .expect("bind client source");
+        let mut stream = socket
+            .connect(
+                format!("127.0.0.1:{proxy_port}")
+                    .parse()
+                    .expect("proxy addr"),
+            )
+            .await
+            .ok()?;
+        if stream.write_all(b"ping").await.is_err() {
+            return None;
+        }
+        let mut buf = [0u8; 4];
+        match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf)).await {
+            Ok(Ok(_)) if &buf == b"ping" => Some(stream),
+            _ => None,
+        }
+    }
+
+    const ATTEMPTS: usize = 8;
+    const LIMIT: usize = 4;
+    let mut held = Vec::new();
+    let mut refused = 0usize;
+    for _ in 0..ATTEMPTS {
+        match try_relay("127.0.0.1", proxy_port).await {
+            Some(stream) => held.push(stream),
+            None => refused += 1,
+        }
+    }
+
+    assert_eq!(
+        held.len(),
+        LIMIT,
+        "exactly FERRUM_TCP_MAX_CONNECTIONS_PER_IP connections from one source must be admitted"
+    );
+    assert_eq!(
+        refused,
+        ATTEMPTS - LIMIT,
+        "every connection past the per-source cap must be closed at accept"
+    );
+
+    // The bound is per source, not per listener: a different source IP still
+    // gets its own full budget while the first source is saturated.
+    let other_source = try_relay("127.0.0.2", proxy_port).await;
+    assert!(
+        other_source.is_some(),
+        "a second source IP must still be admitted while another source is at its cap"
+    );
+
+    drop(other_source);
+    drop(held);
+    shutdown_gateway(&mut gateway);
+    backend.abort();
+}

@@ -3535,6 +3535,23 @@ pub struct EnvConfig {
     /// (socket peer, or forwarding headers only from `FERRUM_TRUSTED_PROXIES`).
     /// Default: 0 (disabled). When exceeded, upgrades are rejected with 503.
     pub websocket_max_connections_per_ip: u64,
+    /// Maximum concurrent TCP stream-proxy connections per effective source IP.
+    ///
+    /// Enforced in the TCP stream accept path *before* the frontend TLS
+    /// handshake and before any plugin hook runs, so one source cannot occupy a
+    /// listener's whole pre-handshake budget. The source is the same effective
+    /// client IP the stream context carries: the forwarded address when an
+    /// inbound PROXY-protocol header was accepted from a `FERRUM_TRUSTED_PROXIES`
+    /// peer, otherwise the socket peer. Default: 256. `0` = unlimited.
+    pub tcp_max_connections_per_ip: u64,
+    /// Maximum concurrent UDP/DTLS stream-proxy sessions per effective source IP.
+    ///
+    /// Enforced at session-slot reservation, alongside the listener-wide
+    /// `FERRUM_UDP_MAX_SESSIONS` bound, so one source cannot consume a
+    /// listener's whole session table with many source ports. The source is the
+    /// authenticated forwarded client when a datagram client-address envelope
+    /// was accepted, otherwise the socket peer. Default: 1024. `0` = unlimited.
+    pub udp_max_sessions_per_ip: u64,
 
     // ── Overload management ──────────────────────────────────────────────
     /// How often the overload monitor checks resource pressure in milliseconds.
@@ -4094,6 +4111,8 @@ impl Default for EnvConfig {
             server_http2_max_local_error_reset_streams: 256,
             websocket_max_connections: 20_000,
             websocket_max_connections_per_ip: 0,
+            tcp_max_connections_per_ip: 256,
+            udp_max_sessions_per_ip: 1024,
             overload_check_interval_ms: 1000,
             overload_fd_pressure_threshold: 0.80,
             overload_fd_critical_threshold: 0.95,
@@ -4765,6 +4784,8 @@ impl EnvConfig {
             server_http2_max_local_error_reset_streams: usize = "FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS" => 256usize, max(1usize);
             websocket_max_connections: usize = "FERRUM_WEBSOCKET_MAX_CONNECTIONS" => 20_000usize;
             websocket_max_connections_per_ip: u64 = "FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP" => 0u64;
+            tcp_max_connections_per_ip: u64 = "FERRUM_TCP_MAX_CONNECTIONS_PER_IP" => 256u64;
+            udp_max_sessions_per_ip: u64 = "FERRUM_UDP_MAX_SESSIONS_PER_IP" => 1024u64;
             overload_check_interval_ms: u64 = "FERRUM_OVERLOAD_CHECK_INTERVAL_MS" => 1000u64, max(100u64);
             overload_fd_pressure_threshold: f64 = "FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD" => 0.80f64, clamp(0.0f64, 1.0f64);
             overload_fd_critical_threshold: f64 = "FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD" => 0.95f64, clamp(0.0f64, 1.0f64);
@@ -5517,6 +5538,8 @@ impl EnvConfig {
             server_http2_max_local_error_reset_streams,
             websocket_max_connections,
             websocket_max_connections_per_ip,
+            tcp_max_connections_per_ip,
+            udp_max_sessions_per_ip,
             overload_check_interval_ms,
             overload_fd_pressure_threshold,
             overload_fd_critical_threshold,

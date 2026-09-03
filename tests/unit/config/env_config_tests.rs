@@ -2404,6 +2404,44 @@ fn test_env_config_http2_reset_and_websocket_limits_custom() {
     );
 }
 
+/// The stream-listener per-source admission bounds ship enabled by default
+/// (issue #4544): a listener with no per-source cap can be taken down by one
+/// client. `0` remains the explicit opt-out.
+#[test]
+fn test_stream_per_source_admission_defaults_are_non_zero() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.tcp_max_connections_per_ip, 256);
+            assert_eq!(config.udp_max_sessions_per_ip, 1024);
+        },
+    );
+}
+
+#[test]
+fn test_stream_per_source_admission_is_overridable_and_zero_disables() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_TCP_MAX_CONNECTIONS_PER_IP", "4"),
+            ("FERRUM_UDP_MAX_SESSIONS_PER_IP", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.tcp_max_connections_per_ip, 4);
+            assert_eq!(
+                config.udp_max_sessions_per_ip, 0,
+                "0 must remain the explicit unlimited sentinel"
+            );
+        },
+    );
+}
+
 #[test]
 fn test_websocket_max_connections_per_ip_zero_disables() {
     with_env_vars(
