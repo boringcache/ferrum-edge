@@ -544,6 +544,57 @@ ambient and node-agent DaemonSets. Alerts and monitors fail render without a
 scrape credential. `FerrumMeshControlPlaneConfigStale` does not use `absent()`
 for optional mesh emitters.
 
+A metrics bearer credential is only ever attached to a **verified HTTPS**
+scrape. `FERRUM_METRICS_BEARER_TOKEN` also unlocks full `/health`, `/status`,
+and `/overload` diagnostic detail, and both mesh DaemonSets run on the host
+network, so a plaintext scrape would put the credential on the node network on
+every interval. With `observability.metrics.bearerToken.existingSecret.name`
+set, the `ServiceMonitor` and both `PodMonitor` endpoints select
+`port: admin-https` with `scheme: https` and the monitor's `tlsConfig`, and the
+chart fails render when a scraped component has no usable HTTPS admin listener,
+when the selected `tlsConfig` is empty, or when `tlsConfig.insecureSkipVerify`
+is `true` alongside the credential. An `observability.metrics.allowedCidrs`-only
+scrape carries no credential and may stay on plaintext `admin-http`.
+
+Admin HTTPS uses one shape on every mesh workload —
+`<component>.admin.httpsPort` (default `0`) plus `<component>.admin.tls`
+(`enabled`, `secretName`, `mountPath`, `certKey`, `keyKey`, optional
+`clientCaKey` / `crlKey`) for `controlPlane`, `ca`, `eastWest`, and `ambient`,
+and the pre-existing `nodeAgent.admin.httpsPort` / `nodeAgent.admin.tls`. The
+chart mounts the Secret read-only and renders `FERRUM_ADMIN_HTTPS_PORT` with the
+matching `FERRUM_ADMIN_TLS_*` paths; setting `admin.httpPort: 0` alongside it
+makes the component HTTPS-only.
+
+```yaml
+observability:
+  enabled: true
+  metrics:
+    bearerToken:
+      existingSecret:
+        name: mesh-metrics-bearer
+    serviceMonitor:
+      tlsConfig:
+        ca:
+          secret:
+            name: mesh-scrape-ca
+            key: ca.crt
+        serverName: ferrum-mesh-control-plane-metrics.ferrum.svc
+    podMonitor:
+      tlsConfig:
+        ca:
+          secret:
+            name: mesh-scrape-ca
+            key: ca.crt
+
+controlPlane:
+  admin:
+    bindAddress: 0.0.0.0
+    httpsPort: 9443
+    tls:
+      enabled: true
+      secretName: cp-admin-tls
+```
+
 Example: disable control-plane probes, or replace injector readiness with HTTPS:
 
 ```yaml

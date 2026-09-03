@@ -378,11 +378,21 @@ spec:
                 {{- range $cap := $caps }}
                 - {{ $cap }}
                 {{- end }}
-          {{- if and .Values.nodeAgent.admin.enabled (ne $nodeAgentAdminHttpPort "0") }}
+          {{- if and .Values.nodeAgent.admin.enabled (or (ne $nodeAgentAdminHttpPort "0") (and (ne $nodeAgentAdminHttpsPort "0") $nodeAgentAdminTlsConfigured)) }}
           ports:
+            {{- if ne $nodeAgentAdminHttpPort "0" }}
             - name: admin-http
               containerPort: {{ $nodeAgentAdminHttpPort }}
               protocol: TCP
+            {{- end }}
+            {{- /* Named so the PodMonitor can select the already-supported
+                   HTTPS listener; without it an HTTPS-only node agent has no
+                   scrapable endpoint at all. */}}
+            {{- if and (ne $nodeAgentAdminHttpsPort "0") $nodeAgentAdminTlsConfigured }}
+            - name: admin-https
+              containerPort: {{ $nodeAgentAdminHttpsPort }}
+              protocol: TCP
+            {{- end }}
           {{- end }}
           env:
             - name: FERRUM_MODE

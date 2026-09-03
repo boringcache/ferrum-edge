@@ -140,9 +140,18 @@ fn ambient_rejects_only_active_https_port_collision_with_node_agent() {
         ambient.contains("$nodeAgentAdminHttpsActive"),
         "collision guard must require node-agent HTTPS to be actually active"
     );
+    // Issue #4509: ambient HTTPS activity is derived from the resolved admin
+    // surface (`ferrum-mesh.adminHttpsActive` over `resolveComponentAdmin`),
+    // whose TLS-configured bit requires BOTH env-supplied cert and key paths.
+    let helpers = read("templates/_helpers.tpl");
     assert!(
-        ambient.contains("FERRUM_ADMIN_TLS_CERT_PATH")
-            && ambient.contains("FERRUM_ADMIN_TLS_KEY_PATH"),
+        ambient.contains("ferrum-mesh.adminHttpsActive"),
+        "ambient collision guard must derive HTTPS activity from the resolved admin surface"
+    );
+    assert!(
+        helpers.contains(
+            "$envTlsPair := and (hasKey $env \"FERRUM_ADMIN_TLS_CERT_PATH\") (hasKey $env \"FERRUM_ADMIN_TLS_KEY_PATH\")"
+        ),
         "ambient HTTPS activity must require complete admin TLS env"
     );
     assert!(

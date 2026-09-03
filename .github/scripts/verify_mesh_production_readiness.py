@@ -636,7 +636,84 @@ def validate_observability(results_dir: Path) -> None:
         "Stale-config alert metric missing",
         "FerrumMeshControlPlaneConfigStale must still reference the freshness timestamp",
     )
+    validate_metrics_bearer_https(results_dir)
     print("mesh observability scrape path ok")
+
+
+def validate_metrics_bearer_https(results_dir: Path) -> None:
+    """A metrics bearer credential is only ever attached to a verified HTTPS scrape.
+
+    FERRUM_METRICS_BEARER_TOKEN is not scrape-only: a match also unlocks full
+    /health, /status and /overload detail, and both mesh DaemonSets run on the
+    host network, so a plaintext scrape puts the credential on the node network
+    on every interval (issue #4509, the ferrum-gateway rule from #4316).
+    """
+    rendered = require_capture(
+        results_dir, "mesh-prod-obs-bearer-https.yaml"
+    ).read_text(encoding="utf-8")
+    sm = resource_document(rendered, "ferrum-mesh-metrics", "ServiceMonitor")
+    for needle in ("port: admin-https", "scheme: https", "type: Bearer"):
+        require_text(
+            sm,
+            needle,
+            "Credentialed ServiceMonitor is not HTTPS",
+            f"a bearer ServiceMonitor scrape must carry {needle}",
+        )
+    forbid_text(
+        sm,
+        "port: admin-http\n",
+        "Credentialed ServiceMonitor scrapes plaintext",
+        "a bearer scrape must never select the plaintext admin port",
+    )
+    for svc_name in (
+        "ferrum-mesh-control-plane-metrics",
+        "ferrum-mesh-ca-metrics",
+        "ferrum-mesh-east-west-metrics",
+    ):
+        svc = resource_document(rendered, svc_name, "Service")
+        require_text(
+            svc,
+            "targetPort: admin-https",
+            "Metrics Service missing HTTPS port",
+            f"{svc_name} must publish admin-https for a credentialed scrape",
+        )
+    for pm_name in (
+        "ferrum-mesh-ambient-metrics",
+        "ferrum-mesh-node-agent-metrics",
+    ):
+        pm = resource_document(rendered, pm_name, "PodMonitor")
+        for needle in ("port: admin-https", "scheme: https", "type: Bearer"):
+            require_text(
+                pm,
+                needle,
+                "Credentialed PodMonitor is not HTTPS",
+                f"{pm_name} must carry {needle}",
+            )
+        forbid_text(
+            pm,
+            "port: admin-http\n",
+            "Credentialed PodMonitor scrapes plaintext",
+            f"{pm_name} must never select the plaintext admin port",
+        )
+    require_stderr(
+        results_dir,
+        "mesh-prod-obs-bearer-plaintext.err",
+        ("bearer", "admin HTTPS", "plaintext"),
+        "Bearer over plaintext admin accepted",
+    )
+    require_stderr(
+        results_dir,
+        "mesh-prod-obs-bearer-insecure.err",
+        ("insecureSkipVerify",),
+        "insecureSkipVerify accepted with a bearer scrape",
+    )
+    require_stderr(
+        results_dir,
+        "mesh-prod-obs-bearer-no-tlsconfig.err",
+        ("tlsConfig is empty",),
+        "Empty tlsConfig accepted for an HTTPS scrape",
+    )
+    print("mesh metrics bearer HTTPS-only scrape policy ok")
 
 
 def require_stderr(results_dir: Path, relative: str, needles: tuple[str, ...], title: str) -> None:

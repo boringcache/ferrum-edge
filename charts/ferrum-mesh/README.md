@@ -290,6 +290,36 @@ only. Optional Prometheus Operator CRDs stay gated on `observability.enabled`.
 `FerrumMeshControlPlaneConfigStale` does not use `absent()` — it is silent
 no-data until a scraped data plane emits the freshness timestamp.
 
+A **bearer credential is only ever attached to a verified HTTPS scrape.**
+`FERRUM_METRICS_BEARER_TOKEN` is not scrape-only: a match also unlocks full
+`/health`, `/status`, and `/overload` diagnostic detail, and both DaemonSets run
+on the host network, so a plaintext scrape would put that credential on the node
+network on every interval. When
+`observability.metrics.bearerToken.existingSecret.name` is set, the monitors
+select `port: admin-https` with `scheme: https` and the monitor's `tlsConfig`,
+and the chart **fails render** when:
+
+- a scraped component has no usable HTTPS admin listener
+  (`<component>.admin.httpsPort > 0` with `<component>.admin.tls` configured, or
+  `nodeAgent.admin.httpsPort`/`nodeAgent.admin.tls`);
+- an HTTPS scrape is selected while `serviceMonitor.tlsConfig` /
+  `podMonitor.tlsConfig` is empty — set for example `ca.secret` + `serverName`
+  so the scrape verifies the admin certificate;
+- `tlsConfig.insecureSkipVerify: true` is combined with a bearer credential.
+
+Admin HTTPS is available on `controlPlane`, `ca`, `eastWest`, `ambient`, and
+`nodeAgent` through the same shape: `admin.httpsPort` (default `0`, so existing
+HTTP-only installs are unchanged) plus `admin.tls`
+(`enabled`, `secretName`, `mountPath`, `certKey`, `keyKey`, optional
+`clientCaKey` / `crlKey`). The chart mounts that Secret read-only and renders
+`FERRUM_ADMIN_HTTPS_PORT` and the `FERRUM_ADMIN_TLS_*` paths. A component may
+run HTTPS-only by also setting `admin.httpPort: 0`; the monitors then select
+`admin-https` even without a bearer credential.
+
+An `observability.metrics.allowedCidrs`-only scrape (no bearer Secret) is
+unauthenticated at the credential level and may stay on plaintext
+`port: admin-http`, which is what the default observability path renders.
+
 See [`values.yaml`](values.yaml) for the fully commented value surface and
 [`docs/kubernetes_deployment.md`](../../docs/kubernetes_deployment.md) for the
 deployment guide.

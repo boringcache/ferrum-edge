@@ -221,11 +221,8 @@
 {{- /* Compare only HTTPS surfaces that will actually bind. Ambient inherits the
        binary default HTTPS port 9443, but without admin TLS material no HTTPS
        socket is opened — do not invent a collision against node-agent HTTPS. */ -}}
-{{- $ambientAdminHttpsPort := "9443" -}}
-{{- if hasKey $ambientEnv "FERRUM_ADMIN_HTTPS_PORT" -}}
-{{- $ambientAdminHttpsPort = toString (index $ambientEnv "FERRUM_ADMIN_HTTPS_PORT") -}}
-{{- end -}}
-{{- $ambientAdminHttpsActive := and (ne $ambientAdminHttpsPort "0") (hasKey $ambientEnv "FERRUM_ADMIN_TLS_CERT_PATH") (hasKey $ambientEnv "FERRUM_ADMIN_TLS_KEY_PATH") -}}
+{{- $ambientAdminHttpsPort := toString $ambientAdminResolved.httpsPort -}}
+{{- $ambientAdminHttpsActive := include "ferrum-mesh.adminHttpsActive" (dict "resolved" $ambientAdminResolved) -}}
 {{- $nodeAgentAdminTls := .Values.nodeAgent.admin.tls | default dict -}}
 {{- $nodeAgentAdminTlsConfigured := include "ferrum-mesh.nodeAgentAdminTlsConfigured" $nodeAgentAdminTls -}}
 {{- $nodeAgentAdminHttpsActive := and (ne $nodeAgentAdminHttpsPort "0") $nodeAgentAdminTlsConfigured -}}
@@ -566,6 +563,9 @@ spec:
               containerPort: {{ $ambientAdminPort }}
               protocol: TCP
             {{- end }}
+            {{- with (include "ferrum-mesh.adminHttpsPort" (dict "resolved" $ambientAdminResolved)) }}
+            {{- . | nindent 12 }}
+            {{- end }}
           env:
             {{- include "ferrum-mesh.adminEnv" (dict "env" $ambientEnv "resolved" $ambientAdminResolved) | nindent 12 }}
             {{- include "ferrum-mesh.shutdownEnv" .Values.ambient | nindent 12 }}
@@ -652,7 +652,7 @@ spec:
                    `ambient.env` entry. Re-emitting them here would duplicate the
                    variable in this container's env list. */ -}}
             {{- range $name, $value := $ambientEnv }}
-            {{- if not (has $name (list "FERRUM_ADMIN_HTTP_PORT" "FERRUM_ADMIN_BIND_ADDRESS" "FERRUM_ALLOW_INSECURE_ADMIN_HTTP" "FERRUM_ADMIN_ALLOWED_CIDRS")) }}
+            {{- if not (has $name (list "FERRUM_ADMIN_HTTP_PORT" "FERRUM_ADMIN_HTTPS_PORT" "FERRUM_ADMIN_BIND_ADDRESS" "FERRUM_ALLOW_INSECURE_ADMIN_HTTP" "FERRUM_ADMIN_ALLOWED_CIDRS")) }}
             - name: {{ $name }}
               value: {{ $value | quote }}
             {{- end }}
@@ -665,6 +665,9 @@ spec:
             - name: kube-api-access
               mountPath: /var/run/secrets/kubernetes.io/serviceaccount
               readOnly: true
+            {{- with (include "ferrum-mesh.adminTlsVolumeMount" (dict "resolved" $ambientAdminResolved)) }}
+            {{- . | nindent 12 }}
+            {{- end }}
             {{- if $nodeWaypointRegistryEnabled }}
             - name: bpf-fs
               mountPath: {{ .Values.nodeAgent.bpfFsPath }}
@@ -733,6 +736,9 @@ spec:
                         apiVersion: v1
                         fieldPath: metadata.namespace
                       path: namespace
+        {{- with (include "ferrum-mesh.adminTlsVolume" (dict "resolved" $ambientAdminResolved)) }}
+        {{- . | nindent 8 }}
+        {{- end }}
         {{- if $nodeWaypointRegistryEnabled }}
         - name: bpf-fs
           hostPath:
