@@ -4573,6 +4573,8 @@ When an upstream target is tagged with `mesh.hbone=true` metadata, the gateway r
 
 On HBONE connect failure or malformed HBONE target metadata, tagged dispatch fails closed with an HBONE error response instead of falling back to plain HTTP.
 
+**Response header-block bound.** The outbound HBONE HTTP/2 client advertises a receive-side `SETTINGS_MAX_HEADER_LIST_SIZE` derived from `FERRUM_MAX_HEADER_SIZE_BYTES` (floored at 16 KiB), so a peer holding a valid SVID cannot answer a CONNECT with a multi-megabyte HEADERS/CONTINUATION block. A pool built without that policy still defaults to 16 KiB — parity with hyper's own default, which is what every other backend transport rides — never the raw `h2` crate's 16 MiB. Enforcement is stream-level: an oversized response block refuses that CONNECT stream and the tunnel connection stays up. The Sidecar mesh-mTLS CONNECT pool shares the same dial path and therefore the same 16 KiB bound.
+
 ### Sidecar SVID-mTLS Outbound Pool
 
 When an upstream target is tagged with `mesh.mtls=true` metadata (a Sidecar-topology destination), the gateway routes requests through the Sidecar mesh-mTLS pool (`MeshMtlsConnectionPool`) — plain HTTP/2 over mutual TLS to the peer sidecar's `:15006` inbound listener — using the same gateway SPIFFE identity and SVID-fingerprint pool keying as HBONE. The target's `mesh.spiffe_id` pins the expected peer identity: the destination sidecar's server SVID URI SAN must equal it, so trust-domain membership alone is not enough. A `mesh.mtls`-tagged target that cannot dispatch over the secured transport (missing gateway SVID, missing pinned peer) fails closed with a `502` instead of falling back to plain HTTP.

@@ -189,7 +189,16 @@ impl ReqwestPoolManager {
                 .http2_initial_stream_window_size(config.http2_initial_stream_window_size)
                 .http2_initial_connection_window_size(config.http2_initial_connection_window_size)
                 .http2_adaptive_window(config.http2_adaptive_window)
-                .http2_max_frame_size(config.http2_max_frame_size);
+                .http2_max_frame_size(config.http2_max_frame_size)
+                // Bound the response header block a backend may push back under
+                // the operator's own `FERRUM_MAX_HEADER_SIZE_BYTES` policy
+                // (floored at 16 KiB) instead of hyper's fixed constant. This is
+                // a gateway-global `EnvConfig` value with no per-proxy override,
+                // so it is identical for every client built in this process and
+                // needs no `append_reqwest_client_behavior_pool_key` entry.
+                .http2_max_header_list_size(crate::proxy::h2_parser_max_header_list_size(
+                    self.global_env_config.max_header_size_bytes,
+                ));
         }
 
         Ok(client_builder.build()?)

@@ -81,6 +81,15 @@ pub const HBONE_PEER_SPIFFE_ID_TAG: &str = "mesh.hbone_peer_spiffe_id";
 /// Sidecar-mTLS targets.
 pub const MESH_SPIFFE_ID_TAG: &str = "mesh.spiffe_id";
 const MAX_HBONE_WRITE_CHUNK: usize = 16 * 1024;
+/// Receive-side `SETTINGS_MAX_HEADER_LIST_SIZE` used when no operator policy has
+/// been installed via [`HboneConnectionPool::attach_max_header_list_size`].
+///
+/// This deliberately matches hyper's own 16 KiB default — the bound every
+/// sibling backend transport (`http2_pool.rs`, `grpc_proxy.rs`,
+/// `mesh_mtls_pool.rs`) already rides — rather than `h2`'s 16 MiB default, which
+/// would let any SVID-holding peer buffer a multi-megabyte response header
+/// block per HBONE connection.
+pub const HBONE_DEFAULT_MAX_HEADER_LIST_SIZE: u32 = 16 * 1024;
 const ADAPTIVE_STREAM_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
 const ADAPTIVE_CONNECTION_WINDOW_SIZE: u32 = 64 * 1024 * 1024;
 /// Bounded poll for the peer's `SETTINGS_ENABLE_CONNECT_PROTOCOL` acknowledgement
@@ -609,6 +618,13 @@ pub struct HboneConnectionPool {
     /// as before, and no trust withdrawal can reach them because no publication
     /// path exists without a `ProxyState` either.
     mesh_trust_registry: OnceLock<Arc<MeshTrustRegistry>>,
+    /// Receive-side `SETTINGS_MAX_HEADER_LIST_SIZE` this pool advertises on every
+    /// outbound HBONE h2 connection, installed once by `ProxyState` via
+    /// [`HboneConnectionPool::attach_max_header_list_size`]. Unset for focused
+    /// tests and standalone callers, in which case the builder falls back to
+    /// [`HBONE_DEFAULT_MAX_HEADER_LIST_SIZE`] — hyper's own 16 KiB — rather than
+    /// `h2`'s 16 MiB default.
+    max_header_list_size: OnceLock<u32>,
 }
 
 struct HboneSvidIdentityCache {
@@ -708,6 +724,7 @@ impl HboneConnectionPool {
             last_idle_prune_unix_secs: AtomicU64::new(0),
             backend_conn_limit: OnceLock::new(),
             mesh_trust_registry: OnceLock::new(),
+            max_header_list_size: OnceLock::new(),
         }
     }
 
@@ -721,6 +738,17 @@ impl HboneConnectionPool {
         let _ = self.backend_conn_limit.set(limiter);
     }
 
+    /// Install the operator's `FERRUM_MAX_HEADER_SIZE_BYTES` policy (floored at
+    /// 16 KiB by `h2_parser_max_header_list_size`) as the receive-side
+    /// `SETTINGS_MAX_HEADER_LIST_SIZE` for every outbound HBONE h2 connection
+    /// this pool dials. Additive and idempotent (`OnceLock::set`); a pool
+    /// constructed without it falls back to
+    /// [`HBONE_DEFAULT_MAX_HEADER_LIST_SIZE`], which is hyper's own 16 KiB
+    /// default and therefore parity with every sibling backend transport.
+    pub fn attach_max_header_list_size(&self, max: u32) {
+        let _ = self.max_header_list_size.set(max);
+    }
+
     /// Install the gateway trust ownership registry (issue #3859) so every HBONE
     /// transport this pool dials — pooled, WebSocket 1:1, or datagram 1:1 — is
     /// registered under the accepted gateway trust generation and can be
@@ -728,6 +756,16 @@ impl HboneConnectionPool {
     /// calls are ignored.
     pub fn attach_mesh_trust_registry(&self, registry: Arc<MeshTrustRegistry>) {
         let _ = self.mesh_trust_registry.set(registry);
+    }
+
+    /// The receive-side `SETTINGS_MAX_HEADER_LIST_SIZE` this pool will advertise
+    /// on its next outbound HBONE h2 handshake: the operator policy when one has
+    /// been attached, otherwise [`HBONE_DEFAULT_MAX_HEADER_LIST_SIZE`].
+    pub fn effective_max_header_list_size(&self) -> u32 {
+        self.max_header_list_size
+            .get()
+            .copied()
+            .unwrap_or(HBONE_DEFAULT_MAX_HEADER_LIST_SIZE)
     }
 
     fn trust_registry(&self) -> Option<&Arc<MeshTrustRegistry>> {
@@ -1244,6 +1282,7 @@ impl HboneConnectionPool {
                 self.trust_registry(),
                 MeshTransportKind::Hbone,
                 None,
+                self.effective_max_header_list_size(),
             )
             .await?;
             let baggage = baggage_header_for_source(hbone_source_identity);
@@ -1354,6 +1393,7 @@ impl HboneConnectionPool {
             self.trust_registry(),
             MeshTransportKind::Hbone,
             None,
+            self.effective_max_header_list_size(),
         )
         .await?;
         let baggage = asserted_source.map_or_else(
@@ -1871,6 +1911,7 @@ impl HboneConnectionPool {
                 entries: Arc::clone(&self.entries),
                 key: pool_key.to_string(),
             }),
+            self.effective_max_header_list_size(),
         )
         .await
     }
@@ -2127,6 +2168,12 @@ pub(crate) async fn dial_h2_connect_sender(
     // keepalive failure removes *this* transport and not a newer replacement
     // under the same key. `None` for 1:1 WS/datagram and mesh-mTLS CONNECT.
     keepalive_pool: Option<HboneKeepalivePoolHandle>,
+    // Receive-side `SETTINGS_MAX_HEADER_LIST_SIZE` advertised on the h2
+    // handshake, bounding the response header block the peer may push back.
+    // Callers without an operator policy pass
+    // [`HBONE_DEFAULT_MAX_HEADER_LIST_SIZE`] (hyper's own 16 KiB), never `h2`'s
+    // 16 MiB default.
+    max_header_list_size: u32,
 ) -> Result<MeshH2Transport, HbonePoolError> {
     // Stamp the accepted trust generation BEFORE dialing. If a withdrawal
     // publishes a new generation while this dial is in flight, registration
@@ -2235,10 +2282,24 @@ pub(crate) async fn dial_h2_connect_sender(
 
             let (stream_window_size, connection_window_size) = h2_window_sizes(pool_config);
             let mut builder = h2::client::Builder::new();
+            // Bound the response header block a peer may push at us. An HBONE
+            // peer holds a valid SVID, but a valid SVID is not a promise to
+            // bound its own HEADERS/CONTINUATION block: a compromised in-mesh
+            // workload or any waypoint the mesh routes through can answer a
+            // CONNECT with a multi-megabyte block, and `h2` only installs a
+            // receive-side cap when this setting is `Some` (its default is
+            // 16 MiB). Every sibling backend transport already carries a bound —
+            // `http2_pool.rs` and `grpc_proxy.rs` ride hyper's 16 KiB default and
+            // `src/http3/client.rs` carries its own field-section ceiling — so
+            // the mesh data path must not be the one unbounded reader. This dial
+            // also backs the Sidecar mesh-mTLS CONNECT pool, which passes the
+            // same 16 KiB default. Enforcement is stream-level: `h2` refuses the
+            // oversized stream and the connection survives.
             builder
                 .initial_window_size(stream_window_size)
                 .initial_connection_window_size(connection_window_size)
                 .max_frame_size(pool_config.http2_max_frame_size)
+                .max_header_list_size(max_header_list_size)
                 .max_concurrent_reset_streams(4096);
             if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
                 builder.max_concurrent_streams(max_streams);
