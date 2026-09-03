@@ -606,6 +606,11 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
+    # Issue #4600: the job normally finishes in 16-19 minutes. Without a bound a
+    # single hung testcontainers case (a stalled image pull or a ClickHouse HTTP
+    # call with no deadline) held the job for the 6-hour default and, inside the
+    # merge queue, cost the whole group its budget. Fail fast instead.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
