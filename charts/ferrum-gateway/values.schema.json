@@ -626,7 +626,35 @@
             "certExpiringSeconds": { "type": "integer", "minimum": 0 },
             "databasePollStaleSeconds": { "type": "integer", "minimum": 0 },
             "upstreamUnhealthyRatio": { "type": "number", "minimum": 0, "maximum": 1 },
-            "frontendTlsHandshakeErrorsPerSecond": { "type": "number", "minimum": 0 }
+            "frontendTlsHandshakeErrorsPerSecond": { "type": "number", "minimum": 0 },
+            "databaseUnavailableFor": {
+              "type": "string",
+              "description": "Prometheus duration rendered verbatim as the FerrumGatewayDatabaseUnavailable `for:` clause.",
+              "pattern": "^([0-9]+(ms|[smhdwy]))+$"
+            },
+            "runbookBaseUrl": {
+              "type": "string",
+              "description": "Base URL for the per-alert runbook_url annotation; each alert appends its own docs/runbooks/gateway.md heading anchor."
+            }
+          }
+        },
+        "dashboards": {
+          "type": "object",
+          "description": "Bundled Grafana dashboards rendered as a ConfigMap carrying the Grafana sidecar label. Requires metrics.enabled.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "configMapName": { "type": "string" },
+            "labels": {
+              "type": "object",
+              "additionalProperties": { "type": ["string", "number", "integer", "boolean"] }
+            },
+            "annotations": {
+              "type": "object",
+              "additionalProperties": { "type": ["string", "number", "integer", "boolean"] }
+            },
+            "sidecarLabel": { "type": "string" },
+            "sidecarLabelValue": { "type": "string" }
           }
         }
       }

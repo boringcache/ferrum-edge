@@ -146,6 +146,20 @@ admin explicitly (`admin.bindAddress` + `admin.service.enabled`) and restrict
 access with a `NetworkPolicy`. Scrapers must be authorized via metrics bearer
 token or allowed CIDR; see [`charts/ferrum-gateway/README.md`](../charts/ferrum-gateway/README.md#metrics-and-prometheus).
 
+Every rendered alert carries a `runbook_url` annotation pointing at its section
+in [`docs/runbooks/gateway.md`](runbooks/gateway.md) — symptom, first checks
+against `/live`, `/health`, `/status`, `/overload`, `/metrics`,
+`/backend-capabilities`, and `/cluster`, likely causes, remediation, and
+escalation for each shipped alert. Repoint the whole set at an internal mirror
+with `metrics.alerts.runbookBaseUrl`.
+
+Setting `metrics.dashboards.enabled=true` additionally renders a `ConfigMap`
+containing the bundled Grafana dashboards from
+`charts/ferrum-gateway/dashboards/`, labeled `grafana_dashboard: "1"` for the
+Grafana sidecar (`kiwigrid/k8s-sidecar`) and the Grafana Operator. Override the
+label with `metrics.dashboards.sidecarLabel` /
+`metrics.dashboards.sidecarLabelValue`.
+
 `/metrics` also requires a globally scoped `prometheus_metrics` plugin in the
 gateway configuration; without it the endpoint returns an empty exposition:
 

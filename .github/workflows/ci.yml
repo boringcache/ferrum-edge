@@ -4782,6 +4782,54 @@ jobs:
             "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-prom-rule-rendered.yaml" \
             "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-prometheus-rules.yaml"
           promtool check rules "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-prometheus-rules.yaml"
+          # Issue #4547: every shipped alert must carry a runbook_url annotation.
+          # Rendered in database mode so the mode-gated config alerts are present.
+          helm template ferrum-db ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=database \
+            --set database.type=sqlite \
+            --set metrics.enabled=true \
+            --set metrics.alerts.enabled=true \
+            --set metrics.serviceMonitor.enabled=false \
+            --set metrics.allowedCidrs=10.0.0.0/8 \
+            --set metrics.alerts.frontendTlsHandshakeErrorsPerSecond=5 \
+            --set admin.jwtSecret.existingSecret.name=ferrum-gateway-credentials \
+            --set database.existingSecret.name=ferrum-db \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-runbooks.yaml"
+          python3 -I .github/scripts/extract_rendered_prometheus_rules.py \
+            "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-runbooks.yaml" \
+            "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-runbooks-rules.yaml"
+          promtool check rules "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-runbooks-rules.yaml"
+          alert_count="$(grep -c '^\s*- alert:' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-runbooks-rules.yaml")"
+          runbook_count="$(grep -c 'runbook_url:' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-runbooks-rules.yaml")"
+          if [ "$alert_count" -eq 0 ] || [ "$alert_count" != "$runbook_count" ]; then
+            echo "::error title=Gateway alert without a runbook_url::${alert_count} alerts but ${runbook_count} runbook_url annotations"
+            exit 1
+          fi
+          grep -Fq 'FerrumGatewayDatabaseUnavailable' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-runbooks-rules.yaml"
+          grep -Fq 'ferrum_database_config_source_connected' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-runbooks-rules.yaml"
+          # Issue #4547: the bundled Grafana dashboards render only when opted in.
+          # `--show-only` on a template that produces nothing exits non-zero with
+          # "could not find template" — that IS the pass condition.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set metrics.enabled=true \
+            --set metrics.serviceMonitor.enabled=false \
+            --set metrics.allowedCidrs=10.0.0.0/8 \
+            --show-only templates/observability-dashboards-configmap.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/dashboards-default.out" 2>&1; then
+            echo "::error title=Dashboards ConfigMap rendered by default::metrics.dashboards.enabled defaults to false"
+            exit 1
+          fi
+          grep -Fq 'could not find template' "$RUNNER_TEMP/ferrum-gateway-helm-results/dashboards-default.out"
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set metrics.enabled=true \
+            --set metrics.serviceMonitor.enabled=false \
+            --set metrics.allowedCidrs=10.0.0.0/8 \
+            --set metrics.dashboards.enabled=true \
+            --show-only templates/observability-dashboards-configmap.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/dashboards-enabled.yaml"
+          grep -Fq 'kind: ConfigMap' "$RUNNER_TEMP/ferrum-gateway-helm-results/dashboards-enabled.yaml"
+          grep -Fq 'grafana_dashboard: "1"' "$RUNNER_TEMP/ferrum-gateway-helm-results/dashboards-enabled.yaml"
+          grep -Fq 'gateway-overview.json' "$RUNNER_TEMP/ferrum-gateway-helm-results/dashboards-enabled.yaml"
           # Issue #4289: database poll freshness must not render in file/dp modes.
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set metrics.enabled=true \

@@ -1041,7 +1041,7 @@
     ],
     "subsystem": "circuit_breaker",
     "export_surface": "/metrics",
-    "bundled": "alert",
+    "bundled": "alert_and_dashboard",
     "emission": "when_series_present"
   },
   {
@@ -1187,7 +1187,7 @@
     ],
     "subsystem": "connection_pool",
     "export_surface": "/metrics",
-    "bundled": "documented_only",
+    "bundled": "dashboard",
     "emission": "conditional"
   },
   {
@@ -1199,7 +1199,7 @@
     ],
     "subsystem": "connection_pool",
     "export_surface": "/metrics",
-    "bundled": "documented_only",
+    "bundled": "dashboard",
     "emission": "conditional"
   },
   {
@@ -1496,6 +1496,18 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_database_config_source_connected",
+    "type": "gauge",
+    "help": "Whether the configuration database (database mode) or the control plane's backing database (cp mode) is currently reachable and usable: 1 connected, 0 unavailable.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "database_polling",
+    "export_surface": "/metrics",
+    "bundled": "alert_and_dashboard",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_database_delta_backoff_bucket",
     "type": "gauge",
     "help": "Current rejected-delta retry backoff bucket. Exactly one bucket is 1.",
@@ -1555,6 +1567,19 @@
     "subsystem": "database_polling",
     "export_surface": "/metrics",
     "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_database_poll_failures_total",
+    "type": "counter",
+    "help": "Database/CP config poll failures by bounded reason.",
+    "labels": [
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "database_polling",
+    "export_surface": "/metrics",
+    "bundled": "dashboard",
     "emission": "conditional"
   },
   {
@@ -1626,7 +1651,7 @@
     ],
     "subsystem": "dp_config",
     "export_surface": "/metrics",
-    "bundled": "documented_only",
+    "bundled": "dashboard",
     "emission": "conditional"
   },
   {
@@ -1650,7 +1675,7 @@
     ],
     "subsystem": "dp_config",
     "export_surface": "/metrics",
-    "bundled": "documented_only",
+    "bundled": "dashboard",
     "emission": "conditional"
   },
   {
@@ -3969,7 +3994,7 @@
     ],
     "subsystem": "overload",
     "export_surface": "/metrics",
-    "bundled": "documented_only",
+    "bundled": "dashboard",
     "emission": "conditional"
   },
   {
@@ -4032,7 +4057,7 @@
     ],
     "subsystem": "overload",
     "export_surface": "/metrics",
-    "bundled": "alert",
+    "bundled": "alert_and_dashboard",
     "emission": "conditional"
   },
   {
@@ -4797,7 +4822,7 @@
     ],
     "subsystem": "upstream_health",
     "export_surface": "/metrics",
-    "bundled": "alert",
+    "bundled": "alert_and_dashboard",
     "emission": "when_series_present"
   },
   {
@@ -4811,7 +4836,7 @@
     ],
     "subsystem": "upstream_health",
     "export_surface": "/metrics",
-    "bundled": "alert",
+    "bundled": "alert_and_dashboard",
     "emission": "when_series_present"
   },
   {
