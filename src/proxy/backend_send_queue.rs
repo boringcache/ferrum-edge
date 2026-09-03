@@ -293,16 +293,44 @@ tokio::task_local! {
     static REQWEST_BACKEND_SOCKET: BackendSocketSlot;
 }
 
-/// Run `fut` with `slot` armed as the destination for any backend socket the
-/// bundled HTTP client dials while it is being polled.
-pub(crate) async fn with_reqwest_backend_socket_slot<F>(
+/// Poll an already-pinned dispatch future with `slot` armed as the task-local
+/// destination for any backend socket the bundled HTTP client dials during
+/// that poll.
+///
+/// Borrows the future instead of owning it. The dispatch futures this wraps
+/// are the largest state machines in the gateway, and an HTTP/3 → plain
+/// dispatch overflowed a 2 MiB worker stack on hosted runners once it was
+/// routed through an `async fn` and a by-value `TaskLocalFuture` (two more
+/// whole-future copies in a debug build). The caller pins the future exactly
+/// once, as it did before issue #4411, and this adapter adds one pointer and
+/// one `Arc` clone per poll.
+pub(crate) struct ReqwestBackendSocketScope<'a, F> {
+    future: std::pin::Pin<&'a mut F>,
     slot: BackendSocketSlot,
-    fut: F,
-) -> F::Output
+}
+
+impl<'a, F> ReqwestBackendSocketScope<'a, F> {
+    pub(crate) fn new(future: std::pin::Pin<&'a mut F>, slot: BackendSocketSlot) -> Self {
+        Self { future, slot }
+    }
+}
+
+impl<F> std::future::Future for ReqwestBackendSocketScope<'_, F>
 where
     F: std::future::Future,
 {
-    REQWEST_BACKEND_SOCKET.scope(slot, fut).await
+    type Output = F::Output;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        // `Pin<&mut F>` and `Arc` are both `Unpin`, so this projection is a
+        // plain reborrow.
+        let this = &mut *self;
+        let slot = Arc::clone(&this.slot);
+        REQWEST_BACKEND_SOCKET.sync_scope(slot, || this.future.as_mut().poll(cx))
+    }
 }
 
 /// Publish a newly dialed backend socket into the slot the current dispatch

@@ -47571,12 +47571,16 @@ where
     // Issue #4411: the bundled HTTP client dials its backend socket on THIS
     // task, inside `fut`, and reports it through the vendored
     // connection-admission hook rather than handing the gateway a `TcpStream`.
-    // Arming the pump's slot as a task-local for exactly the span of this
+    // Arming the pump's slot as a task-local for exactly the polls of this
     // dispatch is what lets that hook publish into the right request's pump —
     // and only that request's. Transports that publish their own socket have
-    // already filled the slot; it is write-once, so they still win.
-    let fut = backend_send_queue::with_reqwest_backend_socket_slot(pump.backend_socket_slot(), fut);
+    // already filled the slot; it is write-once, so they still win. The future
+    // is pinned once, here, and the scope borrows it: wrapping it by value
+    // copied the gateway's largest state machine onto a worker stack that an
+    // HTTP/3 → plain dispatch already fills to the brim.
     tokio::pin!(fut);
+    let mut fut =
+        backend_send_queue::ReqwestBackendSocketScope::new(fut, pump.backend_socket_slot());
     tokio::select! {
         biased;
         output = &mut fut => Ok(output),
