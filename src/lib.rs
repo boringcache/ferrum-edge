@@ -1400,6 +1400,7 @@ pub mod _test_support {
         shutdown_rx: &Option<tokio::sync::watch::Receiver<bool>>,
         dns_cache: &crate::dns::DnsCache,
         health_checker: &crate::health_check::HealthChecker,
+        circuit_breaker_cache: &crate::circuit_breaker::CircuitBreakerCache,
     ) -> DiscoveryApplyControlForTest {
         apply_service_discovery_snapshot_inner(
             upstream_namespace,
@@ -1416,6 +1417,7 @@ pub mod _test_support {
             shutdown_rx,
             dns_cache,
             health_checker,
+            circuit_breaker_cache,
             // No supervised task generation behind this seam: external tests
             // drive the pipeline directly, so there is no lifecycle entry to
             // fence or to advance the staleness anchor on.
@@ -1444,6 +1446,7 @@ pub mod _test_support {
         shutdown_rx: &Option<tokio::sync::watch::Receiver<bool>>,
         dns_cache: &crate::dns::DnsCache,
         health_checker: &crate::health_check::HealthChecker,
+        circuit_breaker_cache: &crate::circuit_breaker::CircuitBreakerCache,
         lifecycle_key: &str,
         generation: u64,
     ) -> DiscoveryApplyControlForTest {
@@ -1462,6 +1465,7 @@ pub mod _test_support {
             shutdown_rx,
             dns_cache,
             health_checker,
+            circuit_breaker_cache,
             Some(crate::service_discovery::DiscoveryLifecycle::new(
                 lifecycle_key.to_string(),
                 generation,
@@ -1486,6 +1490,7 @@ pub mod _test_support {
         shutdown_rx: &Option<tokio::sync::watch::Receiver<bool>>,
         dns_cache: &crate::dns::DnsCache,
         health_checker: &crate::health_check::HealthChecker,
+        circuit_breaker_cache: &crate::circuit_breaker::CircuitBreakerCache,
         lifecycle: Option<crate::service_discovery::DiscoveryLifecycle>,
     ) -> DiscoveryApplyControlForTest {
         match crate::service_discovery::apply_discovered_snapshot(
@@ -1503,6 +1508,7 @@ pub mod _test_support {
             shutdown_rx,
             dns_cache,
             health_checker,
+            circuit_breaker_cache,
             lifecycle.as_ref(),
             // No supervised task context behind this seam: staleness expiry
             // during publication preparation is covered against the live

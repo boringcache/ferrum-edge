@@ -571,6 +571,7 @@ async fn test_manager_start_with_no_sd_upstreams() {
         cache,
         dns_cache,
         Arc::new(ferrum_edge::health_check::HealthChecker::new()),
+        Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::default()),
         ferrum_edge::plugins::PluginHttpClient::default(),
         None,
     );
@@ -590,6 +591,7 @@ async fn test_manager_stop_is_idempotent() {
         cache,
         dns_cache,
         Arc::new(ferrum_edge::health_check::HealthChecker::new()),
+        Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::default()),
         ferrum_edge::plugins::PluginHttpClient::default(),
         None,
     );
@@ -2542,6 +2544,7 @@ async fn test_manager_start_with_mismatched_provider_skips() {
         cache.clone(),
         dns_cache,
         Arc::new(ferrum_edge::health_check::HealthChecker::new()),
+        Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::default()),
         ferrum_edge::plugins::PluginHttpClient::default(),
         None,
     );
@@ -2579,6 +2582,7 @@ async fn test_manager_start_with_dns_sd_mismatch_skips() {
         cache,
         dns_cache,
         Arc::new(ferrum_edge::health_check::HealthChecker::new()),
+        Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::default()),
         ferrum_edge::plugins::PluginHttpClient::default(),
         None,
     );
@@ -2610,6 +2614,7 @@ async fn test_manager_start_with_kubernetes_mismatch_skips() {
         cache,
         dns_cache,
         Arc::new(ferrum_edge::health_check::HealthChecker::new()),
+        Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::default()),
         ferrum_edge::plugins::PluginHttpClient::default(),
         None,
     );
@@ -2647,6 +2652,7 @@ async fn test_manager_start_with_mesh_missing_epoch_skips() {
         cache.clone(),
         dns_cache,
         Arc::new(ferrum_edge::health_check::HealthChecker::new()),
+        Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::default()),
         ferrum_edge::plugins::PluginHttpClient::default(),
         None,
     );
@@ -2694,6 +2700,7 @@ async fn test_manager_mesh_discovery_populates_load_balancer() {
         cache.clone(),
         dns_cache,
         Arc::new(ferrum_edge::health_check::HealthChecker::new()),
+        Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::default()),
         ferrum_edge::plugins::PluginHttpClient::default(),
         Some(request_epoch_store(config.clone())),
     );
@@ -3834,6 +3841,7 @@ struct ConsulPipelineHarness {
     lb_cache: Arc<LoadBalancerCache>,
     dns_cache: ferrum_edge::dns::DnsCache,
     health_checker: Arc<ferrum_edge::health_check::HealthChecker>,
+    circuit_breaker_cache: Arc<ferrum_edge::circuit_breaker::CircuitBreakerCache>,
     request_epoch: Option<Arc<RequestEpochStore>>,
     static_targets: Vec<UpstreamTarget>,
     // Kept so the cancel watch sender outlives pipeline cancel checks.
@@ -3888,6 +3896,9 @@ impl ConsulPipelineHarness {
             lb_cache,
             dns_cache,
             health_checker: Arc::new(ferrum_edge::health_check::HealthChecker::new()),
+            circuit_breaker_cache: Arc::new(
+                ferrum_edge::circuit_breaker::CircuitBreakerCache::default(),
+            ),
             request_epoch,
             static_targets: Vec::new(),
             cancel_tx,
@@ -3922,6 +3933,7 @@ impl ConsulPipelineHarness {
             &None,
             &self.dns_cache,
             &self.health_checker,
+            &self.circuit_breaker_cache,
         )
         .await
     }
@@ -4684,6 +4696,7 @@ async fn consul_manager_loop_empty_first_response_clears_cache_and_uses_index_qu
         cache.clone(),
         dns_cache,
         Arc::new(ferrum_edge::health_check::HealthChecker::new()),
+        Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::default()),
         ferrum_edge::plugins::PluginHttpClient::default(),
         None,
     );
@@ -5967,6 +5980,7 @@ async fn production_discovery_loop_retains_targets_and_cursor_on_oversized_or_ma
         &None,
         &k8s_harness.dns_cache,
         &k8s_harness.health_checker,
+        &k8s_harness.circuit_breaker_cache,
     )
     .await;
     assert!(
@@ -6092,6 +6106,7 @@ async fn discovered_snapshot_starts_active_probes_for_sd_only_upstream() {
         &None,
         &dns_cache,
         &health_checker,
+        &ferrum_edge::circuit_breaker::CircuitBreakerCache::default(),
     )
     .await;
     assert!(

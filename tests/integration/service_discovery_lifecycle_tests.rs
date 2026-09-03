@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use ferrum_edge::circuit_breaker::CircuitBreakerCache;
 use ferrum_edge::config::types::{
     GatewayConfig, LoadBalancerAlgorithm, MeshSdConfig, SdProvider, SdStalePolicy,
     ServiceDiscoveryConfig, Upstream, UpstreamTarget, default_namespace,
@@ -137,6 +138,7 @@ fn manager(config: &GatewayConfig) -> ServiceDiscoveryManager {
         Arc::new(LoadBalancerCache::new(config)),
         DnsCache::new(Default::default()),
         Arc::new(HealthChecker::new()),
+        Arc::new(CircuitBreakerCache::default()),
         PluginHttpClient::default(),
         Some(epoch_store(config)),
     )
@@ -388,6 +390,7 @@ async fn a_panicking_poller_is_restarted_and_recovers() {
         Arc::clone(&lb_cache),
         None,
         Arc::new(HealthChecker::new()),
+        Arc::new(CircuitBreakerCache::default()),
         DnsCache::new(Default::default()),
         Vec::new(),
         LoadBalancerAlgorithm::RoundRobin,
@@ -452,6 +455,7 @@ async fn a_clean_cancel_is_not_counted_as_a_crash() {
         lb_cache,
         None,
         Arc::new(HealthChecker::new()),
+        Arc::new(CircuitBreakerCache::default()),
         DnsCache::new(Default::default()),
         Vec::new(),
         LoadBalancerAlgorithm::RoundRobin,
@@ -496,6 +500,7 @@ async fn a_superseded_generation_neither_restarts_nor_publishes() {
         lb_cache,
         None,
         Arc::new(HealthChecker::new()),
+        Arc::new(CircuitBreakerCache::default()),
         DnsCache::new(Default::default()),
         Vec::new(),
         LoadBalancerAlgorithm::RoundRobin,
@@ -619,6 +624,7 @@ async fn apply_under_generation(
     lb_cache: &LoadBalancerCache,
     dns_cache: &DnsCache,
     health_checker: &HealthChecker,
+    circuit_breaker_cache: &CircuitBreakerCache,
     cancel_rx: &tokio::sync::watch::Receiver<bool>,
 ) -> ferrum_edge::_test_support::DiscoveryApplyControlForTest {
     ferrum_edge::_test_support::apply_service_discovery_snapshot_for_generation_for_test(
@@ -636,6 +642,7 @@ async fn apply_under_generation(
         &None,
         dns_cache,
         health_checker,
+        circuit_breaker_cache,
         lifecycle_key,
         generation,
     )
@@ -674,6 +681,7 @@ async fn a_closed_lifecycle_channel_prevents_discovery_publication() {
         &None,
         &dns_cache,
         &health_checker,
+        &CircuitBreakerCache::default(),
     )
     .await;
     assert_eq!(
@@ -700,6 +708,7 @@ async fn a_closed_lifecycle_channel_prevents_discovery_publication() {
         &Some(shutdown_rx),
         &dns_cache,
         &health_checker,
+        &CircuitBreakerCache::default(),
     )
     .await;
     assert_eq!(
@@ -737,6 +746,7 @@ async fn a_superseded_generation_publishes_no_discovered_snapshot() {
         &lb_cache,
         &dns_cache,
         &health_checker,
+        &CircuitBreakerCache::default(),
         &cancel_rx,
     )
     .await;
@@ -758,6 +768,7 @@ async fn a_superseded_generation_publishes_no_discovered_snapshot() {
         &lb_cache,
         &dns_cache,
         &health_checker,
+        &CircuitBreakerCache::default(),
         &cancel_rx,
     )
     .await;
@@ -810,6 +821,7 @@ async fn recovery_from_an_unclaimed_stale_window_clears_cached_readiness() {
         &lb_cache,
         &dns_cache,
         &health_checker,
+        &CircuitBreakerCache::default(),
         &cancel_rx,
     )
     .await;
@@ -839,6 +851,7 @@ async fn recovery_from_an_unclaimed_stale_window_clears_cached_readiness() {
         &lb_cache,
         &dns_cache,
         &health_checker,
+        &CircuitBreakerCache::default(),
         &cancel_rx,
     )
     .await;
@@ -982,6 +995,7 @@ async fn a_superseded_supervisor_does_not_withdraw_when_its_staleness_bound_elap
         Arc::clone(&lb_cache),
         None,
         Arc::new(HealthChecker::new()),
+        Arc::new(CircuitBreakerCache::default()),
         DnsCache::new(Default::default()),
         statics,
         LoadBalancerAlgorithm::RoundRobin,
@@ -1089,6 +1103,7 @@ async fn expiry_withdraws_discovered_targets_and_retains_static_targets() {
         Arc::clone(&lb_cache),
         None,
         Arc::new(HealthChecker::new()),
+        Arc::new(CircuitBreakerCache::default()),
         DnsCache::new(Default::default()),
         statics,
         LoadBalancerAlgorithm::RoundRobin,
@@ -1164,6 +1179,7 @@ async fn expiry_recovers_and_republishes_without_a_config_reload() {
         lb_cache,
         None,
         Arc::new(HealthChecker::new()),
+        Arc::new(CircuitBreakerCache::default()),
         DnsCache::new(Default::default()),
         Vec::new(),
         LoadBalancerAlgorithm::RoundRobin,
@@ -1235,6 +1251,7 @@ async fn expiry_withdrawal_is_not_blocked_by_a_hung_discovery_call() {
         lb_cache,
         None,
         Arc::new(HealthChecker::new()),
+        Arc::new(CircuitBreakerCache::default()),
         DnsCache::new(Default::default()),
         Vec::new(),
         LoadBalancerAlgorithm::RoundRobin,
@@ -1302,6 +1319,7 @@ async fn failed_expiry_publication_retries_and_fails_readiness_closed() {
         lb_cache,
         Some(exhausted_store),
         Arc::new(HealthChecker::new()),
+        Arc::new(CircuitBreakerCache::default()),
         DnsCache::new(Default::default()),
         Vec::new(),
         LoadBalancerAlgorithm::RoundRobin,
@@ -1371,6 +1389,7 @@ async fn fail_readiness_policy_degrades_readiness_until_recovery() {
         lb_cache,
         None,
         Arc::new(HealthChecker::new()),
+        Arc::new(CircuitBreakerCache::default()),
         DnsCache::new(Default::default()),
         Vec::new(),
         LoadBalancerAlgorithm::RoundRobin,
@@ -1429,6 +1448,7 @@ async fn retain_policy_keeps_targets_but_still_reports_staleness() {
         lb_cache,
         None,
         Arc::new(HealthChecker::new()),
+        Arc::new(CircuitBreakerCache::default()),
         DnsCache::new(Default::default()),
         Vec::new(),
         LoadBalancerAlgorithm::RoundRobin,
@@ -1545,6 +1565,7 @@ fn expiry_probe(
         lb_cache,
         None,
         Arc::new(HealthChecker::new()),
+        Arc::new(CircuitBreakerCache::default()),
         DnsCache::new(Default::default()),
         static_targets,
         LoadBalancerAlgorithm::RoundRobin,
@@ -1864,6 +1885,7 @@ async fn a_crash_looping_poller_still_expires_and_withdraws_during_restart_backo
         Arc::clone(&lb_cache),
         None,
         Arc::new(HealthChecker::new()),
+        Arc::new(CircuitBreakerCache::default()),
         DnsCache::new(Default::default()),
         statics,
         LoadBalancerAlgorithm::RoundRobin,
@@ -2047,6 +2069,7 @@ async fn expiry_withdraws_on_time_while_publication_preparation_is_blocked() {
         Arc::clone(&lb_cache),
         None,
         Arc::new(HealthChecker::new()),
+        Arc::new(CircuitBreakerCache::default()),
         DnsCache::new(Default::default()),
         statics,
         LoadBalancerAlgorithm::RoundRobin,
@@ -2166,6 +2189,7 @@ async fn cancellation_stops_a_task_parked_in_publication_preparation() {
         Arc::clone(&lb_cache),
         None,
         Arc::new(HealthChecker::new()),
+        Arc::new(CircuitBreakerCache::default()),
         DnsCache::new(Default::default()),
         Vec::new(),
         LoadBalancerAlgorithm::RoundRobin,
@@ -2222,6 +2246,7 @@ async fn a_retain_policy_expiry_keeps_a_pending_publication_alive() {
         Arc::clone(&lb_cache),
         None,
         Arc::new(HealthChecker::new()),
+        Arc::new(CircuitBreakerCache::default()),
         DnsCache::new(Default::default()),
         Vec::new(),
         LoadBalancerAlgorithm::RoundRobin,
@@ -2462,4 +2487,111 @@ async fn a_refused_unbounded_retention_request_is_bounded_to_one_active_task() {
     );
 
     manager.stop();
+}
+
+/// Issue #4516: circuit-breaker entries must be reclaimed by the
+/// service-discovery publish path, not only by a `GatewayConfig` delta.
+///
+/// Publishes several target generations for one upstream through the exact
+/// production admission → publication pipeline, minting a breaker per live
+/// target after each publication the way dispatch does. Before the fix the
+/// cache grew monotonically with pod churn until it hit its ceiling; now its
+/// occupancy tracks the live target set.
+#[tokio::test]
+async fn service_discovery_target_churn_reclaims_circuit_breaker_entries() {
+    let _guard = isolated().await;
+
+    let upstream_id = "breaker-churn";
+    let mut config = config_with(vec![upstream_with_sd(upstream_id, Vec::new(), None)]);
+    let proxy: ferrum_edge::config::types::Proxy = serde_json::from_value(serde_json::json!({
+        "id": "breaker-churn-proxy",
+        "listen_path": "/churn",
+        "backend_scheme": "http",
+        "backend_host": "unused.local",
+        "backend_port": 1,
+        "upstream_id": upstream_id,
+    }))
+    .expect("proxy fixture");
+    config.proxies.push(proxy);
+    config.normalize_fields();
+
+    let lb_cache = LoadBalancerCache::new(&config);
+    let dns_cache = DnsCache::new(Default::default());
+    let health_checker = HealthChecker::new();
+    let breakers = CircuitBreakerCache::with_max_entries(64);
+    let request_epoch = Some(epoch_store(&config));
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let breaker_config = ferrum_edge::config::types::CircuitBreakerConfig::default();
+
+    let mut state = ferrum_edge::_test_support::DiscoveryLoopStateForTest::new();
+    let ns = default_namespace();
+
+    // Five successive pod generations, two live pods each, no overlap.
+    for generation in 0..5u16 {
+        let live = vec![
+            target(&format!("pod-{}.local", generation * 2), 8080),
+            target(&format!("pod-{}.local", generation * 2 + 1), 8080),
+        ];
+
+        let control = ferrum_edge::_test_support::apply_service_discovery_snapshot_for_test(
+            &ns,
+            upstream_id,
+            "scripted",
+            DiscoverySnapshot::from_targets(live.clone()),
+            &mut state,
+            &lb_cache,
+            &request_epoch,
+            &[],
+            LoadBalancerAlgorithm::RoundRobin,
+            &None,
+            &cancel_rx,
+            &None,
+            &dns_cache,
+            &health_checker,
+            &breakers,
+        )
+        .await;
+        assert_eq!(
+            control,
+            ferrum_edge::_test_support::DiscoveryApplyControlForTest::Continue
+        );
+
+        // Dispatch mints one breaker per live target on the next request.
+        for live_target in &live {
+            breakers.get_or_create(
+                &ns,
+                "breaker-churn-proxy",
+                Some(&ferrum_edge::circuit_breaker::target_key(
+                    &live_target.host,
+                    live_target.port,
+                )),
+                &breaker_config,
+            );
+        }
+
+        assert_eq!(
+            breakers.len(),
+            live.len(),
+            "breaker cache occupancy must track the live target set, not grow with churn \
+             (generation {generation})"
+        );
+    }
+
+    // The final generation's targets are the only ones still resident.
+    assert!(
+        breakers
+            .peek(&ns, "breaker-churn-proxy", Some("pod-8.local:8080"))
+            .is_some()
+    );
+    assert!(
+        breakers
+            .peek(&ns, "breaker-churn-proxy", Some("pod-0.local:8080"))
+            .is_none(),
+        "a retired target's breaker must not survive later publications"
+    );
+    assert_eq!(
+        breakers.admission_refused_total(),
+        0,
+        "reclaimed entries mean the ceiling is never reached in this churn pattern"
+    );
 }

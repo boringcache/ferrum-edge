@@ -102,7 +102,9 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Env var:** `FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES`.
 
-**Cleanup mechanism:** Stale entries for targets that no longer exist in the configuration are pruned on every config reload. When the cache reaches the max entry count, new circuit breaker entries for previously-unseen targets are not created (the request proceeds without circuit breaker protection for that target). This prevents unbounded growth from target churn in environments with dynamic upstreams.
+**Cleanup mechanism:** Stale entries are reclaimed on two axes. On every config reload, breakers for removed proxies and for targets that no longer exist in the configuration are pruned. On every **service-discovery publication** (including a bounded-staleness withdrawal), the breakers for targets that the provider retired are released for each proxy routing to the discovered upstream, in the same pass that reclaims that proxy's passive health state -- so Kubernetes / Consul / DNS-SD pod churn does not accumulate dead entries while `GatewayConfig` is unchanged.
+
+When the cache reaches the max entry count, new circuit breaker entries for previously-unseen targets are not created (the request proceeds on a transient breaker that accumulates no failures, so it can never open for that target). `ferrum_circuit_breaker_cache_admission_refused_total` counts each such request; alert on it rising and raise `FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES`.
 
 ### Health Check State
 

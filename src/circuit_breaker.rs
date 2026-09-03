@@ -668,6 +668,12 @@ pub struct CircuitBreakerCache {
     /// take a read guard on every shard.
     entry_count: AtomicUsize,
     max_entries: usize,
+    /// Monotonic count of admissions refused because the cache was at
+    /// `max_entries`. Exported as
+    /// `ferrum_circuit_breaker_cache_admission_refused_total` so ceiling
+    /// pressure is observable before circuit breaking silently degrades to
+    /// transient (stateless) breakers for every newly discovered target.
+    admission_refused: AtomicU64,
 }
 
 impl Default for CircuitBreakerCache {
@@ -694,6 +700,7 @@ impl CircuitBreakerCache {
             breakers: DashMap::with_shard_amount(shard_amount),
             entry_count: AtomicUsize::new(0),
             max_entries,
+            admission_refused: AtomicU64::new(0),
         }
     }
 
@@ -741,6 +748,7 @@ impl CircuitBreakerCache {
             }
             Entry::Vacant(vacant) => {
                 if !self.try_reserve_entry_slot() {
+                    self.admission_refused.fetch_add(1, Ordering::Relaxed);
                     warn!(
                         "Circuit breaker cache at capacity ({}), skipping new entry for {}",
                         self.max_entries,
@@ -897,6 +905,57 @@ impl CircuitBreakerCache {
         });
     }
 
+    /// Remove circuit breakers for one proxy's targets that are no longer live.
+    ///
+    /// Scoped counterpart to [`Self::prune_stale_targets`], called from the
+    /// service-discovery publish path (`install_merged_targets`) so retired
+    /// pod/endpoint churn reclaims breaker entries without waiting for a
+    /// `GatewayConfig` delta. Without it, every retired target permanently
+    /// holds one admission slot until the cache reaches `max_entries`, after
+    /// which `get_or_create` returns uncached transient breakers and circuit
+    /// breaking stops working for every newly discovered target (issue #4516).
+    ///
+    /// A key is removed only when ALL of the following hold:
+    /// - it is a per-target key (contains `::`),
+    /// - it is inside exactly this proxy's `namespace|proxy_id::` scope, and
+    /// - its `host:port` suffix is absent from `live_targets`.
+    ///
+    /// Every key outside this proxy's scope is left untouched. That scoping is
+    /// what makes this safe where recomputing a global active-key set from a
+    /// single upstream's publication would not be (the #4159 over-prune).
+    /// Resource ids cannot contain `:` (`validate_resource_id`), so the scope
+    /// prefix cannot straddle a neighbouring proxy's key.
+    ///
+    /// The scope prefix is built from the same key helper `scoped_cache_key`
+    /// uses, so the minting and reclaiming forms cannot drift.
+    pub fn prune_stale_targets_for_proxy(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+        live_targets: &[crate::config::types::UpstreamTarget],
+    ) {
+        let scope_prefix = format!(
+            "{}::",
+            crate::config::db_backend::namespaced_runtime_key(namespace, proxy_id)
+        );
+        let live: std::collections::HashSet<String> = live_targets
+            .iter()
+            .map(|target| target_key(&target.host, target.port))
+            .collect();
+        self.breakers.retain(|key, _| {
+            // Not this proxy's per-target scope: another proxy's keys and the
+            // proxy-scoped UDP/DTLS form (no "::") are never touched here.
+            let Some(host_port) = key.strip_prefix(&scope_prefix) else {
+                return true;
+            };
+            let keep = live.contains(host_port);
+            if !keep {
+                self.release_entry_slot();
+            }
+            keep
+        });
+    }
+
     /// Configured admission ceiling for distinct breaker keys.
     ///
     /// Exported as `ferrum_circuit_breaker_cache_max_entries` so operators can
@@ -904,6 +963,16 @@ impl CircuitBreakerCache {
     /// breakers stop being admitted.
     pub fn max_entries(&self) -> usize {
         self.max_entries
+    }
+
+    /// Admissions refused so far because the cache was at `max_entries`.
+    ///
+    /// Every refusal is one request that received a transient, uncached
+    /// breaker: its failures never accumulate, so the breaker for that target
+    /// can never open. A non-zero and rising value means circuit breaking is
+    /// silently degraded for newly seen proxy/target keys.
+    pub fn admission_refused_total(&self) -> u64 {
+        self.admission_refused.load(Ordering::Relaxed)
     }
 
     /// Current number of entries in the cache.

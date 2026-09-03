@@ -9448,6 +9448,7 @@ impl ProxyState {
             load_balancer_cache.clone(),
             dns_cache.clone(),
             health_checker.clone(),
+            circuit_breaker_cache.clone(),
             plugin_http_client,
             Some(request_epoch.clone()),
         ));
