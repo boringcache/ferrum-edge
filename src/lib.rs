@@ -10037,6 +10037,14 @@ pub mod _test_support {
         crate::socket_opts::send_queue_probe_supported()
     }
 
+    /// Debug-build counters for every link of the bundled HTTP client's
+    /// socket handoff and the upload pump's post-EOS drain judgment (issue
+    /// #4411), so an acceptance test that misses the drain bound can report
+    /// which link never happened. Empty in release builds.
+    pub fn post_eos_drain_diagnostics() -> Vec<(&'static str, u64)> {
+        crate::proxy::backend_send_queue::diagnostics::snapshot()
+    }
+
     /// Send-queue depth of a raw descriptor, through the same handle the
     /// bundled HTTP client's dispatch path builds from vendored reqwest patch
     /// 004's `established` callback (issue #4411).

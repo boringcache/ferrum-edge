@@ -746,6 +746,21 @@ async fn post_upload(
     (status, header, body, elapsed)
 }
 
+/// The envelope check for the post-EOS drain bound, with the debug-build
+/// handoff counters in the failure message so a miss names the link that
+/// never happened (hook not reached, published out of scope, pump unarmed,
+/// no socket, watch cancelled, queue drained) rather than only the elapsed time.
+fn assert_drain_bound_envelope(elapsed: Duration) {
+    let ceiling = Duration::from_millis(WRITE_TIMEOUT_MS + 1500);
+    let diagnostics = ferrum_edge::_test_support::post_eos_drain_diagnostics();
+    assert!(
+        elapsed <= ceiling,
+        "timed out too slowly: {elapsed:?} > ceiling {ceiling:?} (timeout was \
+         {WRITE_TIMEOUT_MS}ms); drain handoff diagnostics: {diagnostics:?}"
+    );
+    assert_timeout_envelope(elapsed, WRITE_TIMEOUT_MS);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn in_process_kernel_absorb_write_timeout_maps_to_504() {
     if !ferrum_edge::_test_support::send_queue_probe_supported() {
@@ -783,7 +798,7 @@ async fn in_process_kernel_absorb_write_timeout_maps_to_504() {
         "timeout must carry X-Gateway-Error=backend_timeout, body={body}"
     );
     assert_eq!(body, r#"{"error":"Backend timeout"}"#);
-    assert_timeout_envelope(elapsed, WRITE_TIMEOUT_MS);
+    assert_drain_bound_envelope(elapsed);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -821,7 +836,7 @@ async fn in_process_h2c_kernel_absorb_write_timeout_maps_to_504() {
         "timeout must carry X-Gateway-Error=backend_timeout, body={body}"
     );
     assert_eq!(body, r#"{"error":"Backend timeout"}"#);
-    assert_timeout_envelope(elapsed, WRITE_TIMEOUT_MS);
+    assert_drain_bound_envelope(elapsed);
 }
 
 // ── Vendored reqwest patch 004: the behavioral regression that must survive

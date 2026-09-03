@@ -108,6 +108,7 @@ use bytes::Bytes;
 use http_body::Frame;
 
 use crate::proxy::RequestAuthLifetimePlan;
+use crate::proxy::backend_send_queue::diagnostics as drain_diagnostics;
 use crate::proxy::backend_send_queue::{
     BackendSocketHandle, BackendSocketSlot, await_send_queue_stall,
 };
@@ -867,6 +868,13 @@ where
         return outcome;
     }
     if outcome != UploadPumpOutcome::Completed || !write_configured || !write_armed {
+        if write_configured {
+            if outcome == UploadPumpOutcome::Completed {
+                drain_diagnostics::bump(&drain_diagnostics::POST_EOS_UNARMED);
+            } else {
+                drain_diagnostics::bump(&drain_diagnostics::POST_EOS_NOT_COMPLETED);
+            }
+        }
         return outcome;
     }
     // Post-EOS transport-drain bound (issue #4411).
@@ -888,18 +896,25 @@ where
         // HTTP/3, or a bundled-HTTP-client request served on an ALREADY-POOLED
         // connection (nothing was dialed, so patch 004's hook never fired).
         // Disarmed exactly as before #4411; `backend_read_timeout_ms` governs.
+        drain_diagnostics::bump(&drain_diagnostics::POST_EOS_NO_SOCKET);
         return outcome;
     };
+    drain_diagnostics::bump(&drain_diagnostics::POST_EOS_WATCHED);
     let stalled = tokio::select! {
         biased;
         // A dispatcher that got its response head (or gave up) cancels; the
         // drain is only interesting while the header wait is still running.
-        () = cancel_requested(&mut cancel) => false,
+        () = cancel_requested(&mut cancel) => {
+            drain_diagnostics::bump(&drain_diagnostics::POST_EOS_CANCELLED);
+            false
+        }
         stalled = await_send_queue_stall(socket, write_timeout_ms) => stalled,
     };
     if !stalled {
+        drain_diagnostics::bump(&drain_diagnostics::POST_EOS_NOT_STALLED);
         return outcome;
     }
+    drain_diagnostics::bump(&drain_diagnostics::POST_EOS_STALLED);
     // Deliberately WITHOUT restating the shared terminal: the upload itself did
     // complete cleanly and the transport already observed that end of stream.
     // Rewriting it to a non-clean terminal would describe a whole upload as a

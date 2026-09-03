@@ -312,12 +312,98 @@ where
 /// request with no upload pump) and for a slot that is already filled.
 #[cfg(unix)]
 pub(crate) fn publish_reqwest_backend_socket(fd: std::os::fd::RawFd) {
-    let _ = REQWEST_BACKEND_SOCKET.try_with(|slot| {
+    diagnostics::bump(&diagnostics::ESTABLISHED_REPORTS);
+    let published = REQWEST_BACKEND_SOCKET.try_with(|slot| {
         if slot.get().is_some() {
+            diagnostics::bump(&diagnostics::SLOT_ALREADY_FILLED);
             return;
         }
-        if let Some(handle) = BackendSocketHandle::duplicate_from_raw_fd(fd) {
-            let _ = slot.set(handle);
+        match BackendSocketHandle::duplicate_from_raw_fd(fd) {
+            Some(handle) => {
+                let _ = slot.set(handle);
+                diagnostics::bump(&diagnostics::SOCKET_PUBLISHED);
+            }
+            None => diagnostics::bump(&diagnostics::SOCKET_DUP_FAILED),
         }
     });
+    if published.is_err() {
+        diagnostics::bump(&diagnostics::ESTABLISHED_OUT_OF_SCOPE);
+    }
+}
+
+/// Debug-build counters for every link of the bundled-client socket handoff
+/// and the post-EOS drain judgment (issue #4411).
+///
+/// Compiled to no-ops in release builds. Read through
+/// `_test_support::post_eos_drain_diagnostics`, so an in-process acceptance
+/// test that misses the drain bound can say WHICH link never happened instead
+/// of only reporting the elapsed time.
+pub(crate) mod diagnostics {
+    #[cfg(debug_assertions)]
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[cfg(debug_assertions)]
+    pub(crate) struct Counter {
+        pub(crate) name: &'static str,
+        value: AtomicU64,
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub(crate) struct Counter;
+
+    #[cfg(debug_assertions)]
+    macro_rules! counters {
+        ($($name:ident),* $(,)?) => {
+            $(pub(crate) static $name: Counter = Counter {
+                name: stringify!($name),
+                value: AtomicU64::new(0),
+            };)*
+            static ALL: &[&Counter] = &[$(&$name),*];
+        };
+    }
+
+    #[cfg(not(debug_assertions))]
+    macro_rules! counters {
+        ($($name:ident),* $(,)?) => {
+            $(pub(crate) static $name: Counter = Counter;)*
+        };
+    }
+
+    counters!(
+        ESTABLISHED_REPORTS,
+        ESTABLISHED_OUT_OF_SCOPE,
+        SLOT_ALREADY_FILLED,
+        SOCKET_PUBLISHED,
+        SOCKET_DUP_FAILED,
+        POST_EOS_NOT_COMPLETED,
+        POST_EOS_UNARMED,
+        POST_EOS_NO_SOCKET,
+        POST_EOS_WATCHED,
+        POST_EOS_CANCELLED,
+        POST_EOS_NOT_STALLED,
+        POST_EOS_STALLED,
+    );
+
+    #[inline]
+    pub(crate) fn bump(counter: &Counter) {
+        #[cfg(debug_assertions)]
+        counter.value.fetch_add(1, Ordering::Relaxed);
+        #[cfg(not(debug_assertions))]
+        let _ = counter;
+    }
+
+    /// Every counter's current value, in declaration order. Empty in release
+    /// builds.
+    pub(crate) fn snapshot() -> Vec<(&'static str, u64)> {
+        #[cfg(debug_assertions)]
+        {
+            ALL.iter()
+                .map(|counter| (counter.name, counter.value.load(Ordering::Relaxed)))
+                .collect()
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            Vec::new()
+        }
+    }
 }
