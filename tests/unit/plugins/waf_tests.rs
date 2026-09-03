@@ -7047,3 +7047,156 @@ fn on_body_too_large_openapi_runtime_parity() {
         );
     }
 }
+
+#[tokio::test]
+async fn structured_syntax_json_suffix_content_types_are_inspected() {
+    let plugin = recommended_enforcing_waf();
+
+    for content_type in [
+        "application/vnd.api+json",
+        "application/ld+json",
+        "application/merge-patch+json",
+        "application/json-patch+json",
+        "text/json",
+        // Parameters and casing must not defeat the suffix mapping.
+        "Application/VND.API+JSON; charset=utf-8",
+    ] {
+        let (result, request_ctx) = scan_body_with_content_type(
+            &plugin,
+            content_type,
+            br#"{"q":"id=1 UNION SELECT password FROM users"}"#,
+        )
+        .await;
+
+        assert!(
+            matches!(result, PluginResult::Reject { .. }),
+            "{content_type} body must be inspected and blocked"
+        );
+        assert!(
+            monitored(&request_ctx, "FE-SQLI-001-B"),
+            "{content_type} body must record FE-SQLI-001-B"
+        );
+    }
+}
+
+#[tokio::test]
+async fn structured_syntax_xml_suffix_content_types_are_inspected() {
+    let plugin = recommended_enforcing_waf();
+
+    for content_type in ["application/atom+xml", "application/soap+xml"] {
+        let (result, request_ctx) = scan_body_with_content_type(
+            &plugin,
+            content_type,
+            br#"<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><foo>&xxe;</foo>"#,
+        )
+        .await;
+
+        assert!(
+            matches!(result, PluginResult::Reject { .. }),
+            "{content_type} body must be inspected and blocked"
+        );
+        assert!(
+            monitored(&request_ctx, "FE-XXE-001"),
+            "{content_type} body must record FE-XXE-001"
+        );
+    }
+}
+
+#[tokio::test]
+async fn suffix_mapping_only_admits_xml_when_an_xml_family_entry_is_configured() {
+    // `text/xml` alone still means "XML" to an operator, so `+xml` is admitted.
+    let text_xml_only = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "paranoia_level": 1,
+        "body_content_types": ["text/xml"]
+    }))
+    .unwrap();
+
+    let (result, request_ctx) = scan_body_with_content_type(
+        &text_xml_only,
+        "application/atom+xml",
+        br#"<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><foo>&xxe;</foo>"#,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(monitored(&request_ctx, "FE-XXE-001"));
+}
+
+#[tokio::test]
+async fn opaque_binary_content_type_still_skips_body_inspection() {
+    let plugin = recommended_enforcing_waf();
+
+    let (result, request_ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/octet-stream",
+        b"id=1 UNION SELECT password FROM users",
+    )
+    .await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!monitored(&request_ctx, "FE-SQLI-001-B"));
+}
+
+#[tokio::test]
+async fn suffix_mapping_reuses_the_configured_allowlist_and_adds_no_hidden_types() {
+    // The suffix rule maps onto `application/json` / `application/xml` /
+    // `text/xml`; none of those is configured here, so `+json` stays excluded.
+    let text_plain_only = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "paranoia_level": 1,
+        "body_content_types": ["text/plain"]
+    }))
+    .unwrap();
+
+    let (result, request_ctx) = scan_body_with_content_type(
+        &text_plain_only,
+        "application/vnd.api+json",
+        br#"{"q":"id=1 UNION SELECT password FROM users"}"#,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!monitored(&request_ctx, "FE-SQLI-001-B"));
+
+    // The configured entry itself is unaffected.
+    let (allowed_result, allowed_ctx) = scan_body_with_content_type(
+        &text_plain_only,
+        "text/plain",
+        b"id=1 UNION SELECT password FROM users",
+    )
+    .await;
+    assert!(matches!(allowed_result, PluginResult::Reject { .. }));
+    assert!(monitored(&allowed_ctx, "FE-SQLI-001-B"));
+}
+
+#[tokio::test]
+async fn multipart_gate_is_unchanged_by_the_suffix_rule() {
+    // `multipart/` is decided by `inspect_multipart` before the suffix rule and
+    // a `+json` suffix on a multipart subtype must not smuggle past it.
+    let default_plugin = recommended_enforcing_waf();
+    let (result, request_ctx) = scan_body_with_content_type(
+        &default_plugin,
+        "multipart/related+json; boundary=abc",
+        b"id=1 UNION SELECT password FROM users",
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!monitored(&request_ctx, "FE-SQLI-001-B"));
+
+    let multipart_plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "paranoia_level": 1,
+        "inspect_multipart": true
+    }))
+    .unwrap();
+    let (result, request_ctx) = scan_body_with_content_type(
+        &multipart_plugin,
+        "multipart/form-data; boundary=abc",
+        b"id=1 UNION SELECT password FROM users",
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(monitored(&request_ctx, "FE-SQLI-001-B"));
+}

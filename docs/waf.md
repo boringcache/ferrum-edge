@@ -411,6 +411,25 @@ Request-body inspection is on by default for `POST`/`PUT`/`PATCH` with an
 inspectable `Content-Type` (`body_methods`, `body_content_types`). Multipart and
 binary bodies are opt-in (`inspect_multipart`, `inspect_binary_body`).
 
+The `Content-Type` is matched on its lowercased base media type with parameters
+stripped. RFC 6839 structured-syntax suffixes map onto their base family and
+re-check the same allowlist: a base type ending in `+json` is treated as
+`application/json`, and one ending in `+xml` as `application/xml` /`text/xml`.
+So `application/vnd.api+json`, `application/ld+json`,
+`application/merge-patch+json` and `application/json-patch+json` are inspected
+whenever `application/json` is in `body_content_types`, and
+`application/atom+xml` or `application/soap+xml` whenever either
+`application/xml` or `text/xml` is. This matters because mainstream backends
+(Spring's `MappingJackson2HttpMessageConverter`, ASP.NET Core's
+`SystemTextJsonInputFormatter`) parse `application/*+json` as JSON, so without
+the suffix rule one header token would defeat every body rule.
+
+The suffix rule reuses the configured allowlist rather than adding hidden types:
+if you remove `application/json` from `body_content_types`, `+json` types are
+excluded too, and a plugin configured with only `text/plain` inspects neither.
+`text/json` is in the default allowlist as an explicit entry, since it carries no
+suffix to key off.
+
 Response inspection is **off by default**. Enable `response_inspection` (and
 `response_body_inspection` for body rules) to run the disclosure and
 data-leak rules.
@@ -753,7 +772,7 @@ fire, then switch to `enforce`.
 | `max_scan_bytes` | int | `1048576` | body scan cap |
 | `on_body_too_large` | enum | `fail_closed` | `fail_closed` / `scan_truncated` / `skip` / `block` |
 | `body_methods` | string[] | `[POST,PUT,PATCH]` | methods whose bodies are scanned |
-| `body_content_types` | string[] | see code | inspectable content types |
+| `body_content_types` | string[] | `[application/json, text/json, application/x-www-form-urlencoded, application/xml, text/xml, text/plain, text/html]` | inspectable base content types; `+json` / `+xml` suffixed types match via their base family |
 | `inspect_multipart` | bool | `false` | scan multipart bodies |
 | `inspect_binary_body` | bool | `false` | scan bodies with unknown/binary type |
 | `disallowed_methods` | string[] | `[]` | methods flagged by FE-METHOD-001 |

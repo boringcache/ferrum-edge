@@ -24161,8 +24161,21 @@ components:
           type: array
           items:
             type: string
+          description: >-
+            Base media types whose request/response bodies are eligible for
+            inspection. Matching is on the lowercased base type with parameters
+            stripped. RFC 6839 structured-syntax suffixes map onto their base
+            family and re-check this list: a type ending in `+json` (for example
+            `application/vnd.api+json` or `application/ld+json`) is inspected
+            when `application/json` is listed, and one ending in `+xml` (for
+            example `application/atom+xml`) when either `application/xml` or
+            `text/xml` is listed. The suffix rule reuses this allowlist rather
+            than adding hidden types, so removing `application/json` also
+            excludes `+json` types. `multipart/*` is governed by
+            `inspect_multipart`; anything else by `inspect_binary_body`.
           default:
             - application/json
+            - text/json
             - application/x-www-form-urlencoded
             - application/xml
             - text/xml
