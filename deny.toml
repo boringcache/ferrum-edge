@@ -129,9 +129,23 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 [licenses]
 # Part of the blocking CI gate (see header). Every `[licenses.exceptions]` entry
-# MUST carry an owner, a rationale, and an `[expires:YYYY-MM-DD]` token in the
-# same style as `[advisories.ignore]`. scripts/check_advisory_expiry.sh does not
-# yet enforce license-exception expiry — track that as a follow-up.
+# MUST carry an owner, a rationale, and an `[expires:YYYY-MM-DD]` token, and
+# `scripts/check_advisory_expiry.sh` ENFORCES that on the per-PR
+# `dependency-audit` job and the weekly workflow alike: a missing token or a
+# passed date fails the run, exactly as for `[advisories.ignore]`.
+#
+# Token placement differs from advisories because the schema does. cargo-deny
+# 0.19.9 rejects any key inside an exceptions entry other than the crate spec
+# plus `allow` (`error[unexpected-keys] ... expected: ["allow"]`), so there is no
+# `reason` field to hold the rationale. Put it in a `#` comment immediately
+# preceding the entry (a trailing comment on the entry line also works):
+#
+#     exceptions = [
+#         # owner: <name> — <rationale> [expires:YYYY-MM-DD]
+#         { crate = "some-crate", allow = ["Some-License-1.0"] },
+#     ]
+#
+# The comment binds to ONE entry: the next entry needs its own token.
 version = 2
 # The workspace crate itself is PolyForm-Noncommercial (non-SPDX-OSI); skip
 # evaluating first-party member licenses.

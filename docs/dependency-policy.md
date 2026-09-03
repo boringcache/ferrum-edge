@@ -193,10 +193,56 @@ their upstream licenses (MIT, Apache-2.0, and similar permissive terms for the
 current patches) must fall within the allowlist or carry an explicit exception.
 
 Every `[licenses.exceptions]` entry must document an **owner**, a **rationale**,
-and an `[expires:YYYY-MM-DD]` token in the same style as `[advisories.ignore]`.
-`scripts/check_advisory_expiry.sh` enforces expiry for advisory exceptions only
-today — license-exception expiry is not yet automated and remains a documented
-follow-up.
+and an `[expires:YYYY-MM-DD]` token, and that is now **enforced** — not merely
+documented. `scripts/check_advisory_expiry.sh` walks the `exceptions` array in
+`deny.toml` and fails on a missing token or a passed date, on the per-PR
+`dependency-audit` job in `.github/workflows/ci.yml` **and** on the weekly
+`.github/workflows/dependency-audit.yml`. A first license exception therefore
+cannot become permanent by default, the same guarantee advisories already had.
+
+The token lives in a **comment**, not in the entry value, because cargo-deny's
+two schemas differ: an `[advisories.ignore]` table accepts a free-text `reason`
+field, while a `[licenses.exceptions]` entry does not — cargo-deny 0.19.9 rejects
+every key other than the crate spec plus `allow`
+(`error[unexpected-keys]: found 1 unexpected keys, expected: ["allow"]`). The
+convention is a `#` comment on the line immediately preceding the entry (a
+trailing comment on the entry line is also accepted), and it binds to exactly one
+entry:
+
+```toml
+exceptions = [
+    # owner: platform — vendored root-store data license [expires:2026-12-31]
+    { crate = "some-crate", allow = ["Some-License-1.0"] },
+]
+```
+
+Both the single-line `{ ... }` form and the multi-line `{` / `}` form are parsed.
+Run `scripts/check_advisory_expiry.sh --self-test` to exercise the checker
+against synthetic fixtures (valid entry, missing token, past date, string-form
+advisory ignore, empty/absent `exceptions`); both workflows run that self-test
+immediately before the real check, so the rule cannot rot into a no-op.
+
+### 3a. Third-party license inventory
+
+Both the per-PR `dependency-audit` job and the weekly workflow emit a crate →
+license listing from the **locked** graph:
+
+```bash
+cargo deny list --format json --layout crate > third-party-licenses.json
+```
+
+`cargo deny list` reads `cargo metadata` only and compiles nothing, so it needs
+no build. The file is uploaded as the `third-party-licenses` artifact
+(30-day retention); download it from the Artifacts section of the run summary for
+the relevant CI or Dependency Audit run. Producing it next to the gate that
+enforces the allowlist is what keeps shipped notices from silently diverging from
+what the tree actually resolves to.
+
+The inventory is **not** attached to GitHub Releases. `release.yml`'s
+`create-release` job is byte-frozen by the trusted publication boundary
+(`.github/scripts/verify_cross_build_policy.py`, see `docs/ci_cd.md` →
+"Publish-blocking required checks"), so adding a release asset there is a
+direct-to-`main` change no pull request can make.
 
 ### 4. Vendor drift guard
 
