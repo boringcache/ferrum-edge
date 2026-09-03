@@ -138,3 +138,4 @@ mod ws_frame_logging_tests;
 mod ws_logging_tests;
 mod ws_message_size_limiting_tests;
 mod ws_rate_limiting_tests;
+mod xml_bounds_tests;

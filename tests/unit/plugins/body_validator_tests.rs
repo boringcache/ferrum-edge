@@ -5812,3 +5812,117 @@ async fn advisory_2vmr_multiple_instances_remain_isolated() {
         Some(400),
     );
 }
+
+// ─── Pre-parse XML nesting depth (issue #4565) ─────────────────────────────
+//
+// `roxmltree`'s tokenizer recurses once per open element
+// (`parse_element` -> `parse_content` -> `parse_element`), so `XML_MAX_NODES`
+// alone cannot stop a deeply nested body from overflowing the worker stack
+// *inside* `Document::parse_with_options`. Element nesting is therefore
+// screened over the raw bytes first, bounded by the shared
+// `XML_MAX_NESTING_DEPTH` (256).
+
+/// A `<root>`-wrapped chain nested `levels` deep below the root element, so the
+/// document's maximum depth is `levels + 1`.
+fn nested_xml(levels: usize) -> String {
+    let mut xml = String::with_capacity(levels * 8 + 16);
+    xml.push_str("<root>");
+    for _ in 0..levels {
+        xml.push_str("<n>");
+    }
+    xml.push_str("leaf");
+    for _ in 0..levels {
+        xml.push_str("</n>");
+    }
+    xml.push_str("</root>");
+    xml
+}
+
+fn reject_body_of(result: &PluginResult) -> &str {
+    match result {
+        PluginResult::Reject { body, .. } => body.as_str(),
+        other => panic!("Expected Reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_xml_nesting_beyond_the_depth_bound_is_rejected_before_parse() {
+    let plugin = xml_plugin();
+    let body = nested_xml(300);
+    let mut ctx = make_xml_ctx(&body);
+    let mut headers = make_xml_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match &result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(*status_code, 400),
+        other => panic!("expected Reject for a nesting bomb, got {other:?}"),
+    }
+    assert!(
+        reject_body_of(&result).contains("document nesting exceeds the supported depth"),
+        "expected the fixed depth diagnostic, got: {}",
+        reject_body_of(&result)
+    );
+    // The diagnostic is a compiled-in constant; no body byte is echoed.
+    assert!(!reject_body_of(&result).contains("leaf"));
+}
+
+#[tokio::test]
+async fn test_xml_nesting_at_the_depth_bound_is_accepted() {
+    let plugin = xml_plugin();
+    // 255 nested children below `<root>` == depth 256, exactly the bound.
+    let mut ctx = make_xml_ctx(&nested_xml(255));
+    let mut headers = make_xml_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_xml_depth_screen_ignores_tags_inside_comments_and_cdata() {
+    let plugin = xml_plugin();
+    let mut body = String::from("<root><!--");
+    for _ in 0..600 {
+        body.push_str("<a><b><c>");
+    }
+    body.push_str("--><data><![CDATA[");
+    for _ in 0..600 {
+        body.push_str("<a><b><c>");
+    }
+    body.push_str("]]></data></root>");
+
+    let mut ctx = make_xml_ctx(&body);
+    let mut headers = make_xml_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_xml_depth_screen_does_not_end_a_tag_at_a_quoted_angle_bracket() {
+    let plugin = xml_plugin();
+    // A scan that is not quote-aware terminates each start tag at the `>`
+    // inside `note="/>"` and, seeing `/` as the last significant byte, mistakes
+    // every element for self-closing — so 300 real levels would measure as
+    // depth 1. Both `>` and `/` are legal unescaped inside an attribute value,
+    // so `roxmltree` accepts the document; only the screen may refuse it.
+    let mut body = String::from("<root>");
+    for _ in 0..300 {
+        body.push_str(r#"<n note="/>">"#);
+    }
+    body.push_str("leaf");
+    for _ in 0..300 {
+        body.push_str("</n>");
+    }
+    body.push_str("</root>");
+
+    let mut ctx = make_xml_ctx(&body);
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match &result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(*status_code, 400),
+        other => {
+            panic!("expected Reject: a quoted `>` must not terminate the start tag, got {other:?}")
+        }
+    }
+    assert!(
+        reject_body_of(&result).contains("document nesting exceeds the supported depth"),
+        "expected the fixed depth diagnostic, got: {}",
+        reject_body_of(&result)
+    );
+}

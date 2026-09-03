@@ -317,6 +317,7 @@ use super::utils::http_client::PluginHttpClient;
 use super::utils::redis_rate_limiter::{
     REDIS_PLUGIN_CONFIG_KEYS, RedisConfig, RedisRateLimitClient,
 };
+use super::utils::xml_bounds::{XML_MAX_NESTING_DEPTH, xml_nesting_depth_within_limit};
 use super::{Plugin, PluginResult, RequestContext};
 
 // ── Namespace URIs ──────────────────────────────────────────────────────────
@@ -358,6 +359,12 @@ const MAX_SIGNED_REFERENCES: usize = 8;
 
 /// Bounds for attacker-controlled XML work before signature trust exists.
 /// Legitimate SOAP and SAML signatures stay far below these ceilings.
+///
+/// `MAX_XML_NODES` bounds the parser's arena; `MAX_CANONICALIZATION_DEPTH`
+/// bounds this module's own post-parse canonicalization walk. Neither bounds
+/// `roxmltree`'s per-level tokenizer recursion, so `parse_bounded_xml` also
+/// applies the shared pre-parse [`XML_MAX_NESTING_DEPTH`] screen over the raw
+/// bytes before the document reaches the parser.
 const MAX_XML_NODES: u32 = 65_536;
 const MAX_CANONICALIZATION_DEPTH: usize = 256;
 const MAX_INCLUSIVE_NAMESPACE_PREFIXES: usize = 64;
@@ -5194,6 +5201,16 @@ struct ReferenceTransforms {
 }
 
 fn parse_bounded_xml<'a>(xml: &'a str, context: &str) -> Result<Document<'a>, String> {
+    // Element nesting is screened over the raw bytes first: `roxmltree`'s
+    // tokenizer recurses once per open element, so `nodes_limit` below cannot
+    // stop a deeply nested envelope from overflowing the worker stack inside
+    // `parse_with_options`. `context` is a compiled-in call-site literal; no
+    // envelope byte is interpolated.
+    if !xml_nesting_depth_within_limit(xml, XML_MAX_NESTING_DEPTH) {
+        return Err(format!(
+            "WS-Security: {context} XML nesting exceeds the supported depth"
+        ));
+    }
     Document::parse_with_options(
         xml,
         ParsingOptions {
