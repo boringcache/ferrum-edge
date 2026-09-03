@@ -46,6 +46,7 @@ use crate::plugins::{
     StreamConnectionContext, StreamTransactionSummary, UdpDatagramContext, UdpDatagramDirection,
     UdpDatagramVerdict, UdpMetadataSink,
 };
+use crate::proxy::LoadBalancerConnectionGuard;
 use crate::proxy::datagram_client_address::{
     DatagramClientAddressGate, DatagramClientIdentity, DatagramMetadataError,
 };
@@ -311,6 +312,17 @@ struct UdpSession {
     /// `Arc<UdpSession>` drops so listener-local caches cannot pin the global
     /// overload counter past session expiry.
     overload_guard: std::sync::Mutex<Option<crate::overload::ConnectionGuard>>,
+    /// RAII guard that increments the load balancer's active-connection gauge
+    /// for the selected backend target on construction and decrements it on
+    /// drop, so `least_connections` distributes UDP/DTLS sessions instead of
+    /// pinning every one to the first healthy target (issue #4514). `None` for
+    /// direct-backend proxies, which own no balancer.
+    ///
+    /// Released through the SAME take-before-final-removal path as
+    /// [`Self::overload_guard`] ([`Self::release_session_guards`]) so listener-local
+    /// caches cannot pin the gauge past session expiry, and so there is exactly
+    /// one eager release path rather than two.
+    lb_guard: std::sync::Mutex<Option<LoadBalancerConnectionGuard>>,
     /// Bounded client→backend ingress channel for sessions that run
     /// `on_udp_datagram` hooks. The shared listener recv loop enqueues here
     /// (never awaits hooks) so a slow Redis/I/O-bound plugin for one client
@@ -547,12 +559,22 @@ impl UdpSession {
         Some(termination)
     }
 
-    fn release_overload_guard(&self) {
+    /// Eagerly release both per-session RAII guards — the global overload
+    /// connection count and the load balancer's active-connection gauge for the
+    /// selected target. One function so the two can never diverge; both are
+    /// idempotent, and both are also released by `Drop` if a teardown path
+    /// never reaches here.
+    fn release_session_guards(&self) {
         let mut guard = self
             .overload_guard
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.take();
+        let mut lb_guard = self
+            .lb_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        lb_guard.take();
     }
 
     /// Drop the hook-ingress sender so an idle per-session worker wakes from
@@ -4646,7 +4668,7 @@ fn spawn_session_cleanup(
                             session.close_hook_ingress();
                             let bs = session.bytes_sent.load(Ordering::Relaxed);
                             let br = session.bytes_received.load(Ordering::Relaxed);
-                            session.release_overload_guard();
+                            session.release_session_guards();
                             metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
                             debug!(
                                 proxy_id = %proxy_id,
@@ -6596,6 +6618,42 @@ async fn handle_dtls_client_inner(
     // Populate backend target as soon as it's known — even if DNS or connect fails.
     backend_info.backend_target = format!("{}:{}", backend_host, backend_port);
 
+    // Least-connection accounting for the DTLS session's lifetime (issue
+    // #4514). Unlike plain UDP, a DTLS session has no `UdpSession` record: this
+    // task IS the session, so the guard is a local held to the end of the
+    // relay and dropped on every early return, cancellation, and panic unwind.
+    let lb_balancer = proxy.upstream_id.as_deref().and_then(|upstream_id| {
+        crate::proxy::mesh_tcp_egress::connection_balancer(
+            &epoch.load_balancer,
+            &proxy.namespace,
+            upstream_id,
+        )
+    });
+    let lb_target = lb_balancer.is_some().then(|| {
+        Arc::new(crate::proxy::stream_lb_accounting_target(
+            &backend_host,
+            backend_port,
+            backend_port,
+        ))
+    });
+    let _lb_guard = LoadBalancerConnectionGuard::new(lb_target.clone(), lb_balancer.clone());
+    // Setup between here and the established backend abandons the selection on
+    // any `?`; the penalty sample is owed once, from `Drop`.
+    // Passive failure sampling follows the same precedence rule the HTTP path
+    // uses: active health-check probes win outright, so the penalty sample is
+    // recorded only when no active probes are running for this upstream.
+    let lb_passive_latency = proxy.upstream_id.as_deref().is_some_and(|upstream_id| {
+        !health_checker.has_running_active_probes(&proxy.namespace, upstream_id)
+    });
+    let mut lb_setup_failure = crate::proxy::StreamLbSetupFailureGuard::new(
+        lb_target,
+        if lb_passive_latency {
+            lb_balancer.clone()
+        } else {
+            None
+        },
+    );
+
     // Circuit breaker check — reject before creating backend connection if open.
     // When admitted, capture whether this is a half-open probe so downstream
     // record_failure/record_success calls only decrement the in-flight counter
@@ -6737,6 +6795,7 @@ async fn handle_dtls_client_inner(
             return Err(error);
         }
     };
+    lb_setup_failure.disarm();
     backend_info.backend_resolved_ip = Some(backend_addr.ip().to_string());
     let (backend_udp, backend_dtls) = match connected {
         ConnectedUdpBackend::Plain(socket) => (Some(Arc::new(socket)), None),
@@ -7493,6 +7552,46 @@ async fn create_session(
     // rather than the proxy's configured default.
     progress.record_backend_selection(&backend_host, backend_port);
 
+    // Least-connection accounting for the session's lifetime (issue #4514).
+    // Without this every UDP/DTLS target reports zero active connections
+    // forever and `least_connections` pins every session to the first healthy
+    // target. The guard is moved onto the session below, so it is released
+    // exactly once on every teardown path — idle expiry, auth-lifetime expiry,
+    // listener shutdown — through `release_session_guards`, and by `Drop` if a
+    // path never reaches there. Direct-backend proxies own no balancer and get
+    // the no-op form.
+    let lb_balancer = proxy.upstream_id.as_deref().and_then(|upstream_id| {
+        crate::proxy::mesh_tcp_egress::connection_balancer(
+            &epoch.load_balancer,
+            &proxy.namespace,
+            upstream_id,
+        )
+    });
+    let lb_target = lb_balancer.is_some().then(|| {
+        Arc::new(crate::proxy::stream_lb_accounting_target(
+            &backend_host,
+            backend_port,
+            backend_port,
+        ))
+    });
+    let lb_guard = LoadBalancerConnectionGuard::new(lb_target.clone(), lb_balancer.clone());
+    // Every `?` below this point abandons the selection, so the penalty sample
+    // is owed from `Drop` rather than from each individual failure arm.
+    // Passive failure sampling follows the same precedence rule the HTTP path
+    // uses: active health-check probes win outright, so the penalty sample is
+    // recorded only when no active probes are running for this upstream.
+    let lb_passive_latency = proxy.upstream_id.as_deref().is_some_and(|upstream_id| {
+        !health_checker.has_running_active_probes(&proxy.namespace, upstream_id)
+    });
+    let mut lb_setup_failure = crate::proxy::StreamLbSetupFailureGuard::new(
+        lb_target,
+        if lb_passive_latency {
+            lb_balancer.clone()
+        } else {
+            None
+        },
+    );
+
     // Circuit breaker check — reject before creating backend socket if open.
     // When admitted, capture whether this is a half-open probe so downstream
     // record_failure/record_success calls only decrement the in-flight counter
@@ -7803,6 +7902,7 @@ async fn create_session(
         overload_guard: std::sync::Mutex::new(Some(crate::overload::ConnectionGuard::new(
             overload,
         ))),
+        lb_guard: std::sync::Mutex::new(Some(lb_guard)),
         hook_ingress_tx: std::sync::Mutex::new(hook_ingress_tx),
         hook_ingress_queued_bytes,
         hook_ingress_stop_notify: Arc::new(tokio::sync::Notify::new()),
@@ -8529,7 +8629,7 @@ async fn create_session(
                                             })
                                             .is_some()
                                         {
-                                            reply_session.release_overload_guard();
+                                            reply_session.release_session_guards();
                                             reply_metrics
                                                 .active_sessions
                                                 .fetch_sub(1, Ordering::Relaxed);
@@ -8739,7 +8839,7 @@ async fn create_session(
             .remove_if(&session_key, |_, v| Arc::ptr_eq(v, &reply_session))
             .is_some()
         {
-            reply_session.release_overload_guard();
+            reply_session.release_session_guards();
             reply_metrics
                 .active_sessions
                 .fetch_sub(1, Ordering::Relaxed);
@@ -8781,6 +8881,9 @@ async fn create_session(
         }
     });
 
+    // Committed: the session owns the connection guard and the reply task is
+    // running, so no failed-attempt penalty is owed for this selection.
+    lb_setup_failure.disarm();
     Ok(session)
 }
 
@@ -8952,16 +9055,21 @@ fn udp_port_lane_selection_supported(
     else {
         return Ok(false);
     };
-    let unsupported_algorithm = match override_config.algorithm {
-        Some(crate::config::types::LoadBalancerAlgorithm::LeastConnections) => Some("LEAST_CONN"),
-        Some(crate::config::types::LoadBalancerAlgorithm::LeastLatency) => Some("LEAST_LATENCY"),
-        _ => None,
-    };
-    if let Some(algorithm) = unsupported_algorithm {
+    // `LEAST_CONN` is supported here: every UDP/DTLS session now holds a
+    // `LoadBalancerConnectionGuard` for its lifetime (issue #4514), and
+    // `select_for_port` reads the balancer-level active-connection counters
+    // those guards feed. `LEAST_LATENCY` stays refused uniformly on stream
+    // proxies: UDP/DTLS has no per-request RTT sample, so a per-port latency
+    // lane would be fed on TCP and silently inert here.
+    if matches!(
+        override_config.algorithm,
+        Some(crate::config::types::LoadBalancerAlgorithm::LeastLatency)
+    ) {
         return Err(StreamSetupError::new(
             StreamSetupKind::UnsupportedStreamPolicy,
             format!(
-                "for UDP port {port}: per-port {algorithm} requires stream load-balancer accounting"
+                "for UDP port {port}: per-port LEAST_LATENCY requires stream latency sampling on \
+                 every dispatch path"
             ),
         )
         .into());
@@ -9212,6 +9320,7 @@ impl UdpAuthorizationSessionProbe {
             overload_guard: std::sync::Mutex::new(Some(crate::overload::ConnectionGuard::new(
                 &overload,
             ))),
+            lb_guard: std::sync::Mutex::new(None),
             hook_ingress_tx: std::sync::Mutex::new(hook_ingress_tx),
             hook_ingress_queued_bytes: Arc::new(AtomicUsize::new(0)),
             hook_ingress_stop_notify: Arc::new(tokio::sync::Notify::new()),
@@ -9367,7 +9476,7 @@ impl UdpAuthorizationSessionProbe {
         if !removed {
             return None;
         }
-        self.session.release_overload_guard();
+        self.session.release_session_guards();
         self.metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
         let mut connection_error = None;
         let mut error_class = None;
@@ -9410,7 +9519,7 @@ impl UdpAuthorizationSessionProbe {
             .store(true, std::sync::atomic::Ordering::Release);
         signal_udp_reply_task_stop(&session.stop_reply_task, session.stop_notify.as_ref());
         session.close_hook_ingress();
-        session.release_overload_guard();
+        session.release_session_guards();
         self.metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
         true
     }
@@ -9518,6 +9627,7 @@ mod tests {
             // Tests build sessions without an overload state; the guard slot
             // stays empty for unit tests that exercise summary emission only.
             overload_guard: std::sync::Mutex::new(None),
+            lb_guard: std::sync::Mutex::new(None),
             hook_ingress_tx: std::sync::Mutex::new(None),
             hook_ingress_queued_bytes: Arc::new(AtomicUsize::new(0)),
             hook_ingress_stop_notify: Arc::new(tokio::sync::Notify::new()),
@@ -10842,6 +10952,7 @@ backend_tls_verify_server_cert: false
             overload_guard: std::sync::Mutex::new(Some(crate::overload::ConnectionGuard::new(
                 state,
             ))),
+            lb_guard: std::sync::Mutex::new(None),
             hook_ingress_tx: std::sync::Mutex::new(None),
             hook_ingress_queued_bytes: Arc::new(AtomicUsize::new(0)),
             hook_ingress_stop_notify: Arc::new(tokio::sync::Notify::new()),
@@ -10878,14 +10989,14 @@ backend_tls_verify_server_cert: false
         let cached = Arc::clone(&session);
         assert_eq!(state.active_connections.load(Ordering::Relaxed), 1);
 
-        session.release_overload_guard();
+        session.release_session_guards();
         assert_eq!(
             state.active_connections.load(Ordering::Relaxed),
             0,
             "session expiry must release overload pressure even if a cache still holds an Arc"
         );
 
-        cached.release_overload_guard();
+        cached.release_session_guards();
         drop(session);
         drop(cached);
         assert_eq!(
@@ -11012,7 +11123,7 @@ listen_port: 5300
     }
 
     #[test]
-    fn resolve_udp_backend_target_rejects_port_lane_for_least_connections() {
+    fn resolve_udp_backend_target_engages_port_lane_for_least_connections() {
         let mut config: GatewayConfig = serde_json::from_value(serde_json::json!({
             "version": "1",
             "proxies": [{
@@ -11043,21 +11154,24 @@ listen_port: 5300
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
-        let err = super::resolve_backend_target(
+        let (host, port) = super::resolve_backend_target(
             &proxy,
             &snapshot,
             &HealthChecker::new(),
             "192.0.2.10",
             None,
         )
-        .expect_err("per-port LEAST_CONN must be rejected explicitly");
-        let setup = find_stream_setup_error(&err).expect("typed stream setup error");
-
-        assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
+        .expect("per-port LEAST_CONN is supported once stream accounting exists");
+        assert_eq!(port, 5353);
         assert!(
-            setup.message.contains("per-port LEAST_CONN"),
-            "error should make the unsupported policy explicit: {}",
-            setup.message
+            host == "a.local" || host == "b.local",
+            "selection must stay inside the port lane: {host}"
+        );
+        assert!(
+            super::udp_port_lane_selection_supported(&proxy, &snapshot, "dns", 5353)
+                .expect("per-port LEAST_CONN must no longer be refused"),
+            "per-port LEAST_CONN must engage the port lane now that UDP sessions feed \
+             the balancer's active-connection counters (issue #4514)"
         );
     }
 
@@ -11105,7 +11219,9 @@ listen_port: 5300
 
         assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
         assert!(
-            setup.message.contains("per-port LEAST_LATENCY"),
+            setup
+                .message
+                .contains("per-port LEAST_LATENCY requires stream latency sampling"),
             "error should make the unsupported policy explicit: {}",
             setup.message
         );

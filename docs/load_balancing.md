@@ -247,6 +247,31 @@ upstreams:
 
 **Best for:** Long-lived connections or backends with variable response times.
 
+#### Stream-family proxies (TCP / UDP / DTLS)
+
+`least_connections` is fully accounted on the stream family. A `tcp` / `tcp_tls`
+connection holds the balancer's active-connection guard from backend selection
+until the relay ends (including across connect-phase retry rotation, which moves
+the count to the new target rather than leaving a residue on the abandoned one),
+and a `udp` / `dtls` session holds it for the session lifetime, releasing it on
+idle expiry, authorization-lifetime expiry, and listener shutdown.
+
+One consequence of the strict lowest-index tie-break: a cold upstream whose
+connections are opened and closed strictly one at a time sees every target at
+zero active connections at selection time, so it keeps starting from the first
+healthy target. Concurrent or long-lived connections — the workload this
+algorithm exists for — distribute normally.
+
+`least_latency` on stream proxies is fed by active health-check probe RTT and,
+on TCP, by the backend connect RTT (a failed dial records the same synthetic
+penalty sample the HTTP path uses). Connect RTT is a **passive** sample and
+follows the same precedence rule as HTTP TTFB: when active health-check probes
+are running for the upstream, their controlled RTTs win and passive samples are
+not recorded. UDP/DTLS has no per-request round-trip
+sample, so per-port DestinationRule `LEAST_LATENCY` overrides remain refused on
+stream proxies with an explicit `UnsupportedStreamPolicy` error rather than
+degrading silently. Per-port `LEAST_CONN` overrides are supported.
+
 ### Least Latency
 
 **Algorithm:** `least_latency`
