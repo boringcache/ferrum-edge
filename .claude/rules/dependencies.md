@@ -241,13 +241,20 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 
 ## Advisory Gate
 
-- `cargo deny check advisories bans sources` is BLOCKING on every PR
+- `cargo deny check advisories bans sources licenses` is BLOCKING on every PR
   (`dependency-audit` job in `.github/workflows/ci.yml`) and re-runs weekly in
   `.github/workflows/dependency-audit.yml`.
+- The gate covers BOTH workspaces: the root graph, and `ebpf/Cargo.toml` via
+  `cargo deny --manifest-path ebpf/Cargo.toml check --config deny.toml ...`, in the per-PR
+  job and the weekly workflow alike. `ferrum-ebpf` is not in the root graph but
+  its object ships in the published `-ebpf` / `-ebpf-tools` images and runs
+  privileged on the host network. One shared `deny.toml` — never add
+  `ebpf/deny.toml`.
 - Every `[advisories.ignore]` in `deny.toml` needs a rationale and an
   `[expires:YYYY-MM-DD]` token; `scripts/check_advisory_expiry.sh` fails the
   weekly run once a date passes. Do not silence an advisory without both.
-- Licenses are intentionally not part of the gate yet (see `deny.toml` header).
+- Licenses ARE part of the blocking gate (since #4468): the `[licenses]`
+  allowlist and `confidence-threshold` in `deny.toml` fail CI.
 - A CVE in a vendored crate's lineage follows the emergency procedure in
   `docs/dependency-policy.md` (re-vendor on the fixed version or retire); a plain
   `cargo update` cannot reach a `[patch.crates-io]`-pinned crate.
