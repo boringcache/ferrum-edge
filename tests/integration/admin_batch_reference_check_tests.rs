@@ -184,6 +184,21 @@ fn plugin_referencing_proxy(plugin_id: &str, proxy_id: &str) -> Value {
     })
 }
 
+/// A batch that reaches `check_upstream_exists` (the first #4379 reference
+/// lookup) without submitting a plugin graph, consumer credentials, or an
+/// mTLS-compat participant, so none of the earlier #4527 candidate-validation
+/// sites can shadow the reference-lookup classification under test.
+fn proxy_referencing_upstream(proxy_id: &str, upstream_id: &str) -> Value {
+    json!({
+        "proxies": [{
+            "id": proxy_id,
+            "listen_path": format!("/{proxy_id}"),
+            "backend_scheme": "http",
+            "upstream_id": upstream_id,
+        }],
+    })
+}
+
 #[tokio::test]
 async fn batch_missing_proxy_reference_is_400_with_unchanged_wording() {
     let tmp = TempDir::new().unwrap();
@@ -233,7 +248,7 @@ async fn batch_reference_check_backend_failure_is_503_and_redacted() {
         &base,
         "/batch",
         &namespace,
-        &plugin_referencing_proxy("pc-db-fail", "proxy-db-fail"),
+        &proxy_referencing_upstream("proxy-db-fail", "upstream-db-fail"),
     )
     .await;
 
@@ -262,4 +277,83 @@ async fn batch_reference_check_backend_failure_is_503_and_redacted() {
             "503 body leaked persistence sentinel {sentinel:?}: {rendered}"
         );
     }
+}
+
+/// Issue #4527: the plugin-graph candidate validation runs *before* the first
+/// `batch_reference_lookup`, so for any batch carrying plugin configs a
+/// database outage was answered with `400 "Batch validation failed"` — telling
+/// a Terraform/GitOps caller the payload was malformed and must not be retried.
+/// It must return the same retryable, redacted 503.
+#[tokio::test]
+async fn batch_plugin_graph_candidate_db_failure_is_503_and_redacted() {
+    let tmp = TempDir::new().unwrap();
+    let (base, _shutdown) = start_admin(admin_state(make_store(&tmp).await)).await;
+    let namespace = format!("batch-candidate-db-fail-{}", uuid::Uuid::new_v4());
+    set_batch_reference_check_fault_for_test(&namespace, Some(RAW_DB_DETAIL));
+    let _guard = BatchRefFaultGuard {
+        namespace: namespace.clone(),
+    };
+
+    // Non-empty `plugin_configs` makes `batch_submits_plugin_graph` true, which
+    // is the exact condition issue #4377 documented.
+    let (status, body) = post_ns(
+        &base,
+        "/batch",
+        &namespace,
+        &plugin_referencing_proxy("pc-candidate-db-fail", "proxy-candidate-db-fail"),
+    )
+    .await;
+
+    assert_eq!(
+        status, 503,
+        "a candidate-validation database failure must be retryable: {body:?}"
+    );
+    assert_eq!(
+        body["error"], "Database unavailable — operation failed",
+        "503 must reuse the redacted db_error_response shape: {body:?}"
+    );
+    assert!(
+        body.get("validation_errors").is_none(),
+        "DB failures must not be reported as Batch validation failed: {body:?}"
+    );
+    let rendered = body.to_string();
+    for sentinel in [
+        "s3cr3t-dsn-password",
+        "db.internal:5432",
+        "ferrum_prod",
+        RAW_DB_DETAIL,
+        "Batch validation failed",
+    ] {
+        assert!(
+            !rendered.contains(sentinel),
+            "503 body leaked persistence sentinel {sentinel:?}: {rendered}"
+        );
+    }
+}
+
+/// The 503 classification must not swallow genuine payload problems: with no
+/// fault armed, the same plugin-config payload still returns the unchanged 400.
+#[tokio::test]
+async fn batch_plugin_graph_genuine_miss_stays_400_without_a_fault() {
+    let tmp = TempDir::new().unwrap();
+    let (base, _shutdown) = start_admin(admin_state(make_store(&tmp).await)).await;
+    let namespace = format!("batch-candidate-no-fault-{}", uuid::Uuid::new_v4());
+
+    let (status, body) = post_ns(
+        &base,
+        "/batch",
+        &namespace,
+        &plugin_referencing_proxy("pc-no-fault", "proxy-no-fault"),
+    )
+    .await;
+
+    assert_eq!(
+        status, 400,
+        "an unarmed namespace must keep the client validation error: {body:?}"
+    );
+    assert_eq!(body["error"], "Batch validation failed");
+    assert!(
+        body["validation_errors"].is_array(),
+        "400 must still enumerate the payload problems: {body:?}"
+    );
 }
