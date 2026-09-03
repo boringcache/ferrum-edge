@@ -1959,6 +1959,75 @@ fn spool_walk_skips_a_temp_a_peer_unlinks_between_enumeration_and_probe() {
     );
 }
 
+/// A probe failure that is NOT "the name vanished" must still refuse the walk:
+/// the `NotFound` skip is the only tolerated outcome, so an unreadable entry
+/// keeps the "unreadable temp is protected" rule intact for a live peer write.
+///
+/// The hook makes the day directory unsearchable right before the probe, so
+/// `lstat` on the enumerated child fails with `EACCES` rather than `ENOENT`.
+/// Directory modes are not enforced for root, so the case is skipped there.
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+fn spool_walk_refuses_a_probe_that_fails_for_a_reason_other_than_not_found() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // SAFETY: `geteuid` has no preconditions and only reads process state.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping: directory modes are not enforced for root");
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let manager = SpoolManager::for_tests_with_owner(
+        spool_settings(temp.path(), 1 << 20),
+        &test_owner_spec("node-a"),
+        302,
+    )
+    .unwrap();
+    let day = manager.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let durable = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FD1"));
+    fs::write(&durable, b"{}\n").unwrap();
+
+    /// Restores the day directory's mode even if the assertions panic.
+    struct RestoreMode(std::path::PathBuf);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+        }
+    }
+    let _restore = RestoreMode(day.clone());
+
+    let target = durable.clone();
+    let locked_dir = day.clone();
+    let observed = Arc::new(AtomicUsize::new(0));
+    let hits = Arc::clone(&observed);
+    let _clear = ClearSpoolWalkHook;
+    set_spool_walk_hook_for_tests(Some(Arc::new(move |point, path| {
+        if point == SpoolWalkHookPoint::BeforeEntryProbe && path == target.as_path() {
+            // Search permission on the parent is what `lstat` of a child needs.
+            let _ = fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o000));
+            hits.fetch_add(1, Ordering::SeqCst);
+        }
+    })));
+
+    let error = manager
+        .scan_stats_for_tests()
+        .expect_err("an EACCES probe must refuse the walk, not be skipped");
+    fs::set_permissions(&day, fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(
+        observed.load(Ordering::SeqCst) >= 1,
+        "the enumerate/probe window never opened"
+    );
+    assert!(
+        error.contains("failed to lstat spool path"),
+        "unexpected walk error: {error}"
+    );
+    assert!(durable.exists(), "the entry itself was never touched");
+}
+
 /// A peer sharing the volume removes a selected candidate and replaces it with
 /// files the stale snapshot never saw.
 ///

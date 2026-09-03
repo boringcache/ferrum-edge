@@ -8940,6 +8940,15 @@ fn default_test_spool_owner_spec(node_id: &str) -> SpoolOwnerSpec<'_> {
     }
 }
 
+/// Operator-facing message for a spool probe that failed for a reason other
+/// than the name having vanished (callers handle `NotFound` before this).
+fn spool_probe_failure(what: &str, path: &Path, error: &std::io::Error) -> String {
+    format!(
+        "{PLUGIN_NAME}: failed to {what} '{}': {error}",
+        path.display()
+    )
+}
+
 /// Whether an enumerated temp/claim is old enough to be reclaimed.
 ///
 /// A name that has already vanished reports `false`, not an error: the walk that
@@ -8953,12 +8962,7 @@ fn spool_temp_is_stale(path: &Path, now: SystemTime, age_secs: u64) -> Result<bo
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(format!(
-                "{PLUGIN_NAME}: failed to stat spool temp '{}': {error}",
-                path.display()
-            ));
-        }
+        Err(error) => return Err(spool_probe_failure("stat spool temp", path, &error)),
     };
     if meta.file_type().is_symlink() {
         return Ok(false);
@@ -9397,12 +9401,7 @@ impl<'a> SpoolWalk<'a> {
                     );
                     continue;
                 }
-                Err(error) => {
-                    return Err(format!(
-                        "{PLUGIN_NAME}: failed to lstat spool path '{}': {error}",
-                        path.display()
-                    ));
-                }
+                Err(error) => return Err(spool_probe_failure("lstat spool path", &path, &error)),
             };
             let file_type = meta.file_type();
             if file_type.is_symlink() {
