@@ -108,6 +108,9 @@ use bytes::Bytes;
 use http_body::Frame;
 
 use crate::proxy::RequestAuthLifetimePlan;
+use crate::proxy::backend_send_queue::{
+    BackendSocketHandle, BackendSocketSlot, await_send_queue_stall,
+};
 use crate::proxy::body::BoxError;
 
 /// In-flight frame budget of the bridge channel.
@@ -219,6 +222,16 @@ fn pump_terminal_error(outcome: UploadPumpOutcome) -> BoxError {
 /// recording it is what lets a dispatcher joining this pump distinguish it from
 /// a task that simply died. `RUNNING` is the only state it may overwrite, so a
 /// pump that already settled keeps its own outcome.
+///
+/// The abort is likewise conditional on that state (issue #4411). A task that
+/// has already published a terminal has, by construction, ALREADY dropped the
+/// client body and the bridge sender — so it no longer owns anything this guard
+/// exists to reclaim, and the only work it can still be doing is the post-EOS
+/// send-queue drain watch. Every H1/H2 client drops the request body as soon as
+/// it reaches end of stream, which is exactly when that watch starts, so an
+/// unconditional abort here would cancel the #4411 bound before it could ever
+/// fire. The watch is self-bounding: it ends on a drained queue, an
+/// unanswerable socket, a cancellation, or the write watermark.
 struct AbortPumpOnDrop {
     handle: tokio::task::JoinHandle<()>,
     terminal: Arc<AtomicU8>,
@@ -226,13 +239,18 @@ struct AbortPumpOnDrop {
 
 impl Drop for AbortPumpOnDrop {
     fn drop(&mut self) {
-        let _ = self.terminal.compare_exchange(
-            PUMP_RUNNING,
-            PUMP_CONSUMER_GONE,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        self.handle.abort();
+        if self
+            .terminal
+            .compare_exchange(
+                PUMP_RUNNING,
+                PUMP_CONSUMER_GONE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.handle.abort();
+        }
     }
 }
 
@@ -379,6 +397,11 @@ pub(crate) struct UploadPumpJoin {
     /// because it was aborted — which is exactly what releasing the transport
     /// body does.
     terminal: Arc<AtomicU8>,
+    /// Where the dispatcher publishes the backend socket this upload is being
+    /// written to, so the pump can bound the POST-EOS send-queue drain
+    /// (issue #4411). Empty for a transport that cannot expose a socket, which
+    /// leaves that bound disarmed.
+    socket: BackendSocketSlot,
     cancel_on_drop: bool,
 }
 
@@ -393,6 +416,25 @@ impl UploadPumpJoin {
     pub(crate) fn arm_write_watermark(&mut self) {
         if let Some(write_start) = self.write_start.take() {
             let _ = write_start.send(());
+        }
+    }
+
+    /// Publish the backend socket this upload is being written to, so
+    /// `backend_write_timeout_ms` also bounds the post-EOS drain of the local
+    /// send queue (issue #4411).
+    ///
+    /// Call immediately before `send_request` — strictly before any body frame
+    /// can cross the bridge — so the pump either observes the socket for the
+    /// whole drain or observes none at all. Write-once: a replayed attempt
+    /// installs a fresh pump, so a second binding on the same pump is ignored
+    /// rather than silently re-pointing a live watch at another connection.
+    ///
+    /// `None` is the ordinary case for a transport whose socket the gateway
+    /// does not own (reqwest, HBONE's tunnelled inner client): the drain bound
+    /// stays disarmed and `backend_read_timeout_ms` governs, as before.
+    pub(crate) fn bind_backend_socket(&mut self, socket: Option<Arc<BackendSocketHandle>>) {
+        if let Some(socket) = socket {
+            let _ = self.socket.set(socket);
         }
     }
 
@@ -593,6 +635,10 @@ where
     };
     let terminal = Arc::new(AtomicU8::new(PUMP_RUNNING));
     let task_terminal = Arc::clone(&terminal);
+    // Filled by the dispatcher before `send_request` when the gateway owns the
+    // backend socket (issue #4411); left empty otherwise.
+    let socket: BackendSocketSlot = Arc::new(std::sync::OnceLock::new());
+    let task_socket = Arc::clone(&socket);
     let plan = plan.cloned();
     let handle = tokio::spawn(async move {
         let outcome = run_upload_pump(UploadPumpTask {
@@ -604,6 +650,7 @@ where
             write_start_rx,
             terminal: task_terminal,
             write_timeout_tx,
+            socket: task_socket,
         })
         .await;
         let _ = finished_tx.send(outcome);
@@ -628,6 +675,7 @@ where
             finished: Some(finished_rx),
             write_timeout: Some(write_timeout_rx),
             terminal,
+            socket,
             cancel_on_drop: false,
         },
     )
@@ -691,6 +739,7 @@ struct UploadPumpTask<B> {
     write_start_rx: Option<tokio::sync::oneshot::Receiver<()>>,
     terminal: Arc<AtomicU8>,
     write_timeout_tx: tokio::sync::oneshot::Sender<()>,
+    socket: BackendSocketSlot,
 }
 
 async fn run_upload_pump<B>(task: UploadPumpTask<B>) -> UploadPumpOutcome
@@ -706,6 +755,7 @@ where
         write_start_rx: mut write_start,
         terminal,
         write_timeout_tx,
+        socket,
     } = task;
     let mut cancel = Some(cancel_rx);
     // Absolute and armed once when a credential admitted the stream. Relayed
@@ -798,8 +848,48 @@ where
     // the write watermark publishes it; every other terminal drops the sender.
     if outcome == UploadPumpOutcome::WriteTimeout {
         let _ = write_timeout_tx.send(());
+        return outcome;
     }
-    outcome
+    if outcome != UploadPumpOutcome::Completed || !write_configured || !write_armed {
+        return outcome;
+    }
+    // Post-EOS transport-drain bound (issue #4411).
+    //
+    // Every client byte has now crossed the bridge and the transport body is at
+    // a clean end of stream, so the pre-EOS idle arm above can never fire
+    // again — and HTTP gives the gateway no request-side acknowledgement to
+    // wait on. The remaining evidence is the kernel's: bytes this gateway wrote
+    // that the peer has not accepted. A backend that `accept()`s and never
+    // reads leaves them parked for the life of the connection, so a send queue
+    // that is non-empty and never shrinks for `backend_write_timeout_ms` is the
+    // write stall the watermark promises to bound.
+    //
+    // `sender` and `body` were dropped above BEFORE this point on purpose: the
+    // transport must see the clean EOS and flush its last frames to the socket
+    // before the drain is judged.
+    let Some(socket) = socket.get() else {
+        // No socket was published for this dispatch (reqwest, tunnelled HBONE).
+        // Disarmed exactly as before #4411; `backend_read_timeout_ms` governs.
+        return outcome;
+    };
+    let stalled = tokio::select! {
+        biased;
+        // A dispatcher that got its response head (or gave up) cancels; the
+        // drain is only interesting while the header wait is still running.
+        () = cancel_requested(&mut cancel) => false,
+        stalled = await_send_queue_stall(socket, write_timeout_ms) => stalled,
+    };
+    if !stalled {
+        return outcome;
+    }
+    // Deliberately WITHOUT restating the shared terminal: the upload itself did
+    // complete cleanly and the transport already observed that end of stream.
+    // Rewriting it to a non-clean terminal would describe a whole upload as a
+    // truncated one. What the dispatcher needs is only the signal that the
+    // write watermark fired, which is what `backend_write_watermark_expired`
+    // races against the response-header wait.
+    let _ = write_timeout_tx.send(());
+    UploadPumpOutcome::WriteTimeout
 }
 
 /// Await the write-idle timer, which exists only when the operator configured

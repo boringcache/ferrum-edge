@@ -1287,13 +1287,49 @@ deadline above.
 
 The bound is on transport write *progress*, so it fires while the upload pump is
 blocked on bridge capacity — that expiry surfaces as `504` /
-`X-Gateway-Error: backend_timeout` / `error_class=read_write_timeout`. A backend
-that accepts the connection and never reads therefore only trips it while the
-upload is still backpressured: once the local kernel send buffer has absorbed the
-entire body, as it will for a small or medium POST against a never-reading peer,
-the pump observes a clean end-of-stream and the wait for response headers is
-bounded by `backend_read_timeout_ms` instead. Tracked as issue
-[#4411](https://github.com/ferrum-edge/ferrum-edge/issues/4411).
+`X-Gateway-Error: backend_timeout` / `error_class=read_write_timeout`.
+
+Write progress includes the **post-end-of-stream drain of the local send queue**
+(issue [#4411](https://github.com/ferrum-edge/ferrum-edge/issues/4411)). Once the
+last request byte has been handed to the kernel there is no HTTP-level receipt
+that the backend read it, but the kernel still knows how many bytes the peer has
+not accepted. While the response-header wait runs, Ferrum samples the backend
+socket's send-queue depth every `min(100ms, backend_write_timeout_ms / 4)`.
+Progress means a **strictly decreasing** depth; a depth that is non-zero and has
+not decreased for `backend_write_timeout_ms` is a write stall and ends the
+attempt with the same `504` / `X-Gateway-Error: backend_timeout` /
+`error_class=read_write_timeout`. A depth that oscillates without falling below
+its previous low-water mark is a stall, not progress. A body the peer's kernel
+has fully accepted (send queue empty) is bounded by `backend_read_timeout_ms`, as
+before — the gateway's write genuinely completed.
+
+Two limits of that drain bound are irreducible without a read receipt and are
+stated here rather than approximated with a timing heuristic:
+
+- **Platform.** The send-queue query is Linux (`SIOCOUTQ`) and macOS
+  (`SO_NWRITE`) only. On Windows — and on any other target — the drain bound is
+  disarmed and a never-reading backend remains bounded by
+  `backend_read_timeout_ms`.
+- **Bodies smaller than the peer's receive buffer.** A peer that never calls
+  `recv()` still absorbs roughly its initial receive-buffer size (about 128 KiB
+  on Linux defaults; receive-buffer autotuning only grows on application reads).
+  An upload that fits entirely inside that window leaves the gateway's send queue
+  empty, is indistinguishable from a delivered upload at the transport layer, and
+  is bounded by `backend_read_timeout_ms`.
+- **Transport coverage.** The drain bound is armed for the direct HTTP/2 backend
+  pool and the native gRPC HTTP/2 pool, whose sockets the gateway owns. It is
+  **not** armed for HTTP/1.1 backends dispatched through the bundled HTTP client,
+  which does not expose the connection's socket to the gateway, nor for uploads
+  tunnelled inside an HBONE CONNECT session (the outer socket is shared by every
+  tunnel multiplexed on it, so its send queue is not attributable to one
+  request), nor for HTTP/3, whose upload backpressure is QUIC stream flow control
+  rather than a kernel send queue. Those paths keep the pre-end-of-stream idle
+  bound and `backend_read_timeout_ms`.
+
+On a multiplexed HTTP/2 connection the send queue is shared by every stream on
+it, so a non-zero depth is not by itself attributable to one request. The bound
+is stated on *progress* for that reason: a connection whose send queue never
+shrinks is making no progress for any stream on it.
 
 The bound starts when the backend transport begins consuming the request body —
 the first moment a connection provably exists and the request head is written —
