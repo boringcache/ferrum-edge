@@ -614,7 +614,25 @@ fn runtime_plugin_file_dependency_validation_runs_off_async_workers() {
     let validation = include_str!("../../../src/config/validation_pipeline.rs");
     assert!(validation.contains("validate_plugin_file_dependencies_off_thread"));
     assert!(validation.contains("tokio::task::spawn_blocking"));
-    assert!(validation.contains("GeoRestriction::validate_config"));
+    // Geo shape validation must stay MMDB-free at admission. Since issue #4526
+    // the pipeline reaches it through the shared plugin construction gate
+    // rather than a per-plugin match, so pin both halves of that route: the
+    // pipeline calls the gate, and the gate routes `geo_restriction` to the
+    // shape-only `validate_config` before any constructor that would open the
+    // node-local database.
+    assert!(validation.contains("collect_rejecting_plugin_config_errors"));
+    assert!(validation.contains("validate_plugin_config_with_http_client("));
+    let plugins = include_str!("../../../src/plugins/mod.rs");
+    let gate_start = plugins
+        .find("pub(crate) fn validate_plugin_config_with_http_client(")
+        .expect("shared plugin construction gate");
+    let geo_route = plugins[gate_start..]
+        .find("geo_restriction::GeoRestriction::validate_config(config)")
+        .expect("gate routes geo_restriction to the shape-only validator");
+    assert!(
+        !plugins[gate_start..gate_start + geo_route].contains("GeoRestriction::new("),
+        "admission must never open the node-local MMDB"
+    );
 
     for source in [
         include_str!("../../../src/config/db_loader.rs"),
