@@ -9987,6 +9987,69 @@ pub mod _test_support {
         }
     }
 
+    /// One observation of the post-EOS backend send-queue drain rule
+    /// (issue #4411), as [`crate::proxy::backend_send_queue`] classifies it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SendQueueProbeVerdict {
+        /// The peer's kernel accepted everything; `backend_read_timeout_ms`
+        /// governs from here.
+        Drained,
+        /// Strictly decreasing, or the watermark has not elapsed yet.
+        Progressing,
+        /// Non-zero and not strictly decreasing for the whole watermark.
+        Stalled,
+    }
+
+    /// The progress rule behind the post-EOS `backend_write_timeout_ms` drain
+    /// bound, driven directly so the "oscillating depth is a stall" invariant
+    /// can be proven without a socket or a clock (issue #4411).
+    pub struct SendQueueProgressProbe {
+        inner: crate::proxy::backend_send_queue::SendQueueProgress,
+    }
+
+    impl SendQueueProgressProbe {
+        pub fn new(now_ms: u64, write_timeout_ms: u64) -> Self {
+            Self {
+                inner: crate::proxy::backend_send_queue::SendQueueProgress::new(
+                    now_ms,
+                    write_timeout_ms,
+                ),
+            }
+        }
+
+        pub fn observe(&mut self, depth: u64, now_ms: u64) -> SendQueueProbeVerdict {
+            use crate::proxy::backend_send_queue::SendQueueVerdict;
+            match self.inner.observe(depth, now_ms) {
+                SendQueueVerdict::Drained => SendQueueProbeVerdict::Drained,
+                SendQueueVerdict::Progressing => SendQueueProbeVerdict::Progressing,
+                SendQueueVerdict::Stalled => SendQueueProbeVerdict::Stalled,
+            }
+        }
+    }
+
+    /// Sampling cadence the drain watch uses: `min(100ms, write_timeout / 4)`.
+    pub fn send_queue_sample_interval_ms(write_timeout_ms: u64) -> u64 {
+        crate::proxy::backend_send_queue::sample_interval(write_timeout_ms).as_millis() as u64
+    }
+
+    /// Whether this build target can answer a send-queue query at all.
+    pub fn send_queue_probe_supported() -> bool {
+        crate::socket_opts::send_queue_probe_supported()
+    }
+
+    /// Watch a live socket's send queue exactly as the upload pump does after a
+    /// clean EOS. `true` means the drain stalled for the whole watermark.
+    pub async fn await_backend_send_queue_stall(
+        stream: &tokio::net::TcpStream,
+        write_timeout_ms: u64,
+    ) -> Option<bool> {
+        let handle = crate::proxy::backend_send_queue::BackendSocketHandle::duplicate_from(stream)?;
+        Some(
+            crate::proxy::backend_send_queue::await_send_queue_stall(&handle, write_timeout_ms)
+                .await,
+        )
+    }
+
     /// One gateway-owned BUFFERED upload pump under test (issue #4055).
     ///
     /// The buffered reqwest dispatch has no body adapter to hang a deadline

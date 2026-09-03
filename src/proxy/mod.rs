@@ -37,6 +37,7 @@
 pub mod auth_lifetime;
 pub mod backend_capabilities;
 pub mod backend_dispatch;
+pub mod backend_send_queue;
 pub mod body;
 pub mod client_ip;
 pub mod datagram_client_address;
@@ -52290,6 +52291,15 @@ async fn proxy_to_backend_http2(
 
     let backend_req = Request::from_parts(parts, body);
 
+    // Post-EOS transport-drain bound (issue #4411): publish the backend socket
+    // BEFORE the first body frame can cross the pump's bridge, so the pump can
+    // charge a never-draining send queue to `backend_write_timeout_ms` once the
+    // upload has been handed over in full. Direct-H2 is the sharpest case: the
+    // pre-EOS idle arm cannot fire after the last frame, and hyper has no
+    // request-side receipt to offer.
+    if let Some(pump) = upload_pump.as_mut() {
+        pump.bind_backend_socket(sender.backend_socket());
+    }
     // Send to backend with read timeout (0 = no timeout)
     let h2_send_fut = sender.send_request(backend_req);
     let request_body_too_large = || {

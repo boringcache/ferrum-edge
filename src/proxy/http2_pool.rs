@@ -60,7 +60,55 @@ thread_local! {
 /// so in-path 413 enforcement is unchanged. The limiter treats
 /// `max_bytes = 0` as deny-all — callers must never pass the operator
 /// spelling `0` into it (issue #3942).
-pub type Http2Sender = http2::SendRequest<DirectH2RequestBody>;
+/// One checked-out direct-H2 transport: hyper's multiplexed sender plus a
+/// duplicated handle on the socket underneath it (issue #4411).
+///
+/// The socket handle is what lets `backend_write_timeout_ms` bound the POST-EOS
+/// drain of the local send queue: once the request body has been handed over in
+/// full, the kernel's send-queue depth is the only remaining evidence that the
+/// backend is (or is not) consuming it. See
+/// [`crate::proxy::backend_send_queue`]. `None` when the platform cannot answer
+/// a send-queue query, which leaves that bound disarmed exactly as before.
+///
+/// Deref/DerefMut to the sender so every existing `ready()` / `send_request()` /
+/// `is_closed()` call site is unchanged; cloning is one `Arc` bump on top of
+/// hyper's own clone.
+#[derive(Clone)]
+pub struct Http2Sender {
+    inner: http2::SendRequest<DirectH2RequestBody>,
+    socket: Option<Arc<crate::proxy::backend_send_queue::BackendSocketHandle>>,
+}
+
+impl Http2Sender {
+    pub(crate) fn new(
+        inner: http2::SendRequest<DirectH2RequestBody>,
+        socket: Option<Arc<crate::proxy::backend_send_queue::BackendSocketHandle>>,
+    ) -> Self {
+        Self { inner, socket }
+    }
+
+    /// The socket this transport writes to, for the post-EOS send-queue drain
+    /// bound.
+    pub(crate) fn backend_socket(
+        &self,
+    ) -> Option<Arc<crate::proxy::backend_send_queue::BackendSocketHandle>> {
+        self.socket.clone()
+    }
+}
+
+impl std::ops::Deref for Http2Sender {
+    type Target = http2::SendRequest<DirectH2RequestBody>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for Http2Sender {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
 
 /// Terminal protocol outcome for one DNS candidate.
 ///
@@ -308,6 +356,12 @@ impl Http2PoolManager {
                     pool_config.tcp_keepalive_seconds,
                 );
 
+                // Duplicate the descriptor BEFORE the TLS layer takes
+                // ownership of the stream: after this point the raw socket is
+                // reachable only through the rustls wrapper (issue #4411).
+                let backend_socket =
+                    crate::proxy::backend_send_queue::BackendSocketHandle::duplicate_from(&tcp);
+
                 let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
                     Http2PoolError::BackendUnavailable {
                         message: format!("TLS handshake failed: {}", e),
@@ -349,7 +403,10 @@ impl Http2PoolManager {
                         debug!("http2_pool: TLS connection closed: {}", e);
                     }
                 });
-                Ok(Http2CandidateOutcome::Established(sender))
+                Ok(Http2CandidateOutcome::Established(Http2Sender::new(
+                    sender,
+                    backend_socket,
+                )))
             }
         })
         .await
