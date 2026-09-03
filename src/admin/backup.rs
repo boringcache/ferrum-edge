@@ -939,6 +939,7 @@ mod tests {
     use serde_json::json;
 
     fn sample_config() -> GatewayConfig {
+        quarantined_plugin_configs: Vec::new(),
         serde_json::from_value(json!({
             "version": "1",
             "known_namespaces": ["tenant-a", "tenant-b"],

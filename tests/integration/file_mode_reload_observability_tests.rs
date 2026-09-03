@@ -42,6 +42,7 @@ plugin_configs: []
 }
 
 fn parse_gateway_yaml(yaml: &str) -> GatewayConfig {
+    quarantined_plugin_configs: Vec::new(),
     serde_yaml::from_str(yaml).expect("parse gateway yaml")
 }
 

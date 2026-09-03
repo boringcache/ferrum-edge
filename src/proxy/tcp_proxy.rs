@@ -6034,6 +6034,7 @@ mod backend_target_selection_tests {
     }
 
     fn config_with_subset() -> GatewayConfig {
+        quarantined_plugin_configs: Vec::new(),
         serde_json::from_value(json!({
             "version": "1",
             "proxies": [],
@@ -6063,6 +6064,7 @@ mod backend_target_selection_tests {
     }
 
     fn config_with_two_targets() -> GatewayConfig {
+        quarantined_plugin_configs: Vec::new(),
         serde_json::from_value(json!({
             "version": "1",
             "proxies": [],

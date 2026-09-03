@@ -387,6 +387,7 @@ async fn open_hold_stream_with_options(
 }
 
 fn h3_destination_config(backend_port: u16) -> GatewayConfig {
+    quarantined_plugin_configs: Vec::new(),
     serde_json::from_value(json!({
         "version": "1",
         "proxies": [{

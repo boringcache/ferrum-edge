@@ -425,6 +425,7 @@ impl MeshGrpcServer {
         request: &MeshSliceRequest,
         bearer_namespaces: Option<&HashSet<String>>,
     ) -> GatewayConfig {
+        quarantined_plugin_configs: Vec::new(),
         CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
             config,
             request,
@@ -439,6 +440,7 @@ impl MeshGrpcServer {
         scope: &CpScope,
         bearer_namespaces: Option<&HashSet<String>>,
     ) -> GatewayConfig {
+        quarantined_plugin_configs: Vec::new(),
         CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
             config,
             request,

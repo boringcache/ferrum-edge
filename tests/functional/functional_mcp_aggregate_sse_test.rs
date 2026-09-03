@@ -364,6 +364,7 @@ async fn start_gateway(
 }
 
 fn aggregate_sse_config(upstream_port: u16) -> GatewayConfig {
+    quarantined_plugin_configs: Vec::new(),
     serde_json::from_value(json!({
         "version": "1",
         "proxies": [{

@@ -77,6 +77,7 @@ impl Drop for AdminJwtEnvGuard {
 }
 
 fn empty_gateway_config() -> GatewayConfig {
+    quarantined_plugin_configs: Vec::new(),
     serde_yaml::from_str(
         "version: '1'\nproxies: []\nconsumers: []\nupstreams: []\nplugin_configs: []\n",
     )
