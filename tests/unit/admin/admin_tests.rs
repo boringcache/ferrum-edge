@@ -725,3 +725,40 @@ async fn test_jwt_concurrent_access() {
         "All concurrent token verifications should succeed"
     );
 }
+
+/// Issue #4529: the admin plane must engage `ns`-claim enforcement on exactly
+/// the scopes the CP↔DP gRPC plane already does. `cp` mode derives
+/// `AdminState.admin_require_namespace_claim` from
+/// `CpScope::namespace_claim_required(FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM)`,
+/// so a multi-namespace CP cannot authorize a staging-scoped token against
+/// `prod` on `/backup` or `/restore` while the gRPC plane refuses it.
+#[test]
+fn admin_namespace_claim_derivation_matches_cp_scope() {
+    use ferrum_edge::grpc::cp_server::CpScope;
+
+    let single = CpScope::Single("ferrum".to_string());
+    assert!(
+        !single.namespace_claim_required(false),
+        "single-namespace CP with the flag off keeps the header a routing selector"
+    );
+    assert!(
+        single.namespace_claim_required(true),
+        "the explicit env flag still engages enforcement on a single-namespace CP"
+    );
+
+    let set = CpScope::Set(
+        ["prod", "staging"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<std::collections::HashSet<String>>(),
+    );
+    assert!(
+        set.namespace_claim_required(false),
+        "an explicit multi-namespace scope engages enforcement without the env flag"
+    );
+
+    assert!(
+        CpScope::All.namespace_claim_required(false),
+        "a cluster-wide CP engages enforcement without the env flag"
+    );
+}

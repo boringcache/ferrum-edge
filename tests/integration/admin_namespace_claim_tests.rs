@@ -255,3 +255,35 @@ async fn malformed_ns_claim_rejects_token_at_authentication() {
         assert_eq!(status, 401, "malformed ns claim {bad} must fail closed");
     }
 }
+
+/// Issue #4529: the effect the multi-namespace CP scope must produce on the
+/// REST plane. `cp` mode derives `AdminState.admin_require_namespace_claim`
+/// from `CpScope::namespace_claim_required(env flag)`, so with
+/// `FERRUM_CP_NAMESPACES="prod,staging"` and the admin flag left at its `false`
+/// default the gate is engaged: a staging-scoped operator token cannot export
+/// prod's consumer credentials via `GET /backup`.
+#[tokio::test]
+async fn multi_namespace_cp_scope_engages_backup_tenancy_without_the_env_flag() {
+    use ferrum_edge::grpc::cp_server::CpScope;
+
+    let cp_scope = CpScope::from_env(&["prod".to_string(), "staging".to_string()], "ferrum");
+    // The env flag stays at its documented `false` default; the scope engages it.
+    let engaged = cp_scope.namespace_claim_required(false);
+    assert!(
+        engaged,
+        "a Set scope must engage admin ns-claim enforcement"
+    );
+
+    let (base, _sd) = start_admin(admin_state(engaged)).await;
+    let token = admin_token_with_ns(Some(json!(["staging"])));
+
+    let (status, _) = get_with(&base, "/backup", &token, Some("prod")).await;
+    assert_eq!(
+        status, 403,
+        "a staging-scoped token must not export prod's backup (credentials included)"
+    );
+
+    // The same token still reaches the namespace it is scoped to.
+    let (status, _) = get_with(&base, "/backup", &token, Some("staging")).await;
+    assert_ne!(status, 403, "the token's own namespace must stay reachable");
+}

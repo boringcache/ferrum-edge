@@ -2037,6 +2037,19 @@ pub async fn run(
             "CP namespace authorization requires JWT `ns` claims for ConfigSync, MeshConfigSync, and xDS streams"
         );
     }
+    // The REST admin plane engages the same tenancy boundary as the gRPC config
+    // plane (issue #4529). A multi-namespace scope authorizes no bearer against
+    // every tenant it serves, so `GET /backup` (which serialises consumer
+    // credentials) and `POST /restore` must not accept a token that the gRPC
+    // plane would already refuse. Derived once here and carried into
+    // `AdminState.admin_require_namespace_claim` below.
+    let admin_namespace_claim_required =
+        cp_scope.namespace_claim_required(env_config.admin_require_namespace_claim);
+    if admin_namespace_claim_required && !env_config.admin_require_namespace_claim {
+        info!(
+            "Admin namespace-scoped routes require a JWT `ns` claim because this CP serves multiple namespaces (FERRUM_CP_NAMESPACES); admin tokens without an `ns` claim are refused on those routes"
+        );
+    }
 
     // Discover the initial namespace list. For `Single`/`Set` this is the
     // explicit set; for `All` we query the DB and re-discover on every poll
@@ -2426,7 +2439,7 @@ pub async fn run(
         read_only: env_config.admin_read_only,
         admin_audit_enabled: env_config.admin_audit_enabled,
         admin_audit_fallback_dir: None,
-        admin_require_namespace_claim: env_config.admin_require_namespace_claim,
+        admin_require_namespace_claim: admin_namespace_claim_required,
         startup_ready: Some(startup_ready.clone()),
         serving_degraded: Some(serving_degraded.clone()),
         serving_listener_failures: None,

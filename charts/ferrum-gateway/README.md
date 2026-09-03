@@ -27,10 +27,11 @@ node) or a per-tenant secret selected by `grpc.jwtKeyId`. See
 
 Tenancy enforcement spans both planes: set **`cp.requireNamespaceClaim: true`**
 and **`admin.requireNamespaceClaim: true`** together so CP↔DP gRPC JWTs and
-namespace-scoped admin routes both require an `ns` claim. Enabling only the CP
-flag does **not** constrain admin JWTs — any valid admin token remains global
-and `X-Ferrum-Namespace` is only a routing selector until the admin flag is
-also true. Both values render in `database`, `file`, `cp`, and `dp` modes (any
+namespace-scoped admin routes both require an `ns` claim on a **single-namespace**
+CP. A **multi-namespace** CP (`cp.namespaces` with more than one entry, or `*`)
+needs neither value: both planes engage the `ns` claim requirement automatically,
+and admin tokens without an `ns` claim are refused with `403` on namespace-scoped
+routes (including `/backup` and `/restore`). Both values render in `database`, `file`, `cp`, and `dp` modes (any
 mode that serves the admin API) and are reserved so `env` / `extraEnv` cannot
 desync them.
 

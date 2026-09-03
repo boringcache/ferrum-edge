@@ -28,7 +28,11 @@ Admin JWTs must include `iss`, `sub`, `exp`, `iat`, `nbf`, `jti`, and a string `
 
 ### Per-namespace tenancy (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`)
 
-By default, admin JWTs are **global**: the `X-Ferrum-Namespace` header is a routing selector, not an authorization boundary — any valid Operator/Admin token can address any namespace. On multi-namespace deployments (e.g. a CP with `FERRUM_CP_NAMESPACES="prod,staging"`), set `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true` to make namespace-scoped admin routes require the JWT to carry an `ns` claim authorizing the requested namespace, mirroring the CP↔DP gRPC plane's `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM`:
+On a single-namespace deployment, admin JWTs are **global** by default: the `X-Ferrum-Namespace` header is a routing selector, not an authorization boundary — any valid Operator/Admin token can address any namespace. Setting `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true` makes namespace-scoped admin routes require the JWT to carry an `ns` claim authorizing the requested namespace.
+
+**Enforcement also engages automatically on a multi-namespace control plane.** When `FERRUM_CP_NAMESPACES` names more than one namespace (e.g. `"prod,staging"`) or is `*`, `cp` mode turns namespace-claim enforcement on for the admin plane regardless of `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` — the same rule the CP↔DP gRPC plane applies to `ConfigSync`, `MeshConfigSync`, and xDS streams. On such a CP, **admin tokens without an `ns` claim are refused with `403` on namespace-scoped routes**, including `GET /backup` (which serialises consumer credentials) and `POST /restore`. Mint admin tokens with an explicit `ns` claim before pointing them at a multi-namespace CP. `database`, `file`, `dp`, `mesh`, and `node_agent` modes have no CP scope and keep the flag's `false` default.
+
+Enforcement details, in either case:
 
 - The `ns` claim accepts the same shapes as the gRPC plane: a single string (`"ns": "prod"`) or an array of strings (`"ns": ["prod", "staging"]`).
 - A request whose `X-Ferrum-Namespace` (or the `ferrum` default when the header is omitted) is not in the token's `ns` set is rejected with `403 Forbidden`. With enforcement on, tokens without an `ns` claim are rejected on namespace-scoped routes — tenancy intent must be explicit.
@@ -37,7 +41,7 @@ By default, admin JWTs are **global**: the `X-Ferrum-Namespace` header is a rout
 - Other global surfaces (observability, `/cluster`, TLS management, backend capabilities, mesh introspection, `GET /plugins` type listing) remain unaffected: `X-Ferrum-Namespace` does not select a tenant there. Audit events for those fleet-global mutations (including TLS/ACME management and `POST /mesh/config-revision/reset`) are stored under the canonical default namespace (`ferrum`), not the request header. The same canonical bucket is used for an invalid `X-Ferrum-Namespace` and for an `ns`-claim denial, so a scoped caller cannot file a privileged record under another tenant.
 - Malformed `ns` claims (non-string entries, empty strings) are rejected at authentication time regardless of the flag — a garbled tenancy claim never widens access.
 
-With the flag off (default), behavior is unchanged and back-compatible.
+With enforcement off — the flag unset and the CP scope single-namespace — the namespace header remains a routing selector only.
 
 | Role | Access |
 | --- | --- |
