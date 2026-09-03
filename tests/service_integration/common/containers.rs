@@ -75,7 +75,7 @@ pub fn fixture_http_client_builder() -> reqwest::ClientBuilder {
 /// Run `future` under `limit`, reporting `phase` and the measured elapsed time
 /// if the deadline is breached. The future's own output is returned untouched,
 /// so callers keep their existing error handling and retry logic.
-pub async fn with_phase_deadline<F>(
+pub async fn with_phase_deadline<F: Future>(
     phase: &str,
     limit: Duration,
     future: F,
