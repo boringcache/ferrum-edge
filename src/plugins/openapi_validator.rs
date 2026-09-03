@@ -47,6 +47,7 @@ use super::utils::validation_diagnostics::{
     MAX_DIAGNOSTIC_CHARS, SafeFieldNames, bound_detail, safe_keyword, safe_location,
     schema_violation_detail, xml_error_category,
 };
+use super::utils::xml_bounds::xml_nesting_depth_within_limit;
 use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext};
 
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -2580,118 +2581,6 @@ fn body_to_schema_instance(
         return scalar_to_schema_value(body, schema, conversion).map(SchemaInstance::Value);
     }
     binary_body_to_schema_instance(decoded.as_ref(), schema)
-}
-
-/// Single pass over the raw document bytes rejecting element nesting deeper
-/// than `max_depth`, run *before* the document reaches `roxmltree`, whose
-/// tokenizer recurses once per nesting level. Every delimiter inspected is
-/// ASCII, so byte indexing cannot split a UTF-8 sequence. Constructs that may
-/// legally contain a bare `<` or `>` (comments, CDATA, processing
-/// instructions, DOCTYPE, quoted attribute values) are skipped rather than
-/// counted, so a legitimate document is never rejected. An unterminated
-/// construct simply ends the scan; `roxmltree` rejects such a document itself.
-fn xml_nesting_depth_within_limit(body: &str, max_depth: usize) -> bool {
-    let bytes = body.as_bytes();
-    let mut index = 0usize;
-    let mut depth = 0usize;
-    while index < bytes.len() {
-        if bytes[index] != b'<' {
-            index += 1;
-            continue;
-        }
-        let rest = &bytes[index..];
-        if rest.starts_with(b"<!--") {
-            match find_subslice(&bytes[index + 4..], b"-->") {
-                Some(offset) => index += 4 + offset + 3,
-                None => return true,
-            }
-            continue;
-        }
-        if rest.starts_with(b"<![CDATA[") {
-            match find_subslice(&bytes[index + 9..], b"]]>") {
-                Some(offset) => index += 9 + offset + 3,
-                None => return true,
-            }
-            continue;
-        }
-        if rest.starts_with(b"<?") {
-            match find_subslice(&bytes[index + 2..], b"?>") {
-                Some(offset) => index += 2 + offset + 2,
-                None => return true,
-            }
-            continue;
-        }
-        if rest.starts_with(b"<!") {
-            // DOCTYPE and friends. `allow_dtd` is false, so `roxmltree` rejects
-            // the document regardless; skipping conservatively cannot make the
-            // screen unsound.
-            match bytes[index + 2..].iter().position(|byte| *byte == b'>') {
-                Some(offset) => index += 2 + offset + 1,
-                None => return true,
-            }
-            continue;
-        }
-        if rest.starts_with(b"</") {
-            depth = depth.saturating_sub(1);
-            match bytes[index + 2..].iter().position(|byte| *byte == b'>') {
-                Some(offset) => index += 2 + offset + 1,
-                None => return true,
-            }
-            continue;
-        }
-        depth += 1;
-        if depth > max_depth {
-            return false;
-        }
-        // Advance to the tag's closing `>`, quote-aware: a `>` inside a quoted
-        // attribute value does not terminate the tag.
-        let mut cursor = index + 1;
-        let mut quote: Option<u8> = None;
-        let mut last_significant: Option<u8> = None;
-        let mut terminated = false;
-        while cursor < bytes.len() {
-            let byte = bytes[cursor];
-            match quote {
-                Some(open) => {
-                    if byte == open {
-                        quote = None;
-                    }
-                    last_significant = Some(byte);
-                }
-                None => {
-                    if byte == b'"' || byte == b'\'' {
-                        quote = Some(byte);
-                        last_significant = Some(byte);
-                    } else if byte == b'>' {
-                        terminated = true;
-                        break;
-                    } else if !byte.is_ascii_whitespace() {
-                        last_significant = Some(byte);
-                    }
-                }
-            }
-            cursor += 1;
-        }
-        if !terminated {
-            return true;
-        }
-        if last_significant == Some(b'/') {
-            // Self-closing element: it opened and closed in one tag.
-            depth = depth.saturating_sub(1);
-        }
-        index = cursor + 1;
-    }
-    true
-}
-
-/// First index of `needle` within `haystack`, or `None`.
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
 
 fn xml_body_to_value(
