@@ -2203,6 +2203,18 @@ fn test_constructor_rejects_credentialed_universal_prefix_and_regex() {
         json!([{"regex": "https://.*"}]),
         json!([{"regex": "chrome-extension://.*"}]),
         json!([{"regex": "null"}]),
+        // Issue #4521: hostname-character-class regexes are scheme-universal.
+        // They previously escaped the interlock only because the probe set
+        // carried IP literals that an ordinary hostname class cannot match.
+        json!([{"regex": "https://[\\w.-]+"}]),
+        json!([{"regex": "^https://[a-z0-9.-]+$"}]),
+        json!([{"regex": "^https://([a-z0-9-]+\\.)+[a-z]{2,}$"}]),
+        // Issue #4522: prefix matching is an unbounded `starts_with`, so none
+        // of these terminate at an origin boundary.
+        json!([{"prefix": "https://app.example.com"}]),
+        json!([{"prefix": "https://app."}]),
+        json!([{"prefix": "https://preview-"}]),
+        json!([{"prefix": "https://app.example.com:8443"}]),
     ] {
         let err = CorsPlugin::new(&json!({
             "allowed_origins": origins.clone(),
@@ -2218,24 +2230,39 @@ fn test_constructor_rejects_credentialed_universal_prefix_and_regex() {
 }
 
 #[test]
-fn test_constructor_accepts_credentialed_narrow_prefix() {
+fn test_constructor_accepts_credentialed_host_bounded_prefix() {
+    // Issue #4522: only a `scheme://host:` prefix pins the host, because any
+    // matching origin must continue with the port separator.
     let plugin = CorsPlugin::new(&json!({
-        "allowed_origins": [{"prefix": "https://app.example.com"}],
+        "allowed_origins": [{"prefix": "https://app.example.com:"}],
         "allow_credentials": true
     }))
-    .expect("host-constraining prefix + credentials must construct");
+    .expect("host-bounded prefix + credentials must construct");
+    assert!(plugin.uses_strict_origin_policy());
+}
+
+#[test]
+fn test_constructor_accepts_credentialed_anchored_host_regex() {
+    // Issue #4521: the narrowed probe set must not over-classify an anchored
+    // host-constraining regex — it matches none of `a.invalid` / `b.example` /
+    // `z.test`.
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": [{"regex": "^https://[a-z0-9-]+\\.example\\.com$"}],
+        "allow_credentials": true
+    }))
+    .expect("anchored host-constraining regex + credentials must construct");
     assert!(plugin.uses_strict_origin_policy());
 }
 
 #[tokio::test]
-async fn test_credentialed_narrow_prefix_reflects_matching_origin() {
+async fn test_credentialed_host_bounded_prefix_reflects_only_that_host() {
     let plugin = CorsPlugin::new(&json!({
-        "allowed_origins": [{"prefix": "https://app.example.com"}],
+        "allowed_origins": [{"prefix": "https://app.example.com:"}],
         "allow_credentials": true
     }))
-    .expect("narrow prefix + credentials");
+    .expect("host-bounded prefix + credentials");
 
-    let mut ctx = make_cors_ctx("GET", "https://app.example.com");
+    let mut ctx = make_cors_ctx("GET", "https://app.example.com:8443");
     assert!(matches!(
         plugin.on_request_received(&mut ctx).await,
         PluginResult::Continue
@@ -2246,7 +2273,7 @@ async fn test_credentialed_narrow_prefix_reflects_matching_origin() {
         .await;
     assert_eq!(
         response_headers.get("access-control-allow-origin").unwrap(),
-        "https://app.example.com"
+        "https://app.example.com:8443"
     );
     assert_eq!(
         response_headers
@@ -2254,6 +2281,51 @@ async fn test_credentialed_narrow_prefix_reflects_matching_origin() {
             .unwrap(),
         "true"
     );
+
+    // The suffix-extension origin the bare-host prefix used to admit. A
+    // disallowed origin on a simple request is the plugin's 403 rejection
+    // (the same signal the preflight tests assert), and it carries no
+    // `Access-Control-Allow-Origin`.
+    let mut evil_ctx = make_cors_ctx("GET", "https://app.example.com.evil.net");
+    match plugin.on_request_received(&mut evil_ctx).await {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 403);
+            assert!(
+                !headers.contains_key("access-control-allow-origin"),
+                "host-bounded prefix must not admit a suffix-extended origin: {headers:?}"
+            );
+        }
+        _ => panic!("expected a 403 rejection for the suffix-extended origin"),
+    }
+}
+
+#[tokio::test]
+async fn test_uncredentialed_bare_host_prefix_matching_is_unchanged() {
+    // Issue #4522 changes BREADTH CLASSIFICATION only; `starts_with` matching
+    // semantics (Istio `StringMatch.prefix`) are untouched.
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": [{"prefix": "https://app.example.com"}]
+    }))
+    .expect("uncredentialed bare-host prefix constructs");
+
+    let mut ctx = make_cors_ctx("GET", "https://app.example.com.evil.net");
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    let mut response_headers = HashMap::new();
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert_eq!(
+        response_headers.get("access-control-allow-origin").unwrap(),
+        "https://app.example.com.evil.net"
+    );
+    assert!(!response_headers.contains_key("access-control-allow-credentials"));
 }
 
 #[tokio::test]
@@ -2283,17 +2355,13 @@ async fn test_uncredentialed_universal_prefix_still_reflects() {
 #[test]
 fn test_narrow_regex_is_not_classified_universal() {
     // Probe-set false-positive guard: a host-constraining regex must remain
-    // strict even though it would match one synthetic probe host-shape.
+    // strict under the narrowed reserved-DNS probe set (issue #4521) — this
+    // pattern matches none of `a.invalid` / `b.example` / `z.test`.
     CorsPlugin::new(&json!({
         "allowed_origins": [{"regex": "https://.*\\.example\\.com"}],
         "allow_credentials": true
     }))
     .expect("narrow regex + credentials must construct");
-    CorsPlugin::new(&json!({
-        "allowed_origins": [{"prefix": "https://preview-"}],
-        "allow_credentials": true
-    }))
-    .expect("docs example prefix + credentials must construct");
 }
 
 // ── Private matched-origin / trailer ownership (issue #4296) ───────────────
@@ -2490,6 +2558,12 @@ fn cors_uses_strict_origin_policy_treats_universal_prefix_and_regex_as_non_stric
         json!([{"regex": "https://.*"}]),
         json!([{"regex": "chrome-extension://.*"}]),
         json!([{"regex": "null"}]),
+        json!([{"regex": "https://[\\w.-]+"}]),
+        json!([{"regex": "^https://([a-z0-9-]+\\.)+[a-z]{2,}$"}]),
+        json!([{"prefix": "https://app.example.com"}]),
+        json!([{"prefix": "https://app."}]),
+        json!([{"prefix": "https://preview-"}]),
+        json!([{"prefix": "https://app.example.com:8443"}]),
     ] {
         let plugin =
             CorsPlugin::new(&json!({"allowed_origins": origins.clone()})).unwrap_or_else(|err| {
@@ -2501,11 +2575,11 @@ fn cors_uses_strict_origin_policy_treats_universal_prefix_and_regex_as_non_stric
         );
     }
 
-    let narrow_prefix = CorsPlugin::new(&json!({
-        "allowed_origins": [{"prefix": "https://app.example.com"}]
+    let host_bounded_prefix = CorsPlugin::new(&json!({
+        "allowed_origins": [{"prefix": "https://app.example.com:"}]
     }))
-    .expect("narrow prefix");
-    assert!(narrow_prefix.uses_strict_origin_policy());
+    .expect("host-bounded prefix");
+    assert!(host_bounded_prefix.uses_strict_origin_policy());
 
     let narrow_regex = CorsPlugin::new(&json!({
         "allowed_origins": [{"regex": "https://.*\\.example\\.com"}]

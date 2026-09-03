@@ -353,6 +353,12 @@ fn vs_cors_policy_credentialed_universal_matcher_not_projected() {
         json!([{"prefix": "https://"}]),
         json!([{"prefix": "h"}]),
         json!([{"prefix": "chrome-extension://"}]),
+        // Issues #4521 / #4522: a bare `scheme://host` prefix is matched with
+        // an unbounded `starts_with`, and a hostname-character-class regex is
+        // scheme-universal — neither constrains the host.
+        json!([{"prefix": "https://app.example.com"}]),
+        json!([{"prefix": "https://app."}]),
+        json!([{"regex": "https://[\\w.-]+"}]),
         json!([{"regex": ".*"}]),
         json!([{"regex": "https://.*"}]),
         json!([{"regex": "null"}]),
@@ -378,12 +384,12 @@ fn vs_cors_policy_credentialed_universal_matcher_not_projected() {
         "http": [{
             "route": [{"destination": {"host": "echo.default.svc.cluster.local", "port": {"number": 8080}}}],
             "corsPolicy": {
-                "allowOrigins": [{"prefix": "https://app.example.com"}],
+                "allowOrigins": [{"prefix": "https://app.example.com:"}],
                 "allowCredentials": true
             }
         }]
     }))])
-    .expect("credentialed host-constraining prefix must still project");
+    .expect("credentialed host-bounded `scheme://host:` prefix must still project");
     assert_eq!(projected.config["allow_credentials"], json!(true));
 }
 

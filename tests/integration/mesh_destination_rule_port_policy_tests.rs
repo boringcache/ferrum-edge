@@ -1802,7 +1802,10 @@ fn virtual_service_cors_policy_rides_the_mesh_block_and_matches_gateway_projecti
                     "corsPolicy": {
                         "allowOrigins": [
                             {"exact": "https://fixture.example"},
-                            {"prefix": "https://app."},
+                            // Host-bounded prefix: a bare `https://app.` is
+                            // not host-constraining under `starts_with`, so
+                            // with credentials it defers (issue #4522).
+                            {"prefix": "https://app.example.com:"},
                             {"regex": "https://.*\\.example\\.com"}
                         ],
                         "allowMethods": ["GET", "POST"],
@@ -2780,6 +2783,100 @@ fn virtual_service_cors_policy_exact_star_projects_and_other_wildcards_stay_lite
             plugin.config
         );
     }
+}
+
+#[test]
+fn virtual_service_credentialed_unbounded_origin_matchers_are_deferred() {
+    // Issues #4521 / #4522: the breadth classifier the credentials interlock
+    // uses is shared with the Istio translator, so a credentialed `corsPolicy`
+    // whose origin matcher does not constrain the host is now DEFERRED rather
+    // than projected onto a plugin that would refuse to construct.
+    //
+    // - a bare `scheme://host` prefix is matched with an unbounded
+    //   `starts_with`, so it also admits `https://app.example.com.evil.net`;
+    // - a hostname-character-class regex full-matches every reserved DNS probe
+    //   and is therefore scheme-universal.
+    for cors_policy in [
+        serde_json::json!({
+            "allowOrigins": [{"prefix": "https://app.example.com"}],
+            "allowCredentials": true
+        }),
+        serde_json::json!({
+            "allowOrigins": [{"regex": "https://[\\w.-]+"}],
+            "allowCredentials": true
+        }),
+    ] {
+        let translated = translate_k8s_objects(
+            &[k8s_object(
+                "VirtualService",
+                "vs-credentialed-unbounded",
+                serde_json::json!({
+                    "hosts": ["svc.default.svc.cluster.local"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/"}}],
+                        "route": [{"destination": {
+                            "host": "svc.default.svc.cluster.local",
+                            "port": {"number": 8080}
+                        }}],
+                        "corsPolicy": cors_policy.clone()
+                    }]
+                }),
+            )],
+            k8s_options(),
+        )
+        .expect("credentialed unbounded matcher leaves routing translated");
+        assert!(
+            translated
+                .config
+                .mesh
+                .as_ref()
+                .map(|mesh| mesh.virtual_service_cors_policies.is_empty())
+                .unwrap_or(true),
+            "credentialed unbounded matcher must not ride the mesh slice: {cors_policy}"
+        );
+        assert!(
+            !translated
+                .config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.plugin_name == "cors"),
+            "credentialed unbounded matcher must not project a cors plugin: {cors_policy}"
+        );
+    }
+
+    // The host-bounded `scheme://host:` prefix still projects with credentials.
+    let translated = translate_k8s_objects(
+        &[k8s_object(
+            "VirtualService",
+            "vs-credentialed-bounded",
+            serde_json::json!({
+                "hosts": ["svc.default.svc.cluster.local"],
+                "http": [{
+                    "match": [{"uri": {"prefix": "/"}}],
+                    "route": [{"destination": {
+                        "host": "svc.default.svc.cluster.local",
+                        "port": {"number": 8080}
+                    }}],
+                    "corsPolicy": {
+                        "allowOrigins": [{"prefix": "https://app.example.com:"}],
+                        "allowCredentials": true
+                    }
+                }]
+            }),
+        )],
+        k8s_options(),
+    )
+    .expect("host-bounded credentialed prefix translates");
+    let plugin = translated
+        .config
+        .plugin_configs
+        .iter()
+        .find(|plugin| plugin.plugin_name == "cors")
+        .expect("host-bounded credentialed prefix must project a cors plugin");
+    assert_eq!(
+        plugin.config["allowed_origins"],
+        serde_json::json!([{ "prefix": "https://app.example.com:" }])
+    );
 }
 
 #[test]

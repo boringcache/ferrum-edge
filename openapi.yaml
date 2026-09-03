@@ -22515,11 +22515,16 @@ components:
                     maxLength: 512
                     description: >-
                       Literal byte-prefix of the request Origin header
-                      (case-sensitive), e.g. "https://app.". A prefix that does
-                      not constrain the host (missing `://` or empty authority,
-                      such as "https://" or "h") is effectively universal: it
-                      is admitted without credentials but cannot be combined
-                      with allow_credentials.
+                      (case-sensitive), e.g. "https://app.". Matching is an
+                      unbounded starts_with with no origin parse, so a prefix
+                      constrains the host ONLY when it terminates at an origin
+                      boundary — the form "scheme://host:" (trailing port
+                      separator, any port). Every other shape, including a bare
+                      "https://app.example.com" (which also matches
+                      "https://app.example.com.evil.net"), "https://app.",
+                      "https://app.example.com:8443", "https://" and "h", is
+                      effectively universal: admitted without credentials, but
+                      it cannot be combined with allow_credentials.
                   regex:
                     type: string
                     minLength: 1
@@ -22586,9 +22591,12 @@ components:
             wildcard origins (native `"*"` / `{exact: "*"}` logs a warning and
             disables credentials), opaque exact `null`, and an effectively
             universal prefix or regex (refused at config load rather than
-            silently weakened). A
-            prefix must constrain the host (`://` plus at least one host
-            character); a regex must not match `null` or every origin of a scheme.
+            silently weakened). A prefix must terminate at an origin boundary —
+            only the `scheme://host:` form pins the host, because prefix
+            matching is an unbounded starts_with; a regex must not match `null`
+            or every origin of a scheme (universality is probed against
+            reserved DNS-shaped origins, so a hostname-character-class pattern
+            such as `https://[\w.-]+` is effectively universal).
         max_age:
           type: integer
           format: uint64
