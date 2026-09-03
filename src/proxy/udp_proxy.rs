@@ -803,14 +803,20 @@ struct BackendDtlsConfigCacheState {
     built_under_epoch: AtomicU64,
     /// Shared backend TLS reload epoch owned by the stream listener manager.
     reload_epoch: Arc<AtomicU64>,
+    /// Gateway TLS policy applied to every backend DTLS config built through
+    /// this cache (issue #4507). Carried here rather than threaded through the
+    /// datagram setup path: it is listener-scoped, immutable for the life of
+    /// the listener, and read only when a cache miss builds a config.
+    tls_policy: Option<Arc<crate::tls::TlsPolicy>>,
 }
 
 impl BackendDtlsConfigCacheState {
-    fn new(reload_epoch: Arc<AtomicU64>) -> Self {
+    fn new(reload_epoch: Arc<AtomicU64>, tls_policy: Option<Arc<crate::tls::TlsPolicy>>) -> Self {
         Self {
             entries: DashMap::new(),
             built_under_epoch: AtomicU64::new(reload_epoch.load(Ordering::Acquire)),
             reload_epoch,
+            tls_policy,
         }
     }
 }
@@ -1256,6 +1262,7 @@ fn cached_backend_dtls_config(
         tls_no_verify,
         crls,
         global_ca_bundle_path,
+        cache.tls_policy.as_deref(),
     )?;
     let cached = Arc::new(params);
     let entry = cache.entries.entry(key).or_insert_with(|| cached.clone());
@@ -2510,6 +2517,12 @@ pub struct UdpListenerConfig {
     /// change in place so the listener-local backend DTLS config cache drops
     /// entries built from the pre-rotation material.
     pub backend_tls_reload_epoch: Arc<AtomicU64>,
+    /// Gateway TLS hardening policy (`FERRUM_TLS_MIN_VERSION` /
+    /// `FERRUM_TLS_MAX_VERSION` / `FERRUM_TLS_CIPHER_SUITES` /
+    /// `FERRUM_TLS_CURVES`) applied to backend DTLS configs built by this
+    /// listener (issue #4507). `None` keeps the DTLS stack's own defaults;
+    /// every serving mode supplies `Some`.
+    pub tls_policy: Option<Arc<crate::tls::TlsPolicy>>,
     /// Flipped once the listener successfully binds and can accept traffic.
     pub started: Arc<AtomicBool>,
     /// When set, this listener serves multiple passthrough proxies sharing the port.
@@ -2706,6 +2719,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         circuit_breaker_cache,
         crls,
         backend_tls_reload_epoch,
+        tls_policy,
         started,
         sni_proxy_ids,
         adaptive_buffer,
@@ -2784,7 +2798,10 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             crls,
             started,
             overload,
-            Arc::new(BackendDtlsConfigCacheState::new(backend_tls_reload_epoch)),
+            Arc::new(BackendDtlsConfigCacheState::new(
+                backend_tls_reload_epoch,
+                tls_policy.clone(),
+            )),
             node_waypoint_udp_source_scoping,
             node_waypoint_udp_owner,
             datagram_client_address,
@@ -2986,8 +3003,9 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
     started.store(true, Ordering::Release);
     info!(proxy_id = %proxy_id, "UDP proxy listener started on {}", addr);
 
-    let backend_dtls_config_cache: BackendDtlsConfigCache =
-        Arc::new(BackendDtlsConfigCacheState::new(backend_tls_reload_epoch));
+    let backend_dtls_config_cache: BackendDtlsConfigCache = Arc::new(
+        BackendDtlsConfigCacheState::new(backend_tls_reload_epoch, tls_policy.clone()),
+    );
     // Both maps are consulted on every received datagram, so shard sizing
     // goes through the shared hot-path contract instead of DashMap's
     // `4 * num_cpus` default.
@@ -9573,9 +9591,10 @@ backend_tls_verify_server_cert: false
     #[test]
     fn backend_dtls_config_cache_reuses_ephemeral_certificate() {
         let proxy = test_dtls_proxy();
-        let cache: BackendDtlsConfigCache = Arc::new(BackendDtlsConfigCacheState::new(Arc::new(
-            AtomicU64::new(0),
-        )));
+        let cache: BackendDtlsConfigCache = Arc::new(BackendDtlsConfigCacheState::new(
+            Arc::new(AtomicU64::new(0)),
+            None,
+        ));
         let crls = Arc::new(Vec::new());
 
         let first =
@@ -9596,9 +9615,10 @@ backend_tls_verify_server_cert: false
         let proxy = test_dtls_proxy();
         let mut other_namespace = proxy.clone();
         other_namespace.namespace = "tenant-b".to_string();
-        let cache: BackendDtlsConfigCache = Arc::new(BackendDtlsConfigCacheState::new(Arc::new(
-            AtomicU64::new(0),
-        )));
+        let cache: BackendDtlsConfigCache = Arc::new(BackendDtlsConfigCacheState::new(
+            Arc::new(AtomicU64::new(0)),
+            None,
+        ));
         let crls = Arc::new(Vec::new());
 
         let first =
@@ -9624,7 +9644,7 @@ backend_tls_verify_server_cert: false
         let proxy = test_dtls_proxy();
         let reload_epoch = Arc::new(AtomicU64::new(0));
         let cache: BackendDtlsConfigCache =
-            Arc::new(BackendDtlsConfigCacheState::new(reload_epoch.clone()));
+            Arc::new(BackendDtlsConfigCacheState::new(reload_epoch.clone(), None));
         let crls = Arc::new(Vec::new());
 
         let first =

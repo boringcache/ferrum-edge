@@ -265,7 +265,7 @@ async fn try_spawn_dtls_gateway(
     let overload = Arc::new(OverloadState::new());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let frontend_dtls_config =
-        ferrum_edge::dtls::build_frontend_dtls_config(cert_path, key_path, None, &[])
+        ferrum_edge::dtls::build_frontend_dtls_config(cert_path, key_path, None, &[], None)
             .expect("build frontend DTLS config");
 
     let listener_started = started.clone();
@@ -292,6 +292,7 @@ async fn try_spawn_dtls_gateway(
         circuit_breaker_cache,
         crls: Arc::new(Vec::new()),
         backend_tls_reload_epoch: Arc::new(AtomicU64::new(0)),
+        tls_policy: None,
         started: listener_started,
         sni_proxy_ids: None,
         adaptive_buffer,
