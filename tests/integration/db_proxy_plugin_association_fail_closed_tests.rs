@@ -461,3 +461,441 @@ async fn proxy_write_precheck_can_repair_invalid_associations() {
     assert_eq!(repaired.plugins.len(), 1);
     assert_eq!(repaired.plugins[0].plugin_config_id, "plugin-1");
 }
+
+// ---------------------------------------------------------------------------
+// Admin write path attaches the proxy association (issue #4611)
+//
+// `docs/plugins.md` states the runtime rule: a proxy-scoped plugin config
+// applies only when the target proxy lists it in `plugins`; `proxy_id` alone
+// never attaches it. Database mode used to answer `201`/`200` for a
+// `scope: "proxy"` write while leaving `proxy_plugins` untouched, so
+// `GET /proxies/{id}` reported `plugins: []` and the runtime never applied the
+// config. Both sides must now move in the same transaction.
+// ---------------------------------------------------------------------------
+
+use ferrum_edge::admin::{
+    AdminState,
+    jwt_auth::{JwtConfig, JwtManager},
+    serve_admin_on_listener,
+};
+use ferrum_edge::plugin_cache::PluginCache;
+use jsonwebtoken::{EncodingKey, Header, encode};
+use serde_json::{Value, json};
+use std::sync::Arc;
+
+const ATTACH_JWT_SECRET: &str = "test-secret-key-for-plugin-attach-tests";
+const ATTACH_NAMESPACE: &str = "ferrum";
+
+async fn attach_admin(store: Arc<DatabaseStore>) -> (String, tokio::sync::watch::Sender<bool>) {
+    let state = AdminState {
+        db: Some(store),
+        jwt_manager: JwtManager::new(JwtConfig {
+            secret: ATTACH_JWT_SECRET.to_string(),
+            issuer: "test-ferrum-edge".to_string(),
+            audience: None,
+            max_ttl_seconds: 3600,
+            algorithm: jsonwebtoken::Algorithm::HS256,
+        }),
+        metrics_auth: Default::default(),
+        cached_config: None,
+        proxy_state: None,
+        mode: "database".to_string(),
+        read_only: false,
+        admin_audit_enabled: false,
+        admin_audit_fallback_dir: Some(crate::common::isolated_audit_fallback_dir()),
+        admin_require_namespace_claim: false,
+        startup_ready: None,
+        serving_degraded: None,
+        serving_listener_failures: None,
+        gateway_listener_status: None,
+        gateway_listener_failure_fails_readiness: false,
+        db_available: None,
+        config_rejected: None,
+        admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::none()),
+        cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+        db_health_refresh: Arc::new(tokio::sync::Mutex::new(())),
+        dp_registry: None,
+        mesh_registry: None,
+        cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        mesh_runtime_state: None,
+        admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
+        runtime_config_apply: None,
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        let _ = serve_admin_on_listener(
+            listener,
+            state,
+            shutdown_rx,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await;
+    });
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return (format!("http://{}", addr), shutdown_tx);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("admin server at {} never became ready", addr);
+}
+
+fn attach_token() -> String {
+    let now = Utc::now();
+    let claims = json!({
+        "iss": "test-ferrum-edge",
+        "sub": "test-user",
+        "role": "admin",
+        "iat": now.timestamp(),
+        "nbf": now.timestamp(),
+        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "jti": uuid::Uuid::new_v4().to_string(),
+    });
+    encode(
+        &Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(ATTACH_JWT_SECRET.as_bytes()),
+    )
+    .unwrap()
+}
+
+async fn admin_call(
+    method: reqwest::Method,
+    base_url: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> (u16, Value) {
+    let mut request = reqwest::Client::new()
+        .request(method, format!("{}{}", base_url, path))
+        .bearer_auth(attach_token())
+        .header("X-Ferrum-Namespace", ATTACH_NAMESPACE);
+    if let Some(body) = body {
+        request = request.json(body);
+    }
+    let response = request.send().await.expect("admin request must complete");
+    let status = response.status().as_u16();
+    let body: Value = response.json().await.unwrap_or_else(|_| json!({}));
+    (status, body)
+}
+
+fn attach_proxy_payload(id: &str, listen_path: &str) -> Value {
+    json!({
+        "id": id,
+        "listen_path": listen_path,
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 8080,
+        "strip_listen_path": true,
+    })
+}
+
+fn attach_plugin_payload(id: &str, proxy_id: Option<&str>) -> Value {
+    let mut payload = json!({
+        "id": id,
+        "plugin_name": "request_transformer",
+        "scope": if proxy_id.is_some() { "proxy" } else { "global" },
+        "config": { "rules": [{
+            "operation": "add",
+            "target": "header",
+            "key": "x-ferrum-attach",
+            "value": "1",
+        }] },
+        "enabled": true,
+    });
+    if let Some(proxy_id) = proxy_id {
+        payload["proxy_id"] = json!(proxy_id);
+    }
+    payload
+}
+
+/// Ids the proxy currently lists, as `GET /proxies/{id}` renders them.
+fn association_ids(proxy_body: &Value) -> Vec<String> {
+    proxy_body["plugins"]
+        .as_array()
+        .map(|associations| {
+            associations
+                .iter()
+                .filter_map(|association| {
+                    association["plugin_config_id"].as_str().map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Returns the store, the tempdir, the admin base URL, and the shutdown sender
+/// — the caller must hold the last two alive for the duration of the test.
+type AttachFixture = (
+    Arc<DatabaseStore>,
+    TempDir,
+    String,
+    tokio::sync::watch::Sender<bool>,
+);
+
+async fn attach_fixture() -> AttachFixture {
+    let (store, temp_dir) = sqlite_store().await;
+    let store = Arc::new(store);
+    let (base_url, shutdown) = attach_admin(store.clone()).await;
+    let (status, body) = admin_call(
+        reqwest::Method::POST,
+        &base_url,
+        "/proxies",
+        Some(&attach_proxy_payload("proxy-attach-1", "/attach-1")),
+    )
+    .await;
+    assert_eq!(status, 201, "proxy create must succeed: {:?}", body);
+    (store, temp_dir, base_url, shutdown)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proxy_scoped_plugin_create_writes_the_proxy_association() {
+    let (store, _temp_dir, base_url, _shutdown) = attach_fixture().await;
+
+    let before = store
+        .get_proxy(ATTACH_NAMESPACE, "proxy-attach-1")
+        .await
+        .expect("proxy read must succeed")
+        .expect("proxy must exist");
+
+    let (status, body) = admin_call(
+        reqwest::Method::POST,
+        &base_url,
+        "/plugins/config",
+        Some(&attach_plugin_payload(
+            "pc-attach-1",
+            Some("proxy-attach-1"),
+        )),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "proxy-scoped plugin create must succeed: {:?}",
+        body
+    );
+
+    let (status, proxy_body) = admin_call(
+        reqwest::Method::GET,
+        &base_url,
+        "/proxies/proxy-attach-1",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        association_ids(&proxy_body),
+        vec!["pc-attach-1".to_string()],
+        "201 must mean attached: GET /proxies must list the config"
+    );
+
+    // The poll/CP broadcast contract: the proxy's own `updated_at` advances so
+    // the change is republished, not just the plugin_config row's.
+    let after = store
+        .get_proxy(ATTACH_NAMESPACE, "proxy-attach-1")
+        .await
+        .expect("proxy read must succeed")
+        .expect("proxy must exist");
+    assert!(
+        after.updated_at > before.updated_at,
+        "attaching must advance the proxy's updated_at ({} -> {})",
+        before.updated_at,
+        after.updated_at
+    );
+
+    // The incremental poll republishes the proxy carrying the association, so
+    // a running gateway picks the attachment up on its next cycle.
+    let delta = store
+        .load_incremental_config(ATTACH_NAMESPACE, 0)
+        .await
+        .expect("incremental load must succeed");
+    let republished = delta
+        .added_or_modified_proxies
+        .iter()
+        .find(|proxy| proxy.id == "proxy-attach-1")
+        .expect("the touched proxy must be republished");
+    assert_eq!(republished.plugins.len(), 1);
+    assert_eq!(republished.plugins[0].plugin_config_id, "pc-attach-1");
+
+    // And the resulting generation actually applies the plugin to the proxy.
+    let config = store
+        .load_full_config(ATTACH_NAMESPACE)
+        .await
+        .expect("full load must succeed");
+    let cache = PluginCache::new(&config).expect("plugin cache must build");
+    assert!(
+        !cache
+            .get_plugins(ATTACH_NAMESPACE, "proxy-attach-1")
+            .is_empty(),
+        "the attached plugin must be applied to the proxy"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proxy_scoped_plugin_update_rehomes_the_association() {
+    let (store, _temp_dir, base_url, _shutdown) = attach_fixture().await;
+
+    let (status, body) = admin_call(
+        reqwest::Method::POST,
+        &base_url,
+        "/proxies",
+        Some(&attach_proxy_payload("proxy-attach-2", "/attach-2")),
+    )
+    .await;
+    assert_eq!(status, 201, "second proxy create must succeed: {:?}", body);
+
+    let (status, _) = admin_call(
+        reqwest::Method::POST,
+        &base_url,
+        "/plugins/config",
+        Some(&attach_plugin_payload(
+            "pc-attach-1",
+            Some("proxy-attach-1"),
+        )),
+    )
+    .await;
+    assert_eq!(status, 201);
+
+    let (status, body) = admin_call(
+        reqwest::Method::PUT,
+        &base_url,
+        "/plugins/config/pc-attach-1",
+        Some(&attach_plugin_payload(
+            "pc-attach-1",
+            Some("proxy-attach-2"),
+        )),
+    )
+    .await;
+    assert_eq!(status, 200, "re-homing update must succeed: {:?}", body);
+
+    let first = store
+        .get_proxy(ATTACH_NAMESPACE, "proxy-attach-1")
+        .await
+        .expect("first proxy read must succeed")
+        .expect("first proxy must exist");
+    assert!(
+        first.plugins.is_empty(),
+        "the previous proxy must lose the association"
+    );
+    let second = store
+        .get_proxy(ATTACH_NAMESPACE, "proxy-attach-2")
+        .await
+        .expect("second proxy read must succeed")
+        .expect("second proxy must exist");
+    assert_eq!(second.plugins.len(), 1);
+    assert_eq!(second.plugins[0].plugin_config_id, "pc-attach-1");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_scope_change_away_from_proxy_detaches_the_association() {
+    let (store, _temp_dir, base_url, _shutdown) = attach_fixture().await;
+
+    let (status, _) = admin_call(
+        reqwest::Method::POST,
+        &base_url,
+        "/plugins/config",
+        Some(&attach_plugin_payload(
+            "pc-attach-1",
+            Some("proxy-attach-1"),
+        )),
+    )
+    .await;
+    assert_eq!(status, 201);
+
+    let (status, body) = admin_call(
+        reqwest::Method::PUT,
+        &base_url,
+        "/plugins/config/pc-attach-1",
+        Some(&attach_plugin_payload("pc-attach-1", None)),
+    )
+    .await;
+    assert_eq!(status, 200, "scope change must succeed: {:?}", body);
+
+    let proxy = store
+        .get_proxy(ATTACH_NAMESPACE, "proxy-attach-1")
+        .await
+        .expect("proxy read must succeed")
+        .expect("proxy must exist");
+    assert!(
+        proxy.plugins.is_empty(),
+        "a global-scoped config must not stay associated with a proxy"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_config_delete_detaches_the_association() {
+    let (store, _temp_dir, base_url, _shutdown) = attach_fixture().await;
+
+    let (status, _) = admin_call(
+        reqwest::Method::POST,
+        &base_url,
+        "/plugins/config",
+        Some(&attach_plugin_payload(
+            "pc-attach-1",
+            Some("proxy-attach-1"),
+        )),
+    )
+    .await;
+    assert_eq!(status, 201);
+
+    let (status, body) = admin_call(
+        reqwest::Method::DELETE,
+        &base_url,
+        "/plugins/config/pc-attach-1",
+        None,
+    )
+    .await;
+    assert!(
+        status == 200 || status == 204,
+        "delete must succeed (got {}): {:?}",
+        status,
+        body
+    );
+
+    let proxy = store
+        .get_proxy(ATTACH_NAMESPACE, "proxy-attach-1")
+        .await
+        .expect("proxy read must succeed")
+        .expect("proxy must exist");
+    assert!(
+        proxy.plugins.is_empty(),
+        "deleting the config must remove every association"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proxy_scoped_plugin_for_a_missing_proxy_is_still_rejected() {
+    let (_store, _temp_dir, base_url, _shutdown) = attach_fixture().await;
+
+    let (status, body) = admin_call(
+        reqwest::Method::POST,
+        &base_url,
+        "/plugins/config",
+        Some(&attach_plugin_payload("pc-attach-1", Some("proxy-missing"))),
+    )
+    .await;
+    assert_eq!(status, 400, "unknown proxy_id must be rejected: {:?}", body);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("does not exist in namespace"),
+        "existing diagnostic shape must be preserved: {:?}",
+        body
+    );
+}

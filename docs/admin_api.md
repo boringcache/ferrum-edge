@@ -802,6 +802,32 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   http://localhost:9000/plugins/config
 ```
 
+### Proxy-scoped configs attach the proxy association
+
+A proxy-scoped plugin applies only when the target proxy lists it in `plugins`;
+`proxy_id` alone never attaches it (see `docs/plugins.md` → Scope). In
+**database mode** the Admin API keeps the two surfaces in step, atomically:
+
+| Write | Effect on `proxies[].plugins` |
+| --- | --- |
+| `POST /plugins/config` with `scope: "proxy"`, `proxy_id: P` | appends `{"plugin_config_id": "<id>"}` to `P` (idempotent) |
+| `PUT /plugins/config/{id}` moving `proxy_id` from `P1` to `P2` | removes it from `P1`, adds it to `P2` |
+| `PUT /plugins/config/{id}` changing `scope` to `global` | removes the stale association |
+| `DELETE /plugins/config/{id}` | removes it from every proxy that lists it |
+
+The plugin-config row and the association commit in one transaction, and every
+touched proxy's `updated_at` advances so the next poll / control-plane
+broadcast republishes it. `GET /proxies/{id}` is therefore authoritative: a
+`201` from `POST /plugins/config` means *attached*, not merely created. A
+`proxy_id` that does not exist in the request's namespace is rejected with
+`400 {"error":"proxy_id '<P>' does not exist in namespace '<ns>'"}` and nothing
+is persisted, as before.
+
+`scope: "proxy_group"` associations are unaffected — they are operator-managed
+through `PUT /proxies/{id}` and stay valid for any proxy in the namespace. File
+mode is unchanged: the configuration file's association arrays are the only
+attachment surface there.
+
 Disabled plugin configs are stored without plugin-specific construction, so operators can stage configuration before runtime-only prerequisites are present. For example, `basic_auth` may be created or imported with `enabled: false` before `FERRUM_BASIC_AUTH_HMAC_SECRET` is provisioned. Enabling the config performs normal construction and fails closed unless the secret is present and at least 32 bytes.
 
 Plugin-config reads by `viewer` and `operator` roles use the same redacted projection stored in admin audit diffs; `admin` reads remain raw.
