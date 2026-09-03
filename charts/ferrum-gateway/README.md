@@ -53,6 +53,12 @@ migrations; use the explicit Job for `status`, dry-run, and operator-controlled
   or `ghcr.io/ferrum-edge/ferrum-edge` (for example
   `--set image.tag=<tag>`). The mutable `latest` tag exists for evaluation but
   must not be used in production.
+- **Private registries.** `image.pullSecrets` is a list of Secret **names** in
+  the release namespace — each must already exist as a
+  `kubernetes.io/dockerconfigjson` Secret, the chart never creates one. The
+  names are attached to the gateway pod spec as `imagePullSecrets`:
+  `--set 'image.pullSecrets[0]=regcred'`. The default is `[]`, which renders no
+  `imagePullSecrets` key at all.
 - **Secrets are never generated or rendered into ConfigMaps.** Admin JWT, DB
   URL, and CP/DP gRPC JWT material come from inline values (dev only) or Secret
   references you own. The chart validates that database, cp, and dp modes have

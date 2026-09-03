@@ -5,6 +5,8 @@ image:
   # --set image.tag=<tag>). latest is mutable and for evaluation only.
   tag: ""
   pullPolicy: IfNotPresent
+  # Names of imagePullSecrets to attach to the pod.
+  pullSecrets: []
 
 namespace: ferrum
 

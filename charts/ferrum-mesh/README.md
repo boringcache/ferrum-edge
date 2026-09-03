@@ -25,6 +25,27 @@ tag from `docker.io/ferrumedge/ferrum-edge` or `ghcr.io/ferrum-edge/ferrum-edge`
 (for example `--set image.tag=<published-tag>`). The mutable `latest` tag exists
 for evaluation but must not be used in production.
 
+## Private registries
+
+`image.pullSecrets` is a list of Secret **names** in the release namespace —
+each must already exist as a `kubernetes.io/dockerconfigjson` Secret, the chart
+never creates one:
+
+```bash
+helm install ferrum ./charts/ferrum-mesh --namespace ferrum \
+  --set image.repository=registry.internal.example/ferrum-edge \
+  --set image.tag=<published-tag> \
+  --set 'image.pullSecrets[0]=regcred'
+```
+
+The names are attached to **every** mesh pod spec — control plane, CA,
+east-west gateway, injector, ambient DaemonSet, node agent, and both CNI
+uninstall-hook pods — including workloads that use the `nodeAgent.image` tag
+override. The uninstall-hook pods matter: they run the Ferrum image, so without
+the pull secret `helm uninstall` hangs in `ImagePullBackOff` on the node whose
+CNI chain is being removed. The default is `[]`, which renders no
+`imagePullSecrets` key at all.
+
 ## Gateway API CRDs (required)
 
 When `controlPlane.enabled=true` and `controlPlane.rbac.gatewayApi=true` (the

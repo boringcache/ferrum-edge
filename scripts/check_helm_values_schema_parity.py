@@ -3,9 +3,16 @@
 
 Walks object keys in each chart's values.yaml and requires a matching
 ``properties`` entry in the companion schema (resolving ``$ref``). Descent stops
-under documented free-form maps (``additionalProperties`` not ``false``) and
-under arrays, so extension-map entries and list item payloads are not treated
-as schema-declared chart keys.
+under documented free-form maps (``additionalProperties`` not ``false``), so
+extension-map entries are not treated as schema-declared chart keys.
+
+Arrays are not descended into for key parity — list item payloads are not chart
+keys — but a NON-EMPTY array's first item is kind-checked against the schema's
+``items.type``: a values.yaml that ships strings under a schema declaring
+``object`` items (or the reverse) is a template/schema mismatch that Helm only
+surfaces at ``install``/``upgrade``/``template`` time. An array that defaults to
+``[]`` has no item to check, so this only prevents drift on arrays that ship a
+non-empty default.
 
 Requires PyYAML. Install the hash-pinned requirements next to this script::
 
@@ -87,6 +94,55 @@ def is_open_map(schema_root: dict[str, Any], node: dict[str, Any]) -> bool:
     return additional is not False
 
 
+def value_kind(value: Any) -> str:
+    """Coarse kind of a values.yaml list item: mapping, array, or scalar."""
+    if isinstance(value, dict):
+        return "mapping"
+    if isinstance(value, list):
+        return "array"
+    return "scalar"
+
+
+def schema_kind(item_type: Any) -> str | None:
+    """Coarse kind implied by a schema ``items.type``, or None when unusable."""
+    if isinstance(item_type, list):
+        kinds = {schema_kind(entry) for entry in item_type}
+        kinds.discard(None)
+        # A union that spans kinds constrains nothing we can check.
+        return kinds.pop() if len(kinds) == 1 else None
+    if item_type == "object":
+        return "mapping"
+    if item_type == "array":
+        return "array"
+    if item_type in {"string", "integer", "number", "boolean"}:
+        return "scalar"
+    return None
+
+
+def array_item_kind_mismatch(
+    schema_root: dict[str, Any], child_schema: dict[str, Any], first_item: Any
+) -> str | None:
+    """Describe a kind disagreement between a list's first item and ``items.type``.
+
+    Returns None when the schema declares no usable ``items.type``; an
+    unconstrained array is a documented choice, not drift.
+    """
+    items = child_schema.get("items")
+    if not isinstance(items, dict):
+        return None
+    items = resolve_ref(schema_root, items)
+    expected = schema_kind(items.get("type"))
+    if expected is None:
+        return None
+    actual = value_kind(first_item)
+    if actual == expected:
+        return None
+    return (
+        f"[0] is a {actual} but values.schema.json declares "
+        f"items.type={items.get('type')!r} ({expected})"
+    )
+
+
 def collect_missing(
     values: Any,
     schema_node: dict[str, Any],
@@ -123,7 +179,11 @@ def collect_missing(
                 )
                 continue
             missing.extend(collect_missing(child, child_schema, schema_root, path))
-        # Arrays and scalars: presence of the parent key is enough.
+        elif isinstance(child, list) and child:
+            mismatch = array_item_kind_mismatch(schema_root, child_schema, child[0])
+            if mismatch is not None:
+                missing.append(f"{path}{mismatch}")
+        # Empty arrays and scalars: presence of the parent key is enough.
     return missing
 
 
@@ -152,7 +212,15 @@ def check_chart(chart_dir: Path) -> list[str]:
         ]
 
     missing = collect_missing(values, schema, schema, "")
-    return [f"{chart_dir.name}: missing schema property for values key `{path}`" for path in missing]
+    failures = []
+    for path in missing:
+        if "[0] is a " in path:
+            failures.append(f"{chart_dir.name}: values key `{path}`")
+        else:
+            failures.append(
+                f"{chart_dir.name}: missing schema property for values key `{path}`"
+            )
+    return failures
 
 
 def main() -> int:

@@ -3609,6 +3609,27 @@ jobs:
             --set-string controlPlane.env.FERRUM_ADMIN_ALLOWED_CIDRS=127.0.0.0/8 \
             --set-string controlPlane.env.FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-admin-env-override.yaml"
+          # image.pullSecrets is a list of Secret NAMES (strings) and must reach
+          # EVERY mesh pod spec, including both CNI uninstall-hook pods (they run
+          # the Ferrum image, so a private registry would hang the uninstall).
+          # The chart defaults to [], so without an explicit render neither the
+          # schema nor the template shape is ever exercised (#4510).
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set 'image.pullSecrets[0]=regcred' \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.cni.enabled=true \
+            --set ca.enabled=true \
+            --set eastWest.enabled=true \
+            --set injector.enabled=true \
+            --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-image-pull-secrets.yaml"
+          # The default install must render no imagePullSecrets key at all.
+          if grep -Fq 'imagePullSecrets' "$RUNNER_TEMP/ferrum-helm-results/default-rendered.yaml"; then
+            echo "::error title=Default mesh render carries imagePullSecrets::image.pullSecrets defaults to [] and must render nothing"
+            exit 1
+          fi
           python3 -I .github/scripts/verify_mesh_production_readiness.py \
             --results-dir "$RUNNER_TEMP/ferrum-helm-results"
 
@@ -3675,6 +3696,34 @@ jobs:
             exit 1
           fi
           grep -Fq 'name: FERRUM_FILE_CONFIG_PATH' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"
+          # image.pullSecrets is a list of Secret NAMES (strings). The schema
+          # used to declare object items, so the documented string form was
+          # rejected outright and the schema-valid object form rendered
+          # `- name: map[name:regcred]` (#4510). The default is [], so only an
+          # explicit render exercises either surface.
+          if grep -Fq 'imagePullSecrets' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"; then
+            echo "::error title=Default gateway render carries imagePullSecrets::image.pullSecrets defaults to [] and must render nothing"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set 'image.pullSecrets[0]=regcred' \
+            --set 'image.pullSecrets[1]=mirror-creds' \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/pull-secrets-rendered.yaml"
+          grep -Fq '      imagePullSecrets:' "$RUNNER_TEMP/ferrum-gateway-helm-results/pull-secrets-rendered.yaml"
+          grep -Fq '        - name: regcred' "$RUNNER_TEMP/ferrum-gateway-helm-results/pull-secrets-rendered.yaml"
+          grep -Fq '        - name: mirror-creds' "$RUNNER_TEMP/ferrum-gateway-helm-results/pull-secrets-rendered.yaml"
+          # The object form must now be REJECTED by the schema, so a stale
+          # values file cannot silently render an unresolvable Secret name.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set 'image.pullSecrets[0].name=regcred' \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/pull-secrets-object.out" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/pull-secrets-object.err"; then
+            echo "::error title=Object-form gateway pull secret accepted::image.pullSecrets items must be Secret names (strings)"
+            exit 1
+          fi
+          grep -E 'pullSecrets|want string|got object' \
+            "$RUNNER_TEMP/ferrum-gateway-helm-results/pull-secrets-object.err" \
+            "$RUNNER_TEMP/ferrum-gateway-helm-results/pull-secrets-object.out"
           # GatewayConfig deserialization requires all four top-level lists (version,
           # proxies, consumers, plugin_configs) with no serde defaults, so the default
           # inline ConfigMap must emit consumers/plugin_configs or the pod fails to boot.
