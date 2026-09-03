@@ -1766,8 +1766,10 @@ fn exclude_inbound_ports_for_pod(config: &InjectorConfig, pod: &Value) -> Result
     // RETURN for it does not let anything bypass the mesh (issue #4533).
     // Application ports are NEVER excluded: a destination-port-wide RETURN for
     // an app port would also let ordinary Service / Pod-IP traffic skip mesh
-    // mTLS and `mesh_authz`.
-    if rewrite_app_probes_enabled(pod) {
+    // mTLS and `mesh_authz`. The port is excluded only when at least one probe
+    // was actually rewritten — a pod with no HTTP/TCP/gRPC probes (or one that
+    // opted out) starts no probe listener, so nothing needs a RETURN.
+    if rewrite_app_probes_enabled(pod) && !app_probe_rewrite_for_pod(pod)?.probes.is_empty() {
         ports.push(DEFAULT_APP_PROBE_PORT);
     }
     ports.sort_unstable();
