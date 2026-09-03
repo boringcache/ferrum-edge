@@ -359,7 +359,6 @@ fn parse_grpc_status(trailer_text: &str) -> Option<u32> {
 /// One logical destination reached by a native-gRPC route and a gRPC-Web route.
 /// Both carry `http2MaxRequests: 1`, so a live RPC on either must saturate both.
 fn grpc_destination_config(backend_port: u16) -> GatewayConfig {
-    quarantined_plugin_configs: Vec::new(),
     serde_json::from_value(json!({
         "version": "1",
         "proxies": [

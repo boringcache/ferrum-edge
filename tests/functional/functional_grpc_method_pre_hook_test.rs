@@ -179,7 +179,6 @@ async fn start_gateway(
 }
 
 fn test_config(backend_port: u16, function_port: u16) -> GatewayConfig {
-    quarantined_plugin_configs: Vec::new(),
     serde_json::from_value(json!({
         "version": "1",
         "proxies": [{

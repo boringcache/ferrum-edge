@@ -4606,7 +4606,6 @@ mod tests {
     #[test]
     fn stream_backend_routing_key_tracks_upstream_target_set() {
         let config = |targets: serde_json::Value| -> GatewayConfig {
-            quarantined_plugin_configs: Vec::new(),
             serde_json::from_value(serde_json::json!({
                 "version": "1",
                 "proxies": [],
@@ -4654,7 +4653,6 @@ mod tests {
     fn stream_backend_routing_key_tracks_subset_membership() {
         let config =
             |subset_labels: serde_json::Value, a_tags: serde_json::Value| -> GatewayConfig {
-                quarantined_plugin_configs: Vec::new(),
                 serde_json::from_value(serde_json::json!({
                     "version": "1",
                     "proxies": [],

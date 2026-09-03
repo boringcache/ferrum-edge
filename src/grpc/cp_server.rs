@@ -945,7 +945,6 @@ impl CpGrpcServer {
         request: &MeshSliceRequest,
         scope: &CpScope,
     ) -> GatewayConfig {
-        quarantined_plugin_configs: Vec::new(),
         Self::filter_config_to_mesh_request_for_scope_and_bearer(config, request, scope, None)
     }
 
@@ -1249,7 +1248,6 @@ impl CpGrpcServer {
         namespace: &str,
         scope: &CpScope,
     ) -> GatewayConfig {
-        quarantined_plugin_configs: Vec::new(),
         Self::filter_config_and_projection(config, namespace, scope).0
     }
 
