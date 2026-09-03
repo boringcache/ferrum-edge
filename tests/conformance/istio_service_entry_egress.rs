@@ -1290,3 +1290,236 @@ fn se_udp_hostless_service_entry_admits_nothing_on_either_half() {
     // Source half: the same structural rejection at the public boundary.
     assert_rejected_at_mesh_boundary(&sidecar_source_runtime_with_gateway(), "source");
 }
+
+// ── Wildcard-host egress refusal (issue #4535) ─────────────────────────────
+
+/// A wildcard-host ServiceEntry with `resolution: STATIC` and declared
+/// `endpoints[]` (or `resolution: DNS`/`NONE` with none).
+fn wildcard_se(
+    name: &str,
+    host: &str,
+    port: u16,
+    protocol: &str,
+    resolution: &str,
+    endpoints: Vec<&str>,
+) -> K8sObject {
+    let port_name = protocol.to_lowercase();
+    // The service port below is NAMED, so each endpoint must carry a matching
+    // `ports` entry or the STATIC target builder drops it.
+    let mut endpoint_ports = serde_json::Map::new();
+    endpoint_ports.insert(port_name.clone(), json!(port));
+    let endpoints: Vec<Value> = endpoints
+        .iter()
+        .map(|address| json!({"address": address, "ports": Value::Object(endpoint_ports.clone())}))
+        .collect();
+    service_entry(
+        name,
+        json!({
+            "hosts": [host],
+            "location": "MESH_EXTERNAL",
+            "resolution": resolution,
+            "endpoints": endpoints,
+            "ports": [{
+                "number": port,
+                "name": port_name,
+                "protocol": protocol
+            }]
+        }),
+    )
+}
+
+/// A `resolution: DNS` wildcard HTTP-family ServiceEntry materializes NOTHING.
+///
+/// Without declared endpoints the upstream target host would be the literal
+/// string `*.api.external.com`, which no resolver can answer — while Ferrum's
+/// wildcard host tier still MATCHES `foo.api.external.com`, so every request
+/// routed and then 502'd with no apply-time signal.
+#[test]
+fn se_http_egress_refuses_unresolvable_wildcard_host() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "Wildcard-host HTTP-family egress ServiceEntry refused without endpoints (#4535)",
+        status = Status::Supported,
+        notes = "#4535: a DNS/NONE wildcard host would become the literal upstream dial target; refused with a hosts[]-named warning instead of silently 502ing.",
+    );
+    let translation = translate_k8s_objects(
+        &[wildcard_se(
+            "wildcard-api",
+            "*.api.external.com",
+            443,
+            "TLS",
+            "DNS",
+            Vec::new(),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+    let prepared =
+        prepare_gateway_config_for_mesh(translation.config, &egress_runtime()).expect("mesh apply");
+
+    assert!(
+        !prepared
+            .proxies
+            .iter()
+            .any(|p| p.id.starts_with("mesh-egress")),
+        "no egress proxy may be materialized for an unresolvable wildcard host"
+    );
+    assert!(
+        !prepared
+            .upstreams
+            .iter()
+            .any(|u| u.id.starts_with("mesh-egress-up")),
+        "and no egress upstream either"
+    );
+}
+
+/// The same refusal on the stream family — and the refused entry must NOT
+/// consume the listen port, so a following exact-host ServiceEntry on the same
+/// port still materializes.
+#[test]
+fn se_stream_egress_refuses_wildcard_host_without_claiming_the_port() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "Wildcard-host stream egress ServiceEntry refused, port stays claimable (#4535)",
+        status = Status::Supported,
+        notes = "#4535: the stream branch returns before materialized_stream_ports.insert, so a refused wildcard entry does not block a valid exact-host entry on the same port.",
+    );
+    let translation = translate_k8s_objects(
+        &[
+            wildcard_se(
+                "wildcard-kafka",
+                "*.kafka.external.com",
+                9092,
+                "TCP",
+                "DNS",
+                Vec::new(),
+            ),
+            external_se("kafka", vec!["kafka.external.com"], 9092, "TCP"),
+        ],
+        options(),
+    )
+    .expect("translation succeeds");
+    let prepared =
+        prepare_gateway_config_for_mesh(translation.config, &egress_runtime()).expect("mesh apply");
+
+    assert!(
+        !prepared
+            .proxies
+            .iter()
+            .any(|p| p.id.contains("_star__dot_kafka")),
+        "the wildcard stream entry must not materialize"
+    );
+    let stream = prepared
+        .proxies
+        .iter()
+        .find(|p| p.listen_port == Some(9092))
+        .expect("the exact-host entry must still claim port 9092");
+    assert_eq!(stream.backend_scheme, Some(BackendScheme::Tcp));
+    let upstream = prepared
+        .upstreams
+        .iter()
+        .find(|u| Some(&u.id) == stream.upstream_id.as_ref())
+        .expect("stream upstream");
+    assert_eq!(
+        upstream
+            .targets
+            .iter()
+            .map(|t| t.host.as_str())
+            .collect::<Vec<_>>(),
+        vec!["kafka.external.com"],
+    );
+}
+
+/// A `resolution: STATIC` wildcard entry with declared endpoints IS supported:
+/// the dial set is the endpoint addresses and the wildcard is only the route
+/// selector, so nothing unresolvable ever reaches an upstream target.
+#[test]
+fn se_static_wildcard_host_with_endpoints_still_materializes() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "Wildcard-host egress ServiceEntry supported with resolution: STATIC + endpoints (#4535)",
+        status = Status::Supported,
+        notes = "#4535: the refusal is narrow — a STATIC wildcard entry dials its declared endpoints[], never the wildcard string.",
+    );
+    let translation = translate_k8s_objects(
+        &[wildcard_se(
+            "wildcard-api",
+            "*.api.external.com",
+            443,
+            "TLS",
+            "STATIC",
+            vec!["203.0.113.10", "203.0.113.11"],
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+    let prepared =
+        prepare_gateway_config_for_mesh(translation.config, &egress_runtime()).expect("mesh apply");
+
+    let egress = prepared
+        .proxies
+        .iter()
+        .find(|p| p.id.starts_with("mesh-egress"))
+        .expect("STATIC wildcard entry must still materialize");
+    assert_eq!(egress.hosts, vec!["*.api.external.com".to_string()]);
+    let upstream = prepared
+        .upstreams
+        .iter()
+        .find(|u| Some(&u.id) == egress.upstream_id.as_ref())
+        .expect("egress upstream");
+    assert_eq!(
+        upstream
+            .targets
+            .iter()
+            .map(|t| t.host.as_str())
+            .collect::<Vec<_>>(),
+        vec!["203.0.113.10", "203.0.113.11"],
+        "targets must be the declared endpoints, never the wildcard string"
+    );
+    assert!(
+        upstream.targets.iter().all(|t| !t.host.contains('*')),
+        "no upstream target may carry a wildcard host"
+    );
+}
+
+/// The datagram branch is deliberately STRICTER: a UDP CONNECT authority is
+/// matched exactly, so even a `STATIC` wildcard entry with usable endpoints
+/// would admit a destination no client could ever name. Both wildcard shapes
+/// admit nothing.
+#[test]
+fn se_udp_egress_refuses_every_wildcard_host_including_static() {
+    register_feature!(
+        category = CATEGORY,
+        feature =
+            "Wildcard-host UDP egress ServiceEntry refused even under resolution: STATIC (#4535)",
+        status = Status::Supported,
+        notes = "#4535: datagram egress matches the CONNECT authority exactly, so a wildcard authority is dead config; refused in both resolution modes.",
+    );
+    for (name, resolution, endpoints) in [
+        ("wildcard-dns-dns", "DNS", Vec::new()),
+        ("wildcard-dns-static", "STATIC", vec!["203.0.113.10"]),
+    ] {
+        let translation = translate_k8s_objects(
+            &[wildcard_se(
+                name,
+                "*.dns.external.com",
+                53,
+                "UDP",
+                resolution,
+                endpoints,
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+        let prepared = prepare_gateway_config_for_mesh(translation.config, &egress_runtime())
+            .expect("mesh apply");
+        let mesh = prepared.mesh.as_deref().expect("prepared mesh block");
+        assert!(
+            mesh.egress_udp_destinations
+                .iter()
+                .all(|destination| !destination.host.contains('*')),
+            "{resolution}: a wildcard UDP authority must never be admitted: {:?}",
+            mesh.egress_udp_destinations
+        );
+    }
+}

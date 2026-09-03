@@ -11885,7 +11885,12 @@ fn build_egress_proxies_and_upstreams(
 /// - stream-family egress not enabled (`FERRUM_MESH_EGRESS_STREAM_ENABLED`);
 /// - `port: 0` (a CONNECT authority can never name it);
 /// - a wildcard host (`*.example.com`) — admission is exact-match only, so a
-///   prefix pattern would have to be resolved by guessing;
+///   prefix pattern would have to be resolved by guessing. This is STRICTER than
+///   the HTTP-family and stream-family egress branches, which admit a wildcard
+///   host under `resolution: STATIC` with declared `endpoints[]` (there the host
+///   is only a route selector and the dial set is the endpoints). Here the host
+///   IS the CONNECT authority and authorities are matched exactly, so a wildcard
+///   destination could never be named by any client;
 /// - an empty/whitespace host;
 /// - a `STATIC` endpoint address that is not a bare IP literal;
 /// - a `STATIC` entry that resolved NO usable endpoint — the host is refused
@@ -11969,7 +11974,21 @@ fn build_udp_egress_destinations_for_entry(
             );
             continue;
         }
-        if host.contains('*') {
+        // Refuse the shared unresolvable-wildcard case AND, additionally, every
+        // wildcard: the datagram branch is STRICTER than the HTTP/stream ones on
+        // purpose. A UDP destination is looked up by EXACT authority match
+        // (`mesh_egress_udp_destination_dial_endpoint` in `src/proxy/mod.rs`
+        // compares `dest.host.eq_ignore_ascii_case(authority)`), so even a STATIC
+        // wildcard entry with usable endpoints would admit a destination that no
+        // CONNECT authority can ever name — dead config rather than a working
+        // route. The shared predicate is still called so the two branches cannot
+        // drift about the case they agree on.
+        if crate::modes::mesh::config::egress_host_is_unresolvable_wildcard(
+            host,
+            entry.resolution,
+            entry.endpoints.len(),
+        ) || host.contains('*')
+        {
             warn!(
                 service_entry = %entry.name,
                 namespace = %entry.namespace,
@@ -11977,8 +11996,9 @@ fn build_udp_egress_destinations_for_entry(
                 host = %host,
                 port = port_spec.port,
                 "Skipping wildcard UDP egress ServiceEntry host: datagram-over-mesh egress \
-                 admits exact authority hosts only, so a wildcard cannot be honored without \
-                 guessing the destination"
+                 admits exact authority hosts only (the CONNECT authority is matched \
+                 exactly), so a wildcard cannot be honored without guessing the \
+                 destination — even under resolution: STATIC with declared endpoints[]"
             );
             continue;
         }
@@ -12220,6 +12240,32 @@ fn build_http_egress_for_entry(
             None => (port_spec.port, port_spec.name.clone()),
         };
     for host in proxy_hosts {
+        // A wildcard host with no declared endpoint set has no dialable target:
+        // `build_egress_upstream_targets` would emit the literal `*.example.com`
+        // as the upstream host, which no resolver can answer, while the proxy's
+        // wildcard host tier still MATCHES `foo.example.com` — so every request
+        // would route and then 502 with no apply-time signal. Refuse the host
+        // and do NOT record it in `materialized_http_hosts`, so a later
+        // exact-host ServiceEntry for the same family is not shadowed by it.
+        if crate::modes::mesh::config::egress_host_is_unresolvable_wildcard(
+            host,
+            entry.resolution,
+            entry.endpoints.len(),
+        ) {
+            warn!(
+                service_entry = %entry.name,
+                namespace = %entry.namespace,
+                field = "hosts[]",
+                host = %host,
+                port = port_spec.port,
+                "Skipping wildcard HTTP-family egress ServiceEntry host: without \
+                 resolution: STATIC and a non-empty endpoints[], the wildcard host itself \
+                 becomes the upstream dial target and cannot be resolved. Declare concrete \
+                 endpoints[] or split the family into exact hosts."
+            );
+            continue;
+        }
+
         let targets = build_egress_upstream_targets(
             entry,
             host,
@@ -12326,6 +12372,30 @@ fn build_stream_egress_for_entry(
             return;
         }
     };
+
+    // Same unresolvable-wildcard refusal as the HTTP-family branch: without
+    // declared endpoints the representative host itself becomes the upstream
+    // target and cannot be resolved. Return BEFORE the port is claimed below so
+    // a refused entry does not consume `listen_port` and block a valid exact-host
+    // ServiceEntry on the same port.
+    if crate::modes::mesh::config::egress_host_is_unresolvable_wildcard(
+        representative_host,
+        entry.resolution,
+        entry.endpoints.len(),
+    ) {
+        warn!(
+            service_entry = %entry.name,
+            namespace = %entry.namespace,
+            field = "hosts[]",
+            host = %representative_host,
+            port = port_spec.port,
+            "Skipping wildcard stream-family egress ServiceEntry host: without \
+             resolution: STATIC and a non-empty endpoints[], the wildcard host itself \
+             becomes the upstream dial target and cannot be resolved. Declare concrete \
+             endpoints[] or split the family into exact hosts."
+        );
+        return;
+    }
 
     // Honor a numeric ServiceEntry `targetPort` for the backend dial port while
     // the listener, proxy/upstream IDs, and port-dedup stay keyed on the service
@@ -38130,14 +38200,30 @@ mod tests {
         );
     }
 
+    /// A wildcard host IS materializable when the operator declared concrete
+    /// endpoints (`resolution: STATIC`) — the dial targets are those endpoints
+    /// and the wildcard is only the route selector. Pins the #1727 injective id
+    /// encoding for the wildcard host alongside the supported shape; the
+    /// unresolvable variant (`DNS`/`NONE`, no endpoints) is refused instead and
+    /// is covered in `tests/conformance/istio_service_entry_egress.rs`.
     #[test]
     fn egress_sanitizes_wildcard_host_ids_but_preserves_route_host() {
-        let service_entries = vec![test_external_service_entry(
+        let mut entry = test_external_service_entry(
             "wildcard-api",
             vec!["*.api.external.com".to_string()],
             443,
             AppProtocol::Tls,
-        )];
+        );
+        entry.resolution = Resolution::Static;
+        entry.endpoints = vec![config::MeshEndpoint {
+            address: "203.0.113.10".to_string(),
+            // The service port is NAMED ("http"), so each endpoint must carry a
+            // matching `ports` entry or `build_egress_upstream_targets` drops it.
+            ports: std::collections::HashMap::from([("http".to_string(), 443u16)]),
+            labels: std::collections::HashMap::new(),
+            network: None,
+        }];
+        let service_entries = vec![entry];
 
         let (proxies, upstreams, _udp_destinations) = build_egress_proxies_and_upstreams(
             &service_entries,
@@ -38162,6 +38248,45 @@ mod tests {
             upstreams[0].id,
             "mesh-egress-up-default-wildcard_dash_api-_star__dot_api_dot_external_dot_com-443"
         );
+        // The dial target is the declared endpoint, never the literal wildcard.
+        assert_eq!(
+            upstreams[0]
+                .targets
+                .iter()
+                .map(|t| t.host.clone())
+                .collect::<Vec<_>>(),
+            vec!["203.0.113.10".to_string()]
+        );
+    }
+
+    /// The same wildcard host WITHOUT declared endpoints has no dialable target:
+    /// materializing it would emit the literal `*.api.external.com` as the
+    /// upstream host while the proxy's wildcard host tier still matched
+    /// `foo.api.external.com`, so every request would route and then 502. It must
+    /// be refused outright (issue #4535).
+    #[test]
+    fn egress_refuses_wildcard_host_without_declared_endpoints() {
+        let service_entries = vec![test_external_service_entry(
+            "wildcard-api",
+            vec!["*.api.external.com".to_string()],
+            443,
+            AppProtocol::Tls,
+        )];
+
+        let (proxies, upstreams, _udp_destinations) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+            true,
+            false,
+        );
+
+        assert!(
+            proxies.is_empty(),
+            "an unresolvable wildcard host must not materialize a proxy: {:?}",
+            proxies.iter().map(|p| p.id.clone()).collect::<Vec<_>>()
+        );
+        assert!(upstreams.is_empty(), "and no upstream either");
     }
 
     #[test]
