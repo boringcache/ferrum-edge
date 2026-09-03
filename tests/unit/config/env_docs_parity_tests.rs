@@ -21,6 +21,7 @@ const TRANSCRIPT_SINK_SECRET_ENV_PREFIX: &str = "FERRUM_TRANSCRIPT_SINK_SECRET_"
 const ENV_CONFIG_SOURCE: &str = include_str!("../../../src/config/env_config.rs");
 const CONFIGURATION_MD: &str = include_str!("../../../docs/configuration.md");
 const FERRUM_CONF: &str = include_str!("../../../ferrum.conf");
+const HARDENING_MD: &str = include_str!("../../../docs/hardening.md");
 
 /// Production `env_config.rs` only — truncate at the first `#[cfg(test)]` so
 /// macro sample keys such as `FERRUM_SAMPLE_*` and other test helpers are
@@ -251,5 +252,75 @@ fn public_ferrum_env_settings_have_docs_table_and_ferrum_conf_coverage() {
         missing_conf.is_empty(),
         "public FERRUM_* settings missing from ferrum.conf template assignments (`KEY = ...`):\n  {}",
         missing_conf.join("\n  ")
+    );
+}
+
+/// Extract every `FERRUM_*` token that appears anywhere in a document, using
+/// the same key shape as `is_ferrum_env_key`. Prose, tables, and fenced blocks
+/// are all scanned: the hardening guide names settings in all three.
+fn prose_ferrum_env_tokens(text: &str) -> BTreeSet<&str> {
+    let mut keys = BTreeSet::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Compare on the byte slice: `i` walks every byte, and slicing `text`
+        // inside a multi-byte character (an em dash in prose) would panic.
+        // `i` and `end` below always land on ASCII bytes, so the final `&str`
+        // slice is on char boundaries.
+        if !bytes[i..].starts_with(b"FERRUM_") {
+            i += 1;
+            continue;
+        }
+        // Only start a token at a boundary so `X_FERRUM_FOO` is not split.
+        if i > 0 {
+            let prev = bytes[i - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' {
+                i += 1;
+                continue;
+            }
+        }
+        let mut end = i;
+        while end < bytes.len()
+            && (bytes[end].is_ascii_uppercase()
+                || bytes[end].is_ascii_digit()
+                || bytes[end] == b'_')
+        {
+            end += 1;
+        }
+        let key = &text[i..end];
+        if is_ferrum_env_key(key) {
+            keys.insert(key);
+        }
+        i = end;
+    }
+    keys
+}
+
+/// The hardening guide is a checklist of links, so every `FERRUM_*` it names
+/// must be a real public setting. A rename that misses the guide leaves an
+/// operator configuring a variable the binary ignores.
+#[test]
+fn hardening_guide_only_names_public_ferrum_settings() {
+    let inventory = public_inventory();
+    let named = prose_ferrum_env_tokens(HARDENING_MD);
+    assert!(
+        named.len() > 20,
+        "hardening guide token extraction unexpectedly small ({}); parser or guide likely broke",
+        named.len()
+    );
+
+    let unknown: Vec<&&str> = named
+        .iter()
+        .filter(|key| !inventory.contains(**key))
+        .collect();
+    assert!(
+        unknown.is_empty(),
+        "the hardening guide names a variable that is not a public setting — either the guide \
+         is wrong or the variable was renamed:\n  {}",
+        unknown
+            .iter()
+            .map(|key| **key)
+            .collect::<Vec<_>>()
+            .join("\n  ")
     );
 }

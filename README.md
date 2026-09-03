@@ -501,8 +501,15 @@ Ferrum also **won the E2E TLS /api/users test outright** — 29,808 req/s, the h
 
 ## Documentation
 
+Start at the [documentation index](docs/README.md) — every document under
+`docs/`, grouped by audience.
+
 | Topic | Link |
 |-------|------|
+| Documentation index | [docs/README.md](docs/README.md) |
+| Production hardening checklist | [docs/hardening.md](docs/hardening.md) |
+| Threat model | [docs/threat_model.md](docs/threat_model.md) |
+| Support, versioning & deprecation policy | [docs/support_policy.md](docs/support_policy.md) |
 | Full configuration reference | [docs/configuration.md](docs/configuration.md) |
 | Plugin reference | [docs/plugins.md](docs/plugins.md) |
 | Transaction log schema customization | [docs/log_schema.md](docs/log_schema.md) |
