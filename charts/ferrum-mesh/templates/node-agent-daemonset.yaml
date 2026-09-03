@@ -247,6 +247,7 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: ferrum-node-agent
+      terminationGracePeriodSeconds: {{ .Values.nodeAgent.terminationGracePeriodSeconds }}
       {{- with .Values.nodeAgent.priorityClassName }}
       priorityClassName: {{ . | quote }}
       {{- end }}

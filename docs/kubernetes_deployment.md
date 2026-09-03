@@ -433,7 +433,12 @@ emits Ferrum as a Kubernetes **native sidecar** (`spec.initContainers` with
 application containers wait until the proxy is serving, and an injected Job can
 finish without an operator killing Ferrum. **Minimum Kubernetes version is
 1.29** (native sidecars enabled by default; 1.28 needs the `SidecarContainers`
-feature gate). There is no ordinary-container fallback. HTTP `httpGet` and TCP
+feature gate). There is no ordinary-container fallback, so with
+`injector.enabled=true` the `charts/ferrum-mesh` chart refuses to render below
+1.29 (`ferrum-mesh.validateInjectorKubeVersion`) rather than let a
+`failurePolicy: Fail` webhook mutate pods the apiserver will then reject. The
+chart carries no `Chart.yaml: kubeVersion:` constraint, so everything else still
+installs on an older cluster with `injector.enabled=false`. HTTP `httpGet` and TCP
 `tcpSocket` probe ports on every container in the pod are added to the inbound
 capture exclusion set; `exec`/`grpc` probes are not. Unresolved named probe
 ports fail admission. See [docs/mesh.md](mesh.md#sidecar-container).
@@ -484,8 +489,17 @@ optional `FERRUM_SHUTDOWN_PREDRAIN_SECONDS`, native `preStop.sleep`, and
 mode, which honors the pre-drain window on its admin and CP-gRPC accept loops,
 so the `<1.29` remediation (`shutdownPreStopSeconds: 0` plus a raised
 `shutdownPreDrainSeconds`) is a real contract there and not just a rendered env.
-The injector webhook, node-agent, and one-shot CNI uninstall hooks do not
-receive any of it. Restricted-compatible `securityContext` / non-empty
+One-shot CNI uninstall hooks receive none of it.
+The **injector** receives its own smaller version: `FERRUM_SHUTDOWN_DRAIN_SECONDS`
+(30), `preStop.sleep` (30s, the readiness `failureThreshold × periodSeconds`
+endpoint-removal budget), and `terminationGracePeriodSeconds: 65` — preStop +
+drain + 5s process-exit slack, validated at render. `injector` mode runs none of
+the serving shutdown stages, so the additive serving budget does not apply; the
+window matters because a `/mutate` call landing on a terminating replica is
+connection-refused and fails pod CREATE cluster-wide. The **node-agent** renders
+`terminationGracePeriodSeconds` (30) only: `node_agent` mode never reads
+`FERRUM_SHUTDOWN_DRAIN_SECONDS` and the DaemonSet sits behind no Service, so a
+preStop sleep would only delay node drains. Restricted-compatible `securityContext` / non-empty
 `resources` apply to control plane, CA, and east-west; ambient keeps
 host-network datapath capabilities after dropping ALL, and its
 `securityContext` is a constrained explicit surface

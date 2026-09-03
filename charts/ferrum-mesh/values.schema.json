@@ -452,6 +452,19 @@
         "probes": {
           "$ref": "#/definitions/workloadProbes"
         },
+        "shutdownDrainSeconds": {
+          "$ref": "#/definitions/shutdownSeconds",
+          "description": "FERRUM_SHUTDOWN_DRAIN_SECONDS for injector mode: seconds the webhook waits for in-flight admission connections after SIGTERM. Counts against terminationGracePeriodSeconds."
+        },
+        "shutdownPreStopSeconds": {
+          "$ref": "#/definitions/shutdownSeconds",
+          "description": "Seconds of native lifecycle.preStop.sleep before SIGTERM, covering kube-proxy endpoint removal for the failurePolicy=Fail webhook. Requires Kubernetes 1.29+ (already the injector floor); 0 omits the hook. Counts against terminationGracePeriodSeconds."
+        },
+        "terminationGracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Must be at least shutdownPreStopSeconds + shutdownDrainSeconds + 5s process-exit slack. Injector mode runs none of the serving shutdown stages, so the additive serving budget does not apply."
+        },
         "topologySpreadConstraints": {
           "type": "array",
           "description": "Optional Kubernetes TopologySpreadConstraint list. When unset and replicas >= 2, the chart spreads pods across kubernetes.io/hostname. An explicit empty list disables the default.",
@@ -829,6 +842,11 @@
       "properties": {
         "enabled": {
           "type": "boolean"
+        },
+        "terminationGracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "SIGTERM-to-SIGKILL floor for the node-agent DaemonSet. node_agent mode has no drain stage and the DaemonSet sits behind no Service, so there is deliberately no shutdownDrainSeconds and no preStop here."
         },
         "env": {
           "type": "object",

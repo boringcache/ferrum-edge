@@ -173,10 +173,32 @@ readiness `failureThreshold × periodSeconds`. That remediation is real for ever
 serving workload here, `controlPlane` and `ca` included: `cp` mode honors
 `FERRUM_SHUTDOWN_PREDRAIN_SECONDS` (its admin and CP-gRPC accept loops close on
 the same broadcast the window delays, while `/health` already reports
-`ready: false`). One-shot hooks/jobs (CNI uninstall) and the injector/node-agent
-(not Ferrum serving modes) do not receive this contract. East-west readiness is
-drain-aware `ferrum-edge health` against the loopback admin listener — not
-`tcpSocket` on `tls-passthru`.
+`ready: false`). One-shot hooks/jobs (CNI uninstall) do not receive this
+contract. East-west readiness is drain-aware `ferrum-edge health` against the
+loopback admin listener — not `tcpSocket` on `tls-passthru`.
+
+The **injector** gets the same three fields with a smaller, differently
+computed budget, because `FERRUM_MODE=injector` runs none of the serving
+shutdown stages — it waits up to `FERRUM_SHUTDOWN_DRAIN_SECONDS` for in-flight
+admission connections and then exits:
+
+- `injector.shutdownPreStopSeconds: 30` — readiness `periodSeconds` (10) × the
+  Kubernetes default `failureThreshold` (3), the endpoint-removal budget
+- `injector.shutdownDrainSeconds: 30` — rendered as `FERRUM_SHUTDOWN_DRAIN_SECONDS`
+- `injector.terminationGracePeriodSeconds: 65` — preStop 30 + drain 30 + 5s
+  process-exit slack; render fails below that sum
+
+This matters more than for any other workload: the injector is a
+`failurePolicy: Fail` mutating webhook, so a `/mutate` call that lands on a
+terminating replica is connection-refused and the apiserver rejects the pod
+CREATE in every namespace the `namespaceSelector` admits.
+
+The **node agent** gets `nodeAgent.terminationGracePeriodSeconds: 30` (the
+Kubernetes default, made explicit and validated `>= 1`) and nothing else. There
+is deliberately no `nodeAgent.shutdownDrainSeconds` and no node-agent preStop:
+`node_agent` mode never reads `FERRUM_SHUTDOWN_DRAIN_SECONDS`, and the DaemonSet
+sits behind no Service, so a preStop sleep would delay node drains with no
+endpoint-propagation benefit.
 
 Every **enabled** computed probe must have a usable handler. Setting a
 workload's `admin.httpPort: 0` while a computed probe stays enabled fails render
@@ -185,6 +207,18 @@ readiness probe would leave the host-network datapath unprobed. Supply
 `probes.<probe>.override` or set `probes.<probe>.enabled: false` instead.
 `probes.startup.override` is classified independently of liveness on every
 workload (controlPlane, ca, eastWest, ambient, injector, node-agent).
+
+## Kubernetes version
+
+The chart itself carries no `kubeVersion:` constraint, so it installs on older
+clusters. `injector.enabled=true` does have a floor: the webhook injects Ferrum
+as a Kubernetes **native sidecar** (`spec.initContainers[].restartPolicy: Always`)
+and there is no ordinary-container fallback, so it requires **Kubernetes 1.29+**
+(1.28 works only with the `SidecarContainers` feature gate enabled). Below that,
+the apiserver rejects the mutated pod and `failurePolicy: Fail` turns it into a
+rejected pod CREATE in every selected namespace, so the chart fails at render
+time instead. Set `injector.enabled=false` to install everything else on an
+older cluster.
 
 ## Admin listener validation
 
