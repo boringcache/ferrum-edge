@@ -611,6 +611,44 @@ spec:
 
 For MongoDB itself, consider using the [MongoDB Community Kubernetes Operator](https://github.com/mongodb/mongodb-kubernetes-operator) to manage replica sets.
 
+## Document Keys and Namespaces
+
+Every namespaced resource collection — `proxies`, `upstreams`, `plugin_configs`,
+`api_specs`, and `consumers` — stores its documents under the composite durable
+key
+
+```
+_id = "{namespace}:{id}"
+```
+
+matching the SQL `PRIMARY KEY (namespace, id)`. The namespace charset forbids
+`:`, so the first `:` is an unambiguous delimiter and no two `(namespace, id)`
+pairs can collide. `consumers` has used this shape since issue #2121; the other
+four adopted it in issue #4627 so a resource id is unique **per namespace**
+rather than globally: two tenants may each own a `payments` upstream, and one
+tenant can no longer reserve an id another tenant needs.
+
+The serde-serialized `id` and `namespace` fields remain in every document, and
+every read strips `_id` before deserializing. **Hand-written queries and
+mongosh maintenance must build the composite key**, and any projection that
+needs the bare resource id must ask for `id`, never `_id`:
+
+```js
+// Correct
+db.upstreams.findOne({ _id: "tenant-a:payments", namespace: "tenant-a" })
+db.proxies.find({ namespace: "tenant-a" }, { _id: 0, id: 1 })
+
+// Wrong — matches nothing
+db.upstreams.findOne({ _id: "payments" })
+```
+
+Plugin associations stay embedded in the proxy document's `plugins` array
+(there is no `proxy_plugins` collection); because the proxy document is already
+namespace-keyed, an association cannot bind across tenants. Namespace rename
+moves these documents to a new `_id` with the same fail-closed split-identity
+validation used for consumers: `_id`, the embedded `namespace`, and the `id`
+field must agree, or the whole rename aborts as typed registry corruption.
+
 ## Schema and Migrations
 
 MongoDB uses **indexes** instead of SQL table migrations. Indexes are created

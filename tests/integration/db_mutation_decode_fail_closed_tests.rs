@@ -61,12 +61,14 @@ async fn insert_plugin(
 }
 
 async fn insert_association(store: &DatabaseStore, proxy_id: &str, plugin_config_id: &str) {
-    sqlx::query("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)")
-        .bind(proxy_id)
-        .bind(plugin_config_id)
-        .execute(&store.pool())
-        .await
-        .expect("association insert must succeed");
+    sqlx::query(
+        "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) VALUES ('ferrum', ?, ?)",
+    )
+    .bind(proxy_id)
+    .bind(plugin_config_id)
+    .execute(&store.pool())
+    .await
+    .expect("association insert must succeed");
 }
 
 async fn seed_change(
@@ -107,11 +109,13 @@ async fn count_plugins(store: &DatabaseStore, id: &str) -> i64 {
 }
 
 async fn count_associations(store: &DatabaseStore, plugin_config_id: &str) -> i64 {
-    sqlx::query_scalar("SELECT COUNT(*) FROM proxy_plugins WHERE plugin_config_id = ?")
-        .bind(plugin_config_id)
-        .fetch_one(&store.pool())
-        .await
-        .expect("association count must succeed")
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM proxy_plugins WHERE namespace = 'ferrum' AND plugin_config_id = ?",
+    )
+    .bind(plugin_config_id)
+    .fetch_one(&store.pool())
+    .await
+    .expect("association count must succeed")
 }
 
 async fn count_proxies(store: &DatabaseStore, id: &str) -> i64 {
@@ -196,11 +200,14 @@ async fn delete_plugin_config_rolls_back_when_association_proxy_id_fails_to_deco
         .execute(&mut *conn)
         .await
         .unwrap();
-    sqlx::query("UPDATE proxy_plugins SET proxy_id = X'FF' WHERE plugin_config_id = ?")
-        .bind("plugin-1")
-        .execute(&mut *conn)
-        .await
-        .expect("injecting undecodable proxy_id must succeed");
+    sqlx::query(
+        "UPDATE proxy_plugins SET proxy_id = X'FF' \
+         WHERE namespace = 'ferrum' AND plugin_config_id = ?",
+    )
+    .bind("plugin-1")
+    .execute(&mut *conn)
+    .await
+    .expect("injecting undecodable proxy_id must succeed");
     drop(conn);
 
     let err = store

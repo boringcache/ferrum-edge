@@ -2295,12 +2295,15 @@ async fn api_spec_delete_rejects_cascade_plugin_referenced_by_another_proxy() {
         ))
         .await
         .expect("create foreign referrer proxy");
-    sqlx::query("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)")
-        .bind(&other_proxy_id)
-        .bind(&plugin_id)
-        .execute(&store.pool())
-        .await
-        .expect("inject cross-proxy plugin association");
+    sqlx::query(
+        "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) VALUES (?, ?, ?)",
+    )
+    .bind("ferrum")
+    .bind(&other_proxy_id)
+    .bind(&plugin_id)
+    .execute(&store.pool())
+    .await
+    .expect("inject cross-proxy plugin association");
 
     let (delete_status, delete_body) = client.delete_json(&format!("/api-specs/{spec_id}")).await;
     assert_eq!(
