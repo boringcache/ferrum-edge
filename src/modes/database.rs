@@ -1349,7 +1349,7 @@ pub async fn run(
                     "Database load failed ({}), attempting backup file: {}",
                     e, path
                 );
-                match load_config_backup(path) {
+                match load_config_backup(path, &env_config.namespace) {
                     // Result-shaped backup loader (#3153); startup seeds
                     // config_rejected only for ConfigValidationRejection so
                     // RowDecodeRejection stays fail-loud / non-backup-eligible.
@@ -1380,11 +1380,19 @@ pub async fn run(
                         // source-loaded SVID bundle for the length of the
                         // outage.
                         gateway_trust_authority_unresolved = true;
+                        // The candidate is already projected onto
+                        // `env_config.namespace` by the loader, so these counts
+                        // describe this namespace's resources only. A later
+                        // successful authoritative load replaces this whole
+                        // generation atomically through the ordinary
+                        // `update_config` / `ArcSwap` reload path.
                         warn!(
-                            "Starting with backup config ({} proxies, {} consumers). \
+                            "Starting with backup config for namespace '{}' \
+                             ({} proxies, {} consumers). \
                              Database polling will retry and update when DB recovers. \
                              Gateway-to-mesh identity is refused until an authoritative \
                              database load settles this namespace's trust state.",
+                            env_config.namespace,
                             cfg.proxies.len(),
                             cfg.consumers.len()
                         );

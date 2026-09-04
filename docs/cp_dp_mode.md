@@ -741,7 +741,11 @@ becomes live beside the previous trust.
 
 Database mode can start on the externally provisioned on-disk snapshot at
 `FERRUM_DB_CONFIG_BACKUP_PATH` when the database is unreachable or returns an
-unusable snapshot. That snapshot carries **no** trust state and structurally
+unusable snapshot. The startup loader projects that file onto the gateway's own
+`FERRUM_NAMESPACE` before validating it, so a multi-namespace export never binds
+another namespace's listeners or loads another namespace's consumers,
+credentials, plugin policy or upstreams for the length of the outage. That
+snapshot carries **no** trust state and structurally
 cannot: `GatewayConfig.gateway_trust_bundles` is `#[serde(skip)]` precisely so a
 multi-namespace control plane cannot leak every served namespace's trust
 material into one subscriber's `config_json`, so the field deserializes empty no

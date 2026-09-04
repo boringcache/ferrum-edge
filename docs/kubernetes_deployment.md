@@ -1360,6 +1360,11 @@ env:
 
 This lets Ferrum Edge start with a previously exported config while database polling keeps retrying in the background.
 
+The file is filtered to the pod's `FERRUM_NAMESPACE` before it is validated or served, so a multi-namespace
+(or all-namespace) export is safe to mount here: the pod loads only its own namespace's proxies, consumers,
+credentials, plugin configs, upstreams and trust material, and a `listen_path` or resource name reused in
+another namespace does not reject the file.
+
 ## Kubernetes Service Discovery
 
 Ferrum Edge can discover upstream targets directly from Kubernetes `EndpointSlice` objects. When you use that feature, the service account needs permission to list EndpointSlices in the target namespace.
