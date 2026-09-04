@@ -441,3 +441,107 @@ async fn serving_load_does_not_quarantine_retired_fail_closed_auth_plugin() {
         "runtime admission must fail closed instead of serving without authentication: {rendered}"
     );
 }
+
+/// Issue #4624 — the reload chokepoint, in-process.
+///
+/// A serving-mode full load never produces a candidate with an unconstructible
+/// `FailClosed` row stripped out (the test above proves the load itself fails
+/// closed). This pins the second half of the contract: even if such a candidate
+/// reached [`ProxyState::update_config`], the apply is REJECTED and the entire
+/// prior runtime generation is preserved — `update_config` is not a place where
+/// a security plugin can quietly disappear.
+///
+/// The `OptionalFailOpen` half of the same fixture pins the contrast: that row
+/// is omitted, the apply succeeds, and the fail-closed plugin is untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn full_reload_candidate_with_unconstructible_fail_closed_plugin_keeps_prior_generation() {
+    let (store, _temp_dir) = sqlite_store().await;
+    let ts = Utc::now().to_rfc3339();
+
+    insert_proxy(&store, "proxy-1", &ts).await;
+    insert_plugin(
+        &store,
+        "plugin-1",
+        "proxy",
+        Some("proxy-1"),
+        r#"{"key_location":"header:X-API-Key"}"#,
+        &ts,
+    )
+    .await;
+    insert_association(&store, "proxy-1", "plugin-1").await;
+    insert_named_plugin(&store, "stdout-ok", "stdout_logging", r#"{}"#, &ts).await;
+
+    let good = store
+        .load_full_config("ferrum")
+        .await
+        .expect("the healthy generation must load");
+    assert!(
+        good.quarantined_plugin_configs.is_empty(),
+        "the healthy generation quarantines nothing"
+    );
+
+    let (proxy_state, _health_check_handles) = ferrum_edge::proxy::ProxyState::new(
+        good.clone(),
+        ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
+        ferrum_edge::config::env_config::EnvConfig::default(),
+        None,
+        None,
+    )
+    .expect("proxy state from the healthy generation");
+
+    // A real authoritative full load carries a newer `updated_at` on the row
+    // that changed; without it the apply short-circuits as `Unchanged` before
+    // the plugin cache is ever rebuilt, which is not the path under test.
+    let later = Utc::now() + chrono::Duration::seconds(5);
+    let mut fail_closed_candidate = good.clone();
+    for plugin_config in &mut fail_closed_candidate.plugin_configs {
+        if plugin_config.id == "plugin-1" {
+            plugin_config.config =
+                serde_json::json!({"key_location": "header:X-API-Key", "typo": true});
+            plugin_config.updated_at = later;
+        }
+    }
+    match proxy_state.update_config(fail_closed_candidate) {
+        ferrum_edge::proxy::ConfigApplyOutcome::Rejected { errors } => assert!(
+            errors.iter().any(|error| error.contains("key_auth")),
+            "the rejection must name the unconstructible plugin: {errors:?}"
+        ),
+        other => panic!("an unconstructible key_auth row must not be applied, got: {other:?}"),
+    }
+    let live = proxy_state.config.load_full();
+    assert!(
+        live.plugin_configs
+            .iter()
+            .any(|plugin_config| plugin_config.id == "plugin-1"),
+        "the fail-closed plugin must still be in the serving generation"
+    );
+    assert_eq!(
+        live.plugin_configs.len(),
+        good.plugin_configs.len(),
+        "the ENTIRE prior generation is preserved, not a partially applied candidate"
+    );
+
+    // Contrast: an unconstructible OptionalFailOpen row is omitted, the apply
+    // succeeds, and the fail-closed plugin is untouched.
+    let mut optional_candidate = good.clone();
+    for plugin_config in &mut optional_candidate.plugin_configs {
+        if plugin_config.id == "stdout-ok" {
+            plugin_config.config = serde_json::json!({"filtr": {}});
+            plugin_config.updated_at = later;
+        }
+    }
+    assert!(
+        matches!(
+            proxy_state.update_config(optional_candidate),
+            ferrum_edge::proxy::ConfigApplyOutcome::Applied
+        ),
+        "an unconstructible optional plugin must not reject the generation"
+    );
+    let live = proxy_state.config.load_full();
+    assert!(
+        live.plugin_configs
+            .iter()
+            .any(|plugin_config| plugin_config.id == "plugin-1"),
+        "quarantining an optional plugin must never drop the fail-closed one"
+    );
+}

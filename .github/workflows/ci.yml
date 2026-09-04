@@ -1440,6 +1440,7 @@ jobs:
               functional_mesh_stock_xds_test
               functional_mongodb_test
               functional_namespace_test
+              functional_plugin_quarantine_test
               functional_redis_rate_limiting_test
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
