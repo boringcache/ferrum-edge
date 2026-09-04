@@ -47,6 +47,7 @@ fn injector_config(capture_mode: CaptureMode) -> InjectorConfig {
         proxy_uid: Some(1337),
         exclude_outbound_ports: Vec::new(),
         exclude_inbound_ports: Vec::new(),
+        exclude_inbound_tcp_ports: Vec::new(),
         include_outbound_cidrs: Vec::new(),
         exclude_outbound_cidrs: Vec::new(),
         ip6tables_mode: Ip6TablesMode::Auto,
@@ -430,8 +431,12 @@ fn admission_rewrites_application_probes_to_the_sidecar_probe_port() {
 
     let script = init_container_script(&ops);
     assert!(
-        script.contains("--dport 15020 -j RETURN"),
-        "the sidecar's own probe port must be excluded:\n{script}"
+        script.contains("-p tcp --dport 15020 -j RETURN"),
+        "the sidecar's own TCP probe port must be excluded:\n{script}"
+    );
+    assert!(
+        !script.contains("-p udp --dport 15020 -j RETURN"),
+        "the TCP-only probe server must not create a UDP capture bypass:\n{script}"
     );
     for port in [8080, 9090] {
         assert!(

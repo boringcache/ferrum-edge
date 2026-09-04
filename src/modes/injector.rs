@@ -1637,6 +1637,11 @@ fn capture_config(config: &InjectorConfig, pod: &Value) -> Result<CaptureConfig,
     capture.include_outbound_ports = include_outbound_ports.ports;
     capture.exclude_ports = exclude_outbound_ports_for_pod(config, pod)?;
     capture.exclude_inbound_ports = exclude_inbound_ports_for_pod(config, pod)?;
+    if rewrite_app_probes_enabled(pod) && pod_has_app_probes_to_serve(pod) {
+        capture
+            .exclude_inbound_tcp_ports
+            .push(DEFAULT_APP_PROBE_PORT);
+    }
     capture.ip6tables_mode = config.ip6tables_mode;
     // UDP TPROXY capture (F3 §3.3 Stage 2), flag-gated default-off. When off the
     // emitted plan contains no mangle/TPROXY rules at all. Sidecar UDP egress is
@@ -1761,16 +1766,6 @@ fn exclude_inbound_ports_for_pod(config: &InjectorConfig, pod: &Value) -> Result
         )
         .map_err(|e| format!("invalid {key}: {e}"))?;
         ports.extend(annotation_ports);
-    }
-    // The sidecar's OWN rewritten-probe port terminates in the sidecar, so a
-    // RETURN for it does not let anything bypass the mesh (issue #4533).
-    // Application ports are NEVER excluded: a destination-port-wide RETURN for
-    // an app port would also let ordinary Service / Pod-IP traffic skip mesh
-    // mTLS and `mesh_authz`. The port is excluded only when the sidecar will
-    // serve at least one probe on it — a pod with no HTTP/TCP/gRPC probes (or
-    // one that opted out) starts no probe listener, so nothing needs a RETURN.
-    if rewrite_app_probes_enabled(pod) && pod_has_app_probes_to_serve(pod) {
-        ports.push(DEFAULT_APP_PROBE_PORT);
     }
     ports.sort_unstable();
     ports.dedup();
