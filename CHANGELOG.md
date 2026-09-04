@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-09-04
+
+Patch release replacing `v0.9.1`, whose tag commit can never satisfy the
+release publication gate: the main push run at that commit was cancelled by the
+next merge, and the gate blocks on any non-successful check run in a canonical
+push suite. Beyond the 0.9.1 content, this release carries the database-mode
+startup-backup namespace filter (#4629), connection admission on the mesh
+application-probe and NodeWaypoint capture listeners (#4631), `(namespace, id)`
+resource identity in every durable schema (#4632), and end-to-end proof that a
+malformed fail-closed plugin row never serves fail-open (#4630).
+
 ## [0.9.1] - 2026-09-03
 
 Patch release cut so that an immutable `v0.9.1` release and matching multi-arch
