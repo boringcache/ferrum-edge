@@ -400,6 +400,33 @@ Sizing note: there is no listener-wide budget for concurrently buffered request 
 
 ## Namespaces
 
+### Resource identity is `(namespace, id)`
+
+Proxy, upstream, plugin-config, API-spec, and consumer ids are unique **within a
+namespace**, not globally. Two tenants may each create an upstream `payments`
+and a proxy `edge`; neither can reserve an id the other needs, and no admin
+response ever mixes them. This is enforced in persistence, not only in
+admission: SQL uses a composite `PRIMARY KEY (namespace, id)` on all five
+tables, the `proxy_plugins` junction keys on
+`(namespace, proxy_id, plugin_config_id)` with namespace-qualified foreign keys
+to both sides, and MongoDB stores each document under
+`_id = "{namespace}:{id}"` (issue #4627; consumers since issue #2121).
+
+Practical consequences for API clients:
+
+- A `POST` that would collide with a same-id resource in another namespace now
+  succeeds. `409 Conflict` means the id is taken **in your namespace**.
+- `PUT`, `GET`, and `DELETE` continue to address `(X-Ferrum-Namespace, id)`; an
+  id that exists only in another namespace is a `404`, never someone else's
+  resource.
+- A `plugin_config.proxy_id`, a proxy's `upstream_id`, an API spec's `proxy_id`,
+  and every entry of a proxy's `plugins` array resolve **only** within the
+  request's namespace. A reference to an id owned by another tenant is rejected
+  at admission with `400` and is structurally impossible to persist.
+- Store-level duplicate-key details are never surfaced in a response body; a
+  conflict is reported through the normal `409`/`400` shapes, so response codes
+  cannot be used to probe whether another tenant owns a guessed id.
+
 Namespaces are first-class registry objects. Historically `GET /namespaces` was a `DISTINCT` union over resource tables, so an empty tenant could not exist and there was no rename or delete. The durable `namespaces` table (SQL and Mongo) holds `name` (primary key), optional `description`, `created_at`, and `updated_at`. Connect/migrate runs a **one-time** compatibility backfill: a database that has never completed it inserts every pre-existing derived name from proxies, consumers, plugin configs, upstreams, and gateway trust bundles, plus the canonical `ferrum` row, then durably marks that backfill complete. A failed or partial attempt leaves the marker absent so a later startup retries the same idempotent inserts. That compatibility pass takes the **same global namespace-registry admission lease** every live create/rename/delete takes, and it commits as **one transaction** so it cannot read derived names next to a concurrent confirmed `DELETE` and then resurrect the removed row. On SQL the transaction's first statement verifies the lease row *and locks it* (`SELECT ... FOR UPDATE`; on SQLite the equivalent conditional `UPDATE`, which takes the single database writer lock), then holds that lock across the derived-name scan, the inserts, the marker, and the commit. Because every competing lease acquisition is a write to that same row, no other gateway can take the global key while the pass runs — so a pass that simply takes longer than one lease duration still commits instead of rolling back and starving; the commit-boundary check proves the same owner and generation, which only an ownership change could alter and nothing can alter under the lock. On MongoDB the pass runs the derived-name discovery, the registry upserts, the strict split-identity validation, the completion marker, and the owner/generation lease proof inside a single transaction, so the name set cannot go stale before it is durable; a delete that acquired the lease first fails the in-transaction proof, and one that tries to acquire it later write-conflicts with the same lease document the transaction touches. A standalone `mongod` has no multi-document transactions, so the pass **writes nothing at all** there rather than claiming an atomicity that topology does not have — `POST`/`PUT`/`DELETE /namespaces` already return `501` before mutating anything on that topology, `GET /namespaces` is the registry ∪ derived union either way, and the marker stays absent so the first replica-set-capable startup performs the full fenced pass. A lease already held elsewhere simply defers the pass — the marker stays absent, which is the same crash-retry state — and the lease is released on every path, success or error, so a failed pass never stalls namespace CRUD for its full lease duration. Once completion is durable, later connect/migrate/reconnect/startup passes do **not** reseed deleted names or materialize newer derived-only names. The marker lives in internal compatibility state (`_ferrum_schema_compat`), not as a fake registry row, and never appears in `GET /namespaces`. Nothing else is seeded: the backfill never reads the process environment, so a deployment-specific `FERRUM_NAMESPACE` that has no resources yet is created through `POST /namespaces`. Ordinary resource writes with a new `X-Ferrum-Namespace` still isolate data and appear in `GET /namespaces` as derived names, but they do **not** insert a registry row.
 
 Before either backend writes the compatibility marker, it validates every durable registry identity inside the same transaction. A legacy derived namespace that no longer satisfies the current namespace grammar therefore rolls the complete pass back with a redacted corruption diagnostic; it is never copied into a completed registry for a later admin read to discover.

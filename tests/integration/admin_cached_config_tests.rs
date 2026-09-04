@@ -8249,7 +8249,8 @@ async fn test_proxy_invalid_association_does_not_fall_back_and_put_repairs() {
     .await
     .expect("global plugin insert must succeed");
     sqlx::query(
-        "INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES ('proxy-1', 'global-invalid')",
+        "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) \
+         VALUES ('ferrum', 'proxy-1', 'global-invalid')",
     )
     .execute(&pool)
     .await
@@ -8332,7 +8333,8 @@ async fn test_proxy_get_namespace_miss_does_not_validate_other_namespace_associa
     .await
     .expect("other namespace global plugin insert must succeed");
     sqlx::query(
-        "INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES ('other-proxy', 'other-global-invalid')",
+        "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) \
+         VALUES ('other', 'other-proxy', 'other-global-invalid')",
     )
     .execute(&pool)
     .await

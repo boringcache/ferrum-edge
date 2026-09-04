@@ -1537,7 +1537,33 @@ When using Database or CP modes, Ferrum auto-creates the following tables on sta
 - **`proxies`** — Proxy route definitions. Per-namespace `listen_path` uniqueness is host-scoped and enforced at admission (not by a database `UNIQUE` constraint); a non-unique secondary index on `(namespace, listen_path)` supports candidate scans only
 - **`consumers`** — API consumer/user definitions
 - **`plugin_configs`** — Plugin configurations (global, per-proxy, or proxy-group scoped)
-- **`proxy_plugins`** — Many-to-many linking proxies to plugin configs
+- **`proxy_plugins`** — Many-to-many linking proxies to plugin configs, scoped to one namespace
 - **`upstreams`** — Upstream groups for load-balanced backends (targets stored as JSON, with algorithm and health check configuration)
+- **`api_specs`** — Admin-only API-spec metadata; never read by the proxy runtime
+
+### Resource identity is `(namespace, id)`
+
+`proxies`, `upstreams`, `plugin_configs`, `api_specs`, and `consumers` each use a
+composite **`PRIMARY KEY (namespace, id)`**, so the same resource id may exist in
+two namespaces and one tenant can never reserve an id another tenant needs.
+Every relationship between them carries the namespace too:
+
+| Table | Key columns | References | ON DELETE |
+|---|---|---|---|
+| `proxies` | `(namespace, upstream_id)` | `upstreams(namespace, id)` | `RESTRICT` |
+| `plugin_configs` | `(namespace, proxy_id)` | `proxies(namespace, id)` | `CASCADE` |
+| `proxy_plugins` | `(namespace, proxy_id)` | `proxies(namespace, id)` | `CASCADE` |
+| `proxy_plugins` | `(namespace, plugin_config_id)` | `plugin_configs(namespace, id)` | `CASCADE` |
+| `api_specs` | `(namespace, proxy_id)` | `proxies(namespace, id)` | `CASCADE` |
+
+`proxy_plugins` has its own `namespace` column and a
+`PRIMARY KEY (namespace, proxy_id, plugin_config_id)`; both of its foreign keys
+reuse that single column, so an association is structurally incapable of joining
+a proxy in one namespace to a plugin config in another.
+
+MongoDB matches this: the `proxies`, `upstreams`, `plugin_configs`, `api_specs`,
+and `consumers` collections use the composite `_id` `"{namespace}:{id}"`
+(the namespace charset forbids `:`, so the first `:` is an unambiguous
+delimiter). The `id` and `namespace` fields stay in every document.
 
 See [migrations.md](migrations.md) for schema migration details.

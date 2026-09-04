@@ -48,12 +48,14 @@ async fn seed_proxy_with_plugin(store: &DatabaseStore) {
     .await
     .expect("plugin insert must succeed");
 
-    sqlx::query("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)")
-        .bind("proxy-1")
-        .bind("plugin-1")
-        .execute(&pool)
-        .await
-        .expect("association insert must succeed");
+    sqlx::query(
+        "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) VALUES ('ferrum', ?, ?)",
+    )
+    .bind("proxy-1")
+    .bind("plugin-1")
+    .execute(&pool)
+    .await
+    .expect("association insert must succeed");
 
     sqlx::query(
         "INSERT INTO config_changes (namespace, resource_type, resource_id, operation, created_at) \
@@ -65,6 +67,109 @@ async fn seed_proxy_with_plugin(store: &DatabaseStore) {
     .execute(&pool)
     .await
     .expect("change-log seed must succeed");
+}
+
+/// Inject the pre-#4627 corrupt shape: a proxy-scoped plugin config in
+/// namespace `other` pointing at `ferrum`'s `proxy-1`, plus a junction row
+/// binding them.
+///
+/// The composite foreign keys `(namespace, proxy_id) -> proxies(namespace, id)`
+/// and `(namespace, plugin_config_id) -> plugin_configs(namespace, id)` refuse
+/// both rows now, so enforcement is disabled for the injection. The loader's
+/// own fail-closed validation is what these tests exercise.
+async fn inject_cross_namespace_plugin_association(store: &DatabaseStore) {
+    let ts = Utc::now().to_rfc3339();
+    let mut conn = store.pool().acquire().await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO plugin_configs \
+         (id, namespace, plugin_name, config, scope, proxy_id, enabled, created_at, updated_at) \
+         VALUES (?, 'other', 'key_auth', ?, 'proxy', ?, 1, ?, ?)",
+    )
+    .bind("plugin-other")
+    .bind(r#"{"key_location":"header:X-Secret-Key"}"#)
+    .bind("proxy-1")
+    .bind(&ts)
+    .bind(&ts)
+    .execute(&mut *conn)
+    .await
+    .expect("cross-namespace plugin insert must succeed with enforcement off");
+    sqlx::query(
+        "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) VALUES ('ferrum', ?, ?)",
+    )
+    .bind("proxy-1")
+    .bind("plugin-other")
+    .execute(&mut *conn)
+    .await
+    .expect("cross-namespace association insert must succeed with enforcement off");
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+}
+
+/// Issue #4627: the schema itself now refuses a cross-tenant attachment.
+#[tokio::test(flavor = "multi_thread")]
+async fn composite_foreign_keys_refuse_cross_namespace_plugin_attachment() {
+    let (store, _temp_dir) = sqlite_store().await;
+    seed_proxy_with_plugin(&store).await;
+
+    let ts = Utc::now().to_rfc3339();
+    let pool = store.pool();
+    let plugin_error = sqlx::query(
+        "INSERT INTO plugin_configs \
+         (id, namespace, plugin_name, config, scope, proxy_id, enabled, created_at, updated_at) \
+         VALUES (?, 'other', 'key_auth', ?, 'proxy', ?, 1, ?, ?)",
+    )
+    .bind("plugin-other")
+    .bind(r#"{"key_location":"header:X-Secret-Key"}"#)
+    .bind("proxy-1")
+    .bind(&ts)
+    .bind(&ts)
+    .execute(&pool)
+    .await
+    .expect_err("a plugin config must not attach to a proxy in another namespace");
+    assert!(
+        plugin_error
+            .to_string()
+            .to_lowercase()
+            .contains("foreign key"),
+        "expected a composite FK refusal, got: {plugin_error}"
+    );
+
+    // A junction row can never join tenants either: its single `namespace`
+    // column feeds BOTH foreign keys.
+    sqlx::query(
+        "INSERT INTO plugin_configs \
+         (id, namespace, plugin_name, config, scope, proxy_id, enabled, created_at, updated_at) \
+         VALUES (?, 'other', 'key_auth', ?, 'global', NULL, 1, ?, ?)",
+    )
+    .bind("plugin-other")
+    .bind(r#"{"key_location":"header:X-Secret-Key"}"#)
+    .bind(&ts)
+    .bind(&ts)
+    .execute(&pool)
+    .await
+    .expect("a global plugin config in another namespace is legitimate");
+
+    let junction_error = sqlx::query(
+        "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) VALUES ('ferrum', ?, ?)",
+    )
+    .bind("proxy-1")
+    .bind("plugin-other")
+    .execute(&pool)
+    .await
+    .expect_err("a junction row must not bind across namespaces");
+    assert!(
+        junction_error
+            .to_string()
+            .to_lowercase()
+            .contains("foreign key"),
+        "expected a composite FK refusal, got: {junction_error}"
+    );
 }
 
 async fn drop_proxy_plugins_table(store: &DatabaseStore) {
@@ -195,7 +300,9 @@ async fn malformed_association_row_rejects_candidate_instead_of_being_skipped() 
         .execute(&mut *conn)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, X'FF')")
+    sqlx::query(
+        "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) VALUES ('ferrum', ?, X'FF')",
+    )
         .bind("proxy-1")
         .execute(&mut *conn)
         .await
@@ -218,28 +325,10 @@ async fn one_invalid_association_rejects_the_full_snapshot() {
         .await
         .expect("valid baseline must load before injecting invalid association");
 
-    let ts = Utc::now().to_rfc3339();
-    let pool = store.pool();
-    sqlx::query(
-        "INSERT INTO plugin_configs \
-         (id, namespace, plugin_name, config, scope, proxy_id, enabled, created_at, updated_at) \
-         VALUES (?, 'other', 'key_auth', ?, 'proxy', ?, 1, ?, ?)",
-    )
-    .bind("plugin-other")
-    .bind(r#"{"key_location":"header:X-Secret-Key"}"#)
-    .bind("proxy-1")
-    .bind(&ts)
-    .bind(&ts)
-    .execute(&pool)
-    .await
-    .expect("cross-namespace plugin insert must succeed");
-
-    sqlx::query("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)")
-        .bind("proxy-1")
-        .bind("plugin-other")
-        .execute(&pool)
-        .await
-        .expect("cross-namespace association insert must succeed");
+    // Since issue #4627 the composite foreign keys make this shape
+    // structurally impossible, so the corrupt rows are injected with
+    // enforcement disabled. The loader must still fail closed on them.
+    inject_cross_namespace_plugin_association(&store).await;
 
     let error = store
         .load_full_config("ferrum")
@@ -300,27 +389,10 @@ async fn admin_proxy_reads_reject_incomplete_cross_namespace_associations() {
     let (store, _temp_dir) = sqlite_store().await;
     seed_proxy_with_plugin(&store).await;
 
-    let ts = Utc::now().to_rfc3339();
-    let pool = store.pool();
-    sqlx::query(
-        "INSERT INTO plugin_configs \
-         (id, namespace, plugin_name, config, scope, proxy_id, enabled, created_at, updated_at) \
-         VALUES (?, 'other', 'key_auth', ?, 'proxy', ?, 1, ?, ?)",
-    )
-    .bind("plugin-other")
-    .bind(r#"{"key_location":"header:X-Secret-Key"}"#)
-    .bind("proxy-1")
-    .bind(&ts)
-    .bind(&ts)
-    .execute(&pool)
-    .await
-    .expect("cross-namespace plugin insert must succeed");
-    sqlx::query("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)")
-        .bind("proxy-1")
-        .bind("plugin-other")
-        .execute(&pool)
-        .await
-        .expect("cross-namespace association insert must succeed");
+    // Since issue #4627 the composite foreign keys make this shape
+    // structurally impossible, so the corrupt rows are injected with
+    // enforcement disabled. The loader must still fail closed on them.
+    inject_cross_namespace_plugin_association(&store).await;
 
     let get_message = error_text(store.get_proxy("ferrum", "proxy-1").await);
     assert_association_error_context(&get_message, "get_proxy");
@@ -353,12 +425,14 @@ async fn admin_proxy_reads_reject_global_plugin_associations() {
     .execute(&pool)
     .await
     .expect("global plugin insert must succeed");
-    sqlx::query("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)")
-        .bind("proxy-1")
-        .bind("plugin-global")
-        .execute(&pool)
-        .await
-        .expect("global association insert must succeed");
+    sqlx::query(
+        "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) VALUES ('ferrum', ?, ?)",
+    )
+    .bind("proxy-1")
+    .bind("plugin-global")
+    .execute(&pool)
+    .await
+    .expect("global association insert must succeed");
 
     let get_message = error_text(store.get_proxy("ferrum", "proxy-1").await);
     assert_association_error_context(&get_message, "get_proxy");
@@ -391,12 +465,14 @@ async fn admin_proxy_reads_reject_proxy_group_plugin_with_proxy_id() {
     .execute(&pool)
     .await
     .expect("proxy-group plugin insert must succeed");
-    sqlx::query("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)")
-        .bind("proxy-1")
-        .bind("plugin-group-corrupt")
-        .execute(&pool)
-        .await
-        .expect("proxy-group association insert must succeed");
+    sqlx::query(
+        "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) VALUES ('ferrum', ?, ?)",
+    )
+    .bind("proxy-1")
+    .bind("plugin-group-corrupt")
+    .execute(&pool)
+    .await
+    .expect("proxy-group association insert must succeed");
 
     let get_message = error_text(store.get_proxy("ferrum", "proxy-1").await);
     assert_association_error_context(&get_message, "get_proxy");
@@ -429,12 +505,14 @@ async fn proxy_write_precheck_can_repair_invalid_associations() {
     .execute(&pool)
     .await
     .expect("global plugin insert must succeed");
-    sqlx::query("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)")
-        .bind("proxy-1")
-        .bind("plugin-global")
-        .execute(&pool)
-        .await
-        .expect("global association insert must succeed");
+    sqlx::query(
+        "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) VALUES ('ferrum', ?, ?)",
+    )
+    .bind("proxy-1")
+    .bind("plugin-global")
+    .execute(&pool)
+    .await
+    .expect("global association insert must succeed");
 
     let read_message = error_text(store.get_proxy("ferrum", "proxy-1").await);
     assert_association_error_context(&read_message, "get_proxy");
