@@ -8638,7 +8638,14 @@ mod inner {
 
             let mut added_or_modified_proxies = Vec::new();
             for doc in self
-                .load_change_ids(self.proxies(), namespace, &proxy_upserts)
+                .load_change_ids(
+                    self.proxies(),
+                    namespace,
+                    &proxy_upserts
+                        .iter()
+                        .map(|id| namespaced_doc_id(namespace, id))
+                        .collect::<Vec<_>>(),
+                )
                 .await?
             {
                 let mut proxy = doc_to_proxy(doc)?;
@@ -8660,6 +8667,9 @@ mod inner {
             );
 
             let mut added_or_modified_consumers = Vec::new();
+            // Every point-load below passes the composite `_id`
+            // (`"{namespace}:{id}"`, issue #4627) — change records carry bare
+            // resource ids, and a bare id matches no document.
             // Consumer point-loads use the composite `_id`
             // ("{namespace}:{id}"); change-log records carry plain ids and
             // the namespace is in scope, so construct the composite keys here
@@ -8693,7 +8703,14 @@ mod inner {
 
             let mut added_or_modified_plugin_configs = Vec::new();
             for doc in self
-                .load_change_ids(self.plugin_configs(), namespace, &plugin_config_upserts)
+                .load_change_ids(
+                    self.plugin_configs(),
+                    namespace,
+                    &plugin_config_upserts
+                        .iter()
+                        .map(|id| namespaced_doc_id(namespace, id))
+                        .collect::<Vec<_>>(),
+                )
                 .await?
             {
                 let mut plugin = doc_to_plugin_config(doc)?;
@@ -8714,7 +8731,14 @@ mod inner {
 
             let mut added_or_modified_upstreams = Vec::new();
             for doc in self
-                .load_change_ids(self.upstreams(), namespace, &upstream_upserts)
+                .load_change_ids(
+                    self.upstreams(),
+                    namespace,
+                    &upstream_upserts
+                        .iter()
+                        .map(|id| namespaced_doc_id(namespace, id))
+                        .collect::<Vec<_>>(),
+                )
                 .await?
             {
                 let mut upstream = doc_to_upstream(doc)?;
