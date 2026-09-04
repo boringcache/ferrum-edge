@@ -318,7 +318,7 @@ fn require_namespace_prefixed_identity_requires_suffix_field_and_embedded_namesp
         "identity_value"
     );
     assert!(namespace_prefixed_id_suffix_field("gateway_trust_bundles").is_err());
-    assert!(namespace_prefixed_id_suffix_field("proxies").is_err());
+    assert!(namespace_prefixed_id_suffix_field("audit_events").is_err());
 
     assert_eq!(
         require_namespace_prefixed_identity("ns", "ns:alice", Some("ns"), "id", Some("alice"))
