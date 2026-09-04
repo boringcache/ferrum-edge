@@ -59,7 +59,7 @@ RELEASE="${FERRUM_LIVE_RELEASE:-ferrum-live}"
 IMAGE_REPOSITORY="${FERRUM_LIVE_IMAGE_REPOSITORY:-ferrumedge/ferrum-edge}"
 # Default to the crate version so a release bump cannot desynchronise this lane
 # from the tree it tests; CI overrides both with the live image tag it built.
-FERRUM_TREE_VERSION="$(sed -nE '/^\[package\]$/,/^\[/{s/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p;}' "$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)/Cargo.toml")"
+FERRUM_TREE_VERSION="$(sed -nE '/^\[package\]$/,/^\[/{s/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p;}' "$ROOT_DIR/Cargo.toml")"
 IMAGE_TAG="${FERRUM_LIVE_IMAGE_TAG:-$FERRUM_TREE_VERSION}"
 DEFAULT_CHART_IMAGE_REPOSITORY="${FERRUM_LIVE_DEFAULT_IMAGE_REPOSITORY:-ferrumedge/ferrum-edge}"
 # The chart's own appVersion is what an untouched install renders, so the
