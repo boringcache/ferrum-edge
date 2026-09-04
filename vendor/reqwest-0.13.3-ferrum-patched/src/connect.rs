@@ -1,8 +1,8 @@
-use http::Uri;
 #[cfg(feature = "__tls")]
 use http::header::HeaderValue;
 #[cfg(feature = "__tls")]
 use http::uri::Scheme;
+use http::Uri;
 use hyper::rt::{Read, ReadBufCursor, Write};
 use hyper_util::client::legacy::connect::{Connected, Connection};
 #[cfg(any(feature = "socks", feature = "__tls", unix, target_os = "windows"))]
@@ -11,7 +11,7 @@ use hyper_util::rt::TokioIo;
 use native_tls_crate::{TlsConnector, TlsConnectorBuilder};
 use pin_project_lite::pin_project;
 use tower::util::{BoxCloneSyncServiceLayer, MapRequestLayer};
-use tower::{ServiceBuilder, timeout::TimeoutLayer, util::BoxCloneSyncService};
+use tower::{timeout::TimeoutLayer, util::BoxCloneSyncService, ServiceBuilder};
 use tower_service::Service;
 
 use std::future::Future;
@@ -27,7 +27,7 @@ use self::native_tls_conn::NativeTlsConn;
 #[cfg(feature = "__rustls")]
 use self::rustls_tls_conn::RustlsTlsConn;
 use crate::dns::DynResolver;
-use crate::error::{BoxError, cast_to_internal_error};
+use crate::error::{cast_to_internal_error, BoxError};
 use crate::proxy::{Intercepted, Matcher as ProxyMatcher};
 use sealed::{Conn, Unnameable};
 
@@ -338,9 +338,10 @@ where
     // that caused the dial. Such connections leave the hook uncalled.
     #[cfg(unix)]
     if let (Some(hook), Some(token), Some(fd)) = (hook.as_ref(), token.as_ref(), established.get())
-        && !conn.connected().is_negotiated_h2()
     {
-        hook.established(token, fd);
+        if !conn.connected().is_negotiated_h2() {
+            hook.established(token, fd);
+        }
     }
     #[cfg(not(unix))]
     let _ = (&hook, &established);
@@ -2183,8 +2184,8 @@ mod rustls_tls_conn {
 mod socks {
     use tower_service::Service;
 
-    use http::Uri;
     use http::uri::Scheme;
+    use http::Uri;
     use hyper_util::client::legacy::connect::proxy::{SocksV4, SocksV5};
     use tokio::net::TcpStream;
 
