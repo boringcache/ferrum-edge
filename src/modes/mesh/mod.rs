@@ -15303,7 +15303,12 @@ async fn arm_mesh_runtime_startup(
     // ordinary Service / Pod-IP traffic to those ports still terminates in the
     // mesh proxy under mTLS and `mesh_authz`. Absent env (no rewritten probes)
     // or port `0` starts nothing.
-    match crate::modes::mesh::app_probe::start_from_env(shutdown_tx.subscribe()) {
+    // Admission for that listener comes from the resolved env config (issue
+    // #4625). It is deliberately NOT wired to the process overload state: the
+    // rewritten probes are the application container's own liveness and
+    // readiness probes, so shedding them under sidecar overload would have
+    // kubelet restart a healthy application.
+    match crate::modes::mesh::app_probe::start_from_env(env_config, shutdown_tx.subscribe()) {
         Ok(Some(handle)) => owner.push_mesh_background(handle),
         Ok(None) => {}
         Err(error) => {

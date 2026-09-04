@@ -136,7 +136,10 @@ pub mod mesh_udp_capture;
 pub mod mesh_udp_frame;
 pub mod netns_capture;
 pub mod netns_udp_capture;
-pub(crate) mod node_waypoint_ingress_capture;
+// `pub` rather than `pub(crate)`: the admission helpers this module exposes
+// (issue #4626) are covered by the external unit-test crate, which is where the
+// repository's testing policy puts them.
+pub mod node_waypoint_ingress_capture;
 pub mod node_waypoint_udp_destination;
 pub mod node_waypoint_udp_identity;
 pub mod node_waypoint_udp_reply_source;
