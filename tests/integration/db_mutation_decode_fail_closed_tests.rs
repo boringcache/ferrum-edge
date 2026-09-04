@@ -301,10 +301,10 @@ async fn delete_proxy_rolls_back_when_orphaned_proxy_group_metadata_fails_to_dec
 // Issue #4526 — plugin construction is the real schema gate, and the two
 // consumers of a stored `plugin_configs` row must take OPPOSITE branches:
 //
-// * A serving-mode (`Runtime`) full load QUARANTINES an unconstructible row so
-//   `database` mode still reaches its admin listener and the row stays
-//   deletable in-band. Before this, `ProxyState::new` failed at
-//   `src/modes/database.rs` well before the admin listener bound.
+// * A serving-mode (`Runtime`) full load QUARANTINES an unconstructible
+//   OptionalFailOpen row so `database` mode still reaches its admin listener
+//   and the row stays deletable in-band. FailClosed and KeepLastKnownGood rows
+//   continue to reject publication.
 // * A `ControlPlane` load REJECTS the snapshot, so the CP can never broadcast a
 //   row that would freeze every DP on last-known-good with no ConfigSync
 //   acknowledgement to show it.
@@ -337,26 +337,17 @@ async fn serving_load_quarantines_unconstructible_plugin_row_while_cp_load_rejec
     let (store, _temp_dir) = sqlite_store().await;
     let ts = Utc::now().to_rfc3339();
 
-    // The exact reproduction from issue #4526: a closed config object with a
-    // typo'd key. Admin write-time validation rejects new rows like this; this
-    // one is a direct insert, standing in for a row written by an older
-    // release before the constructor was tightened.
+    // Admin write-time validation rejects new rows like this; this direct
+    // insert stands in for a row written before the constructor was tightened.
     insert_named_plugin(
         &store,
-        "rsl-typo",
-        "request_size_limiting",
-        r#"{"max_bytes":1024,"max_bytez":1}"#,
+        "stdout-typo",
+        "stdout_logging",
+        r#"{"filtr":{}}"#,
         &ts,
     )
     .await;
-    insert_named_plugin(
-        &store,
-        "rsl-ok",
-        "request_size_limiting",
-        r#"{"max_bytes":2048}"#,
-        &ts,
-    )
-    .await;
+    insert_named_plugin(&store, "stdout-ok", "stdout_logging", r#"{}"#, &ts).await;
 
     // Serving mode: the load SUCCEEDS with the bad row quarantined, so startup
     // continues to the admin listener instead of exiting.
@@ -371,7 +362,7 @@ async fn serving_load_quarantines_unconstructible_plugin_row_while_cp_load_rejec
         .collect();
     assert_eq!(
         surviving,
-        vec!["rsl-ok"],
+        vec!["stdout-ok"],
         "only the unconstructible row is dropped from the served snapshot"
     );
     assert_eq!(
@@ -380,8 +371,8 @@ async fn serving_load_quarantines_unconstructible_plugin_row_while_cp_load_rejec
         "the quarantine must be reported so database mode raises config_rejected"
     );
     assert!(
-        runtime_config.quarantined_plugin_configs[0].contains("rsl-typo")
-            && runtime_config.quarantined_plugin_configs[0].contains("request_size_limiting"),
+        runtime_config.quarantined_plugin_configs[0].contains("stdout-typo")
+            && runtime_config.quarantined_plugin_configs[0].contains("stdout_logging"),
         "the quarantine message names the plugin and its config id: {:?}",
         runtime_config.quarantined_plugin_configs
     );
@@ -404,5 +395,24 @@ async fn serving_load_quarantines_unconstructible_plugin_row_while_cp_load_rejec
             && rendered.contains("1 rejecting error(s)"),
         "CP admission must return the typed validation rejection for the unconstructible \
          plugin row: {rendered}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn serving_load_does_not_quarantine_retired_fail_closed_auth_plugin() {
+    let (store, _temp_dir) = sqlite_store().await;
+    let ts = Utc::now().to_rfc3339();
+
+    insert_named_plugin(&store, "retired-auth", "oauth2_auth", r#"{}"#, &ts).await;
+
+    let error = store
+        .load_full_config("ferrum")
+        .await
+        .expect_err("a retired FailClosed auth plugin must reject runtime publication");
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("configuration validation failed")
+            && rendered.contains("1 rejecting error(s)"),
+        "runtime admission must fail closed instead of serving without authentication: {rendered}"
     );
 }

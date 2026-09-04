@@ -856,11 +856,10 @@ fn cp_admission_rejects_an_unknown_plugin_name() {
 }
 
 #[test]
-fn serving_mode_quarantine_drops_only_the_unconstructible_plugin_config() {
-    // `database` mode's repairability contract: the bad row is dropped so the
-    // process can still bind its admin listener, every other row survives, and
-    // the caller gets the operator-facing message to log and to raise
-    // `config_rejected` with.
+fn serving_mode_quarantine_drops_only_unconstructible_optional_plugins() {
+    // `database` mode may omit broken optional instrumentation for in-band
+    // repair, but must retain broken fail-closed controls so shared validation
+    // rejects the candidate rather than serving without them.
     let mut config = GatewayConfig {
         plugin_configs: vec![
             plugin_config_for_gate(
@@ -873,6 +872,7 @@ fn serving_mode_quarantine_drops_only_the_unconstructible_plugin_config() {
                 "request_size_limiting",
                 json!({"max_bytes": 1024, "max_bytez": 1}),
             ),
+            plugin_config_for_gate("stdout-typo", "stdout_logging", json!({"filtr": {}})),
             plugin_config_for_gate("cid", "correlation_id", json!({})),
         ],
         ..GatewayConfig::default()
@@ -883,7 +883,7 @@ fn serving_mode_quarantine_drops_only_the_unconstructible_plugin_config() {
 
     assert_eq!(quarantined.len(), 1, "only the bad row is quarantined");
     assert!(
-        quarantined[0].contains("rsl-typo"),
+        quarantined[0].contains("stdout-typo"),
         "the quarantine message names the offending plugin config: {quarantined:?}"
     );
     let surviving: Vec<&str> = config
@@ -891,11 +891,12 @@ fn serving_mode_quarantine_drops_only_the_unconstructible_plugin_config() {
         .iter()
         .map(|pc| pc.id.as_str())
         .collect();
-    assert_eq!(surviving, vec!["rsl-ok", "cid"]);
+    assert_eq!(surviving, vec!["rsl-ok", "rsl-typo", "cid"]);
     assert!(
         ferrum_edge::_test_support::collect_rejecting_runtime_config_errors_for_test(&config)
-            .is_empty(),
-        "the quarantined snapshot must now pass the rejecting contract so startup continues"
+            .iter()
+            .any(|error| error.contains("rsl-typo")),
+        "the retained FailClosed plugin must still reject runtime publication"
     );
 }
 

@@ -123,6 +123,13 @@ pub(crate) struct RejectedPluginConfig {
 pub(crate) fn collect_rejecting_plugin_config_errors(
     config: &GatewayConfig,
 ) -> Vec<RejectedPluginConfig> {
+    collect_plugin_config_errors(config, false)
+}
+
+fn collect_plugin_config_errors(
+    config: &GatewayConfig,
+    optional_fail_open_only: bool,
+) -> Vec<RejectedPluginConfig> {
     // Backend egress policy is node-local environment configuration. An
     // admitting CP whose `FERRUM_BACKEND_ALLOW_IPS` differs from the serving
     // node's must not refuse a row over an address policy it does not own, so
@@ -141,8 +148,9 @@ pub(crate) fn collect_rejecting_plugin_config_errors(
         if !plugin_config.enabled {
             continue;
         }
-        if crate::plugins::plugin_failure_policy(&plugin_config.plugin_name)
-            == Some(crate::plugins::PluginFailurePolicy::OptionalFailOpen)
+        let failure_policy = crate::plugins::plugin_failure_policy(&plugin_config.plugin_name);
+        if optional_fail_open_only
+            != (failure_policy == Some(crate::plugins::PluginFailurePolicy::OptionalFailOpen))
         {
             continue;
         }
@@ -186,18 +194,20 @@ pub(crate) fn collect_rejecting_plugin_config_errors(
     rejected
 }
 
-/// Drop every enabled plugin config the construction gate refuses, returning
-/// the operator-facing rejection messages for the rows that were removed.
+/// Drop enabled OptionalFailOpen plugin configs the construction gate refuses,
+/// returning the operator-facing rejection messages for the rows removed.
 ///
 /// Serving-mode (`FullConfigLoadPurpose::Runtime`) full loads call this so a
-/// single unconstructible row cannot stop `database` mode before its admin
-/// listener binds — the process starts with that plugin quarantined,
+/// unconstructible optional instrumentation cannot stop `database` mode before
+/// its admin listener binds — the process starts with that plugin quarantined,
 /// `config_rejected` raised, and the row still readable and deletable through
 /// the admin API (issue #4526, the in-band repair contract of issue #2158). CP
 /// loads deliberately do NOT call it: the CP must refuse to broadcast a
-/// snapshot no data plane can construct.
+/// snapshot no data plane can construct. FailClosed, KeepLastKnownGood, and
+/// unknown/retired plugins are never quarantined: they must continue to reject
+/// publication rather than silently removing a security control.
 pub(crate) fn quarantine_unconstructible_plugin_configs(config: &mut GatewayConfig) -> Vec<String> {
-    let rejected = collect_rejecting_plugin_config_errors(config);
+    let rejected = collect_plugin_config_errors(config, true);
     if rejected.is_empty() {
         return Vec::new();
     }
