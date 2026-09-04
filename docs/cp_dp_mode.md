@@ -256,7 +256,7 @@ The gate mirrors `plugin_cache::try_create_plugin` exactly:
 
 Constructors that need node-local resources (the `geo_restriction` MaxMind database, `body_validator` / `ai_response_guard` / `ai_transcript_audit` descriptor sets, `udp_logging` DTLS material, `oidc_relying_party` discovery, the `transaction_log_schema` registry) are validated shape-only, so CP admission never requires a data-plane file to exist on the CP node. Backend egress policy is deliberately **not** applied here: it is node-local environment configuration the admitting CP does not own, and the serving mode still screens it when it builds the cache.
 
-`database` mode takes the opposite branch for the same defect: rather than refusing to start, it **quarantines** the offending row so its admin API binds and the row stays repairable. See [admin_api.md](admin_api.md).
+`database` mode takes the opposite branch for the same defect when the plugin is `OptionalFailOpen` instrumentation: rather than refusing to start, it **quarantines** the offending row so its admin API binds and the row stays repairable. A refused `FailClosed` / `KeepLastKnownGood` plugin or an unknown plugin name still stops startup in every mode — a security control is never silently omitted. See [admin_api.md](admin_api.md).
 
 ### Update Types
 
