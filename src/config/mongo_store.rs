@@ -8968,7 +8968,7 @@ mod inner {
                                 if this
                                     .proxies()
                                     .find_one(doc! {
-                                        "_id": namespaced_doc_id(namespace.as_str(), *id),
+                                        "_id": namespaced_doc_id(namespace.as_str(), id),
                                         "namespace": namespace.as_str(),
                                     })
                                     .session(&mut *s)
@@ -9008,7 +9008,7 @@ mod inner {
                                     .proxies()
                                     .replace_one(
                                         mongodb::bson::doc! {
-                                            "_id": namespaced_doc_id(namespace.as_str(), *id),
+                                            "_id": namespaced_doc_id(namespace.as_str(), id),
                                             "namespace": namespace.as_str(),
                                         },
                                         doc,
