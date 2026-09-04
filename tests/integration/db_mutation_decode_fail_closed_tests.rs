@@ -215,7 +215,26 @@ async fn delete_plugin_config_rolls_back_when_association_proxy_id_fails_to_deco
         .await
         .expect_err("malformed association proxy_id must abort plugin deletion");
     let message = err.to_string();
-    assert_safe_decode_error(&message, "delete_plugin_config", "proxy_id");
+    // `delete_plugin_config` reads the junction twice inside its transaction:
+    // first the mTLS DNS-identity baseline (which, since `proxy_plugins` is
+    // keyed on `(namespace, proxy_id, plugin_config_id)`, reads the namespace's
+    // rows directly rather than joining `proxies`), then its own invalidation
+    // read. Whichever decodes the poisoned row first fails the whole delete
+    // closed with the same safe context.
+    assert!(
+        message.contains("operation=delete_plugin_config")
+            || message.contains("operation=mtls_dns_repair_delete_baseline"),
+        "error should include the delete path's operation context, got: {message}"
+    );
+    assert_safe_decode_error(
+        &message,
+        if message.contains("operation=delete_plugin_config") {
+            "delete_plugin_config"
+        } else {
+            "mtls_dns_repair_delete_baseline"
+        },
+        "proxy_id",
+    );
     assert!(
         message.contains("resource=proxy_plugins"),
         "error should identify proxy_plugins, got: {message}"
