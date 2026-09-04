@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-03
+
+Patch release cut so that an immutable `v0.9.1` release and matching multi-arch
+images exist for the Helm charts' default `appVersion`. The from-source arm64
+eBPF image now builds with thin LTO and 16 codegen units (#4602); the release
+also carries the launch-readiness fixes merged since 0.9.0.
+
 ## [0.9.0] - 2026-09-02
 
 Ferrum Edge 0.9.0 represents the current build-out baseline: a multi-protocol
