@@ -52,12 +52,13 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::config::conf_file::resolve_ferrum_var;
 use crate::plugins::prometheus_metrics::escape_label_value;
+use crate::util::conn_limit::{ConnLimiter, ConnPermit, ConnRejectReason};
 
 /// Default sidecar port kubelet probes after the rewrite. Matches Istio's
 /// status port so cluster policies written for Istio keep working.
@@ -87,6 +88,32 @@ const PROBE_HEADER_READ_TIMEOUT_SECONDS: u64 = 5;
 
 /// Listen backlog for the probe listener. Kubelet probes are low-rate.
 const PROBE_LISTEN_BACKLOG: i32 = 128;
+
+/// Default ceiling on concurrent probe-listener connections (issue #4625).
+///
+/// Deliberately NOT `FERRUM_MAX_CONNECTIONS`: this is the sidecar's own status
+/// port — a management surface the injector exempts from inbound capture — not
+/// a data-plane proxy listener, and the data-plane default (100000) would bound
+/// nothing here. The admin and CP gRPC listeners size their own admission the
+/// same way, for the same reason.
+pub const DEFAULT_APP_PROBE_MAX_CONNECTIONS: usize = 128;
+
+/// Default per-source-IP share of [`DEFAULT_APP_PROBE_MAX_CONNECTIONS`].
+///
+/// Kubelet dials from the node, so a flood arriving from any other source
+/// cannot take the share kubelet's own probes need.
+pub const DEFAULT_APP_PROBE_MAX_CONNECTIONS_PER_IP: usize = 32;
+
+/// Default ceiling on concurrently executing loopback probes (issue #4625).
+///
+/// Independent of the connection cap: one keep-alive connection can pipeline
+/// probe requests indefinitely, so connection capacity alone does not bound the
+/// loopback concurrency pushed at the application container.
+pub const DEFAULT_APP_PROBE_MAX_ACTIVE_PROBES: usize = 16;
+
+/// Body returned when the active-probe budget is exhausted. Fixed, tiny, and
+/// carries nothing request-derived.
+const PROBE_OVERLOAD_BODY: &str = "app probe budget exhausted\n";
 
 // ── Wire types (injector producer ⇄ sidecar consumer) ────────────────────
 
@@ -364,10 +391,240 @@ impl AppProbeMetrics {
     }
 }
 
+// ── Admission (issue #4625) ──────────────────────────────────────────────
+
+/// Sentinel returned when the active-probe budget is already fully committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppProbeBudgetExhausted;
+
+/// Bounded budget for *executing* loopback probes.
+///
+/// The connection cap bounds sockets; this bounds the work a socket can start.
+/// A single admitted keep-alive connection may pipeline probe requests without
+/// limit, and each accepted one opens a fresh loopback connection into the
+/// application container that lives for up to `timeoutSeconds` (bounded by
+/// [`MAX_PROBE_TIMEOUT_SECONDS`], i.e. 600s) while the HTTP variant drains the
+/// whole response body. Without this second dimension the application-facing
+/// concurrency is unbounded even while connection capacity remains.
+///
+/// Acquisition never waits: over-budget requests are refused with a bounded
+/// response rather than queued, because queueing is the same exhaustion
+/// primitive one layer later.
+#[derive(Debug)]
+pub struct AppProbeBudget {
+    /// `None` when the budget is disabled (`max == 0`).
+    semaphore: Option<Arc<Semaphore>>,
+    max: usize,
+    active: AtomicU64,
+    rejected: AtomicU64,
+}
+
+impl AppProbeBudget {
+    /// `max == 0` disables the budget (probes are then bounded only by the
+    /// connection cap).
+    pub fn new(max: usize) -> Self {
+        let semaphore = if max > 0 {
+            Some(Arc::new(Semaphore::new(max.min(Semaphore::MAX_PERMITS))))
+        } else {
+            None
+        };
+        Self {
+            semaphore,
+            max,
+            active: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+        }
+    }
+
+    /// Try to admit one probe execution. Never blocks. The returned guard must
+    /// outlive the probe: it releases the slot on every exit — success,
+    /// failure, probe timeout, connection error, and task cancellation.
+    pub fn try_acquire(self: &Arc<Self>) -> Result<AppProbePermit, AppProbeBudgetExhausted> {
+        let permit = match self.semaphore {
+            Some(ref sem) => match sem.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    self.rejected.fetch_add(1, Ordering::Relaxed);
+                    return Err(AppProbeBudgetExhausted);
+                }
+            },
+            None => None,
+        };
+        self.active.fetch_add(1, Ordering::Relaxed);
+        Ok(AppProbePermit {
+            budget: Arc::clone(self),
+            _permit: permit,
+        })
+    }
+
+    /// Configured ceiling (`0` = unlimited).
+    pub fn max(&self) -> usize {
+        self.max
+    }
+
+    /// Probes executing right now.
+    pub fn active(&self) -> u64 {
+        self.active.load(Ordering::Relaxed)
+    }
+
+    /// Probe requests refused because the budget was full.
+    pub fn rejected(&self) -> u64 {
+        self.rejected.load(Ordering::Relaxed)
+    }
+}
+
+/// RAII guard for one admitted probe execution.
+#[derive(Debug)]
+pub struct AppProbePermit {
+    budget: Arc<AppProbeBudget>,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for AppProbePermit {
+    fn drop(&mut self) {
+        self.budget.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Everything the probe listener consults before it allocates anything.
+///
+/// The probe listener is plaintext, wildcard-bound, and deliberately exempt
+/// from inbound mesh capture, so every peer that can reach the Pod IP reaches
+/// it unauthenticated. Admission therefore has to happen in the accept loop,
+/// before a task, an HTTP state machine, or a loopback probe exists.
+pub struct AppProbeAdmission {
+    /// Global + per-source-IP connection cap. Default DashMap sharding: this is
+    /// a low-rate management surface, matching the admin / CP gRPC listeners.
+    limiter: Arc<ConnLimiter>,
+    budget: Arc<AppProbeBudget>,
+    /// Process overload state, when the listener runs inside a mesh proxy.
+    /// `None` for standalone construction in tests.
+    overload: Option<Arc<crate::overload::OverloadState>>,
+    rejected_overload: AtomicU64,
+}
+
+impl std::fmt::Debug for AppProbeAdmission {
+    /// Hand-written because `OverloadState` is a process-wide hot-atomic block
+    /// with no `Debug`, and printing it here would be noise anyway: the useful
+    /// content is the configured ceilings and the live occupancy.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let limits = self.limiter.snapshot();
+        f.debug_struct("AppProbeAdmission")
+            .field("max_connections", &limits.max_connections)
+            .field("max_connections_per_ip", &limits.max_connections_per_ip)
+            .field("active_connections", &limits.active_connections)
+            .field("max_active_probes", &self.budget.max())
+            .field("active_probes", &self.budget.active())
+            .field("overload_tracked", &self.overload.is_some())
+            .finish()
+    }
+}
+
+impl Default for AppProbeAdmission {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_APP_PROBE_MAX_CONNECTIONS,
+            DEFAULT_APP_PROBE_MAX_CONNECTIONS_PER_IP,
+            DEFAULT_APP_PROBE_MAX_ACTIVE_PROBES,
+            None,
+        )
+    }
+}
+
+impl AppProbeAdmission {
+    pub fn new(
+        max_connections: usize,
+        max_connections_per_ip: usize,
+        max_active_probes: usize,
+        overload: Option<Arc<crate::overload::OverloadState>>,
+    ) -> Self {
+        Self {
+            limiter: Arc::new(ConnLimiter::new(max_connections, max_connections_per_ip)),
+            budget: Arc::new(AppProbeBudget::new(max_active_probes)),
+            overload,
+            rejected_overload: AtomicU64::new(0),
+        }
+    }
+
+    /// Build from the resolved environment configuration.
+    pub fn from_env_config(
+        env_config: &crate::config::EnvConfig,
+        overload: Option<Arc<crate::overload::OverloadState>>,
+    ) -> Self {
+        Self::new(
+            env_config.mesh_app_probe_max_connections,
+            env_config.mesh_app_probe_max_connections_per_ip,
+            env_config.mesh_app_probe_max_active_probes,
+            overload,
+        )
+    }
+
+    /// The active-probe budget, shared with the request handler.
+    pub fn budget(&self) -> &Arc<AppProbeBudget> {
+        &self.budget
+    }
+
+    /// Whether the process is shedding new connections. Checked at the same
+    /// accept-loop boundary the ordinary proxy listener checks it.
+    fn shedding(&self) -> bool {
+        self.overload.as_ref().is_some_and(|overload| {
+            overload
+                .reject_new_connections
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
+    }
+
+    /// Admit one accepted socket, or say why not. Called before any clone,
+    /// task, or HTTP state exists.
+    pub fn try_admit(&self, peer: IpAddr) -> Result<ConnPermit, AppProbeAdmissionRejection> {
+        if self.shedding() {
+            self.rejected_overload.fetch_add(1, Ordering::Relaxed);
+            return Err(AppProbeAdmissionRejection::Overload);
+        }
+        self.limiter
+            .try_acquire(peer)
+            .map_err(AppProbeAdmissionRejection::Limit)
+    }
+
+    /// Connections refused because the process was in critical overload.
+    pub fn rejected_overload(&self) -> u64 {
+        self.rejected_overload.load(Ordering::Relaxed)
+    }
+
+    /// Snapshot the connection limiter for metrics.
+    pub fn limiter_snapshot(&self) -> crate::util::conn_limit::ConnLimiterSnapshot {
+        self.limiter.snapshot()
+    }
+}
+
+/// Why an accepted probe socket was refused. Bounded, never attacker-derived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppProbeAdmissionRejection {
+    /// The process is in critical overload and admits no new connection.
+    Overload,
+    /// A connection cap was reached.
+    Limit(ConnRejectReason),
+}
+
+impl AppProbeAdmissionRejection {
+    /// Stable log/metric label.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Overload => "overload",
+            Self::Limit(reason) => reason.as_label(),
+        }
+    }
+}
+
 static APP_PROBE_METRICS: OnceLock<Arc<AppProbeMetrics>> = OnceLock::new();
+static APP_PROBE_ADMISSION: OnceLock<Arc<AppProbeAdmission>> = OnceLock::new();
 
 fn install_metrics(metrics: Arc<AppProbeMetrics>) {
     let _ = APP_PROBE_METRICS.set(metrics);
+}
+
+fn install_admission(admission: Arc<AppProbeAdmission>) {
+    let _ = APP_PROBE_ADMISSION.set(admission);
 }
 
 /// Render `ferrum_mesh_app_probe_total` from the live process-static counters.
@@ -411,27 +668,168 @@ the sidecar against the application over loopback, by bounded outcome.\n",
             ));
         }
     }
+    render_admission_prometheus(output, gateway_ns_label);
+}
+
+/// Emit `name{gateway_namespace="..."} value`, or the bare series when the
+/// gateway has no namespace label. Mirrors the node-waypoint observability
+/// helper so the two process-static renderers format identically.
+fn render_labelled_value(output: &mut String, name: &str, value: u64, gateway_ns_label: &str) {
+    if gateway_ns_label.is_empty() {
+        output.push_str(&format!("{name} {value}\n"));
+    } else {
+        let label_body = gateway_ns_label
+            .strip_prefix(',')
+            .unwrap_or(gateway_ns_label);
+        output.push_str(&format!("{name}{{{label_body}}} {value}\n"));
+    }
+}
+
+/// Render the probe listener's admission families (issue #4625).
+///
+/// Fixed cardinality: no source-IP label anywhere, and the `reason` values come
+/// from a closed `&'static str` set. Every bucket is emitted at zero so a
+/// dashboard can pin the series before the first rejection.
+fn render_admission_prometheus(output: &mut String, gateway_ns_label: &str) {
+    let Some(admission) = APP_PROBE_ADMISSION.get() else {
+        return;
+    };
+    let limits = admission.limiter_snapshot();
+    for (name, help, kind, value) in [
+        (
+            "ferrum_mesh_app_probe_active_connections",
+            "Application-probe listener connections currently admitted.",
+            "gauge",
+            limits.active_connections,
+        ),
+        (
+            "ferrum_mesh_app_probe_max_connections",
+            "Configured application-probe listener connection cap (0 = unlimited).",
+            "gauge",
+            limits.max_connections as u64,
+        ),
+        (
+            "ferrum_mesh_app_probe_max_connections_per_ip",
+            "Configured per-source-IP application-probe connection cap (0 = unlimited).",
+            "gauge",
+            limits.max_connections_per_ip as u64,
+        ),
+        (
+            "ferrum_mesh_app_probe_active_probes",
+            "Loopback application probes executing right now.",
+            "gauge",
+            admission.budget().active(),
+        ),
+        (
+            "ferrum_mesh_app_probe_max_active_probes",
+            "Configured concurrent loopback application-probe budget (0 = unlimited).",
+            "gauge",
+            admission.budget().max() as u64,
+        ),
+        (
+            "ferrum_mesh_app_probe_rejected_probes_total",
+            "Probe requests refused because the active-probe budget was full.",
+            "counter",
+            admission.budget().rejected(),
+        ),
+    ] {
+        output.push_str(&format!("# HELP {name} {help}\n"));
+        output.push_str(&format!("# TYPE {name} {kind}\n"));
+        render_labelled_value(output, name, value, gateway_ns_label);
+    }
+    output.push_str(
+        "# HELP ferrum_mesh_app_probe_rejected_connections_total Application-probe connections \
+refused in the accept loop before any task or HTTP state was allocated, by reason.\n",
+    );
+    output.push_str("# TYPE ferrum_mesh_app_probe_rejected_connections_total counter\n");
+    for (reason, value) in [
+        ("overload", admission.rejected_overload()),
+        ("max_connections", limits.rejected_max_connections),
+        (
+            "max_connections_per_ip",
+            limits.rejected_max_connections_per_ip,
+        ),
+    ] {
+        output.push_str(&format!(
+            "ferrum_mesh_app_probe_rejected_connections_total{{reason=\"{reason}\"{gateway_ns_label}}} {value}\n"
+        ));
+    }
 }
 
 // ── Server ───────────────────────────────────────────────────────────────
+
+/// One probe-server response: a status, a fixed body, and whether the
+/// connection must be closed after it.
+///
+/// `close` is set only for the admission refusal: keeping an over-budget peer's
+/// keep-alive connection open invites it to retry on the same socket, which is
+/// the pattern the budget exists to bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppProbeResponse {
+    pub status: StatusCode,
+    /// Fixed, `'static`, never request-derived.
+    pub body: &'static str,
+    pub close: bool,
+}
+
+impl AppProbeResponse {
+    fn keep_alive(status: StatusCode, body: &'static str) -> Self {
+        Self {
+            status,
+            body,
+            close: false,
+        }
+    }
+
+    fn close(status: StatusCode, body: &'static str) -> Self {
+        Self {
+            status,
+            body,
+            close: true,
+        }
+    }
+}
 
 /// The rewritten-probe HTTP server. Immutable after construction.
 #[derive(Debug)]
 pub struct AppProbeServer {
     targets: BTreeMap<String, AppProbeSpec>,
     metrics: Arc<AppProbeMetrics>,
+    /// Connection admission plus the active-probe budget. Shared with the
+    /// accept loop so one object owns both dimensions.
+    admission: Arc<AppProbeAdmission>,
 }
 
 impl AppProbeServer {
+    /// Build with the default admission budgets.
+    ///
+    /// `#[allow(dead_code)]` for the same reason `ConnLimiter::unlimited`
+    /// carries it: the binary target compiles this module tree separately from
+    /// the library, and only the external test suites reach this constructor —
+    /// the running sidecar always goes through
+    /// [`AppProbeServer::from_env_with_admission`] with configured budgets.
+    #[allow(dead_code)]
     pub fn new(targets: BTreeMap<String, AppProbeSpec>) -> Self {
-        let metrics = Arc::new(AppProbeMetrics::for_targets(&targets));
-        Self { targets, metrics }
+        Self::with_admission(targets, Arc::new(AppProbeAdmission::default()))
     }
 
-    /// Build from `FERRUM_MESH_APP_PROBES`.
-    pub fn from_env() -> Result<Self, String> {
+    /// Build with an explicit admission controller.
+    pub fn with_admission(
+        targets: BTreeMap<String, AppProbeSpec>,
+        admission: Arc<AppProbeAdmission>,
+    ) -> Self {
+        let metrics = Arc::new(AppProbeMetrics::for_targets(&targets));
+        Self {
+            targets,
+            metrics,
+            admission,
+        }
+    }
+
+    /// Build from `FERRUM_MESH_APP_PROBES` with configured admission budgets.
+    pub fn from_env_with_admission(admission: Arc<AppProbeAdmission>) -> Result<Self, String> {
         let raw = resolve_ferrum_var(APP_PROBES_ENV).unwrap_or_default();
-        Ok(Self::new(parse_app_probes(&raw)?))
+        Ok(Self::with_admission(parse_app_probes(&raw)?, admission))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -457,19 +855,49 @@ impl AppProbeServer {
         Some((container, probe_field, spec))
     }
 
-    /// Serve one kubelet request.
+    /// Serve one kubelet request, returning only the status.
+    ///
+    /// `#[allow(dead_code)]` for the binary-target reason above: the served
+    /// connection needs the body and the close disposition, so production goes
+    /// through [`AppProbeServer::handle_request_detailed`].
+    #[allow(dead_code)]
     pub async fn handle_request(&self, method: &Method, path: &str) -> StatusCode {
+        self.handle_request_detailed(method, path).await.status
+    }
+
+    /// Serve one kubelet request.
+    ///
+    /// The active-probe budget is taken **before** `run_probe`, so a keep-alive
+    /// or pipelined request pattern on an already-admitted connection cannot
+    /// push more concurrent loopback probes at the application container than
+    /// the budget allows. An over-budget request is refused immediately with a
+    /// bounded body and `Connection: close` — never queued, and never recorded
+    /// as a probe outcome, because no probe ran.
+    pub async fn handle_request_detailed(&self, method: &Method, path: &str) -> AppProbeResponse {
         if method != Method::GET && method != Method::HEAD {
-            return StatusCode::METHOD_NOT_ALLOWED;
+            return AppProbeResponse::keep_alive(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method not allowed\n",
+            );
         }
         let Some((container, probe_field, spec)) = self.resolve_target(path) else {
-            return StatusCode::NOT_FOUND;
+            return AppProbeResponse::keep_alive(
+                StatusCode::NOT_FOUND,
+                "unknown app probe target\n",
+            );
+        };
+        let Ok(_probe_permit) = self.admission.budget().try_acquire() else {
+            // Shed rather than queue: a queued probe still holds the socket and
+            // still eventually dials the application.
+            return AppProbeResponse::close(StatusCode::SERVICE_UNAVAILABLE, PROBE_OVERLOAD_BODY);
         };
         let outcome = run_probe(spec).await;
         self.metrics.record(container, probe_field, outcome);
         match outcome {
-            AppProbeOutcome::Success => StatusCode::OK,
-            AppProbeOutcome::Failure | AppProbeOutcome::Timeout => StatusCode::SERVICE_UNAVAILABLE,
+            AppProbeOutcome::Success => AppProbeResponse::keep_alive(StatusCode::OK, "ok\n"),
+            AppProbeOutcome::Failure | AppProbeOutcome::Timeout => {
+                AppProbeResponse::keep_alive(StatusCode::SERVICE_UNAVAILABLE, "app probe failed\n")
+            }
         }
     }
 }
@@ -514,6 +942,8 @@ pub fn bind_app_probe_listener(port: u16) -> Result<TcpListener, anyhow::Error> 
 /// probes, so a workload that never had an HTTP/TCP/gRPC probe does not open a
 /// listener at all.
 pub fn start_from_env(
+    env_config: &crate::config::EnvConfig,
+    overload: Option<Arc<crate::overload::OverloadState>>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<Option<tokio::task::JoinHandle<()>>, anyhow::Error> {
     let port = app_probe_port_from_env().map_err(|e| anyhow::anyhow!(e))?;
@@ -524,7 +954,9 @@ pub fn start_from_env(
         );
         return Ok(None);
     }
-    let server = AppProbeServer::from_env().map_err(|e| anyhow::anyhow!(e))?;
+    let admission = Arc::new(AppProbeAdmission::from_env_config(env_config, overload));
+    let server = AppProbeServer::from_env_with_admission(Arc::clone(&admission))
+        .map_err(|e| anyhow::anyhow!(e))?;
     if server.is_empty() {
         debug!(
             "No rewritten kubelet application probes configured ({APP_PROBES_ENV} empty); \
@@ -535,17 +967,31 @@ pub fn start_from_env(
     let target_count = server.target_count();
     let listener = bind_app_probe_listener(port)?;
     install_metrics(Arc::clone(&server.metrics));
+    install_admission(Arc::clone(&admission));
+    let limits = admission.limiter_snapshot();
     let server = Arc::new(server);
     info!(
         port,
-        target_count, "Mesh application-probe rewrite server listening"
+        target_count,
+        max_connections = limits.max_connections,
+        max_connections_per_ip = limits.max_connections_per_ip,
+        max_active_probes = admission.budget().max(),
+        "Mesh application-probe rewrite server listening"
     );
     Ok(Some(tokio::spawn(async move {
         run_app_probe_server(listener, server, shutdown).await;
     })))
 }
 
-/// Accept loop. One task per connection; probes never run on the accept path.
+/// Accept loop. One task per **admitted** connection; probes never run on the
+/// accept path.
+///
+/// Admission happens between `accept()` and `spawn`: a refused socket costs one
+/// `accept()` and one atomic, never a task, an HTTP state machine, or a
+/// `JoinSet` entry. The permit is moved into the connection task, so it covers
+/// the header read, every served request, and every exit — clean close, parse
+/// error, header timeout, cancellation at shutdown (`abort_all` drops the task
+/// and with it the permit).
 pub async fn run_app_probe_server(
     listener: TcpListener,
     server: Arc<AppProbeServer>,
@@ -554,13 +1000,34 @@ pub async fn run_app_probe_server(
     let mut connections = JoinSet::new();
     let mut accept_backoff = crate::util::accept_backoff::AcceptBackoff::new();
     let mut accept_err_log = crate::util::accept_backoff::LogRateLimiter::new();
+    let mut reject_log = crate::util::accept_backoff::LogRateLimiter::new();
     loop {
         tokio::select! {
             result = listener.accept() => match result {
                 Ok((stream, peer)) => {
                     accept_backoff.on_success();
+                    let permit = match server.admission.try_admit(peer.ip()) {
+                        Ok(permit) => permit,
+                        Err(rejection) => {
+                            if let Some(suppressed) =
+                                reject_log.on_event(crate::socket_opts::monotonic_now_ms())
+                            {
+                                warn!(
+                                    suppressed,
+                                    reason = rejection.as_label(),
+                                    "Refusing a mesh application-probe connection before allocating \
+                                     a task; the listener is at its admission ceiling"
+                                );
+                            }
+                            // Dropped in the accept loop: no task, no HTTP
+                            // state, no loopback probe.
+                            drop(stream);
+                            continue;
+                        }
+                    };
                     let server = Arc::clone(&server);
                     connections.spawn(async move {
+                        let _conn_permit = permit;
                         serve_app_probe_connection(stream, server, peer).await;
                     });
                 }
@@ -597,19 +1064,23 @@ async fn serve_app_probe_connection(
     let service = service_fn(move |req: Request<hyper::body::Incoming>| {
         let server = Arc::clone(&server);
         async move {
-            let status = server.handle_request(req.method(), req.uri().path()).await;
-            let body = match status {
-                StatusCode::OK => "ok\n",
-                StatusCode::NOT_FOUND => "unknown app probe target\n",
-                StatusCode::METHOD_NOT_ALLOWED => "method not allowed\n",
-                _ => "app probe failed\n",
-            };
-            let mut response = Response::new(Full::new(Bytes::from_static(body.as_bytes())));
-            *response.status_mut() = status;
+            let served = server
+                .handle_request_detailed(req.method(), req.uri().path())
+                .await;
+            let mut response = Response::new(Full::new(Bytes::from_static(served.body.as_bytes())));
+            *response.status_mut() = served.status;
             response.headers_mut().insert(
                 hyper::header::CONTENT_TYPE,
                 hyper::header::HeaderValue::from_static("text/plain; charset=utf-8"),
             );
+            if served.close {
+                // Budget refusal: retire the socket instead of leaving a
+                // keep-alive connection for the same peer to retry on.
+                response.headers_mut().insert(
+                    hyper::header::CONNECTION,
+                    hyper::header::HeaderValue::from_static("close"),
+                );
+            }
             Ok::<_, std::convert::Infallible>(response)
         }
     });

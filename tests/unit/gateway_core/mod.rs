@@ -109,6 +109,7 @@ mod node_agent_ingress_topology_tests;
 mod node_agent_pod_watch_backoff_tests;
 mod node_agent_startup_cleanup_tests;
 mod node_agent_watcher_exit_tests;
+mod node_waypoint_capture_admission_tests;
 mod node_waypoint_dtls_socket_options_tests;
 mod node_waypoint_observability_tests;
 mod node_waypoint_udp_destination_tests;
