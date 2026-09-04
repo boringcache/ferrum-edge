@@ -1338,10 +1338,6 @@ impl GrpcPoolManager {
         pool_config: &PoolConfig,
         conn_slot: Option<SharedBackendConnectionGuard>,
     ) -> Result<GrpcPooledSender, GrpcProxyError> {
-        // Duplicate the descriptor BEFORE the preface adapter takes ownership
-        // of the stream (issue #4411).
-        let backend_socket =
-            crate::proxy::backend_send_queue::BackendSocketHandle::duplicate_from(&tcp);
         let settings_received = Arc::new(AtomicBool::new(false));
         let io = TokioIo::new(crate::proxy::h2c_preface::H2cPrefaceIo::new(
             tcp,
@@ -1377,7 +1373,7 @@ impl GrpcPoolManager {
             }
         });
 
-        Ok(GrpcPooledSender::new(sender, backend_socket))
+        Ok(GrpcPooledSender::new(sender))
     }
 
     /// Create an h2 (TLS) connection with ALPN negotiation, mTLS, and custom CA bundles.
@@ -1389,10 +1385,6 @@ impl GrpcPoolManager {
         pool_config: &PoolConfig,
         conn_slot: Option<SharedBackendConnectionGuard>,
     ) -> Result<GrpcPooledSender, GrpcProxyError> {
-        // Duplicate the descriptor BEFORE the TLS layer takes ownership of the
-        // stream (issue #4411).
-        let backend_socket =
-            crate::proxy::backend_send_queue::BackendSocketHandle::duplicate_from(&tcp);
         let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
             GrpcProxyError::backend_unavailable_with_source(
                 GrpcBackendUnavailableKind::TlsHandshake,
@@ -1429,7 +1421,7 @@ impl GrpcPoolManager {
             }
         });
 
-        Ok(GrpcPooledSender::new(sender, backend_socket))
+        Ok(GrpcPooledSender::new(sender))
     }
 }
 
@@ -3745,38 +3737,30 @@ async fn open_hbone_grpc_sender(
     // The socket underneath this sender is the OUTER HBONE session, shared by
     // every tunnel multiplexed on it and owned by the HBONE pool, so no
     // per-request send-queue bound is published here (issue #4411).
-    Ok(GrpcPooledSender::new(sender, None))
+    Ok(GrpcPooledSender::new(sender))
 }
 
-/// One pooled native-gRPC HTTP/2 transport: hyper's multiplexed sender plus a
-/// duplicated handle on the socket underneath it (issue #4411).
+/// One pooled native-gRPC HTTP/2 transport.
 ///
-/// The socket handle is what lets `backend_write_timeout_ms` bound the POST-EOS
-/// drain of the local send queue — the only remaining evidence that a backend is
-/// consuming an upload once the last request byte has been handed to the
-/// kernel. See [`crate::proxy::backend_send_queue`]. `None` for a transport
-/// whose socket the gateway does not own (the nested HTTP/2 connection inside
-/// an HBONE CONNECT tunnel) or on a platform with no send-queue query, which
-/// leaves that bound disarmed exactly as before.
+/// Its socket is deliberately not exposed for a per-request post-EOS drain
+/// check. The connection is multiplexed, so its send queue includes bytes from
+/// every stream and cannot safely provide a write-timeout verdict for any one
+/// request.
 ///
 /// Deref/DerefMut to the sender, so every existing `ready()` / `send_request()`
 /// / `is_closed()` call site is unchanged.
 #[derive(Clone, Debug)]
 pub struct GrpcPooledSender {
     inner: http2::SendRequest<GrpcBody>,
-    socket: Option<Arc<crate::proxy::backend_send_queue::BackendSocketHandle>>,
 }
 
 impl GrpcPooledSender {
-    fn new(
-        inner: http2::SendRequest<GrpcBody>,
-        socket: Option<Arc<crate::proxy::backend_send_queue::BackendSocketHandle>>,
-    ) -> Self {
-        Self { inner, socket }
+    fn new(inner: http2::SendRequest<GrpcBody>) -> Self {
+        Self { inner }
     }
 
     fn backend_socket(&self) -> Option<Arc<crate::proxy::backend_send_queue::BackendSocketHandle>> {
-        self.socket.clone()
+        None
     }
 }
 
@@ -3822,11 +3806,11 @@ impl std::fmt::Display for GrpcDispatchSendError {
 }
 
 impl GrpcDispatchSender {
-    /// The backend socket this transport writes to, for the post-EOS
-    /// send-queue drain bound (issue #4411).
+    /// The backend socket this transport writes to, when it can safely support
+    /// a per-request post-EOS send-queue drain bound.
     ///
-    /// `None` for mesh-mTLS, whose socket the mesh pool owns and whose
-    /// transport this enum only borrows a sender from.
+    /// All current variants return `None`: H2 is multiplexed, while mesh-mTLS
+    /// owns its socket outside this dispatcher.
     fn backend_socket(&self) -> Option<Arc<crate::proxy::backend_send_queue::BackendSocketHandle>> {
         match self {
             Self::H2(sender) => sender.backend_socket(),

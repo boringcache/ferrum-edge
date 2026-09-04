@@ -160,6 +160,10 @@ pub trait ConnectionAdmission: Send + Sync + 'static {
     /// `token` is the same token `admit` returned for this connection, so an
     /// implementation can key what it records on the connection's identity.
     ///
+    /// Only HTTP/1.1 connections are reported: a connection that negotiated
+    /// HTTP/2 over ALPN is multiplexed, and its socket cannot be attributed to
+    /// the single request that dialed it.
+    ///
     /// The default implementation does nothing, so an existing
     /// `ConnectionAdmission` needs no change.
     #[cfg(unix)]
@@ -326,10 +330,18 @@ where
     // Ferrum patch 004: report the socket before the connection reaches hyper,
     // so the hook observes it strictly before the first request byte is
     // written. `hook` and `token` are `Some` together or not at all.
+    //
+    // Only an HTTP/1.1 connection is reported. A connection that negotiated
+    // HTTP/2 over ALPN is multiplexed: its kernel send queue is shared by every
+    // stream hyper opens on it, so no per-request consumer of the descriptor
+    // (a send-queue drain bound, say) could attribute that queue to the request
+    // that caused the dial. Such connections leave the hook uncalled.
     #[cfg(unix)]
     if let (Some(hook), Some(token), Some(fd)) = (hook.as_ref(), token.as_ref(), established.get())
     {
-        hook.established(token, fd);
+        if !conn.connected().is_negotiated_h2() {
+            hook.established(token, fd);
+        }
     }
     #[cfg(not(unix))]
     let _ = (&hook, &established);
@@ -1096,7 +1108,7 @@ impl ConnectorService {
         #[cfg(feature = "socks")]
         match proxy.uri().scheme_str().ok_or("proxy scheme expected")? {
             "socks4" | "socks4a" | "socks5" | "socks5h" => {
-                return self.connect_socks(dst, proxy).await
+                return self.connect_socks(dst, proxy).await;
             }
             _ => (),
         }

@@ -24,6 +24,13 @@ handed to hyper, so no request byte has been written yet. `token` is the same
 token `admit` returned for that connection, so an implementation can key what it
 records on the connection's identity.
 
+Only an HTTP/1.1 connection is reported. A connection that negotiated HTTP/2
+over ALPN is multiplexed — its kernel send queue is shared by every stream
+hyper opens on it — so no per-request consumer of the descriptor could
+attribute that queue to the request that caused the dial; the hook is simply
+not called for it (checked via `Connected::is_negotiated_h2()` on the
+established connection).
+
 The descriptor is *borrowed* for the duration of the call: the connection owns
 it, and an implementation that needs it afterwards must duplicate it (`dup`).
 Ferrum does exactly that inside the callback

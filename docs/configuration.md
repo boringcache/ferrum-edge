@@ -1316,14 +1316,17 @@ stated here rather than approximated with a timing heuristic:
   An upload that fits entirely inside that window leaves the gateway's send queue
   empty, is indistinguishable from a delivered upload at the transport layer, and
   is bounded by `backend_read_timeout_ms`.
-- **Transport coverage.** The drain bound is armed for the direct HTTP/2 backend
-  pool, the native gRPC HTTP/2 pool, and HTTP/1.1 and HTTP/2 backends dispatched
-  through the bundled HTTP client. It is **not** armed for uploads tunnelled
-  inside an HBONE CONNECT session (the outer socket is shared by every tunnel
-  multiplexed on it, so its send queue is not attributable to one request), nor
-  for HTTP/3, whose upload backpressure is QUIC stream flow control rather than a
-  kernel send queue. Those paths keep the pre-end-of-stream idle bound and
-  `backend_read_timeout_ms`.
+- **Transport coverage.** The drain bound is armed only for HTTP/1.1 backend
+  connections dialed by the bundled HTTP client, whose socket the vendored
+  connection-admission hook reports for the request that caused the dial. It
+  is **not** armed for the direct HTTP/2 backend pool, the native gRPC HTTP/2
+  pool, or a bundled-client connection that negotiated HTTP/2 over ALPN: those
+  connections are multiplexed, so their kernel send queue is shared by every
+  stream on them and cannot be attributed to one request. Nor is it armed for
+  uploads tunnelled inside an HBONE CONNECT session (the outer socket is shared
+  by every tunnel multiplexed on it), or for HTTP/3, whose upload backpressure
+  is QUIC stream flow control rather than a kernel send queue. All of those
+  paths keep the pre-end-of-stream idle bound and `backend_read_timeout_ms`.
 - **Requests served on an already-pooled bundled-client connection.** The bundled
   HTTP client does not hand the gateway its sockets; it reports each socket it
   *dials* to the gateway, and the drain bound is armed for the request that
@@ -1335,9 +1338,11 @@ stated here rather than approximated with a timing heuristic:
   therefore dials a fresh socket.
 
 On a multiplexed HTTP/2 connection the send queue is shared by every stream on
-it, so a non-zero depth is not by itself attributable to one request. The bound
-is stated on *progress* for that reason: a connection whose send queue never
-shrinks is making no progress for any stream on it.
+it. Aggregate depth is not a safe progress signal: acknowledged bytes can be
+immediately replaced by DATA from another stream while every stream continues
+to progress. Ferrum therefore never turns that connection-wide measurement into
+a per-request write timeout, which is why only HTTP/1.1 connections publish a
+socket to the drain watch.
 
 The bound starts when the backend transport begins consuming the request body —
 the first moment a connection provably exists and the request head is written —

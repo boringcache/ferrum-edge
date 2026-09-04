@@ -41,10 +41,11 @@
 //! # Multiplexed transports
 //!
 //! On a pooled HTTP/2 connection the send queue is shared by every stream on
-//! it, so a non-zero depth is not by itself attributable to this request. A
-//! depth that never *decreases* is: a connection whose send queue makes no
-//! progress at all is making no progress for any stream on it, this one
-//! included. The bound is therefore stated on progress, never on depth.
+//! it. Even a flat or growing aggregate depth can represent healthy progress
+//! when acknowledged bytes from one stream are replaced by bytes from another.
+//! Such sockets must not be published to a per-request drain watcher; without
+//! stream-attributable evidence, the response-header read timeout remains the
+//! safe post-EOS bound.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -103,6 +104,12 @@ impl BackendSocketHandle {
     /// `None` when the platform has no send-queue query, or when the duplicate
     /// cannot be made (fd exhaustion) — in both cases the drain bound stays
     /// disarmed and the read timeout governs, which is the pre-#4411 behaviour.
+    // The direct HTTP/2 and native gRPC pools no longer publish their sockets
+    // (multiplexed connections have no per-request send queue), so this
+    // constructor has no binary caller until a per-request transport uses it;
+    // it stays as the owned-stream counterpart of `duplicate_from_raw_fd` and
+    // is exercised by the integration tests.
+    #[allow(dead_code)]
     #[cfg(unix)]
     pub fn duplicate_from(stream: &tokio::net::TcpStream) -> Option<Arc<Self>> {
         if !crate::socket_opts::send_queue_probe_supported() {
