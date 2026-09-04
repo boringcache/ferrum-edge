@@ -377,8 +377,20 @@ async fn serving_load_quarantines_unconstructible_plugin_row_while_cp_load_rejec
         runtime_config.quarantined_plugin_configs
     );
 
-    // Control plane: the SAME row is refused outright, so it is never
-    // broadcast to the data-plane fleet.
+    // Control plane: an unconstructible row whose plugin is NOT OptionalFailOpen
+    // is refused outright, so it is never broadcast to the data-plane fleet.
+    // (The `stdout_logging` typo above is exempt in both modes — a serving mode
+    // quarantines it and the CP omits it with a warning — so the CP half of
+    // this contract needs a FailClosed row: the exact reproduction from issue
+    // #4526, a closed config object with a typo'd key.)
+    insert_named_plugin(
+        &store,
+        "rsl-typo",
+        "request_size_limiting",
+        r#"{"max_bytes":1024,"max_bytez":1}"#,
+        &ts,
+    )
+    .await;
     let cp_error = store
         .load_full_config_for_purpose(
             "ferrum",
@@ -394,7 +406,20 @@ async fn serving_load_quarantines_unconstructible_plugin_row_while_cp_load_rejec
         rendered.contains("configuration validation failed")
             && rendered.contains("1 rejecting error(s)"),
         "CP admission must return the typed validation rejection for the unconstructible \
-         plugin row: {rendered}"
+         FailClosed plugin row (the OptionalFailOpen typo is exempt): {rendered}"
+    );
+
+    // And the serving-mode load now fails closed too: a FailClosed row is never
+    // quarantined, so the same store no longer starts a `database` gateway.
+    let runtime_error = store
+        .load_full_config("ferrum")
+        .await
+        .expect_err("a serving-mode full load must refuse an unconstructible FailClosed plugin");
+    let rendered = format!("{runtime_error:#}");
+    assert!(
+        rendered.contains("configuration validation failed")
+            && rendered.contains("1 rejecting error(s)"),
+        "runtime admission must fail closed on a FailClosed row instead of quarantining it: {rendered}"
     );
 }
 
