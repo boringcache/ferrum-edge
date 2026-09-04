@@ -1316,9 +1316,10 @@ stated here rather than approximated with a timing heuristic:
   An upload that fits entirely inside that window leaves the gateway's send queue
   empty, is indistinguishable from a delivered upload at the transport layer, and
   is bounded by `backend_read_timeout_ms`.
-- **Transport coverage.** The drain bound is armed for the direct HTTP/2 backend
-  pool and the native gRPC HTTP/2 pool, whose sockets the gateway owns. It is
-  **not** armed for HTTP/1.1 backends dispatched through the bundled HTTP client,
+- **Transport coverage.** The drain bound is **not** armed for direct HTTP/2 or
+  native gRPC HTTP/2 pools because their connections are multiplexed and their
+  aggregate socket queues cannot be attributed to one request. It is also not
+  armed for HTTP/1.1 backends dispatched through the bundled HTTP client,
   which does not expose the connection's socket to the gateway, nor for uploads
   tunnelled inside an HBONE CONNECT session (the outer socket is shared by every
   tunnel multiplexed on it, so its send queue is not attributable to one
@@ -1327,9 +1328,10 @@ stated here rather than approximated with a timing heuristic:
   bound and `backend_read_timeout_ms`.
 
 On a multiplexed HTTP/2 connection the send queue is shared by every stream on
-it, so a non-zero depth is not by itself attributable to one request. The bound
-is stated on *progress* for that reason: a connection whose send queue never
-shrinks is making no progress for any stream on it.
+it. Aggregate depth is not a safe progress signal: acknowledged bytes can be
+immediately replaced by DATA from another stream while every stream continues
+to progress. Ferrum therefore never turns that connection-wide measurement into
+a per-request write timeout.
 
 The bound starts when the backend transport begins consuming the request body —
 the first moment a connection provably exists and the request head is written —

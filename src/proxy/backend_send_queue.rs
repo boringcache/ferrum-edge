@@ -41,10 +41,11 @@
 //! # Multiplexed transports
 //!
 //! On a pooled HTTP/2 connection the send queue is shared by every stream on
-//! it, so a non-zero depth is not by itself attributable to this request. A
-//! depth that never *decreases* is: a connection whose send queue makes no
-//! progress at all is making no progress for any stream on it, this one
-//! included. The bound is therefore stated on progress, never on depth.
+//! it. Even a flat or growing aggregate depth can represent healthy progress
+//! when acknowledged bytes from one stream are replaced by bytes from another.
+//! Such sockets must not be published to a per-request drain watcher; without
+//! stream-attributable evidence, the response-header read timeout remains the
+//! safe post-EOS bound.
 
 use std::sync::Arc;
 use std::time::Duration;
