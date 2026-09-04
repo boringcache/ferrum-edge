@@ -609,7 +609,7 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS upstreams (
-                id VARCHAR(255) COLLATE utf8mb4_0900_bin PRIMARY KEY,
+                id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
                 namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT 'ferrum',
                 name VARCHAR(255) COLLATE utf8mb4_0900_bin,
                 targets MEDIUMTEXT NOT NULL,
