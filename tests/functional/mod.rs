@@ -93,6 +93,7 @@ mod functional_otel_ldap_test;
 mod functional_overload_test;
 mod functional_passthrough_test;
 mod functional_plugin_extended_test;
+mod functional_plugin_quarantine_test;
 mod functional_plugin_test;
 mod functional_plugins_network_test;
 mod functional_policy_path_canonicalization_test;
