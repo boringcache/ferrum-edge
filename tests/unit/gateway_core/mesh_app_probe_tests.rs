@@ -364,10 +364,12 @@ mod admission {
     /// the condition `validate_mesh_app_probe_limits` refuses.
     #[test]
     fn defaults_are_safe_and_come_from_the_env_config() {
-        assert!(DEFAULT_APP_PROBE_MAX_CONNECTIONS > 0);
-        assert!(DEFAULT_APP_PROBE_MAX_CONNECTIONS_PER_IP > 0);
-        assert!(DEFAULT_APP_PROBE_MAX_ACTIVE_PROBES > 0);
-        assert!(DEFAULT_APP_PROBE_MAX_CONNECTIONS_PER_IP <= DEFAULT_APP_PROBE_MAX_CONNECTIONS);
+        const {
+            assert!(DEFAULT_APP_PROBE_MAX_CONNECTIONS > 0);
+            assert!(DEFAULT_APP_PROBE_MAX_CONNECTIONS_PER_IP > 0);
+            assert!(DEFAULT_APP_PROBE_MAX_ACTIVE_PROBES > 0);
+            assert!(DEFAULT_APP_PROBE_MAX_CONNECTIONS_PER_IP <= DEFAULT_APP_PROBE_MAX_CONNECTIONS);
+        }
 
         let env_config = EnvConfig::default();
         assert_eq!(
