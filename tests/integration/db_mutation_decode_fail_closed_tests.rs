@@ -489,11 +489,16 @@ async fn full_reload_candidate_with_unconstructible_fail_closed_plugin_keeps_pri
     )
     .expect("proxy state from the healthy generation");
 
+    // A real authoritative full load carries a newer `updated_at` on the row
+    // that changed; without it the apply short-circuits as `Unchanged` before
+    // the plugin cache is ever rebuilt, which is not the path under test.
+    let later = Utc::now() + chrono::Duration::seconds(5);
     let mut fail_closed_candidate = good.clone();
     for plugin_config in &mut fail_closed_candidate.plugin_configs {
         if plugin_config.id == "plugin-1" {
             plugin_config.config =
                 serde_json::json!({"key_location": "header:X-API-Key", "typo": true});
+            plugin_config.updated_at = later;
         }
     }
     match proxy_state.update_config(fail_closed_candidate) {
@@ -522,6 +527,7 @@ async fn full_reload_candidate_with_unconstructible_fail_closed_plugin_keeps_pri
     for plugin_config in &mut optional_candidate.plugin_configs {
         if plugin_config.id == "stdout-ok" {
             plugin_config.config = serde_json::json!({"filtr": {}});
+            plugin_config.updated_at = later;
         }
     }
     assert!(
