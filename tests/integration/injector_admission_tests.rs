@@ -430,8 +430,12 @@ fn admission_rewrites_application_probes_to_the_sidecar_probe_port() {
 
     let script = init_container_script(&ops);
     assert!(
-        script.contains("--dport 15020 -j RETURN"),
-        "the sidecar's own probe port must be excluded:\n{script}"
+        script.contains("-p tcp --dport 15020 -j RETURN"),
+        "the sidecar's own TCP probe port must be excluded:\n{script}"
+    );
+    assert!(
+        !script.contains("-p udp --dport 15020 -j RETURN"),
+        "the TCP-only probe server must not create a UDP capture bypass:\n{script}"
     );
     for port in [8080, 9090] {
         assert!(
@@ -439,6 +443,39 @@ fn admission_rewrites_application_probes_to_the_sidecar_probe_port() {
             "application port {port} must stay captured:\n{script}"
         );
     }
+}
+
+#[test]
+fn admission_keeps_unowned_pre_rewritten_probe_port_captured() {
+    // A probe that merely LOOKS rewritten — the sidecar's path shape on the
+    // probe port, but no recorded original for the sidecar to serve — must not
+    // unlock the probe-port exclusion: nothing in the sidecar will answer on
+    // 15020, so an application that binds it would sit outside mesh capture.
+    let pod = json!({
+        "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
+        "spec": {
+            "serviceAccountName": "api",
+            "containers": [{
+                "name": "app",
+                "image": "app:test",
+                "readinessProbe": {
+                    "httpGet": {
+                        "path": "/app-probe/app/readinessProbe",
+                        "port": 15020
+                    }
+                }
+            }]
+        }
+    });
+    let ops = injected_patch_ops(pod, |_| {});
+
+    assert_eq!(sidecar_env_value(&ops, "FERRUM_MESH_APP_PROBES"), None);
+    assert_eq!(sidecar_env_value(&ops, "FERRUM_MESH_APP_PROBE_PORT"), None);
+    let script = init_container_script(&ops);
+    assert!(
+        !script.contains("--dport 15020 -j RETURN"),
+        "an application may own an unregistered probe port, so it must stay captured:\n{script}"
+    );
 }
 
 #[test]

@@ -1637,6 +1637,19 @@ fn capture_config(config: &InjectorConfig, pod: &Value) -> Result<CaptureConfig,
     capture.include_outbound_ports = include_outbound_ports.ports;
     capture.exclude_ports = exclude_outbound_ports_for_pod(config, pod)?;
     capture.exclude_inbound_ports = exclude_inbound_ports_for_pod(config, pod)?;
+    // The sidecar's OWN probe port terminates in the sidecar, so a TCP RETURN
+    // for it lets nothing bypass the mesh (issue #4533) — but only when the
+    // sidecar will actually bind that listener, i.e. when the rewrite produced
+    // (or, on reinvocation, recovered) at least one probe registration. A probe
+    // that merely LOOKS rewritten with no recorded original is not served, so
+    // its port stays captured: an application could otherwise bind 15020 and
+    // sit outside mesh mTLS / `mesh_authz`. The exclusion is TCP-only; the
+    // probe server speaks no UDP.
+    if rewrite_app_probes_enabled(pod) && !app_probe_rewrite_for_pod(pod)?.probes.is_empty() {
+        capture
+            .exclude_inbound_tcp_ports
+            .push(DEFAULT_APP_PROBE_PORT);
+    }
     capture.ip6tables_mode = config.ip6tables_mode;
     // UDP TPROXY capture (F3 §3.3 Stage 2), flag-gated default-off. When off the
     // emitted plan contains no mangle/TPROXY rules at all. Sidecar UDP egress is
@@ -1762,54 +1775,9 @@ fn exclude_inbound_ports_for_pod(config: &InjectorConfig, pod: &Value) -> Result
         .map_err(|e| format!("invalid {key}: {e}"))?;
         ports.extend(annotation_ports);
     }
-    // The sidecar's OWN rewritten-probe port terminates in the sidecar, so a
-    // RETURN for it does not let anything bypass the mesh (issue #4533).
-    // Application ports are NEVER excluded: a destination-port-wide RETURN for
-    // an app port would also let ordinary Service / Pod-IP traffic skip mesh
-    // mTLS and `mesh_authz`. The port is excluded only when the sidecar will
-    // serve at least one probe on it — a pod with no HTTP/TCP/gRPC probes (or
-    // one that opted out) starts no probe listener, so nothing needs a RETURN.
-    if rewrite_app_probes_enabled(pod) && pod_has_app_probes_to_serve(pod) {
-        ports.push(DEFAULT_APP_PROBE_PORT);
-    }
     ports.sort_unstable();
     ports.dedup();
     Ok(ports)
-}
-
-/// Whether any application container carries a kubelet probe the sidecar's
-/// probe server serves: an `httpGet` / `tcpSocket` / `grpc` handler, whether
-/// still in its original shape or already rewritten to the probe port.
-///
-/// This decides whether the probe port needs an inbound-capture RETURN. Unlike
-/// [`app_probe_rewrite_for_pod`] it does not depend on the injected sidecar's
-/// record of the original handlers being present, so the init container comes
-/// out identical on first injection and on reinvocation of an injected pod.
-/// `exec` probes run inside the container and are never served.
-fn pod_has_app_probes_to_serve(pod: &Value) -> bool {
-    for pointer in APP_PROBE_CONTAINER_LIST_POINTERS {
-        let Some(containers) = pod.pointer(pointer).and_then(Value::as_array) else {
-            continue;
-        };
-        for container in containers {
-            let container_name = container_display_name(container);
-            if container_name == SIDECAR_CONTAINER_NAME || container_name == INIT_CONTAINER_NAME {
-                continue;
-            }
-            for probe_field in CONTAINER_PROBE_FIELDS {
-                let Some(probe) = container.get(probe_field).and_then(Value::as_object) else {
-                    continue;
-                };
-                if ["httpGet", "tcpSocket", "grpc"]
-                    .iter()
-                    .any(|handler| probe.contains_key(*handler))
-                {
-                    return true;
-                }
-            }
-        }
-    }
-    false
 }
 
 /// Whether kubelet application probes are rewritten for this pod.
@@ -4398,12 +4366,20 @@ mod tests {
         }
         let namespace = pod_namespace(&pod, None, &config);
         let sidecar = sidecar_container(&config, &pod, &namespace, &rewrite.probes);
-        let init = init_container(&config, &pod).expect("init container");
-        let containers = pod["spec"]["initContainers"]
+        // The apiserver applies the whole patch at once, so the persisted pod
+        // carries the sidecar (and its recorded probe originals) before anyone
+        // recomputes the init container from it. Mirror that order: the init
+        // container's probe-port exclusion is keyed on the registrations the
+        // rewrite recovers from that record.
+        pod["spec"]["initContainers"]
             .as_array_mut()
-            .expect("initContainers");
-        containers.push(sidecar);
-        containers.push(init);
+            .expect("initContainers")
+            .push(sidecar);
+        let init = init_container(&config, &pod).expect("init container");
+        pod["spec"]["initContainers"]
+            .as_array_mut()
+            .expect("initContainers")
+            .push(init);
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None)
             .expect("reinvocation should be accepted");
