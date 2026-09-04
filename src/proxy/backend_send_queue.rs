@@ -104,6 +104,12 @@ impl BackendSocketHandle {
     /// `None` when the platform has no send-queue query, or when the duplicate
     /// cannot be made (fd exhaustion) — in both cases the drain bound stays
     /// disarmed and the read timeout governs, which is the pre-#4411 behaviour.
+    // The direct HTTP/2 and native gRPC pools no longer publish their sockets
+    // (multiplexed connections have no per-request send queue), so this
+    // constructor has no binary caller until a per-request transport uses it;
+    // it stays as the owned-stream counterpart of `duplicate_from_raw_fd` and
+    // is exercised by the integration tests.
+    #[allow(dead_code)]
     #[cfg(unix)]
     pub fn duplicate_from(stream: &tokio::net::TcpStream) -> Option<Arc<Self>> {
         if !crate::socket_opts::send_queue_probe_supported() {

@@ -770,6 +770,9 @@ pub fn socket_send_queue_bytes(_fd: i32) -> std::io::Result<u64> {
     ))
 }
 
+// Reached from the binary only through `BackendSocketHandle`, whose production
+// callers are per-request transports; with none active it is test-support only.
+#[allow(dead_code)]
 /// Whether [`socket_send_queue_bytes`] can answer at all on this build target.
 ///
 /// Callers use it to skip installing the sampler entirely rather than paying a
