@@ -1892,7 +1892,6 @@ impl AiTranscriptAudit {
             headers: cfg_bool(capture_obj, "headers", false, "capture")?,
             tool_calls: cfg_bool(capture_obj, "tool_calls", true, "capture")?,
             stream_hash,
-            exclude_inbound_tcp_ports: Vec::new(),
         };
         if !capture.request && !capture.response && streaming == StreamingCapture::Off {
             return Err(
