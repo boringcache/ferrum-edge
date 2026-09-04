@@ -14,6 +14,7 @@
 //! suite (`scripted_backend_tests.rs`, `scripted_backend_h2_tests.rs`,
 //! `scripted_backend_h3_tests.rs`).
 
+use crate::scaffolding::Http2Client;
 use crate::scaffolding::backends::{
     HttpStep, RequestMatcher, ScriptedHttp1Backend, ScriptedTcpBackend, TcpStep,
 };
@@ -710,4 +711,260 @@ async fn send_queue_drain_watch_lets_a_reading_peer_finish() {
         "a peer that keeps reading must never be charged a write timeout"
     );
     peer.abort();
+}
+
+// ── #4411: the bundled HTTP client's HTTP/1.1 backend path ──────────────────
+//
+// The issue's own reproduction. 2 MiB fits comfortably inside a loopback send
+// buffer plus a never-reading peer's initial receive window, so the upload pump
+// reaches a clean end of stream with no bridge-capacity backpressure at all and
+// the pre-EOS idle arm can never fire. Only the post-EOS send-queue drain bound
+// can produce the 504 the watermark promises — and on this path it can only do
+// so because vendored reqwest patch 004 reports the dialed socket to the
+// gateway (`docs/upstream-reqwest-patches/004-connection-established-fd/`).
+
+const KERNEL_ABSORB_UPLOAD_BYTES: usize = 2 * 1024 * 1024;
+
+async fn post_upload(
+    harness: &GatewayHarness,
+    client: &reqwest::Client,
+    bytes: usize,
+) -> (reqwest::StatusCode, Option<String>, String, Duration) {
+    let started = Instant::now();
+    let resp = client
+        .post(harness.proxy_url("/api/twrite"))
+        .header("content-type", "application/octet-stream")
+        .header("expect", "")
+        .body(vec![b'x'; bytes])
+        .send()
+        .await
+        .expect("gateway returns a response");
+    let elapsed = started.elapsed();
+    let status = resp.status();
+    let header = gateway_error_header(resp.headers()).map(str::to_owned);
+    let body = resp.text().await.expect("body");
+    (status, header, body, elapsed)
+}
+
+/// The envelope check for the post-EOS drain bound, with the debug-build
+/// handoff counters in the failure message so a miss names the link that
+/// never happened (hook not reached, published out of scope, pump unarmed,
+/// no socket, watch cancelled, queue drained) rather than only the elapsed time.
+fn assert_drain_bound_envelope(elapsed: Duration) {
+    let ceiling = Duration::from_millis(WRITE_TIMEOUT_MS + 1500);
+    let diagnostics = ferrum_edge::_test_support::post_eos_drain_diagnostics();
+    assert!(
+        elapsed <= ceiling,
+        "timed out too slowly: {elapsed:?} > ceiling {ceiling:?} (timeout was \
+         {WRITE_TIMEOUT_MS}ms); drain handoff diagnostics: {diagnostics:?}"
+    );
+    assert_timeout_envelope(elapsed, WRITE_TIMEOUT_MS);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_process_kernel_absorb_write_timeout_maps_to_504() {
+    if !ferrum_edge::_test_support::send_queue_probe_supported() {
+        // No send-queue query on this target: `backend_read_timeout_ms` is the
+        // only bound, as documented next to `backend_write_timeout_ms`.
+        return;
+    }
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
+        .step(TcpStep::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn");
+
+    let yaml =
+        file_mode_yaml_for_backend_with(backend_port, timeout_overrides(8_000, WRITE_TIMEOUT_MS));
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = harness.http_client().expect("client");
+    let (status, header, body, elapsed) =
+        post_upload(&harness, client.as_reqwest(), KERNEL_ABSORB_UPLOAD_BYTES).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::GATEWAY_TIMEOUT,
+        "kernel-absorbed never-read POST must be 504, got {status} body={body}"
+    );
+    assert_eq!(
+        header.as_deref(),
+        Some("backend_timeout"),
+        "timeout must carry X-Gateway-Error=backend_timeout, body={body}"
+    );
+    assert_eq!(body, r#"{"error":"Backend timeout"}"#);
+    assert_drain_bound_envelope(elapsed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_process_h2c_kernel_absorb_write_timeout_maps_to_504() {
+    if !ferrum_edge::_test_support::send_queue_probe_supported() {
+        return;
+    }
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
+        .step(TcpStep::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn");
+
+    let yaml =
+        file_mode_yaml_for_backend_with(backend_port, timeout_overrides(8_000, WRITE_TIMEOUT_MS));
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = Http2Client::h2c_prior_knowledge().expect("h2c client");
+    let (status, header, body, elapsed) =
+        post_upload(&harness, client.as_reqwest(), KERNEL_ABSORB_UPLOAD_BYTES).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::GATEWAY_TIMEOUT,
+        "h2c kernel-absorbed never-read POST must be 504, got {status} body={body}"
+    );
+    assert_eq!(
+        header.as_deref(),
+        Some("backend_timeout"),
+        "timeout must carry X-Gateway-Error=backend_timeout, body={body}"
+    );
+    assert_eq!(body, r#"{"error":"Backend timeout"}"#);
+    assert_drain_bound_envelope(elapsed);
+}
+
+// ── Vendored reqwest patch 004: the behavioral regression that must survive
+//    retirement (`.claude/rules/dependencies.md`) ─────────────────────────────
+//
+// This is the ONE thing patch 004 adds: `ConnectionAdmission::established` is
+// called once per NEW physical connection, with that connection's own socket.
+// If the callback stops firing, or fires with a descriptor that is not the
+// dialed socket, the two acceptance tests above silently degrade to
+// `backend_read_timeout_ms` instead of failing loudly — this one fails loudly.
+#[cfg(unix)]
+mod vendored_established_hook {
+    use super::*;
+    use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct RecordingAdmission {
+        /// Duplicated exactly as production does, so the assertion below reads
+        /// the socket the hook named rather than a number the kernel may have
+        /// recycled by then.
+        sockets: Mutex<Vec<OwnedFd>>,
+    }
+
+    impl reqwest::ConnectionAdmission for RecordingAdmission {
+        fn admit(
+            &self,
+            _dst: &http::Uri,
+        ) -> Result<reqwest::ConnectionAdmissionToken, Box<dyn std::error::Error + Send + Sync>>
+        {
+            Ok(reqwest::ConnectionAdmissionToken::unlimited())
+        }
+
+        fn established(&self, _token: &reqwest::ConnectionAdmissionToken, fd: RawFd) {
+            // SAFETY: the hook's contract is that the connection owns `fd` and
+            // is alive for the duration of this call.
+            let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+            if let Ok(owned) = borrowed.try_clone_to_owned() {
+                self.sockets.lock().expect("lock").push(owned);
+            }
+        }
+    }
+
+    /// A backend that answers every request on the same connection, so the
+    /// second request is a pooled reuse rather than a second dial.
+    fn spawn_keepalive_backend(listener: tokio::net::TcpListener) {
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    // One response per complete request head, so a request that
+                    // arrives across two reads cannot desynchronize the
+                    // connection and make reqwest open a second one.
+                    let mut pending = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = socket.read(&mut buf).await {
+                        if n == 0 {
+                            return;
+                        }
+                        pending.extend_from_slice(&buf[..n]);
+                        while let Some(end) =
+                            pending.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            pending.drain(..end + 4);
+                            if socket
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn established_reports_the_dialed_socket_once_per_physical_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind backend");
+        let addr = listener.local_addr().expect("local addr");
+        spawn_keepalive_backend(listener);
+
+        let admission = Arc::new(RecordingAdmission::default());
+        let hook: Arc<dyn reqwest::ConnectionAdmission> = admission.clone();
+        let client = reqwest::Client::builder()
+            .connection_admission(hook)
+            .build()
+            .expect("client");
+
+        let url = format!("http://{addr}/");
+        for _ in 0..2 {
+            let response = client.get(url.as_str()).send().await.expect("response");
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(response.text().await.expect("body"), "ok");
+        }
+
+        let sockets = admission.sockets.lock().expect("lock");
+        assert_eq!(
+            sockets.len(),
+            1,
+            "established must fire exactly once per NEW physical connection; \
+             two requests over one pooled connection dial once"
+        );
+        // The reported descriptor is THIS connection's socket, not an arbitrary
+        // open fd: its peer is the backend the client dialed.
+        let probe = std::net::TcpStream::from(
+            sockets[0]
+                .try_clone()
+                .expect("duplicate the reported descriptor"),
+        );
+        assert_eq!(
+            probe.peer_addr().expect("peer address").port(),
+            addr.port(),
+            "established reported a descriptor that is not the dialed backend socket"
+        );
+        // And it is still the socket the gateway would sample: a send-queue
+        // query against it must be answerable on a supported target.
+        if ferrum_edge::_test_support::send_queue_probe_supported() {
+            assert!(
+                ferrum_edge::_test_support::raw_fd_send_queue_bytes(probe.as_raw_fd()).is_some(),
+                "the reported descriptor must answer a send-queue query"
+            );
+        }
+    }
 }

@@ -118,6 +118,36 @@ impl BackendSocketHandle {
         None
     }
 
+    /// [`duplicate_from`](Self::duplicate_from) for a socket the gateway only
+    /// ever sees as a raw descriptor (issue #4411): the bundled HTTP client
+    /// reports its newly dialed backend socket to
+    /// [`crate::backend_conn_limit::ReqwestConnectionAdmission`] as an
+    /// `AsRawFd` value, never as a `TcpStream` it hands over.
+    ///
+    /// The descriptor is duplicated here, inside the reporting call, exactly as
+    /// [`duplicate_from`](Self::duplicate_from) duplicates an owned stream — so
+    /// nothing outside this call ever holds a bare fd number that the owning
+    /// transport could close and the kernel could recycle.
+    ///
+    /// # Safety contract
+    ///
+    /// `fd` must be open for the duration of this call. The vendored reqwest
+    /// hook guarantees that: it reports the descriptor after the dial resolved
+    /// and before the connection object is handed to hyper, with the connection
+    /// (and therefore the socket) alive and owned by the connector.
+    #[cfg(unix)]
+    pub fn duplicate_from_raw_fd(fd: std::os::fd::RawFd) -> Option<Arc<Self>> {
+        if !crate::socket_opts::send_queue_probe_supported() {
+            return None;
+        }
+        // SAFETY: see the safety contract above — the caller reports a
+        // descriptor its own live connection owns, and the borrow does not
+        // escape this expression.
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+        let fd = borrowed.try_clone_to_owned().ok()?;
+        Some(Arc::new(Self { fd }))
+    }
+
     /// Current send-queue depth in bytes, or `None` when the kernel refuses to
     /// answer (closed socket, unsupported platform).
     #[cfg(unix)]
@@ -232,6 +262,181 @@ pub(crate) async fn await_send_queue_stall(
             SendQueueVerdict::Drained => return false,
             SendQueueVerdict::Progressing => {}
             SendQueueVerdict::Stalled => return true,
+        }
+    }
+}
+
+// ── The bundled HTTP client's backend socket (issue #4411) ──────────────────
+//
+// Every other backend transport constructs its own `TcpStream`, so its
+// dispatcher can publish a [`BackendSocketHandle`] directly into the pump's
+// slot. The bundled HTTP client owns and hides its socket pool: the gateway
+// learns about a socket only through the vendored connection-admission hook
+// (`docs/upstream-reqwest-patches/004-connection-established-fd/`), which fires
+// deep inside the connector — with no reference to the request that caused the
+// dial.
+//
+// A task-local closes that gap without a registry. The connector is polled by
+// the very task that is awaiting this request's dispatch future, so scoping the
+// pump's slot around that future makes "the connection this request dialed" the
+// only thing the hook can publish into. It cannot mis-attribute: a task that
+// dialed nothing publishes nothing, and the slot is write-once.
+//
+// A request served on an ALREADY-POOLED connection dials nothing and therefore
+// arms no drain bound — `backend_read_timeout_ms` governs it, exactly as before
+// #4411. That is a residual, not a hole in the reported failure mode: a
+// connection whose send queue is stalled never completes its request, so it is
+// never returned to the idle pool, so every request against a backend that
+// accepts and never reads dials a fresh socket. It is documented next to
+// `backend_write_timeout_ms` in `docs/configuration.md`.
+tokio::task_local! {
+    static REQWEST_BACKEND_SOCKET: BackendSocketSlot;
+}
+
+/// Poll an already-pinned dispatch future with `slot` armed as the task-local
+/// destination for any backend socket the bundled HTTP client dials during
+/// that poll.
+///
+/// Borrows the future instead of owning it. The dispatch futures this wraps
+/// are the largest state machines in the gateway, and an HTTP/3 → plain
+/// dispatch overflowed a 2 MiB worker stack on hosted runners once it was
+/// routed through an `async fn` and a by-value `TaskLocalFuture` (two more
+/// whole-future copies in a debug build). The caller pins the future exactly
+/// once, as it did before issue #4411, and this adapter adds one pointer and
+/// one `Arc` clone per poll.
+pub(crate) struct ReqwestBackendSocketScope<'a, F> {
+    future: std::pin::Pin<&'a mut F>,
+    slot: BackendSocketSlot,
+}
+
+impl<'a, F> ReqwestBackendSocketScope<'a, F> {
+    pub(crate) fn new(future: std::pin::Pin<&'a mut F>, slot: BackendSocketSlot) -> Self {
+        Self { future, slot }
+    }
+}
+
+impl<F> std::future::Future for ReqwestBackendSocketScope<'_, F>
+where
+    F: std::future::Future,
+{
+    type Output = F::Output;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        // `Pin<&mut F>` and `Arc` are both `Unpin`, so this projection is a
+        // plain reborrow.
+        let this = &mut *self;
+        let slot = Arc::clone(&this.slot);
+        REQWEST_BACKEND_SOCKET.sync_scope(slot, || this.future.as_mut().poll(cx))
+    }
+}
+
+/// Publish a newly dialed backend socket into the slot the current dispatch
+/// armed, duplicating the descriptor first.
+///
+/// A no-op outside an armed dispatch (warmup dials, admin-side clients, a
+/// request with no upload pump) and for a slot that is already filled.
+#[cfg(unix)]
+pub(crate) fn publish_reqwest_backend_socket(fd: std::os::fd::RawFd) {
+    diagnostics::bump(&diagnostics::ESTABLISHED_REPORTS);
+    let published = REQWEST_BACKEND_SOCKET.try_with(|slot| {
+        if slot.get().is_some() {
+            diagnostics::bump(&diagnostics::SLOT_ALREADY_FILLED);
+            return;
+        }
+        match BackendSocketHandle::duplicate_from_raw_fd(fd) {
+            Some(handle) => {
+                let _ = slot.set(handle);
+                diagnostics::bump(&diagnostics::SOCKET_PUBLISHED);
+            }
+            None => diagnostics::bump(&diagnostics::SOCKET_DUP_FAILED),
+        }
+    });
+    if published.is_err() {
+        diagnostics::bump(&diagnostics::ESTABLISHED_OUT_OF_SCOPE);
+    }
+}
+
+/// Debug-build counters for every link of the bundled-client socket handoff
+/// and the post-EOS drain judgment (issue #4411).
+///
+/// Compiled to no-ops in release builds. Read through
+/// `_test_support::post_eos_drain_diagnostics`, so an in-process acceptance
+/// test that misses the drain bound can say WHICH link never happened instead
+/// of only reporting the elapsed time.
+///
+/// `#[allow(dead_code)]`: the snapshot side is reached only through
+/// `_test_support`, and the binary target recompiles this module without the
+/// test crates that call it.
+#[allow(dead_code)]
+pub(crate) mod diagnostics {
+    #[cfg(debug_assertions)]
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[cfg(debug_assertions)]
+    pub(crate) struct Counter {
+        pub(crate) name: &'static str,
+        value: AtomicU64,
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub(crate) struct Counter;
+
+    #[cfg(debug_assertions)]
+    macro_rules! counters {
+        ($($name:ident),* $(,)?) => {
+            $(pub(crate) static $name: Counter = Counter {
+                name: stringify!($name),
+                value: AtomicU64::new(0),
+            };)*
+            static ALL: &[&Counter] = &[$(&$name),*];
+        };
+    }
+
+    #[cfg(not(debug_assertions))]
+    macro_rules! counters {
+        ($($name:ident),* $(,)?) => {
+            $(pub(crate) static $name: Counter = Counter;)*
+        };
+    }
+
+    counters!(
+        ESTABLISHED_REPORTS,
+        ESTABLISHED_OUT_OF_SCOPE,
+        SLOT_ALREADY_FILLED,
+        SOCKET_PUBLISHED,
+        SOCKET_DUP_FAILED,
+        POST_EOS_NOT_COMPLETED,
+        POST_EOS_UNARMED,
+        POST_EOS_NO_SOCKET,
+        POST_EOS_WATCHED,
+        POST_EOS_CANCELLED,
+        POST_EOS_NOT_STALLED,
+        POST_EOS_STALLED,
+    );
+
+    #[inline]
+    pub(crate) fn bump(counter: &Counter) {
+        #[cfg(debug_assertions)]
+        counter.value.fetch_add(1, Ordering::Relaxed);
+        #[cfg(not(debug_assertions))]
+        let _ = counter;
+    }
+
+    /// Every counter's current value, in declaration order. Empty in release
+    /// builds.
+    pub(crate) fn snapshot() -> Vec<(&'static str, u64)> {
+        #[cfg(debug_assertions)]
+        {
+            ALL.iter()
+                .map(|counter| (counter.name, counter.value.load(Ordering::Relaxed)))
+                .collect()
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            Vec::new()
         }
     }
 }

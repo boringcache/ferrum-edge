@@ -10051,6 +10051,23 @@ pub mod _test_support {
         crate::socket_opts::send_queue_probe_supported()
     }
 
+    /// Debug-build counters for every link of the bundled HTTP client's
+    /// socket handoff and the upload pump's post-EOS drain judgment (issue
+    /// #4411), so an acceptance test that misses the drain bound can report
+    /// which link never happened. Empty in release builds.
+    pub fn post_eos_drain_diagnostics() -> Vec<(&'static str, u64)> {
+        crate::proxy::backend_send_queue::diagnostics::snapshot()
+    }
+
+    /// Send-queue depth of a raw descriptor, through the same handle the
+    /// bundled HTTP client's dispatch path builds from vendored reqwest patch
+    /// 004's `established` callback (issue #4411).
+    #[cfg(unix)]
+    pub fn raw_fd_send_queue_bytes(fd: std::os::fd::RawFd) -> Option<u64> {
+        crate::proxy::backend_send_queue::BackendSocketHandle::duplicate_from_raw_fd(fd)?
+            .send_queue_bytes()
+    }
+
     /// Watch a live socket's send queue exactly as the upload pump does after a
     /// clean EOS. `true` means the drain stalled for the whole watermark.
     pub async fn await_backend_send_queue_stall(

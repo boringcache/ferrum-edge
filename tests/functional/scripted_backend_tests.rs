@@ -1869,6 +1869,80 @@ async fn h1_backend_write_timeout_maps_to_504_backend_timeout() {
     );
 }
 
+// #4411: the issue's own reproduction, on the bundled HTTP client's HTTP/1.1
+// backend path. 2 MiB with no receive-window pin fits inside the loopback send
+// buffer plus the never-reading peer's initial receive window, so the upload
+// pump reaches a clean EOS with no bridge backpressure and the pre-EOS idle arm
+// can never fire. Only the post-EOS send-queue drain bound produces the 504,
+// and on this path only because vendored reqwest patch 004 reports the dialed
+// socket (`docs/upstream-reqwest-patches/004-connection-established-fd/`).
+const KERNEL_ABSORB_UPLOAD_BYTES: usize = 2 * 1024 * 1024;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h1_kernel_absorb_write_timeout_maps_to_504_backend_timeout() {
+    if !ferrum_edge::_test_support::send_queue_probe_supported() {
+        // No send-queue query on this target; `backend_read_timeout_ms` is the
+        // only bound, as documented next to `backend_write_timeout_ms`.
+        return;
+    }
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
+        .step(TcpStep::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn");
+
+    let write_timeout_ms: u64 = 800;
+    let yaml = file_mode_yaml_with_timeouts_and_access_log(backend_port, 8_000, write_timeout_ms);
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = harness.http_client().expect("client");
+    let started = Instant::now();
+    let resp = client
+        .as_reqwest()
+        .post(harness.proxy_url("/api/twrite"))
+        .header("content-type", "application/octet-stream")
+        .header("expect", "")
+        .body(vec![b'x'; KERNEL_ABSORB_UPLOAD_BYTES])
+        .send()
+        .await
+        .expect("gateway returns a response");
+    let elapsed = started.elapsed();
+    let status = resp.status();
+    let gateway_error = resp
+        .headers()
+        .get("x-gateway-error")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = resp.text().await.expect("body");
+
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "kernel-absorbed never-read POST must be 504, got {status} body={body}"
+    );
+    assert_eq!(
+        gateway_error.as_deref(),
+        Some("backend_timeout"),
+        "timeout must carry X-Gateway-Error=backend_timeout, body={body}"
+    );
+    assert_eq!(body, r#"{"error":"Backend timeout"}"#);
+    assert_timeout_envelope(elapsed, write_timeout_ms);
+
+    let logs = collect_read_write_timeout_logs(&harness).await;
+    assert!(
+        has_read_write_timeout_class(&logs),
+        "write timeout must classify as read_write_timeout; logs:\n{logs}"
+    );
+}
+
 // #4057: SSE headers + one event + stall. Headers are already committed, so
 // the client sees 200 then an abort near the idle read watermark. Access log
 // must be `body_error_class=read_write_timeout`, not `request_error`.
