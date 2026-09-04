@@ -18877,6 +18877,7 @@ mod build_h3_backend_headers_tests {
     fn minimal_proxy_state() -> ProxyState {
         let dns_cache = DnsCache::new(DnsConfig::default());
         let config = GatewayConfig {
+            quarantined_plugin_configs: Vec::new(),
             version: "1".to_string(),
             proxies: vec![],
             consumers: vec![],

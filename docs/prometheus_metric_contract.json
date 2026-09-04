@@ -2465,6 +2465,21 @@
     "emission": "when_process_initialized"
   },
   {
+    "name": "ferrum_mesh_app_probe_total",
+    "type": "counter",
+    "help": "Rewritten kubelet application probes performed by the sidecar against the application over loopback, by bounded outcome.",
+    "labels": [
+      "container",
+      "probe",
+      "outcome",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_app_probe",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_mesh_bpf_accept_to_first_byte_microseconds",
     "type": "histogram",
     "help": "Time from captured TCP passive-established accept to the first inbound application-data byte on the same accepted socket, in microseconds. Missing, raced, stale, reversed, or corrupt correlation evidence emits no sample; fixed le buckets plus sum/count; sum overflow or counter saturation drops the sample.",

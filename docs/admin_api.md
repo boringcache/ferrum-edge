@@ -156,6 +156,8 @@ diagnosable.
 
 In database **and control-plane** mode, if a **full** config load is rejected by the runtime-config validation contract (a reachable backend served a semantically-invalid snapshot — e.g. a partial/direct-DB write) **or by typed SQL row decoding** (a reachable backend served an undecodable row — e.g. malformed JSON in a column) the gateway keeps serving the last known-good config **and keeps the admin API writable**: `db_available` stays true because admin writes are the in-band repair path for the offending resource. Re-enabling writes is gated on any deferred schema migration applying first, so a reachable backend whose schema is still pending keeps writes blocked while `config_rejected` stays set. The rejection also skips failover (the same invalid snapshot lives on every replica). The authenticated `/health` detail then carries `config_rejected: true` and `status: "degraded"` (the boolean detail is authenticated-only; the coarse `degraded` status is also visible unauthenticated). The flag is sticky and clears only after an accepted authoritative **full** reload (an accepted incremental poll does not clear it). While the backend is later unreachable (`admin_writes_enabled` false) the `config_rejected` detail is suppressed so it never advertises the writable repair path during an outage, even though the underlying flag remains set. A genuine connectivity failure is unaffected and still flips `admin_writes_enabled` to false. Startup still fails loudly for undecodable rows (backup bootstrap is not eligible), matching the non-transient decode policy.
 
+In **database** mode a stored `plugin_configs` row that the shared plugin **construction** gate refuses (unknown key, bad regex, out-of-range value, unknown/retired plugin name) is **quarantined** rather than fatal: the serving-mode full load drops that row, logs one `error!` naming the plugin, its config id, and the constructor error, omits it from the plugin cache, and raises `config_rejected`. The process therefore reaches its admin listener with the offending row still visible through `GET /plugins` and deletable through `DELETE /plugins/{id}`, which is the in-band repair path. `config_rejected` is *not* cleared by a later accepted reload that still had to quarantine a row. Control-plane mode does the opposite and **rejects** such a snapshot outright, so an unconstructible plugin config is never broadcast to the data-plane fleet (`OptionalFailOpen` plugins are exempt in both modes — a serving mode omits them with a warning rather than refusing the generation).
+
 In **file** mode, if a SIGHUP reload candidate fails read, parse, validation, or apply, the gateway likewise keeps serving the last known-good config and raises the same `config_rejected` signal: authenticated `/health` reports `config_rejected: true` with `status: "degraded"` (boolean detail authenticated-only; coarse `degraded` also visible unauthenticated). File-mode admin stays read-only; operators repair by fixing the config file and reloading. The flag clears on the next Applied or Unchanged reload.
 
 In **CP, DP, and mesh modes**, if a supervised serving-listener task exits with an error *after* the gateway became ready (the CP gRPC server; a DP proxy/admin HTTP/HTTPS/H3 listener; or a mesh traffic/admin listener), `/health` returns 503 with `status: "unavailable"` and `ready: false`. The same sticky path applies in **CP mode** when the database config poll task exits unexpectedly (abort/unexpected completion — not ordinary shutdown). A Rust panic in a shipping build (`panic = "abort"`, issue #4166) terminates the process before this signal can be set; operators restart via a process supervisor. This is a **sticky** signal: it is set once and never cleared, so it survives a later readiness restore. Mesh authenticated `/health`/`/status` and `/overload` responses include `listener_failures` with `failures_total` and per-listener `listener`, `listen_port`, `kind`, and a deliberately sanitized `error`; raw error strings are not retained. Unauthenticated health/status responses remain exactly `status` plus `ready`, and unauthenticated overload remains `{level}`.
@@ -800,6 +802,32 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   http://localhost:9000/plugins/config
 ```
 
+### Proxy-scoped configs attach the proxy association
+
+A proxy-scoped plugin applies only when the target proxy lists it in `plugins`;
+`proxy_id` alone never attaches it (see `docs/plugins.md` → Scope). In
+**database mode** the Admin API keeps the two surfaces in step, atomically:
+
+| Write | Effect on `proxies[].plugins` |
+| --- | --- |
+| `POST /plugins/config` with `scope: "proxy"`, `proxy_id: P` | appends `{"plugin_config_id": "<id>"}` to `P` (idempotent) |
+| `PUT /plugins/config/{id}` moving `proxy_id` from `P1` to `P2` | removes it from `P1`, adds it to `P2` |
+| `PUT /plugins/config/{id}` changing `scope` to `global` | removes the stale association |
+| `DELETE /plugins/config/{id}` | removes it from every proxy that lists it |
+
+The plugin-config row and the association commit in one transaction, and every
+touched proxy's `updated_at` advances so the next poll / control-plane
+broadcast republishes it. `GET /proxies/{id}` is therefore authoritative: a
+`201` from `POST /plugins/config` means *attached*, not merely created. A
+`proxy_id` that does not exist in the request's namespace is rejected with
+`400 {"error":"proxy_id '<P>' does not exist in namespace '<ns>'"}` and nothing
+is persisted, as before.
+
+`scope: "proxy_group"` associations are unaffected — they are operator-managed
+through `PUT /proxies/{id}` and stay valid for any proxy in the namespace. File
+mode is unchanged: the configuration file's association arrays are the only
+attachment surface there.
+
 Disabled plugin configs are stored without plugin-specific construction, so operators can stage configuration before runtime-only prerequisites are present. For example, `basic_auth` may be created or imported with `enabled: false` before `FERRUM_BASIC_AUTH_HMAC_SECRET` is provisioned. Enabling the config performs normal construction and fails closed unless the secret is present and at least 32 bytes.
 
 Plugin-config reads by `viewer` and `operator` roles use the same redacted projection stored in admin audit diffs; `admin` reads remain raw.
@@ -1328,7 +1356,7 @@ Returns the connection status to the Control Plane:
 - **`status`**: `online` when the gRPC stream to the CP is active, `offline` when disconnected (e.g., CP is down, DP is in backoff retry).
 - **`is_primary`**: `true` when connected to the primary (first) CP URL, `false` when connected to a fallback CP (multi-CP failover).
 - **`last_config_received_at`**: Timestamp of the last successfully *accepted* config update (full snapshot or delta) from the CP. Rejected resource deltas do not advance this stamp. `null` if no config has been accepted yet.
-- **`config_diverged`**: Sticky operator signal set when a non-empty ConfigSync DELTA is rejected. Cleared only after an authoritative FULL_SNAPSHOT is accepted. Last-known-good config continues to serve while `true`.
+- **`config_diverged`**: Sticky operator signal set when a non-empty ConfigSync DELTA is rejected, or when an admitted FULL_SNAPSHOT fails to apply (most commonly a plugin config this data plane cannot construct — the DP logs the plugin name, config id, and constructor error). Cleared only after an authoritative FULL_SNAPSHOT is accepted. Last-known-good config continues to serve while `true`. `ConfigSync.Subscribe` is server-streaming with no client acknowledgement, so this DP-side field is the in-band signal that a data plane is frozen; the CP's `last_sync_at` only records that the CP *sent* an update.
 - **`config_diverged_since`**: When sticky divergence was first raised (`null` when not diverged).
 - **`config_divergence_recoveries_total`**: Count of divergence → FULL_SNAPSHOT recovery transitions.
 

@@ -2207,6 +2207,14 @@ pub mod _test_support {
         crate::config::validation_pipeline::collect_rejecting_runtime_config_errors(config)
     }
 
+    /// Drop every enabled plugin config the shared construction gate refuses,
+    /// returning the operator-facing rejection messages (issue #4526).
+    pub fn quarantine_unconstructible_plugin_configs_for_test(
+        config: &mut crate::config::types::GatewayConfig,
+    ) -> Vec<String> {
+        crate::config::validation_pipeline::quarantine_unconstructible_plugin_configs(config)
+    }
+
     pub async fn lock_namespace_config_admission_for_test(
         namespace: &str,
     ) -> tokio::sync::MutexGuard<'static, ()> {
@@ -3337,6 +3345,12 @@ pub mod _test_support {
     // ── proxy/tcp_proxy ──────────────────────────────────────────────────────
     pub fn classify_stream_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
         crate::proxy::tcp_proxy::classify_stream_error(error)
+    }
+
+    /// The pre-copy (setup-phase) stream classifier the TCP accept loop uses
+    /// for DNS / dial / handshake / plugin-reject failures (issue #4536).
+    pub fn classify_stream_setup_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
+        crate::proxy::tcp_proxy::classify_stream_setup_error(error)
     }
 
     /// Production typed emit for an opaque-TLS SNI peek refusal (issue #4407).

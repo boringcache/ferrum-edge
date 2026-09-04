@@ -53,6 +53,21 @@ pub(crate) fn classify_stream_error(error: &anyhow::Error) -> crate::retry::Erro
     crate::retry::classify_boxed_error(error.as_ref())
 }
 
+/// Classify a stream failure raised **before** any byte was relayed — DNS,
+/// the backend dial, the backend TLS/DTLS handshake, a plugin reject.
+///
+/// The connect phase is knowledge the CALL SITE has and the error value does
+/// not (issue #4536), so this hands `phase_is_connect = true` to the shared
+/// classifier. That keeps a raw-TCP `ECONNREFUSED` / connect RST / dial
+/// `EADDRNOTAVAIL` / backend-TLS rustls failure pre-wire — nothing reached the
+/// backend's application layer, so `retry_on_connect_failure` may replay and
+/// the disconnect cause stays a connect failure. Every other
+/// `classify_stream_error` call site is inside the copy loop, where the same
+/// signals are genuinely ambiguous and must stay post-wire.
+pub(crate) fn classify_stream_setup_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
+    crate::retry::classify_boxed_setup_error(error.as_ref())
+}
+
 const NODE_WAYPOINT_IDENTITY_WARN_WINDOW_MS: u64 = 60_000;
 const NODE_WAYPOINT_IDENTITY_WARN_UNSET_MS: u64 = u64::MAX;
 
@@ -2867,9 +2882,12 @@ async fn run_tcp_accept_loop(
                                 "TCP connection error"
                             );
                             let error_message = e.to_string();
-                            let err_class = classify_stream_error(e);
+                            let err_class = classify_stream_setup_error(e);
                             // Pre-copy error (DNS, connect, plugin reject, TLS
-                            // handshake). No bytes flowed; the typed
+                            // handshake). No bytes flowed, so the SETUP-phase
+                            // classifier is used: the phase is call-site
+                            // knowledge, never inferred from the error value
+                            // (issue #4536). The typed
                             // `StreamSetupError` (when present in the chain)
                             // resolves which side failed without inspecting
                             // the message string. Direction is derived from

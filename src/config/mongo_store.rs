@@ -943,6 +943,72 @@ mod inner {
         pub while_holding: Option<MongoReconnectTransitionHook>,
     }
 
+    /// Mirror the junction reconciliation onto an admission candidate so the
+    /// graph validated before a proxy-scoped plugin write is the graph the
+    /// write actually commits (issue #4611).
+    fn apply_proxy_association_to_candidate(candidate: &mut GatewayConfig, pc: &PluginConfig) {
+        if pc.scope == PluginScope::ProxyGroup {
+            return;
+        }
+        let desired = match pc.scope {
+            PluginScope::Proxy => pc.proxy_id.as_deref(),
+            _ => None,
+        };
+        for proxy in &mut candidate.proxies {
+            if proxy.namespace != pc.namespace {
+                continue;
+            }
+            let should_have = desired == Some(proxy.id.as_str());
+            let has = proxy
+                .plugins
+                .iter()
+                .any(|association| association.plugin_config_id == pc.id);
+            if should_have && !has {
+                proxy.plugins.push(PluginAssociation {
+                    plugin_config_id: pc.id.clone(),
+                });
+            } else if !should_have && has {
+                proxy
+                    .plugins
+                    .retain(|association| association.plugin_config_id != pc.id);
+            }
+        }
+    }
+
+    /// Proxies needing a `config_changes` row for a plugin-config write: every
+    /// proxy whose association set moved, plus the proxy-scoped target itself
+    /// (recorded unconditionally, as before, so an otherwise no-op re-write
+    /// still republishes the proxy that applies the config).
+    fn plugin_config_touched_proxies(
+        pc: &PluginConfig,
+        plan: &ProxyAssociationPlan,
+    ) -> Vec<String> {
+        let mut touched = plan.touched.clone();
+        if pc.scope == PluginScope::Proxy
+            && let Some(proxy_id) = pc.proxy_id.as_deref()
+            && !touched.iter().any(|current| current.as_str() == proxy_id)
+        {
+            touched.push(proxy_id.to_string());
+        }
+        touched
+    }
+
+    /// The proxy-association reconciliation a proxy-scoped plugin-config write
+    /// must perform alongside the `plugin_configs` document (issue #4611).
+    ///
+    /// Computed before the mutation so the transaction (or the standalone
+    /// sequence) knows exactly which proxies change and which need a
+    /// `config_changes` row.
+    #[derive(Clone, Default)]
+    struct ProxyAssociationPlan {
+        /// The proxy that must gain the association, if it does not have it.
+        attach: Option<String>,
+        /// Proxies whose association is no longer valid for this config.
+        detach: Vec<String>,
+        /// `detach` plus `attach` — every proxy whose plugin set changes.
+        touched: Vec<String>,
+    }
+
     #[derive(Clone)]
     pub struct MongoStore {
         // The live client, database handle, and any generated TLS PEM paths.
@@ -3353,6 +3419,204 @@ mod inner {
             }
 
             Ok(())
+        }
+
+        /// Plan the proxy-association reconciliation for a proxy-scoped plugin
+        /// config write (issue #4611).
+        ///
+        /// `scope: "proxy"` + `proxy_id` is the operator's attachment intent,
+        /// but the runtime only applies a config the proxy lists in its
+        /// `plugins` array (`docs/plugins.md`), so both sides must move
+        /// together. Validity drives the plan, which also re-homes a moved
+        /// `proxy_id`:
+        /// - `proxy` — the only valid association is `proxy_id`; any other is
+        ///   config `GatewayConfig::validate` rejects, so it is pulled.
+        /// - `global` — a global config must not be associated with a proxy.
+        /// - `proxy_group` — associations are operator-managed via
+        ///   `proxy.plugins` and any proxy may reference the config, so
+        ///   existing ones are left alone.
+        ///
+        /// The plan is computed before the mutation so the transaction (or the
+        /// standalone sequence) has the exact set of proxies to touch and to
+        /// record `config_changes` rows for.
+        async fn plan_proxy_scoped_plugin_association(
+            &self,
+            pc: &PluginConfig,
+        ) -> Result<ProxyAssociationPlan, anyhow::Error> {
+            if pc.scope == PluginScope::ProxyGroup {
+                return Ok(ProxyAssociationPlan::default());
+            }
+            let desired = match pc.scope {
+                PluginScope::Proxy => pc.proxy_id.clone(),
+                _ => None,
+            };
+
+            let mut attached = Vec::new();
+            let mut cursor = self
+                .proxies()
+                .find(doc! {
+                    "namespace": &pc.namespace,
+                    "plugins.plugin_config_id": &pc.id,
+                })
+                .projection(doc! { "_id": 1 })
+                .await?;
+            while cursor.advance().await? {
+                let doc = cursor.deserialize_current()?;
+                // Every association-bearing proxy must decode: silently
+                // skipping one would leave an invalid association behind while
+                // the write reported success.
+                let proxy_id = doc.get_str("_id").map_err(|error| {
+                    anyhow::anyhow!(
+                        "operation=plan_proxy_scoped_plugin_association resource=proxies field=_id: failed to decode proxy holding the plugin association: {error}"
+                    )
+                })?;
+                attached.push(proxy_id.to_string());
+            }
+
+            let detach: Vec<String> = attached
+                .iter()
+                .filter(|proxy_id| desired.as_deref() != Some(proxy_id.as_str()))
+                .cloned()
+                .collect();
+            let attach = desired.filter(|desired| {
+                !attached
+                    .iter()
+                    .any(|current| current.as_str() == desired.as_str())
+            });
+            let mut touched = detach.clone();
+            touched.extend(attach.clone());
+            Ok(ProxyAssociationPlan {
+                attach,
+                detach,
+                touched,
+            })
+        }
+
+        /// Apply a [`ProxyAssociationPlan`] inside a replica-set transaction.
+        async fn apply_proxy_association_plan_in_session(
+            &self,
+            session: &mut ClientSession,
+            namespace: &str,
+            plugin_config_id: &str,
+            plan: &ProxyAssociationPlan,
+        ) -> mongodb::error::Result<()> {
+            if !plan.detach.is_empty() {
+                self.proxies()
+                    .update_many(
+                        doc! {
+                            "_id": { "$in": plan.detach.clone() },
+                            "namespace": namespace,
+                        },
+                        doc! {
+                            "$pull": { "plugins": { "plugin_config_id": plugin_config_id } },
+                            "$set": { "updated_at": Utc::now().to_rfc3339() },
+                        },
+                    )
+                    .session(&mut *session)
+                    .await?;
+            }
+            if let Some(attach) = plan.attach.as_deref() {
+                self.proxies()
+                    .update_one(
+                        doc! { "_id": attach, "namespace": namespace },
+                        doc! {
+                            "$push": { "plugins": { "plugin_config_id": plugin_config_id } },
+                            "$set": { "updated_at": Utc::now().to_rfc3339() },
+                        },
+                    )
+                    .session(&mut *session)
+                    .await?;
+            }
+            Ok(())
+        }
+
+        /// Apply a [`ProxyAssociationPlan`] on a standalone deployment, where
+        /// no multi-document transaction is available; the caller compensates
+        /// the plugin-config document if this fails, matching the surrounding
+        /// standalone write paths.
+        async fn apply_proxy_association_plan(
+            &self,
+            namespace: &str,
+            plugin_config_id: &str,
+            plan: &ProxyAssociationPlan,
+        ) -> Result<(), anyhow::Error> {
+            if !plan.detach.is_empty() {
+                self.proxies()
+                    .update_many(
+                        doc! {
+                            "_id": { "$in": plan.detach.clone() },
+                            "namespace": namespace,
+                        },
+                        doc! {
+                            "$pull": { "plugins": { "plugin_config_id": plugin_config_id } },
+                            "$set": { "updated_at": Utc::now().to_rfc3339() },
+                        },
+                    )
+                    .await?;
+            }
+            if let Some(attach) = plan.attach.as_deref() {
+                self.proxies()
+                    .update_one(
+                        doc! { "_id": attach, "namespace": namespace },
+                        doc! {
+                            "$push": { "plugins": { "plugin_config_id": plugin_config_id } },
+                            "$set": { "updated_at": Utc::now().to_rfc3339() },
+                        },
+                    )
+                    .await?;
+            }
+            Ok(())
+        }
+
+        /// Best-effort inverse of [`Self::apply_proxy_association_plan`] for a
+        /// standalone deployment whose follow-up failed after the plan was
+        /// applied (issue #4611). The caller rolls the plugin-config document
+        /// back; this puts the junction back to match it, so a loader never
+        /// sees a proxy referencing a config that no longer exists or no
+        /// longer targets it. Failures are logged, not returned: the original
+        /// error is what the caller reports, and the association is then a
+        /// hand repair like every other standalone partial write.
+        async fn compensate_proxy_association_plan(
+            &self,
+            namespace: &str,
+            plugin_config_id: &str,
+            plan: &ProxyAssociationPlan,
+        ) {
+            if let Some(attach) = plan.attach.as_deref() {
+                let result = self
+                    .proxies()
+                    .update_one(
+                        doc! { "_id": attach, "namespace": namespace },
+                        doc! {
+                            "$pull": { "plugins": { "plugin_config_id": plugin_config_id } },
+                            "$set": { "updated_at": Utc::now().to_rfc3339() },
+                        },
+                    )
+                    .await;
+                if let Err(error) = result {
+                    warn!(
+                        "standalone plugin-config write failed after attaching the proxy association and the compensating detach also failed (namespace={namespace} plugin_config_id={plugin_config_id} proxy_id={attach}): {error}; repair the proxy's `plugins` array by hand"
+                    );
+                }
+            }
+            if !plan.detach.is_empty() {
+                let result = self
+                    .proxies()
+                    .update_many(
+                        doc! { "_id": { "$in": plan.detach.clone() }, "namespace": namespace },
+                        doc! {
+                            "$addToSet": { "plugins": { "plugin_config_id": plugin_config_id } },
+                            "$set": { "updated_at": Utc::now().to_rfc3339() },
+                        },
+                    )
+                    .await;
+                if let Err(error) = result {
+                    warn!(
+                        "standalone plugin-config write failed after detaching proxy associations and the compensating re-attach also failed (namespace={namespace} plugin_config_id={plugin_config_id} proxies={:?}): {error}; repair those proxies' `plugins` arrays by hand",
+                        plan.detach
+                    );
+                }
+            }
         }
 
         async fn record_config_change_in_session(
@@ -7881,6 +8145,33 @@ mod inner {
                 error!("MongoDB config: {}", message);
             }
 
+            // Serving-mode repairability (issue #4526), parity with the SQL
+            // loader: quarantine stored plugin rows the shared construction
+            // gate refuses so `database` mode still reaches its admin listener
+            // and the offending row stays deletable in-band. CP loads keep
+            // rejecting so an unconstructible row is never broadcast.
+            if matches!(purpose, FullConfigLoadPurpose::Runtime) {
+                let quarantined =
+                    crate::config::validation_pipeline::quarantine_unconstructible_plugin_configs(
+                        &mut config,
+                    );
+                for message in &quarantined {
+                    error!(
+                        "MongoDB config: quarantined unconstructible plugin config — {}",
+                        message
+                    );
+                }
+                if !quarantined.is_empty() {
+                    error!(
+                        "Quarantined {} plugin config(s) during full config load; serving \
+                         without them and publishing config_rejected so they can be repaired \
+                         through the admin API",
+                        quarantined.len()
+                    );
+                }
+                config.quarantined_plugin_configs = quarantined;
+            }
+
             // Mongo does not run the SQL-side `ValidationPipeline`, but full
             // runtime loads must still fail closed on the same rejecting
             // validation contract used by SQL loads and CP updates. This
@@ -9883,29 +10174,43 @@ mod inner {
                 } else {
                     candidate.plugin_configs.push(pc.clone());
                 }
+                apply_proxy_association_to_candidate(candidate, pc);
             })
             .await?;
             let doc = plugin_config_to_doc(pc)?;
+            // The junction reconciliation is planned before the mutation so
+            // the transaction knows exactly which proxies move (issue #4611).
+            let plan = self.plan_proxy_scoped_plugin_association(pc).await?;
+            let touched_proxies = plugin_config_touched_proxies(pc, &plan);
             mtls_lease
                 .run_mutation(async {
                     if self.replica_set_configured() {
                         let connection = self.connection();
                         let mut session = connection.client.start_session().await?;
-                        let proxy_id = if pc.scope == PluginScope::Proxy {
-                            pc.proxy_id.clone()
-                        } else {
-                            None
-                        };
                         session
                             .start_transaction()
                             .and_run(
-                                (self, doc, pc.namespace.clone(), pc.id.clone(), proxy_id),
-                                |s, (this, doc, namespace, id, proxy_id)| {
+                                (
+                                    self,
+                                    doc,
+                                    pc.namespace.clone(),
+                                    pc.id.clone(),
+                                    plan.clone(),
+                                    touched_proxies.clone(),
+                                ),
+                                |s, (this, doc, namespace, id, plan, touched_proxies)| {
                                     Box::pin(async move {
                                         this.plugin_configs()
                                             .insert_one(doc.clone())
                                             .session(&mut *s)
                                             .await?;
+                                        this.apply_proxy_association_plan_in_session(
+                                            &mut *s,
+                                            namespace.as_str(),
+                                            id.as_str(),
+                                            plan,
+                                        )
+                                        .await?;
                                         this.record_config_change_in_session(
                                             &mut *s,
                                             namespace.as_str(),
@@ -9914,12 +10219,12 @@ mod inner {
                                             "upsert",
                                         )
                                         .await?;
-                                        if let Some(proxy_id) = proxy_id.as_deref() {
+                                        for proxy_id in touched_proxies.iter() {
                                             this.record_config_change_in_session(
                                                 &mut *s,
                                                 namespace.as_str(),
                                                 "proxy",
-                                                proxy_id,
+                                                proxy_id.as_str(),
                                                 "upsert",
                                             )
                                             .await?;
@@ -9934,26 +10239,36 @@ mod inner {
                         self.compact_config_changes_best_effort(&pc.namespace).await;
                     } else {
                         self.plugin_configs().insert_one(doc).await?;
-                        if let Err(err) = self
-                            .record_config_change(&pc.namespace, "plugin_config", &pc.id, "upsert")
-                            .await
-                        {
-                            self.rollback_standalone_created_document(
-                                "plugin_configs",
+                        let followup: Result<(), anyhow::Error> = async {
+                            // Attach before the change records: a standalone
+                            // deployment has no transaction, so the association
+                            // — the part the runtime reads — is written while
+                            // the plugin-config document can still be rolled
+                            // back.
+                            self.apply_proxy_association_plan(&pc.namespace, &pc.id, &plan)
+                                .await?;
+                            self.record_config_change(
                                 &pc.namespace,
                                 "plugin_config",
                                 &pc.id,
-                                &err,
+                                "upsert",
                             )
-                            .await;
-                            return Err(err);
+                            .await?;
+                            for proxy_id in &touched_proxies {
+                                self.record_config_change(
+                                    &pc.namespace,
+                                    "proxy",
+                                    proxy_id.as_str(),
+                                    "upsert",
+                                )
+                                .await?;
+                            }
+                            Ok(())
                         }
-                        if pc.scope == PluginScope::Proxy
-                            && let Some(proxy_id) = pc.proxy_id.as_deref()
-                            && let Err(err) = self
-                                .record_config_change(&pc.namespace, "proxy", proxy_id, "upsert")
-                                .await
-                        {
+                        .await;
+                        if let Err(err) = followup {
+                            self.compensate_proxy_association_plan(&pc.namespace, &pc.id, &plan)
+                                .await;
                             self.rollback_standalone_created_document(
                                 "plugin_configs",
                                 &pc.namespace,
@@ -9984,6 +10299,7 @@ mod inner {
                 {
                     *existing = pc.clone();
                 }
+                apply_proxy_association_to_candidate(candidate, pc);
             })
             .await?;
             // Preserve api_spec_id by carrying it into the replacement document.
@@ -10014,21 +10330,29 @@ mod inner {
             if let Some(sid) = existing_spec_id {
                 doc.insert("api_spec_id", sid);
             }
+            // The junction reconciliation is planned before the mutation so the
+            // transaction knows exactly which proxies move (issue #4611). A
+            // `proxy_id` move detaches the old proxy and attaches the new one;
+            // a scope change away from `proxy` detaches the stale association.
+            let plan = self.plan_proxy_scoped_plugin_association(pc).await?;
+            let touched_proxies = plugin_config_touched_proxies(pc, &plan);
             let matched = mtls_lease
                 .run_mutation(async {
                     if self.replica_set_configured() {
                         let connection = self.connection();
                         let mut session = connection.client.start_session().await?;
-                        let proxy_id = if pc.scope == PluginScope::Proxy {
-                            pc.proxy_id.clone()
-                        } else {
-                            None
-                        };
                         let matched = session
                             .start_transaction()
                             .and_run(
-                                (self, doc, pc.namespace.clone(), pc.id.clone(), proxy_id),
-                                |s, (this, doc, namespace, id, proxy_id)| {
+                                (
+                                    self,
+                                    doc,
+                                    pc.namespace.clone(),
+                                    pc.id.clone(),
+                                    plan.clone(),
+                                    touched_proxies.clone(),
+                                ),
+                                |s, (this, doc, namespace, id, plan, touched_proxies)| {
                                     Box::pin(async move {
                                         let replace_result = this
                                             .plugin_configs()
@@ -10046,6 +10370,13 @@ mod inner {
                                             // (DB-M4).
                                             return Ok(false);
                                         }
+                                        this.apply_proxy_association_plan_in_session(
+                                            &mut *s,
+                                            namespace.as_str(),
+                                            id.as_str(),
+                                            plan,
+                                        )
+                                        .await?;
                                         this.record_config_change_in_session(
                                             &mut *s,
                                             namespace.as_str(),
@@ -10054,12 +10385,12 @@ mod inner {
                                             "upsert",
                                         )
                                         .await?;
-                                        if let Some(proxy_id) = proxy_id.as_deref() {
+                                        for proxy_id in touched_proxies.iter() {
                                             this.record_config_change_in_session(
                                                 &mut *s,
                                                 namespace.as_str(),
                                                 "proxy",
-                                                proxy_id,
+                                                proxy_id.as_str(),
                                                 "upsert",
                                             )
                                             .await?;
@@ -10086,6 +10417,12 @@ mod inner {
                             return Ok(false);
                         }
                         let change_result: Result<(), anyhow::Error> = async {
+                            // Attach/detach before the change records: a
+                            // standalone deployment has no transaction, so the
+                            // association the runtime reads is written while the
+                            // plugin-config document can still be rolled back.
+                            self.apply_proxy_association_plan(&pc.namespace, &pc.id, &plan)
+                                .await?;
                             self.record_config_change(
                                 &pc.namespace,
                                 "plugin_config",
@@ -10093,13 +10430,11 @@ mod inner {
                                 "upsert",
                             )
                             .await?;
-                            if pc.scope == PluginScope::Proxy
-                                && let Some(proxy_id) = pc.proxy_id.as_deref()
-                            {
+                            for proxy_id in &touched_proxies {
                                 self.record_config_change(
                                     &pc.namespace,
                                     "proxy",
-                                    proxy_id,
+                                    proxy_id.as_str(),
                                     "upsert",
                                 )
                                 .await?;
@@ -10108,6 +10443,8 @@ mod inner {
                         }
                         .await;
                         if let Err(err) = change_result {
+                            self.compensate_proxy_association_plan(&pc.namespace, &pc.id, &plan)
+                                .await;
                             self.rollback_standalone_updated_document(
                                 "plugin_configs",
                                 "plugin_config",

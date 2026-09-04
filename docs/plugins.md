@@ -32,6 +32,21 @@ Custom plugins are auto-discovered from the `custom_plugins/` directory at build
 
 - **Global** plugins (`scope: "global"`) apply to all proxies automatically. `proxy_id` must be null.
 - **Proxy-scoped** plugins (`scope: "proxy"`) apply only to a specific proxy. `proxy_id` is required and must match the proxy that lists the plugin in its `plugins` association array (`plugin_config_id`). Setting `proxy_id` alone does not attach the plugin — the target proxy must include that association (same runtime rule as proxy-group plugins). In database mode the Admin API also rejects associations whose `proxy_id` does not match the referencing proxy.
+
+  In **database mode** the Admin API writes that association for you, so the
+  two surfaces cannot drift: `POST /plugins/config` and `PUT /plugins/config/{id}`
+  with `scope: "proxy"` append `{plugin_config_id}` to the target proxy's
+  `plugins` array in the same transaction as the config row (a `PUT` that moves
+  `proxy_id` re-homes the association; changing `scope` to `global` removes it;
+  `DELETE` removes it from every proxy that lists it). The touched proxies'
+  `updated_at` advances so the next poll / control-plane broadcast republishes
+  them. `GET /proxies/{id}` is therefore authoritative for what is attached — a
+  `201` from `POST /plugins/config` means attached, not merely created. A
+  `proxy_id` that does not exist in the request's namespace is still rejected
+  with `400` and nothing is persisted.
+
+  In **file mode** nothing writes the association for you: the configuration
+  file must list `plugin_config_id` under the target proxy's `plugins`.
 - **Proxy-group-scoped** plugins (`scope: "proxy_group"`) apply to a subset of proxies that reference the plugin in their `plugins` association list. `proxy_id` must be null. A **single shared plugin instance** is reused across all associated proxies, so stateful plugins (e.g., `rate_limiting`) share counters across the group. When a proxy is deleted, only the association is removed — the proxy-group plugin config survives.
 - Proxy and proxy-group attachment identity is `(namespace, id)`. Two namespaces may reuse the same bare proxy id and the same bare plugin config id; a proxy only ever resolves plugin configs from its own namespace, and same-id proxy-group configs in two namespaces get independent instances with independent state.
 - A proxy may have **multiple instances** of the same plugin type (e.g., two `http_logging` configs shipping to different destinations). Each instance has its own `id`, `config`, and optional `priority_override` to control execution order

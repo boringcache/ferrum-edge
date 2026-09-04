@@ -292,7 +292,12 @@ paths:
         whose read, parse, validation, revision-gate admission, or proxy apply
         is rejected keeps the last known-good mesh slice / policy baseline and
         sets the flag, and the admin API stays read-only exactly as in file
-        mode). `config_rejected` is a sticky flag cleared only
+        mode). In database mode the flag also covers a full load that had to
+        QUARANTINE one or more stored plugin configs the shared plugin
+        construction gate refuses: those rows are omitted from the plugin cache
+        so the process still binds its admin listener and the offending row can
+        be repaired or deleted in-band, and `config_rejected` stays raised while
+        any load keeps quarantining. `config_rejected` is a sticky flag cleared only
         by an accepted authoritative full reload (Applied or Unchanged) — and,
         for the localized mesh sources, only once the proxy apply lifecycle
         accepts that exact recovery candidate, never on a provisional slice
@@ -5554,6 +5559,25 @@ paths:
     post:
       operationId: createPluginConfig
       summary: Create a plugin configuration
+      description: |
+        Creates the plugin configuration.
+
+        **Proxy-scoped side effect (database mode).** A proxy-scoped plugin
+        applies only when the target proxy lists it in `plugins` — `proxy_id`
+        alone never attaches it. So a body with `scope: "proxy"` and
+        `proxy_id: "<P>"` also appends `{"plugin_config_id": "<id>"}` to proxy
+        `P`'s `plugins` array, in the same transaction (idempotent if the
+        association already exists). `201` therefore means both writes
+        committed, and `GET /proxies/{id}` is authoritative for what is
+        attached. If `P` does not exist in the request's namespace the write is
+        rejected with `400`
+        (`proxy_id '<P>' does not exist in namespace '<ns>'`) and nothing is
+        persisted; a plugin whose attachment is unsupported for the target
+        proxy's protocol (for example `tcp_connection_throttle` on an
+        HTTP-family proxy) is likewise rejected with `400`.
+
+        File mode is unchanged: the configuration file's `plugins` association
+        arrays remain the only attachment surface there.
       tags: [Plugins]
       requestBody:
         required: true
@@ -5630,6 +5654,20 @@ paths:
         mutated. `POST /plugins/config` and `/batch` still default `enabled` to
         `true` when the key is absent — a create has no prior state to
         overwrite.
+
+        **Proxy-scoped side effect (database mode).** The proxy association is
+        reconciled with the replacement body in the same transaction, so
+        `GET /proxies/{id}` stays authoritative. `scope: "proxy"` ensures the
+        association on `proxy_id`; moving `proxy_id` from `P1` to `P2` removes
+        the association from `P1` and adds it to `P2`; changing `scope` to
+        `global` removes it. (`scope: "proxy_group"` leaves existing
+        associations alone — they are operator-managed through
+        `PUT /proxies/{id}` and remain valid for any proxy.) Every touched
+        proxy's `updated_at` advances so the next poll / control-plane
+        broadcast republishes it. A `proxy_id` that does not exist in the
+        request's namespace is rejected with `400`
+        (`proxy_id '<P>' does not exist in namespace '<ns>'`) and nothing is
+        mutated.
       tags: [Plugins]
       requestBody:
         required: true
@@ -5669,6 +5707,10 @@ paths:
     delete:
       operationId: deletePluginConfig
       summary: Delete a plugin configuration
+      description: |
+        Deletes the plugin configuration and, in the same transaction, removes
+        it from the `plugins` array of every proxy that lists it, advancing
+        those proxies' `updated_at`.
       tags: [Plugins]
       parameters:
         - $ref: "#/components/parameters/LiveApplyMode"
@@ -31146,8 +31188,14 @@ components:
               type: boolean
               description: |
                 Sticky operator signal set when a non-empty ConfigSync DELTA is
-                rejected. Cleared only after an authoritative FULL_SNAPSHOT is
-                accepted. Last-known-good config continues to serve while true.
+                rejected, or when an admitted FULL_SNAPSHOT fails to apply (for
+                example a plugin config this data plane cannot construct).
+                Cleared only after an authoritative FULL_SNAPSHOT is accepted.
+                Last-known-good config continues to serve while true. Because
+                ConfigSync.Subscribe is server-streaming with no client
+                acknowledgement, this DP-side field — not the CP's
+                `last_sync_at`, which records only that the CP sent the update
+                — is the in-band signal that a data plane is frozen.
             config_diverged_since:
               type: [string, "null"]
               format: date-time

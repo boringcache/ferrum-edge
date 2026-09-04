@@ -64351,6 +64351,7 @@ mod tests {
 
     fn make_validation_config(proxies: Vec<Proxy>) -> GatewayConfig {
         GatewayConfig {
+            quarantined_plugin_configs: Vec::new(),
             version: "1".to_string(),
             proxies,
             consumers: vec![],

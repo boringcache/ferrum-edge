@@ -3839,18 +3839,26 @@ The injector supports per-pod capture overrides via annotations. The Istio annot
 | `ferrum.io/excludeOutboundPorts` | outbound | Ferrum-native alias for the above |
 | `traffic.sidecar.istio.io/excludeInboundPorts` | inbound | Comma-separated TCP and UDP destination ports excluded from inbound capture (Istio-compatible). RETURN rules are emitted BEFORE the inbound REDIRECT/TPROXY catch-all so the exclusion is honored |
 | `ferrum.io/excludeInboundPorts` | inbound | Ferrum-native alias for the above |
+| `ferrum.io/rewriteAppProbes` | inbound | `"false"` opts out of the kubelet application-probe rewrite, leaving probes pointing at application ports AND leaving those ports captured (such probes fail under `STRICT`). Default on |
+| `sidecar.istio.io/rewriteAppHTTPProbers` | inbound | Istio-compatible spelling of the above |
 | `traffic.sidecar.istio.io/excludeOutboundIPRanges` | outbound | Comma-separated CIDRs appended to the env-derived outbound exclude list (matches Istio: per-pod additive) |
 | `traffic.sidecar.istio.io/includeOutboundIPRanges` | outbound | Comma-separated CIDRs that REPLACE the env-derived outbound include list when present (matches Istio: include-overrides-include) |
 
 Port-list annotations merge with their Ferrum aliases; exclude lists also merge with the applicable injector-level defaults. `includeOutboundPorts` is annotation-only and narrows outbound REDIRECT rules to the listed TCP destination ports when the include CIDR list is only the implicit catch-all. If `includeOutboundIPRanges` is also explicit, the rule sets are additive: all ports inside the explicit CIDRs are captured, plus the listed ports to any destination. The `*` wildcard means all outbound ports to any destination, even when explicit include CIDRs are also present. Outbound exclude ports still win because their RETURN rules are emitted first. CIDR annotations are validated at admission time -- invalid ports or CIDRs are rejected with a webhook error that names the offending annotation, so a typo cannot silently produce a broken iptables plan.
 
-**Kubelet probe ports (issue [#4431](https://github.com/ferrum-edge/ferrum-edge/issues/4431)).** Inbound capture also excludes TCP ports used by `startupProbe` / `readinessProbe` / `livenessProbe` on every container in the pod (`containers`, `initContainers`, and `ephemeralContainers`):
+**Kubelet application probes are REWRITTEN, not excluded (issues [#4431](https://github.com/ferrum-edge/ferrum-edge/issues/4431), [#4533](https://github.com/ferrum-edge/ferrum-edge/issues/4533)).** Inbound capture is a protocol-wide catch-all `REDIRECT` to `:15006`, and kubelet dials `podIP:<port>` in plaintext. Under `STRICT` `PeerAuthentication` the mesh inbound listener does not demux plaintext, so a captured probe fails its handshake — a `livenessProbe` then restart-loops the container and a `readinessProbe` / `startupProbe` keeps the pod out of Ready.
 
-- `httpGet` and `tcpSocket` probes contribute their port.
-- `exec` and `grpc` probes are skipped — they have no HTTP/TCP kubelet port to exclude.
-- A named probe port is resolved against **that container's** `ports[].name` → `containerPort`. Numeric strings (`"8080"`) are treated as numbers.
-- An unresolved or ambiguous name fails admission rather than leaving the probe captured by the inbound catch-all (kubelet probes the Pod IP by default; Ferrum's inbound HTTP routes are service-host based, so a captured liveness probe 404/503s and restarts a healthy container).
-- Operator annotations and `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS` still win: probe ports are unioned with those lists and deduplicated.
+Ferrum's answer is Istio's `rewriteAppHTTPProbers` model, **not** a per-port capture exclusion:
+
+- For every application container (`spec.containers`, plus any native sidecar in `spec.initContainers`; the injected `ferrum-edge` / `ferrum-edge-init` containers are skipped) and each of `startupProbe` / `readinessProbe` / `livenessProbe`, an `httpGet`, `tcpSocket`, or `grpc` handler is replaced with `httpGet { path: /app-probe/<container>/<probeField>, port: 15020, scheme: HTTP }`. `initialDelaySeconds`, `periodSeconds`, `timeoutSeconds`, `failureThreshold`, and `successThreshold` are preserved verbatim.
+- The ORIGINAL handler — with any named port already resolved against that container's `ports[].name` → `containerPort` — is recorded in the sidecar's `FERRUM_MESH_APP_PROBES` environment variable. In mesh mode the sidecar serves `FERRUM_MESH_APP_PROBE_PORT` (default `15020`) and re-runs the original probe against `127.0.0.1`: same path/port/scheme/`httpHeaders`/`Host` for `httpGet` (success = 2xx/3xx, as for kubelet), a TCP connect for `tcpSocket`, and `grpc.health.v1.Health/Check` with the spec's `service` for `grpc` (success = `SERVING`). The probe's `timeoutSeconds` bounds each request. Outcomes are counted in `ferrum_mesh_app_probe_total{container,probe,outcome}`.
+- **`grpc` probes are covered.** A Kubernetes `GRPCAction` has a REQUIRED `port` and kubelet opens an ordinary TCP connection to it, so a gRPC-probed workload was exactly the case that hard-failed under `STRICT` before the rewrite.
+- `exec` probes are untouched — they run inside the container and are never captured.
+- **No application port is excluded from inbound capture.** Only `15020` gets an inbound `RETURN`, and that port terminates in the sidecar. This is the security half of the change: a destination-port-wide `RETURN` for an application port would also let ordinary Service / Pod-IP traffic to that port bypass the sidecar and, with it, mesh mTLS and `mesh_authz`.
+- An unresolved or ambiguous named probe port still fails admission rather than being silently left captured.
+- Operator annotations and `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS` are unchanged and still additive; `15020` is unioned with them.
+- **Opt-out:** `ferrum.io/rewriteAppProbes: "false"` (or Istio's `sidecar.istio.io/rewriteAppHTTPProbers: "false"`) leaves the probes alone AND leaves their ports captured. Under `STRICT` those probes will fail; the supported alternatives are an `exec` probe over loopback or an explicit `excludeInboundPorts` entry, whose bypass consequences the operator then owns.
+- **Sidecar topology only.** Ambient / NodeWaypoint workloads get no injected sidecar and no probe rewrite; the node-agent keeps its own kubelet-probe exemption path derived from the enrolled pod spec (see `FERRUM_NODE_AGENT_NODE_IP`).
 
 **Pod-restart caveat (injector / iptables init container):** annotations consumed by the `injector` mode are evaluated at pod admission time only. Existing pods retain their previous iptables capture rules until restart; bouncing affected workloads is required for previously-ignored annotations to take effect in the init-container path. The eBPF capture path lifts this restriction for `includeOutboundPorts` -- see below.
 
@@ -6007,6 +6015,7 @@ Set `FERRUM_NODE_AGENT_FALLBACK_MODE=iptables` only when running a custom node-a
 | `FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS` | (empty) | CIDRs to exclude from outbound capture (highest priority) |
 | `FERRUM_MESH_CAPTURE_EXCLUDE_PORTS` | `15001,15006,15008,15020` | Destination TCP ports excluded from outbound capture |
 | `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS` | (empty) | Destination TCP and UDP ports excluded from inbound capture (mirrors Istio `excludeInboundPorts`; pod annotation `traffic.sidecar.istio.io/excludeInboundPorts` is additive) |
+| `FERRUM_MESH_APP_PROBE_PORT` | `15020` | Sidecar port serving rewritten kubelet application probes (`/app-probe/<container>/<probeField>`). The injector points every application `httpGet` / `tcpSocket` / `grpc` probe here and records the original handler in `FERRUM_MESH_APP_PROBES`; only this port is excluded from inbound capture. `0` disables the listener |
 | `FERRUM_MESH_IP6TABLES_ENABLED` | `auto` | IPv6 iptables fan-out: `auto` probes and skips IPv6 rules when `ip6tables` is unavailable, `true` requires it when IPv6 CIDRs are configured and fails all capture setup before IPv4 rules if unavailable, `false` emits IPv4-only capture rules |
 | `FERRUM_MESH_CAPTURE_IPV6_ENABLED` | derived | Whether the Sidecar TCP capture listeners must serve IPv6 captured traffic. Derived from `FERRUM_MESH_IP6TABLES_ENABLED` plus the include/exclude CIDR families when unset; set to `true` by the injector whenever the rendered init-container plan emits `ip6tables` rules |
 
@@ -6577,6 +6586,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS` | (empty) | CIDRs to exclude from outbound capture (highest priority) |
 | `FERRUM_MESH_CAPTURE_EXCLUDE_PORTS` | `15001,15006,15008,15020` | Destination TCP ports excluded from outbound capture |
 | `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS` | (empty) | Destination TCP and UDP ports excluded from inbound capture (mirrors Istio `excludeInboundPorts`; pod annotation `traffic.sidecar.istio.io/excludeInboundPorts` is additive) |
+| `FERRUM_MESH_APP_PROBE_PORT` | `15020` | Sidecar port serving rewritten kubelet application probes (`/app-probe/<container>/<probeField>`). The injector points every application `httpGet` / `tcpSocket` / `grpc` probe here and records the original handler in `FERRUM_MESH_APP_PROBES`; only this port is excluded from inbound capture. `0` disables the listener |
 
 ### Injector
 
