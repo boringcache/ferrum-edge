@@ -5,25 +5,25 @@ metadata-hints = ["project=ferrum-edge"]
 
 [entries.cargo-target]
 kind = "cargo-target"
-tag = "ferrum-edge-unit-tests-20260905-target"
+tag = "ferrum-edge-unit-tests-20260905-r2-target"
 path = "target"
 
 [entries.cargo-registry]
-tag = "ferrum-edge-unit-tests-20260905-registry"
+tag = "ferrum-edge-unit-tests-20260905-r2-registry"
 
 [entries.cargo-git]
-tag = "ferrum-edge-unit-tests-20260905-git"
+tag = "ferrum-edge-unit-tests-20260905-r2-git"
 
 [profiles.cargo]
 entries = ["cargo-target", "cargo-registry", "cargo-git"]
 
 [adapters.sccache]
-tag = "ferrum-edge-unit-tests-20260905-compiler"
+tag = "ferrum-edge-unit-tests-20260905-r2-compiler"
 
 [adapters.cargo]
-tag = "ferrum-edge-unit-tests-20260905"
+tag = "ferrum-edge-unit-tests-20260905-r2"
 profiles = ["cargo"]
 compiler-cache = "sccache"
-command = ["cargo", "test", "--lib", "--test", "unit_tests"]
+command = ["cargo", "test", "--lib", "--test", "unit_tests", "--no-run"]
 fail-on-cache-error = true
 metadata-hints = ["tool=sccache", "lane=default-unit-tests"]
