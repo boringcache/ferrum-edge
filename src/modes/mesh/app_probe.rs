@@ -112,8 +112,10 @@ pub const DEFAULT_APP_PROBE_MAX_CONNECTIONS_PER_IP: usize = 32;
 pub const DEFAULT_APP_PROBE_MAX_ACTIVE_PROBES: usize = 16;
 
 /// Body returned when the active-probe budget is exhausted. Fixed, tiny, and
-/// carries nothing request-derived.
-const PROBE_OVERLOAD_BODY: &str = "app probe budget exhausted\n";
+/// carries nothing request-derived. Named for the budget, not for process
+/// overload: this listener is deliberately not overload-gated (see
+/// [`AppProbeAdmission`]).
+const PROBE_BUDGET_EXHAUSTED_BODY: &str = "app probe budget exhausted\n";
 
 // ── Wire types (injector producer ⇄ sidecar consumer) ────────────────────
 
@@ -831,7 +833,10 @@ impl AppProbeServer {
         let Ok(_probe_permit) = self.admission.budget().try_acquire() else {
             // Shed rather than queue: a queued probe still holds the socket and
             // still eventually dials the application.
-            return AppProbeResponse::close(StatusCode::SERVICE_UNAVAILABLE, PROBE_OVERLOAD_BODY);
+            return AppProbeResponse::close(
+                StatusCode::SERVICE_UNAVAILABLE,
+                PROBE_BUDGET_EXHAUSTED_BODY,
+            );
         };
         let outcome = run_probe(spec).await;
         self.metrics.record(container, probe_field, outcome);
