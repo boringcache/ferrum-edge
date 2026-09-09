@@ -42,8 +42,10 @@ jobs:
         run: |
           python3 - <<'PY'
           import collections
+          import hashlib
           import json
           import os
+          import re
           import stat
           from pathlib import Path
 
@@ -70,6 +72,31 @@ jobs:
                       category = "incremental"
                   categories[category] += info.st_size
 
+          dependency_outputs = {}
+          for record in records:
+              path = Path(record["path"])
+              if path.parent.name != "deps":
+                  continue
+              match = re.fullmatch(r"(.+)-[0-9a-f]{16}", path.name)
+              if match:
+                  dependency_outputs[(str(path.parent.parent), match[1], record["bytes"])] = record
+          duplicate_outputs = []
+          for record in records:
+              path = Path(record["path"])
+              if path.parent.name not in {"debug", "release"} or path.suffix:
+                  continue
+              other = dependency_outputs.get((str(path.parent), path.name, record["bytes"]))
+              if other is None:
+                  continue
+              digests = []
+              for candidate in (record, other):
+                  with (root / candidate["path"]).open("rb") as file:
+                      digests.append(hashlib.file_digest(file, "sha256").hexdigest())
+              duplicate_outputs.append({"paths": [record["path"], other["path"]],
+                                        "bytes_per_copy": record["bytes"],
+                                        "same_content": digests[0] == digests[1],
+                                        "sha256": digests})
+
           fingerprints = []
           for path in root.glob("**/.fingerprint/ferrum-edge*/*.json"):
               value = json.loads(path.read_text())
@@ -86,6 +113,7 @@ jobs:
               "unique_inode_bytes": sum(item["bytes"] for item in inodes.values()),
               "allocated_bytes": sum(item["allocated_bytes"] for item in inodes.values()),
               "hardlinked_files": sum(item["links"] > 1 for item in records),
+              "duplicate_outputs": duplicate_outputs,
               "directories": directories.most_common(),
               "categories": categories.most_common(),
               "largest_files": sorted(records, key=lambda item: item["bytes"], reverse=True)[:40],
