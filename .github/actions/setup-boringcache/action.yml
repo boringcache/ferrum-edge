@@ -1,0 +1,23 @@
+name: BoringCache Cargo
+description: Restore Cargo downloads and install BoringCache for target and compiler caching.
+runs:
+  using: composite
+  steps:
+    - name: BoringCache Cargo
+      uses: boringcache/one@a610ec5a564efd9b360925056dbade04deb5def6 # v1.30.0
+      with:
+        mode: archive
+        cache-profiles: dependencies
+        trust-policy: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'auto' || 'restore' }}
+        fail-on-cache-error: true
+
+    - name: Expose the verified compiler cache
+      if: env.FERRUM_SCCACHE_BIN != ''
+      shell: bash
+      run: |
+        dirname "$FERRUM_SCCACHE_BIN" >> "$GITHUB_PATH"
+        # Keep cc-rs fingerprints identical in precompile and later test steps.
+        if [ "$RUNNER_OS" != Windows ]; then
+          echo 'CC=sccache cc' >> "$GITHUB_ENV"
+          echo 'CXX=sccache c++' >> "$GITHUB_ENV"
+        fi

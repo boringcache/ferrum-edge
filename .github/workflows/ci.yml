@@ -499,6 +499,9 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_rust == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -562,6 +565,7 @@ jobs:
           save: ${{ matrix.shard == 'core' && 'true' || 'false' }}
           # A setup/compile failure must not reserve an incomplete immutable key.
           cache-on-failure: "false"
+          cache: "false"
 
       - name: Precompile inline and hardening test binaries
         # Compile this shard's targets in one Cargo invocation before running
@@ -573,7 +577,7 @@ jobs:
           python3 .github/scripts/run_unit_ci.py default-build --sample-parent "$$" &
           unit_sampler_pid=$!
           trap 'kill "$unit_sampler_pid" 2>/dev/null || true; wait "$unit_sampler_pid" || true' EXIT
-          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/default-build.time" cargo test $UNIT_PRECOMPILE_TARGETS --no-run --timings 2>&1 | tee "$RUNNER_TEMP/unit-ci/default-build.log"
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/default-build.time" boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile "unit-$UNIT_SHARD" test $UNIT_PRECOMPILE_TARGETS --no-run --timings 2>&1 | tee "$RUNNER_TEMP/unit-ci/default-build.log"
           kill "$unit_sampler_pid"
           wait "$unit_sampler_pid"
           trap - EXIT
@@ -705,6 +709,9 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_acme == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     env:
       # Shared `ci-debug` rust-cache lane: every member must compile with
       # identical profile settings so restored dependency artifacts stay
@@ -730,6 +737,7 @@ jobs:
       - uses: ./.github/actions/setup-rust-ci
         with:
           shared-key: "ci-debug"
+          cache: "false"
 
       - name: Precompile ACME library and DNS hook test binaries
         # Keep inline ACME coverage, but compile only the two-test DNS target
@@ -741,7 +749,7 @@ jobs:
           python3 .github/scripts/run_unit_ci.py acme-build --sample-parent "$$" &
           unit_sampler_pid=$!
           trap 'kill "$unit_sampler_pid" 2>/dev/null || true; wait "$unit_sampler_pid" || true' EXIT
-          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/acme-build.time" cargo test --features acme --lib --test acme_dns01_tests --no-run --timings 2>&1 | tee "$RUNNER_TEMP/unit-ci/acme-build.log"
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/acme-build.time" boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile acme test --features acme --lib --test acme_dns01_tests --no-run --timings 2>&1 | tee "$RUNNER_TEMP/unit-ci/acme-build.log"
           kill "$unit_sampler_pid"
           wait "$unit_sampler_pid"
           trap - EXIT
@@ -798,6 +806,9 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_secrets_backends == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     env:
       # Shared `ci-debug` rust-cache lane: every member must compile with
       # identical profile settings so restored dependency artifacts stay
@@ -809,6 +820,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         with:
+          cache: "false"
           shared-key: "ci-debug"
 
       - name: Install cargo-nextest
@@ -824,7 +836,7 @@ jobs:
         # by the all-features build and the backend-specific test filters.
         # Vault/AWS use testcontainers; GCP/Azure use in-process wiremock fakes.
         run: |
-          cargo nextest run \
+          boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile secrets --skip-save nextest run \
             --features secrets-vault,secrets-aws,secrets-gcp,secrets-azure \
             --test secrets_functional \
             --no-fail-fast \
@@ -840,7 +852,7 @@ jobs:
         # once more without cloud features so that coverage survives the
         # matrix consolidation.
         run: |
-          cargo nextest run \
+          boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile secrets --skip-restore nextest run \
             --test secrets_functional \
             --no-fail-fast \
             cross_backend
@@ -852,6 +864,9 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_service_integration == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     env:
       # Shared `ci-debug` rust-cache lane: every member must compile with
       # identical profile settings so restored dependency artifacts stay
@@ -868,6 +883,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         with:
+          cache: "false"
           shared-key: "ci-debug"
 
       - name: Install cargo-nextest
@@ -884,7 +900,7 @@ jobs:
         # coverage for the host-port allocator every fixture above maps
         # through, and the filter list is exhaustive, so a module missing
         # from it never runs (issue #3999).
-        run: cargo nextest run --test service_integration --no-fail-fast consul ldap kafka mysql oidc oauth2_introspection clickhouse host_port_allocation
+        run: boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile service-integration nextest run --test service_integration --no-fail-fast consul ldap kafka mysql oidc oauth2_introspection clickhouse host_port_allocation
         env:
           RUST_BACKTRACE: 1
 
@@ -893,6 +909,9 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_pkcs11 == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     env:
       # Same cold-compile survivability caps as test-unit (own rust-cache key,
       # same repeated exit-143 runner loss during the pkcs11 double-target
@@ -915,6 +934,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         with:
+          cache: "false"
           shared-key: "ci-debug"
 
       - name: Install SoftHSM and OpenSC tools
@@ -961,7 +981,7 @@ jobs:
         # Both later filters execute in separate libtest binaries. Compile the
         # pair together so the certificate-pairing phase cannot trigger a
         # second full ferrum-edge compile after the signer smoke test passes.
-        run: cargo test --features pkcs11 --lib --test unit_tests --no-run
+        run: boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile pkcs11 test --features pkcs11 --lib --test unit_tests --no-run
         env:
           RUST_BACKTRACE: 1
 
@@ -995,6 +1015,9 @@ jobs:
     # than the runtime image glibc; all native archive consumers use the same
     # Linux architecture.
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
     env:
       # Shared `ci-debug` rust-cache lane: every member must compile with
       # identical profile settings so restored dependency artifacts stay
@@ -1006,6 +1029,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         with:
+          cache: "false"
           shared-key: "ci-debug"
 
       - name: Install cargo-nextest
@@ -1018,7 +1042,7 @@ jobs:
         # directory compiles the dependency graph again before shards can run.
         # This binary is used only for tests; release producers keep their
         # shipping profile and all consumers keep the target/debug contract.
-        run: cargo build --bin ferrum-edge
+        run: boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile artifacts --skip-save build --bin ferrum-edge
 
       - name: Build ferrum-cni binary
         # `cni_tests` launches `env!("CARGO_BIN_EXE_ferrum-cni")`, which
@@ -1029,7 +1053,7 @@ jobs:
         #
         # This debug-path binary is transferred to every integration shard;
         # omit DWARF from the transfer-only build to keep the artifact small.
-        run: cargo build --bin ferrum-cni
+        run: boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile artifacts --skip-restore --skip-save build --bin ferrum-cni
 
       - name: Build integration tests archive
         # Nextest archives are native binaries, so the file and artifact names
@@ -1037,7 +1061,7 @@ jobs:
         # MB larger and is omitted only from this transfer artifact.
         run: |
           archive_file="integration-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
-          cargo nextest archive \
+          boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile artifacts --skip-restore --skip-save nextest archive \
             --test integration_tests \
             --archive-file "$archive_file"
 
@@ -1046,7 +1070,7 @@ jobs:
         # reusing the leaf-crate compilation from the integration archive.
         run: |
           archive_file="functional-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
-          cargo nextest archive \
+          boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile artifacts --skip-restore nextest archive \
             --test functional_tests \
             --archive-file "$archive_file"
 
@@ -1336,6 +1360,9 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_conformance == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     env:
       # Shares the `ci-test` rust-cache key with test-unit: keep the same
       # compile settings so cached artifact fingerprints stay uniform across
@@ -1347,6 +1374,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         with:
+          cache: "false"
           shared-key: "ci-debug"
 
       - name: Run mesh conformance tests
@@ -1358,7 +1386,7 @@ jobs:
         # (a deleted/renamed GA test fails CI); --test-threads=1 guarantees the
         # `zz_`-named gate runs last with a fully populated registry. The
         # ordering-independent per-call GA assertion runs regardless.
-        run: cargo test --test conformance_tests -- --test-threads=1
+        run: boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile conformance test --test conformance_tests -- --test-threads=1
         env:
           RUST_BACKTRACE: 1
           FERRUM_CONFORMANCE_STRICT_GATE: "1"
@@ -1377,6 +1405,9 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_dependency_audit == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     # cargo-deny only runs `cargo metadata` (no compilation), so this job does
     # not install sccache. Clear the checked-in sccache rustc-wrapper
     # (.cargo/config.toml `[build] rustc-wrapper = "sccache"`) — same fallback
@@ -1387,6 +1418,14 @@ jobs:
       CARGO_BUILD_RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: BoringCache Cargo
+        uses: boringcache/one@a610ec5a564efd9b360925056dbade04deb5def6 # v1.30.0
+        with:
+          mode: archive
+          cache-profiles: audit
+          trust-policy: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'auto' || 'restore' }}
+          fail-on-cache-error: true
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -1466,11 +1505,15 @@ jobs:
     needs: [ci-plan, build-test-artifacts]
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_vendor_patches == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
+          cache: "false"
           shared-key: "ci-vendor-patches"
 
       - name: Install cargo-nextest
@@ -1479,19 +1522,19 @@ jobs:
           tool: cargo-nextest
 
       - name: Run vendored h3 frame-drain regressions
-        run: cargo test --manifest-path vendor/h3-0.0.8-ferrum-patched/Cargo.toml --lib frame
+        run: boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile vendor-patches test --manifest-path vendor/h3-0.0.8-ferrum-patched/Cargo.toml --lib frame
 
       - name: Run vendored tungstenite raw-takeover and parser-policy regressions
         run: |
-          cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib into_inner_with_read_buffer
-          cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib size_limit_hit
-          cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib auto_pong
+          boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile vendor-patches test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib into_inner_with_read_buffer
+          boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile vendor-patches test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib size_limit_hit
+          boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile vendor-patches test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib auto_pong
 
       - name: Run vendored tokio-tungstenite raw-takeover regression
-        run: cargo test --manifest-path vendor/tokio-tungstenite-0.29.0-ferrum-patched/Cargo.toml --config 'patch.crates-io.tungstenite.path="vendor/tungstenite-0.29.0-ferrum-patched"' --test into_inner_with_read_buffer
+        run: boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile vendor-patches test --manifest-path vendor/tokio-tungstenite-0.29.0-ferrum-patched/Cargo.toml --config 'patch.crates-io.tungstenite.path="vendor/tungstenite-0.29.0-ferrum-patched"' --test into_inner_with_read_buffer
 
       - name: Run vendored dimpl credential security regressions
-        run: cargo test --manifest-path vendor/dimpl-0.6.1-ferrum-patched/Cargo.toml --features test-hooks --test auto credential_security
+        run: boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile vendor-patches test --manifest-path vendor/dimpl-0.6.1-ferrum-patched/Cargo.toml --features test-hooks --test auto credential_security
 
       - name: Download integration tests archive
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -5982,11 +6025,15 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_rust == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
+          cache: "false"
           shared-key: "ci-lint"
           save: "true"
           # Main concurrency protection does not prevent setup/compile failures.
@@ -6003,7 +6050,7 @@ jobs:
         env:
           CARGO_BUILD_JOBS: 2
         run: |
-          cargo clippy \
+          boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile lint clippy \
             --config profile.test.debug=0 \
             --config profile.dev.debug=0 \
             --all-targets -- -D warnings
@@ -6031,7 +6078,7 @@ jobs:
     # rebuild of every entry behind it, and it did so without a defect in the
     # ejected change. Discovery coverage is unchanged -- every merged change is
     # still fuzzed at byte-identical bounds by the push to `main` that follows
-    # it, which is also the only event permitted to populate this lane's cache.
+    # it. Trusted pushes and manual dispatches may populate the cache.
     #
     # Target inventory (#4442): `datagram_client_address` is the seventh smoke
     # target. It is invoked on its own rather than from the six-target loop
@@ -6048,6 +6095,7 @@ jobs:
     timeout-minutes: 120
     permissions:
       contents: read
+      id-token: write
     # The repository-root Cargo config also selects the mold linker through
     # per-target rustflags, and this isolated lane installs no fast linker, so
     # the inherited rustflags are cleared explicitly. The rustc wrapper is
@@ -6090,8 +6138,7 @@ jobs:
         with:
           toolchain: nightly-2025-07-01
 
-      # The repository's own checksum-pinned sccache installer, and the only
-      # local action this contract admits. It never enables the
+      # The repository's own checksum-pinned sccache installer never enables the
       # credential-bearing sccache GHA backend, never persists
       # ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL into later steps, asserts
       # those credentials are absent before any build runs, and fails closed to
@@ -6099,19 +6146,10 @@ jobs:
       # lazily started sccache server indexes the restored entries.
       - uses: ./.github/actions/setup-sccache
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          workspaces: fuzz -> target
-          shared-key: fuzz-smoke
-          # Only a push to `main` may write this lane's cache. GitHub already
-          # scopes a pull request's cache writes to its own ref; writing
-          # nothing at all from an untrusted ref is the stronger statement,
-          # and it keeps every compiler artifact the sanitizer build reuses
-          # attributable to code that has already merged.
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-
+      - name: BoringCache Cargo
+        uses: ./.github/actions/setup-boringcache
       - name: Install pinned cargo-fuzz
-        run: cargo install cargo-fuzz --locked --version 0.13.1
+        run: boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile tools install cargo-fuzz --locked --version 0.13.1
 
       - name: Run deterministic property smoke tests
         working-directory: fuzz
@@ -6119,7 +6157,7 @@ jobs:
           set -euo pipefail
 
           property_started=$SECONDS
-          cargo test --locked
+          boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile fuzz --skip-save test --locked
           echo "Fuzz property smoke seconds: $((SECONDS - property_started))"
 
       - name: Run bounded libFuzzer smoke budget
@@ -6275,7 +6313,7 @@ jobs:
 
           for fuzz_target in traceparent config_decode proxy_protocol mesh_udp_frame k8s_crd plugin_config; do
             echo "Fuzz smoke target: ${fuzz_target}"
-            cargo fuzz run --codegen-units 16 "$fuzz_target" -- \
+            boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile fuzz --skip-restore --skip-save fuzz run --codegen-units 16 "$fuzz_target" -- \
               -runs=512 \
               -max_total_time=8 \
               -max_len=4096 \
@@ -6284,7 +6322,7 @@ jobs:
           done
 
           echo "Fuzz smoke target: datagram_client_address"
-          cargo fuzz run --codegen-units 16 datagram_client_address -- \
+          boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile fuzz --skip-restore fuzz run --codegen-units 16 datagram_client_address -- \
             -runs=512 \
             -max_total_time=8 \
             -max_len=65536 \
@@ -6317,6 +6355,9 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_ebpf_build == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
@@ -6333,22 +6374,16 @@ jobs:
 
       - uses: ./.github/actions/setup-fast-linker
 
-      - name: Cache eBPF Rust dependencies and compiler outputs
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          shared-key: "ci-ebpf-programs"
-          workspaces: |
-            ebpf -> target
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-
+      - name: BoringCache Cargo
+        uses: ./.github/actions/setup-boringcache
       - name: Install bpf-linker
         uses: ./.github/actions/setup-bpf-linker
 
       - name: Build BPF programs
-        run: cd ebpf && cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
+        run: cd ebpf && boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile ebpf +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
 
       - name: Test shared types
-        run: cd ebpf && cargo test -p ferrum-ebpf-common
+        run: cd ebpf && boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile ebpf test -p ferrum-ebpf-common
 
       - name: Upload BPF artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -6362,6 +6397,9 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_ebpf_userspace == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     env:
       # Shared `ci-debug` rust-cache lane: every member must compile with
       # identical profile settings so restored dependency artifacts stay
@@ -6373,6 +6411,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         with:
+          cache: "false"
           shared-key: "ci-debug"
 
       - name: Build userspace aya loader (--features ebpf)
@@ -6382,7 +6421,7 @@ jobs:
         # guarantees the loader keeps building as the shared BPF ABI
         # (ferrum-ebpf-common) and map set evolve. The kernel ELF is read at
         # runtime, so no compiled BPF object is needed here.
-        run: cargo build --lib --features ebpf
+        run: boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile ebpf-userspace build --lib --features ebpf
         env:
           RUST_BACKTRACE: 1
 
@@ -6393,6 +6432,9 @@ jobs:
     # but it adds several minutes to every PR when run unconditionally.
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_ebpf_kernel_live == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     env:
       # Shared `ci-debug` rust-cache lane: every member must compile with
       # identical profile settings so restored dependency artifacts stay
@@ -6410,20 +6452,21 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         with:
+          cache: "false"
           shared-key: "ci-debug"
 
       - name: Install bpf-linker
         uses: ./.github/actions/setup-bpf-linker
 
       - name: Build BPF programs (kernel object)
-        run: cd ebpf && cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
+        run: cd ebpf && boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile ebpf-live +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
 
       - name: Build and locate live-kernel test binary (--features ebpf)
         id: build_test_bin
         run: |
           set -euo pipefail
           mapfile -t bins < <(
-            cargo test --features ebpf --lib --no-run --message-format=json-render-diagnostics \
+            boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile ebpf-live test --features ebpf --lib --no-run --message-format=json-render-diagnostics \
               | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("lib"))) | .executable'
           )
           if [ "${#bins[@]}" -ne 1 ]; then
@@ -6501,6 +6544,9 @@ jobs:
     # capture/netns/UDP surfaces.
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_netns_capture_live == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     env:
       # Shared `ci-debug` rust-cache lane: every member must compile with
       # identical profile settings so restored dependency artifacts stay
@@ -6512,6 +6558,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         with:
+          cache: "false"
           shared-key: "ci-debug"
 
       - name: Build and locate live test binary
@@ -6519,7 +6566,7 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -t bins < <(
-            cargo test --lib --no-run --message-format=json-render-diagnostics \
+            boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile netns-live --skip-save test --lib --no-run --message-format=json-render-diagnostics \
               | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("lib"))) | .executable'
           )
           if [ "${#bins[@]}" -ne 1 ]; then
@@ -6531,9 +6578,9 @@ jobs:
           echo "In-netns live test binary: $BIN"
           echo "test_bin=$BIN" >> "$GITHUB_OUTPUT"
 
-          cargo build --bin ferrum-edge
+          boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile netns-live --skip-restore --skip-save build --bin ferrum-edge
           mapfile -t functional_bins < <(
-            cargo test --test functional_tests --no-run --message-format=json-render-diagnostics \
+            boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile netns-live --skip-restore test --test functional_tests --no-run --message-format=json-render-diagnostics \
               | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("test"))) | .executable'
           )
           if [ "${#functional_bins[@]}" -ne 1 ]; then
@@ -6638,6 +6685,9 @@ jobs:
     # real SPIRE control planes and runs the full cross-cluster protocol matrix.
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_two_cluster_live == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     env:
       # Shared `ci-debug` rust-cache lane: every member must compile with
       # identical profile settings so restored dependency artifacts stay
@@ -6650,6 +6700,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         with:
+          cache: "false"
           # Same default-feature/profile dependency graph as netns-capture-live.
           # That job also builds the functional target; either completed archive
           # supplies this lane's dependencies. Cargo still builds this checkout's
@@ -6677,9 +6728,9 @@ jobs:
         id: build_test_bin
         run: |
           set -euo pipefail
-          cargo build --bin ferrum-edge
+          boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile two-cluster-live --skip-save build --bin ferrum-edge
           mapfile -t bins < <(
-            cargo test --test functional_tests --no-run --message-format=json-render-diagnostics \
+            boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile two-cluster-live --skip-restore test --test functional_tests --no-run --message-format=json-render-diagnostics \
               | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("test"))) | .executable'
           )
           if [ "${#bins[@]}" -ne 1 ]; then
@@ -6734,6 +6785,9 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_platform_build == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.ci-plan.outputs.binary-matrix) }}
@@ -6778,25 +6832,8 @@ jobs:
 
       - uses: ./.github/actions/setup-fast-linker
 
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        # Cache restore/save is a build-time optimization, not a correctness
-        # input. The Windows runner occasionally fails the post-step cache
-        # upload to GitHub's cache service with no log output (observed on PR
-        # #884: tar.exe completes, then the step is marked failed before any
-        # error is printed). The release binary itself is already built and
-        # uploaded as an artifact before this step's post phase runs, so a
-        # cache miss / save failure should not gate the binary build. Treat
-        # this step as best-effort across all targets to avoid an entire
-        # build matrix entry going red on a transient GitHub Actions cache
-        # issue.
-        continue-on-error: true
-        with:
-          shared-key: "build-${{ matrix.target }}-prbuild"
-          # Restore-only: the repository cache quota is reserved for the
-          # PR-facing `ci-debug` / `ci-lint` lanes and the main-only fuzz lane.
-          save-if: "false"
-
+      - name: BoringCache Cargo
+        uses: ./.github/actions/setup-boringcache
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
@@ -6846,11 +6883,11 @@ jobs:
 
       - name: Check merge-group macOS target
         if: github.event_name == 'merge_group' && runner.os == 'macOS'
-        run: cargo check --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
+        run: boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile binaries check --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
 
       - name: Build fast verification binary
         if: github.event_name != 'merge_group' || runner.os != 'macOS'
-        run: cargo build --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
+        run: boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile binaries build --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
 
       - name: Report compiler cache statistics
         if: always()

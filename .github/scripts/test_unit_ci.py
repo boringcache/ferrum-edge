@@ -18,14 +18,19 @@ from run_unit_ci import (
 )
 
 
+BORINGCACHE_CARGO = (
+    "boringcache cargo "
+    "--${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }}"
+)
+
 # The Unit Tests job is a four-shard matrix; the shard's targets arrive through
 # job-level `UNIT_PRECOMPILE_TARGETS` / `UNIT_TARGET` env (see ci.yml), so the
 # literal step commands are shard-independent and stay pinned here.
 COMMANDS = {
-    "default-build": "cargo test $UNIT_PRECOMPILE_TARGETS --no-run",
+    "default-build": f'{BORINGCACHE_CARGO} --profile "unit-$UNIT_SHARD" test $UNIT_PRECOMPILE_TARGETS --no-run',
     "default-lib": "cargo test --lib",
     "default-unit": 'cargo test --test "$UNIT_TARGET"',
-    "acme-build": "cargo test --features acme --lib --test acme_dns01_tests --no-run",
+    "acme-build": f"{BORINGCACHE_CARGO} --profile acme test --features acme --lib --test acme_dns01_tests --no-run",
     "acme-outbound": "cargo test --features acme --lib tls::acme::client::tests",
     "acme-dns": "cargo test --features acme --test acme_dns01_tests",
     "acme-renewal": "cargo test --features acme --lib tls::acme_renewal_resume_tests",

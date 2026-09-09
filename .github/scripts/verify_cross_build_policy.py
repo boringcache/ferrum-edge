@@ -4136,7 +4136,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
     # rebuild of every entry behind it, and it did so without a defect in the
     # ejected change. Discovery coverage is unchanged -- every merged change is
     # still fuzzed at byte-identical bounds by the push to `main` that follows
-    # it, which is also the only event permitted to populate this lane's cache.
+    # it. Trusted pushes and manual dispatches may populate the cache.
     #
     # Target inventory (#4442): `datagram_client_address` is the seventh smoke
     # target. It is invoked on its own rather than from the six-target loop
@@ -4153,6 +4153,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
     timeout-minutes: 120
     permissions:
       contents: read
+      id-token: write
     # The repository-root Cargo config also selects the mold linker through
     # per-target rustflags, and this isolated lane installs no fast linker, so
     # the inherited rustflags are cleared explicitly. The rustc wrapper is
@@ -4195,8 +4196,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
         with:
           toolchain: nightly-2025-07-01
 
-      # The repository's own checksum-pinned sccache installer, and the only
-      # local action this contract admits. It never enables the
+      # The repository's own checksum-pinned sccache installer never enables the
       # credential-bearing sccache GHA backend, never persists
       # ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL into later steps, asserts
       # those credentials are absent before any build runs, and fails closed to
@@ -4204,19 +4204,10 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
       # lazily started sccache server indexes the restored entries.
       - uses: ./.github/actions/setup-sccache
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          workspaces: fuzz -> target
-          shared-key: fuzz-smoke
-          # Only a push to `main` may write this lane's cache. GitHub already
-          # scopes a pull request's cache writes to its own ref; writing
-          # nothing at all from an untrusted ref is the stronger statement,
-          # and it keeps every compiler artifact the sanitizer build reuses
-          # attributable to code that has already merged.
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-
+      - name: BoringCache Cargo
+        uses: ./.github/actions/setup-boringcache
       - name: Install pinned cargo-fuzz
-        run: cargo install cargo-fuzz --locked --version 0.13.1
+        run: boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile tools install cargo-fuzz --locked --version 0.13.1
 
       - name: Run deterministic property smoke tests
         working-directory: fuzz
@@ -4224,7 +4215,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
           set -euo pipefail
 
           property_started=$SECONDS
-          cargo test --locked
+          boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile fuzz --skip-save test --locked
           echo "Fuzz property smoke seconds: $((SECONDS - property_started))"
 
       - name: Run bounded libFuzzer smoke budget
@@ -4380,7 +4371,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
 
           for fuzz_target in traceparent config_decode proxy_protocol mesh_udp_frame k8s_crd plugin_config; do
             echo "Fuzz smoke target: ${fuzz_target}"
-            cargo fuzz run --codegen-units 16 "$fuzz_target" -- \
+            boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile fuzz --skip-restore --skip-save fuzz run --codegen-units 16 "$fuzz_target" -- \
               -runs=512 \
               -max_total_time=8 \
               -max_len=4096 \
@@ -4389,7 +4380,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
           done
 
           echo "Fuzz smoke target: datagram_client_address"
-          cargo fuzz run --codegen-units 16 datagram_client_address -- \
+          boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile fuzz --skip-restore fuzz run --codegen-units 16 datagram_client_address -- \
             -runs=512 \
             -max_total_time=8 \
             -max_len=65536 \
@@ -4421,6 +4412,16 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
 # Oldest first. The index of a revision's job text in this tuple is its
 # generation; a higher index may replace a lower one, never the reverse.
 CI_FUZZ_SMOKE_JOB_GENERATIONS = (CI_FUZZ_SMOKE_RETIRED_JOB, CI_FUZZ_SMOKE_JOB)
+
+CI_FUZZ_CARGO_PREFIX = "boringcache cargo --${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'write' || 'read-only' }} --profile fuzz"
+
+
+def fuzz_budget_commands(job: str) -> str:
+    """Compare the original Cargo bounds after the exact cache wrapper."""
+    for flags in (" --skip-restore --skip-save ", " --skip-restore ", " --skip-save ", " "):
+        job = job.replace(CI_FUZZ_CARGO_PREFIX + flags, "cargo ")
+    return job
+
 
 # The bounded libFuzzer budget, verbatim. Every admitted generation must carry
 # it exactly once, wherever in the job it runs.
@@ -7351,6 +7352,16 @@ def closed_job_field_errors(
     return errors
 
 
+CI_CACHE_OIDC_JOBS = (
+    "test-unit", "test-acme", "test-secrets", "test-service-integration",
+    "test-pkcs11-softhsm", "build-test-artifacts", "test-conformance",
+    "dependency-audit", "test-vendor-patches", "lint", "fuzz-smoke",
+    "build-ebpf", "build-ebpf-userspace", "ebpf-live", "netns-capture-live",
+    "two-cluster-mesh-live", "build-binaries",
+)
+CI_CACHE_PERMISSIONS = "    permissions:\n      contents: read\n      id-token: write\n"
+
+
 def nonpublishing_ci_errors(contents: str, source: str) -> list[str]:
     """CI can build and upload test artifacts, but cannot publish releases."""
     errors: list[str] = []
@@ -7358,7 +7369,27 @@ def nonpublishing_ci_errors(contents: str, source: str) -> list[str]:
     errors.extend(failures)
     if permission != "permissions:\n  contents: read\n":
         errors.append(f"{source} must default to contents: read only")
-    active = "\n".join(line for line in contents.splitlines() if not line.lstrip().startswith("#"))
+    # Only these build jobs may request an OIDC assertion for cache access.
+    # Release permissions, other jobs, and workflow-level OIDC remain denied.
+    permission_contents = contents
+    for job_name in CI_CACHE_OIDC_JOBS:
+        job, failures = extract_job_block(contents, source, job_name, required=False)
+        errors.extend(failures)
+        if job is None or failures:
+            continue
+        job_permissions, failures = extract_job_field_block(
+            contents, source, job_name, "permissions", required=False,
+        )
+        errors.extend(failures)
+        active_permissions = "".join(
+            line for line in (job_permissions or "").splitlines(keepends=True)
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+        if not failures and active_permissions == CI_CACHE_PERMISSIONS:
+            permission_contents = permission_contents.replace(
+                job, job.replace(CI_CACHE_PERMISSIONS, "    permissions:\n      contents: read\n", 1), 1,
+            )
+    active = "\n".join(line for line in permission_contents.splitlines() if not line.lstrip().startswith("#"))
     if re.search(r"\b(?:actions|contents|packages|id-token):\s*write\b|\bwrite-all\b", active):
         errors.append(f"{source} must not grant publication write permissions")
     for job in ("latest-release", "docker", "docker-manifest", "build-arm64-cross",
@@ -27243,6 +27274,23 @@ pre_build = []
     no_publish = "name: CI\npermissions:\n  contents: read\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps: []\n"
     if validate_publish_control_contract(no_publish, "CI workflow"):
         failures.append("read-only nonpublishing CI was rejected")
+    for job_name in CI_CACHE_OIDC_JOBS:
+        cache_oidc = no_publish.replace("  test:\n", f"  {job_name}:\n" + CI_CACHE_PERMISSIONS)
+        if validate_publish_control_contract(cache_oidc, "CI workflow"):
+            failures.append(f"cache OIDC permissions were rejected for {job_name}")
+        commented_oidc = cache_oidc.replace("    steps:", "    # Keep cache access scoped to this job.\n    steps:")
+        if validate_publish_control_contract(commented_oidc, "CI workflow"):
+            failures.append(f"a comment changed cache OIDC permissions for {job_name}")
+        for mutation in (
+            cache_oidc.replace("      contents: read", "      contents: write"),
+            cache_oidc.replace("      id-token: write", "      id-token: write\n      packages: write"),
+            cache_oidc.replace("      id-token: write", "      id-token: write\n      actions: write"),
+            cache_oidc.replace("      id-token: write", "      id-token: write\n      id-token: write"),
+            cache_oidc.replace(f"  {job_name}:\n", "  unrelated:\n"),
+            cache_oidc.replace("permissions:\n  contents: read", "permissions:\n  contents: read\n  id-token: write"),
+        ):
+            if not validate_publish_control_contract(mutation, "CI workflow"):
+                failures.append(f"widened cache OIDC permissions were accepted for {job_name}")
     for mutation in (
         no_publish.replace("contents: read", "contents: write"),
         no_publish.replace("    steps: []", "    permissions:\n      actions: write\n    steps: []"),
@@ -29776,7 +29824,7 @@ pre_build = []
     # Wherever the six-target budget runs, it runs at exactly these bounds. A
     # generation that moved the lane must not also have relaxed it.
     for generation, admitted in enumerate(CI_FUZZ_SMOKE_JOB_GENERATIONS):
-        if admitted.count(CI_FUZZ_SMOKE_BOUNDED_BUDGET) != 1:
+        if fuzz_budget_commands(admitted).count(CI_FUZZ_SMOKE_BOUNDED_BUDGET) != 1:
             failures.append(
                 f"admitted fuzz-smoke generation {generation} does not carry the "
                 "bounded six-target libFuzzer budget exactly once"
@@ -29786,7 +29834,7 @@ pre_build = []
     # revision from dropping `datagram_client_address` back out of the required
     # smoke, or re-bounding it to the loop's generic 4 KiB ceiling and leaving
     # the scheduled lane reaching parser lengths this lane never can (#4442).
-    if CI_FUZZ_SMOKE_JOB.count(CI_FUZZ_SMOKE_DATAGRAM_BUDGET) != 1:
+    if fuzz_budget_commands(CI_FUZZ_SMOKE_JOB).count(CI_FUZZ_SMOKE_DATAGRAM_BUDGET) != 1:
         failures.append(
             "the adopted fuzz-smoke generation does not carry the bounded "
             "datagram_client_address invocation exactly once"
@@ -29848,20 +29896,17 @@ pre_build = []
             "the adopted fuzz-smoke generation pins a job-level rustc wrapper, "
             "which would override the pinned installer's fail-closed decision"
         )
-    if CI_FUZZ_SMOKE_JOB.count("uses: ./.github/actions/") != 1:
+    if CI_FUZZ_SMOKE_JOB.count("uses: ./.github/actions/") != 2:
         failures.append(
-            "the adopted fuzz-smoke generation must reference exactly one local "
-            "action"
+            "the adopted fuzz-smoke generation must reference exactly two local "
+            "actions"
         )
     if "      - uses: ./.github/actions/setup-sccache\n" not in CI_FUZZ_SMOKE_JOB:
         failures.append(
             "the adopted fuzz-smoke generation no longer uses the repository's "
             "checksum-pinned sccache installer"
         )
-    if (
-        "          save-if: ${{ github.event_name == 'push' && "
-        "github.ref == 'refs/heads/main' }}\n"
-    ) not in CI_FUZZ_SMOKE_JOB:
+    if CI_CACHE_PERMISSIONS not in CI_FUZZ_SMOKE_JOB or CI_FUZZ_CARGO_PREFIX not in CI_FUZZ_SMOKE_JOB:
         failures.append(
             "the adopted fuzz-smoke generation lets an untrusted ref write the "
             "compiler cache the sanitizer build restores"
@@ -29987,8 +30032,8 @@ pre_build = []
         "widened libFuzzer budget": ("-max_total_time=8", "-max_total_time=800"),
         "unbounded input length": ("-max_len=4096", "-max_len=1048576"),
         "unpinned cargo-fuzz": (
-            "cargo install cargo-fuzz --locked --version 0.13.1",
-            "cargo install cargo-fuzz",
+            "install cargo-fuzz --locked --version 0.13.1",
+            "install cargo-fuzz",
         ),
         "missing protoc setup": (
             "      - name: Install required build dependency\n"
@@ -30001,7 +30046,8 @@ pre_build = []
         ),
         "mutable toolchain pin": ("nightly-2025-07-01", "nightly"),
         "repository-supplied script": (
-            'cargo fuzz run --codegen-units 16 "$fuzz_target" -- \\',
+            ('cargo fuzz run --codegen-units 16 "$fuzz_target" -- \\',
+             CI_FUZZ_CARGO_PREFIX + ' --skip-restore --skip-save fuzz run --codegen-units 16 "$fuzz_target" -- \\'),
             'bash scripts/fuzz_smoke.sh --codegen-units 16 "$fuzz_target" -- \\',
         ),
         "mutable action ref": (
@@ -30009,7 +30055,8 @@ pre_build = []
             "actions/checkout@v6",
         ),
         "local action substitution": (
-            "uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2",
+            ("uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2",
+             "uses: ./.github/actions/setup-boringcache"),
             "uses: ./.github/actions/fuzz-cache",
         ),
         "widened permissions": (
@@ -30089,9 +30136,8 @@ pre_build = []
             "        if: github.event_name != 'pull_request'\n",
         ),
         "untrusted cache writes": (
-            "          save-if: ${{ github.event_name == 'push' && "
-            "github.ref == 'refs/heads/main' }}\n",
-            "          save-if: true\n",
+            CI_FUZZ_CARGO_PREFIX,
+            "boringcache cargo --write --profile fuzz",
         ),
         "unpinned third-party sccache installer": (
             "      - uses: ./.github/actions/setup-sccache\n",
@@ -30102,15 +30148,15 @@ pre_build = []
             '    env:\n      RUSTFLAGS: ""\n      SCCACHE_GHA_ENABLED: "true"\n',
         ),
         "cache directory escape": (
-            "          shared-key: fuzz-smoke\n",
-            "          shared-key: fuzz-smoke\n          cache-directories: /\n",
+            CI_FUZZ_CARGO_PREFIX + " --skip-save test --locked",
+            CI_FUZZ_CARGO_PREFIX + " --skip-save test --locked --target-dir /",
         ),
         # Issue #4442. The three ways a pull request could unschedule the
         # seventh target on the surface it controls: delete its invocation,
         # re-bound it to the loop's generic ceiling, or point the invocation at
         # a target the loop already covers so the step still prints seven runs.
         "datagram target dropped from the smoke budget": (
-            CI_FUZZ_SMOKE_DATAGRAM_BUDGET,
+            CI_FUZZ_SMOKE_DATAGRAM_BUDGET.replace("cargo fuzz run", CI_FUZZ_CARGO_PREFIX + " --skip-restore fuzz run"),
             "",
         ),
         "datagram target re-bounded to the generic smoke ceiling": (
@@ -30118,8 +30164,8 @@ pre_build = []
             "            -max_len=4096 \\\n",
         ),
         "datagram target substituted for one already covered": (
-            "cargo fuzz run --codegen-units 16 datagram_client_address -- \\",
-            "cargo fuzz run --codegen-units 16 proxy_protocol -- \\",
+            "fuzz run --codegen-units 16 datagram_client_address -- \\",
+            "fuzz run --codegen-units 16 proxy_protocol -- \\",
         ),
     }
     for tamper_name, (original, replacement) in fuzz_smoke_adopted_tampering.items():
