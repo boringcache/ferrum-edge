@@ -1,0 +1,107 @@
+name: Fuzz Cache Inspection
+
+on:
+  push:
+    branches: [fuzz-cache-inspection]
+    paths: [.github/workflows/fuzz-cache-inspection.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  inspect:
+    name: Inspect restored fuzz target
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          ref: 558a3ccd412c285c20c609be3460fdbf6947040d
+          persist-credentials: false
+
+      - name: Set up BoringCache
+        uses: boringcache/one@a610ec5a564efd9b360925056dbade04deb5def6 # v1.30.0
+        with:
+          setup: none
+          mode: archive
+          cache-profiles: dependencies
+          trust-policy: restore
+          fail-on-cache-error: true
+
+      - name: Restore the published fuzz target
+        run: |
+          boringcache --version
+          df -h .
+          boringcache restore boringcache/ferrum-edge \
+            --entry fuzz-target-toolchain-e3b99108dfccdd33-graph-551e4f3879e93b22-branch-boringcache-validation-ubuntu-24-x86_64:fuzz/target \
+            --no-git --no-platform --fail-on-cache-miss --fail-on-cache-error
+
+      - name: Measure target files and inspect Cargo fingerprints
+        run: |
+          python3 - <<'PY'
+          import collections
+          import json
+          import os
+          import stat
+          from pathlib import Path
+
+          root = Path("fuzz/target")
+          records = []
+          directories = collections.Counter()
+          categories = collections.Counter()
+          inodes = {}
+          for directory, _, names in os.walk(root):
+              for name in names:
+                  path = Path(directory) / name
+                  info = path.lstat()
+                  if not stat.S_ISREG(info.st_mode):
+                      continue
+                  relative = path.relative_to(root)
+                  record = {"path": str(relative), "bytes": info.st_size,
+                            "allocated_bytes": info.st_blocks * 512,
+                            "links": info.st_nlink, "mtime_ns": info.st_mtime_ns}
+                  records.append(record)
+                  inodes.setdefault((info.st_dev, info.st_ino), record)
+                  directories[str(relative.parent)] += info.st_size
+                  category = path.suffix or "extensionless"
+                  if "/incremental/" in str(path):
+                      category = "incremental"
+                  categories[category] += info.st_size
+
+          fingerprints = []
+          for path in root.glob("**/.fingerprint/ferrum-edge*/*.json"):
+              value = json.loads(path.read_text())
+              fingerprints.append({"path": str(path.relative_to(root)),
+                                   "value": value})
+          freshness_path = root / ".boringcache/cargo-freshness-v2.json"
+          freshness = json.loads(freshness_path.read_text())
+          lease = [entry for entry in freshness["entries"]
+                   if bytes.fromhex(entry["path_bytes_hex"]).decode() == "src/tls/lease.rs"]
+          result = {
+              "source_commit": "558a3ccd412c285c20c609be3460fdbf6947040d",
+              "file_count": len(records),
+              "logical_bytes": sum(item["bytes"] for item in records),
+              "unique_inode_bytes": sum(item["bytes"] for item in inodes.values()),
+              "allocated_bytes": sum(item["allocated_bytes"] for item in inodes.values()),
+              "hardlinked_files": sum(item["links"] > 1 for item in records),
+              "directories": directories.most_common(),
+              "categories": categories.most_common(),
+              "largest_files": sorted(records, key=lambda item: item["bytes"], reverse=True)[:40],
+              "files": records,
+              "fingerprints": fingerprints,
+              "lease_source_freshness": lease,
+          }
+          Path("fuzz-cache-inspection.json").write_text(json.dumps(result, indent=2) + "\n")
+          print(json.dumps({key: value for key, value in result.items()
+                            if key not in {"files", "fingerprints"}}, indent=2))
+          PY
+          du -h -d 3 fuzz/target | sort -h | tail -n 20
+
+      - name: Upload inspection
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        with:
+          name: fuzz-cache-inspection
+          path: fuzz-cache-inspection.json
+          retention-days: 7
