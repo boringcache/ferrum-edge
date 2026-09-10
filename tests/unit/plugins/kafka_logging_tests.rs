@@ -1799,9 +1799,12 @@ async fn kafka_enum_fields_accept_only_their_canonical_spelling() {
         );
     }
 
+    // `ssl` / `sasl_ssl` are canonical spellings too, but the default build
+    // links librdkafka without TLS (issue #5212), so their admission is
+    // decided by librdkafka's client-config validation rather than by the
+    // spelling check this test pins.
     for (field, value) in [
         ("security_protocol", "plaintext"),
-        ("security_protocol", "ssl"),
         ("key_field", "none"),
         ("key_field", "proxy_id"),
         ("acks", "all"),
