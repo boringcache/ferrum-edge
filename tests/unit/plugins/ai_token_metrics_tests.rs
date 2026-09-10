@@ -109,6 +109,10 @@ fn assert_usage_and_metrics(
     registry.configure(0, 3600, 0, 10_000, "");
     registry.record(&summary);
     let output = registry.render_uncached();
+    // Configuring even an empty namespace emits its label on every AI series.
+    let labels = format!(
+        "proxy_id=\"test-proxy\",provider=\"{provider}\",namespace=\"\""
+    );
     for (metadata_key, metric, value) in [
         ("ai_prompt_tokens", "ferrum_ai_prompt_tokens_total", prompt),
         (
@@ -118,10 +122,13 @@ fn assert_usage_and_metrics(
         ),
         ("ai_total_tokens", "ferrum_ai_tokens_total", total),
     ] {
-        let series = format!("{metric}{{proxy_id=\"test-proxy\",provider=\"{provider}\"}}");
+        let series = format!("{metric}{{{labels}}}");
         if let Some(value) = value {
             assert_eq!(ctx.metadata[metadata_key], value.to_string());
-            assert!(output.contains(&format!("{series} {value}\n")));
+            assert!(
+                output.contains(&format!("{series} {value}\n")),
+                "missing {series} {value} in:\n{output}"
+            );
         } else {
             assert!(!ctx.metadata.contains_key(metadata_key));
             assert!(!output.contains(&series));
@@ -129,7 +136,7 @@ fn assert_usage_and_metrics(
     }
     assert_eq!(ctx.metadata["ai_estimated_cost"], cost);
     assert!(output.contains(&format!(
-        "ferrum_ai_estimated_cost_currency_units_total{{proxy_id=\"test-proxy\",provider=\"{provider}\"}} {cost}\n"
+        "ferrum_ai_estimated_cost_currency_units_total{{{labels}}} {cost}\n"
     )));
 }
 
@@ -404,8 +411,11 @@ fn retry_release_requires_origin_sse_and_no_buffering_opt_in() {
         for (content_type, is_sse) in [
             ("text/event-stream", true),
             ("Text/Event-Stream; charset=utf-8", true),
+            // This observer conservatively preserves streaming for variants,
+            // using the same classification with and without retries (#5333).
+            ("application/event-stream+json", true),
+            ("application/vnd.acme-event-stream", true),
             ("application/json", false),
-            ("application/event-stream+json", false),
             ("text/plain", false),
         ] {
             let headers = HashMap::from([("Content-Type".to_string(), content_type.to_string())]);
@@ -414,6 +424,18 @@ fn retry_release_requires_origin_sse_and_no_buffering_opt_in() {
                 !opt_in && is_sse,
                 "{content_type}, opt_in={opt_in}"
             );
+            if is_sse {
+                assert_eq!(
+                    plugin.should_buffer_response_body_for_content_type(
+                        &ctx,
+                        Some(content_type),
+                        200,
+                        &headers,
+                    ),
+                    opt_in,
+                    "{content_type}, opt_in={opt_in}"
+                );
+            }
         }
         assert!(!plugin.should_release_response_body_under_retries(&ctx, 200, &HashMap::new()));
         assert!(plugin.should_buffer_response_body_for_content_type(

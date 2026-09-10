@@ -1336,7 +1336,7 @@ async fn ai_token_metrics_retry_sse_release_honors_origin_headers_and_opt_in() {
                 .to_string();
                 let client = harness.http_client().expect("client");
                 let mut request = client
-                    .post(harness.proxy_url("/chat"))
+                    .request(reqwest::Method::POST, &harness.proxy_url("/chat"))
                     .header("content-type", "application/json")
                     .body(request_body.clone());
                 if accept_sse {
