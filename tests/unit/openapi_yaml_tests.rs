@@ -5871,6 +5871,17 @@ async fn loki_logging_schema_matches_strict_runtime_config_contract() {
     });
     assert_component_validity(&spec, "LokiLoggingConfig", &valid, true);
     assert!(LokiLogging::new(&valid, PluginHttpClient::default()).is_ok());
+    assert_component_validity(
+        &spec,
+        "PluginConfig",
+        &json!({
+            "plugin_name": "loki_logging",
+            "scope": "global",
+            "enabled": true,
+            "config": valid
+        }),
+        true,
+    );
     let valid_minima = json!({
         "endpoint_url": "http://127.0.0.1:3100/loki/api/v1/push",
         "labels": {"_a": ""},
@@ -5884,6 +5895,18 @@ async fn loki_logging_schema_matches_strict_runtime_config_contract() {
     });
     assert_component_validity(&spec, "LokiLoggingConfig", &valid_minima, true);
     assert!(LokiLogging::new(&valid_minima, PluginHttpClient::default()).is_ok());
+
+    let url_whitespace = json!({
+        "endpoint_url": " http://127.0.0.1:3100/push "
+    });
+    assert_component_validity(&spec, "LokiLoggingConfig", &url_whitespace, true);
+    assert!(LokiLogging::new(&url_whitespace, PluginHttpClient::default()).is_ok());
+    let unicode_header = json!({
+        "endpoint_url": "http://127.0.0.1:3100/loki/api/v1/push",
+        "custom_headers": {"X-Example": "café"}
+    });
+    assert_component_validity(&spec, "LokiLoggingConfig", &unicode_header, true);
+    assert!(LokiLogging::new(&unicode_header, PluginHttpClient::default()).is_ok());
 
     let mut invalid = vec![
         json!({"endpoint_url": "https://logs.example.com/push", "endpont_url": "typo"}),
@@ -5904,6 +5927,20 @@ async fn loki_logging_schema_matches_strict_runtime_config_contract() {
         json!({"endpoint_url": "https://logs.example.com/push", "retry_delay_ms": 0}),
         json!({"endpoint_url": "https://logs.example.com/push", "max_entry_bytes": 1023}),
         json!({"endpoint_url": "https://logs.example.com/push", "buffer_max_bytes": 268435457}),
+        json!({
+            "endpoint_url": "http://127.0.0.1:3100/loki/api/v1/push",
+            "schema": {},
+            "schema_ref": "example"
+        }),
+        json!({
+            "endpoint_url": "http://127.0.0.1:3100/loki/api/v1/push",
+            "schema_ref": ""
+        }),
+        json!({"endpoint_url": "http://127.0.0.1:99999/push"}),
+        json!({
+            "endpoint_url": "http://127.0.0.1:3100/loki/api/v1/push",
+            "buffer_max_bytes": 1024
+        }),
     ];
     let oversized_header_name = "x".repeat(LOKI_MAX_CUSTOM_HEADER_NAME_BYTES + 1);
     let mut oversized_headers = serde_json::Map::new();
@@ -5922,6 +5959,17 @@ async fn loki_logging_schema_matches_strict_runtime_config_contract() {
     }
     for config in invalid {
         assert_component_validity(&spec, "LokiLoggingConfig", &config, false);
+        assert_component_validity(
+            &spec,
+            "PluginConfig",
+            &json!({
+                "plugin_name": "loki_logging",
+                "scope": "global",
+                "enabled": true,
+                "config": config.clone()
+            }),
+            false,
+        );
         assert!(
             LokiLogging::new(&config, PluginHttpClient::default()).is_err(),
             "runtime accepted OpenAPI-invalid Loki config: {config}"
@@ -6053,8 +6101,8 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
     );
     assert_eq!(
         schema["properties"]["global_tags"]["propertyNames"]["pattern"],
-        "^[A-Za-z_][A-Za-z0-9_.-]*$",
-        "global_tags keys must encode the runtime ASCII tag-key grammar"
+        "^(?!(namespace|method|status_class|status|grpc_status|proxy|protocol|error_class|error|cause|direction|body_outcome|body_error|result|io_side)$)[A-Za-z_][A-Za-z0-9_.-]*$",
+        "global_tags keys must encode the runtime ASCII tag-key grammar and reserved-name exclusion"
     );
     assert_eq!(
         schema["properties"]["global_tags"]["propertyNames"]["maxLength"], 64,
@@ -6064,8 +6112,8 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
         .as_str()
         .unwrap_or("");
     assert!(
-        prefix_desc.contains("Unicode characters") && prefix_desc.contains("UTF-8 bytes"),
-        "prefix description must distinguish OpenAPI character maxLength from runtime byte cap: {prefix_desc}"
+        prefix_desc.contains("UTF-8 bytes") && prefix_desc.contains("sanitization"),
+        "prefix description must document the runtime post-sanitization byte cap: {prefix_desc}"
     );
 
     let documented = schema["properties"]
@@ -6113,10 +6161,28 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
     });
     assert_component_validity(&spec, "StatsdLoggingConfig", &valid, true);
     assert!(StatsdLogging::new(&valid, PluginHttpClient::default()).is_ok());
+    assert_component_validity(
+        &spec,
+        "PluginConfig",
+        &json!({
+            "plugin_name": "statsd_logging",
+            "scope": "global",
+            "enabled": true,
+            "config": valid
+        }),
+        true,
+    );
 
     let valid_minima = json!({"host": "127.0.0.1"});
     assert_component_validity(&spec, "StatsdLoggingConfig", &valid_minima, true);
     assert!(StatsdLogging::new(&valid_minima, PluginHttpClient::default()).is_ok());
+
+    let prefix_padded = json!({
+        "host": "127.0.0.1",
+        "prefix": format!(" {} ", "a".repeat(256))
+    });
+    assert_component_validity(&spec, "StatsdLoggingConfig", &prefix_padded, true);
+    assert!(StatsdLogging::new(&prefix_padded, PluginHttpClient::default()).is_ok());
 
     let runtime_and_schema_invalid = [
         json!({"host": "statsd.example.test", "prot": 9125}),
@@ -6137,9 +6203,27 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
         json!({"host": "statsd.example.test", "global_tags": null}),
         json!({"host": "statsd.example.test", "schema": null}),
         json!({"host": null}),
+        json!({"host": "statsd.example.test", "schema": {}, "schema_ref": "example"}),
+        json!({"host": "statsd.example.test", "schema_ref": ""}),
+        json!({"host": ""}),
+        json!({"host": "127.0.0.1:8125"}),
+        json!({"host": "statsd.example.test", "prefix": ""}),
+        json!({"host": "127.0.0.1", "global_tags": {"method": "example"}}),
+        json!({"host": "127.0.0.1", "buffer_max_bytes": 2050}),
     ];
     for config in runtime_and_schema_invalid {
         assert_component_validity(&spec, "StatsdLoggingConfig", &config, false);
+        assert_component_validity(
+            &spec,
+            "PluginConfig",
+            &json!({
+                "plugin_name": "statsd_logging",
+                "scope": "global",
+                "enabled": true,
+                "config": config.clone()
+            }),
+            false,
+        );
         assert!(
             StatsdLogging::new(&config, PluginHttpClient::default()).is_err(),
             "runtime accepted OpenAPI-invalid StatsD config: {config}"
