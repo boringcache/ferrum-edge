@@ -26577,7 +26577,14 @@ components:
         configured gRPC response validators and limits still apply; if a body
         policy or transform invalidates that authorized representation, the
         response fails closed to a nonzero gRPC error rather than degrading to
-        an empty successful trailers-only reply. The status-only shape carries
+        an empty successful trailers-only reply. An over-limit raw function
+        response on a native gRPC terminate request is likewise a mandatory
+        rejection rather than a fall-through, even with `on_error: continue`.
+        The same representation is produced on HTTP/1.1, HTTP/2, and HTTP/3:
+        the HTTP/3 finalized-request-egress rejection is written through the
+        context-aware writer, so the authored frame, the terminal metadata, and
+        an original gRPC-Web client's browser framing all survive that
+        boundary. The status-only shape carries
         the same provenance: unchanged, it stays trailers-only and restores its
         complete terminal metadata (grpc-status, optional grpc-message,
         grpc-status-details-bin, and validated custom trailers) from the
@@ -26587,7 +26594,13 @@ components:
         discards every authored terminal key with it, and it can never
         authorize DATA. Cloud credential
         fields fall
-        back to well-known environment variables. Terminate mode forwards
+        back to well-known environment variables. Every recognized provider
+        field is validated whenever it is SUPPLIED, independently of which
+        provider the row selects: JSON type, the Lambda Invoke identifier
+        grammars, the HTTP field-value grammar for credential headers, and the
+        lexical URL contract. A well-typed, well-formed field belonging to an
+        inactive provider stays accepted, so changing `provider` later cannot
+        turn an already-admitted row into a constructor error. Terminate mode forwards
         applicable end-to-end response headers, preserving repeated Set-Cookie
         and list-valued Link while requiring Location, Content-Location, and
         Refresh to remain singleton,
@@ -26654,7 +26667,13 @@ components:
         admission rejects equal or reversed ordering before persistence. This
         candidate check derives static serverless capabilities without resolving
         CP-local cloud credentials; runtime construction still validates the
-        node-local credentials and environment fail closed.
+        node-local credentials and environment fail closed. CP and admin
+        admission of the plugin config itself is shape-only for the same
+        reason: every supplied field is validated, while AWS/Azure/GCP
+        credentials that intentionally exist only on data planes are resolved
+        and enforced when the serving node builds its plugin cache. `validate`
+        therefore checks the shape of the row rather than whether the
+        validating node holds the credentials the row needs at serve time.
         HEAD/204/205/304 bodies are empty. Automatic redirects are disabled;
         pre_proxy accepts only 2xx as approval, while terminate may
         intentionally return only final 2xx-5xx statuses (200-599).
@@ -26678,11 +26697,11 @@ components:
         function_url:
           type: string
           format: uri
-          pattern: "^[Hh][Tt][Tt][Pp][Ss]?://[^@/?#\\s]+(?:[/?][^#\\s]*)?$"
-          description: "HTTP(S) trigger URL without URL userinfo or a fragment. Required for azure_functions and gcp_cloud_functions; ignored for aws_lambda invocation (the URL is derived from region + function name), but still validated when supplied. Path/query credentials are structurally redacted from diagnostics and non-admin/audit projections."
+          pattern: '^[Hh][Tt][Tt][Pp][Ss]?://(?:\[[0-9A-Fa-f:.]+\]|[^\x00-\x20\x7F@/?#:\[\]]+)(?::(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[0-9]{1,4}))?(?:[/?][^\x00-\x20\x7F#]*)?$'
+          description: "HTTP(S) trigger URL without URL userinfo or a fragment. Required for azure_functions and gcp_cloud_functions; ignored for aws_lambda invocation (the URL is derived from region + function name), but still validated when supplied, whichever provider is selected. The lexical contract matches runtime admission: a non-empty host (a registered name, an IPv4 literal, or a bracketed IPv6 literal), an optional port of 0-65535, no URL userinfo, no fragment, and no raw ASCII whitespace or control character anywhere in the value. Path/query credentials are structurally redacted from diagnostics and non-admin/audit projections."
         aws_region:
           type: string
-          description: "AWS region (aws_lambda only). Falls back to AWS_DEFAULT_REGION, then AWS_REGION env vars."
+          description: "AWS region (aws_lambda only). Falls back to AWS_DEFAULT_REGION, then AWS_REGION env vars. The default endpoint is partition-aware: cn-* regions derive lambda.<region>.amazonaws.com.cn and every other region derives lambda.<region>.amazonaws.com. The air-gapped ISO partitions are not derived and require an explicit aws_endpoint_url."
         aws_access_key_id:
           type: string
           description: "IAM access key (aws_lambda only). Falls back to AWS_ACCESS_KEY_ID env var."
@@ -26691,27 +26710,40 @@ components:
           description: "IAM secret key (aws_lambda only). Falls back to AWS_SECRET_ACCESS_KEY env var."
         aws_function_name:
           type: string
-          description: "Lambda function name or ARN (aws_lambda only). Falls back to AWS_LAMBDA_FUNCTION_NAME env var."
+          minLength: 1
+          maxLength: 170
+          pattern: '^(arn:(aws[a-zA-Z-]*)?:lambda:)?([a-z]{2}(-gov)?(-iso([a-z])?)?-[a-z]+-[0-9]:)?([0-9]{12}:)?(function:)?[a-zA-Z0-9_.-]+(:(\$LATEST|[a-zA-Z0-9_-]+))?$'
+          description: "Lambda function name, partial ARN, or full ARN (aws_lambda only), matching the Lambda Invoke API FunctionName grammar. Falls back to AWS_LAMBDA_FUNCTION_NAME env var; the environment value is held to the same grammar. Validated whenever supplied, whichever provider is selected. Existence and invoke permission are not checked at admission."
         aws_session_token:
           type: string
           description: "STS session token (aws_lambda only). Falls back to AWS_SESSION_TOKEN env var."
         aws_qualifier:
           type: string
-          description: "Optional version/alias qualifier (e.g., $LATEST, prod)."
+          minLength: 1
+          maxLength: 128
+          pattern: '^[a-zA-Z0-9$_-]+$'
+          description: "Optional version/alias qualifier (e.g., $LATEST, prod), matching the Lambda Invoke API Qualifier grammar. Validated whenever supplied, whichever provider is selected."
         aws_endpoint_url:
           type: string
           format: uri
-          pattern: "^[Hh][Tt][Tt][Pp][Ss]?://[^@/?#\\s]+/?$"
+          pattern: '^[Hh][Tt][Tt][Pp][Ss]?://(?:\[[0-9A-Fa-f:.]+\]|[^\x00-\x20\x7F@/?#:\[\]]+)(?::(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[0-9]{1,4}))?/?$'
           description: >-
             Optional HTTP(S) Lambda endpoint override for LocalStack or a
             VPC-internal endpoint. Must be an origin without userinfo, path,
-            query, or fragment. Falls back to `AWS_LAMBDA_ENDPOINT_URL`.
+            query, or fragment, using the same lexical URL contract as
+            `function_url` (non-empty host, port 0-65535, no raw whitespace or
+            control characters). Validated whenever supplied, whichever
+            provider is selected. Falls back to `AWS_LAMBDA_ENDPOINT_URL`. A
+            non-default port is part of the signed SigV4 canonical `Host`, so
+            a verifying endpoint accepts the invocation.
         azure_function_key:
           type: string
-          description: "Function key for x-functions-key auth (azure_functions only). Falls back to AZURE_FUNCTIONS_KEY env var."
+          pattern: '^[^\x00-\x08\x0A-\x1F\x7F]*$'
+          description: "Function key for x-functions-key auth (azure_functions only). Falls back to AZURE_FUNCTIONS_KEY env var. The value must be representable as an HTTP field value (no NUL, CR, LF, or other control byte except horizontal tab); the effective config or environment value is parsed at admission so an unusable credential never reaches the serving cache. Validated whenever supplied, whichever provider is selected."
         gcp_bearer_token:
           type: string
-          description: "Bearer token for Authorization header (gcp_cloud_functions only). Falls back to GCP_CLOUD_FUNCTIONS_BEARER_TOKEN env var."
+          pattern: '^[^\x00-\x08\x0A-\x1F\x7F]*$'
+          description: "Bearer token for Authorization header (gcp_cloud_functions only). Falls back to GCP_CLOUD_FUNCTIONS_BEARER_TOKEN env var. The assembled `Bearer <token>` value must be representable as an HTTP field value (no NUL, CR, LF, or other control byte except horizontal tab) and is parsed at admission. Validated whenever supplied, whichever provider is selected."
         forward_body:
           type: boolean
           default: false
@@ -26720,7 +26752,9 @@ components:
           type: array
           items:
             type: string
-          description: "Header names to forward into the function payload (lowercased at config load). Values come from the finalized backend-visible header view (the function is invoked in the finalized-request-egress phase, after request-body transforms and every final request-policy hook), so a header an earlier plugin removed - authorization under strip_authorization_on_success, or a gateway-owned claim_headers destination with no verified claim - is omitted rather than re-read from the client's original request."
+            minLength: 1
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+          description: "Each entry must be a non-empty RFC 9110 HTTP field-name token (no empty string, spaces, or other separators), matching runtime admission. Header names to forward into the function payload (lowercased at config load). Values come from the finalized backend-visible header view (the function is invoked in the finalized-request-egress phase, after request-body transforms and every final request-policy hook), so a header an earlier plugin removed - authorization under strip_authorization_on_success, or a gateway-owned claim_headers destination with no verified claim - is omitted rather than re-read from the client's original request."
         forward_query_params:
           type: boolean
           default: false
@@ -26729,14 +26763,16 @@ components:
           type: integer
           format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           default: 5000
-          description: "Function invocation timeout in milliseconds. Must be > 0."
+          description: "Function invocation timeout in milliseconds. Must be > 0 and representable as a u64; a larger integer is rejected before the plugin constructor sees it."
         max_response_body_bytes:
           type: integer
           format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           default: 10485760
-          description: "Max function response body size (10 MiB default). Must be > 0."
+          description: "Max function response body size (10 MiB default). Must be > 0 and representable as a u64 (and as a usize on the serving platform); a larger integer is rejected before the plugin constructor sees it."
         on_error:
           type: string
           enum: [reject, continue]

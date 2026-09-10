@@ -11510,3 +11510,146 @@ fn merge_into_object(target: &mut serde_json::Value, extra: &serde_json::Value) 
         target.insert(key.clone(), value.clone());
     }
 }
+
+/// Issues #5176, #5177, #5178, #5181, #5189: the published
+/// `serverless_function` grammar and the constructor's admission rules must
+/// describe the same set of accepted configurations.
+#[test]
+fn serverless_function_schema_matches_runtime_admission() {
+    use ferrum_edge::plugins::create_plugin;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let properties = spec
+        .pointer("/components/schemas/ServerlessFunctionConfig/properties")
+        .expect("ServerlessFunctionConfig properties exist");
+
+    fn compile_pattern(value: &serde_json::Value) -> Regex {
+        let raw = value["pattern"].as_str().expect("published pattern");
+        Regex::new(raw).expect("published pattern compiles")
+    }
+    let pattern_for = |field: &str| compile_pattern(&properties[field]);
+
+    // Issue #5177: `format: uint64` is not an assertion, so the ceiling the
+    // runtime can actually represent must be published as `maximum`.
+    for field in ["timeout_ms", "max_response_body_bytes"] {
+        assert_eq!(
+            properties[field]["maximum"].as_u64(),
+            Some(u64::MAX),
+            "{field} must publish the u64 ceiling"
+        );
+        assert_eq!(properties[field]["minimum"].as_u64(), Some(1), "{field}");
+    }
+
+    // Issue #5176: `forward_headers` entries are HTTP field-name tokens.
+    let header_item = &properties["forward_headers"]["items"];
+    assert_eq!(header_item["minLength"].as_u64(), Some(1));
+    let header_pattern = compile_pattern(header_item);
+    assert!(header_pattern.is_match("x-request-id"));
+    assert!(header_pattern.is_match("X-Request-ID"));
+    assert!(!header_pattern.is_match(""));
+    assert!(!header_pattern.is_match("bad header"));
+    assert!(!header_pattern.is_match("bad:header"));
+
+    // Issue #5189: a credential must be representable as an HTTP field value.
+    for field in ["azure_function_key", "gcp_bearer_token"] {
+        let pattern = pattern_for(field);
+        assert!(pattern.is_match("ordinary-credential=="), "{field}");
+        assert!(!pattern.is_match("audit\ncredential"), "{field}");
+        assert!(!pattern.is_match("audit\rcredential"), "{field}");
+        assert!(!pattern.is_match("audit\u{0}credential"), "{field}");
+        assert!(!pattern.is_match("audit\u{7f}credential"), "{field}");
+    }
+
+    // Issue #5181: the Lambda Invoke identifier grammars.
+    assert_eq!(
+        properties["aws_function_name"]["maxLength"].as_u64(),
+        Some(170)
+    );
+    assert_eq!(properties["aws_qualifier"]["maxLength"].as_u64(), Some(128));
+    let name_pattern = pattern_for("aws_function_name");
+    for accepted in [
+        "my-function",
+        "my_function.v2",
+        "my-function:prod",
+        "my-function:$LATEST",
+        "123456789012:function:my-function",
+        "arn:aws:lambda:us-east-1:123456789012:function:my-function",
+        "arn:aws-cn:lambda:cn-north-1:123456789012:function:my-function:prod",
+    ] {
+        assert!(name_pattern.is_match(accepted), "name={accepted}");
+    }
+    for rejected in [" ", "my function", "my/function", "my-function:bad alias"] {
+        assert!(!name_pattern.is_match(rejected), "name={rejected:?}");
+    }
+    let qualifier_pattern = pattern_for("aws_qualifier");
+    for accepted in ["$LATEST", "prod", "1", "blue-green_2"] {
+        assert!(qualifier_pattern.is_match(accepted), "qualifier={accepted}");
+    }
+    for rejected in ["not a qualifier", "bad/alias", ""] {
+        assert!(
+            !qualifier_pattern.is_match(rejected),
+            "qualifier={rejected:?}"
+        );
+    }
+
+    // Issue #5178: one lexical URL contract for both URL-valued fields.
+    let url_pattern = pattern_for("function_url");
+    for accepted in [
+        "http://127.0.0.1/a%20b",
+        "https://functions.example/api/transform",
+        "https://functions.example:65535/api/transform",
+        "https://[2001:db8::1]:8443/api/transform",
+        "http://127.0.0.1:0/pre",
+    ] {
+        assert!(url_pattern.is_match(accepted), "url={accepted}");
+    }
+    for rejected in [
+        "https://:1234",
+        "https://127.0.0.1:65536/pre",
+        "http://127.0.0.1/a b",
+        "http://user:pass@127.0.0.1/pre",
+        "https://functions.example/api#fragment",
+    ] {
+        assert!(!url_pattern.is_match(rejected), "url={rejected}");
+    }
+    let endpoint_pattern = pattern_for("aws_endpoint_url");
+    for accepted in ["http://localhost:4566", "http://localhost:4566/"] {
+        assert!(endpoint_pattern.is_match(accepted), "endpoint={accepted}");
+    }
+    for rejected in [
+        "https://example.com/lambda",
+        "https://example.com?token=secret",
+        "https://:1234",
+        "https://127.0.0.1:65536",
+    ] {
+        assert!(!endpoint_pattern.is_match(rejected), "endpoint={rejected}");
+    }
+
+    // Runtime parity for the same inputs: every schema rejection above is also
+    // a constructor rejection, and the accepted base configuration builds.
+    let base = json!({
+        "provider": "azure_functions",
+        "function_url": "http://127.0.0.1:45678/pre"
+    });
+    assert!(create_plugin("serverless_function", &base).is_ok());
+    for extra in [
+        json!({"function_url": "https://:1234"}),
+        json!({"function_url": "https://127.0.0.1:65536/pre"}),
+        json!({"function_url": "http://127.0.0.1/a b"}),
+        json!({"forward_headers": [""]}),
+        json!({"forward_headers": ["bad header"]}),
+        json!({"azure_function_key": "audit\ncredential"}),
+        json!({"gcp_bearer_token": "audit\ncredential"}),
+        json!({"aws_function_name": "bad name"}),
+        json!({"aws_qualifier": "not a qualifier"}),
+        json!({"aws_endpoint_url": "https://example.com/lambda"}),
+    ] {
+        let mut config = base.clone();
+        merge_into_object(&mut config, &extra);
+        assert!(
+            create_plugin("serverless_function", &config).is_err(),
+            "runtime must reject the schema-invalid config: {config}"
+        );
+    }
+}
