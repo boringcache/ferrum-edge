@@ -11750,11 +11750,23 @@ components:
         local token bucket, including across Redis failure/recovery. Redis mode
         (`sync_mode: "redis"`) externalizes those per-connection counters under a
         per-plugin/gateway-instance key namespace; it does not coordinate a portable
-        frame budget across gateway instances, reconnects, or plugin rebuilds. Unknown
-        top-level keys are rejected by the runtime and by this schema. Counter
-        storage supports only local memory and Redis; database-backed counters
-        are intentionally unsupported.
+        frame budget across gateway instances, reconnects, or plugin rebuilds.
+        `sync_mode` is parsed case-insensitively (`LOCAL`, `Redis`); `redis`
+        requires `redis_url`. Unknown top-level keys are rejected by the runtime
+        and by this schema. Counter storage supports only local memory and Redis;
+        database-backed counters are intentionally unsupported. Residual admission
+        rules this schema cannot express, enforced by the constructor alone:
+        `burst_size` must be >= `frames_per_second`, an integer multiple of it,
+        and `burst_size / frames_per_second` must be at most 3600 seconds.
       additionalProperties: false
+      allOf:
+        - if:
+            required: [sync_mode]
+            properties:
+              sync_mode:
+                pattern: "^[rR][eE][dD][iI][sS]$"
+          then:
+            required: [redis_url]
       properties:
         frames_per_second:
           type: integer
@@ -11790,32 +11802,44 @@ components:
             control-frame payload limit) so the frame stays well-formed.
         sync_mode:
           type: string
-          enum: [local, redis]
+          pattern: "^([lL][oO][cC][aA][lL]|[rR][eE][dD][iI][sS])$"
           default: local
           description: >-
             Frame counter storage: 'local' (in-memory) or 'redis' (externalized
             per-connection counters namespaced per plugin/gateway instance; not
-            a portable cross-instance budget). Database-backed counters are
-            unsupported. Any RESP-compatible server works.
+            a portable cross-instance budget), parsed case-insensitively.
+            `redis` additionally requires `redis_url`. Database-backed counters
+            are unsupported. Any RESP-compatible server works.
         redis_url:
           type: string
           minLength: 1
-          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
-          description: "Redis connection URL. Required when sync_mode is 'redis'. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY."
+          pattern: '^rediss?://[^/?#\s]+(?:/\d{0,10})?(?:\?[^\s#]*)?$'
+          description: >-
+            Redis connection URL (e.g., redis://host:6379/0). Required when
+            sync_mode is 'redis'. Must not carry a URL fragment; TLS skip-verify
+            is only FERRUM_TLS_NO_VERIFY. The path, when present, is the database
+            selector and must be a single non-negative integer no greater than
+            2147483647. Residual validation the pattern cannot express and the
+            plugin constructor still enforces: an out-of-range TCP port, and a
+            database index above the server's own `databases` setting (which only
+            the server can decide, on the handshake `SELECT`).
         redis_tls:
           type: boolean
           default: false
           description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
+          minLength: 1
           default: "{FERRUM_NAMESPACE}:ws_rate_limiting:{plugin-config-id}"
           description: >-
             Key prefix for all Redis keys. Defaults to
             `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
             independent policies of this plugin type in one namespace do not
-            share counters. Setting this explicitly is the documented opt-in
-            for a deliberately shared budget: every instance configured with
-            the same prefix increments and rejects against the same counters.
+            share the surrounding key namespace. Must be non-empty when set.
+            This plugin still prepends a per-instance UUID to every logical
+            connection key, so an explicit shared prefix does not opt two
+            plugin or gateway instances into a shared per-connection frame
+            budget.
         redis_pool_size:
           type: integer
           minimum: 1
@@ -11842,14 +11866,18 @@ components:
             meaningful with sync_mode=redis, but validated in either mode.
         redis_connect_timeout_seconds:
           type: integer
+          format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           default: 5
-          description: Redis connection timeout in seconds
+          description: Redis connection timeout in seconds. Must be a positive unsigned 64-bit integer.
         redis_health_check_interval_seconds:
           type: integer
+          format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           default: 5
-          description: Health check ping interval when Redis is unavailable
+          description: Health check ping interval when Redis is unavailable. Must be a positive unsigned 64-bit integer.
 
     UdpRateLimitingConfig:
       type: object
@@ -11858,30 +11886,50 @@ components:
         datagrams per resolved client IP using a fixed-window algorithm with
         atomic counters. Excess datagrams are silently dropped (standard UDP
         flood mitigation). Operates on both client→backend and backend→client
-        datagrams within the same window per client IP. Unknown top-level keys
+        datagrams within the same window per client IP. `datagrams_per_second`
+        and `bytes_per_second` are per-second rates; the effective per-window
+        cap is `rate × window_seconds`. `sync_mode` is parsed case-insensitively
+        (`LOCAL`, `Redis`); `redis` requires `redis_url`. Unknown top-level keys
         are rejected by the runtime and by this schema. Counter storage supports
         only local memory and Redis; database-backed counters are intentionally
-        unsupported.
+        unsupported. Residual admission rules this schema cannot express,
+        enforced by the constructor alone: the checked product of a configured
+        rate and `window_seconds` must fit in an unsigned 64-bit integer.
       additionalProperties: false
       anyOf:
         - required: [datagrams_per_second]
         - required: [bytes_per_second]
+      allOf:
+        - if:
+            required: [sync_mode]
+            properties:
+              sync_mode:
+                pattern: "^[rR][eE][dD][iI][sS]$"
+          then:
+            required: [redis_url]
       properties:
         datagrams_per_second:
           type: integer
           format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           description: >-
-            Maximum datagrams per `window_seconds`. At least one of
-            `datagrams_per_second` or `bytes_per_second` is required.
+            Sustained datagram rate per second per client IP. The effective
+            per-window cap is `datagrams_per_second × window_seconds`. Both
+            client→backend and backend→client datagrams count against the same
+            cap. At least one of `datagrams_per_second` or `bytes_per_second` is
+            required.
         bytes_per_second:
           type: integer
           format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           description: >-
-            Maximum bytes per `window_seconds` (sum of datagram payload sizes).
-            At least one of `datagrams_per_second` or `bytes_per_second` is
-            required.
+            Sustained payload-byte rate per second per client IP (sum of datagram
+            payload sizes). The effective per-window cap is
+            `bytes_per_second × window_seconds`. Both directions count against
+            the same cap. At least one of `datagrams_per_second` or
+            `bytes_per_second` is required.
         window_seconds:
           type: integer
           format: uint64
@@ -11896,28 +11944,41 @@ components:
             (and similarly for bytes).
         sync_mode:
           type: string
-          enum: [local, redis]
+          pattern: "^([lL][oO][cC][aA][lL]|[rR][eE][dD][iI][sS])$"
           default: local
-          description: "Datagram/byte counter storage: 'local' (in-memory) or 'redis' (centralized). Database-backed counters are unsupported."
+          description: >-
+            Datagram/byte counter storage: 'local' (in-memory) or 'redis'
+            (centralized), parsed case-insensitively. `redis` additionally
+            requires `redis_url`. Database-backed counters are unsupported.
         redis_url:
           type: string
           minLength: 1
-          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
-          description: "Redis connection URL. Required when sync_mode is 'redis'. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY."
+          pattern: '^rediss?://[^/?#\s]+(?:/\d{0,10})?(?:\?[^\s#]*)?$'
+          description: >-
+            Redis connection URL (e.g., redis://host:6379/0). Required when
+            sync_mode is 'redis'. Must not carry a URL fragment; TLS skip-verify
+            is only FERRUM_TLS_NO_VERIFY. The path, when present, is the database
+            selector and must be a single non-negative integer no greater than
+            2147483647. Residual validation the pattern cannot express and the
+            plugin constructor still enforces: an out-of-range TCP port, and a
+            database index above the server's own `databases` setting (which only
+            the server can decide, on the handshake `SELECT`).
         redis_tls:
           type: boolean
           default: false
           description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
+          minLength: 1
           default: "{FERRUM_NAMESPACE}:udp_rate_limiting:{plugin-config-id}"
           description: >-
             Key prefix for all Redis keys. Defaults to
             `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
             independent policies of this plugin type in one namespace do not
-            share counters. Setting this explicitly is the documented opt-in
-            for a deliberately shared budget: every instance configured with
-            the same prefix increments and rejects against the same counters.
+            share counters. Must be non-empty when set; setting it explicitly is
+            the documented opt-in for a deliberately shared budget: every
+            instance configured with the same prefix increments and rejects
+            against the same counters.
         redis_pool_size:
           type: integer
           minimum: 1
@@ -11944,12 +12005,18 @@ components:
             meaningful with sync_mode=redis, but validated in either mode.
         redis_connect_timeout_seconds:
           type: integer
+          format: uint64
+          minimum: 1
+          maximum: 18446744073709551615
           default: 5
-          description: Redis connection timeout in seconds
+          description: Redis connection timeout in seconds. Must be a positive unsigned 64-bit integer.
         redis_health_check_interval_seconds:
           type: integer
+          format: uint64
+          minimum: 1
+          maximum: 18446744073709551615
           default: 5
-          description: Health check ping interval when Redis is unavailable
+          description: Health check ping interval when Redis is unavailable. Must be a positive unsigned 64-bit integer.
 
     # ── Circuit Breaker ─────────────────────────────────────────────
     CircuitBreakerConfig:
@@ -25252,8 +25319,16 @@ components:
         redis_url:
           type: string
           minLength: 1
-          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
-          description: "Redis connection URL (e.g., redis://host:6379/0). Required when sync_mode is 'redis'. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY."
+          pattern: '^rediss?://[^/?#\s]+(?:/\d{0,10})?(?:\?[^\s#]*)?$'
+          description: >-
+            Redis connection URL (e.g., redis://host:6379/0). Required when
+            sync_mode is 'redis'. Must not carry a URL fragment; TLS skip-verify
+            is only FERRUM_TLS_NO_VERIFY. The path, when present, is the database
+            selector and must be a single non-negative integer no greater than
+            2147483647. Residual validation the pattern cannot express and the
+            plugin constructor still enforces: an out-of-range TCP port, and a
+            database index above the server's own `databases` setting (which only
+            the server can decide, on the handshake `SELECT`).
         redis_tls:
           type: boolean
           default: false
@@ -29909,8 +29984,16 @@ components:
         redis_url:
           type: string
           minLength: 1
-          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
-          description: "Redis connection URL. Required when sync_mode is 'redis'. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY."
+          pattern: '^rediss?://[^/?#\s]+(?:/\d{0,10})?(?:\?[^\s#]*)?$'
+          description: >-
+            Redis connection URL (e.g., redis://host:6379/0). Required when
+            sync_mode is 'redis'. Must not carry a URL fragment; TLS skip-verify
+            is only FERRUM_TLS_NO_VERIFY. The path, when present, is the database
+            selector and must be a single non-negative integer no greater than
+            2147483647. Residual validation the pattern cannot express and the
+            plugin constructor still enforces: an out-of-range TCP port, and a
+            database index above the server's own `databases` setting (which only
+            the server can decide, on the handshake `SELECT`).
         redis_tls:
           type: boolean
           default: false
