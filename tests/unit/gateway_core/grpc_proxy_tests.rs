@@ -3669,3 +3669,103 @@ fn grpc_streaming_fast_path_takes_a_materialized_transport_and_never_retries() {
         "the fully-streaming gRPC fast path must remain mutually exclusive with retry"
     );
 }
+
+/// GHSA-8x5h-g4xh-hgc9: a fully-streamed native-gRPC upload never collects a
+/// request body, so the ONLY place its forwarded DATA bytes can reach
+/// `TransactionSummary.bytes_sent` — and therefore `api_chargeback`'s
+/// sent-bandwidth billing — is the request body wrapper itself.
+///
+/// Structural, because the invariant lives on a hyper-owned poll loop that no
+/// in-process unit test can drive; the live behaviour is covered by
+/// `api_chargeback_bills_streamed_and_buffered_h2_grpc_upload_bytes` in
+/// `tests/functional/scripted_backend_h2_tests.rs`.
+#[test]
+fn grpc_streaming_upload_publishes_forwarded_request_bytes() {
+    let src = include_str!("../../../src/proxy/grpc_proxy.rs");
+
+    // The variant carries the shared counter.
+    let streaming_variant = src
+        .split("    Streaming {")
+        .nth(1)
+        .and_then(|rest| rest.split("    /// Streaming body sourced from a channel").next())
+        .expect("the Streaming variant must exist");
+    let accounting_field = "request_bytes: Option<GrpcUploadByteAccounting>";
+    assert!(
+        streaming_variant.contains(accounting_field),
+        "the streamed gRPC request body must carry request-byte accounting"
+    );
+
+    // Every terminal state publishes: clean EOF, transport error, overflow
+    // abort, authorization expiry, and Drop (cancelled / never-polled uploads).
+    let poll_arm = src
+        .split("impl http_body::Body for GrpcBody")
+        .nth(1)
+        .expect("body implementation")
+        .split("GrpcBody::Streaming {")
+        .nth(1)
+        .expect("streaming poll arm")
+        .split("GrpcBody::Channel {")
+        .next()
+        .expect("bounded streaming poll arm");
+    let publishes = poll_arm.matches("accounting.publish(").count();
+    assert_eq!(
+        publishes, 4,
+        "each terminal state of the streamed upload must publish its byte tally"
+    );
+    let tally = poll_arm
+        .find("*bytes_seen = bytes_seen.saturating_add(data.len());")
+        .expect("the streamed upload must tally forwarded DATA");
+    let limit_check = poll_arm
+        .find("if *max_bytes > 0")
+        .expect("the streamed upload must still enforce its size limit");
+    assert!(
+        tally < limit_check,
+        "the forwarded-byte tally must accumulate whether or not a size limit is configured"
+    );
+    let drop_impl = src
+        .split("impl Drop for GrpcBody {")
+        .nth(1)
+        .expect("drop implementation")
+        .split("\nimpl http_body::Body for GrpcBody")
+        .next()
+        .expect("bounded drop implementation");
+    assert!(
+        drop_impl.contains("accounting.publish("),
+        "an abandoned streamed upload must still publish the bytes it forwarded"
+    );
+
+    // The caller wires the request context's counter and its publication latch,
+    // and the deferred gRPC summary waits on that latch before reading it.
+    let proxy_src = include_str!("../../../src/proxy/mod.rs");
+    let accounting = proxy_src
+        .split("GrpcUploadByteAccounting::new(")
+        .nth(1)
+        .expect("the streaming gRPC dispatch must build request-byte accounting")
+        .split(");")
+        .next()
+        .expect("bounded accounting constructor");
+    assert!(
+        accounting.contains("ctx.bytes_sent_observed"),
+        "the streamed gRPC upload must publish into ctx.bytes_sent_observed"
+    );
+    let latch_attachment = proxy_src
+        .find("grpc_streaming_request_bytes_latch.clone()")
+        .expect("the deferred gRPC summary must attach the streamed upload's publication latch");
+    assert!(
+        proxy_src[..latch_attachment]
+            .trim_end()
+            .ends_with(".with_passthrough_request_bytes_latch("),
+        "the deferred gRPC summary must wait for the streamed upload's byte publication"
+    );
+
+    // The H3 cross-protocol bridge already counts forwarded DATA; it must mirror
+    // the same value into the shared counter so every consumer agrees.
+    let h3_src = include_str!("../../../src/http3/cross_protocol.rs");
+    let h3_publish = h3_src
+        .find("fetch_max(forwarded_request_bytes, Ordering::Release)")
+        .expect("the H3 gRPC bridge must mirror its forwarded upload bytes");
+    assert!(
+        h3_src[..h3_publish].contains("ctx.bytes_sent_observed"),
+        "the H3 gRPC bridge must mirror its forwarded upload bytes into the shared counter"
+    );
+}
