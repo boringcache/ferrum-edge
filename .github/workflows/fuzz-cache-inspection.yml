@@ -72,7 +72,6 @@ jobs:
         uses: boringcache/one@404b744a2053da4cf963f13f615f7fafe94f3cf7 # v1.30.1
         with:
           cli-version: ${{ inputs.cli_artifact_id != '' && 'skip' || inputs.cli_version }}
-          setup: none
           mode: archive
           cache-profiles: dependencies
           trust-policy: restore
