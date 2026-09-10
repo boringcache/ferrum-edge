@@ -531,7 +531,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_kafka_logging_healthy` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Whether the Kafka logging generation recovered from its latest failure. |
 | `ferrum_kafka_logging_in_flight` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Records waiting in librdkafka for terminal delivery. |
 | `ferrum_kafka_logging_records_total` | counter | `generation`, `outcome` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Kafka logging record outcomes. |
-| `ferrum_kafka_logging_retained_bytes` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Ferrum userspace retained payload+key bytes awaiting librdkafka admission. |
+| `ferrum_kafka_logging_retained_bytes` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Ferrum-charged retained payload+key bytes, held from admission through librdkafka's own copy of the record until terminal delivery, terminal failure, purge, or immediate rejection. |
 | `ferrum_log_sink_accepted_records_total` | counter | `sink` | `logging` | `documented_only` | `when_process_initialized` | Records accepted by the bounded process log sink. |
 | `ferrum_log_sink_dropped_records_total` | counter | `sink`, `reason` | `logging` | `documented_only` | `when_process_initialized` | Log records dropped by bounded admission. |
 | `ferrum_log_sink_healthy` | gauge | `sink` | `logging` | `documented_only` | `when_process_initialized` | Whether the process log sink has recovered from its latest I/O or drain failure. |
