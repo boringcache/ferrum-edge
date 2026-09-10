@@ -814,7 +814,7 @@ async fn test_gzip_origin_document_is_decoded_to_identity_before_cache_and_specz
         reject_parts(plugin.on_request_received(&mut cached).await);
     assert_eq!(cached_status, 200);
     assert_eq!(cached_body, GZIP_SPEC_JSON);
-    assert!(cached_!headers.contains_key("content-encoding"));
+    assert!(!cached_headers.contains_key("content-encoding"));
 }
 
 #[tokio::test]
@@ -856,7 +856,7 @@ async fn test_gzip_origin_head_uses_decoded_representation_without_wire_body() {
             .and_then(|value| value.parse::<usize>().ok()),
         Some(GZIP_SPEC_JSON.len())
     );
-    assert!(head_!headers.contains_key("content-encoding"));
+    assert!(!head_headers.contains_key("content-encoding"));
 
     let (suppressed_status, suppressed_body, suppressed_headers) = reject_parts(
         plugin
