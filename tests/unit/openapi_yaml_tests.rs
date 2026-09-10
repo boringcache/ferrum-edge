@@ -3919,18 +3919,18 @@ fn plugin_config_shared_schema_matches_admin_admission() {
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
 
     assert_eq!(
-        spec["paths"]["/plugins/config"]["post"]["requestBody"]["content"]["application/json"]
-            ["schema"]["$ref"],
+        spec["paths"]["/plugins/config"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+            ["$ref"],
         json!("#/components/schemas/PluginConfigCreate")
     );
     assert_eq!(
-        spec["paths"]["/plugins/config/{id}"]["put"]["requestBody"]["content"]
-            ["application/json"]["schema"]["$ref"],
+        spec["paths"]["/plugins/config/{id}"]["put"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
         json!("#/components/schemas/PluginConfigReplace")
     );
     assert_eq!(
-        spec["components"]["schemas"]["BatchCreateRequest"]["properties"]["plugin_configs"]
-            ["items"]["$ref"],
+        spec["components"]["schemas"]["BatchCreateRequest"]["properties"]["plugin_configs"]["items"]
+            ["$ref"],
         json!("#/components/schemas/PluginConfigCreate")
     );
     assert_eq!(
@@ -3991,7 +3991,12 @@ fn plugin_config_shared_schema_matches_admin_admission() {
         &enabled_http_logging_missing_endpoint,
         false,
     );
-    assert_component_validity(&spec, "PluginConfig", &enabled_http_logging_missing_endpoint, false);
+    assert_component_validity(
+        &spec,
+        "PluginConfig",
+        &enabled_http_logging_missing_endpoint,
+        false,
+    );
 
     let object_only_null = json!({
         "plugin_name": "http_logging",
@@ -4019,7 +4024,12 @@ fn plugin_config_shared_schema_matches_admin_admission() {
         "enabled": false,
         "config": {}
     });
-    assert_component_validity(&spec, "PluginConfigCreate", &disabled_prometheus_proxy, false);
+    assert_component_validity(
+        &spec,
+        "PluginConfigCreate",
+        &disabled_prometheus_proxy,
+        false,
+    );
 }
 
 #[test]
