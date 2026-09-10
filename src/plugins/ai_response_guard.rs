@@ -20,6 +20,7 @@
 //! closed for enforcing actions. Methods that were never enrolled are never
 //! inspected opportunistically and never forced onto the buffered path.
 
+use crate::fips::approved::Sha256;
 use async_trait::async_trait;
 use flate2::bufread::GzDecoder;
 use flate2::write::GzEncoder;
@@ -30,7 +31,6 @@ use prost_reflect::{
 };
 use regex::{NoExpand, Regex, RegexSet};
 use serde_json::Value;
-use crate::fips::approved::Sha256;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read as _, Write as _};
