@@ -5719,8 +5719,8 @@ async fn a_second_instance_does_not_inherit_another_instances_detection() {
 
     let mut response_headers =
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
-    let body = json!({"jsonrpc": "2.0", "id": "req-1", "result": {"id": "task-secret"}})
-        .to_string();
+    let body =
+        json!({"jsonrpc": "2.0", "id": "req-1", "result": {"id": "task-secret"}}).to_string();
     assert!(matches!(
         disjoint
             .on_response_body(&mut ctx, 200, &mut response_headers, body.as_bytes())
@@ -5982,7 +5982,9 @@ async fn final_request_body_recheck_covers_batch_members() {
         panic!("a denied member injected after admission must be refused");
     };
     let body: Value = serde_json::from_str(&body).expect("refusal should be JSON");
-    let responses = body.as_array().expect("batch refusal answers with an array");
+    let responses = body
+        .as_array()
+        .expect("batch refusal answers with an array");
     assert_eq!(responses.len(), 2);
     assert_eq!(responses[0]["id"], "a");
     assert_eq!(responses[1]["id"], "b");

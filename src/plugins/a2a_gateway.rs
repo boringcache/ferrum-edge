@@ -1030,8 +1030,8 @@ impl A2aGateway {
                 "http"
             }
         });
-        let host = header_value(headers, "x-forwarded-host")
-            .or_else(|| header_value(headers, "host"))?;
+        let host =
+            header_value(headers, "x-forwarded-host").or_else(|| header_value(headers, "host"))?;
         let candidate = forwarded_public_base_url(proto, host)?;
         self.discovery
             .allowed_public_origins
@@ -1426,7 +1426,10 @@ impl Plugin for A2aGateway {
         let observation = Arc::new(Mutex::new(None));
         self.pending_stream_observations
             .insert(stream_id, Arc::clone(&observation));
-        Some(Box::new(A2aSseStreamInspector::new(Some(binding), observation)))
+        Some(Box::new(A2aSseStreamInspector::new(
+            Some(binding),
+            observation,
+        )))
     }
 
     async fn on_response_stream_terminated(
@@ -1679,7 +1682,12 @@ impl Plugin for A2aGateway {
             return PluginResult::Continue;
         };
         if self.observability.emit_metadata {
-            emit_response_metadata(ctx, Some(binding), &value, self.observability.max_payload_size);
+            emit_response_metadata(
+                ctx,
+                Some(binding),
+                &value,
+                self.observability.max_payload_size,
+            );
         }
         if !rewrite_card {
             return PluginResult::Continue;
@@ -2401,7 +2409,10 @@ fn jsonrpc_error_response_body(detection: &A2aDetection, code: i64, message: &st
             .collect();
         return Value::Array(responses);
     }
-    let truncated = matches!(detection.jsonrpc_batch_ids, Some(BatchResponseIds::Unbounded));
+    let truncated = matches!(
+        detection.jsonrpc_batch_ids,
+        Some(BatchResponseIds::Unbounded)
+    );
     let response = jsonrpc_error_response(
         detection.jsonrpc_id.clone().unwrap_or(Value::Null),
         code,
