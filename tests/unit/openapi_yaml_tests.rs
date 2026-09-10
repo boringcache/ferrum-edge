@@ -16722,3 +16722,149 @@ fn serverless_function_schema_matches_runtime_admission() {
         );
     }
 }
+
+/// Issue #5239: the `ApiChargebackConfig` component must reject exactly what the
+/// constructor rejects — no-op pricing, blank currency, out-of-range or
+/// duplicate status codes, negative timer/budget values, simultaneous `schema`
+/// and `schema_ref`, and projection features the billing-row record family
+/// cannot express.
+#[test]
+fn api_chargeback_schema_admits_only_constructible_configs() {
+    use ferrum_edge::plugins::api_chargeback::ApiChargeback;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/ApiChargebackConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("ApiChargebackConfig schema compiles");
+
+    // The minimal effective configuration: a nonempty tier counts even at a
+    // zero price, because an explicitly zero-priced tier still meters calls.
+    let base = json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0}]});
+    let with = |patch: serde_json::Value| -> serde_json::Value {
+        let mut config = base.clone();
+        let object = config.as_object_mut().expect("base is an object");
+        for (key, value) in patch.as_object().expect("patch is an object") {
+            object.insert(key.clone(), value.clone());
+        }
+        config
+    };
+    let accept = |config: serde_json::Value| {
+        assert!(
+            validator.validate(&config).is_ok(),
+            "OpenAPI must admit {config}"
+        );
+        ApiChargeback::new(&config, "ferrum")
+            .unwrap_or_else(|err| panic!("runtime must admit {config}: {err}"));
+    };
+    let reject = |config: serde_json::Value| {
+        assert!(
+            validator.validate(&config).is_err(),
+            "OpenAPI must reject {config}"
+        );
+        assert!(
+            ApiChargeback::new(&config, "ferrum").is_err(),
+            "runtime must reject {config}"
+        );
+    };
+
+    let documented_per_call = json!({
+        "currency": "USD",
+        "pricing_tiers": [
+            {"status_codes": [200, 201, 202, 204], "price_per_call": 0.00001},
+            {"status_codes": [301, 302], "price_per_call": 0.000005}
+        ]
+    });
+    let documented_combined = json!({
+        "currency": "USD",
+        "pricing_tiers": [
+            {"status_codes": [200, 201, 202, 204], "price_per_call": 0.00001}
+        ],
+        "bandwidth_pricing": {
+            "price_per_byte_sent": 0.0000000001,
+            "price_per_byte_received": 0.0000000002
+        },
+        "stream_connection_pricing": {"price_per_connection": 0.0005}
+    });
+    let supported_derived = json!({
+        "schema": {"derived_fields": [{"name": "row_kind", "kind": "summary_kind"}]}
+    });
+
+    accept(base.clone());
+    accept(json!({"bandwidth_pricing": {"price_per_byte_sent": 0.01}}));
+    accept(json!({"bandwidth_pricing": {"price_per_byte_received": 0.02}}));
+    accept(json!({"stream_connection_pricing": {"price_per_connection": 5}}));
+    accept(json!({"pricing_tiers": [{"status_codes": [100, 599], "price_per_call": 1}]}));
+    accept(documented_per_call);
+    accept(documented_combined);
+    accept(with(json!({"schema": {"omit": ["proxy_name"]}})));
+    accept(with(
+        json!({"schema": {"rename": {"total_calls": "calls"}}}),
+    ));
+    accept(with(supported_derived));
+
+    let unrepresentable_derived = json!({
+        "schema": {"derived_fields": [{"name": "host", "kind": "backend_host"}]}
+    });
+
+    // No effective pricing: the plugin would record nothing.
+    reject(json!({}));
+    reject(json!({"bandwidth_pricing": {}}));
+    reject(json!({"bandwidth_pricing": {"price_per_byte_sent": 0}}));
+    reject(json!({"stream_connection_pricing": {"price_per_connection": 0}}));
+    reject(json!({"pricing_tiers": []}));
+    // Currency is trimmed and must not be empty.
+    reject(with(json!({"currency": ""})));
+    reject(with(json!({"currency": " \t "})));
+    // Status codes must be real HTTP statuses, distinct within a tier.
+    reject(json!({"pricing_tiers": [{"status_codes": [99], "price_per_call": 1}]}));
+    reject(json!({"pricing_tiers": [{"status_codes": [600], "price_per_call": 1}]}));
+    reject(json!({"pricing_tiers": [{"status_codes": [200, 200], "price_per_call": 1}]}));
+    // Timer / budget knobs are unsigned 64-bit integers.
+    reject(with(json!({"render_cache_ttl_seconds": -1})));
+    reject(with(json!({"stale_entry_ttl_seconds": -1})));
+    reject(with(json!({"cache_invalidation_min_age_ms": -1})));
+    reject(with(json!({"cleanup_interval_seconds": -1})));
+    reject(with(json!({"max_entries": 0})));
+    reject(with(json!({"max_retained_bytes": 0})));
+    // Projection surface: mutually exclusive, and narrowed to the billing row.
+    reject(with(json!({"schema": {}, "schema_ref": "missing"})));
+    reject(with(json!({"schema": {"order": ["proxy_id"]}})));
+    reject(with(json!({"schema": {"summary_type": "http"}})));
+    reject(with(json!({"schema": {"timestamp_format": "epoch_ms"}})));
+    reject(with(json!({"schema": {"metadata": {"mode": "omit"}}})));
+    reject(with(json!({"schema": {"omit": ["response_status_code"]}})));
+    reject(with(json!({"schema": {"rename": {"client_ip": "ip"}}})));
+    reject(with(unrepresentable_derived));
+
+    // Constraints that stay runtime-only must be documented as such rather than
+    // silently missing from the component.
+    let component = spec
+        .pointer("/components/schemas/ApiChargebackConfig")
+        .expect("ApiChargebackConfig exists");
+    let description = component["description"].as_str().expect("a description");
+    assert!(
+        description.contains("Runtime-only admission"),
+        "the component must name the constraints JSON Schema cannot express"
+    );
+
+    let guide = include_str!("../../docs/plugins.md");
+    let section = guide
+        .split("### `api_chargeback`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("api_chargeback docs section");
+    assert!(
+        section.contains("Precise admission rules"),
+        "docs/plugins.md must state the exact admission rules"
+    );
+    assert!(
+        section.contains("unsigned 64-bit integer"),
+        "docs/plugins.md must state the unsigned bound on the timer knobs"
+    );
+}
