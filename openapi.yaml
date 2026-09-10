@@ -11586,7 +11586,8 @@ components:
                   required: [config]
                   properties:
                     config:
-                      $ref: "#/components/schemas/FaultInjectionConfig"        - if:
+                      $ref: "#/components/schemas/FaultInjectionConfig"
+        - if:
             required: [plugin_name]
             properties:
               plugin_name:
