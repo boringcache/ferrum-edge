@@ -1080,6 +1080,16 @@ impl Plugin for PluginInstanceWrapper {
     fn metric_tag_override_plans_are_conditional(&self) -> bool {
         self.trigger.is_some() || self.inner.metric_tag_override_plans_are_conditional()
     }
+    fn records_mesh_service_graph(&self, summary: &TransactionSummary) -> bool {
+        self.inner.records_mesh_service_graph(summary)
+            && self
+                .trigger
+                .as_ref()
+                .is_none_or(|gate| gate.transaction_log_enabled(summary))
+    }
+    fn workload_custom_trace_attributes(&self) -> Option<&str> {
+        self.inner.workload_custom_trace_attributes()
+    }
     fn priority(&self) -> u16 {
         self.priority
     }

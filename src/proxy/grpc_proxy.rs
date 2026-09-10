@@ -95,6 +95,56 @@ pub trait GrpcUploadTerminationObserver: Send + Sync {
     fn on_upload_terminated(&self);
 }
 
+/// Shared request-byte accounting for a gRPC upload that is forwarded frame by
+/// frame instead of being collected first.
+///
+/// The buffered gRPC arms publish `ctx.bytes_sent_observed` from the collected
+/// request length, so `TransactionSummary.bytes_sent` — and everything that
+/// bills on it, `api_chargeback` included — sees the uploaded bytes. A fully
+/// streamed upload never collects, so without this it publishes nothing and the
+/// summary reports zero uploaded bytes for an RPC that really did send a body.
+///
+/// The hot path tallies frames into the body's plain `bytes_seen` counter; this
+/// publishes once at upload termination (clean EOF, overflow abort, transport
+/// error, or `Drop`) rather than paying an atomic per DATA frame. `latch`
+/// releases summary builders that were constructed while the upload was still
+/// in flight — an early backend response can flush headers, and therefore build
+/// the deferred summary, long before a client-streaming upload finishes.
+pub struct GrpcUploadByteAccounting {
+    /// `ctx.bytes_sent_observed` for the request being forwarded.
+    observed: Arc<AtomicU64>,
+    /// Signaled by the same publication that writes `observed`.
+    latch: Arc<crate::proxy::body::DirectH2BytesLatch>,
+    /// Guards against double publication when EOF is followed by `Drop`.
+    published: bool,
+}
+
+impl GrpcUploadByteAccounting {
+    pub fn new(
+        observed: Arc<AtomicU64>,
+        latch: Arc<crate::proxy::body::DirectH2BytesLatch>,
+    ) -> Self {
+        Self {
+            observed,
+            latch,
+            published: false,
+        }
+    }
+
+    /// Publish `seen` forwarded DATA bytes exactly once and release waiters.
+    ///
+    /// `fetch_max` matches every other `bytes_sent_observed` writer, so a
+    /// publication can never lower an earlier observation.
+    fn publish(&mut self, seen: u64) {
+        crate::proxy::body::publish_passthrough_request_bytes(
+            &self.observed,
+            seen,
+            &mut self.published,
+            &self.latch,
+        );
+    }
+}
+
 /// Sum type for gRPC request bodies: either pre-buffered or streaming from the
 /// client. This allows a single pool type (`SendRequest<GrpcBody>`) to handle
 /// both buffered (retries, plugins) and streaming (zero-copy fast path) bodies.
@@ -134,6 +184,11 @@ pub enum GrpcBody {
     /// `exceeded` flag if the limit is breached. The caller checks the flag
     /// after `send_request()` completes to return a proper gRPC error.
     ///
+    /// `bytes_seen` accumulates unconditionally, not only under a configured
+    /// limit: it is also the forwarded-byte tally `request_bytes` publishes
+    /// into `ctx.bytes_sent_observed` at upload termination, which is what
+    /// `TransactionSummary.bytes_sent` and `api_chargeback` bill on.
+    ///
     /// **Thread-safety of `bytes_seen: usize`**: this counter is only read
     /// and written inside `poll_frame()`, which requires `Pin<&mut Self>`.
     /// The mutable-borrow requirement guarantees exclusive ownership, making
@@ -166,6 +221,11 @@ pub enum GrpcBody {
         bytes_seen: usize,
         max_bytes: usize,
         exceeded: Arc<AtomicBool>,
+        /// Publishes `bytes_seen` into the request's shared request-byte
+        /// counter once the upload terminates. `None` only where no request
+        /// context owns the dispatch (mesh/test entries that build the body
+        /// directly).
+        request_bytes: Option<GrpcUploadByteAccounting>,
         /// Fired from `Drop` when this request body terminates. Carries the
         /// deferred circuit-breaker probe accounting so a late upload overflow
         /// is recorded at upload termination, not at response-header time.
@@ -216,6 +276,20 @@ pub enum GrpcBody {
 
 impl Drop for GrpcBody {
     fn drop(&mut self) {
+        // Publish whatever the streamed upload actually forwarded before it was
+        // abandoned. `Drop` is the only terminal signal a cancelled, reset, or
+        // never-polled upload reaches, so without this a partial upload would
+        // bill zero uploaded bytes. Idempotent with the EOF/error publications
+        // in `poll_frame`.
+        if let GrpcBody::Streaming {
+            bytes_seen,
+            request_bytes,
+            ..
+        } = self
+            && let Some(accounting) = request_bytes.as_mut()
+        {
+            accounting.publish(*bytes_seen as u64);
+        }
         // Notify the upload-termination observer when the streaming request
         // body is dropped. hyper drops it once the upload finishes (END_STREAM)
         // or the stream is reset, so this is the canonical "request upload
@@ -268,6 +342,7 @@ impl http_body::Body for GrpcBody {
                 bytes_seen,
                 max_bytes,
                 exceeded,
+                request_bytes,
                 grpc_messages,
                 grpc_scanner,
                 auth_deadline,
@@ -276,24 +351,33 @@ impl http_body::Body for GrpcBody {
                 if let Some(deadline) = auth_deadline
                     && deadline.expired(cx)
                 {
+                    // Terminal: the authorization bound replaced the rest of
+                    // the upload with an error, so publish what was forwarded.
+                    if let Some(accounting) = request_bytes.as_mut() {
+                        accounting.publish(*bytes_seen as u64);
+                    }
                     return Poll::Ready(Some(Err(deadline.message().into())));
                 }
                 match incoming.poll_frame(cx) {
                     Poll::Ready(Some(Ok(frame))) => {
                         if let Some(data) = frame.data_ref() {
-                            if *max_bytes > 0 {
-                                *bytes_seen = bytes_seen.saturating_add(data.len());
-                                if *bytes_seen > *max_bytes {
-                                    exceeded.store(true, Ordering::Release);
-                                    // Return an error to RST_STREAM the request,
-                                    // preventing the backend from treating a truncated
-                                    // prefix as a completed stream.
-                                    return Poll::Ready(Some(Err(format!(
-                                        "gRPC request payload exceeds maximum of {} bytes",
-                                        max_bytes
-                                    )
-                                    .into())));
+                            // Tally every forwarded DATA frame, limit or not:
+                            // this counter is the request-byte observation the
+                            // terminal summary bills on.
+                            *bytes_seen = bytes_seen.saturating_add(data.len());
+                            if *max_bytes > 0 && *bytes_seen > *max_bytes {
+                                exceeded.store(true, Ordering::Release);
+                                if let Some(accounting) = request_bytes.as_mut() {
+                                    accounting.publish(*bytes_seen as u64);
                                 }
+                                // Return an error to RST_STREAM the request,
+                                // preventing the backend from treating a truncated
+                                // prefix as a completed stream.
+                                return Poll::Ready(Some(Err(format!(
+                                    "gRPC request payload exceeds maximum of {} bytes",
+                                    max_bytes
+                                )
+                                .into())));
                             }
                             if let (Some(messages), Some(scanner)) =
                                 (grpc_messages.as_ref(), grpc_scanner.as_mut())
@@ -303,8 +387,19 @@ impl http_body::Body for GrpcBody {
                         }
                         Poll::Ready(Some(Ok(frame)))
                     }
-                    Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
-                    Poll::Ready(None) => Poll::Ready(None),
+                    Poll::Ready(Some(Err(e))) => {
+                        if let Some(accounting) = request_bytes.as_mut() {
+                            accounting.publish(*bytes_seen as u64);
+                        }
+                        Poll::Ready(Some(Err(e)))
+                    }
+                    Poll::Ready(None) => {
+                        // Clean END_STREAM: the whole upload is on the wire.
+                        if let Some(accounting) = request_bytes.as_mut() {
+                            accounting.publish(*bytes_seen as u64);
+                        }
+                        Poll::Ready(None)
+                    }
                     Poll::Pending => Poll::Pending,
                 }
             }
@@ -2209,6 +2304,15 @@ pub(crate) fn grpc_status_from_maps(
     trailers
         .get("grpc-status")
         .or_else(|| headers.get("grpc-status"))
+        .map(|status| parse_grpc_status_joined_value(status))
+}
+
+/// [`grpc_status_from_maps`] for a caller that only holds the initial HEADERS
+/// block and has no separate wire-trailer view — the Trailers-Only encoding,
+/// where the terminal status rides in the initial headers with END_STREAM.
+pub(crate) fn grpc_status_from_headers(headers: &HashMap<String, String>) -> Option<u32> {
+    headers
+        .get("grpc-status")
         .map(|status| parse_grpc_status_joined_value(status))
 }
 
@@ -4210,6 +4314,12 @@ pub async fn proxy_grpc_request_from_bytes(
 /// the upload terminates (clean EOF or overflow abort) — see
 /// `GrpcUploadTerminationObserver`.
 ///
+/// `request_bytes` carries `ctx.bytes_sent_observed` plus the publication latch
+/// the deferred summary waits on. Unlike the buffered arms there is no collected
+/// length to report, so this is the only place the fully-streamed upload's
+/// forwarded byte count reaches `TransactionSummary.bytes_sent` (and therefore
+/// `api_chargeback`'s sent-bandwidth billing).
+///
 /// `transport` is the ALREADY-MATERIALIZED [`GrpcDispatchTransport`] the caller
 /// resolved for its LB-selected target (issue #3728). It is a parameter rather
 /// than a hard-wired direct pool so the H1/H2 frontend's fully-streaming fast
@@ -4231,6 +4341,7 @@ pub async fn proxy_grpc_request_streaming(
     grpc_deadline_at: Option<tokio::time::Instant>,
     held_frontend_upload: &mut Option<GrpcBody>,
     grpc_request_messages: Option<Arc<AtomicU64>>,
+    request_bytes: Option<GrpcUploadByteAccounting>,
     auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     let (parts, body) = req.into_parts();
@@ -4261,6 +4372,7 @@ pub async fn proxy_grpc_request_streaming(
         bytes_seen: 0,
         max_bytes: max_grpc_recv_size_bytes,
         exceeded: Arc::clone(&body_size_exceeded),
+        request_bytes,
         upload_observer,
         grpc_messages,
         grpc_scanner,

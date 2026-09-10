@@ -76,7 +76,7 @@ paths:
 - UDP: `UdpSocket` per session; GSO-batched send on Linux.
 - `Proxy.dispatch_kind` is precomputed at config load by `GatewayConfig::resolve_dispatch_kind()`.
 - Buffer only when a plugin requires request/response body buffering or retry needs replay. SSE always streams.
-- `ProxyBody` response coalescing uses one generic `Coalescing<S: FrameSource>` adapter with reqwest, H2/gRPC, and H3 sources. Do not create parallel per-protocol coalescers.
+- `ProxyBody` response coalescing uses one generic `Coalescing<S: FrameSource>` adapter with reqwest, H2/gRPC, and H3 sources. Do not create parallel per-protocol coalescers. Its accumulator is lazy (issue #5040): construction reserves nothing, the first DATA frame is held as `Bytes`, and the aggregation `BytesMut` is allocated only when a second frame must be merged. Keep the one-frame, idle-body, and large-frame-bypass paths free of both the reservation and the copy.
 - Direct-H2 plain responses bypass `coalescing_h2_body` only when `Content-Length` is known, within max response limit, and at least 512 KiB.
 
 ## HTTP/3 And gRPC

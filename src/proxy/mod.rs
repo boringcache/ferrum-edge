@@ -33813,6 +33813,14 @@ async fn handle_proxy_request_inner(
         // CLOSED state, or the buffered-request streaming path) records the
         // outcome at response-header time as before.
         let mut grpc_streaming_probe_recorder: Option<Arc<GrpcStreamingProbeRecorder>> = None;
+        // Publication latch for the fully-streamed native-gRPC upload's
+        // forwarded request bytes (GHSA-8x5h-g4xh-hgc9). That arm never
+        // collects a body, so `ctx.bytes_sent_observed` is written once at
+        // upload termination; a backend that answers before a client-streaming
+        // upload finishes would otherwise build the deferred summary — and bill
+        // `api_chargeback` — against a still-zero counter. `None` on every
+        // buffered arm, which publishes the collected length synchronously.
+        let mut grpc_streaming_request_bytes_latch: Option<Arc<body::DirectH2BytesLatch>> = None;
         // Unread frontend upload retained across a synthesized Trailers-Only
         // error on the fully-streaming H2 path. The pinned h2 transport already
         // orders response HEADERS before its permitted NO_ERROR cancellation;
@@ -34336,6 +34344,12 @@ async fn handle_proxy_request_inner(
                     upstream_balancer.clone(),
                 ));
                 grpc_backend_admission_started_at = Instant::now();
+                let request_bytes_latch = Arc::new(body::DirectH2BytesLatch::new());
+                grpc_streaming_request_bytes_latch = Some(Arc::clone(&request_bytes_latch));
+                let request_bytes_accounting = grpc_proxy::GrpcUploadByteAccounting::new(
+                    Arc::clone(&ctx.bytes_sent_observed),
+                    request_bytes_latch,
+                );
                 let result = grpc_proxy::proxy_grpc_request_streaming(
                     request,
                     grpc_dispatch_proxy,
@@ -34353,6 +34367,11 @@ async fn handle_proxy_request_inner(
                     ctx.grpc_deadline_at(),
                     &mut held_frontend_grpc_upload,
                     Some(Arc::clone(&ctx.grpc_request_messages_observed)),
+                    // The buffered arms `fetch_max` the collected length into
+                    // this counter; the streamed arm has no collected length,
+                    // so the body publishes its forwarded DATA tally at upload
+                    // termination instead (GHSA-8x5h-g4xh-hgc9).
+                    Some(request_bytes_accounting),
                     // Same absolute plan the buffered gRPC arms use (#3815);
                     // the fully-streamed upload gets the gateway-owned pump
                     // instead of a bounded collect.
@@ -35604,6 +35623,17 @@ async fn handle_proxy_request_inner(
                 } else {
                     None
                 };
+                // A fully-streamed upload publishes its forwarded request bytes
+                // only at upload termination, which a server- or bidi-streaming
+                // RPC can reach long after the response headers this summary was
+                // built from. Waiting on the latch is what keeps `bytes_sent`
+                // (and `api_chargeback`'s sent-bandwidth charge) from settling on
+                // a still-zero counter. `None` on every buffered request arm.
+                let deferred_grpc_logger = deferred_grpc_logger.map(|logger| {
+                    logger.with_passthrough_request_bytes_latch(
+                        grpc_streaming_request_bytes_latch.clone(),
+                    )
+                });
 
                 if body_exceeded {
                     drop(backend_admission_permits.take());

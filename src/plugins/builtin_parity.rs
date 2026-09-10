@@ -453,7 +453,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "mcp_gateway",
         classification: BuiltinPluginClassification::Public,
         priority: 2992,
-        active_phases: "before_proxy, transform_request_body, transform_response_body",
+        active_phases: "before_proxy, transform_request_body, transform_response_body, after_proxy, on_final_response_body, on_response_committed",
         matrix_protocols: HTTP_ONLY_PROTOCOLS,
         protocol_rationale: "HTTP-only MCP JSON-RPC parsing, metadata, and namespaced tool/resource/prompt routing",
     },

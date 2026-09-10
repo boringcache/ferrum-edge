@@ -18,7 +18,10 @@
 //!   `large_window = true`, so a handful of header bits can ask it for a 1 GiB
 //!   ring buffer. RFC 7932 caps the `br` window at 24 bits, and a peer that
 //!   named `br` has not agreed to anything larger. `gzip` is decoded through
-//!   `MultiGzDecoder`, whose DEFLATE window RFC 1951 fixes at 32 KiB.
+//!   `flate2::bufread::GzDecoder`, whose DEFLATE window RFC 1951 fixes at
+//!   32 KiB. Each gzip coding must contain exactly one complete member; any
+//!   remaining bytes, including another valid member, are rejected. Request
+//!   normalization and both representation gates share this rule.
 //! * **Charged before allocation.** Every growth of the output buffer is
 //!   reserved against an aggregate budget BEFORE the allocator is asked for it,
 //!   and topped up to the capacity the allocator actually returned. The active
@@ -100,8 +103,8 @@ pub(crate) fn projected_decode_output_capacity(decoded_len: usize, limit: usize)
 ///
 /// Derivation, from the locked sources:
 ///
-/// * `flate2::read::MultiGzDecoder::new` wraps the input in
-///   `std::io::BufReader::new` — one 8 KiB buffer (`flate2` `src/gz/read.rs`);
+/// * `flate2::bufread::GzDecoder` reads the input slice directly, without an
+///   additional `std::io::BufReader` allocation;
 /// * `flate2`'s `Decompress` holds a boxed `miniz_oxide` `InflateState`
 ///   (`flate2` `src/ffi/miniz_oxide.rs`). `InflateState` is
 ///   dominated by `dict: [u8; TINFL_LZ_DICT_SIZE]` = 32 KiB plus a
@@ -109,8 +112,8 @@ pub(crate) fn projected_decode_output_capacity(decoded_len: usize, limit: usize)
 ///   `[i16; 1024] + [i16; 576]` = 3,200 B each (`miniz_oxide`
 ///   `src/inflate/core.rs`), i.e. well under 16 KiB of tables and scalars.
 ///
-/// That is on the order of 56 KiB. DEFLATE's window is fixed at 32 KiB by
-/// RFC 1951, so nothing in the stream can enlarge it. `256 KiB` is a ~4.5x
+/// That is on the order of 48 KiB. DEFLATE's window is fixed at 32 KiB by
+/// RFC 1951, so nothing in the stream can enlarge it. `256 KiB` is a >5x
 /// margin for allocator overhead and for a future `miniz_oxide` that grows its
 /// state, and is still small enough that gzip decodes are not rationed.
 pub(crate) const GZIP_DECODER_SCRATCH_BYTES: usize = 256 * 1024;
@@ -206,7 +209,7 @@ pub(crate) enum ChargedDecodeError {
     /// A coding token this decoder does not implement.
     Unsupported,
     /// A supported coding whose stream is malformed, truncated, Large Window
-    /// Brotli, or followed by trailing bytes.
+    /// Brotli, or followed by trailing bytes (including another gzip member).
     Malformed,
     /// The decode would have produced more than the caller's ceiling.
     TooLarge,
@@ -411,13 +414,22 @@ pub(crate) fn decode_one_coding(
     // capacity refusal alike — which is what returns the codec's heap charge
     // before the next pass asks for its own.
     match coding {
-        SupportedCoding::Gzip => read_decoded_bounded(
-            flate2::read::MultiGzDecoder::new(data).take(take),
-            limit,
-            concurrent_bytes,
-            reservation,
-            budget,
-        ),
+        SupportedCoding::Gzip => {
+            // BufRead over the slice leaves all bytes after the first member
+            // visible, without read-ahead hiding a suffix in an internal buffer.
+            let mut decoder = flate2::bufread::GzDecoder::new(data);
+            let decoded = read_decoded_bounded(
+                (&mut decoder).take(take),
+                limit,
+                concurrent_bytes,
+                reservation,
+                budget,
+            )?;
+            if !decoder.into_inner().is_empty() {
+                return Err(ChargedDecodeError::Malformed);
+            }
+            Ok(decoded)
+        }
         SupportedCoding::Brotli => read_decoded_bounded(
             StrictBrotliReader::new(data).take(take),
             limit,

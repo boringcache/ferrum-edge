@@ -272,6 +272,75 @@ fn grpc_chargeback_file_config(port: u16, overrides: Value) -> String {
     serde_yaml::to_string(&config).expect("serialize gRPC chargeback yaml")
 }
 
+/// Same shape as [`grpc_chargeback_file_config`] plus per-byte bandwidth
+/// pricing, so a test can assert the uploaded request bytes the gateway
+/// actually forwarded (GHSA-8x5h-g4xh-hgc9).
+fn grpc_chargeback_bandwidth_file_config(port: u16, overrides: Value) -> String {
+    let mut proxy = json!({
+        "id": "grpc-chargeback",
+        "listen_path": "/grpc",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": port,
+        "strip_listen_path": true,
+        "backend_connect_timeout_ms": 2000,
+        "backend_read_timeout_ms": 5000,
+        "backend_write_timeout_ms": 5000,
+        "auth_mode": "single",
+        "plugins": [
+            {"plugin_config_id": "grpc-chargeback-key-auth"},
+            {"plugin_config_id": "grpc-chargeback-pricing"}
+        ],
+    });
+    if let (Some(proxy_obj), Some(overrides_obj)) = (proxy.as_object_mut(), overrides.as_object()) {
+        for (key, value) in overrides_obj {
+            proxy_obj.insert(key.clone(), value.clone());
+        }
+    }
+    let config = json!({
+        "version": "1",
+        "proxies": [proxy],
+        "consumers": [{
+            "id": "grpc-chargeback-consumer",
+            "username": "grpc-chargeback-user",
+            "credentials": {
+                "keyauth": [{"key": "grpc-chargeback-key-99887766"}]
+            }
+        }],
+        "upstreams": [],
+        "plugin_configs": [
+            {
+                "id": "grpc-chargeback-key-auth",
+                "plugin_name": "key_auth",
+                "scope": "proxy",
+                "proxy_id": "grpc-chargeback",
+                "enabled": true,
+                "config": {"key_location": "header:x-api-key"},
+            },
+            {
+                "id": "grpc-chargeback-pricing",
+                "plugin_name": "api_chargeback",
+                "scope": "proxy",
+                "proxy_id": "grpc-chargeback",
+                "enabled": true,
+                "config": {
+                    "pricing_tiers": [
+                        {"status_codes": [200], "price_per_call": 0.001}
+                    ],
+                    "bandwidth_pricing": {
+                        "price_per_byte_sent": 0.01,
+                        "price_per_byte_received": 0.02
+                    },
+                    "render_cache_ttl_seconds": 0,
+                    "cache_invalidation_min_age_ms": 0,
+                    "cleanup_interval_seconds": 0,
+                },
+            }
+        ],
+    });
+    serde_yaml::to_string(&config).expect("serialize gRPC chargeback bandwidth yaml")
+}
+
 async fn wait_for_chargeback_statuses(
     harness: &GatewayHarness,
     consumer: &str,
@@ -1587,6 +1656,99 @@ async fn assert_api_chargeback_uses_terminal_grpc_status(overrides: Value, case:
         Some(2),
         "{case}: {charges:#?}"
     );
+}
+
+/// GHSA-8x5h-g4xh-hgc9: the fully-streamed native-gRPC upload publishes no
+/// collected request length, so its forwarded DATA bytes must reach
+/// `TransactionSummary.bytes_sent` from the request body itself. Before the fix
+/// the streamed arm billed zero uploaded bytes while the buffered arm billed
+/// the real count.
+async fn assert_api_chargeback_bills_grpc_upload_bytes(overrides: Value, case: &str) {
+    // The gRPC client prepends the 5-byte length-prefix header, so the wire
+    // request body is `PAYLOAD.len() + 5`.
+    const PAYLOAD: &[u8] = b"chargeback-upload";
+    let expected_bytes_sent = (PAYLOAD.len() + 5) as u64;
+
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    // `AcceptRpc` drains the request body, so the backend answers only after it
+    // has received the complete upload and its end-of-stream.
+    let _backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondStatus {
+            code: 0,
+            message: "",
+        })
+        .spawn()
+        .expect("spawn backend");
+    let harness = GatewayHarness::builder()
+        .file_config(grpc_chargeback_bandwidth_file_config(
+            backend_port,
+            overrides,
+        ))
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn gRPC chargeback gateway");
+    let gateway_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .expect("gateway port");
+    let client = GrpcClient::h2c(format!("127.0.0.1:{gateway_port}"));
+    let auth = [("x-api-key", "grpc-chargeback-key-99887766".to_string())];
+
+    let body = Bytes::from_static(PAYLOAD);
+    let response = client
+        .unary_with_headers("/grpc/echo.Echo/Upload", body, &auth)
+        .await
+        .expect("upload RPC");
+    assert_eq!(response.http_status, 200, "{case}: {response:?}");
+    assert_eq!(response.grpc_status(), Some(0), "{case}: {response:?}");
+
+    let charges = wait_for_chargeback_statuses(
+        &harness,
+        "grpc-chargeback-user",
+        "grpc-chargeback",
+        &[(200, 1)],
+    )
+    .await;
+    let bandwidth =
+        &charges["consumers"]["grpc-chargeback-user"]["proxies"]["grpc-chargeback"]["bandwidth"];
+    let bytes_sent = bandwidth["bytes_sent"].as_u64();
+    assert_eq!(
+        bytes_sent,
+        Some(expected_bytes_sent),
+        "{case}: streamed gRPC upload bytes must be billed; {charges:#?}"
+    );
+    let charge_sent = bandwidth["charge_sent"]
+        .as_f64()
+        .expect("sent-bandwidth charge");
+    assert!(
+        (charge_sent - expected_bytes_sent as f64 * 0.01).abs() < 1e-9,
+        "{case}: sent-bandwidth charge must price the forwarded upload; {charges:#?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn api_chargeback_bills_streamed_and_buffered_h2_grpc_upload_bytes() {
+    // No retry configured -> fully-streamed request AND response (the arm that
+    // previously published nothing).
+    assert_api_chargeback_bills_grpc_upload_bytes(Value::Null, "streamed_h2").await;
+    // Retry configured -> the buffered-request arm, which must still report the
+    // same count and must not double count.
+    assert_api_chargeback_bills_grpc_upload_bytes(
+        json!({
+            "retry": {
+                "max_retries": 1,
+                "retry_on_connect_failure": true,
+            }
+        }),
+        "buffered_h2",
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -407,6 +407,15 @@ every other surface is `false` or omitted.
 | `hash_arguments` | boolean | `true` | Emit SHA-256 hashes of tool arguments as `ai_tool_governor.arguments_hashes`. Raw arguments are never placed in metadata. |
 | `max_argument_log_bytes` | integer ≥ 0 | `0` | When `> 0`, log up to this many bytes of a **blocked** call's raw arguments at `debug` for audit. `0` keeps raw arguments out of logs entirely. |
 
+### Admission diagnostics
+
+A key that is **present but wrong-typed** is reported as a type error naming the
+JSON kind that was supplied (`… 'action' must be a string (expected allow, deny,
+redact_args, require_approval, or dry_run), got a number`), never as a missing
+key — the same shape `risk` and `approval.fail_on_error` already use. A
+present-but-empty `approval.endpoint_url` is likewise reported as empty rather
+than as absent. Rejected values are never echoed back; only their kind is named.
+
 ### Disabled instances
 
 `enabled: false` short-circuits the constructor: the plugin buffers nothing and
@@ -539,6 +548,26 @@ When `observability.emit_metadata` is on (default), the plugin writes
 when a payload carried an unreadable tool-call shape; never raw body bytes).
 `unrecognized_tool_call_shape` is recorded in **both** modes and under **both**
 `unknown_shape_action` settings, and never sets `decision`.
+
+**Bounded observation ledgers.** The comma-delimited cumulative fields —
+`tool_names`, `policy_ids`, `approval_id`, `arguments_hashes`, and
+`redacted_tools` — are aggregated across every governed surface of one request
+and every completed batch of one response stream, so each one is explicitly
+bounded: at most **64 distinct values** (matching the 64-call per-batch
+governable limit, so one well-formed batch is never truncated) and at most
+**8192 UTF-8 bytes** per field, with each individual value retained to at most
+**256 UTF-8 bytes** plus a trailing `…` when it was shortened. A stream that
+keeps emitting batches of distinct tool names therefore cannot grow this state
+without limit — the documented `0` (unlimited) response-byte policy leaves no
+wire-byte ceiling that could serve as the bound. Values are deduplicated, and
+order of first observation is preserved.
+
+When a ledger is full, further distinct values are counted in
+`ai_tool_governor.observations_omitted` (absent when nothing was dropped) so a
+capped field is never silently short. Truncation changes nothing about
+enforcement: every tool call is still governed, the highest-severity `decision`
+and the maximum `risk` are still recorded, and a higher-severity batch still
+replaces a weaker decision's ledger in full.
 
 Raw arguments are **never** placed in metadata and never logged unless
 `observability.max_argument_log_bytes > 0` (then a bounded excerpt of a blocked

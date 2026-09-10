@@ -9350,11 +9350,44 @@ fn ai_prompt_shield_schema_matches_runtime_validation() {
         json!({"patterns": []}),
         json!({"max_scan_bytes": 0}),
         json!({"patterns": ["email"], "scan_field": "all"}),
+        // A `custom_patterns` entry is as closed as the top level: an
+        // unsupported nested member is refused by both surfaces, not read as
+        // name/regex and dropped.
+        json!({
+            "patterns": [],
+            "custom_patterns": [{"name": "account", "regex": "ACCT-[0-9]+", "note": "x"}]
+        }),
+        // The published `name` bound and the constructor's agree.
+        json!({
+            "patterns": [],
+            "custom_patterns": [{"name": "n".repeat(200), "regex": "ACCT-[0-9]+"}]
+        }),
     ] {
         assert_component_validity(&spec, "AiPromptShieldConfig", &config, false);
         assert!(
             AiPromptShield::new(&config).is_err(),
             "runtime should reject schema-invalid config: {config}"
+        );
+    }
+
+    // `max_scan_bytes` publishes an explicit numeric domain whose bound every
+    // JSON number representation holds exactly, so the component and the
+    // constructor reach the same verdict at, just above, and far above it.
+    // Written through `from_str` because `json!` would need the literals to fit
+    // a Rust integer type.
+    for (raw, expected_valid) in [
+        (r#"{"max_scan_bytes":9007199254740991}"#, true),
+        (r#"{"max_scan_bytes":1024.0}"#, true),
+        (r#"{"max_scan_bytes":9007199254740992}"#, false),
+        (r#"{"max_scan_bytes":18446744073709551616}"#, false),
+        (r#"{"max_scan_bytes":1024.5}"#, false),
+    ] {
+        let config: serde_json::Value = serde_json::from_str(raw).expect("fixture parses");
+        assert_component_validity(&spec, "AiPromptShieldConfig", &config, expected_valid);
+        assert_eq!(
+            AiPromptShield::new(&config).is_ok(),
+            expected_valid,
+            "component and constructor must agree on {raw}"
         );
     }
 }
@@ -16293,5 +16326,294 @@ fn mesh_custom_authorization_failure_documentation_matches_the_runtime() {
     assert!(
         mesh_docs.contains("capped at **128 process-wide**"),
         "docs/mesh.md must state the shared process-wide check budget"
+    );
+}
+
+/// Issues #5176, #5177, #5178, #5181, #5189: the published
+/// `serverless_function` grammar and the constructor's admission rules must
+/// describe the same set of accepted configurations.
+#[test]
+fn serverless_function_schema_matches_runtime_admission() {
+    use ferrum_edge::plugins::create_plugin;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let properties = spec
+        .pointer("/components/schemas/ServerlessFunctionConfig/properties")
+        .expect("ServerlessFunctionConfig properties exist");
+
+    fn compile_pattern(value: &serde_json::Value) -> Regex {
+        let raw = value["pattern"].as_str().expect("published pattern");
+        Regex::new(raw).expect("published pattern compiles")
+    }
+    let pattern_for = |field: &str| compile_pattern(&properties[field]);
+
+    // Issue #5177: `format: uint64` is not an assertion, so the ceiling the
+    // runtime can actually represent must be published as `maximum`.
+    for field in ["timeout_ms", "max_response_body_bytes"] {
+        assert_eq!(
+            properties[field]["maximum"].as_u64(),
+            Some(u64::MAX),
+            "{field} must publish the u64 ceiling"
+        );
+        assert_eq!(properties[field]["minimum"].as_u64(), Some(1), "{field}");
+    }
+
+    // Issue #5176: `forward_headers` entries are HTTP field-name tokens.
+    let header_item = &properties["forward_headers"]["items"];
+    assert_eq!(header_item["minLength"].as_u64(), Some(1));
+    let header_pattern = compile_pattern(header_item);
+    assert!(header_pattern.is_match("x-request-id"));
+    assert!(header_pattern.is_match("X-Request-ID"));
+    assert!(!header_pattern.is_match(""));
+    assert!(!header_pattern.is_match("bad header"));
+    assert!(!header_pattern.is_match("bad:header"));
+
+    // Issue #5189: a credential must be representable as an HTTP field value.
+    for field in ["azure_function_key", "gcp_bearer_token"] {
+        let pattern = pattern_for(field);
+        assert!(pattern.is_match("ordinary-credential=="), "{field}");
+        assert!(!pattern.is_match("audit\ncredential"), "{field}");
+        assert!(!pattern.is_match("audit\rcredential"), "{field}");
+        assert!(!pattern.is_match("audit\u{0}credential"), "{field}");
+        assert!(!pattern.is_match("audit\u{7f}credential"), "{field}");
+    }
+
+    // Issue #5181: the Lambda Invoke identifier grammars.
+    assert_eq!(
+        properties["aws_function_name"]["maxLength"].as_u64(),
+        Some(170)
+    );
+    assert_eq!(properties["aws_qualifier"]["maxLength"].as_u64(), Some(128));
+    let name_pattern = pattern_for("aws_function_name");
+    for accepted in [
+        "my-function",
+        "my_function.v2",
+        "my-function:prod",
+        "my-function:$LATEST",
+        "123456789012:function:my-function",
+        "arn:aws:lambda:us-east-1:123456789012:function:my-function",
+        "arn:aws-cn:lambda:cn-north-1:123456789012:function:my-function:prod",
+    ] {
+        assert!(name_pattern.is_match(accepted), "name={accepted}");
+    }
+    for rejected in [" ", "my function", "my/function", "my-function:bad alias"] {
+        assert!(!name_pattern.is_match(rejected), "name={rejected:?}");
+    }
+    let qualifier_pattern = pattern_for("aws_qualifier");
+    for accepted in ["$LATEST", "prod", "1", "blue-green_2"] {
+        assert!(qualifier_pattern.is_match(accepted), "qualifier={accepted}");
+    }
+    for rejected in ["not a qualifier", "bad/alias", ""] {
+        assert!(
+            !qualifier_pattern.is_match(rejected),
+            "qualifier={rejected:?}"
+        );
+    }
+
+    // Issue #5178: one lexical URL contract for both URL-valued fields.
+    let url_pattern = pattern_for("function_url");
+    for accepted in [
+        "http://127.0.0.1/a%20b",
+        "https://functions.example/api/transform",
+        "https://functions.example:65535/api/transform",
+        "https://[2001:db8::1]:8443/api/transform",
+        "http://127.0.0.1:0/pre",
+    ] {
+        assert!(url_pattern.is_match(accepted), "url={accepted}");
+    }
+    for rejected in [
+        "https://:1234",
+        "https://127.0.0.1:65536/pre",
+        "http://127.0.0.1/a b",
+        "http://user:pass@127.0.0.1/pre",
+        "https://functions.example/api#fragment",
+    ] {
+        assert!(!url_pattern.is_match(rejected), "url={rejected}");
+    }
+    let endpoint_pattern = pattern_for("aws_endpoint_url");
+    for accepted in ["http://localhost:4566", "http://localhost:4566/"] {
+        assert!(endpoint_pattern.is_match(accepted), "endpoint={accepted}");
+    }
+    for rejected in [
+        "https://example.com/lambda",
+        "https://example.com?token=secret",
+        "https://:1234",
+        "https://127.0.0.1:65536",
+    ] {
+        assert!(!endpoint_pattern.is_match(rejected), "endpoint={rejected}");
+    }
+
+    // Runtime parity for the same inputs: every schema rejection above is also
+    // a constructor rejection, and the accepted base configuration builds.
+    let base = json!({
+        "provider": "azure_functions",
+        "function_url": "http://127.0.0.1:45678/pre"
+    });
+    assert!(create_plugin("serverless_function", &base).is_ok());
+    for extra in [
+        json!({"function_url": "https://:1234"}),
+        json!({"function_url": "https://127.0.0.1:65536/pre"}),
+        json!({"function_url": "http://127.0.0.1/a b"}),
+        json!({"forward_headers": [""]}),
+        json!({"forward_headers": ["bad header"]}),
+        json!({"azure_function_key": "audit\ncredential"}),
+        json!({"gcp_bearer_token": "audit\ncredential"}),
+        json!({"aws_function_name": "bad name"}),
+        json!({"aws_qualifier": "not a qualifier"}),
+        json!({"aws_endpoint_url": "https://example.com/lambda"}),
+    ] {
+        let mut config = base.clone();
+        merge_into_object(&mut config, &extra);
+        assert!(
+            create_plugin("serverless_function", &config).is_err(),
+            "runtime must reject the schema-invalid config: {config}"
+        );
+    }
+}
+
+/// Issue #5239: the `ApiChargebackConfig` component must reject exactly what the
+/// constructor rejects — no-op pricing, blank currency, out-of-range or
+/// duplicate status codes, negative timer/budget values, simultaneous `schema`
+/// and `schema_ref`, and projection features the billing-row record family
+/// cannot express.
+#[test]
+fn api_chargeback_schema_admits_only_constructible_configs() {
+    use ferrum_edge::plugins::api_chargeback::ApiChargeback;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/ApiChargebackConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("ApiChargebackConfig schema compiles");
+
+    // The minimal effective configuration: a nonempty tier counts even at a
+    // zero price, because an explicitly zero-priced tier still meters calls.
+    let base = json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0}]});
+    let with = |patch: serde_json::Value| -> serde_json::Value {
+        let mut config = base.clone();
+        let object = config.as_object_mut().expect("base is an object");
+        for (key, value) in patch.as_object().expect("patch is an object") {
+            object.insert(key.clone(), value.clone());
+        }
+        config
+    };
+    let accept = |config: serde_json::Value| {
+        assert!(
+            validator.validate(&config).is_ok(),
+            "OpenAPI must admit {config}"
+        );
+        ApiChargeback::new(&config, "ferrum")
+            .unwrap_or_else(|err| panic!("runtime must admit {config}: {err}"));
+    };
+    let reject = |config: serde_json::Value| {
+        assert!(
+            validator.validate(&config).is_err(),
+            "OpenAPI must reject {config}"
+        );
+        assert!(
+            ApiChargeback::new(&config, "ferrum").is_err(),
+            "runtime must reject {config}"
+        );
+    };
+
+    let documented_per_call = json!({
+        "currency": "USD",
+        "pricing_tiers": [
+            {"status_codes": [200, 201, 202, 204], "price_per_call": 0.00001},
+            {"status_codes": [301, 302], "price_per_call": 0.000005}
+        ]
+    });
+    let documented_combined = json!({
+        "currency": "USD",
+        "pricing_tiers": [
+            {"status_codes": [200, 201, 202, 204], "price_per_call": 0.00001}
+        ],
+        "bandwidth_pricing": {
+            "price_per_byte_sent": 0.0000000001,
+            "price_per_byte_received": 0.0000000002
+        },
+        "stream_connection_pricing": {"price_per_connection": 0.0005}
+    });
+    let supported_derived = json!({
+        "schema": {"derived_fields": [{"name": "row_kind", "kind": "summary_kind"}]}
+    });
+
+    accept(base.clone());
+    accept(json!({"bandwidth_pricing": {"price_per_byte_sent": 0.01}}));
+    accept(json!({"bandwidth_pricing": {"price_per_byte_received": 0.02}}));
+    accept(json!({"stream_connection_pricing": {"price_per_connection": 5}}));
+    accept(json!({"pricing_tiers": [{"status_codes": [100, 599], "price_per_call": 1}]}));
+    accept(documented_per_call);
+    accept(documented_combined);
+    accept(with(json!({"schema": {"omit": ["proxy_name"]}})));
+    accept(with(
+        json!({"schema": {"rename": {"total_calls": "calls"}}}),
+    ));
+    accept(with(supported_derived));
+
+    let unrepresentable_derived = json!({
+        "schema": {"derived_fields": [{"name": "host", "kind": "backend_host"}]}
+    });
+
+    // No effective pricing: the plugin would record nothing.
+    reject(json!({}));
+    reject(json!({"bandwidth_pricing": {}}));
+    reject(json!({"bandwidth_pricing": {"price_per_byte_sent": 0}}));
+    reject(json!({"stream_connection_pricing": {"price_per_connection": 0}}));
+    reject(json!({"pricing_tiers": []}));
+    // Currency is trimmed and must not be empty.
+    reject(with(json!({"currency": ""})));
+    reject(with(json!({"currency": " \t "})));
+    // Status codes must be real HTTP statuses, distinct within a tier.
+    reject(json!({"pricing_tiers": [{"status_codes": [99], "price_per_call": 1}]}));
+    reject(json!({"pricing_tiers": [{"status_codes": [600], "price_per_call": 1}]}));
+    reject(json!({"pricing_tiers": [{"status_codes": [200, 200], "price_per_call": 1}]}));
+    // Timer / budget knobs are unsigned 64-bit integers.
+    reject(with(json!({"render_cache_ttl_seconds": -1})));
+    reject(with(json!({"stale_entry_ttl_seconds": -1})));
+    reject(with(json!({"cache_invalidation_min_age_ms": -1})));
+    reject(with(json!({"cleanup_interval_seconds": -1})));
+    reject(with(json!({"max_entries": 0})));
+    reject(with(json!({"max_retained_bytes": 0})));
+    // Projection surface: mutually exclusive, and narrowed to the billing row.
+    reject(with(json!({"schema": {}, "schema_ref": "missing"})));
+    reject(with(json!({"schema": {"order": ["proxy_id"]}})));
+    reject(with(json!({"schema": {"summary_type": "http"}})));
+    reject(with(json!({"schema": {"timestamp_format": "epoch_ms"}})));
+    reject(with(json!({"schema": {"metadata": {"mode": "omit"}}})));
+    reject(with(json!({"schema": {"omit": ["response_status_code"]}})));
+    reject(with(json!({"schema": {"rename": {"client_ip": "ip"}}})));
+    reject(with(unrepresentable_derived));
+
+    // Constraints that stay runtime-only must be documented as such rather than
+    // silently missing from the component.
+    let component = spec
+        .pointer("/components/schemas/ApiChargebackConfig")
+        .expect("ApiChargebackConfig exists");
+    let description = component["description"].as_str().expect("a description");
+    assert!(
+        description.contains("Runtime-only admission"),
+        "the component must name the constraints JSON Schema cannot express"
+    );
+
+    let guide = include_str!("../../docs/plugins.md");
+    let section = guide
+        .split("### `api_chargeback`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("api_chargeback docs section");
+    assert!(
+        section.contains("Precise admission rules"),
+        "docs/plugins.md must state the exact admission rules"
+    );
+    assert!(
+        section.contains("unsigned 64-bit integer"),
+        "docs/plugins.md must state the unsigned bound on the timer knobs"
     );
 }

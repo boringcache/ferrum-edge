@@ -23153,7 +23153,56 @@ components:
         `custom_tags`, `custom_header_tags`, and `custom_env_tags` combined. The
         individual `maxProperties: 32` bounds remain for generated clients, but
         the cross-property combined total cannot be expressed mechanically.
+        The same 32-name union bound applies across every effective instance
+        on a proxy, including potentially triggered instances. Names compose;
+        later instances win for values they stamp. Invalid root/field types
+        are construction errors; OptionalFailOpen warns and omits the instance.
       additionalProperties: false
+      allOf:
+        - if:
+            allOf:
+              - not:
+                  anyOf:
+                    - required: [span_reporting_disabled]
+                      properties:
+                        span_reporting_disabled: {const: true}
+                    - required: [disable_span_reporting]
+                      not: {required: [span_reporting_disabled]}
+                      properties:
+                        disable_span_reporting: {const: true}
+                    - required: [disableSpanReporting]
+                      not:
+                        anyOf:
+                          - required: [span_reporting_disabled]
+                          - required: [disable_span_reporting]
+                      properties:
+                        disableSpanReporting: {const: true}
+              - anyOf:
+                  - required: [tracing_providers]
+                    properties:
+                      tracing_providers: {type: array, minItems: 1}
+                  - required: [tracing_provider]
+                    not: {required: [tracing_providers]}
+                    properties:
+                      tracing_provider: {type: object}
+          then:
+            properties:
+              service_name: {pattern: '\S'}
+              deployment_environment: {pattern: '\S'}
+              batch_size: {minimum: 1, maximum: 10000}
+              flush_interval_ms: {minimum: 100, maximum: 600000}
+              buffer_capacity: {minimum: 1, maximum: 100000}
+              buffer_max_bytes: {minimum: 65536, maximum: 268435456}
+              max_retries: {minimum: 0, maximum: 10}
+              retry_delay_ms: {minimum: 0, maximum: 60000}
+        - if:
+            not: {required: [tracing_providers]}
+          then:
+            properties:
+              tracing_provider:
+                anyOf:
+                  - type: "null"
+                  - $ref: '#/components/schemas/WorkloadMetricsConfig/$defs/provider'
       properties:
         node_id:
           type: string
@@ -23171,14 +23220,20 @@ components:
           type: object
           additionalProperties:
             type: string
-          description: Static workload labels to inject as `mesh.*` metadata keys on every transaction.
+          description: |
+            Workload label hints, not arbitrary metadata injection. Workload
+            selects the first nonblank canonical-name, app.kubernetes.io/name,
+            app, k8s-app, or workload label, then the SPIFFE service account.
+            App selects app.kubernetes.io/name, app, or k8s-app; service selects
+            service.istio.io/canonical-name, service, or app. Both fall back to
+            workload, whose final fallback is unknown.
         trust_domain_aliases:
-          type: array
+          type: [array, "null"]
           items:
             type: string
           description: Additional SPIFFE trust domains accepted as equivalent to the workload's trust domain.
         trusted_hbone_assertors:
-          type: array
+          type: [array, "null"]
           items:
             oneOf:
               - type: string
@@ -23188,17 +23243,23 @@ components:
                   assertor:
                     type: string
                   asserts:
-                    type: array
+                    type: [array, "null"]
                     items:
                       type: string
                   scope:
-                    type: string
-                    enum: [same_namespace, mesh_wide]
+                    type: [string, "null"]
+                    pattern: '^\s*(same_namespace|mesh_wide)\s*$'
                     description: |
                       `mesh_wide` requires `assertor` to be a full, exactly
                       matched `spiffe://` ID; bare service-account matchers are
                       rejected.
                 additionalProperties: false
+                allOf:
+                  - not:
+                      required: [asserts, scope]
+                      properties:
+                        asserts: {type: array}
+                        scope: {type: string}
           default: ["ztunnel", "waypoint"]
           description: |
             Allow-list of identity-asserting infrastructure components whose
@@ -23206,7 +23267,8 @@ components:
             metrics source attribution. Bare service-account names match any
             peer whose SPIFFE path ends with `/sa/<name>`; full SPIFFE IDs
             match exactly. Default is `["ztunnel", "waypoint"]`. Explicit
-            empty array disables baggage-derived source attribution.
+            empty array disables baggage-derived source attribution. Null
+            selects the default, as does omission.
 
             Identical schema and identical semantics to the `mesh_authz` field
             of the same name — the two plugins share ONE relation, so telemetry
@@ -23228,9 +23290,13 @@ components:
             baseline arrives over native/file/xDS mesh config rather than the
             CRD watcher. Non-numeric or out-of-range ProxyConfig / Telemetry
             sampling values fail closed at Kubernetes translation.
+            Direct standalone omission leaves new roots unsampled; a valid
+            upstream W3C or B3 sampling decision is still inherited.
         custom_tags:
           type: object
           maxProperties: 32
+          propertyNames:
+            $ref: '#/components/schemas/WorkloadMetricsConfig/$defs/customTagName'
           additionalProperties:
             type: string
             maxLength: 1024
@@ -23245,8 +23311,12 @@ components:
         custom_header_tags:
           type: object
           maxProperties: 32
+          propertyNames:
+            $ref: '#/components/schemas/WorkloadMetricsConfig/$defs/customTagName'
           additionalProperties:
             type: string
+            minLength: 1
+            pattern: '^[!#$%&''*+.^_`|~0-9A-Za-z-]+$'
           description: |
             Custom tags populated from request headers (`tag_name ->
             header_name`). Credential-bearing source headers and reserved or
@@ -23256,6 +23326,8 @@ components:
         custom_env_tags:
           type: object
           maxProperties: 32
+          propertyNames:
+            $ref: '#/components/schemas/WorkloadMetricsConfig/$defs/customTagName'
           additionalProperties:
             type: string
             maxLength: 256
@@ -23291,7 +23363,7 @@ components:
                 required: [name, operation]
                 properties:
                   metric:
-                    type: string
+                    type: [string, "null"]
                     description: |
                       Metric family targeted by this override. Supported values
                       are `REQUEST_COUNT`, `REQUEST_DURATION`, `REQUEST_SIZE`,
@@ -23300,10 +23372,9 @@ components:
                       `TCP_RECEIVED_BYTES`, `GRPC_REQUEST_MESSAGES`,
                       `GRPC_RESPONSE_MESSAGES`, their matching `ferrum_mesh_*`
                       metric names, and `ALL_METRICS`; omitted means all
-                      metrics. Recognized Istio standard families Ferrum does
-                      not emit are accepted and ignored with a bounded
-                      construction-time warning; unknown families remain
-                      configuration errors.
+                      metrics, as does null. Other names fail direct plugin
+                      construction. Istio translation separately warns and
+                      omits recognized families Ferrum does not emit.
                   name:
                     type: string
                     description: |
@@ -23312,6 +23383,24 @@ components:
                   operation:
                     type: object
                     required: [type]
+                    allOf:
+                      - if:
+                          properties:
+                            type: {const: rename}
+                        then:
+                          required: [new_name]
+                      - if:
+                          properties:
+                            type: {const: set}
+                        then:
+                          required: [value]
+                      - if:
+                          properties:
+                            type: {const: set_expr}
+                        then:
+                          anyOf:
+                            - required: [expression]
+                            - required: [cel]
                     description: |
                       One of `{"type": "remove"}`,
                       `{"type": "rename", "new_name": "..."}`,
@@ -23370,7 +23459,7 @@ components:
                           so a multibyte expression can be rejected
                           below 512 characters.
                       expression:
-                        type: object
+                        $ref: '#/components/schemas/WorkloadMetricsConfig/$defs/celExpression'
                         description: |
                           Precompiled CEL AST produced by Telemetry translation
                           / materialization (`op`: `literal`, `attribute`,
@@ -23391,22 +23480,22 @@ components:
                 `TCP_CLOSED_CONNECTIONS`, `TCP_SENT_BYTES`,
                 `TCP_RECEIVED_BYTES`, `GRPC_REQUEST_MESSAGES`,
                 `GRPC_RESPONSE_MESSAGES`, their matching `ferrum_mesh_*` metric
-                names, and `ALL_METRICS`. Recognized Istio standard families
-                Ferrum does not emit are accepted and ignored with a bounded
-                construction-time warning; unknown families remain errors.
+                names, and `ALL_METRICS`. Other names fail direct construction;
+                Istio translation separately warns and omits recognized
+                families Ferrum does not emit.
         tracing_providers:
-          type: array
+          type: [array, "null"]
           items:
-            type: object
+            $ref: '#/components/schemas/WorkloadMetricsConfig/$defs/provider'
           description: |
             Per-provider tracing exporters surfaced from the Istio Telemetry
             CRD via the mesh slice. Also enables trace-context propagation
-            when span reporting is disabled.
+            when span reporting is disabled. Present null or [] disables
+            exporters and overrides the singular fallback.
         tracing_provider:
-          type: object
           description: |
             Singular tracing exporter fallback. Ignored when
-            `tracing_providers` is present.
+            `tracing_providers` is present. Omitted/null means no provider.
         span_reporting_disabled:
           type: boolean
           default: false
@@ -23416,8 +23505,9 @@ components:
         service_name:
           type: string
           description: |
-            Service name attached to exported spans. Defaults to the
-            workload's service when omitted.
+            Service name attached to exported spans. Defaults to
+            ferrum-edge-mesh-<namespace> for a nonblank namespace, otherwise
+            ferrum-edge-mesh. Must be nonblank when exporters are active.
         deployment_environment:
           type: string
           description: |
@@ -23426,31 +23516,49 @@ components:
             root config object.
         batch_size:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          default: 50
           description: |
             Span export batch size. Read by the shared OTel exporter options
             off this same root config object.
         flush_interval_ms:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          default: 5000
           description: |
             Span export flush interval in milliseconds. Read by the shared
             OTel exporter options off this same root config object.
         buffer_capacity:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          default: 10000
           description: |
             Maximum buffered spans awaiting export. Read by the shared OTel
             exporter options off this same root config object.
         buffer_max_bytes:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          default: 16777216
           description: |
             Maximum retained bytes of buffered spans. Read by the shared OTel
             exporter options off this same root config object.
         max_retries:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          default: 2
           description: |
             Span export retry attempts. Read by the shared OTel exporter
             options off this same root config object.
         retry_delay_ms:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          default: 1000
           description: |
             Delay between span export retries, in milliseconds. Read by the
             shared OTel exporter options off this same root config object.
@@ -23467,35 +23575,151 @@ components:
             with the Istio Telemetry CRD field name. Ignored when either
             snake_case spelling is present.
         direction_emit:
-          type: object
-          additionalProperties: false
+          type: [object, "null"]
           properties:
             server:
               type: boolean
+              default: true
             client:
               type: boolean
+              default: false
           description: |
             Which traffic directions emit telemetry, translated from
-            `Telemetry.tracing[].match.mode`. Defaults to server-only.
+            `Telemetry.tracing[].match.mode`. Omitted/null defaults to
+            server-only. Unknown nested fields are ignored.
         _effective_mesh_authz_baggage_gates:
           type: array
+          minItems: 1
+          maxItems: 16
           items:
             type: object
             additionalProperties: false
             properties:
               trusted_hbone_assertors:
-                type: array
-                items:
-                  type: object
+                $ref: '#/components/schemas/WorkloadMetricsConfig/properties/trusted_hbone_assertors'
               trust_domain_aliases:
-                type: array
-                items:
-                  type: string
+                $ref: '#/components/schemas/WorkloadMetricsConfig/properties/trust_domain_aliases'
           description: |
             Internal mesh-injection field: an exact copy of every enabled
             global `mesh_authz` baggage gate, evaluated as a fail-closed
             conjunction. Not operator-facing; direct instances configure
             `trusted_hbone_assertors` / `trust_domain_aliases` instead.
+      $defs:
+        customTagName:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[A-Za-z0-9_.-]+$'
+          description: |
+            Runtime additionally rejects reserved telemetry names and sensitive
+            names, including operator-configured classifiers. String/label
+            byte limits and cross-map/cross-instance unions are checked at
+            admission; JSON Schema maxLength counts Unicode characters.
+        provider:
+          type: object
+          required: [kind, config]
+          discriminator:
+            propertyName: kind
+          oneOf:
+            - properties:
+                kind: {const: opentelemetry}
+                config:
+                  type: object
+                  required: [endpoint]
+                  properties:
+                    endpoint: {type: string}
+            - properties:
+                kind: {const: zipkin}
+                config:
+                  type: object
+                  required: [url]
+                  properties:
+                    url: {type: string}
+            - properties:
+                kind: {const: datadog}
+                config:
+                  type: object
+                  required: [agent_url]
+                  properties:
+                    agent_url: {type: string}
+                    service: {type: [string, "null"]}
+            - properties:
+                kind: {const: lightstep}
+                config:
+                  type: object
+                  anyOf:
+                    - required: [collector_url, access_token_env]
+                    - required: [collector_url, accessTokenEnv]
+                  not: {required: [access_token_env, accessTokenEnv]}
+                  properties:
+                    collector_url: {type: string}
+                    access_token_env: {type: string}
+                    accessTokenEnv: {type: string}
+          description: |
+            Direct provider envelope; name-only references belong to Istio
+            translation. Unknown fields are ignored by serde. Active exporters
+            require an absolute HTTP(S) endpoint with a host and no embedded
+            credentials. Lightstep reads its bearer token from the named local
+            environment variable at construction. URL/header/token validation
+            and local environment availability are runtime checks. Exporter
+            ranges in the parent conditional apply only with at least one
+            selected provider and reporting enabled; inactive numeric options
+            still require unsigned integer types.
+        celStringAttribute:
+          type: string
+          enum:
+            - source_workload
+            - source_namespace
+            - source_principal
+            - source_app
+            - source_service
+            - destination_workload
+            - destination_namespace
+            - destination_principal
+            - destination_app
+            - destination_service
+            - request_protocol
+            - response_flags
+            - connection_security_policy
+            - request_method
+            - request_host
+        celExpression:
+          type: object
+          description: |
+            Compiled AST uses snake_case attribute names, unlike CEL source.
+            Runtime enforces depth <= 8, total nodes <= 24, literal values <=
+            256 UTF-8 bytes, and family-specific attribute availability.
+            Recursive shape is modeled here; aggregate node/depth and encoded
+            plan-byte budgets remain runtime admission checks.
+          oneOf:
+            - required: [op, value]
+              additionalProperties: false
+              properties:
+                op: {const: literal}
+                value: {type: string, maxLength: 256}
+            - required: [op, name]
+              additionalProperties: false
+              properties:
+                op: {const: attribute}
+                name:
+                  $ref: '#/components/schemas/WorkloadMetricsConfig/$defs/celStringAttribute'
+            - required: [op, attribute]
+              additionalProperties: false
+              properties:
+                op: {const: string_of_int}
+                attribute:
+                  type: string
+                  enum: [response_code, destination_port]
+            - required: [op, attribute, then_expr, else_expr]
+              additionalProperties: false
+              properties:
+                op: {const: has_then_else}
+                attribute:
+                  $ref: '#/components/schemas/WorkloadMetricsConfig/$defs/celStringAttribute'
+                then_expr:
+                  $ref: '#/components/schemas/WorkloadMetricsConfig/$defs/celExpression'
+                else_expr:
+                  $ref: '#/components/schemas/WorkloadMetricsConfig/$defs/celExpression'
 
     MeshBpfMetricsConfig:
       type: [object, "null", string, array, number, boolean]
@@ -25980,7 +26204,7 @@ components:
         decompress_request:
           type: [boolean, "null"]
           default: false
-          description: "Enable decompression of gzip/brotli request Content-Encoding lists (OWS-tolerant ordered chains; malformed/unsupported members fail closed). Null selects the default."
+          description: "Enable decompression of gzip/brotli request Content-Encoding lists (OWS-tolerant ordered chains; malformed/unsupported members fail closed). Each gzip/x-gzip layer must contain exactly one complete member with a valid trailer and no remaining bytes; additional members (even empty ones), padding, and trailing data fail closed with 400. The shared request representation gate applies the same rule; a claimed response representation rejects these forms with its existing 502 inspection error (gRPC INTERNAL). Unclaimed encoded responses retain their existing pass-through behavior. Null selects the default."
 
     SseConfig:
       type: object
@@ -28840,7 +29064,14 @@ components:
         configured gRPC response validators and limits still apply; if a body
         policy or transform invalidates that authorized representation, the
         response fails closed to a nonzero gRPC error rather than degrading to
-        an empty successful trailers-only reply. The status-only shape carries
+        an empty successful trailers-only reply. An over-limit raw function
+        response on a native gRPC terminate request is likewise a mandatory
+        rejection rather than a fall-through, even with `on_error: continue`.
+        The same representation is produced on HTTP/1.1, HTTP/2, and HTTP/3:
+        the HTTP/3 finalized-request-egress rejection is written through the
+        context-aware writer, so the authored frame, the terminal metadata, and
+        an original gRPC-Web client's browser framing all survive that
+        boundary. The status-only shape carries
         the same provenance: unchanged, it stays trailers-only and restores its
         complete terminal metadata (grpc-status, optional grpc-message,
         grpc-status-details-bin, and validated custom trailers) from the
@@ -28850,7 +29081,13 @@ components:
         discards every authored terminal key with it, and it can never
         authorize DATA. Cloud credential
         fields fall
-        back to well-known environment variables. Terminate mode forwards
+        back to well-known environment variables. Every recognized provider
+        field is validated whenever it is SUPPLIED, independently of which
+        provider the row selects: JSON type, the Lambda Invoke identifier
+        grammars, the HTTP field-value grammar for credential headers, and the
+        lexical URL contract. A well-typed, well-formed field belonging to an
+        inactive provider stays accepted, so changing `provider` later cannot
+        turn an already-admitted row into a constructor error. Terminate mode forwards
         applicable end-to-end response headers, preserving repeated Set-Cookie
         and list-valued Link while requiring Location, Content-Location, and
         Refresh to remain singleton,
@@ -28917,7 +29154,13 @@ components:
         admission rejects equal or reversed ordering before persistence. This
         candidate check derives static serverless capabilities without resolving
         CP-local cloud credentials; runtime construction still validates the
-        node-local credentials and environment fail closed.
+        node-local credentials and environment fail closed. CP and admin
+        admission of the plugin config itself is shape-only for the same
+        reason: every supplied field is validated, while AWS/Azure/GCP
+        credentials that intentionally exist only on data planes are resolved
+        and enforced when the serving node builds its plugin cache. `validate`
+        therefore checks the shape of the row rather than whether the
+        validating node holds the credentials the row needs at serve time.
         HEAD/204/205/304 bodies are empty. Automatic redirects are disabled;
         pre_proxy accepts only 2xx as approval, while terminate may
         intentionally return only final 2xx-5xx statuses (200-599).
@@ -28941,11 +29184,11 @@ components:
         function_url:
           type: string
           format: uri
-          pattern: "^[Hh][Tt][Tt][Pp][Ss]?://[^@/?#\\s]+(?:[/?][^#\\s]*)?$"
-          description: "HTTP(S) trigger URL without URL userinfo or a fragment. Required for azure_functions and gcp_cloud_functions; ignored for aws_lambda invocation (the URL is derived from region + function name), but still validated when supplied. Path/query credentials are structurally redacted from diagnostics and non-admin/audit projections."
+          pattern: '^[Hh][Tt][Tt][Pp][Ss]?://(?:\[[0-9A-Fa-f:.]+\]|[^\x00-\x20\x7F@/?#:\[\]]+)(?::(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[0-9]{1,4}))?(?:[/?][^\x00-\x20\x7F#]*)?$'
+          description: "HTTP(S) trigger URL without URL userinfo or a fragment. Required for azure_functions and gcp_cloud_functions; ignored for aws_lambda invocation (the URL is derived from region + function name), but still validated when supplied, whichever provider is selected. The lexical contract matches runtime admission: a non-empty host (a registered name, an IPv4 literal, or a bracketed IPv6 literal), an optional port of 0-65535, no URL userinfo, no fragment, and no raw ASCII whitespace or control character anywhere in the value. Path/query credentials are structurally redacted from diagnostics and non-admin/audit projections."
         aws_region:
           type: string
-          description: "AWS region (aws_lambda only). Falls back to AWS_DEFAULT_REGION, then AWS_REGION env vars."
+          description: "AWS region (aws_lambda only). Falls back to AWS_DEFAULT_REGION, then AWS_REGION env vars. The default endpoint is partition-aware: cn-* regions derive lambda.<region>.amazonaws.com.cn and every other region derives lambda.<region>.amazonaws.com. The air-gapped ISO partitions are not derived and require an explicit aws_endpoint_url."
         aws_access_key_id:
           type: string
           description: "IAM access key (aws_lambda only). Falls back to AWS_ACCESS_KEY_ID env var."
@@ -28954,27 +29197,40 @@ components:
           description: "IAM secret key (aws_lambda only). Falls back to AWS_SECRET_ACCESS_KEY env var."
         aws_function_name:
           type: string
-          description: "Lambda function name or ARN (aws_lambda only). Falls back to AWS_LAMBDA_FUNCTION_NAME env var."
+          minLength: 1
+          maxLength: 170
+          pattern: '^(arn:(aws[a-zA-Z-]*)?:lambda:)?([a-z]{2}(-gov)?(-iso([a-z])?)?-[a-z]+-[0-9]:)?([0-9]{12}:)?(function:)?[a-zA-Z0-9_.-]+(:(\$LATEST|[a-zA-Z0-9_-]+))?$'
+          description: "Lambda function name, partial ARN, or full ARN (aws_lambda only), matching the Lambda Invoke API FunctionName grammar. Falls back to AWS_LAMBDA_FUNCTION_NAME env var; the environment value is held to the same grammar. Validated whenever supplied, whichever provider is selected. Existence and invoke permission are not checked at admission."
         aws_session_token:
           type: string
           description: "STS session token (aws_lambda only). Falls back to AWS_SESSION_TOKEN env var."
         aws_qualifier:
           type: string
-          description: "Optional version/alias qualifier (e.g., $LATEST, prod)."
+          minLength: 1
+          maxLength: 128
+          pattern: '^[a-zA-Z0-9$_-]+$'
+          description: "Optional version/alias qualifier (e.g., $LATEST, prod), matching the Lambda Invoke API Qualifier grammar. Validated whenever supplied, whichever provider is selected."
         aws_endpoint_url:
           type: string
           format: uri
-          pattern: "^[Hh][Tt][Tt][Pp][Ss]?://[^@/?#\\s]+/?$"
+          pattern: '^[Hh][Tt][Tt][Pp][Ss]?://(?:\[[0-9A-Fa-f:.]+\]|[^\x00-\x20\x7F@/?#:\[\]]+)(?::(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[0-9]{1,4}))?/?$'
           description: >-
             Optional HTTP(S) Lambda endpoint override for LocalStack or a
             VPC-internal endpoint. Must be an origin without userinfo, path,
-            query, or fragment. Falls back to `AWS_LAMBDA_ENDPOINT_URL`.
+            query, or fragment, using the same lexical URL contract as
+            `function_url` (non-empty host, port 0-65535, no raw whitespace or
+            control characters). Validated whenever supplied, whichever
+            provider is selected. Falls back to `AWS_LAMBDA_ENDPOINT_URL`. A
+            non-default port is part of the signed SigV4 canonical `Host`, so
+            a verifying endpoint accepts the invocation.
         azure_function_key:
           type: string
-          description: "Function key for x-functions-key auth (azure_functions only). Falls back to AZURE_FUNCTIONS_KEY env var."
+          pattern: '^[^\x00-\x08\x0A-\x1F\x7F]*$'
+          description: "Function key for x-functions-key auth (azure_functions only). Falls back to AZURE_FUNCTIONS_KEY env var. The value must be representable as an HTTP field value (no NUL, CR, LF, or other control byte except horizontal tab); the effective config or environment value is parsed at admission so an unusable credential never reaches the serving cache. Validated whenever supplied, whichever provider is selected."
         gcp_bearer_token:
           type: string
-          description: "Bearer token for Authorization header (gcp_cloud_functions only). Falls back to GCP_CLOUD_FUNCTIONS_BEARER_TOKEN env var."
+          pattern: '^[^\x00-\x08\x0A-\x1F\x7F]*$'
+          description: "Bearer token for Authorization header (gcp_cloud_functions only). Falls back to GCP_CLOUD_FUNCTIONS_BEARER_TOKEN env var. The assembled `Bearer <token>` value must be representable as an HTTP field value (no NUL, CR, LF, or other control byte except horizontal tab) and is parsed at admission. Validated whenever supplied, whichever provider is selected."
         forward_body:
           type: boolean
           default: false
@@ -28983,7 +29239,9 @@ components:
           type: array
           items:
             type: string
-          description: "Header names to forward into the function payload (lowercased at config load). Values come from the finalized backend-visible header view (the function is invoked in the finalized-request-egress phase, after request-body transforms and every final request-policy hook), so a header an earlier plugin removed - authorization under strip_authorization_on_success, or a gateway-owned claim_headers destination with no verified claim - is omitted rather than re-read from the client's original request."
+            minLength: 1
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+          description: "Each entry must be a non-empty RFC 9110 HTTP field-name token (no empty string, spaces, or other separators), matching runtime admission. Header names to forward into the function payload (lowercased at config load). Values come from the finalized backend-visible header view (the function is invoked in the finalized-request-egress phase, after request-body transforms and every final request-policy hook), so a header an earlier plugin removed - authorization under strip_authorization_on_success, or a gateway-owned claim_headers destination with no verified claim - is omitted rather than re-read from the client's original request."
         forward_query_params:
           type: boolean
           default: false
@@ -28992,14 +29250,16 @@ components:
           type: integer
           format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           default: 5000
-          description: "Function invocation timeout in milliseconds. Must be > 0."
+          description: "Function invocation timeout in milliseconds. Must be > 0 and representable as a u64; a larger integer is rejected before the plugin constructor sees it."
         max_response_body_bytes:
           type: integer
           format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           default: 10485760
-          description: "Max function response body size (10 MiB default). Must be > 0."
+          description: "Max function response body size (10 MiB default). Must be > 0 and representable as a u64 (and as a usize on the serving platform); a larger integer is rejected before the plugin constructor sees it."
         on_error:
           type: string
           enum: [reject, continue]
@@ -29876,6 +30136,7 @@ components:
             always_capture_on_error:
               type: [boolean, "null"]
               default: true
+              description: "Override a losing sampling roll for a failed transaction. Fires on an HTTP status >= 400, on a streamed body that did not complete, and on the final client-visible gRPC application status: a native gRPC call normally fails under HTTP 200 with a non-zero grpc-status, and that status (from the terminal trailers, a Trailers-Only header block, or the UNKNOWN a gRPC transaction with no terminal status carries) is treated as an error at buffered commit, stream termination, and the transaction-log fallback alike. grpc-status 0 remains a success and stays subject to ordinary sampling."
             max_records_per_minute:
               type: [integer, "null"]
               minimum: 0
@@ -31376,7 +31637,7 @@ components:
     AiPromptShieldConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_prompt_shield — HTTP-only PII detection and redaction in bare JSON AI prompts. Native gRPC is unsupported (not registered for the Grpc protocol view). Framed gRPC-Web bodies remain outside the JSON inspection scope and are skipped without decoding."
+      description: "Plugin: ai_prompt_shield — HTTP-only PII detection and redaction in bare JSON AI prompts. Native gRPC is unsupported (not registered for the Grpc protocol view). Framed gRPC-Web bodies remain outside the JSON inspection scope and are skipped without decoding. Inspection is scoped to POST requests on every hook, including the request-body transform, so a co-located body plugin that forces buffering cannot extend redaction to another method. Every in-scope request is re-decided in on_final_request_body over the exact backend-visible body after all request-body transforms; reject and warn re-decide there and redact fails closed, because that hook cannot rewrite wire bytes."
       anyOf:
         - not:
             required: [patterns]
@@ -31405,14 +31666,16 @@ components:
           type: array
           items:
             type: object
+            additionalProperties: false
             required: [name, regex]
             properties:
               name:
                 type: string
+                maxLength: 128
               regex:
                 type: string
           default: []
-          description: "Custom {name, regex} patterns"
+          description: "Custom {name, regex} patterns. Each entry accepts exactly these two members; an unknown member is fatal at construction, like an unknown top-level field. `regex` must not match the empty string — a zero-width rule would insert the redaction placeholder at every position — and `name` is bounded (maxLength, in characters) because it is substituted into redaction_placeholder."
         scan_fields:
           type: string
           enum: [content, all]
@@ -31423,16 +31686,17 @@ components:
           items:
             type: string
           default: []
-          description: "Message roles to skip scanning. Filters messages[].role, Gemini contents[].role, and Cohere chat_history[].role (matched case-insensitively, since Cohere spells roles USER/CHATBOT/SYSTEM/TOOL); the value 'system' additionally suppresses the top-level system field, the Cohere preamble, and the Gemini system instruction"
+          description: "Message roles to skip scanning. Applies to scan_fields: content ONLY — scan_fields: all deliberately scans every value in the body regardless of role, so a role exemption does not preserve a message there. In content mode it filters messages[].role, Gemini contents[].role, and Cohere chat_history[].role (matched case-insensitively, since Cohere spells roles USER/CHATBOT/SYSTEM/TOOL); the value 'system' additionally suppresses the top-level system field, the Cohere preamble, and the Gemini system instruction. Provider inputs that carry no role, such as an OpenAI Responses function_call_output item, are never suppressed."
         redaction_placeholder:
           type: string
           default: "[REDACTED:{type}]"
-          description: Template for redacted text
+          description: "Template for redacted text. `{type}` is substituted with the matched pattern name; the RENDERED result must be at most 512 UTF-8 bytes, since every match re-emits it. Redaction output is additionally charged against a per-request growth allowance of four times the request body size (minimum 65536, maximum 67108864 bytes); an expanding policy that exhausts it fails the request closed with 413 rather than forwarding a partially redacted body."
         max_scan_bytes:
           type: integer
           minimum: 1
+          maximum: 9007199254740991
           default: 1048576
-          description: Maximum body size to scan; enforcing actions reject larger bodies instead of bypassing inspection
+          description: "Maximum body size to scan; enforcing actions reject larger bodies instead of bypassing inspection. The supported domain is 1 to 9007199254740991 (2^53-1), the largest integer every JSON number representation holds exactly, so this component and the constructor reach the same verdict for every input. A mathematically integral value is accepted however it is spelled (1024 and 1024.0 alike); a fractional, negative, zero, or out-of-range value is rejected at construction rather than truncated."
 
     AiPromptCompressorConfig:
       type: object
@@ -32673,7 +32937,8 @@ components:
 
     McpGatewayConfig:
       type: object
-      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, bounded JSON-RPC batch admission with per-item validation and ordered synthetic response assembly. Aggregate-router mode also supports multiplexed SSE sessions: GET with Accept text/event-stream attaches one generation-scoped listener per live downstream session and routes events by a bounded, type-sensitive JSON-RPC request/stream identity preserving the exact numeric wire token over a single retained-event ring with one byte budget. While a listener is attached, every aggregate JSON-RPC request with a representable id opens its identity before catalog refresh or upstream dispatch and answers 202 with its response published on the stream — gateway-authored list/ping/error responses and upstream-routed tools/call, prompts/get, resources/read, and passthrough methods alike — so a concurrent notifications/cancelled marks a genuinely open request and its late result is suppressed. Notifications, batch members, and initialize are never multiplexed. Completing, cancelling, or refusing a stream returns its capacity exactly once through a request-owned lease, a late or duplicate response for a terminal identity is refused rather than misattributed; mismatched or ambiguous correlated responses are replaced by a bounded gateway -32603 error that carries the request's own JSON-RPC id token so the pending call still resolves, and are never published or returned as successful inline answers (the id comparison is byte-exact and runs only while a listener is attached; mcp.sse.delivery records refused), and a retention refusal terminalizes the identity and answers the POST inline rather than dropping a JSON-RPC response. Teardown is unconditional on client disconnect, session DELETE, idle eviction, and plugin reload/update/delete; a listener past its configured lifetime is superseded by a fresh GET so a stalled transport can never hold the slot. Duplicate listeners, invalid/unknown/stale identities, and invalid, oversized, unknown, or too-old Last-Event-ID cursors fail closed with fixed, value-redacted diagnostics. Aggregate upstream-routed members such as tools/call must be singleton requests so later plugin phases are preserved; batch request members return JSON-RPC -32009, while notification-only batches report the restriction once at batch level. MCP initialize must also be a singleton HTTP request: initialize batch members return JSON-RPC -32010 before any session mint or eviction, so no batch mints or evicts a session or returns a session header. A notification-only batch whose gateway dispatch otherwise fails reports JSON-RPC -32011. A batch member whose session is no longer live contributes a per-item JSON-RPC -32004 element because the singleton bare HTTP 404 cannot be expressed per item. Aggregate batches always answer HTTP 200 with a response array, so an unsupported MCP-Protocol-Version surfaces per item rather than as the singleton HTTP 400; transparent_proxy batches cannot be partially forwarded and are rejected whole with HTTP 400. The plugin also supports tool argument JSON Schema validation and mcp.* metadata emission. Aggregate tools/call rewrites stage a private gateway-authenticated public-to-upstream tool-name mapping so ai_tool_governor can keep policy keys on public namespaced identities. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins. Cannot be composed with request_deduplication on the same proxy; admission rejects the pair with 400 because a deduplicated replay is served before this plugin runs and cannot be proven to match the live catalog mapping. Two enabled mcp_gateway instances on one proxy may not have nesting endpoint.path scopes, and endpoint.path may not be \"/\", because the endpoint reserves its whole path subtree. A client JSON-RPC id token reflected into a gateway-authored singleton response is bounded at 4096 wire bytes; a larger id is refused with a fixed -32600 that does not echo it."
+      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, bounded JSON-RPC batch admission with per-item validation and ordered synthetic response assembly. Aggregate-router mode also supports OPT-IN multiplexed SSE sessions (sessions.sse_multiplexing, default false): enabling it moves a POST request's JSON-RPC response onto the session GET stream, which MCP Streamable HTTP does not permit, so it is a deliberate Ferrum transport extension rather than a default. When enabled, GET with Accept text/event-stream attaches one generation-scoped listener per live downstream session and routes events by a bounded, type-sensitive JSON-RPC request/stream identity preserving the exact numeric wire token over a single retained-event ring with one byte budget. While a listener is attached, every aggregate JSON-RPC request with a representable id opens its identity before catalog refresh or upstream dispatch and answers 202 with its response published on the stream — gateway-authored list/ping/error responses and upstream-routed tools/call, prompts/get, resources/read, and passthrough methods alike — so a concurrent notifications/cancelled marks a genuinely open request and its late result is suppressed. Notifications, batch members, and initialize are never multiplexed. Completing, cancelling, or refusing a stream returns its capacity exactly once through a request-owned lease, a late or duplicate response for a terminal identity is refused rather than misattributed; mismatched or ambiguous correlated responses are replaced by a bounded gateway -32603 error that carries the request's own JSON-RPC id token so the pending call still resolves, and are never published or returned as successful inline answers (the id comparison is byte-exact and runs only while a listener is attached; mcp.sse.delivery records refused), and a retention refusal terminalizes the identity and answers the POST inline rather than dropping a JSON-RPC response. Teardown is unconditional on client disconnect, session DELETE, idle eviction, and plugin reload/update/delete; a listener past its configured lifetime is superseded by a fresh GET so a stalled transport can never hold the slot. Duplicate listeners, invalid/unknown/stale identities, and invalid, oversized, unknown, or too-old Last-Event-ID cursors fail closed with fixed, value-redacted diagnostics. Aggregate upstream-routed members such as tools/call must be singleton requests so later plugin phases are preserved; batch request members return JSON-RPC -32009, while notification-only batches report the restriction once at batch level. MCP initialize must also be a singleton HTTP request: initialize batch members return JSON-RPC -32010 before any session mint or eviction, so no batch mints or evicts a session or returns a session header. A notification-only batch whose gateway dispatch otherwise fails reports JSON-RPC -32011. A batch member whose session is no longer live contributes a per-item JSON-RPC -32004 element because the singleton bare HTTP 404 cannot be expressed per item. Aggregate batches always answer HTTP 200 with a response array, so an unsupported MCP-Protocol-Version surfaces per item rather than as the singleton HTTP 400; transparent_proxy batches cannot be partially forwarded and are rejected whole with HTTP 400. The plugin also supports tool argument JSON Schema validation and mcp.* metadata emission. Aggregate tools/call rewrites stage a private gateway-authenticated public-to-upstream tool-name mapping so ai_tool_governor can keep policy keys on public namespaced identities. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins. Cannot be composed with request_deduplication on the same proxy; admission rejects the pair with 400 because a deduplicated replay is served before this plugin runs and cannot be proven to match the live catalog mapping. Two enabled mcp_gateway instances on one proxy may not have nesting endpoint.path scopes, and endpoint.path may not be \"/\", because the endpoint reserves its whole path subtree. A client JSON-RPC id token reflected into a gateway-authored singleton response is bounded at 4096 wire bytes; a larger id is refused with a fixed -32600 that does not echo it. The admitted singleton id is retained privately so a gateway-authored terminal decided in a response phase (result validation, an uninspectable or oversized upstream representation, an upstream transport failure) names the request it answers instead of returning id null. Every response phase is instance-scoped: an instance acts on a response only for a request it admitted itself, so instances with disjoint endpoint scopes on one proxy never apply each other's response policies. Unknown keys are rejected at the root and in every fixed-shape object here; the operator-defined servers.* and policy.tools.* key sets stay open. Rules this schema deliberately leaves to plugin load, because portable JSON Schema cannot compare sibling values or resolve external state: endpoint.path canonicalization beyond the shape checked here, HTTP header-name destinations that are protocol-managed, upstream_url host egress screening, namespace uniqueness, at-least-one-enabled-server (exactly one in transparent_proxy, at least one exposing a family in aggregate_router), max_batch_item_bytes <= max_batch_bytes, and the sse_* budget relationships."
+      additionalProperties: false
       allOf:
         - if:
             properties:
@@ -32699,64 +32964,120 @@ components:
                     - required: [hide_denied_items]
                     - required: [on_new_tool]
                     - required: [on_schema_change]
+              # transparent_proxy has no mediated tool catalog, so result
+              # validation cannot be enabled. Presence of an explicit `false`
+              # (or `null`) is still admitted — only the enabling VALUE is not.
+              validation:
+                properties:
+                  validate_tool_results:
+                    not:
+                      const: true
+        # aggregate_router advertises no capability it cannot dispatch:
+        # advertise_logging / advertise_completions / advertise_tasks have no
+        # dedicated handler, so each requires passthrough_unknown_methods.
+        - if:
+            properties:
+              mode:
+                const: aggregate_router
+            required: [mode]
+          then:
+            anyOf:
+              - required: [capabilities]
+                properties:
+                  capabilities:
+                    required: [passthrough_unknown_methods]
+                    properties:
+                      passthrough_unknown_methods:
+                        const: true
+              - properties:
+                  capabilities:
+                    properties:
+                      advertise_logging:
+                        not:
+                          const: true
+                      advertise_completions:
+                        not:
+                          const: true
+                      advertise_tasks:
+                        not:
+                          const: true
       required: [mode, endpoint, servers]
       properties:
         enabled:
-          type: boolean
+          type: [boolean, "null"]
           default: true
+          description: An explicit null selects the default, exactly as omission does.
         mode:
           type: string
           enum: [transparent_proxy, aggregate_router]
         endpoint:
           type: object
+          additionalProperties: false
           required: [path]
           properties:
             path:
               type: string
+              minLength: 2
+              pattern: '^/'
+              not:
+                # A canonical policy path carries no percent-escape, no
+                # backslash, and no dot segment. The remaining canonicalization
+                # rules are checked at plugin load.
+                pattern: '%|\\|(^|/)\.\.?($|/)'
               description: Canonical public MCP endpoint path, such as /mcp. Must not be "/" — the endpoint reserves its whole path subtree, so a root endpoint would refuse every other handler on the proxy and is rejected at admission. Only the exact path is served; slash-delimited descendants return 404 in both modes. A trailing-slash endpoint also reserves its unsuffixed scope. Two enabled mcp_gateway instances on one proxy may not have nesting endpoint scopes; admission rejects the pair. Queries do not change selection. Methods other than GET, POST, and DELETE return 405 when they reach this plugin.
             protocol_versions:
-              type: array
+              type: [array, "null"]
               minItems: 1
               items:
                 type: string
+                minLength: 1
+                pattern: '\S'
               default: ["2025-11-25"]
               description: Supported MCP protocol versions, in preference order. The first entry is the gateway's preferred version, returned by aggregate-mode initialize when the client requests an unsupported version. Includes 2025-03-26 when JSON-RPC batches are desired; batches are admitted under validation.max_batch_* limits.
         discovery:
-          type: object
-          description: Catalog discovery requires aggregate_router. Explicit aggregate_tools, aggregate_resources, aggregate_prompts, namespace_separator, cache_ttl_seconds, hide_denied_items, on_new_tool, and on_schema_change fields are rejected in transparent_proxy, including explicit defaults, because every one of them is inert without a mediated catalog.
+          type: [object, "null"]
+          additionalProperties: false
+          description: Catalog discovery requires aggregate_router. Explicit aggregate_tools, aggregate_resources, aggregate_prompts, namespace_separator, cache_ttl_seconds, hide_denied_items, on_new_tool, and on_schema_change fields are rejected in transparent_proxy, including explicit defaults, because every one of them is inert without a mediated catalog. An explicit null block, and an explicit null on any field below, selects the defaults exactly as omission does.
           properties:
             aggregate_tools:
-              type: boolean
+              type: [boolean, "null"]
               default: true
             aggregate_resources:
-              type: boolean
+              type: [boolean, "null"]
               default: true
             aggregate_prompts:
-              type: boolean
+              type: [boolean, "null"]
               default: true
             namespace_separator:
-              type: string
+              type: [string, "null"]
+              minLength: 1
               default: "."
             cache_ttl_seconds:
-              type: integer
+              type: [integer, "null"]
               format: uint64
+              minimum: 1
               default: 300
+              description: Also bounds recovery from a wholly unavailable catalog family — that outage is cached for this long before the family is retried.
             hide_denied_items:
-              type: boolean
+              type: [boolean, "null"]
               default: true
             on_new_tool:
-              type: string
-              enum: [allow, allow_immediately, expose, hide_until_configured]
+              type: [string, "null"]
+              enum: [allow, allow_immediately, expose, hide_until_configured, null]
               default: hide_until_configured
             on_schema_change:
-              type: string
-              enum: [allow, allow_immediately, expose, hide_until_configured]
+              type: [string, "null"]
+              enum: [allow, allow_immediately, expose, hide_until_configured, null]
               default: hide_until_configured
         sessions:
-          type: object
+          type: [object, "null"]
+          additionalProperties: false
+          description: An explicit null block, and an explicit null on any field below, selects the defaults exactly as omission does. The sse_* relationships (event bytes inside the retained-byte budget, replay inside retention, keepalive inside the listener lifetime) compare sibling values and are enforced at plugin load.
           properties:
             downstream_session_header:
-              type: string
+              type: [string, "null"]
+              minLength: 1
+              pattern: '^[!#$%&*+\-.^_`|~0-9A-Za-z]+$'
               default: mcp-session-id
               description: >-
                 Must be a valid HTTP header name; rejected at config validation
@@ -32767,36 +33088,48 @@ components:
                 `transfer-encoding`, `upgrade`, case-insensitive) are also
                 rejected.
             upstream_session_header:
-              type: string
+              type: [string, "null"]
+              minLength: 1
+              pattern: '^[!#$%&*+\-.^_`|~0-9A-Za-z]+$'
               default: mcp-session-id
               description: Must be a valid HTTP header name; rejected at config validation otherwise.
             initialize_upstreams:
-              type: string
-              enum: [lazy, startup, passthrough]
+              type: [string, "null"]
+              enum: [lazy, startup, passthrough, null]
               default: lazy
               description: startup is accepted as a V1 alias for lazy because upstream MCP initialize requires a downstream client session.
             session_ttl_seconds:
-              type: integer
+              type: [integer, "null"]
               format: uint64
               default: 3600
               minimum: 1
               description: Idle downstream MCP session lifetime before eviction.
             max_sessions:
-              type: integer
+              type: [integer, "null"]
               format: uint64
               default: 16384
               minimum: 1
               description: Maximum downstream MCP sessions retained by this plugin instance; oldest sessions are evicted when the cap is reached.
             sse_multiplexing:
-              type: boolean
-              default: true
+              type: [boolean, "null"]
+              default: false
               description: >-
-                Aggregate-router only. When true, GET with Accept text/event-stream
-                attaches one multiplexed SSE listener for the downstream session.
-                When false, aggregate GET keeps a 405 rejection. Transparent mode
-                ignores this flag and continues to forward GET upstream.
+                Aggregate-router only, and OFF by default because it is not MCP
+                Streamable HTTP. When true, GET with Accept text/event-stream
+                attaches one multiplexed SSE listener for the downstream session
+                AND a POST carrying a JSON-RPC request is answered with an empty
+                202 whose response is published on that listener. The advertised
+                transport instead requires a POST carrying a request to answer on
+                that POST (application/json or its own text/event-stream stream),
+                reserves 202 for a POST carrying only notifications and responses,
+                and permits a response on a GET stream only when resuming a stream
+                an earlier POST began. Enabling this is therefore an explicit
+                opt-in to a Ferrum transport extension for clients written against
+                it. When false, aggregate GET keeps a 405 rejection and every
+                request is answered on its own POST. Transparent mode ignores this
+                flag and continues to forward GET upstream.
             sse_max_streams_per_session:
-              type: integer
+              type: [integer, "null"]
               format: uint64
               default: 64
               minimum: 1
@@ -32807,7 +33140,7 @@ components:
                 the same bound also caps the retained terminal records that
                 refuse a late or duplicate response.
             sse_max_retained_events:
-              type: integer
+              type: [integer, "null"]
               format: uint64
               default: 128
               minimum: 1
@@ -32818,7 +33151,7 @@ components:
                 owed to a consumer is never evicted: a publish that cannot be
                 admitted fails closed and the POST answers inline instead.
             sse_max_retained_bytes:
-              type: integer
+              type: [integer, "null"]
               format: uint64
               default: 1048576
               minimum: 1
@@ -32828,14 +33161,14 @@ components:
                 event bytes). Must leave room for SSE framing above
                 sse_max_event_bytes.
             sse_max_event_bytes:
-              type: integer
+              type: [integer, "null"]
               format: uint64
               default: 262144
               minimum: 1
               maximum: 2097152
               description: Max serialized JSON-RPC payload bytes admitted for one multiplexed SSE event.
             sse_max_replay_events:
-              type: integer
+              type: [integer, "null"]
               format: uint64
               default: 64
               minimum: 0
@@ -32847,21 +33180,21 @@ components:
                 delivery watermark can resume and any older cursor fails closed
                 with HTTP 410.
             sse_max_stream_id_bytes:
-              type: integer
+              type: [integer, "null"]
               format: uint64
               default: 128
               minimum: 1
               maximum: 512
               description: Max UTF-8 bytes admitted for a JSON-RPC request id used as a stream identity.
             sse_max_last_event_id_bytes:
-              type: integer
+              type: [integer, "null"]
               format: uint64
               default: 64
               minimum: 1
               maximum: 1024
               description: Max accepted Last-Event-ID header bytes; values are never logged.
             sse_listener_max_lifetime_seconds:
-              type: integer
+              type: [integer, "null"]
               format: uint64
               default: 300
               minimum: 5
@@ -32877,7 +33210,7 @@ components:
                 new responses to that listener and a fresh GET takes the
                 single-listener slot rather than receiving 409.
             sse_keepalive_seconds:
-              type: integer
+              type: [integer, "null"]
               format: uint64
               default: 15
               minimum: 1
@@ -32887,31 +33220,33 @@ components:
                 sse_listener_max_lifetime_seconds. Also how a vanished peer is
                 discovered on a quiet session.
         capabilities:
-          type: object
+          type: [object, "null"]
+          additionalProperties: false
+          description: An explicit null block, and an explicit null on any field below, selects the defaults exactly as omission does.
           properties:
             advertise_tools:
-              type: boolean
+              type: [boolean, "null"]
               default: true
             advertise_resources:
-              type: boolean
+              type: [boolean, "null"]
               default: true
             advertise_prompts:
-              type: boolean
+              type: [boolean, "null"]
               default: true
             advertise_logging:
-              type: boolean
+              type: [boolean, "null"]
               default: false
               description: In aggregate_router mode, requires passthrough_unknown_methods=true until logging methods are routed or implemented.
             advertise_completions:
-              type: boolean
+              type: [boolean, "null"]
               default: false
               description: In aggregate_router mode, requires passthrough_unknown_methods=true until explicit completion routing is implemented.
             advertise_tasks:
-              type: boolean
+              type: [boolean, "null"]
               default: false
               description: In aggregate_router mode, requires passthrough_unknown_methods=true until task methods are routed or implemented.
             passthrough_unknown_methods:
-              type: boolean
+              type: [boolean, "null"]
               default: false
         servers:
           type: object
@@ -32921,59 +33256,82 @@ components:
             description: Server ids are embedded in public mcp:// resource URIs, so they must be URI-safe (ASCII alphanumerics, '.', '_', '-').
           additionalProperties:
             type: object
+            additionalProperties: false
             required: [upstream_url, namespace]
+            description: >-
+              Claude-Desktop-style stdio spawn fields (command, args, stdio) are
+              rejected here: mcp_gateway is HTTP-only and never spawns a process.
+              "At least one enabled server", "exactly one enabled server in
+              transparent_proxy", "at least one enabled server exposing a family
+              in aggregate_router", and namespace uniqueness compare sibling
+              entries and are enforced at plugin load.
             properties:
               upstream_url:
                 type: string
                 format: uri
-                description: HTTP or HTTPS upstream MCP endpoint URL. Credentials, query, and fragment are rejected.
+                pattern: '^https?://'
+                not:
+                  # No credentials (userinfo before the host), no query, no
+                  # fragment.
+                  anyOf:
+                    - pattern: '^https?://[^/]*@'
+                    - pattern: '[?#]'
+                description: HTTP or HTTPS upstream MCP endpoint URL. Credentials, query, and fragment are rejected. Literal-IP hosts are additionally screened against the backend egress policy at plugin load.
               namespace:
                 type: string
-                description: Public namespace prefix used for tool and prompt names.
+                minLength: 1
+                pattern: '\S'
+                description: Public namespace prefix used for tool and prompt names. Must be non-blank and unique across servers.
               enabled:
-                type: boolean
+                type: [boolean, "null"]
                 default: true
               expose_tools:
-                type: boolean
+                type: [boolean, "null"]
                 default: true
               expose_resources:
-                type: boolean
+                type: [boolean, "null"]
                 default: false
               expose_prompts:
-                type: boolean
+                type: [boolean, "null"]
                 default: false
               initialize_strategy:
-                type: string
-                enum: [lazy, startup, passthrough]
+                type: [string, "null"]
+                enum: [lazy, startup, passthrough, null]
                 description: Overrides sessions.initialize_upstreams for this server; startup is accepted as a V1 alias for lazy.
         policy:
-          type: object
-          description: Catalog policy requires aggregate_router. Explicit default_action, tools, and hide_denied_tools fields are rejected in transparent_proxy, including explicit defaults.
+          type: [object, "null"]
+          additionalProperties: false
+          description: Catalog policy requires aggregate_router. Explicit default_action, tools, and hide_denied_tools fields are rejected in transparent_proxy, including explicit defaults. An explicit null block, and an explicit null on any field below, selects the defaults exactly as omission does.
           properties:
             default_action:
-              type: string
-              enum: [allow, deny]
+              type: [string, "null"]
+              enum: [allow, deny, null]
               default: deny
             hide_denied_tools:
-              type: boolean
+              type: [boolean, "null"]
               default: true
             tools:
-              type: object
+              type: [object, "null"]
+              description: Public namespaced tool name to policy. The key set is operator-defined, so this map stays open; each entry is a closed object.
               additionalProperties:
                 type: object
+                additionalProperties: false
                 required: [action]
                 properties:
                   action:
                     type: string
                     enum: [allow, deny, hide_from_discovery]
         validation:
-          type: object
+          type: [object, "null"]
+          additionalProperties: false
+          description: An explicit null block, and an explicit null on any field below, selects the defaults exactly as omission does. max_batch_item_bytes must not exceed max_batch_bytes; that comparison is between sibling values and is enforced at plugin load.
           properties:
             validate_tool_arguments:
-              type: boolean
+              type: [boolean, "null"]
               default: true
+              description: Validates tools/call arguments against the discovered inputSchema. It does NOT gate observability.log_argument_hash or observability.log_raw_arguments, which are evaluated independently.
             validate_tool_results:
-              type: boolean
+              type: [boolean, "null"]
               default: false
               description: >
                 Aggregate-router only. When true, compile each discovered tool
@@ -32991,66 +33349,124 @@ components:
                 outputSchema values are refused at catalog admission with
                 field-specific diagnostics. Default false.
             max_upstream_response_bytes:
-              type: integer
+              type: [integer, "null"]
               format: int64
               minimum: 1
               default: 4194304
               description: "Maximum bytes read from a single non-SSE upstream application/json response before the read is aborted (DoS backstop). Must be greater than 0."
             max_catalog_items_per_list:
-              type: integer
+              type: [integer, "null"]
               format: int64
               minimum: 1
               default: 10000
               description: "Maximum items accumulated across paginated catalog list pages (tools/resources/prompts) before the aggregation is rejected. Must be greater than 0."
             max_catalog_bytes_per_list:
-              type: integer
+              type: [integer, "null"]
               format: int64
               minimum: 1
               default: 8388608
               description: "Maximum total serialized bytes accumulated across paginated catalog list pages before the aggregation is rejected. Must be greater than 0."
             max_batch_items:
-              type: integer
+              type: [integer, "null"]
               format: int64
               minimum: 1
               default: 32
               description: "Maximum JSON-RPC batch array members admitted before session, catalog, or upstream work. Empty batches are rejected separately as Invalid Request. Must be greater than 0."
             max_batch_bytes:
-              type: integer
+              type: [integer, "null"]
               format: int64
               minimum: 1
               default: 1048576
               description: "Maximum aggregate request-body bytes admitted for a JSON-RPC batch. Enforced on the raw request body before any JSON parsing, using the first non-whitespace byte to detect array-shaped input. Must be greater than 0 and at least max_batch_item_bytes."
             max_batch_item_bytes:
-              type: integer
+              type: [integer, "null"]
               format: int64
               minimum: 1
               default: 262144
               description: "Maximum raw wire bytes admitted for one JSON-RPC batch member. Measured on the member's exact raw JSON slice as received (internal whitespace and escape sequences included, array separators and surrounding inter-member whitespace excluded), before the member is deserialized, so a member cannot shrink under the cap by normalizing. Oversized members yield a bounded per-item Invalid Request with id null (their id is never materialized or reflected) while siblings continue. Must be greater than 0 and must not exceed max_batch_bytes."
             max_batch_response_bytes:
-              type: integer
+              type: [integer, "null"]
               format: int64
               minimum: 1
               default: 1048576
               description: "Maximum serialized bytes admitted for an assembled JSON-RPC batch response array (including array framing). Oversized aggregates fail closed without returning a partial body. Must be greater than 0."
         observability:
-          type: object
+          type: [object, "null"]
+          additionalProperties: false
+          description: >-
+            There are no result-side observation settings. `log_raw_results` and
+            `log_result_hash` had no producer anywhere in the plugin, so they are
+            rejected as unknown keys rather than accepted and ignored.
           properties:
             emit_metadata:
-              type: boolean
+              type: [boolean, "null"]
               default: true
             log_raw_arguments:
-              type: boolean
+              type: [boolean, "null"]
               default: false
-              description: Copies raw MCP tool arguments into request metadata. Arguments can contain secrets or PII; prefer log_argument_hash unless the logging path is explicitly protected.
+              description: Copies raw MCP tool arguments into request metadata. Arguments can contain secrets or PII; prefer log_argument_hash unless the logging path is explicitly protected. Evaluated independently of validation.validate_tool_arguments.
             log_argument_hash:
-              type: boolean
+              type: [boolean, "null"]
               default: true
-            log_raw_results:
-              type: boolean
-              default: false
-            log_result_hash:
-              type: boolean
-              default: false
+              description: Emits mcp.arguments_hash. Evaluated independently of validation.validate_tool_arguments.
+
+    ApiChargebackRenderSchema:
+      description: >-
+        `SummaryLogSchema` narrowed to what an `api_chargeback` billing row can
+        actually express. The `/charges` row is an aggregate assembled into a
+        `serde_json::Map`-backed document, so it has no HTTP/stream summary
+        type, no RFC3339 timestamp field, no metadata map, and no member order
+        under the projection's control: `summary_type`, `timestamp_format`,
+        `metadata`, and `order` are rejected at construction rather than
+        silently ignored. `omit` names and `rename` sources must be native
+        billing-row fields, and `summary_kind` is the only derived kind
+        representable from a row that spans many transactions (it has no single
+        status, backend, or outcome). See docs/log_schema.md.
+      allOf:
+        - $ref: "#/components/schemas/SummaryLogSchema"
+        - type: object
+          not:
+            anyOf:
+              - required: [summary_type]
+              - required: [timestamp_format]
+              - required: [metadata]
+              - required: [order]
+          properties:
+            omit:
+              type: array
+              items:
+                enum:
+                  - proxy_id
+                  - namespace
+                  - proxy_name
+                  - currency
+                  - protocol_family
+                  - total_calls
+                  - total_charges
+                  - by_status
+                  - bandwidth
+                  - stream
+            rename:
+              type: object
+              propertyNames:
+                enum:
+                  - proxy_id
+                  - namespace
+                  - proxy_name
+                  - currency
+                  - protocol_family
+                  - total_calls
+                  - total_charges
+                  - by_status
+                  - bandwidth
+                  - stream
+            derived_fields:
+              type: array
+              items:
+                type: object
+                properties:
+                  kind:
+                    const: summary_kind
 
     ApiChargebackConfig:
       type: object
@@ -33097,11 +33513,66 @@ components:
         claim above 512 bytes is rejected at authentication, and any remaining
         oversized value is represented as a prefix plus a domain-separated
         SHA-256 digest of the complete value.
+        Runtime-only admission (not expressible here): every enabled instance
+        must resolve to the same shared tunables and the same projection; a
+        `schema_ref` must name a definition a `transaction_log_schema` plugin
+        registered; a status code must not appear in more than one tier across
+        the whole `pricing_tiers` array; and `stale_entry_ttl_seconds` /
+        `cleanup_interval_seconds` interact with the collection contract
+        described in docs/plugins.md.
+      allOf:
+        # Effective pricing must exist, matching `PricingConfig::has_any_pricing`:
+        # a nonempty `pricing_tiers` counts even when every price is zero
+        # (explicitly zero-priced tiers still meter calls), while a
+        # bandwidth-only or stream-only configuration must price something above
+        # zero or the plugin would record nothing and is rejected at startup.
+        - anyOf:
+            - required: [pricing_tiers]
+              properties:
+                pricing_tiers:
+                  type: array
+                  minItems: 1
+            - required: [bandwidth_pricing]
+              properties:
+                bandwidth_pricing:
+                  type: object
+                  anyOf:
+                    - required: [price_per_byte_sent]
+                      properties:
+                        price_per_byte_sent:
+                          type: number
+                          exclusiveMinimum: 0
+                          maximum: 1.0e288
+                    - required: [price_per_byte_received]
+                      properties:
+                        price_per_byte_received:
+                          type: number
+                          exclusiveMinimum: 0
+                          maximum: 1.0e288
+            - required: [stream_connection_pricing]
+              properties:
+                stream_connection_pricing:
+                  type: object
+                  required: [price_per_connection]
+                  properties:
+                    price_per_connection:
+                      type: number
+                      exclusiveMinimum: 0
+                      maximum: 1.0e288
+        # `schema` and `schema_ref` are mutually exclusive projections.
+        - not:
+            required: [schema, schema_ref]
       properties:
         currency:
           type: string
+          minLength: 1
+          pattern: '\S'
           default: "USD"
-          description: Currency label included in Prometheus metrics and JSON output. Informational only — the plugin does not perform currency conversion.
+          description: |
+            Currency label included in Prometheus metrics and JSON output.
+            Informational only — the plugin does not perform currency
+            conversion. Trimmed at admission and rejected when the trimmed
+            value is empty, so a whitespace-only label cannot become a currency.
         pricing_tiers:
           type: array
           minItems: 1
@@ -33113,9 +33584,12 @@ components:
               status_codes:
                 type: array
                 minItems: 1
+                uniqueItems: true
                 items:
                   type: integer
-                description: Billable status codes that trigger this tier's charge. Ordinary HTTP uses the wire status. Native gRPC and translated gRPC-Web map final terminal codes as 0→200, 1→499, 2→500, 3→400, 4→504, 5→404, 6→409, 7→403, 8→429, 9→400, 10→409, 11→400, 12→501, 13→500, 14→503, 15→500, and 16→401; missing, malformed, or unknown terminal codes map to 500. A status code must appear in exactly one tier.
+                  minimum: 100
+                  maximum: 599
+                description: Billable status codes that trigger this tier's charge. Must be real HTTP status codes in 100–599 and distinct within the tier. Ordinary HTTP uses the wire status. Native gRPC and translated gRPC-Web map final terminal codes as 0→200, 1→499, 2→500, 3→400, 4→504, 5→404, 6→409, 7→403, 8→429, 9→400, 10→409, 11→400, 12→501, 13→500, 14→503, 15→500, and 16→401; missing, malformed, or unknown terminal codes map to 500. A status code must appear in exactly one tier; cross-tier duplication is rejected at construction.
               price_per_call:
                 type: number
                 minimum: 0
@@ -33180,36 +33654,52 @@ components:
                 as `price_per_call`).
         render_cache_ttl_seconds:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
           default: 5
           description: |
             How long the cached /charges response is served before rebuilding.
-            Process-global: every enabled api_chargeback instance must use the
-            same value.
+            Unsigned 64-bit; a negative or fractional value is rejected at
+            construction. Process-global: every enabled api_chargeback instance
+            must use the same value.
         stale_entry_ttl_seconds:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
           default: 3600
           description: |
-            How long idle chargeback entries live before eviction.
-            Process-global: every enabled api_chargeback instance must use the
-            same value.
+            How long an idle chargeback entry may live before it becomes
+            eligible for eviction. Eligibility is not deletion: an idle entry is
+            removed only once a completed GET /charges export has collected its
+            current counters, so uncollected billing state is never discarded on
+            age alone. Unsigned 64-bit. Process-global: every enabled
+            api_chargeback instance must use the same value.
         cache_invalidation_min_age_ms:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
           default: 500
           description: |
-            Minimum age (ms) of the render cache before record() will invalidate
-            it. Process-global: every enabled api_chargeback instance must use
-            the same value.
+            Minimum age (ms) of a render cache before record() will invalidate
+            it. Evaluated per format against that document's own timestamp, so
+            a JSON-only collector gets the same protection as a Prometheus one.
+            Unsigned 64-bit. Process-global: every enabled api_chargeback
+            instance must use the same value.
         cleanup_interval_seconds:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
           default: 300
           description: |
             How often (seconds) the background task evicts entries that have
-            been idle longer than stale_entry_ttl_seconds. Set to 0 to disable.
-            Process-global: every enabled api_chargeback instance must use the
-            same value.
+            been idle longer than stale_entry_ttl_seconds AND have already been
+            collected by a completed export. Set to 0 to disable. Unsigned
+            64-bit. Process-global: every enabled api_chargeback instance must
+            use the same value.
         max_entries:
           type: integer
           minimum: 1
+          maximum: 18446744073709551615
           default: 100000
           description: |
             Hard ceiling on retained billing rows (complete registry entry keys)
@@ -33225,6 +33715,7 @@ components:
         max_retained_bytes:
           type: integer
           minimum: 1
+          maximum: 18446744073709551615
           default: 67108864
           description: |
             Hard ceiling on estimated retained registry bytes, covering ordinary
@@ -33232,7 +33723,7 @@ components:
             Process-global: every enabled api_chargeback instance must use the
             same value.
         schema:
-          $ref: "#/components/schemas/SummaryLogSchema"
+          $ref: "#/components/schemas/ApiChargebackRenderSchema"
         schema_ref:
           type: string
           description: >-
@@ -33997,6 +34488,8 @@ components:
             lost); `dropped_charges_total` counts charges that could not be
             retained at all, which is only reachable when `max_retained_bytes`
             is too small for the configured proxy/status matrix.
+            `uncollected_retained_entries` reports rows held past
+            `stale_entry_ttl_seconds` awaiting collection.
           properties:
             entries:
               type: integer
@@ -34020,6 +34513,14 @@ components:
             dropped_charges_total:
               type: integer
               description: Charges lost because no row could be admitted.
+            uncollected_retained_entries:
+              type: integer
+              description: |
+                Billing rows the last eviction pass kept past
+                `stale_entry_ttl_seconds` because no completed `/charges` export
+                has collected their current counters. Idle age alone never
+                deletes uncollected billing state; a sustained nonzero value
+                means rows are ageing out faster than they are being scraped.
             overflow_consumer_id:
               type: string
               description: |

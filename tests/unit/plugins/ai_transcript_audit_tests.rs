@@ -12597,3 +12597,192 @@ async fn grpc_map_ordinals_are_deterministic_and_key_ordered() {
         );
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// Native gRPC terminal status drives `always_capture_on_error`
+// ══════════════════════════════════════════════════════════════════════
+
+/// `grpc_audit_overrides` with the caller's `sampling` block merged over it.
+fn grpc_audit_overrides_with_sampling(sampling: Value) -> Value {
+    let mut overrides = grpc_audit_overrides();
+    overrides["sampling"] = sampling;
+    overrides
+}
+
+/// A live gRPC-enrolled instance whose only route to a record is the error
+/// override: at `rate: 0` the sampling roll always loses.
+fn grpc_error_override_plugin(endpoint: &str) -> AiTranscriptAudit {
+    let sampling = json!({ "rate": 0.0, "always_capture_on_error": true });
+    let overrides = grpc_audit_overrides_with_sampling(sampling);
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(endpoint, overrides),
+        loopback_http_client(),
+    )
+    .expect("valid grpc audit config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    plugin
+}
+
+/// Stand in for the proxy core, which normalizes the final client-visible gRPC
+/// status — from the terminal TRAILERS frame or a Trailers-Only header block —
+/// into `metadata["grpc_status"]` before the committed and stream-termination
+/// hooks run.
+fn set_final_grpc_status(ctx: &mut RequestContext, status: u32) {
+    let status = status.to_string();
+    ctx.metadata.insert("grpc_status".to_string(), status);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_failure_under_http_200_overrides_a_lost_sampling_roll() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = grpc_error_override_plugin(&endpoint);
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let headers = grpc_headers();
+    let request = grpc_frame(&hello_request_bytes("ada"));
+    let response = grpc_frame(&hello_response_bytes("upstream failed"));
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &request)
+        .await;
+    // The RPC fails the way native gRPC normally does: the transport status
+    // stays 200 and only the terminal `grpc-status` reports the failure.
+    set_final_grpc_status(&mut ctx, 13);
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &response)
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "a failed RPC must be retained by always_capture_on_error, got {records:?}"
+    );
+    assert_eq!(records[0]["capture_reason"], "error");
+    assert_eq!(records[0]["status_code"], 200);
+    assert_eq!(records[0]["grpc_status"], 13);
+    assert_eq!(records[0]["sampled"], false);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_ok_status_stays_subject_to_ordinary_sampling() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = grpc_error_override_plugin(&endpoint);
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let headers = grpc_headers();
+    let request = grpc_frame(&hello_request_bytes("ada"));
+    let response = grpc_frame(&hello_response_bytes("hello ada"));
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &request)
+        .await;
+    set_final_grpc_status(&mut ctx, 0);
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &response)
+        .await;
+
+    assert_eq!(audit_meta(&ctx, SINK_KEY).as_deref(), Some("skipped"));
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert!(
+        requests.is_empty(),
+        "grpc-status 0 is a success and must not fire the error override"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_trailers_only_error_is_retained_from_the_initial_headers() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = grpc_error_override_plugin(&endpoint);
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let request = grpc_frame(&hello_request_bytes("ada"));
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &grpc_headers(), &request)
+        .await;
+    // Trailers-Only: no DATA frame at all, and the terminal status rides in the
+    // initial HEADERS block this hook is handed. `request_protocol` is what the
+    // proxy core stamps for every native gRPC request.
+    ctx.metadata
+        .insert("request_protocol".to_string(), "grpc".to_string());
+    let mut headers = grpc_headers();
+    headers.insert("grpc-status".to_string(), "5".to_string());
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, b"")
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "a Trailers-Only error must be retained, got {records:?}"
+    );
+    assert_eq!(records[0]["capture_reason"], "error");
+    assert_eq!(records[0]["status_code"], 200);
+    assert_eq!(records[0]["grpc_status"], 5);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_failure_reaches_the_transaction_log_fallback() {
+    // A streamed gRPC response never reaches a buffered response hook, so the
+    // transaction-log fallback is the only emission point left. It reads the
+    // same normalized terminal status the transaction summary reports.
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = grpc_error_override_plugin(&endpoint);
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let request = grpc_frame(&hello_request_bytes("ada"));
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &grpc_headers(), &request)
+        .await;
+    let mut metadata = ctx.metadata.clone();
+    metadata.insert("grpc_status".to_string(), "14".to_string());
+    let mut summary = create_test_transaction_summary();
+    summary.metadata = metadata;
+    // The transport status of a completed-but-failed RPC is still 200.
+    summary.response_status_code = 200;
+    plugin.log(&summary).await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "the log fallback must retain a failed RPC, got {records:?}"
+    );
+    assert_eq!(records[0]["capture_reason"], "error");
+    assert_eq!(records[0]["grpc_status"], 14);
+}
+
+#[tokio::test]
+async fn http_records_never_carry_a_grpc_status() {
+    // The gRPC error override must not change HTTP behaviour: an ordinary HTTP
+    // transaction has no gRPC application status to report.
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let config = config_with_sink(&endpoint, json!({ "sampling": { "rate": 1.0 } }));
+    let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["capture_reason"], "sampled");
+    let record = &records[0];
+    assert!(
+        record.get("grpc_status").is_none(),
+        "an HTTP record must not carry a gRPC application status: {record:?}"
+    );
+}
