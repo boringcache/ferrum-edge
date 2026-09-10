@@ -50,7 +50,7 @@ impl<'s> EmittedKeys<'s> {
 
     /// `true` when some field of this record already owns `key`.
     pub(crate) fn contains(&self, key: &str) -> bool {
-        self.reserved.contains(key) || self.per_record.iter().any(|claimed| *claimed == key)
+        self.reserved.contains(key) || self.per_record.contains(&key)
     }
 }
 
