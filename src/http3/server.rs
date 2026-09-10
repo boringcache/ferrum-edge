@@ -5395,13 +5395,21 @@ async fn handle_h3_request(
                     Some(&original_request_path),
                 )
                 .await;
-                send_h3_reject_flavor_aware(
+                // Context-aware writer, like every other H3 plugin rejection:
+                // the contextless one drops the client's gRPC-Web flavor and
+                // passes `FramedGrpcUnaryProvenance::NONE`, which turns a
+                // browser-framed refusal into a native gRPC reply and degrades
+                // a valid `serverless_function` native gRPC terminate response
+                // into an empty trailers-only success (issue #5174).
+                send_h3_plugin_reject_flavor_aware(
                     &mut stream,
+                    &plugins,
+                    &mut ctx,
                     http_flavor,
+                    grpc_web_response_content_type,
                     http_status,
                     reject.body.clone(),
                     &headers,
-                    RejectBodyDisposition::for_request(&ctx.method, http_status.as_u16()),
                 )
                 .await?;
                 return Ok(());
@@ -5514,13 +5522,21 @@ async fn handle_h3_request(
                     Some(&original_request_path),
                 )
                 .await;
-                send_h3_reject_flavor_aware(
+                // Context-aware writer, like every other H3 plugin rejection:
+                // the contextless one drops the client's gRPC-Web flavor and
+                // passes `FramedGrpcUnaryProvenance::NONE`, which turns a
+                // browser-framed refusal into a native gRPC reply and degrades
+                // a valid `serverless_function` native gRPC terminate response
+                // into an empty trailers-only success (issue #5174).
+                send_h3_plugin_reject_flavor_aware(
                     &mut stream,
+                    &plugins,
+                    &mut ctx,
                     http_flavor,
+                    grpc_web_response_content_type,
                     http_status,
                     reject.body.clone(),
                     &headers,
-                    RejectBodyDisposition::for_request(&ctx.method, http_status.as_u16()),
                 )
                 .await?;
                 return Ok(());
