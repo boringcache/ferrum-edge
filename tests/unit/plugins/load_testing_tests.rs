@@ -2091,7 +2091,10 @@ async fn spawn_h2_preferring_tls_capture(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind replay TLS listener");
-    let port = listener.local_addr().expect("replay listener address").port();
+    let port = listener
+        .local_addr()
+        .expect("replay listener address")
+        .port();
     let handle = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept replay connection");
         let mut tls = TlsAcceptor::from(Arc::new(server_config))
