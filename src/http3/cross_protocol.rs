@@ -2288,13 +2288,20 @@ where
     } else {
         None
     };
-    let should_buffer_response = retry_config.is_some()
-        || !crate::proxy::should_stream_response_body(
-            proxy,
-            plugins,
-            ctx,
-            requires_response_body_buffering,
-        );
+    // Deliberately NOT gated on `retry_config.is_some()`, for the same reason
+    // `stream_grpc_response` below is not gated on `grpc_has_retry`: this
+    // bridge's retry loop decides every attempt from the response STATUS the
+    // instant `send()` resolves, before a single body byte is read, so replay
+    // needs the REQUEST body preserved — never the response buffered. Coupling
+    // the two is what made a plain `sse` proxy with `retry.max_retries`
+    // configured collect a backend event stream to EOF before the client saw
+    // its first event, while the same configuration streamed on H1/H2.
+    let should_buffer_response = !crate::proxy::should_stream_response_body(
+        proxy,
+        plugins,
+        ctx,
+        requires_response_body_buffering,
+    );
 
     // Mesh egress needs an exact replayable body for the shared H1/H2 HBONE /
     // Sidecar mesh-mTLS pools. Force-buffer a streaming upload when the
@@ -4348,6 +4355,46 @@ where
     // mislabel or rewrite a representation it must preserve.
     crate::http3::server::stamp_h3_original_response_metadata(ctx, status, &response_headers);
 
+    // Refine the pre-header buffer/stream decision now that the content-type is
+    // known — same downgrade the H1/H2 path applies. `inspect` mode buffers by
+    // default (so a JSON response is inspected via `on_response_body`); this
+    // downgrades only a response every active body plugin can release to the
+    // windowed streaming path. Retry-enabled requests use the same marked
+    // decision context as H1/H2, allowing inherently streaming responses such
+    // as MCP SSE to opt out conservatively after headers arrive.
+    //
+    // Runs BEFORE `after_proxy`, exactly as the H1/H2 dispatch and the native
+    // H3 refined path do, and over the same pristine backend header map the
+    // stamp above captured. Refining afterwards asked the chain about a
+    // representation the gateway itself had just relabelled: an `sse` instance
+    // with `wrap_non_sse_responses` rewrites the `Content-Type` to
+    // `text/event-stream` in `after_proxy` and then releases its own body
+    // (nothing left to wrap in an already-SSE response), so the bytes streamed
+    // out unframed under the event-stream label the wrap was supposed to fill.
+    let has_retry = crate::retry::has_effective_http_retries(proxy.retry.as_ref(), method)
+        && crate::proxy::current_retry_attempt_allowed(
+            route_retry_ceiling,
+            proxy,
+            current_target.as_deref(),
+            0,
+        );
+    // A mesh-egress response is already fully retained, so it is pinned to the
+    // buffered pipeline: there is no live body left to stream, and buffering is
+    // the strictly more inspected of the two paths.
+    let should_buffer_response = {
+        let retry_ctx = has_retry.then(|| crate::proxy::retry_response_decision_context(&*ctx));
+        let response_decision_ctx = retry_ctx.as_ref().unwrap_or(&*ctx);
+        matches!(body_source, PlainBridgeBodySource::MeshBuffered(_))
+            || !crate::proxy::refine_stream_response_for_content_type(
+                !should_buffer_response,
+                proxy,
+                plugins,
+                Some(response_decision_ctx),
+                status,
+                &response_headers,
+            )
+    };
+
     // Run `after_proxy` hooks so response-transformer, CORS, compression-
     // advertise, and other hooks that modify response headers see the
     // cross-protocol path. A rejection here cancels the backend response
@@ -4446,35 +4493,6 @@ where
         sticky_reissue_target.is_some(),
         &mut response_headers,
     );
-
-    // Refine the pre-header buffer/stream decision now that the content-type is
-    // known — same downgrade the H1/H2 path applies. `inspect` mode buffers by
-    // default (so a JSON response is inspected via `on_response_body`); this
-    // downgrades only a response every active body plugin can release to the
-    // windowed streaming path. Retry-enabled requests use the same marked
-    // decision context as H1/H2, allowing inherently streaming responses such
-    // as MCP SSE to opt out conservatively after headers arrive.
-    let has_retry = crate::retry::has_effective_http_retries(proxy.retry.as_ref(), method)
-        && crate::proxy::current_retry_attempt_allowed(
-            route_retry_ceiling,
-            proxy,
-            current_target.as_deref(),
-            0,
-        );
-    let retry_ctx = has_retry.then(|| crate::proxy::retry_response_decision_context(&*ctx));
-    let response_decision_ctx = retry_ctx.as_ref().unwrap_or(&*ctx);
-    // A mesh-egress response is already fully retained, so it is pinned to the
-    // buffered pipeline: there is no live body left to stream, and buffering is
-    // the strictly more inspected of the two paths.
-    let should_buffer_response = matches!(body_source, PlainBridgeBodySource::MeshBuffered(_))
-        || !crate::proxy::refine_stream_response_for_content_type(
-            !should_buffer_response,
-            proxy,
-            plugins,
-            Some(response_decision_ctx),
-            status,
-            &response_headers,
-        );
 
     if should_buffer_response {
         let mut response_status = status;
