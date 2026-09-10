@@ -7604,6 +7604,395 @@ fn proxy_alerts_schema_rejects_unknown_keys_and_keeps_open_maps() {
     );
 }
 
+fn proxy_alerts_channel_config(channel: serde_json::Value) -> serde_json::Value {
+    json!({
+        "channels": { "ops": channel },
+        "rules": [{
+            "name": "r",
+            "type": "status_code_count",
+            "status_codes": [500],
+            "threshold_count": 1,
+            "channels": ["ops"]
+        }]
+    })
+}
+
+fn proxy_alerts_rule_config(rule: serde_json::Value) -> serde_json::Value {
+    json!({
+        "channels": {
+            "ops": {
+                "type": "webhook",
+                "url": "http://127.0.0.1:54321/",
+                "body_template": "{}"
+            }
+        },
+        "rules": [rule]
+    })
+}
+
+fn assert_proxy_alerts_schema_and_constructor(
+    validator: &jsonschema::Validator,
+    name: &str,
+    config: &serde_json::Value,
+    schema_valid: bool,
+    constructor_valid: bool,
+) {
+    assert_eq!(
+        validator.validate(config).is_ok(),
+        schema_valid,
+        "{name}: unexpected schema result for {config}"
+    );
+    let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(config);
+    match (parsed, constructor_valid) {
+        (Ok(_), true) | (Err(_), false) => {}
+        (Ok(_), false) => panic!("{name}: constructor accepted {config}"),
+        (Err(err), true) => panic!("{name}: constructor rejected {config}: {err}"),
+    }
+}
+
+#[test]
+fn proxy_alerts_schema_matches_constructor_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let description = spec["components"]["schemas"]["ProxyAlertsConfig"]["description"]
+        .as_str()
+        .expect("ProxyAlertsConfig description");
+    for contract in [
+        "OptionalFailOpen",
+        "HTTP 400",
+        "delivery_retry_max_ms >= delivery_retry_base_ms",
+        "UTF-8 byte",
+        "case-insensitive",
+        "ferrum-edge validate",
+    ] {
+        assert!(
+            description.contains(contract),
+            "ProxyAlertsConfig description missing `{contract}`"
+        );
+    }
+
+    let docs = include_str!("../../docs/proxy_alerts.md");
+    let plugins_docs = include_str!("../../docs/plugins.md");
+    let notifications_docs = include_str!("../../docs/notifications.md");
+    for (path, text, needle) in [
+        ("docs/proxy_alerts.md", docs, "OptionalFailOpen"),
+        ("docs/proxy_alerts.md", docs, "ferrum-edge validate"),
+        ("docs/proxy_alerts.md", docs, "constructor-only"),
+        ("docs/plugins.md", plugins_docs, "OptionalFailOpen"),
+        ("docs/notifications.md", notifications_docs, "case-insensitive"),
+        ("docs/notifications.md", notifications_docs, "character ceiling"),
+    ] {
+        assert!(
+            text.contains(needle),
+            "{path} missing `{needle}`"
+        );
+    }
+
+    assert_eq!(
+        spec.pointer(
+            "/components/schemas/ProxyAlertsConfig/properties/max_concurrent_dispatches/maximum",
+        )
+        .and_then(serde_json::Value::as_u64),
+        Some(4_294_967_295)
+    );
+    let method_schema = spec
+        .pointer("/components/schemas/ProxyAlertsWebhookChannel/properties/method")
+        .expect("webhook method schema");
+    assert!(
+        method_schema.get("enum").is_none(),
+        "webhook method must not be an uppercase-only enum"
+    );
+    assert_eq!(
+        method_schema["pattern"],
+        json!("^[Pp][Oo][Ss][Tt]$|^[Pp][Uu][Tt]$|^[Pp][Aa][Tt][Cc][Hh]$")
+    );
+    assert_eq!(
+        spec.pointer("/components/schemas/ProxyAlertsEmailChannel/allOf")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(2),
+        "email channel must encode username/password pairing"
+    );
+
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/ProxyAlertsConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .unwrap_or_else(|error| panic!("ProxyAlertsConfig schema compiles: {error}"));
+
+    let webhook = json!({
+        "type": "webhook",
+        "url": "http://127.0.0.1:54321/",
+        "body_template": "{}"
+    });
+    let mut method_post = webhook.clone();
+    method_post["method"] = json!("post");
+    let mut method_patch = webhook.clone();
+    method_patch["method"] = json!("pAtCh");
+    let mut empty_url = webhook.clone();
+    empty_url["url"] = json!("");
+    let mut ftp_url = webhook.clone();
+    ftp_url["url"] = json!("ftp://example.test/");
+    let mut empty_url_env = webhook.clone();
+    empty_url_env.as_object_mut().expect("webhook object").remove("url");
+    empty_url_env["url_env"] = json!("");
+    let mut unbalanced = webhook.clone();
+    unbalanced["body_template"] = json!("${");
+
+    let email = json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com"]
+    });
+    let mut email_username_only = email.clone();
+    email_username_only["username"] = json!("alerts");
+    let mut email_empty_subject = email.clone();
+    email_empty_subject["subject_template"] = json!("");
+    let mut email_empty_host = email.clone();
+    email_empty_host["smtp_host"] = json!("");
+    let mut email_dots = email.clone();
+    email_dots["from"] = json!("a..b@example.test");
+    let mut email_long_subject = email.clone();
+    email_long_subject["subject_template"] = json!("é".repeat(600));
+
+    let mut too_many_dispatches = proxy_alerts_channel_config(webhook.clone());
+    too_many_dispatches["max_concurrent_dispatches"] = json!(4_294_967_296_u64);
+    let mut retry_inversion = proxy_alerts_channel_config(webhook.clone());
+    retry_inversion["delivery_retry_base_ms"] = json!(2000);
+    retry_inversion["delivery_retry_max_ms"] = json!(100);
+
+    let cases: [(&str, serde_json::Value, bool, bool); 25] = [
+        (
+            "minimal webhook",
+            proxy_alerts_channel_config(webhook.clone()),
+            true,
+            true,
+        ),
+        (
+            "method post",
+            proxy_alerts_channel_config(method_post),
+            true,
+            true,
+        ),
+        (
+            "method pAtCh",
+            proxy_alerts_channel_config(method_patch),
+            true,
+            true,
+        ),
+        (
+            "slack",
+            proxy_alerts_channel_config(json!({
+                "type": "slack",
+                "webhook_url": "https://hooks.slack.com/services/x/y/z"
+            })),
+            true,
+            true,
+        ),
+        (
+            "teams",
+            proxy_alerts_channel_config(json!({
+                "type": "teams",
+                "webhook_url": "https://outlook.office.com/webhook/x"
+            })),
+            true,
+            true,
+        ),
+        (
+            "discord",
+            proxy_alerts_channel_config(json!({
+                "type": "discord",
+                "webhook_url": "https://discord.com/api/webhooks/x"
+            })),
+            true,
+            true,
+        ),
+        (
+            "email",
+            proxy_alerts_channel_config(email.clone()),
+            true,
+            true,
+        ),
+        (
+            "error_rate",
+            proxy_alerts_rule_config(json!({
+                "name": "r",
+                "type": "error_rate",
+                "status_codes": [500],
+                "threshold_percent": 5.0,
+                "channels": ["ops"]
+            })),
+            true,
+            true,
+        ),
+        (
+            "latency_percentile",
+            proxy_alerts_rule_config(json!({
+                "name": "r",
+                "type": "latency_percentile",
+                "metric": "backend_total_ms",
+                "percentile": 95,
+                "threshold_ms": 1500,
+                "channels": ["ops"]
+            })),
+            true,
+            true,
+        ),
+        (
+            "error_class",
+            proxy_alerts_rule_config(json!({
+                "name": "r",
+                "type": "error_class",
+                "classes": ["connection_refused"],
+                "threshold_count": 1,
+                "channels": ["ops"]
+            })),
+            true,
+            true,
+        ),
+        (
+            "stream_disconnect_cause",
+            proxy_alerts_rule_config(json!({
+                "name": "r",
+                "type": "stream_disconnect_cause",
+                "causes": ["backend_error"],
+                "threshold_count": 1,
+                "channels": ["ops"]
+            })),
+            true,
+            true,
+        ),
+        (
+            "grpc_status_count",
+            proxy_alerts_rule_config(json!({
+                "name": "r",
+                "type": "grpc_status_count",
+                "grpc_statuses": [14, "OTHER"],
+                "threshold_count": 1,
+                "channels": ["ops"]
+            })),
+            true,
+            true,
+        ),
+        (
+            "grpc_status_rate",
+            proxy_alerts_rule_config(json!({
+                "name": "r",
+                "type": "grpc_status_rate",
+                "grpc_statuses": [14],
+                "threshold_percent": 5.0,
+                "channels": ["ops"]
+            })),
+            true,
+            true,
+        ),
+        (
+            "disabled draft",
+            json!({
+                "channels": {
+                    "ops": {
+                        "type": "webhook",
+                        "url": "http://127.0.0.1:54321/",
+                        "body_template": "{}"
+                    }
+                },
+                "rules": [
+                    { "enabled": false, "unknown_draft_field": true },
+                    {
+                        "name": "r",
+                        "type": "status_code_count",
+                        "status_codes": [500],
+                        "threshold_count": 1,
+                        "channels": ["ops"]
+                    }
+                ]
+            }),
+            true,
+            true,
+        ),
+        (
+            "empty url",
+            proxy_alerts_channel_config(empty_url),
+            false,
+            false,
+        ),
+        (
+            "ftp url",
+            proxy_alerts_channel_config(ftp_url),
+            false,
+            false,
+        ),
+        (
+            "empty url_env",
+            proxy_alerts_channel_config(empty_url_env),
+            false,
+            false,
+        ),
+        (
+            "email username without password",
+            proxy_alerts_channel_config(email_username_only),
+            false,
+            false,
+        ),
+        (
+            "empty subject_template",
+            proxy_alerts_channel_config(email_empty_subject),
+            false,
+            false,
+        ),
+        (
+            "empty smtp_host",
+            proxy_alerts_channel_config(email_empty_host),
+            false,
+            false,
+        ),
+        (
+            "repeated local-part dots",
+            proxy_alerts_channel_config(email_dots),
+            false,
+            false,
+        ),
+        (
+            "max_concurrent_dispatches exceeds u32",
+            too_many_dispatches,
+            false,
+            false,
+        ),
+        (
+            "unbalanced webhook placeholder",
+            proxy_alerts_channel_config(unbalanced),
+            true,
+            false,
+        ),
+        (
+            "email subject byte bound",
+            proxy_alerts_channel_config(email_long_subject),
+            true,
+            false,
+        ),
+        (
+            "delivery retry sibling comparison",
+            retry_inversion,
+            true,
+            false,
+        ),
+    ];
+
+    for (name, config, schema_ok, constructor_ok) in cases {
+        assert_proxy_alerts_schema_and_constructor(
+            &validator,
+            name,
+            &config,
+            schema_ok,
+            constructor_ok,
+        );
+    }
+}
+
 #[test]
 fn ai_prompt_compressor_runtime_and_openapi_contracts_match() {
     use ferrum_edge::plugins::ai_prompt_compressor::AiPromptCompressor;
