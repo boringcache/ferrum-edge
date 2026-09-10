@@ -16880,6 +16880,14 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
 /// at most a partial event, which SSE framing discards) and then releases the
 /// listener slot. Authorization expiry after the 200/event-stream head has
 /// committed RESETS the stream rather than sending a clean FIN.
+///
+/// A PROTOCOL-only bound never resets on its own expiry. Reaching the listener
+/// lifetime is ordinary rotation — the client is expected to reattach with
+/// `Last-Event-ID` — so both terminal paths (the pump timing out, and the body
+/// reaching EOF because the broker ended it at that same lifetime) give `finish`
+/// the bounded post-deadline grace instead of racing it against a deadline that
+/// has already elapsed. Only an actual stalled write past that grace, or an
+/// expired authorization, resets.
 async fn send_h3_aggregate_sse_response(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     ctx: &mut RequestContext,
@@ -17026,15 +17034,27 @@ async fn send_h3_aggregate_sse_response(
             }
         }
     } else {
-        match crate::http3::stream_util::await_response_write_before_deadline(
-            Some(deadline),
-            stream.finish(),
-        )
-        .await
-        {
+        // The body reached its own EOF, which is what an ordinary listener
+        // rotation looks like: the broker ends the stream AT the configured
+        // lifetime, so the composed deadline has normally just elapsed. Racing
+        // the FIN against that already-expired deadline would turn every quiet
+        // expiry into a stream RESET and make routine rotation read as a
+        // transport fault, so a protocol-only bound gets the same bounded
+        // post-deadline opportunity the timeout branch above already grants it.
+        // An expired AUTHORIZATION keeps the strict deadline-bounded write and
+        // its mandatory reset (issues #4112 / #4363).
+        let expired_authorization = aggregate_sse_bound.expired_authorization();
+        let finish = stream.finish();
+        let finished = if expired_authorization.is_some() {
+            crate::http3::stream_util::await_response_write_before_deadline(Some(deadline), finish)
+                .await
+        } else {
+            crate::http3::stream_util::await_post_deadline_terminal_response_write(finish).await
+        };
+        match finished {
             Ok(()) | Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {}
             Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                if let Some(termination) = aggregate_sse_bound.expired_authorization() {
+                if let Some(termination) = expired_authorization {
                     ctx.record_authorization_termination_once(termination, auth_family);
                 }
                 crate::http3::stream_util::abort_response_stream(stream);
