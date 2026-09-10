@@ -2904,6 +2904,18 @@ pub struct RequestContext {
     /// fails closed with 406 when identity is prohibited) instead of buffering
     /// for a compression it cannot run; `after_proxy` must not reacquire.
     compression_response_admission_declined: bool,
+    /// Effective `compression` instances that registered in `before_proxy` and
+    /// have not yet taken their `after_proxy` response decision.
+    ///
+    /// Content negotiation is a decision about the whole configured chain, not
+    /// about one instance: an instance whose `algorithms` or `content_types`
+    /// cannot serve this response says nothing about whether a later sibling
+    /// can. Counting the outstanding decisions is what lets the fixed `406`
+    /// terminal wait until every eligible instance has declined, instead of the
+    /// first one refusing on behalf of the rest (issue #5092). `0` — the
+    /// `before_proxy` chain never reached compression, as on a short-circuited
+    /// `response_caching` HIT — means this instance is the only decider left.
+    compression_response_decisions_pending: u32,
     /// Reserved response-buffer admission permit for gateway compression.
     /// Codec CPU admission is acquired separately, immediately before the
     /// blocking transform, and this permit is held across that transform so the
@@ -3051,6 +3063,20 @@ pub struct RequestContext {
     /// Plugins downstream of `spiffe_identity` may read this for identity-aware
     /// authorization (e.g. mesh policy evaluation in Phase C).
     pub peer_spiffe_id: Option<crate::identity::SpiffeId>,
+    /// Set when `spiffe_identity` derived [`Self::peer_spiffe_id`] from the
+    /// peer's X.509 SVID on this connection (GHSA-qqg9-3r2g-fh44).
+    ///
+    /// Private and crate-set, through
+    /// [`Self::admit_certificate_spiffe_principal`] only, so a certificate-
+    /// derived principal is never conflated with a kernel-attested
+    /// (node-waypoint eBPF) or HBONE-asserted one: those carry no leaf validity
+    /// window, so bounding them by a certificate deadline would be a fiction.
+    /// The authorization-lifetime machinery treats a marked request as
+    /// authenticated, which is what makes the deadline admitted alongside it
+    /// actually enforceable on SPIFFE-only policy chains (`spiffe_identity` +
+    /// `mesh_authz`, no `mtls_auth`). Carries no certificate, DN, SAN, serial,
+    /// or absolute expiry.
+    peer_spiffe_certificate_principal: bool,
     /// Cumulative nanoseconds spent by plugins making external HTTP calls
     /// (via `PluginHttpClient::execute_tracked`). Shared across all plugin
     /// invocations for this request — clone-safe via Arc.
@@ -3575,6 +3601,7 @@ impl RequestContext {
             compression_response_encode_owner: None,
             compression_response_admission_owner: None,
             compression_response_admission_declined: false,
+            compression_response_decisions_pending: 0,
             compression_response_buffer_permit: HeldResponseBufferPermit::default(),
             compression_staged_request_plaintext: None,
             compression_response_encode_aborted: false,
@@ -3598,6 +3625,7 @@ impl RequestContext {
             mtls_auth_connection_cache: None,
             peer_spiffe_extraction_cache: None,
             peer_spiffe_id: None,
+            peer_spiffe_certificate_principal: false,
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reject_hook_execution_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             mirror_result_rxs: Vec::new(),
@@ -4144,6 +4172,34 @@ impl RequestContext {
 
     pub(crate) fn compression_response_admission_declined(&self) -> bool {
         self.compression_response_admission_declined
+    }
+
+    /// Register one effective `compression` instance as still owing an
+    /// `after_proxy` response decision for this request.
+    ///
+    /// Saturating: an implausible instance count must not wrap the tally down
+    /// into a smaller one, because a smaller tally is the fail-OPEN direction
+    /// for the negotiation terminal it gates.
+    pub(crate) fn register_compression_response_decision(&mut self) {
+        self.compression_response_decisions_pending = self
+            .compression_response_decisions_pending
+            .saturating_add(1);
+    }
+
+    /// Settle this instance's `after_proxy` response decision, reporting whether
+    /// it was the LAST one outstanding.
+    ///
+    /// `true` means no further `compression` instance is expected to decide, so
+    /// a refusal taken now is a refusal on behalf of the whole configured chain.
+    /// Saturating at zero: a tally that never registered (the `before_proxy`
+    /// chain did not reach compression) reports `true` immediately, which
+    /// preserves the fail-closed single-instance behavior instead of losing the
+    /// terminal.
+    pub(crate) fn settle_compression_response_decision(&mut self) -> bool {
+        self.compression_response_decisions_pending = self
+            .compression_response_decisions_pending
+            .saturating_sub(1);
+        self.compression_response_decisions_pending == 0
     }
 
     /// Drop this request's reserved response-buffer admission (permit + owner)
@@ -4895,6 +4951,10 @@ impl RequestContext {
             compression_response_encode_owner: self.compression_response_encode_owner,
             compression_response_admission_owner: self.compression_response_admission_owner,
             compression_response_admission_declined: self.compression_response_admission_declined,
+            // The response decision happens on the real context, after this
+            // request-side clone is discarded; carrying the tally keeps the two
+            // views consistent without giving the clone a second vote.
+            compression_response_decisions_pending: self.compression_response_decisions_pending,
             // The reserved response-buffer permit stays on the donor (live)
             // context: this compatibility clone runs only the request-body hooks,
             // never the response-body transform that consumes the permit. Moving
@@ -4946,6 +5006,7 @@ impl RequestContext {
             mtls_auth_connection_cache: self.mtls_auth_connection_cache.clone(),
             peer_spiffe_extraction_cache: self.peer_spiffe_extraction_cache.clone(),
             peer_spiffe_id: self.peer_spiffe_id.clone(),
+            peer_spiffe_certificate_principal: self.peer_spiffe_certificate_principal,
             plugin_http_call_ns: Arc::clone(&self.plugin_http_call_ns),
             reject_hook_execution_ns: Arc::clone(&self.reject_hook_execution_ns),
             // Watch receivers are clone-safe. Preserve them so the detached
@@ -6053,6 +6114,51 @@ impl RequestContext {
             .as_ref()
             .map(|consumer| consumer.username.as_str())
             .or_else(|| meaningful_identity(self.authenticated_identity.as_deref()))
+    }
+
+    /// Contribute an authorization deadline observed by an admitting
+    /// authentication or identity mechanism (issue #3816, GHSA-qqg9-3r2g-fh44).
+    ///
+    /// Earliest wins and the bound is monotonic: a later hook can only tighten
+    /// it, never lengthen it, and `None` is a no-op rather than a reset. A
+    /// long-lived second credential presented alongside a short-lived one
+    /// therefore cannot widen the bound the short-lived one already
+    /// established.
+    pub fn observe_credential_deadline(&mut self, deadline: Option<tokio::time::Instant>) {
+        let Some(deadline) = deadline else {
+            return;
+        };
+        self.credential_deadline_at = Some(match self.credential_deadline_at {
+            Some(existing) => existing.min(deadline),
+            None => deadline,
+        });
+    }
+
+    /// Whether an X.509-derived SPIFFE principal was admitted for this request.
+    ///
+    /// True only for a [`Self::peer_spiffe_id`] that `spiffe_identity` derived
+    /// from the peer certificate, never for a pre-stamped kernel-attested or
+    /// HBONE-asserted identity. This is the SPIFFE half of the
+    /// authorization-lifetime authentication predicate.
+    pub fn has_certificate_spiffe_principal(&self) -> bool {
+        self.peer_spiffe_certificate_principal
+    }
+
+    /// Admit a certificate-derived peer SPIFFE principal together with the
+    /// leaf's authorization deadline (GHSA-qqg9-3r2g-fh44).
+    ///
+    /// The identity and its temporal bound are set together and only together,
+    /// so a SPIFFE-only policy chain can never hold an identity the lifetime
+    /// machinery does not bound. Crate-private: only the certificate-derived
+    /// extraction path may mark this provenance.
+    pub(crate) fn admit_certificate_spiffe_principal(
+        &mut self,
+        id: crate::identity::SpiffeId,
+        deadline: tokio::time::Instant,
+    ) {
+        self.peer_spiffe_id = Some(id);
+        self.peer_spiffe_certificate_principal = true;
+        self.observe_credential_deadline(Some(deadline));
     }
 
     /// Return the identity value to forward to the backend in
@@ -8173,6 +8279,17 @@ pub struct StreamConnectionContext {
     /// [`Self::credential_deadline_at`] to read it. Contains no certificate,
     /// DN, SAN, serial, fingerprint, or absolute expiry.
     credential_deadline_at: Option<tokio::time::Instant>,
+    /// Set when `spiffe_identity` derived the `peer_spiffe_id` metadata on this
+    /// connection from the peer's X.509 SVID (GHSA-qqg9-3r2g-fh44).
+    ///
+    /// Mirrors `RequestContext::peer_spiffe_certificate_principal`, and is
+    /// private and crate-set for the same reason: a pre-stamped kernel-attested
+    /// (node-waypoint eBPF) or HBONE-asserted `peer_spiffe_id` carries no leaf
+    /// validity window and must not be treated as certificate-bounded. A marked
+    /// session counts as authenticated for [`Self::is_authenticated`], so the
+    /// TCP/TLS and UDP/DTLS relays bound it by the deadline admitted alongside
+    /// it. Carries no certificate, DN, SAN, serial, or absolute expiry.
+    peer_spiffe_certificate_principal: bool,
     /// Plugin metadata. Lazily allocated on first write to avoid a HashMap allocation
     /// for stream connections that have no metadata-writing plugins configured.
     pub metadata: Option<HashMap<String, String>>,
@@ -8293,6 +8410,7 @@ impl StreamConnectionContext {
             authenticated_identity: None,
             auth_method: None,
             credential_deadline_at: None,
+            peer_spiffe_certificate_principal: false,
             metadata: None,
             admission_permits: Vec::new(),
             tls_client_cert_der: None,
@@ -8414,7 +8532,33 @@ impl StreamConnectionContext {
     /// Whether this connection admitted an authenticated principal. Mirrors the
     /// HTTP-side predicate in `proxy::auth_lifetime::request_is_authenticated`.
     pub fn is_authenticated(&self) -> bool {
-        self.identified_consumer.is_some() || self.authenticated_identity.is_some()
+        self.identified_consumer.is_some()
+            || self.authenticated_identity.is_some()
+            || self.peer_spiffe_certificate_principal
+    }
+
+    /// Whether an X.509-derived SPIFFE principal was admitted for this session.
+    /// True only for a `peer_spiffe_id` `spiffe_identity` derived from the peer
+    /// certificate, never for a pre-stamped attested or asserted identity.
+    pub fn has_certificate_spiffe_principal(&self) -> bool {
+        self.peer_spiffe_certificate_principal
+    }
+
+    /// Admit a certificate-derived peer SPIFFE principal on this session
+    /// together with the leaf's authorization deadline (GHSA-qqg9-3r2g-fh44).
+    ///
+    /// The metadata identity and its temporal bound are written together and
+    /// only together, so a SPIFFE-only stream policy chain can never hold an
+    /// identity the lifetime machinery does not bound. Crate-private: only the
+    /// certificate-derived extraction path may mark this provenance.
+    pub(crate) fn admit_certificate_spiffe_principal(
+        &mut self,
+        id: &crate::identity::SpiffeId,
+        deadline: tokio::time::Instant,
+    ) {
+        self.insert_metadata("peer_spiffe_id".to_string(), id.to_string());
+        self.peer_spiffe_certificate_principal = true;
+        self.observe_credential_deadline(Some(deadline));
     }
 
     /// Insert a metadata value, lazily allocating the map on first write.

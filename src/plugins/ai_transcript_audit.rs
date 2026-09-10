@@ -89,7 +89,7 @@ use super::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metada
 use super::utils::response_body::{
     BoundedReadError, measure_response_body_bounded, read_response_body_bounded,
 };
-use super::utils::sink_loss::SinkLossReason;
+use super::utils::sink_loss::{SinkLossReason, record_dropped as record_sink_loss};
 use super::utils::{
     BatchConfig, BatchConfigDefaults, BatchingLoggerPermit, DeferredBatchingLogger,
     HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES, LoggerHooks, PluginHttpClient, build_batch_config,
@@ -1703,6 +1703,23 @@ impl RecordsPerMinute {
             .map(RateLimitReservation::commit)
             .is_some()
     }
+
+    /// Non-consuming peek: whether the current window has already refused every
+    /// further reservation.
+    ///
+    /// Deliberately does NOT reserve. Only fail-closed *sink* admission reads
+    /// it, to decline to reject traffic on behalf of a record the finite window
+    /// can never export. A `true` grants nothing, and a stale `false` leaves
+    /// admission exactly where it was before, so unlike a non-consuming
+    /// *capture* peek this cannot let concurrent candidates amplify capture
+    /// past the configured ceiling.
+    fn window_exhausted(&self) -> bool {
+        if self.max_per_minute == 0 {
+            return false;
+        }
+        let (window, count) = Self::unpack(self.state.load(Ordering::Relaxed));
+        window == Self::current_window() && count >= self.max_per_minute
+    }
 }
 
 #[derive(Clone)]
@@ -1963,8 +1980,14 @@ impl AiTranscriptAudit {
             cfg_str(redaction_obj, "placeholder", "redaction")?.unwrap_or("[REDACTED:{type}]");
         let hash_redacted = cfg_bool(redaction_obj, "hash_redacted_values", true, "redaction")?;
         let hash_secret = cfg_str(redaction_obj, "hash_secret", "redaction")?;
+        // Counted in CHARACTERS, not UTF-8 bytes, so the admitted contract is
+        // the one the documentation, the diagnostic, and the JSON Schema
+        // `minLength` all state (JSON Schema counts code points, and a
+        // byte-counted minimum would silently admit an 8-character secret that
+        // the published component refuses). 16 characters is never fewer than
+        // 16 bytes, so this is the stricter of the two readings.
         if let Some(secret) = hash_secret
-            && secret.len() < 16
+            && secret.chars().count() < 16
         {
             return Err(
                 "ai_transcript_audit: 'redaction.hash_secret' must be at least 16 characters"
@@ -2443,6 +2466,29 @@ impl AiTranscriptAudit {
         sample_hit || self.sampling.always_on_error || self.sampling.always_on_guardrail
     }
 
+    /// Whether a finite sampling window could still admit an export for this
+    /// staged record.
+    ///
+    /// `sampling.max_records_per_minute` is a documented volume cap that drops
+    /// records and NEVER rejects traffic, so a record the window has already
+    /// refused must not select a fail-closed `503` on behalf of an audit record
+    /// that can never be written — nor take a queue permit and a retained-byte
+    /// reservation that a still-exportable record could use. A record holding a
+    /// capture-time reservation already owns its slot and is gated normally; an
+    /// override-only candidate acquires at enqueue, so the live window is the
+    /// only thing that can answer for it here.
+    ///
+    /// Export suppression is bounded by the window itself: traffic continues,
+    /// and the first record admitted after the window rolls over flushes
+    /// normally, which is the same background-send recovery probe that restores
+    /// `sink_healthy` on every other path.
+    fn capture_admission_possible(&self, staged: &AuditStaging) -> bool {
+        if staged.capture_skipped.is_some() {
+            return false;
+        }
+        staged.rate_reservation.is_some() || !self.rate_limiter.window_exhausted()
+    }
+
     /// Reserve fail-closed sink capacity before the response becomes
     /// immutable. The permit is stored with the bounded request staging and is
     /// consumed only after validators determine the final status/body.
@@ -2455,6 +2501,9 @@ impl AiTranscriptAudit {
                 return PluginResult::Continue;
             };
             if !self.commit_may_emit(staging.sample_hit) {
+                return PluginResult::Continue;
+            }
+            if !self.capture_admission_possible(&staging) {
                 return PluginResult::Continue;
             }
             let sample_hit = staging.sample_hit;
@@ -2491,7 +2540,11 @@ impl AiTranscriptAudit {
             return PluginResult::Continue;
         };
         let sample_hit = staging.sample_hit;
+        let admissible = self.capture_admission_possible(&staging);
         drop(staging);
+        if !admissible {
+            return PluginResult::Continue;
+        }
         self.ensure_sink_error_admission_for_sample(ctx, sample_hit)
     }
 
@@ -2608,6 +2661,9 @@ impl AiTranscriptAudit {
         let Some(mut staging) = self.staging.get_mut(&record_id) else {
             return PluginResult::Continue;
         };
+        if !self.capture_admission_possible(&staging) {
+            return PluginResult::Continue;
+        }
         if self.on_buffer_full == BufferFullPolicy::Reject && staging.commit_permit.is_none() {
             let Some(permit) = self.logger.try_reserve() else {
                 ctx.metadata
@@ -5712,6 +5768,13 @@ fn validate_ack_json(bytes: &[u8]) -> Result<(), AckFailure> {
 /// - health goes true only after a 2xx whose acknowledgement fully drained and
 ///   validated. Each retry attempt re-publishes, so a batch that succeeds on
 ///   attempt N restores health at attempt N and not before.
+///
+/// Loss accounting: a permanent (non-retryable) 4xx returns `Ok` so the shared
+/// retry loop stops immediately, which also means that loop never sees the
+/// batch as lost. Those records are therefore counted here, exactly once, under
+/// the same `batch_discard` reason the retry-exhausted path uses. Every other
+/// terminal outcome returns `Err` and is counted by
+/// [`crate::plugins::utils::batching_logger`] after the retry budget is spent.
 fn classify_batch_delivery(
     cfg: &HttpFlushConfig,
     entry_count: usize,
@@ -5727,6 +5790,11 @@ fn classify_batch_delivery(
             && status != reqwest::StatusCode::REQUEST_TIMEOUT
             && status != reqwest::StatusCode::TOO_MANY_REQUESTS
         {
+            record_sink_loss(
+                "ai_transcript_audit",
+                SinkLossReason::BatchDiscard,
+                entry_count as u64,
+            );
             tracing::warn!(
                 "ai_transcript_audit batch discarded due to {} response ({} entries lost){}",
                 status,
@@ -6522,15 +6590,30 @@ fn redact_json_value_strings_at_depth(
                 {
                     wholesale_redact_data_source_parameters(&mut value);
                 } else if ctx == JsonRedactionContext::Normal && is_azure_data_sources_key(&key) {
-                    if let Value::Array(sources) = &mut value {
-                        for source in sources.iter_mut() {
-                            redact_json_value_strings_at_depth(
-                                redactor,
-                                source,
-                                depth + 1,
-                                JsonRedactionContext::DataSourceItem,
-                            );
+                    // The provider's conventional shape is an array of
+                    // data-source items, but a captured transcript is arbitrary
+                    // JSON and this name proves no type invariant. Every other
+                    // shape is traversed as a single data-source item instead of
+                    // falling out of the branch untouched: a recognized
+                    // container name must never bypass the ordinary member-name
+                    // and value visitor.
+                    match &mut value {
+                        Value::Array(sources) => {
+                            for source in sources.iter_mut() {
+                                redact_json_value_strings_at_depth(
+                                    redactor,
+                                    source,
+                                    depth + 1,
+                                    JsonRedactionContext::DataSourceItem,
+                                );
+                            }
                         }
+                        other => redact_json_value_strings_at_depth(
+                            redactor,
+                            other,
+                            depth + 1,
+                            JsonRedactionContext::DataSourceItem,
+                        ),
                     }
                 } else {
                     let next_ctx = if ctx == JsonRedactionContext::DataSourceItem {

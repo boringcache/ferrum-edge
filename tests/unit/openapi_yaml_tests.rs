@@ -273,6 +273,96 @@ fn transaction_log_schema_closed_object_keys_match_openapi() {
 }
 
 #[test]
+fn transaction_log_schema_openapi_matches_constructor_admission() {
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    // Issue #5168: the document admitted schema shapes the constructor
+    // rejects — empty names, empty list entries / rename targets / derived
+    // names / static keys, null static values, duplicate `order` entries, and
+    // control characters in a metadata prefix — so schema-driven tooling
+    // approved configurations that fail at load. Both surfaces must agree.
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/TransactionLogSchemaConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("TransactionLogSchemaConfig schema compiles");
+
+    for config in [
+        json!({ "schemas": {} }),
+        json!({ "schemas": { "": {} } }),
+        json!({ "schemas": { "basic": { "omit": [""] } } }),
+        json!({ "schemas": { "basic": { "rename": { "proxy_id": "" } } } }),
+        json!({ "schemas": { "basic": { "rename": { "": "route_id" } } } }),
+        json!({ "schemas": { "basic": { "order": ["*", "*"] } } }),
+        json!({ "schemas": { "basic": { "static_fields": { "stamp": null } } } }),
+        json!({ "schemas": { "basic": { "static_fields": { "": "v1" } } } }),
+        json!({
+            "schemas": { "basic": { "derived_fields": [{ "name": "", "kind": "outcome" }] } }
+        }),
+        json!({
+            "schemas": { "basic": { "metadata": { "mode": "flatten", "prefix": "bad\u{1}" } } }
+        }),
+        json!({ "schemas": { "basic": { "metadata": { "mode": "nested", "prefix": 3 } } } }),
+        json!({
+            "schemas": { "basic": { "metadata": { "mode": "omit", "on_collision": "bad" } } }
+        }),
+    ] {
+        let documented = validator.validate(&config);
+        let runtime = validate_plugin_config("transaction_log_schema", &config);
+        assert!(documented.is_err(), "schema should reject: {config}");
+        assert!(runtime.is_err(), "runtime should reject: {config}");
+    }
+
+    for config in [
+        json!({ "schemas": { "basic": {} } }),
+        json!({
+            "schemas": {
+                "basic": {
+                    "summary_type": "http",
+                    "omit": ["request_user_agent"],
+                    "rename": { "proxy_id": "route_id" },
+                    "order": ["route_id", "*"],
+                    "static_fields": { "env": "production" },
+                    "derived_fields": [{ "name": "outcome", "kind": "outcome" }],
+                    "metadata": { "mode": "flatten", "prefix": "meta_" },
+                    "timestamp_format": "epoch_ms"
+                }
+            }
+        }),
+    ] {
+        let documented = validator.validate(&config);
+        let runtime = validate_plugin_config("transaction_log_schema", &config);
+        assert!(documented.is_ok(), "schema should accept: {config}");
+        assert!(runtime.is_ok(), "runtime should accept: {config}");
+    }
+
+    // Non-global scope is rejected by the admin write path, so the
+    // `PluginConfig` branch must not admit it either.
+    let plugin_branch = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/PluginConfig",
+        "components": spec["components"].clone()
+    });
+    let plugin_validator = jsonschema::draft202012::options()
+        .build(&plugin_branch)
+        .expect("PluginConfig schema compiles");
+    let mut plugin = json!({
+        "plugin_name": "transaction_log_schema",
+        "scope": "global",
+        "enabled": true,
+        "config": { "schemas": { "basic": {} } }
+    });
+    assert!(plugin_validator.validate(&plugin).is_ok());
+    plugin["scope"] = json!("proxy_group");
+    assert!(plugin_validator.validate(&plugin).is_err());
+}
+
+#[test]
 fn typed_component_properties_match_serde_field_inventories() {
     use ferrum_edge::config::types::{
         ActiveHealthCheck, BackendTlsConfig, CircuitBreakerConfig, ConsulConfig, Consumer,
@@ -3146,12 +3236,59 @@ fn ai_federation_schema_publishes_security_fields_and_rejects_unknown_keys() {
         json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "model_mapping": {"gpt-../unsafe": "gpt-4o"}}]}),
         json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "max_response_body_bytes": 0}]}),
         json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "max_response_body_bytes": 67_108_865}]}),
+        // Issue #5260: the component used to admit configurations the
+        // constructor rejects, so `validate` reported success for a file that
+        // could never load. An empty or absent static credential is a
+        // configuration error for every provider type that reads one.
+        json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": ""}]}),
+        json!({"providers": [{"name": "p", "provider_type": "anthropic"}]}),
+        json!({"providers": [{"name": "p", "provider_type": "google_vertex", "google_project_id": "proj", "google_region": "us-central1", "google_service_account_json": ""}]}),
+        // Providers that interpolate the resolved model into the endpoint path
+        // restrict every provider-native model identifier to a safe URL path
+        // component.
+        json!({"providers": [{"name": "p", "provider_type": "google_gemini", "api_key": "test", "default_model": "family/model"}]}),
+        json!({"providers": [{"name": "p", "provider_type": "aws_bedrock", "aws_region": "us-east-1", "model_mapping": {"gpt-4o": "family/model"}}]}),
+        // The endpoint path components exclude the traversal sequence exactly
+        // as `validate_url_path_component` does at load.
+        json!({"providers": [{"name": "p", "provider_type": "azure_openai", "api_key": "test", "azure_resource": "res", "azure_deployment": "v..1"}]}),
+        json!({"providers": [{"name": "p", "provider_type": "azure_openai", "api_key": "test", "azure_resource": "res", "azure_deployment": "dep", "azure_api_version": "v..1"}]}),
+        json!({"providers": [{"name": "p", "provider_type": "google_vertex", "google_project_id": "a..b", "google_region": "us-central1", "google_service_account_json": "{}"}]}),
     ] {
         assert!(
             validator.validate(&invalid).is_err(),
             "schema accepted {invalid}"
         );
     }
+
+    // The tightening must not reject what the constructor accepts: the model
+    // component rule is provider-conditional, and the credential rule does not
+    // apply to the two provider types that never read `api_key`.
+    for accepted in [
+        json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "default_model": "family/model"}]}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "model_mapping": {"gpt-4o": "family/model"}}]}),
+        json!({"providers": [{"name": "b", "provider_type": "aws_bedrock", "aws_region": "us-east-1"}]}),
+        json!({"providers": [{"name": "v", "provider_type": "google_vertex", "google_project_id": "proj", "google_region": "us-central1", "google_service_account_json": "{}"}]}),
+        json!({"providers": [{"name": "g", "provider_type": "google_gemini", "api_key": "test", "default_model": "gemini-1.5-pro"}]}),
+    ] {
+        assert!(
+            validator.validate(&accepted).is_ok(),
+            "schema rejected {accepted}"
+        );
+    }
+
+    // Issue #5262: a completed 2xx that cannot be normalized is terminal, so
+    // the component overview must not still promise priority fallback for it.
+    let description = schema["description"]
+        .as_str()
+        .expect("AiFederationConfig must document itself");
+    assert!(
+        !description.contains("malformed provider success responses"),
+        "AiFederationConfig still promises fallback after a completed malformed success"
+    );
+    assert!(
+        description.contains("response_normalization_failed"),
+        "AiFederationConfig must state that a completed 2xx normalization failure is terminal"
+    );
 }
 
 #[test]
@@ -5713,6 +5850,11 @@ fn kafka_logging_schema_rejects_unknown_root_keys_and_is_closed() {
         schema["properties"]["security_protocol"]["default"],
         json!("plaintext")
     );
+    assert_eq!(schema["properties"]["topic"]["maxLength"], json!(249));
+    assert_eq!(
+        schema["properties"]["message_timeout_ms"]["maximum"],
+        json!(2147483647)
+    );
 
     for valid in [
         json!({"broker_list": "localhost:9092", "topic": "logs"}),
@@ -5756,6 +5898,160 @@ fn kafka_logging_schema_rejects_unknown_root_keys_and_is_closed() {
         json!({"broker_list": "localhost:9092", "topic": "logs", "security_protocol": "sasl_plaintext", "ssl_ca_location": "/etc/ferrum/ca.pem"}),
         json!({"broker_list": "localhost:9092", "topic": "logs", "security_protocol": "sasl_ssl", "sasl_username": "alice"}),
         json!({"broker_list": "localhost:9092", "topic": "logs", "security_protocol": "ssl", "ssl_certificate_location": "/etc/ferrum/client.pem"}),
+    ] {
+        assert_component_validity(&spec, "KafkaLoggingConfig", &invalid, false);
+    }
+}
+
+/// The retained-byte lease and the `key_field: none` partitioning contract must
+/// not drift back to their pre-#5218 / pre-#5219 text on any operator surface.
+///
+/// Both claims were stale in opposite directions: the budget was described as
+/// released at `send`, when it is held through terminal delivery; and `none` was
+/// described as round-robin, when it simply omits the key and lets librdkafka's
+/// own (sticky, consistent-random) partitioner choose.
+#[test]
+fn kafka_logging_operator_surfaces_describe_the_implemented_behavior() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/KafkaLoggingConfig")
+        .expect("KafkaLoggingConfig exists");
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let kafka_section = plugin_docs
+        .split_once("### `kafka_logging`")
+        .and_then(|(_, rest)| rest.split_once("\n### "))
+        .map(|(section, _)| section)
+        .expect("docs/plugins.md has a bounded kafka_logging section");
+
+    let buffer_description = schema["properties"]["buffer_max_bytes"]["description"]
+        .as_str()
+        .expect("buffer_max_bytes description");
+    assert!(
+        buffer_description.contains("NOT released when librdkafka send returns"),
+        "the OpenAPI budget description must state that the lease survives handoff"
+    );
+    assert!(
+        !buffer_description.contains("Bytes are released when librdkafka send returns"),
+        "the OpenAPI budget description must not claim release at handoff"
+    );
+    assert!(
+        kafka_section.contains("The charge is **not** released when `send` returns"),
+        "docs/plugins.md must state that the lease survives handoff"
+    );
+    assert!(
+        !kafka_section.contains("Bytes release when librdkafka `send` returns"),
+        "docs/plugins.md must not claim release at handoff"
+    );
+
+    let key_field_description = schema["properties"]["key_field"]["description"]
+        .as_str()
+        .expect("key_field description");
+    assert!(
+        key_field_description.contains("consistent_random"),
+        "the OpenAPI key_field description must name the librdkafka partitioner"
+    );
+    assert!(
+        !key_field_description.contains("round-robin"),
+        "the OpenAPI key_field description must not promise round-robin"
+    );
+    assert!(
+        kafka_section.contains("consistent_random"),
+        "docs/plugins.md must name the librdkafka partitioner for key_field none"
+    );
+    assert!(
+        !kafka_section.contains("round-robin"),
+        "docs/plugins.md must not promise round-robin partition assignment"
+    );
+
+    // The retained-bytes gauge HELP is published from the contract inventory.
+    for surface in [
+        include_str!("../../docs/prometheus_metrics.md"),
+        include_str!("../../docs/prometheus_metric_contract.json"),
+    ] {
+        assert!(
+            !surface.contains("awaiting librdkafka admission"),
+            "the retained-bytes gauge must not describe a userspace-only budget"
+        );
+    }
+}
+
+/// The component must admit exactly what `KafkaLogging::new` admits (#5217).
+///
+/// Every syntactic case below was reproduced against the constructor; a client
+/// generated from this schema has to reach the same verdict, or preflight is
+/// useless. Two constraints stay deliberately outside the schema because JSON
+/// Schema cannot express them: `buffer_max_bytes >= max_entry_bytes` (an
+/// unrestricted sibling-number comparison) and whether a `schema_ref` names a
+/// schema some `transaction_log_schema` plugin actually registered. Both are
+/// stated in the component descriptions instead.
+#[test]
+fn kafka_logging_schema_matches_runtime_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let long_topic = "a".repeat(249);
+    let too_long_topic = "a".repeat(250);
+    let base = |extra: serde_json::Value| -> serde_json::Value {
+        let mut config = json!({"broker_list": "127.0.0.1:9092", "topic": "audit-logs"});
+        for (key, value) in extra.as_object().expect("overrides are an object") {
+            config[key] = value.clone();
+        }
+        config
+    };
+
+    for valid in [
+        base(json!({"topic": long_topic})),
+        base(json!({"topic": "a.b_c-d"})),
+        base(json!({"topic": "..."})),
+        base(json!({"message_timeout_ms": 0})),
+        base(json!({"message_timeout_ms": 2147483647})),
+        base(json!({"schema_ref": "named"})),
+        base(json!({"producer_config": {"linger.ms": "50"}})),
+        base(json!({"producer_config": {"queue.buffering.max.messages": "100000"}})),
+        base(json!({"producer_config": {"queue.buffering.max.kbytes": "262144"}})),
+        base(json!({"producer_config": {"message.max.bytes": "4194304"}})),
+        base(json!({
+            "security_protocol": "ssl",
+            "producer_config": {"ssl.cipher.suites": "DEFAULT"}
+        })),
+        base(json!({
+            "security_protocol": "sasl_ssl",
+            "sasl_username": " padded ",
+            "sasl_password": " padded ",
+            "producer_config": {"sasl.kerberos.service.name": "kafka"}
+        })),
+    ] {
+        assert_component_validity(&spec, "KafkaLoggingConfig", &valid, true);
+    }
+
+    for invalid in [
+        // Kafka topic syntax (#5213).
+        base(json!({"topic": "."})),
+        base(json!({"topic": ".."})),
+        base(json!({"topic": "bad/name"})),
+        base(json!({"topic": "bad name"})),
+        base(json!({"topic": too_long_topic})),
+        // Runtime integer bounds and the non-empty schema reference (#5217).
+        base(json!({"message_timeout_ms": -1})),
+        base(json!({"message_timeout_ms": 2147483648u64})),
+        base(json!({"schema_ref": ""})),
+        base(json!({"schema": {}, "schema_ref": "named"})),
+        // Normalized enum spellings the constructor refuses (#5217).
+        base(json!({"security_protocol": "PLAINTEXT"})),
+        base(json!({"key_field": " none "})),
+        base(json!({"acks": " 1 "})),
+        base(json!({"compression": " gzip "})),
+        // producer_config refusals, namespaces, and budgets (#5215, #5217).
+        base(json!({"producer_config": {"security.protocol": "ssl"}})),
+        base(json!({"producer_config": {"sasl.password": "secret"}})),
+        base(json!({"producer_config": {"transactional.id": "audit"}})),
+        base(json!({"producer_config": {"queue.buffering.max.messages": "100001"}})),
+        base(json!({"producer_config": {"queue.buffering.max.messages": "0"}})),
+        base(json!({"producer_config": {"queue.buffering.max.kbytes": "262145"}})),
+        base(json!({"producer_config": {"message.max.bytes": "4194305"}})),
+        base(json!({"producer_config": {"ssl.cipher.suites": "DEFAULT"}})),
+        base(json!({"producer_config": {"sasl.kerberos.service.name": "kafka"}})),
     ] {
         assert_component_validity(&spec, "KafkaLoggingConfig", &invalid, false);
     }
@@ -7211,6 +7507,81 @@ async fn compression_schema_matches_strict_runtime_config_contract() {
             "runtime accepted OpenAPI-invalid compression config: {config}"
         );
     }
+
+    // Constructor admission is the source of truth; the schema previously
+    // ACCEPTED each of these while `validate` exited 1 (issue #5095), and
+    // accepted content-type rules the matcher can never equal (issue #5096).
+    for config in [
+        json!({"algorithms": []}),
+        json!({"content_types": []}),
+        json!({"content_types": [""]}),
+        json!({"content_types": ["\u{e9}"]}),
+        json!({"content_types": [" "]}),
+        json!({"content_types": ["application/json; charset=utf-8"]}),
+        json!({"content_types": ["application/json "]}),
+        json!({"content_types": null}),
+        json!({"min_content_length": -1}),
+        json!({"max_decompressed_request_size": 0}),
+        json!({"max_decompressed_request_size": 33_554_433}),
+        json!({"brotli_quality": 12}),
+    ] {
+        assert_component_validity(&spec, "CompressionConfig", &config, false);
+        assert!(
+            CompressionPlugin::new(&config).is_err(),
+            "runtime accepted a config the schema now rejects: {config}"
+        );
+    }
+
+    // A `min_content_length` past `u64::MAX` is runtime-rejected (it is not an
+    // unsigned integer any more). The schema's `maximum` cannot bind it: the
+    // value only survives JSON parsing as an `f64`, and `u64::MAX` rounds to the
+    // same `f64`, so this stays a runtime-only assertion rather than a parity
+    // case that would silently depend on float behaviour.
+    let past_u64: serde_json::Value =
+        serde_json::from_str(r#"{"min_content_length": 18446744073709551616}"#)
+            .expect("oversized literal parses");
+    assert!(
+        CompressionPlugin::new(&past_u64).is_err(),
+        "runtime must reject a min_content_length past u64::MAX"
+    );
+
+    // Explicit null is "omitted" for every optional field the constructor reads
+    // through its `optional_*` helpers. `content_types` is deliberately NOT one
+    // of them, and is covered above.
+    for field in [
+        "algorithms",
+        "min_content_length",
+        "max_decompressed_request_size",
+        "gzip_level",
+        "brotli_quality",
+        "remove_accept_encoding",
+        "decompress_request",
+    ] {
+        let mut object = serde_json::Map::new();
+        object.insert(field.to_string(), serde_json::Value::Null);
+        let config = serde_json::Value::Object(object);
+        assert_component_validity(&spec, "CompressionConfig", &config, true);
+        assert!(
+            CompressionPlugin::new(&config).is_ok(),
+            "runtime must treat an explicit null {field} as omitted"
+        );
+    }
+
+    // Values both surfaces must keep accepting, so the tightened bounds did not
+    // over-constrain the documented shapes.
+    for config in [
+        json!({"content_types": ["application/vnd.api+json", "text/csv"]}),
+        json!({"min_content_length": 0}),
+        json!({"max_decompressed_request_size": 1}),
+        json!({"max_decompressed_request_size": 33_554_432}),
+        json!({"brotli_quality": 11}),
+    ] {
+        assert_component_validity(&spec, "CompressionConfig", &config, true);
+        assert!(
+            CompressionPlugin::new(&config).is_ok(),
+            "runtime rejected a schema-valid compression config: {config}"
+        );
+    }
 }
 
 #[test]
@@ -7310,6 +7681,14 @@ fn grpc_web_schema_matches_the_strict_runtime_shape() {
         json!({}),
         json!({"expose_headers": ["x-request-id"]}),
         json!({"expose_headers": []}),
+        // Field-level parity (issue #5134): the constructor treats an explicit
+        // null as the empty list and trims ASCII OWS off each item, and the
+        // schema has to say the same thing.
+        json!({"expose_headers": null}),
+        json!({"expose_headers": [" X-Ok "]}),
+        json!({"expose_headers": ["custom-header-bin", "x-request-id"]}),
+        // Names differing only in case are accepted and collapse to one entry.
+        json!({"expose_headers": ["X-Request-Id", "x-request-id"]}),
     ] {
         assert_component_validity(&spec, "GrpcWebConfig", &config, true);
         assert!(
@@ -7326,6 +7705,13 @@ fn grpc_web_schema_matches_the_strict_runtime_shape() {
         json!(true),
         json!({"expose_header": ["x-request-id"]}),
         json!({"expose_headers": ["x-request-id"], "extra": true}),
+        // Item constraints the schema previously did not model at all.
+        json!({"expose_headers": [""]}),
+        json!({"expose_headers": ["   "]}),
+        json!({"expose_headers": ["bad name"]}),
+        json!({"expose_headers": ["bad:name"]}),
+        json!({"expose_headers": ["x-request-id\r\nx-injected"]}),
+        json!({"expose_headers": [1]}),
     ] {
         assert_component_validity(&spec, "GrpcWebConfig", &config, false);
         assert!(
@@ -8298,6 +8684,97 @@ fn jwt_auth_schema_rejects_unknown_config_keys() {
             "schema should reject unknown jwt_auth key: {config}"
         );
     }
+}
+
+#[test]
+fn prometheus_metrics_config_is_closed_and_bounds_unsigned_timing_fields() {
+    use ferrum_edge::plugins::prometheus_metrics::PrometheusMetrics;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/PrometheusMetricsConfig")
+        .expect("PrometheusMetricsConfig component exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    let schema_fields: BTreeSet<&str> = schema["properties"]
+        .as_object()
+        .expect("PrometheusMetricsConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        schema_fields,
+        BTreeSet::from([
+            "cache_invalidation_min_age_ms",
+            "mesh_series_budget_per_family",
+            "render_cache_ttl_seconds",
+            "stale_entry_ttl_seconds",
+        ])
+    );
+    assert!(
+        !schema_fields.contains("schema") && !schema_fields.contains("schema_ref"),
+        "schema/schema_ref must not be accepted properties"
+    );
+
+    let uint64_max = json!(u64::MAX);
+    for field in [
+        "render_cache_ttl_seconds",
+        "stale_entry_ttl_seconds",
+        "cache_invalidation_min_age_ms",
+    ] {
+        assert_eq!(schema["properties"][field]["format"], json!("uint64"));
+        assert_eq!(schema["properties"][field]["minimum"], json!(0));
+        assert_eq!(schema["properties"][field]["maximum"], uint64_max);
+    }
+    assert_eq!(
+        schema["properties"]["mesh_series_budget_per_family"]["minimum"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["mesh_series_budget_per_family"]["maximum"],
+        json!(1_000_000)
+    );
+
+    for config in [
+        json!({}),
+        json!({"render_cache_ttl_seconds": 0}),
+        json!({"render_cache_ttl_seconds": u64::MAX}),
+        json!({"stale_entry_ttl_seconds": u64::MAX}),
+        json!({"cache_invalidation_min_age_ms": u64::MAX}),
+        json!({"mesh_series_budget_per_family": 1}),
+        json!({"mesh_series_budget_per_family": 1_000_000}),
+    ] {
+        assert_component_validity(&spec, "PrometheusMetricsConfig", &config, true);
+        PrometheusMetrics::new(&config, "ferrum")
+            .unwrap_or_else(|err| panic!("constructor must accept {config}: {err}"));
+    }
+
+    for config in [
+        json!({"render_cache_ttl_secnds": 10}),
+        json!({"schema": {}}),
+        json!({"schema_ref": "x"}),
+        json!({"render_cache_ttl_seconds": -1}),
+        json!({"stale_entry_ttl_seconds": -1}),
+        json!({"cache_invalidation_min_age_ms": -1}),
+        json!({"mesh_series_budget_per_family": 0}),
+        json!({"mesh_series_budget_per_family": 1_000_001}),
+    ] {
+        assert_component_validity(&spec, "PrometheusMetricsConfig", &config, false);
+        assert!(
+            PrometheusMetrics::new(&config, "ferrum").is_err(),
+            "constructor must reject {config}"
+        );
+    }
+
+    let over = serde_json::from_str("18446744073709551616")
+        .expect("u64::MAX+1 must parse as a JSON number");
+    let mut over_range = json!({});
+    over_range
+        .as_object_mut()
+        .expect("object")
+        .insert("render_cache_ttl_seconds".to_string(), over);
+    assert_component_validity(&spec, "PrometheusMetricsConfig", &over_range, false);
 }
 
 #[test]
@@ -9478,6 +9955,507 @@ async fn ai_transcript_audit_schema_matches_runtime_unknown_key_contract() {
         assert_eq!(
             runtime_valid, expected_valid,
             "runtime/schema parity drift for {config}"
+        );
+    }
+}
+
+/// Table-driven component-versus-constructor contract for every admission rule
+/// the component can express (issue #5273).
+///
+/// The unknown-key test above proves the two key SETS agree; this one proves
+/// the two ADMISSION decisions agree for the type, null, enum, non-empty,
+/// conditional, numeric, and string-grammar constraints.
+///
+/// Descriptor-file dependencies are deliberately kept out: `grpc.descriptor_path`
+/// points at a path that does not exist, which the constructor treats as
+/// "enrollment retained, body excerpts omitted" rather than a config error, so
+/// these cases compare schema against shape and never against node-local file
+/// state.
+#[tokio::test]
+async fn ai_transcript_audit_schema_matches_runtime_admission_contract() {
+    use ferrum_edge::plugins::ai_transcript_audit::AiTranscriptAudit;
+    use ferrum_edge::plugins::utils::PluginHttpClient;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let http_client = PluginHttpClient::default();
+
+    // The minimum admissible sink, plus whatever a case overrides on it.
+    let sink = |extra: serde_json::Value| {
+        let overlay = extra.as_object().expect("sink overlay is an object");
+        let mut base = json!({"endpoint_url": "https://audit.example.com/ingest"});
+        for (key, value) in overlay {
+            base[key] = value.clone();
+        }
+        base
+    };
+    // A single-method gRPC enrollment whose descriptor is intentionally absent.
+    let grpc = |method: serde_json::Value| {
+        json!({
+            "descriptor_path": "/nonexistent/ferrum-ai-transcript-audit-descriptor.bin",
+            "methods": {"/test.Greeter/SayHello": method}
+        })
+    };
+    // 8 code points, 16 UTF-8 bytes: admitted under a byte-counted minimum,
+    // refused under the character-counted one the schema and the constructor
+    // now agree on.
+    let short_multibyte_secret = "\u{00e9}".repeat(8);
+
+    let cases: Vec<(&str, serde_json::Value, bool)> = vec![
+        // ---- null keeps the documented default for every fixed scalar ----
+        (
+            "mode null",
+            json!({
+                "mode": null,
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "capture.request null",
+            json!({
+                "capture": {"request": null},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "sink.on_sink_error null",
+            json!({
+                "sink": sink(json!({"on_sink_error": null}))
+            }),
+            true,
+        ),
+        (
+            "limits.max_entry_bytes null",
+            json!({
+                "limits": {"max_entry_bytes": null},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "privacy.path_mode null",
+            json!({
+                "privacy": {"path_mode": null},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "redaction.builtins null",
+            json!({
+                "redaction": {"builtins": null},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        // ---- null is a TYPE ERROR where the runtime has no default path ----
+        (
+            "sink null",
+            json!({
+                "sink": null
+            }),
+            false,
+        ),
+        (
+            "sink.batch_size null",
+            json!({
+                "sink": sink(json!({"batch_size": null}))
+            }),
+            false,
+        ),
+        (
+            "sink.custom_headers null",
+            json!({
+                "sink": sink(json!({"custom_headers": null}))
+            }),
+            false,
+        ),
+        (
+            "redaction.custom_patterns null",
+            json!({
+                "redaction": {"custom_patterns": null},
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "grpc null",
+            json!({
+                "grpc": null,
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        // ---- capture.streaming_response accepts the string spellings ----
+        (
+            "streaming_response 'true'",
+            json!({
+                "capture": {"streaming_response": "true"},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "streaming_response 'false'",
+            json!({
+                "capture": {"streaming_response": "false"},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "streaming_response 'sampled'",
+            json!({
+                "capture": {"streaming_response": "sampled"},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "streaming_response 'maybe'",
+            json!({
+                "capture": {"streaming_response": "maybe"},
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        // ---- full_body needs the explicit unredacted-capture opt-in ----
+        (
+            "full_body without opt-in",
+            json!({
+                "mode": "full_body",
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "full_body with opt-in",
+            json!({
+                "mode": "full_body",
+                "allow_full_body": true,
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        // ---- at least one capture direction must stay enabled ----
+        (
+            "every capture direction off",
+            json!({
+                "capture": {
+                    "request": false,
+                    "response": false,
+                    "streaming_response": false
+                },
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "request+response off, streaming defaulted off",
+            json!({
+                "capture": {"request": false, "response": false},
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "request+response off, streaming on",
+            json!({
+                "capture": {
+                    "request": false,
+                    "response": false,
+                    "streaming_response": true
+                },
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        // ---- an emptied pattern set is a silent pass-through redactor ----
+        (
+            "empty pattern set in redacted_body",
+            json!({
+                "redaction": {"builtins": []},
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "empty pattern set in metadata_only",
+            json!({
+                "mode": "metadata_only",
+                "redaction": {"builtins": []},
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "empty builtins with a custom pattern",
+            json!({
+                "redaction": {
+                    "builtins": [],
+                    "custom_patterns": [{"name": "ticket", "regex": "T-[0-9]+"}]
+                },
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "empty pattern set in hash_only",
+            json!({
+                "mode": "hash_only",
+                "redaction": {"builtins": []},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "empty pattern set in hash_only under path_mode redact",
+            json!({
+                "mode": "hash_only",
+                "redaction": {"builtins": []},
+                "privacy": {"path_mode": "redact"},
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        // ---- the hash_secret minimum is counted in CHARACTERS ----
+        (
+            "hash_secret of 16 characters",
+            json!({
+                "redaction": {"hash_secret": "fleet-stable-key"},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "hash_secret of 8 characters / 16 bytes",
+            json!({
+                "redaction": {"hash_secret": short_multibyte_secret},
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        // ---- numeric and string grammar ----
+        (
+            "max_records_per_minute at the u64 ceiling",
+            json!({
+                "sampling": {"max_records_per_minute": u64::MAX},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "negative max_records_per_minute",
+            json!({
+                "sampling": {"max_records_per_minute": -1},
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "ftp collector scheme",
+            json!({
+                "sink": sink(json!({"endpoint_url": "ftp://audit.example.com/ingest"}))
+            }),
+            false,
+        ),
+        (
+            "uppercase https collector scheme",
+            json!({
+                "sink": sink(json!({"endpoint_url": "HTTPS://audit.example.com/ingest"}))
+            }),
+            true,
+        ),
+        (
+            "empty collector url",
+            json!({
+                "sink": sink(json!({"endpoint_url": ""}))
+            }),
+            false,
+        ),
+        // ---- gRPC method shape ----
+        (
+            "duplicate grpc text_fields",
+            json!({
+                "grpc": grpc(json!({
+                    "request_type": "test.Hello",
+                    "text_fields": ["name", "name"]
+                })),
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "distinct grpc text_fields",
+            json!({
+                "grpc": grpc(json!({
+                    "request_type": "test.Hello",
+                    "text_fields": ["name"]
+                })),
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "null grpc text_fields",
+            json!({
+                "grpc": grpc(json!({
+                    "request_type": "test.Hello",
+                    "text_fields": null
+                })),
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "empty grpc text_fields",
+            json!({
+                "grpc": grpc(json!({
+                    "request_type": "test.Hello",
+                    "text_fields": []
+                })),
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "grpc method with only a null request_type",
+            json!({
+                "grpc": grpc(json!({"request_type": null})),
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "grpc method with a null request_type and a real response_type",
+            json!({
+                "grpc": grpc(json!({
+                    "request_type": null,
+                    "response_type": "test.Reply"
+                })),
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "grpc max_messages null",
+            json!({
+                "grpc": {
+                    "descriptor_path": "/nonexistent/ferrum-descriptor.bin",
+                    "methods": {"/test.Greeter/SayHello": {"request_type": "test.Hello"}},
+                    "max_messages": null
+                },
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+    ];
+
+    for (label, config, expected_valid) in cases {
+        assert_component_validity(&spec, "AiTranscriptAuditConfig", &config, expected_valid);
+        let runtime_valid = AiTranscriptAudit::new(&config, http_client.clone()).is_ok();
+        assert_eq!(
+            runtime_valid, expected_valid,
+            "runtime/schema admission drift for {label}: {config}"
+        );
+    }
+
+    // Checks ordinary JSON Schema cannot express. The component documents each
+    // of these as runtime-only; the contract here is that the schema stays
+    // permissive while the constructor still refuses, so a schema-driven editor
+    // never blocks a valid config and never claims one of these is admissible.
+    let runtime_only: Vec<(&str, serde_json::Value)> = vec![
+        (
+            "max_entry_bytes below the worst-case serialized-record contract",
+            json!({
+                "limits": {"max_entry_bytes": 1},
+                "sink": sink(json!({}))
+            }),
+        ),
+        (
+            "buffer_max_bytes below the max_entry_bytes retained charge",
+            json!({
+                "limits": {"max_entry_bytes": 16777216, "buffer_max_bytes": 65536},
+                "sink": sink(json!({}))
+            }),
+        ),
+        (
+            "capture limits over the cross-field aggregate",
+            json!({
+                "limits": {
+                    "max_request_bytes": 1048576,
+                    "max_response_bytes": 1048576,
+                    "max_stream_capture_bytes": 1048576
+                },
+                "sink": sink(json!({}))
+            }),
+        ),
+        (
+            "custom pattern that is not a valid Rust regex",
+            json!({
+                "redaction": {"custom_patterns": [{"name": "bad", "regex": "([a-z"}]},
+                "sink": sink(json!({}))
+            }),
+        ),
+        (
+            "cleartext collector without the loopback opt-in",
+            json!({
+                "sink": sink(json!({"endpoint_url": "http://127.0.0.1:9000/ingest"}))
+            }),
+        ),
+        (
+            "cleartext non-loopback collector with the loopback opt-in",
+            json!({
+                "sink": sink(json!({
+                    "endpoint_url": "http://audit.example.com/ingest",
+                    "allow_insecure_loopback": true
+                }))
+            }),
+        ),
+        (
+            "collector url carrying userinfo credentials",
+            json!({
+                "sink": sink(json!({"endpoint_url": "https://u:p@audit.example.com/x"}))
+            }),
+        ),
+        (
+            "sink header template referencing the process environment",
+            json!({
+                "sink": sink(json!({"custom_headers": {"X-A": "${FERRUM_DB_URL}"}}))
+            }),
+        ),
+        (
+            "two grpc method keys that normalize to one path",
+            json!({
+                "grpc": {
+                    "descriptor_path": "/nonexistent/ferrum-descriptor.bin",
+                    "methods": {
+                        "/test.Greeter/SayHello": {"request_type": "test.Hello"},
+                        "test.Greeter/SayHello": {"request_type": "test.Hello"}
+                    }
+                },
+                "sink": sink(json!({}))
+            }),
+        ),
+        (
+            "grpc text_fields that differ only by segment whitespace",
+            json!({
+                "grpc": grpc(json!({
+                    "request_type": "test.Hello",
+                    "text_fields": ["outer.name", "outer . name"]
+                })),
+                "sink": sink(json!({}))
+            }),
+        ),
+    ];
+
+    for (label, config) in runtime_only {
+        assert_component_validity(&spec, "AiTranscriptAuditConfig", &config, true);
+        assert!(
+            AiTranscriptAudit::new(&config, http_client.clone()).is_err(),
+            "runtime must still refuse the documented runtime-only check {label}: {config}"
         );
     }
 }
@@ -11169,6 +12147,9 @@ fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract()
 
 #[test]
 fn spec_expose_schema_matches_strict_runtime_null_contract() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::spec_expose::SpecExpose;
+
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
     let schema = spec
@@ -11177,6 +12158,22 @@ fn spec_expose_schema_matches_strict_runtime_null_contract() {
 
     assert_eq!(schema["additionalProperties"], false);
     assert_eq!(schema["required"], json!(["spec_url"]));
+    assert_eq!(
+        schema["properties"]["spec_url"]["pattern"],
+        r"^\s*https?://[^/@?#]+(?:[/?#].*)?\s*$"
+    );
+    assert_eq!(
+        schema["properties"]["content_type"]["pattern"],
+        r"^[\u0009\u0020-\u007E]*[!-~][\u0009\u0020-\u007E]*$"
+    );
+    assert_eq!(
+        schema["properties"]["cache_ttl_seconds"]["maximum"],
+        json!(u64::MAX)
+    );
+    assert_eq!(
+        schema["properties"]["max_response_body_bytes"]["maximum"],
+        json!(u64::MAX)
+    );
     for (field, scalar_type) in [
         ("content_type", "string"),
         ("tls_no_verify", "boolean"),
@@ -11202,15 +12199,48 @@ fn spec_expose_schema_matches_strict_runtime_null_contract() {
         }),
         true,
     );
+    assert_component_validity(
+        &spec,
+        "SpecExposeConfig",
+        &json!({ "spec_url": " https://example.com/spec " }),
+        true,
+    );
+    SpecExpose::new(
+        &json!({ "spec_url": " https://example.com/spec " }),
+        PluginHttpClient::default(),
+    )
+    .expect("trimmed spec_url must remain accepted");
+
     for invalid in [
         json!({"spec_url": "https://example.com/openapi.yaml", "tls_no_verfy": true}),
         json!({"spec_url": "https://example.com/openapi.yaml", "content_type": 7}),
         json!({"spec_url": "https://example.com/openapi.yaml", "tls_no_verify": "false"}),
         json!({"spec_url": "https://example.com/openapi.yaml", "cache_ttl_seconds": -1}),
+        json!({"spec_url": "https://example.com/openapi.yaml", "cache_ttl_seconds": 1e20}),
         json!({"spec_url": "https://example.com/openapi.yaml", "max_response_body_bytes": 0}),
+        json!({"spec_url": "https://example.com/openapi.yaml", "max_response_body_bytes": 1e20}),
+        json!({"spec_url": "https://example.com/openapi.yaml", "content_type": "   "}),
+        json!({
+            "spec_url": "https://example.com/openapi.yaml",
+            "content_type": "application/yaml\r\nx-bad: yes"
+        }),
+        json!({"spec_url": "ftp://example.com/openapi.yaml"}),
+        json!({"spec_url": "https:///openapi.yaml"}),
+        json!({"spec_url": "https://user:pass@example.com/openapi.yaml"}),
+        json!({"spec_url": "not a url"}),
     ] {
         assert_component_validity(&spec, "SpecExposeConfig", &invalid, false);
+        assert!(
+            SpecExpose::new(&invalid, PluginHttpClient::default()).is_err(),
+            "schema-invalid spec_expose config unexpectedly passed runtime: {invalid}"
+        );
     }
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    assert!(plugin_docs.contains("must be nonempty after trim"));
+    assert!(plugin_docs.contains("Must be greater than zero"));
+    assert!(plugin_docs.contains("decoded to identity"));
+    assert!(plugin_docs.contains("reject-path `after_proxy`"));
 }
 
 #[test]
@@ -11953,11 +12983,53 @@ fn response_mock_schema_matches_strict_runtime_contract() {
 
     assert_eq!(rule["properties"]["path"]["minLength"], 1);
     assert_eq!(rule["properties"]["method"]["minLength"], 1);
-    assert_eq!(rule["properties"]["status_code"]["minimum"], 100);
-    assert_eq!(rule["properties"]["status_code"]["maximum"], 599);
+    assert_eq!(
+        rule["properties"]["method"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        rule["properties"]["method"]["pattern"],
+        "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+    );
+    let status_one_of = rule["properties"]["status_code"]["oneOf"]
+        .as_array()
+        .expect("status_code oneOf");
+    assert_eq!(status_one_of.len(), 3);
+    assert_eq!(status_one_of[0]["type"], "null");
+    assert_eq!(status_one_of[1]["const"], 101);
+    assert_eq!(status_one_of[2]["minimum"], 200);
+    assert_eq!(status_one_of[2]["maximum"], 599);
+    assert_eq!(
+        rule["properties"]["headers"]["type"],
+        json!(["object", "null"])
+    );
+    assert_eq!(
+        rule["properties"]["headers"]["propertyNames"]["pattern"],
+        "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+    );
+    assert!(
+        rule["properties"]["headers"]["propertyNames"]["not"]["pattern"]
+            .as_str()
+            .expect("protocol-managed header exclusion")
+            .contains("[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]")
+    );
     assert_eq!(
         rule["properties"]["headers"]["additionalProperties"]["type"],
         "string"
+    );
+    assert_eq!(
+        rule["properties"]["body"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        rule["properties"]["delay_ms"]["type"],
+        json!(["integer", "null"])
+    );
+    assert_eq!(rule["properties"]["delay_ms"]["minimum"], 0);
+    assert_eq!(rule["properties"]["delay_ms"]["maximum"], 3600000);
+    assert_eq!(
+        schema["properties"]["passthrough_on_no_match"]["type"],
+        json!(["boolean", "null"])
     );
 
     let description = schema["description"].as_str().expect("description");
@@ -12027,6 +13099,17 @@ fn response_mock_schema_matches_strict_runtime_contract() {
             }]
         }),
         json!({
+            "passthrough_on_no_match": null,
+            "rules": [{
+                "method": null,
+                "path": "/",
+                "status_code": null,
+                "headers": null,
+                "body": null,
+                "delay_ms": null
+            }]
+        }),
+        json!({
             "rules": [{
                 "path": "/api/v1",
                 "status_code": 599,
@@ -12040,6 +13123,7 @@ fn response_mock_schema_matches_strict_runtime_contract() {
                 "body": "must-not-be-sent"
             }]
         }),
+        json!({"rules": [{"path": "/", "delay_ms": 3600000}]}),
     ] {
         assert_component_validity(&spec, "ResponseMockConfig", &valid, true);
         assert!(
@@ -12058,10 +13142,14 @@ fn response_mock_schema_matches_strict_runtime_contract() {
         }),
         json!({"rules": [{"path": "", "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "method": "", "body": "ok"}]}),
+        json!({"rules": [{"path": "/health", "method": "BAD METHOD", "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "status_code": 99, "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "status_code": 100, "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "status_code": 103, "body": "ok"}]}),
+        json!({"rules": [{"path": "/health", "status_code": 199, "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "status_code": 600, "body": "ok"}]}),
+        json!({"rules": [{"path": "/", "delay_ms": -1}]}),
+        json!({"rules": [{"path": "/", "delay_ms": 3600001}]}),
         json!({"rules": [{"body": "missing-path"}]}),
         json!({"rules": []}),
         json!({}),
@@ -12071,24 +13159,22 @@ fn response_mock_schema_matches_strict_runtime_contract() {
                 "headers": {"x-mock": 42}
             }]
         }),
+        json!({
+            "rules": [{
+                "path": "/",
+                "headers": {"Content-Length": "3"}
+            }]
+        }),
+        json!({
+            "rules": [{
+                "path": "/",
+                "headers": {"connection": "close"}
+            }]
+        }),
     ] {
-        // OpenAPI keeps minimum 100 / maximum 599; runtime rejects unsupported
-        // informational statuses (100, 102–199) as the authoritative boundary.
-        let runtime_err = ResponseMock::new(&invalid).is_err();
-        if invalid
-            .pointer("/rules/0/status_code")
-            .and_then(|v| v.as_u64())
-            .is_some_and(|code| matches!(code, 100 | 103))
-        {
-            assert!(
-                runtime_err,
-                "informational status must fail runtime: {invalid}"
-            );
-            continue;
-        }
         assert_component_validity(&spec, "ResponseMockConfig", &invalid, false);
         assert!(
-            runtime_err,
+            ResponseMock::new(&invalid).is_err(),
             "schema-invalid config unexpectedly passed runtime: {invalid}"
         );
     }
@@ -12099,10 +13185,22 @@ fn response_mock_schema_matches_strict_runtime_contract() {
     assert!(guide.contains("WebSocket handshake contract"));
     assert!(guide.contains("never establishes an upgraded frame stream"));
     assert!(guide.contains("Unknown top-level and per-rule keys are rejected"));
+    assert!(guide.contains("Omitted or explicit `null`"));
+    assert!(guide.contains("0`–`3600000"));
     assert!(guide.contains("Status / body wire semantics"));
     assert!(guide.contains("informational statuses"));
     assert!(guide.contains("Native gRPC exclusion"));
     assert!(guide.contains("native gRPC unsupported"));
+
+    let features = include_str!("../../FEATURES.md");
+    assert!(
+        features.contains("relative only for prefix"),
+        "FEATURES.md must qualify prefix-only relative mock paths"
+    );
+    assert!(
+        features.contains("host-only"),
+        "FEATURES.md must mention host-only full-path matching"
+    );
 
     let matrix = include_str!("../../docs/plugin_execution_order.md");
     assert!(
@@ -13464,6 +14562,170 @@ fn merge_into_object(target: &mut serde_json::Value, extra: &serde_json::Value) 
     }
 }
 
+/// Bidirectional parity for `ai_semantic_firewall`: the published component and
+/// the constructor must return the SAME verdict, so a schema-validating client
+/// can preflight a configuration `ferrum-edge validate` will accept.
+#[test]
+fn ai_semantic_firewall_schema_matches_runtime_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    const ENDPOINT: &str = "http://127.0.0.1:1/v1/embeddings";
+    let provider = json!({"type": "openai_compatible_embeddings", "endpoint": ENDPOINT});
+
+    let accepted = [
+        json!({"provider": provider}),
+        json!({"enabled": false}),
+        json!({"provider": provider, "enabled": false}),
+        json!({
+            "provider": provider,
+            "inspect": {"request": false, "response": true},
+            "builtins": {"response_leakage": true}
+        }),
+        // An empty extraction list is fine while no rule in that direction runs.
+        json!({
+            "provider": provider,
+            "inspect": {"request": false, "response": true},
+            "extraction": {"request_json_paths": []}
+        }),
+        // Ids and examples are trimmed, so padded text is admissible.
+        json!({
+            "provider": provider,
+            "custom_rules": [{"id": " a ", "examples": [" reference "]}]
+        }),
+        json!({
+            "provider": provider,
+            "builtins": {"prompt_injection": {"examples_mode": "replace", "examples": ["x"]}}
+        }),
+        json!({"provider": provider, "streaming_response": "inspect", "streaming": {}}),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"window": "tokens", "tokenizer": "chars4", "max_window_tokens": 2}
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"max_hold_ms": 100, "on_hold_timeout": "on_error"}
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"enforcement": "detect", "max_hold_ms": 100, "on_hold_timeout": "forward"}
+        }),
+    ];
+    for config in &accepted {
+        assert_component_validity(&spec, "AiSemanticFirewallConfig", config, true);
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("ai_semantic_firewall", config).is_ok(),
+            "runtime should accept schema-valid config: {config}"
+        );
+    }
+
+    let rejected = [
+        json!({"provider": provider, "inspect": {"request": false, "response": false}}),
+        json!({"provider": provider, "builtins": {}}),
+        // Request-only rules with request inspection disabled.
+        json!({
+            "provider": provider,
+            "inspect": {"request": false, "response": true},
+            "builtins": {"prompt_injection": true}
+        }),
+        json!({"provider": provider, "extraction": {"request_json_paths": []}}),
+        // provider.type is an exact one-value vocabulary: no aliases, no padding.
+        json!({"provider": {"type": "openai_compatible", "endpoint": ENDPOINT}}),
+        json!({"provider": {"type": "openai-compatible", "endpoint": ENDPOINT}}),
+        json!({"provider": {"type": " openai_compatible_embeddings ", "endpoint": ENDPOINT}}),
+        json!({"provider": provider, "custom_rules": [{"id": " ", "examples": ["reference"]}]}),
+        json!({"provider": provider, "custom_rules": [{"id": "a", "examples": [" "]}]}),
+        json!({
+            "provider": provider,
+            "builtins": {"prompt_injection": {"examples_mode": "replace"}}
+        }),
+        json!({"provider": provider, "streaming": {}}),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"window": "tokens"}
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"tokenizer": "chars4"}
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"overlap_bytes": -1}
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"on_hold_timeout": "on_error"}
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"enforcement": "detect", "max_hold_ms": 100, "on_hold_timeout": "cut"}
+        }),
+        // A disabled instance still validates the blocks it carries.
+        json!({"provider": {"type": "bogus"}, "enabled": false}),
+        // Materializing an advertised default must never invalidate a config:
+        // these two token-only fields therefore carry no schema default.
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"max_window_tokens": 256}
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"overlap_tokens": 32}
+        }),
+    ];
+    for config in &rejected {
+        assert_component_validity(&spec, "AiSemanticFirewallConfig", config, false);
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("ai_semantic_firewall", config).is_err(),
+            "runtime should reject schema-invalid config: {config}"
+        );
+    }
+
+    // Cross-field numeric comparisons and id uniqueness are NOT expressible in
+    // standard JSON Schema. The component describes them; the constructor is
+    // the only gate. Keep this list in sync with that description.
+    let constructor_only = [
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {
+                "window": "tokens",
+                "tokenizer": "chars4",
+                "max_window_tokens": 2,
+                "overlap_tokens": 32
+            }
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"max_window_bytes": 64, "overlap_bytes": 128}
+        }),
+        json!({
+            "provider": provider,
+            "custom_rules": [
+                {"id": "dup", "examples": ["a"]},
+                {"id": "dup", "examples": ["b"]}
+            ]
+        }),
+    ];
+    for config in &constructor_only {
+        assert_component_validity(&spec, "AiSemanticFirewallConfig", config, true);
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("ai_semantic_firewall", config).is_err(),
+            "constructor must still reject what the schema cannot express: {config}"
+        );
+    }
+}
+
 /// One table, both directions: every row must be admitted — or refused — by
 /// the published component and by the constructor alike.
 ///
@@ -13863,4 +15125,244 @@ fn opa_schema_and_constructor_admit_the_same_configs() {
             constructed.err()
         );
     }
+}
+
+/// The `MeshAuthzConfig` component must agree with what the plugin constructor
+/// actually admits — both directions. A schema that accepts a document the
+/// gateway rejects sends operators into a failed reload; one that rejects a
+/// supported document blocks a valid policy. The cases below are the ones the
+/// audit found disagreeing (issue #5066).
+#[test]
+fn mesh_authz_component_matches_runtime_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let policy = |rules: serde_json::Value| {
+        json!({
+            "name": "deny-admin",
+            "namespace": "default",
+            "scope": {"kind": "mesh_wide"},
+            "rules": rules,
+        })
+    };
+    let deny_admin = json!([{"action": "deny", "to": [{"paths": ["/admin/*"]}]}]);
+    let custom = json!([{"action": {"custom": {"provider": "ext"}}}]);
+    let no_action = json!([{"to": [{"paths": ["/admin/*"]}]}]);
+    let rule_typo = json!([{"action": "deny", "not_path": ["/a"]}]);
+    let match_typo = json!([{"action": "deny", "to": [{"not_path": ["/a"]}]}]);
+
+    for valid in [
+        // An omitted `config:` block deserializes to null for every plugin.
+        serde_json::Value::Null,
+        json!({}),
+        json!({"trust_domain_aliases": null}),
+        json!({"trust_domain_aliases": ["cluster.local"]}),
+        json!({"trusted_hbone_assertors": null}),
+        json!({"trusted_hbone_assertors": []}),
+        json!({"trusted_hbone_assertors": ["ztunnel", "waypoint"]}),
+        json!({"trusted_hbone_assertors": [{"assertor": "waypoint", "scope": null}]}),
+        // The constructor trims the scope value, exactly as it trims the
+        // assertor; the schema expresses that with a pattern, not an enum.
+        json!({"trusted_hbone_assertors": [{"assertor": "waypoint", "scope": " same_namespace "}]}),
+        json!({"trusted_hbone_assertors": [
+            {"assertor": "spiffe://cluster.local/ns/istio-system/sa/ztunnel", "scope": "mesh_wide"}
+        ]}),
+        json!({"mesh_policies": []}),
+        json!({"mesh_policies": [policy(deny_admin)]}),
+        json!({"mesh_policies": [policy(custom)]}),
+        json!({"mesh_policies": [{
+            "name": "scoped", "namespace": "default",
+            "scope": {"kind": "workload_selector", "selector": {"labels": {"app": "api"}}},
+        }]}),
+        json!({"node_waypoint_route_upstreams": [
+            {"id": "u", "namespace": "default", "targets": [{"host": "h", "port": 8080}]}
+        ]}),
+    ] {
+        assert_component_validity(&spec, "MeshAuthzConfig", &valid, true);
+    }
+
+    for invalid in [
+        // A non-object root builds a policy-free instance that allows
+        // everything, so it is refused rather than degraded.
+        json!(7),
+        json!("mesh_policies"),
+        json!([]),
+        // Unknown root key (the #4525 contract, kept).
+        json!({"mesh_policy": []}),
+        // A policy document with no identity or scope.
+        json!({"mesh_policies": [{}]}),
+        // `action` is required on every rule.
+        json!({"mesh_policies": [policy(no_action)]}),
+        // Closed grammar at each nesting level.
+        json!({"mesh_policies": [policy(rule_typo)]}),
+        json!({"mesh_policies": [policy(match_typo)]}),
+        json!({"mesh_policies": [{
+            "name": "scoped", "namespace": "default",
+            "scope": {"kind": "workload_selector", "selector": {"labelz": {}}},
+        }]}),
+        // Wrong-typed scoping flag: silently reading it as false would
+        // re-enable the construction-time scope filter on a node waypoint.
+        json!({"per_pod_policy_scoping": "true"}),
+        json!({"ambient_udp_source_scoping": 1}),
+        // Grant exclusivity and the exact-SPIFFE requirement for mesh_wide.
+        json!({"trusted_hbone_assertors": [
+            {"assertor": "waypoint", "asserts": [], "scope": "same_namespace"}
+        ]}),
+        json!({"trusted_hbone_assertors": [{"assertor": "waypoint", "scope": "mesh_wide"}]}),
+        // Trust-domain grammar.
+        json!({"trust_domain_aliases": ["not/a/domain"]}),
+        // uint16 has a numeric ceiling, not just a format hint.
+        json!({"node_waypoint_route_upstreams": [
+            {"id": "u", "namespace": "default", "targets": [{"host": "h", "port": 65536}]}
+        ]}),
+    ] {
+        assert_component_validity(&spec, "MeshAuthzConfig", &invalid, false);
+    }
+}
+
+/// `mesh_authz` is a public built-in that appears in `/plugins`, the execution
+/// order table, and the protocol matrix, so the public guide must carry its
+/// configuration and behavior reference (issue #5065).
+#[test]
+fn mesh_authz_public_guide_documents_its_configuration_contract() {
+    let guide = include_str!("../../docs/plugins.md");
+    assert!(
+        guide.contains("### `mesh_authz`"),
+        "docs/plugins.md must carry a mesh_authz section"
+    );
+
+    let section = guide
+        .split("### `mesh_authz`")
+        .nth(1)
+        .expect("mesh_authz section")
+        .split("\n### ")
+        .next()
+        .expect("mesh_authz section body");
+
+    // Every accepted root key, including the injection-only ones an operator
+    // will see echoed back by `GET /plugins`.
+    for key in [
+        "mesh_slice",
+        "mesh_policies",
+        "namespace",
+        "labels",
+        "per_pod_policy_scoping",
+        "ambient_udp_source_scoping",
+        "trust_domain_aliases",
+        "trusted_hbone_assertors",
+        "cluster_domain",
+        "cluster_domains",
+        "node_waypoint_route_upstreams",
+    ] {
+        assert!(
+            section.contains(&format!("`{key}`")),
+            "docs/plugins.md mesh_authz section must document `{key}`"
+        );
+    }
+
+    for contract in [
+        "2075",
+        "FailClosed",
+        "implicit-deny",
+        "**Strict configuration admission.**",
+        "**Trusted identity is required.**",
+    ] {
+        assert!(
+            section.contains(contract),
+            "docs/plugins.md mesh_authz section must state: {contract}"
+        );
+    }
+}
+
+/// The CUSTOM outcome vocabulary in `docs/mesh.md` must stay in lock-step with
+/// the closed reason enum (issue #5068). The exhaustive match makes a NEW
+/// reason a compile error here rather than a silently undocumented label, and
+/// the assertions pin BOTH the metric labels and the finer per-request reason
+/// tokens the metric folds into them.
+#[test]
+fn mesh_custom_authorization_outcome_documentation_matches_the_reason_enum() {
+    use ferrum_edge::plugins::mesh::ext_authz::MeshExtAuthzReason as Reason;
+
+    // The `outcome` metric label `record()` folds each reason into.
+    let metric_outcome = |reason: Reason| -> &'static str {
+        match reason {
+            Reason::Allowed => "allowed",
+            Reason::DeniedByProvider => "denied_by_provider",
+            Reason::ProviderUnbound => "provider_unbound",
+            Reason::ProviderError => "provider_error",
+            Reason::ProviderConflict => "provider_conflict",
+            Reason::Unexecutable => "unexecutable",
+            Reason::Timeout => "timeout",
+            Reason::TransportError | Reason::RequestBuildFailed => "transport_error",
+            Reason::ResponseTooLarge | Reason::ResponseReadFailed => "response_refused",
+            Reason::BodyUnavailable => "body_unavailable",
+            Reason::BodyTooLarge => "body_too_large",
+            Reason::ConcurrencyExhausted => "concurrency_exhausted",
+        }
+    };
+
+    let reasons = [
+        Reason::Allowed,
+        Reason::DeniedByProvider,
+        Reason::ProviderUnbound,
+        Reason::ProviderError,
+        Reason::ProviderConflict,
+        Reason::Unexecutable,
+        Reason::Timeout,
+        Reason::TransportError,
+        Reason::RequestBuildFailed,
+        Reason::ResponseTooLarge,
+        Reason::ResponseReadFailed,
+        Reason::BodyUnavailable,
+        Reason::BodyTooLarge,
+        Reason::ConcurrencyExhausted,
+    ];
+
+    let mesh_docs = include_str!("../../docs/mesh.md");
+    let mut outcomes: BTreeSet<&'static str> = BTreeSet::new();
+    for reason in reasons {
+        let token = reason.as_str();
+        assert!(
+            mesh_docs.contains(&format!("`{token}`")),
+            "docs/mesh.md must document the reason token `{token}`"
+        );
+        outcomes.insert(metric_outcome(reason));
+    }
+
+    assert_eq!(outcomes.len(), 12, "the outcome label set is twelve values");
+    for outcome in &outcomes {
+        assert!(
+            mesh_docs.contains(&format!("| `{outcome}` |")),
+            "docs/mesh.md outcome table must carry a row for `{outcome}`"
+        );
+    }
+    assert!(
+        !mesh_docs.contains("`response_refused`, `body_unavailable`"),
+        "docs/mesh.md must not restate the outcome set as a prose list that can drift"
+    );
+}
+
+/// The CUSTOM failure reference must not promise `failOpen` for the refusals
+/// that are decided without a provider, and must not describe cancellation as
+/// producing an allow (issue #5069).
+#[test]
+fn mesh_custom_authorization_failure_documentation_matches_the_runtime() {
+    let mesh_docs = include_str!("../../docs/mesh.md");
+
+    assert!(
+        mesh_docs.contains("**unconditional fixed `403` refusals**"),
+        "docs/mesh.md must document the unbound-provider / absent-executor refusal"
+    );
+    assert!(
+        mesh_docs.contains("it never synthesizes an allow"),
+        "docs/mesh.md must describe cancellation as ending the request"
+    );
+    assert!(
+        !mesh_docs.contains("and task cancellation are all failed checks"),
+        "docs/mesh.md must not restate the corrected fail-open claim"
+    );
+    assert!(
+        mesh_docs.contains("capped at **128 process-wide**"),
+        "docs/mesh.md must state the shared process-wide check budget"
+    );
 }

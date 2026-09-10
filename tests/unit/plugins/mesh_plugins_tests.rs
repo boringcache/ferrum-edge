@@ -8369,3 +8369,177 @@ async fn mesh_host_port_policy_uses_one_decimal_identity() {
         }
     }
 }
+
+// ── Strict configuration admission (advisory GHSA-9x95-2xx8-xr37) ──────────
+//
+// Every case here is a MISSPELLING or a wrong-typed value that used to be
+// silently discarded. In an authorization grammar a discarded member is a
+// discarded RESTRICTION, so each of these widened the effective policy with no
+// diagnostic anywhere. They fail construction now, which fails the whole plugin
+// generation and keeps the previous valid one serving.
+
+#[test]
+fn mesh_authz_rejects_a_non_object_config_root() {
+    for root in [json!(7), json!("mesh_policies"), json!([]), json!(true)] {
+        let err = match MeshAuthz::new(&root) {
+            Ok(_) => panic!("a non-object mesh_authz config root must fail closed: {root}"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("must be a JSON object"),
+            "error should name the root shape: {err}"
+        );
+    }
+}
+
+#[test]
+fn mesh_authz_accepts_an_absent_config_as_a_policy_free_instance() {
+    // `PluginConfig.config` is `#[serde(default)]`, so an omitted `config:`
+    // block arrives as `null` for every plugin. That is absence, not a
+    // malformed policy document, and must keep working.
+    MeshAuthz::new(&json!(null)).expect("an absent config builds a policy-free instance");
+    MeshAuthz::new(&json!({})).expect("an explicit empty config is a supported scaffold");
+}
+
+#[test]
+fn mesh_authz_rejects_wrong_typed_scoping_flags() {
+    for key in ["per_pod_policy_scoping", "ambient_udp_source_scoping"] {
+        for value in [json!("true"), json!(1), json!({}), json!([])] {
+            let config = json!({ (key): value.clone() });
+            let err = match MeshAuthz::new(&config) {
+                Ok(_) => panic!("{key} = {value} must fail closed, not read as false"),
+                Err(err) => err,
+            };
+            assert!(err.contains(key), "error should name the field: {err}");
+            assert!(
+                err.contains("must be a boolean"),
+                "error should name the expected type: {err}"
+            );
+        }
+        // Absent and explicit null both mean "not supplied", matching how the
+        // alias / assertor lists treat null.
+        MeshAuthz::new(&json!({ (key): serde_json::Value::Null }))
+            .unwrap_or_else(|e| panic!("explicit null {key} is absence, not an error: {e}"));
+    }
+}
+
+#[test]
+fn mesh_authz_rejects_unknown_members_at_every_policy_nesting_level() {
+    let base = json!({
+        "name": "deny-admin",
+        "namespace": "default",
+        "scope": {"kind": "mesh_wide"},
+        "rules": [{"action": "deny", "to": [{"paths": ["/admin/*"]}]}]
+    });
+    let mut cases: Vec<(&str, serde_json::Value)> = Vec::new();
+
+    let mut policy_typo = base.clone();
+    policy_typo["ruless"] = json!([]);
+    cases.push(("ruless", policy_typo));
+
+    let mut rule_typo = base.clone();
+    rule_typo["rules"][0]["not_path"] = json!(["/public/*"]);
+    cases.push(("not_path", rule_typo));
+
+    let mut match_typo = base.clone();
+    match_typo["rules"][0]["to"][0]["not_hostz"] = json!(["admin.example.com"]);
+    cases.push(("not_hostz", match_typo));
+
+    let mut principal_typo = base.clone();
+    principal_typo["rules"][0]["from"] = json!([{"spiffe_id_patern": "spiffe://cluster.local/*"}]);
+    cases.push(("spiffe_id_patern", principal_typo));
+
+    let mut negation_typo = base.clone();
+    negation_typo["rules"][0]["source_negation"] = json!({"not_ip_block": ["10.0.0.0/8"]});
+    cases.push(("not_ip_block", negation_typo));
+
+    let mut condition_typo = base.clone();
+    condition_typo["rules"][0]["when"] = json!([{"key": "connection.sni", "valuez": ["admin"]}]);
+    cases.push(("valuez", condition_typo));
+
+    let mut selector_typo = base.clone();
+    selector_typo["scope"] = json!({"kind": "workload_selector", "selector": {"labelz": {}}});
+    cases.push(("labelz", selector_typo));
+
+    for (misspelling, policy) in cases {
+        let err = match MeshAuthz::new(&json!({ "mesh_policies": [policy] })) {
+            Ok(_) => panic!("misspelled '{misspelling}' must fail closed, not drop a restriction"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains(misspelling),
+            "error should name the unknown member '{misspelling}': {err}"
+        );
+    }
+}
+
+#[test]
+fn mesh_authz_requires_an_explicit_rule_action() {
+    // Without this, `action` fell back to its `Allow` default, so a rule whose
+    // action key was misspelled (or simply forgotten) became a GRANT.
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [{
+            "name": "deny-admin",
+            "namespace": "default",
+            "scope": {"kind": "mesh_wide"},
+            "rules": [{"to": [{"paths": ["/admin/*"]}]}]
+        }]
+    })) {
+        Ok(_) => panic!("a rule with no action must fail closed, not default to allow"),
+        Err(err) => err,
+    };
+    assert!(err.contains("action"), "error should name the field: {err}");
+}
+
+#[test]
+fn mesh_authz_keeps_omitted_optional_matchers_and_empty_scaffolds() {
+    // Strictness must not turn documented omissions into errors: an omitted
+    // `to` still means "any request", and an explicitly empty rule list is a
+    // valid scaffold.
+    MeshAuthz::new(&json!({
+        "mesh_policies": [{
+            "name": "deny-everything",
+            "namespace": "default",
+            "scope": {"kind": "mesh_wide"},
+            "rules": [{"action": "deny"}]
+        }]
+    }))
+    .expect("a rule carrying only its action is valid");
+
+    MeshAuthz::new(&json!({
+        "namespace": "default",
+        "mesh_policies": [{
+            "name": "scaffold",
+            "namespace": "default",
+            "scope": {"kind": "namespace", "namespace": "default"}
+        }]
+    }))
+    .expect("a policy with no rules is a valid scaffold");
+}
+
+#[test]
+fn mesh_authz_rejects_a_mesh_slice_carrying_a_misspelled_policy_member() {
+    // The slice path deserializes the same closed grammar, so an injected or
+    // control-plane-supplied slice cannot smuggle a dropped restriction past
+    // the admission the direct config enforces.
+    let err = match MeshAuthz::new(&json!({
+        "mesh_slice": {
+            "node_id": "node-a",
+            "namespace": "default",
+            "version": "test",
+            "mesh_policies": [{
+                "name": "deny-admin",
+                "namespace": "default",
+                "scope": {"kind": "mesh_wide"},
+                "rules": [{"action": "deny", "to": [{"not_path": ["/public/*"]}]}]
+            }]
+        }
+    })) {
+        Ok(_) => panic!("a misspelled matcher inside a mesh_slice must fail closed"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("not_path"),
+        "error should name the unknown member: {err}"
+    );
+}
