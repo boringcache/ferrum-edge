@@ -451,11 +451,17 @@ fn validate_kafka_topic_name(topic: &str) -> Result<(), String> {
 /// sink can never deliver (#5215). Refusing the property at admission is
 /// fail-closed and surfaces the limitation immediately instead of publishing a
 /// permanently unusable generation.
-const UNSUPPORTED_PRODUCER_KEYS: &[(&str, &str)] = &[(
-    "transactional.id",
-    "the Kafka logging sink never begins or commits a Kafka transaction, so a \
-     transactional producer rejects every record",
-)];
+const UNSUPPORTED_PRODUCER_KEYS: &[(&str, &str)] = &[
+    (
+        "transactional.id",
+        "the Kafka logging sink never begins or commits a Kafka transaction, so a \
+         transactional producer rejects every record",
+    ),
+    (
+        "delivery.report.only.error",
+        "delivery reporting is managed by the Kafka logging sink for every terminal outcome",
+    ),
+];
 
 /// `producer_config` keys that alias top-level security controls and must not
 /// silently override them after validation. Values are `(librdkafka key,
@@ -1766,6 +1772,8 @@ impl KafkaLogging {
         for (key, value) in &admitted.extra_props {
             kafka_config.set(key, value);
         }
+        // Every terminal outcome participates in delivery accounting.
+        kafka_config.set("delivery.report.only.error", "false");
 
         kafka_config.set(
             "queue.buffering.max.messages",
