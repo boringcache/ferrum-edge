@@ -4075,8 +4075,9 @@ impl RequestContext {
     /// into a smaller one, because a smaller tally is the fail-OPEN direction
     /// for the negotiation terminal it gates.
     pub(crate) fn register_compression_response_decision(&mut self) {
-        self.compression_response_decisions_pending =
-            self.compression_response_decisions_pending.saturating_add(1);
+        self.compression_response_decisions_pending = self
+            .compression_response_decisions_pending
+            .saturating_add(1);
     }
 
     /// Settle this instance's `after_proxy` response decision, reporting whether
@@ -4089,8 +4090,9 @@ impl RequestContext {
     /// preserves the fail-closed single-instance behavior instead of losing the
     /// terminal.
     pub(crate) fn settle_compression_response_decision(&mut self) -> bool {
-        self.compression_response_decisions_pending =
-            self.compression_response_decisions_pending.saturating_sub(1);
+        self.compression_response_decisions_pending = self
+            .compression_response_decisions_pending
+            .saturating_sub(1);
         self.compression_response_decisions_pending == 0
     }
 
