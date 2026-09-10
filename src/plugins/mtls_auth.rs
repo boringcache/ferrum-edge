@@ -22,7 +22,9 @@ use x509_parser::prelude::*;
 
 use crate::consumer_index::ConsumerIndex;
 
-use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
+use super::utils::auth_flow::{
+    self, AuthMechanism, CredentialDeadline, ExtractedCredential, VerifyOutcome,
+};
 use super::utils::cert_validity::CertValidityWindow;
 use super::{PluginResult, RequestContext, StreamConnectionContext};
 
@@ -887,22 +889,33 @@ impl MtlsAuth {
                     r#"{"error":"Client certificate is not currently valid"}"#.into(),
                 );
             }
-            deadline
+            Some(deadline)
         } else {
-            // First successful evaluation: convert `notAfter` once. An
-            // unrepresentable conversion fails closed and does not populate the
-            // slot, so a later request retries rather than caching a bogus Instant.
-            let Some(converted) =
-                auth_flow::try_credential_deadline_from_unix_seconds(validity.not_after_unix, 0)
-            else {
-                debug!(
-                    "mtls_auth: certificate expiry is not representable as a monotonic deadline"
-                );
-                return VerifyOutcome::Invalid(r#"{"error":"Invalid client certificate"}"#.into());
-            };
-            match monotonic_expiry.set(converted) {
-                Ok(()) => converted,
-                Err(_) => monotonic_expiry.get().copied().unwrap_or(converted),
+            // First successful evaluation: convert `notAfter` once. An unusable
+            // interval fails closed and does not populate the slot, so a later
+            // request retries rather than caching a bogus Instant.
+            let converted =
+                auth_flow::try_credential_deadline_from_unix_seconds(validity.not_after_unix, 0);
+            match converted {
+                CredentialDeadline::Bounded(deadline) => match monotonic_expiry.set(deadline) {
+                    Ok(()) => Some(deadline),
+                    Err(_) => Some(monotonic_expiry.get().copied().unwrap_or(deadline)),
+                },
+                // A valid leaf whose `notAfter` outruns the representable
+                // monotonic range is not an invalid certificate (issue #5396):
+                // admit it with no credential bound and let the finite
+                // authenticated-stream maximum bound the session. The slot stays
+                // empty so a later request can still capture a real deadline.
+                CredentialDeadline::Unbounded => {
+                    debug!("mtls_auth: certificate expiry is beyond the monotonic deadline range");
+                    None
+                }
+                CredentialDeadline::Invalid => {
+                    debug!("mtls_auth: certificate expiry cannot bound a live credential");
+                    return VerifyOutcome::Invalid(
+                        r#"{"error":"Invalid client certificate"}"#.into(),
+                    );
+                }
             }
         };
 
@@ -915,8 +928,9 @@ impl MtlsAuth {
             // The authoritative certificate bound published on the shared
             // protocol-neutral contract. Cache hits return the Instant captured
             // above, never a newly derived later value.
-            Some(consumer) => VerifyOutcome::consumer(consumer)
-                .with_credential_deadline(Some(credential_deadline)),
+            Some(consumer) => {
+                VerifyOutcome::consumer(consumer).with_credential_deadline(credential_deadline)
+            }
             None => VerifyOutcome::ConsumerNotFound(
                 r#"{"error":"No consumer found for client certificate"}"#.into(),
             ),

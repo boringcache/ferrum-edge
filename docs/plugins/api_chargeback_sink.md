@@ -463,6 +463,25 @@ failure the static contract test is there to catch. Operators who rename or
 omit keys must keep the destination table in sync; Ferrum cannot inspect the
 remote schema.
 
+The OpenAPI `schema` property uses `ApiChargebackSinkLogSchema`, a refinement
+of the shared logging schema for this row family. It accepts `omit`, `rename`,
+`order`, `static_fields`, and `derived_fields`. Omit/rename source names must
+come from the native JSON keys above. Derived kinds are `status_class` (from
+billable `status_code`), `summary_kind` (always `charge_event`), and `outcome`
+(`error` for `status_code >= 500` or a nonzero `grpc_status`, otherwise `ok`).
+`backend_host` is rejected. The keys `summary_type`, `timestamp_format`, and
+`metadata` are forbidden even with null/default values; `received_at` remains
+an epoch-nanosecond integer.
+
+`schema` and `schema_ref` are mutually exclusive by key presence, including
+null values. `schema_ref` must be a nonempty registered name; the constructor
+resolves and recompiles its definition with the same sink restrictions. Named
+definitions must first compile against the transaction-summary inventory, so
+use inline `schema` for charge-event-only fields. JSON Schema cannot resolve
+the named registry or compare the final projected keys: reference existence,
+output-key collisions, sensitive-data restrictions, omit/rename conflicts,
+and complete `order` coverage remain constructor checks.
+
 For HTTP-family events, `status_code` is the billable status used for pricing
 and rollups. `http_status_code` preserves the transport status, and
 `grpc_status` preserves the normalized final application code when the request
