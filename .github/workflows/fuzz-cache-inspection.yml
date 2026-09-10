@@ -102,6 +102,9 @@ jobs:
                   if event.get("schema") == "archive_graph_phase.v1":
                       print(json.dumps({"duration_ms": event.get("duration_ms"),
                                         "lifecycle": event.get("lifecycle")}))
+                  elif event.get("operation") == "archive_graph_restore_workers":
+                      print(json.dumps({"operation": event["operation"],
+                                        "details": event.get("details")}))
           PY
 
       - name: Measure target files and inspect Cargo fingerprints
