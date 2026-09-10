@@ -1108,8 +1108,7 @@ impl OidcRelyingParty {
             context_id: session_context_id,
             correlation_cookie_name_prefix,
             correlation_cookie_attrs: build_correlation_cookie_attrs(secure, &callback_path),
-            hide_session_cookie: optional_bool(session_obj, "hide_session_cookie")?
-                .unwrap_or(true),
+            hide_session_cookie: optional_bool(session_obj, "hide_session_cookie")?.unwrap_or(true),
             max_cookie_bytes: max_cookie_bytes as usize,
             ttl: Duration::from_secs(ttl_secs),
             idle_ttl: Duration::from_secs(idle_ttl_secs),
@@ -1625,8 +1624,14 @@ impl OidcRelyingParty {
             return self.challenge(ctx, true);
         };
         let now = chrono::Utc::now().timestamp();
-        if now > payload.issued_at_unix.saturating_add(self.session.ttl.as_secs() as i64)
-            || now > payload.last_touch_unix.saturating_add(self.session.idle_ttl.as_secs() as i64)
+        if now
+            > payload
+                .issued_at_unix
+                .saturating_add(self.session.ttl.as_secs() as i64)
+            || now
+                > payload
+                    .last_touch_unix
+                    .saturating_add(self.session.idle_ttl.as_secs() as i64)
         {
             return self.challenge(ctx, true);
         }
