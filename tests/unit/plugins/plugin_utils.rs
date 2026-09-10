@@ -449,6 +449,38 @@ pub fn assert_continue(result: PluginResult) {
     }
 }
 
+/// Assert that a validated far-future credential expiry was admitted without an
+/// *effective* deadline (issue #5420).
+///
+/// Which of the two admissible answers a platform gives is decided by its
+/// monotonic clock rather than by the plugin: a `timespec`-backed
+/// `tokio::time::Instant` carries `i64` seconds and can express
+/// `now + (i64::MAX - now_unix)`, so it publishes that astronomically distant
+/// bound, while a narrower representation saturates and publishes no bound at
+/// all. Both admit the credential. What must never happen — the regression
+/// issue #5420 fixed — is a bound that has ALREADY elapsed, which is how the
+/// old collapse onto `now` presented a token the JWT layer had just validated
+/// as live.
+///
+/// The conversion's `Unbounded` branch itself is proven deterministically, on
+/// every platform, by the injected-clock tests in
+/// `auth_flow_credential_deadline_tests`.
+#[allow(dead_code)]
+pub fn assert_no_effective_credential_deadline(ctx: &RequestContext) {
+    // Longer than any authenticated stream this gateway holds open, so a
+    // deadline still beyond it is indistinguishable from an absent one.
+    const A_YEAR: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 60 * 60);
+
+    if let Some(deadline) = ferrum_edge::_test_support::request_credential_deadline_at(ctx) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            remaining > A_YEAR,
+            "a validated far-future expiry must publish either no monotonic bound or one \
+             far beyond any real session, never one that already elapsed: {remaining:?} left"
+        );
+    }
+}
+
 /// Assert that a plugin result is Reject with optional status code check
 #[allow(dead_code)]
 pub fn assert_reject(result: PluginResult, expected_status: Option<u16>) {

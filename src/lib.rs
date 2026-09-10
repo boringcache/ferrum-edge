@@ -8621,6 +8621,42 @@ pub mod _test_support {
         )
     }
 
+    /// Infallible Unix-to-monotonic conversion with injected clocks, the one
+    /// the JSON `exp` callers use (issue #5420). `None` is the admitted
+    /// far-future case — an expiry this platform's monotonic clock cannot
+    /// express — while an unusable interval still converts to the injected
+    /// `now_mono`, i.e. a deadline already elapsed.
+    pub fn credential_deadline_from_unix_seconds_at_for_test(
+        expires_at_unix: i64,
+        leeway_seconds: u64,
+        now_unix: u64,
+        now_mono: tokio::time::Instant,
+    ) -> Option<tokio::time::Instant> {
+        crate::plugins::utils::auth_flow::credential_deadline_from_unix_seconds_at(
+            expires_at_unix,
+            leeway_seconds,
+            now_unix,
+            now_mono,
+        )
+    }
+
+    /// The same conversion driven from already-validated claims, so the `exp`
+    /// extraction `jwt_auth` and `jwks_auth` authenticate through is covered at
+    /// an injected clock (issue #5420).
+    pub fn credential_deadline_from_claims_at_for_test(
+        claims: &serde_json::Value,
+        leeway_seconds: u64,
+        now_unix: u64,
+        now_mono: tokio::time::Instant,
+    ) -> Option<tokio::time::Instant> {
+        crate::plugins::utils::auth_flow::credential_deadline_from_claims_at(
+            claims,
+            leeway_seconds,
+            now_unix,
+            now_mono,
+        )
+    }
+
     /// Production inclusive mTLS leaf-validity predicate at an explicit Unix
     /// instant (issue #4359). `None` is the fail-closed inverted-interval case.
     /// Does not sample the wall clock and carries no certificate material.
@@ -9829,6 +9865,12 @@ pub mod _test_support {
     /// hook-ingress channel) that external coverage drives through the
     /// production datagram paths.
     pub use crate::proxy::udp_proxy::UdpAuthorizationSessionProbe;
+
+    /// A real plain-UDP session driven through the production non-blocking
+    /// client→backend admission and its bounded per-session backend-send writer
+    /// (issue #5045), with only the backend send itself injectable so a parked
+    /// send needs no sleep.
+    pub use crate::proxy::udp_proxy::{UdpEgressAdmissionForTest, UdpEgressWriterProbe};
 
     /// The fixed PRE-COMMITMENT terminal the H1/H2 dispatch funnel substitutes
     /// when a request-upload authorization expiry cancelled the backend

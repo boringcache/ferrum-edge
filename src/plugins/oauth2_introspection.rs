@@ -547,9 +547,12 @@ impl Oauth2Introspection {
                 if !provider.forward_original_token {
                     self.stage_original_token_stripping(&mut attempt, ctx, &token, candidate);
                 }
+                // `and_then`, not `map`: an introspection `exp` the monotonic
+                // clock cannot express publishes no bound rather than an
+                // already-elapsed one (issue #5420).
                 let deadline = authorization
                     .expires_at_unix
-                    .map(|expiry| credential_deadline_from_unix_seconds(expiry, 0));
+                    .and_then(|expiry| credential_deadline_from_unix_seconds(expiry, 0));
                 let outcome = self
                     .resolve_identity(&authorization, consumer_index)
                     .with_credential_deadline(deadline);

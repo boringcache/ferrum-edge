@@ -3,7 +3,7 @@ use ferrum_edge::_test_support::{
     oidc_open_session_cookie_for_test, oidc_resolve_discovery_for_test,
     oidc_resolved_discovery_endpoints_for_test, oidc_sealed_due_refresh_session_cookie_for_test,
     oidc_sealed_refresh_session_cookie_for_test, oidc_sealed_session_cookie_for_test,
-    oidc_session_state_from_set_cookie_for_test,
+    oidc_session_state_from_set_cookie_for_test, request_credential_deadline_remaining,
 };
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::types::{AuthMode, GatewayConfig, PluginConfig, PluginScope};
@@ -757,6 +757,37 @@ async fn concurrent_requests_share_one_transient_refresh_failure_and_backoff() {
         );
     }
     assert_eq!(server.received_requests().await.expect("requests").len(), 1);
+}
+
+#[tokio::test]
+async fn oidc_session_keeps_its_cap_for_a_far_future_id_token_expiry() {
+    // Issue #5420 turned the shared Unix-to-monotonic conversion into an
+    // `Option`, so this call site now forwards it unwrapped. Unlike the JWT and
+    // introspection sites, it clamps the claim expiry to the session
+    // `ttl_secs` / `idle_ttl_secs` window BEFORE converting, so its input stays
+    // representable and the published bound must be unchanged: a missing
+    // deadline here would mean the session lost its cap entirely.
+    let plugin = OidcRelyingParty::new(&base_config(), PluginHttpClient::default()).unwrap();
+    let set_cookie = oidc_sealed_session_cookie_for_test(
+        &plugin,
+        json!({"sub": "oidc-subject", "exp": i64::MAX}),
+        false,
+    )
+    .expect("session seals");
+    let mut ctx = session_ctx(&set_cookie);
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_continue(result);
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("oidc-subject"));
+
+    let remaining = request_credential_deadline_remaining(&ctx)
+        .expect("the default 1800s idle window still bounds the credential");
+    assert!(
+        remaining > Duration::from_secs(1_700) && remaining <= Duration::from_secs(1_800),
+        "the deadline must stay the idle-TTL cap, not the far-future claim: {remaining:?}"
+    );
 }
 
 #[tokio::test]

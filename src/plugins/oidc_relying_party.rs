@@ -1725,12 +1725,13 @@ impl OidcRelyingParty {
                     .last_touch_unix
                     .saturating_add(self.session.idle_ttl.as_secs() as i64),
             );
+        // The session window above already clamps this to a representable
+        // value, but the conversion is shared: `None` means "no bound", never
+        // "expired" (issue #5420).
+        let credential_deadline = credential_deadline_from_unix_seconds(credential_valid_until, 0);
         let outcome = self
             .resolve_identity(&payload.claims, consumer_index)
-            .with_credential_deadline(Some(credential_deadline_from_unix_seconds(
-                credential_valid_until,
-                0,
-            )));
+            .with_credential_deadline(credential_deadline);
         let mut attempt = AuthenticationAttempt::new();
         if authentication_attempt_can_commit(ctx, &outcome, true) {
             if let Some(cookie) = rolling_cookie {
