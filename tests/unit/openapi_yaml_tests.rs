@@ -2269,7 +2269,10 @@ fn assert_schema_and_constructor(
     }
 }
 
-fn redis_sync_mode_guard(schema: &serde_json::Value, schema_name: &str) -> &serde_json::Value {
+fn redis_sync_mode_guard<'a>(
+    schema: &'a serde_json::Value,
+    schema_name: &str,
+) -> &'a serde_json::Value {
     schema["allOf"]
         .as_array()
         .unwrap_or_else(|| panic!("{schema_name} allOf"))
@@ -3034,7 +3037,7 @@ fn request_deduplication_schema_matches_runtime_validation() {
         assert_eq!(schema["properties"][bounded]["minimum"], json!(1));
         assert_eq!(
             schema["properties"][bounded]["maximum"].as_f64(),
-            Some(u64::MAX as f64),,
+            Some(u64::MAX as f64),
             "{bounded} must publish the unsigned 64-bit ceiling"
         );
     }
