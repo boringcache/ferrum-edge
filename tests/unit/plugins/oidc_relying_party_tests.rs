@@ -3802,3 +3802,59 @@ fn new_rejects_redirect_uris_carrying_a_fragment() {
         json!("https://app.example.com/oauth/callback?rp=edge");
     assert!(validate_plugin_config("oidc_relying_party", &config).is_ok());
 }
+
+/// `EncodingKey::from_ec_pem` only proves the PEM is a well-formed EC key, not
+/// that its curve matches the selected algorithm. An ES256 client with a P-384
+/// key started cleanly and then failed to sign the first client assertion —
+/// after the browser's one-time authorization code had already been consumed
+/// and with the token endpoint never contacted (issue #5032).
+#[test]
+fn private_key_jwt_requires_a_key_that_supports_the_selected_algorithm() {
+    let p256 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .expect("P-256 key")
+        .serialize_pem();
+    let p384 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384)
+        .expect("P-384 key")
+        .serialize_pem();
+    let rsa = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)
+        .expect("RSA key")
+        .serialize_pem();
+    let ed25519 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
+        .expect("Ed25519 key")
+        .serialize_pem();
+
+    let config_for = |alg: &str, pem: &str| {
+        let mut config = base_config();
+        config["providers"][0]["client_auth"] = json!({
+            "method": "private_key_jwt",
+            "private_key_jwt_alg": alg,
+            "private_key_pem": pem
+        });
+        config
+    };
+
+    for (alg, pem, label) in [
+        ("ES256", &p384, "ES256 with a P-384 key"),
+        ("ES384", &p256, "ES384 with a P-256 key"),
+    ] {
+        let error = validate_plugin_config("oidc_relying_party", &config_for(alg, pem))
+            .err()
+            .unwrap_or_else(|| panic!("{label} must be rejected"));
+        assert!(
+            error.contains("private_key"),
+            "unexpected error for {label}: {error}"
+        );
+    }
+
+    for (alg, pem, label) in [
+        ("ES256", &p256, "ES256 with a P-256 key"),
+        ("ES384", &p384, "ES384 with a P-384 key"),
+        ("RS256", &rsa, "RS256 with an RSA key"),
+        ("EdDSA", &ed25519, "EdDSA with an Ed25519 key"),
+    ] {
+        assert!(
+            validate_plugin_config("oidc_relying_party", &config_for(alg, pem)).is_ok(),
+            "{label} must remain accepted"
+        );
+    }
+}

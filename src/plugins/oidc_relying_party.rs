@@ -2941,11 +2941,11 @@ fn parse_client_auth(
         }),
         "private_key_jwt" => {
             let pem = required_string(&auth, "private_key_pem", "client_auth")?;
-            let alg = match auth
+            let alg_name = auth
                 .get("private_key_jwt_alg")
                 .and_then(Value::as_str)
-                .unwrap_or("RS256")
-            {
+                .unwrap_or("RS256");
+            let alg = match alg_name {
                 "RS256" => Algorithm::RS256,
                 "RS384" => Algorithm::RS384,
                 "RS512" => Algorithm::RS512,
@@ -2963,6 +2963,19 @@ fn parse_client_auth(
                 _ => EncodingKey::from_rsa_pem(pem.as_bytes())
                     .map_err(|e| format!("oidc_relying_party: invalid RSA private key PEM: {e}"))?,
             };
+            // Parsing the PEM only proves it is a well-formed key of that
+            // family, not that it supports the selected algorithm: an ES256
+            // client with a P-384 key parsed cleanly and then failed to sign
+            // the first client assertion, after the browser's one-time
+            // authorization code had already been consumed and with the token
+            // endpoint never contacted (issue #5032). Signing a throwaway
+            // assertion here proves the pairing with no external I/O.
+            build_client_assertion("ferrum-edge", "ferrum-edge", &encoding_key, alg, &None)
+                .map_err(|_| {
+                    format!(
+                        "oidc_relying_party: client_auth.private_key_pem cannot sign private_key_jwt_alg {alg_name}"
+                    )
+                })?;
             let kid = auth
                 .get("private_key_jwt_kid")
                 .and_then(Value::as_str)
