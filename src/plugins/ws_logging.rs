@@ -67,7 +67,7 @@ use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Authoritative closed set of top-level `ws_logging` configuration keys.
-const WS_LOGGING_CONFIG_KEYS: &[&str] = &[
+pub const WS_LOGGING_CONFIG_KEYS: &[&str] = &[
     "batch_size",
     "buffer_capacity",
     "buffer_max_bytes",
@@ -300,9 +300,9 @@ impl<'a> From<&'a WsDisconnectContext> for WsDisconnectLogEntry<'a> {
 }
 
 struct WsConfig {
-    /// Full dial URL retained only for connection establishment. Handed to
-    /// tungstenite as the *request* (Host authority + TLS SNI); the transport
-    /// socket is opened separately against a policy-screened address.
+    /// Canonical admitted URL handed to tungstenite as the *request*
+    /// (Host authority + TLS SNI); the transport socket is opened separately
+    /// against a policy-screened address.
     endpoint_url: String,
     /// Structurally redacted form used in every diagnostic (`scheme://host[:port]/redacted`).
     endpoint_url_for_logs: String,
@@ -546,6 +546,14 @@ impl WsLogging {
         }
         let endpoint_hostname = endpoint_hostname(&parsed_url)?;
         let endpoint_url_for_logs = redacted_endpoint_url(&parsed_url);
+        // `Url::parse` is more lenient than tungstenite's `http::Uri` request
+        // builder (uppercase schemes, raw spaces, non-ASCII paths). Store the
+        // canonical serialized URL so admission and the collector handshake share
+        // one representation, then refuse values that still cannot be a request URI.
+        let endpoint_url = parsed_url.as_str().to_string();
+        if let Err(error) = endpoint_url.parse::<http::Uri>() {
+            return Err(format!("ws_logging: invalid 'endpoint_url': {error}"));
+        }
 
         // Build TLS connector for wss:// using gateway CA/verify settings.
         // This is sync admission work (no Tokio spawn) and remains in `new`
@@ -1420,6 +1428,14 @@ async fn send_batch(
         }
     }
 
+    // Post-admission loss: these records were already counted as accepted.
+    // Count every discarded RECORD, matching the shared batching sender and
+    // the `batch_discard` sink-loss contract.
+    sink_loss::record_dropped(
+        WS_PLUGIN_NAME,
+        SinkLossReason::BatchDiscard,
+        entry_count as u64,
+    );
     warn!(
         "WebSocket logging batch discarded after {} attempts ({} entries lost)",
         total_attempts, entry_count,
@@ -1498,11 +1514,11 @@ async fn connect_screened_stream(cfg: &WsConfig) -> Result<tokio::net::TcpStream
 ///
 /// Resolves and screens the destination through [`connect_screened_stream`],
 /// then runs the TLS + WebSocket handshake over that screened socket with
-/// `client_async_tls_with_config`. The original endpoint URL is still what
-/// tungstenite turns into the client request, so the configured hostname
-/// remains the TLS SNI / certificate-verification identity and the WebSocket
-/// `Host` authority — the screened IP is never substituted into the TLS
-/// identity. The pre-built TLS connector keeps `wss://` on the gateway's CA
+/// `client_async_tls_with_config`. The canonical admitted endpoint URL is
+/// what tungstenite turns into the client request, so the configured
+/// hostname remains the TLS SNI / certificate-verification identity and the
+/// WebSocket `Host` authority — the screened IP is never substituted into
+/// the TLS identity. The pre-built TLS connector keeps `wss://` on the gateway's CA
 /// trust chain, CRL list, and `FERRUM_TLS_NO_VERIFY` setting. The entire
 /// establishment path (DNS, TCP, TLS, and WebSocket Upgrade) is bounded by
 /// `connect_timeout`.

@@ -1589,7 +1589,7 @@ Given all built-in plugins enabled, the execution order is:
 
 | # | Plugin | Priority | Active Phases |
 |---|--------|----------|---------------|
-| 1 | `otel_tracing` | 25 | on_request_received, on_stream_connect, before_proxy, after_proxy, log, on_stream_disconnect |
+| 1 | `otel_tracing` | 25 | on_request_received, on_stream_connect, before_proxy, after_proxy, log, on_stream_disconnect, on_ws_disconnect |
 | 2 | `correlation_id` | 50 | on_request_received, before_proxy, after_proxy, apply_websocket_handshake_response_headers, on_stream_connect |
 | 3 | `cors` | 100 | on_request_received, after_proxy |
 | 4 | `request_termination` | 125 | on_request_received |
@@ -1605,10 +1605,10 @@ Given all built-in plugins enabled, the execution order is:
 | 14 | `mtls_auth` | 950 | authenticate, on_stream_connect |
 | 15 | `jwks_auth` | 1000 | authenticate |
 | 16 | `oauth2_introspection` | 1050 | authenticate, before_proxy |
-| 17 | `oidc_relying_party` | 1075 | authenticate, before_proxy |
+| 17 | `oidc_relying_party` | 1075 | on_request_received, authenticate, before_proxy, after_proxy |
 | 18 | `jwt_auth` | 1100 | authenticate |
 | 19 | `key_auth` | 1200 | authenticate, before_proxy |
-| 20 | `ldap_auth` | 1250 | authenticate |
+| 20 | `ldap_auth` | 1250 | authenticate, before_proxy |
 | 21 | `basic_auth` | 1300 | authenticate, before_proxy |
 | 22 | `hmac_auth` | 1400 | authenticate |
 | 23 | `soap_ws_security` | 1500 | authenticate, before_proxy, on_final_request_body |
@@ -1655,14 +1655,14 @@ Given all built-in plugins enabled, the execution order is:
 | 64 | `ai_token_metrics` | 4100 | on_response_body |
 | 65 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body, response_stream_inspector, on_response_stream_terminated |
 | 66 | `stdout_logging` | 9000 | log, on_stream_disconnect, on_ws_disconnect |
-| 67 | `ws_frame_logging` | 9050 | on_ws_frame |
+| 67 | `ws_frame_logging` | 9050 | on_ws_frame, on_ws_disconnect |
 | 68 | `statsd_logging` | 9075 | log, on_stream_disconnect, on_ws_disconnect |
 | 69 | `http_logging` | 9100 | log, on_stream_disconnect |
 | 70 | `tcp_logging` | 9125 | log, on_stream_disconnect |
 | 71 | `kafka_logging` | 9150 | log, on_stream_disconnect |
 | 72 | `loki_logging` | 9155 | log, on_stream_disconnect |
 | 73 | `udp_logging` | 9160 | log, on_stream_disconnect |
-| 74 | `ws_logging` | 9175 | log, on_stream_disconnect |
+| 74 | `ws_logging` | 9175 | log, on_stream_disconnect, on_ws_disconnect |
 | 75 | `transaction_debugger` | 9200 | on_request_received, before_proxy, on_final_request_body, after_proxy, on_final_response_body, log, on_stream_disconnect, on_ws_disconnect |
 | 76 | `proxy_alerts` | 9250 | log, on_stream_disconnect, on_ws_disconnect |
 | 77 | `prometheus_metrics` | 9300 | log, on_stream_disconnect, on_ws_disconnect |
@@ -1755,9 +1755,9 @@ Rate limiting sits at the end of the AuthZ band (priority 2900) so it can enforc
 
 **Redis mode** (`sync_mode: "redis"`): rate-limit counter plugins support only `local` and `redis` storage; database-backed counters are intentionally unsupported. `rate_limiting`, `ai_rate_limiter`, `graphql`, `grpc_method_router`, and `udp_rate_limiting` use Redis for coordinated counters across multiple gateway instances. `ws_rate_limiting` also supports Redis, but only to externalize its per-connection counters; because WebSocket connection IDs are process-local, it namespaces keys per gateway instance to avoid cross-instance collisions rather than sharing a portable connection budget across reconnects. When Redis is unavailable, behavior is governed by `redis_failure_policy`, which defaults to `fail_closed`: the plugin refuses with `503` rather than silently degrading to a per-process enforcement domain. `redis_failure_policy: "local_fallback"` is the explicit opt-in that falls back to local in-memory state and switches back when connectivity is restored. `request_deduplication` expresses the same choice through its own `on_redis_unavailable` field (also fail-closed by default) and does not accept `redis_failure_policy`; `ai_semantic_cache` keeps automatic local fallback because a cache miss carries no enforcement consequence. The shared client reconnects in the background under either policy. Redis Cluster is not supported and is screened rather than assumed: the client runs `INFO CLUSTER` on every newly established connection and reacts to `MOVED`/`ASK`/`CROSSSLOT`/`CLUSTERDOWN`/`TRYAGAIN`; a proven Cluster endpoint is refused terminally for the life of the client. The Redis backend uses native RESP protocol commands (no Lua scripts), so it works with Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
 
-### OpenAPI validation runs after body validation (priority 2960)
+### OpenAPI client validation precedes before_proxy (priority 2960)
 
-`openapi_validator` runs after the generic `body_validator` so explicit per-proxy body checks can fail first, then the generated OpenAPI contract can enforce operation-specific schemas. It runs before AI request policy and request transformation, which means contract mismatches are caught before the request body is reshaped or sent to an upstream.
+`openapi_validator` decides a matched client request contract before `body_validator` runs its `before_proxy` request checks. Priorities 2950 and 2960 order hooks within a lifecycle phase; they do not reorder distinct phases. OpenAPI response validation runs in `on_final_response_body`, while unknown-operation admission and backend-request fallback retain the phases described below.
 
 That ordering is enforced by a dedicated lifecycle phase, not by priority alone. The imported OpenAPI **request** contract is decided in `validate_client_request_body_contract`, which the proxy runs on the prebuffered original client body after gateway-owned normalization (bounded `Content-Encoding` decoding) and **before any `before_proxy` hook or `transform_request_body` transformer**. A configured transform can therefore no longer add a schema-required property, coerce an invalid type, rename a field, or delete an `additionalProperties: false` violation and have the result accepted as if the client had sent it (`GHSA-896v-jx23-9g6p`). The phase is read-only: it admits or rejects, it never rewrites the body or headers.
 
@@ -2104,6 +2104,8 @@ An **absent** `Content-Type` is treated as JSON, and the representation gate's c
 - Body rules are parsed once at config load time, not per-request.
 - When `response_transformer` has body rules, it automatically enables conservative response body buffering for the proxy. Backend-declared `text/event-stream` responses are released after headers; request-side SSE intent alone never releases a JSON response. Without body rules, responses stream through with zero overhead.
 - `request_transformer` body transformation runs after the request body is collected and before it is sent to the backend (HTTP/1.1 and HTTPS paths).
+- `request_transformer` body rules collect only the uploads they can rewrite. The config-time capability is the upper bound; per request, an upload whose declared `Content-Type` is non-JSON streams straight through instead of being collected and then declined, so an ordinary binary or form POST pays no extra upstream time-to-first-byte and no full-body buffer. An **absent** `Content-Type` stays buffered, because the transform still parses it as JSON. A `before_proxy` header rewrite cannot bypass the rules: both the H1/H2 and the native H3 dispatch ladders re-evaluate the request-body requirements against the effective outbound headers before the body is read, so a `text/plain` → `application/json` rewrite still selects buffering.
+- An unrelated header rule never changes either buffering answer. Request header rules run in `before_proxy` and need no body; response header rules run in `after_proxy`. The one response exception is request-qualified: a TRANSLATED gRPC-Web response keeps the buffered compatibility view so terminal-metadata policy can be enforced over it, and that exception applies only to requests `grpc_web` actually translated — never to an ordinary HTTP SSE or binary response.
 - Header, query, and body rules can be mixed in a single plugin configuration.
 
 ## gRPC Compatibility

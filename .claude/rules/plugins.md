@@ -97,7 +97,11 @@ paths:
   `Proxy-Authorization`, and `Cookie` remain mandatory Vary names even for
   anonymous entries because downstream shared caches cannot observe Ferrum's
   private caller partition; present values are hashed and absence is a distinct
-  keyed state. The RFC shared-cache authorization admission checks both pristine
+  keyed state. That merged `Vary` list is emitted on the `MISS` response too,
+  not only on the retained entry: the first publicly cacheable response is the
+  one a downstream cache stores, so publishing the contract only from the
+  second request onwards leaves it unpartitioned (advisory
+  `GHSA-vf55-2vfh-48j8`). An origin `Vary: *` is left untouched. The RFC shared-cache authorization admission checks both pristine
   inbound and live backend-visible `Authorization`, so request transforms cannot
   erase it.
 - Exception: `api_chargeback_sink` admits at most one effective instance per

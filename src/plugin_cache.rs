@@ -2491,6 +2491,21 @@ fn try_create_plugin(
         )
     };
 
+    finalize_created_plugin(pc, created)
+}
+
+/// Apply the shared post-construction contract to a plugin instance built for
+/// `pc`: compile and admit an execution trigger, wrap a priority override, and
+/// turn a construction failure into the configured failure-policy outcome.
+///
+/// Split out of [`try_create_plugin`] so a caller that must build one plugin
+/// through a non-production constructor (candidate composition admission uses a
+/// worker-free `oidc_relying_party`) still gets the identical trigger,
+/// priority, and failure-policy handling instead of a second, drifting copy.
+fn finalize_created_plugin(
+    pc: &PluginConfig,
+    created: Result<Option<Arc<dyn Plugin>>, String>,
+) -> Result<Option<Arc<dyn Plugin>>, String> {
     match created {
         Ok(Some(plugin)) => {
             let trigger = match pc.trigger.as_ref() {
@@ -4333,7 +4348,23 @@ pub(crate) fn validate_plugin_security_composition_candidate(
         // cross-plugin admission can use a cheap capability stand-in; otherwise
         // an admin write can accept a row that runtime publication rejects and
         // wedge every subsequent reload behind it.
-        let created = if has_trigger && plugin_config.plugin_name == "geo_restriction" {
+        let created = if plugin_config.plugin_name == "oidc_relying_party" {
+            // The production constructor starts a discovery task and a JWKS
+            // refresh worker. Candidate admission also runs on the synchronous
+            // `ferrum-edge validate` CLI path, which has no Tokio reactor, so
+            // constructing it here aborted the process for a configuration that
+            // starts cleanly under `run` (issue #5024). Every capability this
+            // gate inspects is derived from parsed config, so the worker-free
+            // instance is an exact stand-in and still rejects the same shapes.
+            finalize_created_plugin(
+                plugin_config,
+                crate::plugins::oidc_relying_party::OidcRelyingParty::new_without_workers(
+                    &plugin_config.config,
+                    http_client.clone(),
+                )
+                .map(|plugin| Some(Arc::new(plugin) as Arc<dyn Plugin>)),
+            )
+        } else if has_trigger && plugin_config.plugin_name == "geo_restriction" {
             // GeoRestriction's constructor opens a node-local MMDB. Its plugin
             // capabilities are trigger-neutral (all protocols, no contextless
             // hooks, limits, trailer policy, or auth role), so candidate
