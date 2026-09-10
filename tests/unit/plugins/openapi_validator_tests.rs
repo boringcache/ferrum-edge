@@ -3583,9 +3583,24 @@ async fn xml_wrapped_array_presence_is_preserved_on_requests_and_responses() {
     });
     for (constraint, absent, empty, nonempty) in [
         (json!({"required": ["items"]}), false, true, true),
-        (json!({"properties": {"items": {"minItems": 1}}}), true, false, true),
-        (json!({"properties": {"items": {"maxItems": 0}}}), true, true, false),
-        (json!({"dependentRequired": {"items": ["label"]}}), true, false, false),
+        (
+            json!({"properties": {"items": {"minItems": 1}}}),
+            true,
+            false,
+            true,
+        ),
+        (
+            json!({"properties": {"items": {"maxItems": 0}}}),
+            true,
+            true,
+            false,
+        ),
+        (
+            json!({"dependentRequired": {"items": ["label"]}}),
+            true,
+            false,
+            false,
+        ),
     ] {
         let mut schema = base.clone();
         if let Some(items) = constraint
@@ -3661,7 +3676,11 @@ async fn binary_schema_representation_rules_apply_in_both_directions() {
             false,
         ),
         (json!({"not": {"type": "string"}}), false, false),
-        (json!({"if": {"type": "string"}, "then": false}), false, false),
+        (
+            json!({"if": {"type": "string"}, "then": false}),
+            false,
+            false,
+        ),
         (json!({"const": "ok"}), true, false),
         (json!({"enum": ["ok"]}), true, false),
         (json!({"pattern": "^ok$"}), true, false),
@@ -5885,7 +5904,10 @@ async fn multipart_encoding_header_content_plugin_cache_rebuild_replaces_and_del
         "hello\r\n--abc--\r\n"
     );
     assert_continue(run(&cache, &headers, xml_body.as_bytes()).await);
-    assert_reject(run(&cache, &headers, scalar_body.as_bytes()).await, Some(400));
+    assert_reject(
+        run(&cache, &headers, scalar_body.as_bytes()).await,
+        Some(400),
+    );
 
     cache
         .rebuild(&gateway_with_validator(deleted_config))
