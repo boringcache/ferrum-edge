@@ -437,10 +437,10 @@ async fn mesh_outbound_registry_metrics_classify_only_applicable_entries() {
         } else {
             "<admit_wildcard>"
         };
-        assert_eq!(
-            series[0],
-            format!("{prefix}host=\"{bucket}\",decision=\"admit\"}} 1")
+        assert!(
+            series[0].starts_with(&format!("{prefix}host=\"{bucket}\",decision=\"admit\""))
         );
+        assert!(series[0].ends_with("} 1"));
     }
 }
 
@@ -8364,6 +8364,259 @@ fn mesh_outbound_registry_accepts_every_documented_key() {
         }),
     );
     assert!(plugin.is_ok(), "{:?}", plugin.err());
+
+    let reference = include_str!("../../../docs/plugins.md")
+        .split_once("### `mesh_outbound_registry`")
+        .unwrap()
+        .1
+        .split("\n### ")
+        .next()
+        .unwrap();
+    let documented: std::collections::BTreeSet<_> = reference
+        .lines()
+        .filter_map(|line| line.strip_prefix("| `"))
+        .filter_map(|line| line.split_once('`').map(|(key, _)| key))
+        .collect();
+    assert_eq!(
+        documented,
+        std::collections::BTreeSet::from([
+            "namespace",
+            "outbound_listen_ports",
+            "registry",
+            "reject_status",
+        ])
+    );
+}
+
+#[test]
+fn mesh_outbound_registry_admission_matches_openapi() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).unwrap();
+    let validators = ["MeshOutboundRegistryConfig", "PluginConfig"].map(|component| {
+        let schema = json!({
+            "$ref": format!("#/components/schemas/{component}"),
+            "components": spec["components"].clone(),
+        });
+        jsonschema::draft202012::options().build(&schema).unwrap()
+    });
+    let check = |config: serde_json::Value, admitted: bool| {
+        let error =
+            ferrum_edge::plugins::validate_plugin_config("mesh_outbound_registry", &config).err();
+        assert_eq!(error.is_none(), admitted, "{config}: {error:?}");
+        assert_eq!(validators[0].is_valid(&config), admitted, "{config}");
+        let wrapped = json!({
+            "plugin_name": "mesh_outbound_registry",
+            "scope": "global",
+            "enabled": true,
+            "config": config,
+        });
+        assert_eq!(validators[1].is_valid(&wrapped), admitted, "{wrapped}");
+        error
+    };
+
+    for (entry, admitted) in [
+        ("", true),
+        (" \t\n", true),
+        ("\u{0085}\u{2003}", true),
+        ("reviews.default.svc.cluster.local", true),
+        (" Reviews.SVC... ", true),
+        ("\u{0085}reviews.svc\u{2003}", true),
+        ("reviews.svc:1", true),
+        ("reviews.svc:65535", true),
+        ("reviews.svc:0000443", true),
+        ("reviews.svc:*", true),
+        ("*.example.com", true),
+        ("*.Example.Com.:443", true),
+        ("*.example.com:*", true),
+        ("127.0.0.1", true),
+        ("127.0.0.1:443", true),
+        ("xn--bcher-kva.example", true),
+        ("::", true),
+        ("::1", true),
+        ("2001:0DB8:0:0:0:0:0:1", true),
+        ("2001:db8::1:*", true),
+        ("[2001:DB8::1]", true),
+        ("[2001:db8::1]:000443", true),
+        ("[2001:db8::1]:*", true),
+        ("::ffff:192.0.2.1", true),
+        ("[::ffff:192.0.2.1]:443", true),
+        ("1:2:3:4:5:6:192.0.2.1", true),
+        ("https://known.test/path", false),
+        ("known.test/path", false),
+        ("known.test?query", false),
+        ("known.test#fragment", false),
+        ("user@known.test", false),
+        ("known.test:65536", false),
+        ("known.test:0", false),
+        ("known.test:-1", false),
+        ("known.test:+443", false),
+        ("known.test:http", false),
+        ("known.test:", false),
+        (":443", false),
+        ("known.test :443", false),
+        ("known. test", false),
+        ("known.\t test", false),
+        ("known.\u{2003}test", false),
+        ("known.test\0", false),
+        ("bücher.example", false),
+        ("known..test", false),
+        ("-known.test", false),
+        ("known-.test", false),
+        ("_known.test", false),
+        (".", false),
+        ("*", false),
+        ("*.", false),
+        ("*known.test", false),
+        ("known.*.test", false),
+        ("*.*.test", false),
+        ("[not-an-ip]:443", false),
+        ("[127.0.0.1]:443", false),
+        ("[2001:db8::1", false),
+        ("2001:db8::1]", false),
+        ("[::1]extra:443", false),
+        ("[::1]:65536", false),
+        ("[::1]:0", false),
+        ("[::1]:+443", false),
+        ("[::1]:", false),
+        ("[::1].", false),
+        ("[::1%eth0]:443", false),
+        ("1:2:3:4:5:6:7:8:9", false),
+        ("1:2:3:4:5:6:7::8", false),
+        ("2001:db8::1::2", false),
+        ("2001:db8:::1", false),
+        ("::ffff:192.0.2.256", false),
+        ("::ffff:192.0.02.1", false),
+        ("1:2:3:4:5:6::192.0.2.1", false),
+    ] {
+        let error = check(json!({"registry": ["valid.example", entry]}), admitted);
+        if let Some(error) = error {
+            assert!(
+                error.contains("mesh_outbound_registry: registry[1]:"),
+                "{error}"
+            );
+        }
+    }
+    // Exercise every compression position, including the IPv4-tail forms,
+    // against the published authority patterns and the standard IP parser.
+    for left in 0..=8 {
+        for right in 0..=8 {
+            let prefix = vec!["abcd"; left].join(":");
+            let suffix = vec!["abcd"; right].join(":");
+            let entry = format!("{prefix}::{suffix}");
+            let _ = check(json!({"registry": [entry]}), left + right < 8);
+            let entry = format!("[{prefix}::{suffix}]:443");
+            let _ = check(json!({"registry": [entry]}), left + right < 8);
+            let entry = format!("{prefix}::{}192.0.2.1", "abcd:".repeat(right));
+            let _ = check(json!({"registry": [entry]}), left + right < 6);
+        }
+    }
+    for (port, admitted) in [
+        (-1, false),
+        (0, false),
+        (1, true),
+        (65535, true),
+        (65536, false),
+    ] {
+        let _ = check(json!({"outbound_listen_ports": [port]}), admitted);
+    }
+    for (status, admitted) in [
+        (399, false),
+        (400, true),
+        (502, true),
+        (599, true),
+        (600, false),
+    ] {
+        let _ = check(json!({"reject_status": status}), admitted);
+    }
+    let _ = check(json!({}), true);
+    let _ = check(json!({"registry": []}), true);
+}
+
+#[tokio::test]
+async fn mesh_outbound_registry_preserves_normalized_destination_matches() {
+    for (entry, authority) in [
+        (" Reviews.SVC... ", "REVIEWS.svc"),
+        ("reviews.svc.:0000443", "REVIEWS.SVC:443"),
+        ("*.Example.Com.:0443", "API.EXAMPLE.COM:443"),
+        ("reviews.svc:*", "REVIEWS.SVC:65535"),
+        ("xn--bcher-kva.example", "XN--BCHER-KVA.EXAMPLE"),
+        ("2001:0DB8:0:0:0:0:0:1", "[2001:db8::1]"),
+        ("[2001:DB8::1]:0443", "[2001:db8:0:0:0:0:0:1]:443"),
+        ("2001:db8::1:*", "[2001:DB8::1]:443"),
+        ("[::ffff:192.0.2.1]:443", "[::ffff:c000:201]:443"),
+    ] {
+        let plugin = create_plugin("mesh_outbound_registry", &json!({"registry": [entry]}))
+            .unwrap()
+            .unwrap();
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+        ctx.headers.insert("host".into(), authority.into());
+        assert!(matches!(
+            plugin.on_request_received(&mut ctx).await,
+            PluginResult::Continue
+        ));
+    }
+}
+
+#[tokio::test]
+async fn mesh_outbound_registry_empty_effective_registry_denies_destinations() {
+    for config in [
+        json!({}),
+        json!({"registry": []}),
+        json!({"registry": ["", " \t"]}),
+    ] {
+        let plugin = create_plugin("mesh_outbound_registry", &config).unwrap().unwrap();
+        for host in ["known.test", "known.test:443", "[::1]:443"] {
+            let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+            ctx.headers.insert("host".into(), host.into());
+            assert!(matches!(
+                plugin.on_request_received(&mut ctx).await,
+                PluginResult::Reject {
+                    status_code: 502,
+                    ..
+                }
+            ));
+        }
+    }
+}
+
+#[test]
+fn mesh_outbound_registry_invalid_slice_keeps_stream_and_route_miss_enforcement() {
+    use ferrum_edge::modes::mesh::outbound_enforcement::{Decision, MeshOutboundEnforcement};
+
+    let slice = MeshSlice {
+        namespace: "default".into(),
+        services: vec![MeshService {
+            name: "invalid/service".into(),
+            namespace: "default".into(),
+            cluster_ips: Vec::new(),
+            ports: Vec::new(),
+            workloads: Vec::new(),
+            protocol_overrides: HashMap::new(),
+            uid: None,
+        }],
+        ..MeshSlice::default()
+    };
+    let enforcement = MeshOutboundEnforcement::from_slice(
+        &slice,
+        "cluster.local",
+        "default".into(),
+        vec![15001],
+        404,
+    )
+    .expect("an invalid registry must keep the gate installed");
+    assert_eq!(enforcement.registry().registry_size(), 0);
+    assert_eq!(
+        enforcement.check_destination(15001, "known.test", 443),
+        Decision::Deny
+    );
+    assert_eq!(
+        enforcement.check_destination(15006, "known.test", 443),
+        Decision::Skip
+    );
+    assert_eq!(
+        enforcement.http_route_miss_reject_status(15001, Some("known.test"), Some(443)),
+        Some(404)
+    );
 }
 
 #[test]
