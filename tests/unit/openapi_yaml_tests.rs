@@ -7725,13 +7725,18 @@ fn proxy_alerts_schema_matches_constructor_admission() {
         ("docs/proxy_alerts.md", docs, "ferrum-edge validate"),
         ("docs/proxy_alerts.md", docs, "constructor-only"),
         ("docs/plugins.md", plugins_docs, "OptionalFailOpen"),
-        ("docs/notifications.md", notifications_docs, "case-insensitive"),
-        ("docs/notifications.md", notifications_docs, "character ceiling"),
+        (
+            "docs/notifications.md",
+            notifications_docs,
+            "case-insensitive",
+        ),
+        (
+            "docs/notifications.md",
+            notifications_docs,
+            "character ceiling",
+        ),
     ] {
-        assert!(
-            text.contains(needle),
-            "{path} missing `{needle}`"
-        );
+        assert!(text.contains(needle), "{path} missing `{needle}`");
     }
 
     assert_eq!(
@@ -7783,7 +7788,10 @@ fn proxy_alerts_schema_matches_constructor_admission() {
     let mut ftp_url = webhook.clone();
     ftp_url["url"] = json!("ftp://example.test/");
     let mut empty_url_env = webhook.clone();
-    empty_url_env.as_object_mut().expect("webhook object").remove("url");
+    empty_url_env
+        .as_object_mut()
+        .expect("webhook object")
+        .remove("url");
     empty_url_env["url_env"] = json!("");
     let mut unbalanced = webhook.clone();
     unbalanced["body_template"] = json!("${");
