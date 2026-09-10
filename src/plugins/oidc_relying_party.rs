@@ -499,12 +499,31 @@ struct RefreshTokenResponse {
 struct RefreshOutcome {
     mutated: bool,
     refreshed: bool,
+    /// The refresh token this request carried is spent, or its transition
+    /// outcome is unknown, so nothing about this session may be re-sealed into
+    /// a `Set-Cookie` — not even an idle slide or a claims-expiry backfill.
+    ///
+    /// The cookie store has no shared server-side session: another replica (or
+    /// another instance's flight) may already have rotated this generation and
+    /// handed the browser the new cookie. Emitting the unchanged payload would
+    /// overwrite that rotated cookie with the credential the provider has
+    /// already consumed (issue #5025).
+    must_not_reseal: bool,
 }
 
 impl RefreshOutcome {
     const UNCHANGED: Self = Self {
         mutated: false,
         refreshed: false,
+        must_not_reseal: false,
+    };
+    /// The transition either proved this refresh token spent or left its
+    /// outcome indeterminate. Same shape as `UNCHANGED`, but the request must
+    /// not publish a session cookie at all.
+    const SPENT_OR_UNKNOWN: Self = Self {
+        mutated: false,
+        refreshed: false,
+        must_not_reseal: true,
     };
 }
 
@@ -1600,8 +1619,17 @@ impl OidcRelyingParty {
             return self.challenge(ctx, true);
         }
 
-        let mut session_mutated = refresh.mutated || refresh.refreshed || backfilled_claims_expiry;
-        session_mutated |= self.maybe_slide_session(&mut payload, now);
+        // A spent (or indeterminate) refresh transition forbids publishing ANY
+        // session cookie from this request: an idle slide or a claims-expiry
+        // backfill would re-seal the pre-rotation refresh token and overwrite
+        // whichever rotated cookie the browser already holds (issue #5025).
+        let session_mutated = if refresh.must_not_reseal {
+            false
+        } else {
+            let mut mutated = refresh.mutated || refresh.refreshed || backfilled_claims_expiry;
+            mutated |= self.maybe_slide_session(&mut payload, now);
+            mutated
+        };
         let rolling_cookie = if session_mutated {
             match self.seal_session_cookie(&payload) {
                 Ok(cookie) => Some(cookie),
@@ -1785,6 +1813,7 @@ impl OidcRelyingParty {
                             let outcome = RefreshOutcome {
                                 mutated: true,
                                 refreshed: claims_refreshed,
+                                must_not_reseal: false,
                             };
                             match self.seal_session_value(payload) {
                                 Ok(sealed) => (
@@ -1805,7 +1834,7 @@ impl OidcRelyingParty {
                                 "OIDC token refresh rejected as invalid_grant; the spent refresh token is not re-sealed and the freshness gate decides whether the existing session may keep serving"
                             );
                             (
-                                RefreshOutcome::UNCHANGED,
+                                RefreshOutcome::SPENT_OR_UNKNOWN,
                                 RefreshFlightResult::SpentCredential,
                             )
                         }
@@ -1820,6 +1849,7 @@ impl OidcRelyingParty {
                                 RefreshOutcome {
                                     mutated: true,
                                     refreshed: false,
+                                    must_not_reseal: false,
                                 },
                                 RefreshFlightResult::Deferred,
                             )
@@ -1844,7 +1874,7 @@ impl OidcRelyingParty {
                             plugin = "oidc_relying_party",
                             "coalesced OIDC token refresh outlived the follower wait bound; serving without a session update"
                         );
-                        return RefreshOutcome::UNCHANGED;
+                        return RefreshOutcome::SPENT_OR_UNKNOWN;
                     }
                 },
                 RefreshFlightRole::Completed(record) => {
@@ -1856,7 +1886,7 @@ impl OidcRelyingParty {
             plugin = "oidc_relying_party",
             "OIDC token refresh leader re-election budget exhausted; serving without a session update"
         );
-        RefreshOutcome::UNCHANGED
+        RefreshOutcome::SPENT_OR_UNKNOWN
     }
 
     /// Apply a coalesced refresh transition to a request that did not run the
@@ -1879,7 +1909,10 @@ impl OidcRelyingParty {
                         plugin = "oidc_relying_party",
                         "coalesced OIDC refresh result did not open; serving without a session update"
                     );
-                    return RefreshOutcome::UNCHANGED;
+                    // The winner rotated this generation; this request's copy
+                    // of the refresh token is spent even though its state
+                    // could not be adopted.
+                    return RefreshOutcome::SPENT_OR_UNKNOWN;
                 };
                 payload.sub = winner.sub;
                 payload.id_token_b64 = winner.id_token_b64;
@@ -1893,14 +1926,16 @@ impl OidcRelyingParty {
                 RefreshOutcome {
                     mutated: true,
                     refreshed: *claims_refreshed,
+                    must_not_reseal: false,
                 }
             }
-            RefreshFlightResult::SpentCredential => RefreshOutcome::UNCHANGED,
+            RefreshFlightResult::SpentCredential => RefreshOutcome::SPENT_OR_UNKNOWN,
             RefreshFlightResult::Deferred => {
                 payload.refresh_after_unix = now + REFRESH_RETRY_BACKOFF_SECS;
                 RefreshOutcome {
                     mutated: true,
                     refreshed: false,
+                    must_not_reseal: false,
                 }
             }
         }

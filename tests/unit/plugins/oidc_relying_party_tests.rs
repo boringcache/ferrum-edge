@@ -3481,3 +3481,56 @@ async fn unrepresentable_provider_expires_in_does_not_panic_the_session_path() {
         assert_continue(plugin.authenticate(&mut ctx, &consumers).await);
     }
 }
+
+/// A spent refresh token must suppress the sliding-idle cookie too. The
+/// documented multi-replica contract is that the `invalid_grant` loser emits no
+/// `Set-Cookie` at all; before issue #5025 an ordinary active-browser request
+/// whose idle window happened to be due re-sealed and published the already
+/// spent credential, overwriting the winner's rotated cookie.
+#[tokio::test]
+async fn spent_refresh_token_suppresses_the_rolling_idle_cookie() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": "invalid_grant"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let plugin = OidcRelyingParty::new(
+        &refresh_config(&format!("{}/token", server.uri())),
+        PluginHttpClient::default(),
+    )
+    .expect("valid refresh config");
+    let now = chrono::Utc::now().timestamp();
+    let cookie = oidc_sealed_refresh_session_cookie_for_test(
+        &plugin,
+        json!({
+            "sub": "oidc-subject",
+            "email": "accepted@example.test",
+            "exp": now + 3600
+        }),
+        Some("spent-refresh-token".to_string()),
+        // Both refresh AND the idle slide are due on this request.
+        true,
+        true,
+    )
+    .expect("session seals");
+    let consumer_index = ConsumerIndex::new(&[]);
+
+    let mut first = session_ctx(&cookie);
+    assert_continue(plugin.authenticate(&mut first, &consumer_index).await);
+    assert!(
+        rolling_cookie(&plugin, &mut first).await.is_none(),
+        "an idle slide must not publish a spent refresh token"
+    );
+
+    // The cached SpentCredential follower takes the same branch without a
+    // second grant.
+    let mut repeated = session_ctx(&cookie);
+    assert_continue(plugin.authenticate(&mut repeated, &consumer_index).await);
+    assert!(
+        rolling_cookie(&plugin, &mut repeated).await.is_none(),
+        "a cached spent-credential follower must not publish a cookie either"
+    );
+    assert_eq!(server.received_requests().await.expect("requests").len(), 1);
+}
