@@ -26393,24 +26393,29 @@ components:
         ttl_seconds:
           type: [integer, "null"]
           format: uint64
+          minimum: 0
+          maximum: 18446744073709551615
           default: 300
-          description: "Fallback freshness lifetime in seconds when the backend response has no s-maxage, max-age, or Expires, or when respect_cache_control is explicitly false. With the default true policy, precedence is s-maxage > max-age > Expires minus Date > ttl_seconds; missing Date uses response receipt time. Invalid or repeated Expires, or invalid/repeated Date for Expires-based freshness, means already expired. Upstream Age, Date, response delay, and cache residency still reduce remaining freshness."
+          description: "Fallback freshness lifetime in seconds when the backend response has no s-maxage, max-age, or Expires, or when respect_cache_control is explicitly false. Must be an unsigned 64-bit integer: a negative value or one above 18446744073709551615 is rejected at admission. With the default true policy, precedence is s-maxage > max-age > Expires minus Date > ttl_seconds; missing Date uses response receipt time. Invalid or repeated Expires, or invalid/repeated Date for Expires-based freshness, means already expired. Upstream Age, Date, response delay, and cache residency still reduce remaining freshness."
         max_entries:
           type: [integer, "null"]
           format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           default: 10000
           description: Maximum number of cached entries. Overflow is evicted oldest-first from an insertion-ordered queue in amortized O(1) per admitted entry — no full-map clone or sort is performed while the accounting mutex is held. Must be greater than zero.
         max_entry_size_bytes:
           type: [integer, "null"]
           format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           default: 1048576
           description: Maximum size of a single cached response body (1 MiB by default). Larger responses are not cached. Must be greater than zero.
         max_total_size_bytes:
           type: [integer, "null"]
           format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           default: 104857600
           description: Maximum accounted retained in-memory response-entry footprint across all entries (100 MiB by default). Concurrent stores and replacements are admitted atomically. When the byte cap is the limiting dimension, every expired entry is reclaimed in expiration order through an ordered index; fresh entries are never evicted to admit a new representation, and the store is refused if it still does not fit. Reclamation cost is bounded by entries actually retired rather than by cache size. An entry larger than the cap alone is never cached. Must be greater than zero.
         cacheable_methods:
@@ -26418,9 +26423,9 @@ components:
           minItems: 1
           items:
             type: string
-            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+            pattern: "^([Gg][Ee][Tt]|[Hh][Ee][Aa][Dd])$"
           default: ["GET", "HEAD"]
-          description: "HTTP methods eligible for caching (uppercased). Must contain at least one entry, and every entry must be a valid RFC 9110 HTTP method token that is also a bodyless retrieval method — only GET and HEAD are accepted. A body-bearing method is rejected at admission because cache lookup runs in before_proxy, ahead of on_final_request_body, so the exact backend-visible request body cannot be bound into the key. At runtime the transport must observe the complete H1/H2/H3 upload and privately prove it is empty before lookup; a non-empty or unproven body, any Transfer-Encoding, or a non-zero/unparsable Content-Length bypasses lookup and storage."
+          description: "HTTP methods eligible for caching (uppercased before use, so any letter casing of the two accepted tokens is admitted). Must contain at least one entry, and every entry must be a valid RFC 9110 HTTP method token that is also a bodyless retrieval method — only GET and HEAD are accepted; every other method token, including POST and OPTIONS, is rejected at admission. A body-bearing method is rejected at admission because cache lookup runs in before_proxy, ahead of on_final_request_body, so the exact backend-visible request body cannot be bound into the key. At runtime the transport must observe the complete H1/H2/H3 upload and privately prove it is empty before lookup; a non-empty or unproven body, any Transfer-Encoding, or a non-zero/unparsable Content-Length bypasses lookup and storage."
         cacheable_status_codes:
           type: array
           minItems: 1
@@ -26458,9 +26463,9 @@ components:
           description: "Legacy key-partition toggle. Caller isolation no longer depends on it: every cache key binds a mandatory caller-authorization partition (authentication mechanism, resolved identity/consumer, peer SPIFFE identity, and SHA-256 digests of every credential header presented), so two credentials that resolve to one display subject with different scopes can never share an entry. The flag is still bound into the key digest so flipping it yields a disjoint keyspace rather than reusing entries minted under the other setting. It does not authorize shared storage of a response to an Authorization-bearing request: the origin must still send Cache-Control public, must-revalidate, or s-maxage, so backend-side revocation, expiry, and scope changes remain authoritative."
         anonymous_caller_scope:
           type: [string, "null"]
-          enum: ["caller_address", "shared", null]
+          pattern: '^\s*([Cc][Aa][Ll][Ll][Ee][Rr][_-][Aa][Dd][Dd][Rr][Ee][Ss][Ss]|[Ss][Hh][Aa][Rr][Ee][Dd])\s*$'
           default: "caller_address"
-          description: "How anonymous callers (no gateway identity, no credential header, no peer SPIFFE identity) are partitioned. caller_address (default) binds the gateway-resolved canonical peer address, which the origin observes through Ferrum's regenerated X-Forwarded-For; a request whose canonical address cannot be parsed bypasses the cache entirely rather than being keyed incompletely. shared is an explicit operator attestation that the origin does not vary its response by caller address on this route and lets anonymous callers share one retained representation — only set it when that is known-safe, because it re-opens cross-caller replay for address-sensitive origins. It applies to anonymous callers only: an authenticated caller always binds its canonical peer address, because the backend receives Ferrum's regenerated forwarding identity for that caller too and may vary policy or content by it."
+          description: "How anonymous callers (no gateway identity, no credential header, no peer SPIFFE identity) are partitioned. The value is trimmed and ASCII-lowercased before it is matched, and caller-address is an accepted alias of caller_address, so caller_address, caller-address, and shared are admitted in any letter casing and with surrounding whitespace. caller_address (default) binds the gateway-resolved canonical peer address, which the origin observes through Ferrum's regenerated X-Forwarded-For; a request whose canonical address cannot be parsed bypasses the cache entirely rather than being keyed incompletely. shared is an explicit operator attestation that the origin does not vary its response by caller address on this route and lets anonymous callers share one retained representation — only set it when that is known-safe, because it re-opens cross-caller replay for address-sensitive origins. It applies to anonymous callers only: an authenticated caller always binds its canonical peer address, because the backend receives Ferrum's regenerated forwarding identity for that caller too and may vary policy or content by it."
         add_cache_status_header:
           type: [boolean, "null"]
           default: true
