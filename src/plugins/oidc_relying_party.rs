@@ -920,6 +920,17 @@ impl OidcRelyingParty {
         let logout_path = optional_string(provider_obj, "logout_path", "provider[0]")?
             .unwrap_or_else(|| "/oauth/logout".to_string());
         validate_path_only(&logout_path, "logout_path")?;
+        // `on_request_received` tests the callback branch first, so a logout
+        // path that routing delivers as the callback path is dead
+        // configuration: every logout is read as an OAuth callback and answers
+        // "Missing state", and the configured logout handler never runs
+        // (issue #5030).
+        if route_paths_collide(&logout_path, &callback_path) {
+            return Err(
+                "oidc_relying_party: provider[0].logout_path must not resolve to the same path as callback_path"
+                    .to_string(),
+            );
+        }
 
         let id_token_clock_skew_secs = optional_u64(
             provider_obj,
@@ -3631,6 +3642,30 @@ fn validate_path_only(path: &str, field: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Whether two configured paths reach the same request-received branch.
+///
+/// Compares the way routing delivers a path rather than byte for byte:
+/// duplicate slashes collapse and a single trailing slash is not significant.
+fn route_paths_collide(left: &str, right: &str) -> bool {
+    normalized_route_path(left) == normalized_route_path(right)
+}
+
+fn normalized_route_path(path: &str) -> String {
+    let mut normalized = String::with_capacity(path.len());
+    let mut previous_slash = false;
+    for character in path.chars() {
+        if character == '/' && previous_slash {
+            continue;
+        }
+        previous_slash = character == '/';
+        normalized.push(character);
+    }
+    while normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+    normalized
 }
 
 /// Whether `value` is usable verbatim as an RFC 6265 §4.1.1 `path-value`.

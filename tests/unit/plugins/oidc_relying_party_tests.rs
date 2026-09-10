@@ -3732,3 +3732,48 @@ async fn minimum_cookie_size_cap_can_still_seal_a_browser_challenge() {
     assert_eq!(status_code, 302, "headers: {headers:?}");
     assert!(headers.contains_key("set-cookie"));
 }
+
+/// `on_request_received` checks the callback branch before the logout branch,
+/// so a `logout_path` that routing delivers as the callback path makes logout
+/// unreachable: it answers "Missing state" and the configured handler never
+/// runs (issue #5030).
+#[test]
+fn new_rejects_logout_paths_that_collide_with_the_callback_path() {
+    for logout_path in ["/oauth/callback", "/oauth/callback/", "/oauth//callback"] {
+        let mut config = base_config();
+        config["providers"][0]["logout_path"] = json!(logout_path);
+        let error = validate_plugin_config("oidc_relying_party", &config)
+            .err()
+            .unwrap_or_else(|| panic!("logout_path={logout_path} must be rejected"));
+        assert!(
+            error.contains("logout_path"),
+            "unexpected error for logout_path={logout_path}: {error}"
+        );
+    }
+}
+
+/// Every accepted `logout_path` must actually reach local cookie deletion
+/// (issue #5030).
+#[tokio::test]
+async fn accepted_logout_paths_reach_local_cookie_deletion() {
+    let mut config = base_config();
+    config["providers"][0]["logout_path"] = json!("/oauth/sign-out");
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).expect("valid config");
+    let mut ctx = html_ctx();
+    ctx.path = "/oauth/sign-out".to_string();
+    let PluginResult::Reject {
+        status_code,
+        headers,
+        ..
+    } = plugin.on_request_received(&mut ctx).await
+    else {
+        panic!("logout must terminate locally");
+    };
+    assert_eq!(status_code, 200);
+    assert!(
+        headers
+            .get("set-cookie")
+            .is_some_and(|cookie| cookie.contains("Max-Age=0")),
+        "logout must expire the session cookie: {headers:?}"
+    );
+}
