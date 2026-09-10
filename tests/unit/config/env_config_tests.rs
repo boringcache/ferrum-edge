@@ -32,6 +32,24 @@ fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
     }
 }
 
+/// A Workload API socket path whose every directory component the production
+/// socket contract admits on this host.
+///
+/// The tests that use it are about *attestor* diagnostics, and `validate`
+/// checks the socket contract first. A hard-coded `/tmp/...` is a symlinked
+/// ancestor on macOS, so the socket check refuses it and the attestor assertion
+/// fails on the wrong error — poisoning `ENV_LOCK` for every other test in this
+/// binary (issue #4984). The real directory behind the platform temporary
+/// directory is resolved instead. The socket file itself is never created:
+/// the contract requires the parent to exist, not the socket.
+fn admitted_workload_api_socket_path() -> String {
+    std::fs::canonicalize(std::env::temp_dir())
+        .expect("the platform temporary directory resolves to a real directory")
+        .join("fe-env-attestor.sock")
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Helper to remove an env var (must be called inside with_env_vars or while holding ENV_LOCK).
 fn remove_var(key: &str) {
     // SAFETY: Called within with_env_vars which holds ENV_LOCK.
@@ -1283,6 +1301,7 @@ fn test_env_config_mesh_workload_api_rejects_file_svid_override() {
 
 #[test]
 fn test_env_config_mesh_workload_api_rejects_malformed_unix_identity_rule() {
+    let socket_path = admitted_workload_api_socket_path();
     with_env_vars(
         &[
             ("FERRUM_MODE", "mesh"),
@@ -1299,10 +1318,7 @@ fn test_env_config_mesh_workload_api_rejects_malformed_unix_identity_rule() {
             ("FERRUM_MESH_CA_BOOTSTRAP_DEV", "true"),
             ("FERRUM_MESH_WORKLOAD_API_ENABLED", "true"),
             ("FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY", "true"),
-            (
-                "FERRUM_MESH_WORKLOAD_API_SOCKET_PATH",
-                "/tmp/ferrum-env-config-attestor-validation.sock",
-            ),
+            ("FERRUM_MESH_WORKLOAD_API_SOCKET_PATH", socket_path.as_str()),
             (
                 "FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES",
                 "uid:not-a-number=spiffe://cluster.local/ns/default/sa/app",
@@ -1321,6 +1337,7 @@ fn test_env_config_mesh_workload_api_rejects_malformed_unix_identity_rule() {
 
 #[test]
 fn test_env_config_mesh_workload_api_requires_available_attestor() {
+    let socket_path = admitted_workload_api_socket_path();
     with_env_vars(
         &[
             ("FERRUM_MODE", "mesh"),
@@ -1337,10 +1354,7 @@ fn test_env_config_mesh_workload_api_requires_available_attestor() {
             ("FERRUM_MESH_CA_BOOTSTRAP_DEV", "true"),
             ("FERRUM_MESH_WORKLOAD_API_ENABLED", "true"),
             ("FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY", "true"),
-            (
-                "FERRUM_MESH_WORKLOAD_API_SOCKET_PATH",
-                "/tmp/ferrum-env-config-attestor-validation.sock",
-            ),
+            ("FERRUM_MESH_WORKLOAD_API_SOCKET_PATH", socket_path.as_str()),
         ],
         || {
             remove_var("FERRUM_MESH_PRODUCTION_MODE");
