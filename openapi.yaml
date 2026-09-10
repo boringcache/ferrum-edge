@@ -17576,7 +17576,12 @@ components:
     StdoutLoggingConfig:
       type: [object, "null"]
       additionalProperties: false
-      description: "Plugin: stdout_logging — Writes one JSON transaction/stream summary per line to the bounded non-blocking stdout writer. Independent of FERRUM_LOG_LEVEL. Accepted keys are filter, schema, and schema_ref; null or an empty object uses defaults. The optional filter runs before schema application."
+      description: "Plugin: stdout_logging — Writes one JSON transaction/stream summary per line to the bounded non-blocking stdout writer. Independent of FERRUM_LOG_LEVEL. Accepted keys are filter, schema, and schema_ref; null or an empty object uses defaults. The optional filter runs before schema application. `schema` and `schema_ref` are mutually exclusive. `filter.expression` is mutually exclusive with the flat filter keys (status_code_min, status_code_max, min_latency_ms, errors_only) by key presence, including `errors_only: false`."
+      if:
+        type: object
+      then:
+        not:
+          required: [schema, schema_ref]
       properties:
         filter:
           type: [object, "null"]
@@ -17586,6 +17591,15 @@ components:
             serialized. All present fields must match for an entry to be
             logged. The expression form is mutually exclusive with the flat
             predicates. When omitted, every transaction is logged.
+          if:
+            type: object
+          then:
+            not:
+              anyOf:
+                - required: [expression, status_code_min]
+                - required: [expression, status_code_max]
+                - required: [expression, min_latency_ms]
+                - required: [expression, errors_only]
           properties:
             status_code_min:
               type: integer
@@ -17617,25 +17631,32 @@ components:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
           type: string
+          minLength: 1
           description: >-
             Name of a schema registered by a `transaction_log_schema` plugin.
             Mutually exclusive with `schema`. See docs/log_schema.md.
 
     HttpLoggingConfig:
       type: object
-      description: "Plugin: http_logging — Sends transaction logs to an HTTP endpoint in batches."
+      additionalProperties: false
+      description: "Plugin: http_logging — Sends transaction logs to an HTTP endpoint in batches. Unknown top-level keys are rejected. `schema` and `schema_ref` are mutually exclusive. Registration policy is OptionalFailOpen."
       required:
         - endpoint_url
+      not:
+        required: [schema, schema_ref]
       properties:
         endpoint_url:
           type: string
+          minLength: 1
+          format: uri
+          pattern: '^[hH][tT][tT][pP][sS]?://(?![^/?#]*@)(?:\[[^\]\s]+\]|[^/?#:\s]+)(?::[0-9]+)?(?:[/?#]\S*)?$'
           description: >-
-            URL to POST transaction logs to. Must be http:// or https:// with a
-            hostname or IP address; userinfo credentials
-            (https://user:pass@host) are rejected — authenticate with
-            custom_headers. Some collectors require a credential in the URL
-            (Sumo Logic path token, Mezmo apikey query parameter), so this value
-            is never rendered in operational output: egress-denial, DNS/TLS,
+            Required URL to POST transaction logs to. Must be http:// or https://
+            with a hostname or IP address (IPv6 authorities are allowed); empty
+            strings and userinfo credentials (https://user:pass@host) are
+            rejected — authenticate with custom_headers. Some collectors require
+            a credential in the URL (Sumo Logic path token), so this value is
+            never rendered in operational output: egress-denial, DNS/TLS,
             retry, slow-call, and batch-failure diagnostics show only a
             structurally redacted scheme://host:port/redacted form. The admin
             audit and non-admin read projections apply the schema-aware
@@ -17644,9 +17665,15 @@ components:
             `[REDACTED_FRAGMENT]` markers.
         custom_headers:
           type: object
+          propertyNames:
+            type: string
+            minLength: 1
+            maxLength: 65535
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           additionalProperties:
             type: string
-          description: "Key-value pairs of custom HTTP headers to include on every batch request. Use this for service-specific auth (e.g., DD-API-KEY for Datadog, Api-Key for New Relic) or metadata headers."
+            pattern: '^[\u0009\u0020-\u007E]*$'
+          description: "Key-value pairs of custom HTTP headers to include on every batch request. Names use HTTP token syntax. Values are visible ASCII plus HTAB; CR/LF and other controls are rejected. Use this for service-specific auth (e.g., DD-API-KEY for Datadog, Api-Key for New Relic) or metadata headers."
           example:
             DD-API-KEY: your-datadog-api-key
         batch_size:
@@ -17701,6 +17728,7 @@ components:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
           type: string
+          minLength: 1
           description: >-
             Name of a schema registered by a `transaction_log_schema` plugin.
             Mutually exclusive with `schema`. See docs/log_schema.md.
@@ -18207,23 +18235,36 @@ components:
 
     WsLoggingConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: ws_logging — Sends transaction logs to a WebSocket endpoint in
         batches with bounded establishment/write timeouts, per-entry and
         queued-byte admission budgets, and structurally redacted endpoint
-        diagnostics.
+        diagnostics. Unknown top-level keys are rejected. `schema` and
+        `schema_ref` are mutually exclusive. `buffer_max_bytes` must be at
+        least 2 * (max_entry_bytes + 1) at runtime; this schema encodes the
+        absolute floor (2050) but cannot express that sibling-field arithmetic.
       required:
         - endpoint_url
+      allOf:
+        - not:
+            required: [schema, schema_ref]
       properties:
         endpoint_url:
           type: string
+          minLength: 1
+          format: uri
+          pattern: '^[wW][sS][sS]?://(?![^/?#]*@)(?:\[[^\]\s]+\]|[^/?#:\s]+)(?::[0-9]+)?(?:[/?#].*)?$'
           description: >-
             WebSocket URL (ws:// or wss://) to send transaction logs to. Must
             include a hostname and must not include URL user information.
             Path/query credentials are permitted for collectors that require
             them, but operational diagnostics always use a structurally
             redacted form (`scheme://host[:port]/redacted`). Malformed or
-            non-WebSocket schemes are rejected at config load time.
+            non-WebSocket schemes are rejected at config load time. The
+            constructor canonicalizes the value (lowercase scheme,
+            percent-encoded path) before the collector handshake so admitted
+            representations match the tungstenite request URI.
         reconnect_delay_ms:
           type: integer
           default: 5000
@@ -18295,11 +18336,15 @@ components:
             Aggregate serialized-content budget across queued records,
             contiguous batch assembly, and retries. Admission conservatively
             reserves two copies plus JSON-array framing, so this value must be
-            greater than or equal to 2 * (max_entry_bytes + 1).
+            greater than or equal to 2 * (max_entry_bytes + 1). Runtime
+            validation enforces that sibling-field lower bound; this schema
+            encodes only the absolute floor (2050) when max_entry_bytes is at
+            its minimum.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
           type: string
+          minLength: 1
           description: >-
             Name of a schema registered by a `transaction_log_schema` plugin.
             Mutually exclusive with `schema`. WebSocket disconnect entries are
@@ -18317,6 +18362,16 @@ components:
     LokiLoggingConfig:
       type: object
       additionalProperties: false
+      not:
+        required: [schema, schema_ref]
+      allOf:
+        - if:
+            not:
+              required: [max_entry_bytes]
+          then:
+            properties:
+              buffer_max_bytes:
+                minimum: 65536
       description: >-
         Plugin: loki_logging — Ships transaction logs to Grafana Loki via the
         push API in bounded, label-grouped streams. HTTP 204 is the canonical
@@ -18325,20 +18380,25 @@ components:
         non-empty/anomalous compatible-success responses, and every other
         non-retryable response are terminal; 408, 429, and 5xx responses use
         bounded exponential backoff with jitter. Explicit nulls and unknown
-        top-level fields are rejected.
+        top-level fields are rejected. `schema` and `schema_ref` are
+        structurally exclusive. When `max_entry_bytes` is omitted, OpenAPI
+        requires `buffer_max_bytes` to be at least the default per-entry
+        ceiling (65536); a sibling comparison against an explicit
+        `max_entry_bytes` is enforced only at construction. Named-schema
+        existence is runtime-only.
       required:
         - endpoint_url
       properties:
         endpoint_url:
           type: string
-          format: uri
-          pattern: '^[hH][tT][tT][pP][sS]?://(?![^/?#]*@)(?:\[[^\]\s]+\]|[^/?#:\s]+)(?::[0-9]+)?(?:[/?#]\S*)?$'
+          pattern: '^\s*[hH][tT][tT][pP][sS]?://(?![^/?#]*@)(?:\[[^\]\s]+\]|[^/?#:\s]+)(?::(?:[0-9]{1,4}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?(?:[/?#]\S*)?\s*$'
           description: >-
             Loki push API URL (for example,
-            http://loki:3100/loki/api/v1/push). URL user information is
+            http://loki:3100/loki/api/v1/push). Leading and trailing whitespace
+            is ignored by runtime URL parsing. URL user information is
             rejected; use authorization_header or custom_headers instead.
-            Path and query components are redacted from operational and
-            non-admin diagnostics.
+            Ports must be 0–65535. Path and query components are redacted from
+            operational and non-admin diagnostics.
         authorization_header:
           type: string
           minLength: 1
@@ -18355,12 +18415,13 @@ components:
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           additionalProperties:
             type: string
-            pattern: '^[\u0009\u0020-\u007E]*$'
+            pattern: '^[^\u0000\r\n]*$'
           description: >-
             Extra HTTP headers (for example, X-Scope-OrgID for multi-tenant
             Loki). Names use HTTP token syntax and are at most 65,535 ASCII
-            bytes. All values are redacted from audit records and non-admin
-            config reads.
+            bytes. Values may contain UTF-8 (HeaderValue obs-text); NUL, CR,
+            and LF are rejected. All values are redacted from audit records and
+            non-admin config reads.
         labels:
           type: object
           propertyNames:
@@ -18444,20 +18505,35 @@ components:
           description: >-
             Per-plugin retained-content byte budget across queued, batched,
             and retrying entries. Must be at least max_entry_bytes; entries
-            are dropped non-blockingly when the budget is exhausted.
+            are dropped non-blockingly when the budget is exhausted. When
+            max_entry_bytes is omitted, this field must be at least 65536
+            (the default per-entry ceiling). An arbitrary sibling comparison
+            against an explicit max_entry_bytes is runtime-only.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
           type: string
+          minLength: 1
           description: >-
             Name of a schema registered by a `transaction_log_schema` plugin.
             Mutually exclusive with `schema`. Note: Loki labels
             (`build_http_labels` / `build_stream_labels`) read typed summary
             fields and are NOT affected by `rename:`. See docs/log_schema.md.
+            Existence of the named schema is resolved at construction.
 
     StatsdLoggingConfig:
       type: object
       additionalProperties: false
+      not:
+        required: [schema, schema_ref]
+      allOf:
+        - if:
+            not:
+              required: [max_entry_bytes]
+          then:
+            properties:
+              buffer_max_bytes:
+                minimum: 131074
       description: >-
         Plugin: statsd_logging — Sends transaction metrics to a StatsD-compatible
         server over UDP. Unknown top-level keys are rejected at construction /
@@ -18468,7 +18544,14 @@ components:
         body_error, result, io_side, error_class). The authoritative namespace
         tag is always appended and preserves the full validated Ferrum namespace
         (up to 254 bytes). Metric prefixes are sanitized and capped at 256
-        bytes; encoded global_tags (+ namespace) are capped at 400 bytes.
+        UTF-8 bytes after trim; encoded global_tags (+ namespace) are capped at
+        400 bytes. `schema` and `schema_ref` are structurally exclusive. When
+        `max_entry_bytes` is omitted, OpenAPI requires `buffer_max_bytes` to
+        be at least 131074 (`2 * (65536 + 1)`); a sibling comparison against an
+        explicit `max_entry_bytes` is enforced only at construction. Named-schema
+        existence is runtime-only. Construction also rejects a prefix/tag/schema
+        combination whose smallest ordinary record (HTTP, gRPC, stream, or
+        WebSocket) cannot fit `max_entry_bytes`.
         UDP datagrams never exceed a 1452-byte conservative IPv4/IPv6 payload
         ceiling; indivisible oversized lines are dropped rather than fragmented.
         Hot-path admission reserves a queue slot and a provisional max_entry_bytes
@@ -18489,7 +18572,16 @@ components:
       properties:
         host:
           type: string
-          description: StatsD server hostname or IP address
+          minLength: 1
+          not:
+            anyOf:
+              - pattern: "://"
+              - pattern: "[/?#@\\s]"
+              - pattern: "^[^\\[\\]:]+:[^:]+$"
+          description: >-
+            StatsD server hostname or IP address. Must be a bare hostname or IP
+            without scheme, path, query, fragment, credentials, or port
+            (bracketed and unbracketed IPv6 literals are allowed).
         port:
           type: integer
           default: 8125
@@ -18499,24 +18591,26 @@ components:
         prefix:
           type: string
           default: "ferrum"
-          maxLength: 256
+          minLength: 1
           description: >-
-            Metric name prefix (e.g., ferrum.request.count). Sanitized for
-            StatsD line-protocol safety. OpenAPI `maxLength` counts Unicode
-            characters; runtime admission separately enforces at most 256
-            UTF-8 bytes after sanitization, so multibyte prefixes may be
-            rejected below 256 characters.
+            Metric name prefix (e.g., ferrum.request.count). Leading and
+            trailing whitespace is trimmed before sanitization; empty after
+            trim is rejected. Runtime admission enforces at most 256 UTF-8
+            bytes after sanitization, so a longer raw string may still be
+            refused. Construction also requires max_entry_bytes to fit the
+            smallest ordinary record under this prefix.
         global_tags:
           type: object
           propertyNames:
             type: string
             minLength: 1
             maxLength: 64
-            pattern: '^[A-Za-z_][A-Za-z0-9_.-]*$'
+            pattern: '^(?!(namespace|method|status_class|status|grpc_status|proxy|protocol|error_class|error|cause|direction|body_outcome|body_error|result|io_side)$)[A-Za-z_][A-Za-z0-9_.-]*$'
             description: >-
               Tag keys are restricted to the ASCII grammar
               `[A-Za-z_][A-Za-z0-9_.-]*`, so OpenAPI `maxLength: 64`
-              matches the runtime 64-byte key ceiling.
+              matches the runtime 64-byte key ceiling. Reserved runtime tag
+              names are excluded case-insensitively.
           additionalProperties:
             type: string
           description: >-
@@ -18551,7 +18645,11 @@ components:
           maximum: 1048576
           description: >-
             Maximum rendered StatsD line-protocol bytes for one admitted
-            transaction. Oversized renders are dropped before enqueue.
+            transaction. Configuration is rejected unless the smallest ordinary
+            record (HTTP, gRPC, stream, or WebSocket) with the resolved prefix,
+            global tags, and schema fits this budget. Request-shaped fields
+            can still make an individual render exceed the budget; those
+            oversized entries are dropped before enqueue.
         buffer_max_bytes:
           type: integer
           default: 16777216
@@ -18562,6 +18660,9 @@ components:
             one MTU-bounded datagram buffer, and retries. Admission reserves
             two copies plus framing before rendering and shrinks that lease to
             the exact retained size. Must be at least 2 * (max_entry_bytes + 1).
+            When max_entry_bytes is omitted, this field must be at least 131074
+            (the default-dependent bound). An arbitrary sibling comparison against
+            an explicit max_entry_bytes is runtime-only.
         max_retries:
           type: integer
           default: 0
@@ -18594,9 +18695,11 @@ components:
             no-ops for statsd (line protocol, not JSON). See docs/log_schema.md.
         schema_ref:
           type: string
+          minLength: 1
           description: >-
             Name of a schema registered by a `transaction_log_schema` plugin.
             Mutually exclusive with `schema`. Same statsd caveats as above.
+            Existence of the named schema is resolved at construction.
 
     TransactionLogSchemaConfig:
       type: object
@@ -20363,33 +20466,87 @@ components:
           items:
             type: object
             additionalProperties: false
+            # `client_auth` is effectively required: an omitted object defaults
+            # `method` to client_secret_basic, which then rejects for a missing
+            # client_id. Model that as a required key rather than leaving the
+            # schema to accept a provider the constructor always refuses.
+            required: [client_auth]
+            oneOf:
+              - required: [introspection_endpoint]
+              - required: [discovery_url]
             properties:
               introspection_endpoint:
                 type: string
+                minLength: 1
+                pattern: '^\s*[hH][tT][tT][pP][sS]?://[^/?#\s]+([/?#][^\s]*)?\s*$'
                 description: >-
-                  Direct token introspection endpoint URL. Must use https when
+                  Direct token introspection endpoint URL. Exactly one of
+                  introspection_endpoint or discovery_url must be configured.
+                  Must use https when
                   client_auth.method is credentialed (client_secret_basic,
                   client_secret_post, or private_key_jwt) and the host is not
                   loopback/localhost; http is only permitted for loopback hosts.
+                  Surrounding whitespace is trimmed. A path or query is
+                  accepted, but operational diagnostics record only the endpoint
+                  origin (scheme, host, port).
               discovery_url:
                 type: string
+                minLength: 1
+                pattern: '^\s*[hH][tT][tT][pP][sS]?://[^/?#\s]+([/?#][^\s]*)?\s*$'
                 description: >-
-                  OIDC discovery URL used to resolve introspection_endpoint. Must
+                  OIDC discovery URL used to resolve introspection_endpoint.
+                  Exactly one of introspection_endpoint or discovery_url must be
+                  configured. Must
                   use https when client_auth.method is credentialed and the host
                   is not loopback/localhost; http is only permitted for loopback
                   hosts. The discovered endpoint must preserve the discovery
                   URL's scheme, normalized host, and effective port.
               issuer:
                 type: string
-                description: Expected iss claim in active introspection responses
+                pattern: '\S'
+                description: >-
+                  Expected iss claim in active introspection responses. Trimmed;
+                  a blank value is rejected. Also used as the audience of a
+                  private_key_jwt client assertion.
               audiences:
                 type: array
                 items:
                   type: string
-                description: Accepted aud claims; OR matched
+                  pattern: '\S'
+                description: Accepted aud claims; OR matched. Entries are trimmed and must not be blank.
               client_auth:
                 type: object
                 additionalProperties: false
+                allOf:
+                  # `method` defaults to client_secret_basic when absent, so the
+                  # secret-based branch also covers the omitted key.
+                  - if:
+                      anyOf:
+                        - not:
+                            required: [method]
+                        - required: [method]
+                          properties:
+                            method:
+                              enum: [client_secret_basic, client_secret_post]
+                    then:
+                      required: [client_id, client_secret]
+                      properties:
+                        client_id:
+                          pattern: '\S'
+                        client_secret:
+                          minLength: 1
+                  - if:
+                      required: [method]
+                      properties:
+                        method:
+                          const: private_key_jwt
+                    then:
+                      required: [client_id, private_key_pem]
+                      properties:
+                        client_id:
+                          pattern: '\S'
+                        private_key_pem:
+                          minLength: 1
                 properties:
                   method:
                     type: string
@@ -20401,11 +20558,15 @@ components:
                     default: client_secret_basic
                     description: >-
                       Client authentication method against the introspection
-                      endpoint. Credentialed methods (client_secret_basic,
+                      endpoint. Surrounding whitespace is trimmed before
+                      matching. Credentialed methods (client_secret_basic,
                       client_secret_post, private_key_jwt) require an https
                       endpoint for non-loopback hosts; http is only accepted
                       for loopback/localhost endpoints. The 'none' method is
                       loopback/localhost-only regardless of scheme.
+                      client_secret_basic and client_secret_post require
+                      client_id and client_secret; private_key_jwt requires
+                      client_id and private_key_pem.
                   client_id:
                     type: string
                   client_secret:
@@ -20414,9 +20575,17 @@ components:
                   private_key_pem:
                     type: string
                     format: password
+                    description: >-
+                      PEM private key for private_key_jwt. The key must be
+                      usable with private_key_jwt_alg: an EC key's curve must
+                      match the selected ES algorithm (P-256 for ES256, P-384
+                      for ES384) and an RSA key must meet the signing
+                      backend's minimum modulus size. A mismatch is rejected at
+                      config load, not at request time.
                   private_key_jwt_alg:
                     type: string
                     enum: [RS256, RS384, RS512, ES256, ES384, EdDSA]
+                    default: RS256
                   private_key_jwt_kid:
                     type: string
               from_headers:
@@ -20428,12 +20597,20 @@ components:
                   properties:
                     name:
                       type: string
+                      pattern: '^\s*[!#$%&''*+.^_`|~0-9A-Za-z-]+\s*$'
+                      description: >-
+                        Header carrying the token. Trimmed and lowercased; must
+                        be a valid HTTP header name.
                     prefix:
-                      type: string
+                      type: ["string", "null"]
+                      description: >-
+                        Scheme prefix stripped from the header value. Null and
+                        the empty string both mean "no prefix".
               from_params:
                 type: array
                 items:
                   type: string
+                  pattern: '\S'
               forward_original_token:
                 type: boolean
                 default: true
@@ -20441,14 +20618,27 @@ components:
                 type: integer
                 format: uint64
                 default: 60
+                minimum: 0
+                maximum: 86400
+                description: >-
+                  Active-token cache TTL cap, in seconds. 0 disables positive
+                  caching.
               negative_cache_ttl_secs:
                 type: integer
                 format: uint64
                 default: 10
+                minimum: 0
+                maximum: 300
+                description: >-
+                  Inactive-token cache TTL, in seconds. 0 disables negative
+                  caching.
               request_timeout_ms:
                 type: integer
                 format: uint64
                 default: 5000
+                minimum: 100
+                maximum: 30000
+                description: Per-introspection-request timeout, in milliseconds.
               max_cache_entries:
                 type: integer
                 format: uint64
@@ -20483,26 +20673,52 @@ components:
                   max_cache_entry_bytes result.
               token_hint_param:
                 type: [string, "null"]
+                pattern: '\S'
+                description: >-
+                  Value sent as RFC 7662 `token_type_hint` on every
+                  introspection request (for example `access_token`). Null and
+                  an omitted key both send no hint; a blank string is rejected.
               required_scopes:
                 type: array
                 items:
                   type: string
+                  pattern: '\S'
               required_roles:
                 type: array
                 items:
                   type: string
+                  pattern: '\S'
               scope_claim:
                 type: string
+                pattern: '^[^.]+(\.[^.]+)*$'
+                description: >-
+                  Per-provider override of the global scope claim path.
               role_claim:
                 type: string
+                pattern: '^[^.]+(\.[^.]+)*$'
+                description: >-
+                  Per-provider override of the global role claim path.
               consumer_identity_claim:
                 type: string
+                pattern: '^[^.]+(\.[^.]+)*$'
+                description: >-
+                  Per-provider override of the global consumer-lookup claim
+                  path.
               consumer_header_claim:
                 type: string
+                pattern: '^[^.]+(\.[^.]+)*$'
+                description: >-
+                  Per-provider override of the global X-Consumer-Username
+                  display claim path.
               claim_headers:
                 type: object
+                propertyNames:
+                  pattern: '^[^.]+(\.[^.]+)*$'
                 additionalProperties:
                   type: string
+                  pattern: '^\s*[!#$%&''*+.^_`|~0-9A-Za-z-]+\s*$'
+                  not:
+                    pattern: '^\s*([Xx]-[Cc][Oo][Nn][Ss][Uu][Mm][Ee][Rr]-[Uu][Ss][Ee][Rr][Nn][Aa][Mm][Ee]|[Xx]-[Cc][Oo][Nn][Ss][Uu][Mm][Ee][Rr]-[Cc][Uu][Ss][Tt][Oo][Mm]-[Ii][Dd]|[Hh][Oo][Ss][Tt]|[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Ee]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn])\s*$'
                 description: >-
                   Claim path to upstream header mappings. Destination headers are
                   gateway-owned and always sanitized: every configured destination is
@@ -20521,15 +20737,22 @@ components:
             one provider that uses the Authorization location.
         scope_claim:
           type: string
+          pattern: '^[^.]+(\.[^.]+)*$'
           default: scope
         role_claim:
           type: string
+          pattern: '^[^.]+(\.[^.]+)*$'
           default: roles
         consumer_identity_claim:
           type: string
+          pattern: '^[^.]+(\.[^.]+)*$'
           default: username
         consumer_header_claim:
           type: string
+          pattern: '^[^.]+(\.[^.]+)*$'
+          description: >-
+            Claim used for X-Consumer-Username when no consumer maps. Defaults
+            to the effective consumer_identity_claim.
 
     OidcRelyingPartyConfig:
       type: object
@@ -20539,6 +20762,8 @@ components:
         code + PKCE and encrypted sessions. ID token verification requires a JWT
         header kid that selects exactly one current trusted JWKS key; missing,
         empty, and unknown kid values are rejected with no all-keys fallback.
+        Optional string fields accept null as "unset", matching constructor
+        admission.
       required: [providers, session]
       properties:
         providers:
@@ -20548,88 +20773,148 @@ components:
           items:
             type: object
             additionalProperties: false
-            required: [issuer, client_id, redirect_uri]
+            required: [issuer, client_id, redirect_uri, scopes, client_auth]
+            oneOf:
+              - required: [discovery_url]
+                not:
+                  anyOf:
+                    - required: [authorization_endpoint]
+                    - required: [token_endpoint]
+                    - required: [jwks_uri]
+              - required: [authorization_endpoint, token_endpoint, jwks_uri]
+                not:
+                  required: [discovery_url]
             properties:
               issuer:
                 type: string
+                minLength: 1
                 description: Expected ID token issuer
               discovery_url:
-                type: string
-                description: OIDC discovery URL
+                type: [string, "null"]
+                minLength: 1
+                description: OIDC discovery URL. Mutually exclusive with authorization_endpoint, token_endpoint, and jwks_uri.
               authorization_endpoint:
-                type: string
+                type: [string, "null"]
+                minLength: 1
               token_endpoint:
-                type: string
+                type: [string, "null"]
+                minLength: 1
               userinfo_endpoint:
-                type: string
-                description: Optional UserInfo endpoint. When set alongside discovery_url, the explicit value overrides the UserInfo endpoint advertised by the discovery document, including one that omits it.
+                type: [string, "null"]
+                minLength: 1
+                description: Optional UserInfo endpoint. When set alongside discovery_url, the explicit value overrides the UserInfo endpoint advertised by the discovery document, including one that omits it, and the discarded advertisement is not validated.
               jwks_uri:
-                type: string
+                type: [string, "null"]
+                minLength: 1
               end_session_endpoint:
-                type: string
-                description: Optional end-session endpoint used for RP-initiated logout. When set alongside discovery_url, the explicit value overrides the end-session endpoint advertised by the discovery document, including one that omits it.
+                type: [string, "null"]
+                minLength: 1
+                description: Optional end-session endpoint used for RP-initiated logout. When set alongside discovery_url, the explicit value overrides the end-session endpoint advertised by the discovery document, including one that omits it, and the discarded advertisement is not validated.
               post_logout_redirect_uri:
-                type: string
+                type: [string, "null"]
+                minLength: 1
                 description: Absolute HTTPS redirect URI sent to the provider after RP-initiated logout; HTTP is allowed only for localhost or literal loopback development endpoints.
               client_id:
                 type: string
+                minLength: 1
               client_auth:
                 type: object
                 additionalProperties: false
+                allOf:
+                  - if:
+                      properties:
+                        method:
+                          enum: [client_secret_basic, client_secret_post, null]
+                    then:
+                      required: [client_secret]
+                  - if:
+                      required: [method]
+                      properties:
+                        method:
+                          const: private_key_jwt
+                    then:
+                      required: [private_key_pem]
                 properties:
                   method:
-                    type: string
+                    type: [string, "null"]
                     enum:
                       - client_secret_basic
                       - client_secret_post
                       - private_key_jwt
                       - none
+                      - null
                     default: client_secret_basic
+                    description: Null or absent selects client_secret_basic. A non-string value is rejected. "none" is admitted only for localhost or literal loopback token endpoints.
                   client_secret:
                     type: string
+                    minLength: 1
                     format: password
                   private_key_pem:
                     type: string
+                    minLength: 1
                     format: password
+                    description: Must support private_key_jwt_alg; admission signs a throwaway assertion, so a key on the wrong curve or of the wrong family is rejected at config load.
                   private_key_jwt_alg:
-                    type: string
-                    enum: [RS256, RS384, RS512, ES256, ES384, EdDSA]
+                    type: [string, "null"]
+                    enum: [RS256, RS384, RS512, ES256, ES384, EdDSA, null]
+                    default: RS256
                   private_key_jwt_kid:
-                    type: string
+                    type: [string, "null"]
               redirect_uri:
                 type: string
-                description: Absolute callback URI registered with the provider. Before issuing a browser challenge, Ferrum requires its host to match the validated request Host/:authority; DNS comparison is case-insensitive, IP literals compare by address, and ports are ignored. Trailing-dot DNS callback hosts and missing, malformed, or cross-host request authorities fail closed before state or cookies are issued.
+                minLength: 1
+                pattern: '^[^#]*$'
+                description: Absolute callback URI registered with the provider, with no fragment (RFC 6749 §3.1.2). Before issuing a browser challenge, Ferrum requires its host to match the validated request Host/:authority; DNS comparison is case-insensitive, IP literals compare by address, and ports are ignored. Trailing-dot DNS callback hosts and missing, malformed, or cross-host request authorities fail closed before state or cookies are issued.
               callback_path:
-                type: string
+                type: [string, "null"]
+                pattern: '^/[^\s?#;,]*$'
                 default: /oauth/callback
-                description: Callback path handled by Ferrum; must equal the path in redirect_uri.
+                description: Callback path handled by Ferrum; must equal the path in redirect_uri. Also the correlation cookie's Path attribute, so it carries cookie-path syntax rules.
               logout_path:
-                type: string
+                type: [string, "null"]
+                pattern: '^/[^\s?#;,]*$'
                 default: /oauth/logout
+                description: Must not resolve to the same path as callback_path; the callback branch is evaluated first.
               scopes:
                 type: array
+                minItems: 1
+                contains:
+                  const: openid
                 items:
                   type: string
+                  minLength: 1
+                description: Must include "openid".
               audiences:
                 type: array
                 items:
                   type: string
+                  minLength: 1
               required_scopes:
                 type: array
                 items:
                   type: string
+                  minLength: 1
               required_roles:
                 type: array
                 items:
                   type: string
+                  minLength: 1
               scope_claim:
-                type: string
+                type: [string, "null"]
+                minLength: 1
+                default: scope
               role_claim:
-                type: string
+                type: [string, "null"]
+                minLength: 1
+                default: roles
               consumer_identity_claim:
-                type: string
+                type: [string, "null"]
+                minLength: 1
+                default: sub
               consumer_header_claim:
-                type: string
+                type: [string, "null"]
+                minLength: 1
+                default: sub
               claim_headers:
                 type: object
                 additionalProperties:
@@ -20645,39 +20930,61 @@ components:
                 type: integer
                 format: uint64
                 default: 60
+                minimum: 0
+                maximum: 3600
         session:
           type: object
           additionalProperties: false
           required: [encryption_secret]
+          not:
+            allOf:
+              - required: [same_site]
+                properties:
+                  same_site:
+                    pattern: '^[Nn][Oo][Nn][Ee]$'
+              - required: [secure]
+                properties:
+                  secure:
+                    const: false
           properties:
             encryption_secret:
               type: string
+              minLength: 32
               format: password
               description: AEAD key material for durable session cookies and sealed pending authorization-code correlation cookies; must be at least 32 bytes
             encryption_secret_previous:
-              type: string
+              type: [string, "null"]
+              minLength: 32
               format: password
               description: Previous encryption secret accepted while rotating session and pending-flow cookies within the same versioned OIDC context
             cookie_name:
-              type: string
-              description: Explicit cookie name opts out of automatic naming. When omitted, the context-derived name is prefixed __Host- when secure with no domain and a root path, __Secure- when secure otherwise, and left unprefixed when secure is false because browsers reject a prefixed cookie without Secure.
+              type: [string, "null"]
+              pattern: '^[A-Za-z0-9!#$%&''*+\-.^_`|~]+$'
+              description: Explicit cookie name opts out of automatic naming and must be an RFC 6265 cookie-name token. An explicit __Host- name additionally requires secure with no domain and a root path, and an explicit __Secure- name requires secure. When omitted, the context-derived name is prefixed __Host- when secure with no domain and a root path, __Secure- when secure otherwise, and left unprefixed when secure is false because browsers reject a prefixed cookie without Secure.
             store:
-              type: string
-              enum: [cookie]
+              type: [string, "null"]
+              enum: [cookie, null]
               default: cookie
             ttl_secs:
               type: integer
               format: uint64
               default: 3600
+              minimum: 1
+              maximum: 31536000
+              description: Absolute session lifetime. Bounded so it can take part in Unix-timestamp arithmetic on every authenticated request.
             idle_ttl_secs:
               type: integer
               format: uint64
               default: 1800
+              minimum: 1
+              maximum: 31536000
             max_cookie_bytes:
               type: integer
               format: uint64
               default: 8000
-              description: Maximum encoded size for sealed session cookies and sealed pending-flow correlation cookies
+              minimum: 1024
+              maximum: 8000
+              description: Maximum encoded size for sealed session cookies and sealed pending-flow correlation cookies. The minimum is what a sealed pending authorization flow needs before any original-URL bytes.
             secure:
               type: boolean
               default: true
@@ -20687,17 +20994,36 @@ components:
               default: true
             same_site:
               type: string
-              enum: [lax, strict, none]
+              pattern: '^([Ll][Aa][Xx]|[Ss][Tt][Rr][Ii][Cc][Tt]|[Nn][Oo][Nn][Ee])$'
               default: lax
+              description: Case-insensitive; normalized to lower case. "none" requires secure=true.
             domain:
-              type: string
-              description: Optional Domain attribute for the durable session cookie. The short-lived sealed pending-flow correlation cookie never inherits this value; secure correlation cookies use __Host- with Path=/, while insecure loopback-development cookies are scoped to callback_path.
+              type: [string, "null"]
+              maxLength: 254
+              pattern: '^\.?[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?)*$'
+              description: Optional bare DNS Domain attribute (leading dot allowed) for the durable session cookie. The short-lived sealed pending-flow correlation cookie never inherits this value; secure correlation cookies use __Host- with Path=/, while insecure loopback-development cookies are scoped to callback_path.
             path:
-              type: string
+              type: [string, "null"]
+              pattern: '^/[^\s;,]*$'
               default: /
+            hide_session_cookie:
+              type: boolean
+              default: true
+              description: Remove this plugin's own session and pending-flow correlation cookies from the Cookie header forwarded to the selected backend, leaving unrelated application cookies intact. The sealed session cookie is a complete replayable gateway credential and the upstream already receives the verified identity and claim headers, so passthrough must be an explicit opt-in.
         behavior:
-          type: object
+          type: [object, "null"]
           additionalProperties: false
+          allOf:
+            - if:
+                required: [post_login_redirect_param]
+                properties:
+                  post_login_redirect_param:
+                    type: string
+              then:
+                required: [trusted_redirect_hosts]
+                properties:
+                  trusted_redirect_hosts:
+                    minItems: 1
           properties:
             state_ttl_secs:
               type: integer
@@ -20718,31 +21044,40 @@ components:
               minimum: 1
               description: Per-instance maximum pending browser authorization flows started per resolved client IP; must not exceed state_cache_max_entries.
             post_login_redirect_param:
-              type: string
+              type: [string, "null"]
+              minLength: 1
+              description: Requires a non-empty trusted_redirect_hosts.
             trusted_redirect_hosts:
               type: array
               items:
                 type: string
+                minLength: 1
             refresh_skew_secs:
               type: integer
               format: uint64
               default: 30
+              minimum: 0
+              description: Refresh lead time before token expiry; must not exceed session.ttl_secs / 2, which the constructor enforces across the two objects.
             challenge_html_status:
               type: integer
               default: 302
+              enum: [302, 303, 307]
             challenge_api_status:
               type: integer
               default: 401
+              enum: [401, 403]
             html_accept_substrings:
               type: array
               items:
                 type: string
+                minLength: 1
             rp_initiated_logout:
               type: boolean
               default: true
               description: With an authentic session cookie, send id_token_hint on provider logout and attempt discovered refresh-token revocation within five seconds. Cookie copies remain valid within session and claims lifetime limits. Without a valid cookie, return the local logout page.
             post_login_default_path:
-              type: string
+              type: [string, "null"]
+              minLength: 1
               default: /
 
     JwtAuthConfig:
@@ -20941,10 +21276,10 @@ components:
         ldap_url:
           type: string
           minLength: 1
-          pattern: "^ldaps?://"
+          pattern: '^ldaps?://(?:[^/?#@]*@)?(?:\[[0-9A-Fa-f:.]+\]|[^\s/?#:@\[\]]+)(?::(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[0-9]{1,4})?)?(?:[\s/?#]|$)'
           not:
-            pattern: "^ldaps?://[^/?#]*@"
-          description: "LDAP server URL. Use ldaps:// or ldap:// with starttls=true; non-loopback plaintext ldap:// requires the explicit development-only allow_plaintext override. Embedded URL credentials are rejected. Each connection freshly resolves and policy-screens all A/AAAA candidates while retaining this hostname for TLS/SNI verification."
+            pattern: '^ldaps?://[^/?#]*[^/?#@]@'
+          description: "LDAP server URL. Use ldaps:// or ldap:// with starttls=true; non-loopback plaintext ldap:// requires the explicit development-only allow_plaintext override. The scheme is matched case-sensitively and the value must carry no leading or trailing whitespace. A hostname is required and an explicit port must be 0-65535. Embedded URL credentials are rejected; a bare '@' with empty userinfo carries none and is accepted. Each connection freshly resolves and policy-screens all A/AAAA candidates while retaining this hostname for TLS/SNI verification."
           example: "ldaps://ldap.example.com:636"
         bind_dn_template:
           type: string
@@ -20955,44 +21290,51 @@ components:
         search_base_dn:
           type: string
           minLength: 1
-          description: "Base DN for search-then-bind user search"
+          pattern: '\S'
+          description: "Base DN for search-then-bind user search. Surrounding whitespace is trimmed; a whitespace-only value is rejected"
         search_filter:
           type: string
           minLength: 1
           pattern: '\{username\}'
-          description: "LDAP search filter with {username} placeholder"
+          description: "LDAP search filter with {username} placeholder. The value must also parse as an RFC 4515 search filter; a malformed filter is rejected at load rather than failing every request with 500"
           example: "(&(objectClass=user)(sAMAccountName={username}))"
         canonical_identity_attribute:
           type: string
           minLength: 1
+          pattern: '\S'
           description: "Required in both bind modes. Exactly one value from the authenticated entry (the uniquely selected search entry, or a base-scope read of the directly bound DN) becomes the authenticated identity, Consumer mapping key, custom group-filter {username}, and default memberUid value (for example uid or sAMAccountName). Choose the authoritative attribute whose value username-based groups store; mismatches fail closed and never fall back to the presented login. Attribute-name matching is LDAP case-insensitive."
         service_account_dn:
           type: string
           minLength: 1
-          description: "DN for the service account used in search-then-bind"
+          pattern: '\S'
+          description: "DN for the service account used in search-then-bind. Surrounding whitespace is trimmed; a whitespace-only value is rejected"
         service_account_password:
           type: string
           minLength: 1
           writeOnly: true
           format: password
-          description: "Password for the service account"
+          description: "Password for the service account. Taken verbatim: it is never trimmed, so a secret with leading or trailing whitespace binds as configured. Only an empty string is rejected"
         group_base_dn:
           type: string
           minLength: 1
-          description: "Base DN for group membership search"
+          pattern: '\S'
+          description: "Base DN for group membership search. Surrounding whitespace is trimmed; a whitespace-only value is rejected"
         group_filter:
           type: string
           minLength: 1
-          description: "Group search filter. When required_groups is non-empty, a custom filter must contain {user_dn} or {username}. {username} is the authenticated canonical identity read from canonical_identity_attribute in both bind modes, never the presented login. Before authorization, every custom-filter match is rechecked against the exact returned group DN using member, uniqueMember, and memberUid so a static branch cannot fabricate membership."
+          pattern: '\S'
+          description: "Group search filter. The value must parse as an RFC 4515 search filter; a malformed filter is rejected at load. When required_groups is non-empty, a custom filter must contain {user_dn} or {username}. {username} is the authenticated canonical identity read from canonical_identity_attribute in both bind modes, never the presented login. Before authorization, every custom-filter match is rechecked against the exact returned group DN using member, uniqueMember, and memberUid so a static branch cannot fabricate membership."
         required_groups:
           type: array
           items:
             type: string
             minLength: 1
-          description: "LDAP/AD group names the user must belong to (OR logic)"
+            pattern: '\S'
+          description: "LDAP/AD group names the user must belong to (OR logic). A returned group entry matches when its group_attribute value matches, or when the entry's OWN first RDN is typed cn or group_attribute and its RFC 4514-decoded value matches; an entry merely nested under a required group never matches"
         group_attribute:
           type: string
           minLength: 1
+          pattern: '\S'
           default: "cn"
           description: "Attribute containing the group name; returned LDAP attribute names are matched case-insensitively"
         starttls:
@@ -21035,11 +21377,16 @@ components:
           format: uint64
           default: 10000
           minimum: 1
-          description: "Strict maximum entries in the auth result cache. At capacity, one existing entry is replaced without a full-cache scan."
+          maximum: 1000000
+          description: "Strict maximum entries in the auth result cache (1-1,000,000). At capacity, one existing entry is replaced without a full-cache scan."
         consumer_mapping:
           type: boolean
           default: true
           description: "Whether to map LDAP user to a gateway Consumer"
+        hide_credentials:
+          type: boolean
+          default: true
+          description: "Remove the verified Authorization: Basic credential from the backend request, including when another mechanism wins a multi-auth chain. Only the Basic scheme this plugin consumes is removed; an Authorization header carrying another scheme reaches the backend unchanged. Set to false only for a legacy backend that explicitly requires the directory password."
 
     HmacAuthConfig:
       type: object
@@ -23345,6 +23692,8 @@ components:
       type: object
       additionalProperties: false
       required: [opa_host, policy_path]
+      not:
+        required: [fail_open, fail_closed]
       description: |
         Plugin: opa — Delegates HTTP request authorization to Open Policy
         Agent's Data API in the `authorize` phase. The gateway POSTs
@@ -23358,26 +23707,40 @@ components:
         opa_host:
           type: string
           format: uri
+          minLength: 1
+          pattern: '^[hH][tT][tT][pP][sS]?://[^@/?#\s]+(/[^?#\s]*)?$'
           description: >-
             Base OPA URL using http:// or https://. URL credentials are not
-            allowed; use `headers` for OPA authentication.
+            allowed; use `headers` for OPA authentication. A query string or
+            fragment is rejected; a base path is accepted and is prepended to
+            /v1/data/{policy_path}. Operational diagnostics record only the
+            endpoint origin (scheme, host, port), never the configured path.
           example: "http://opa.opa-system.svc.cluster.local:8181"
         policy_path:
           type: string
+          minLength: 1
+          pattern: '^(?!(\.|\.\.)(/|$))[^/?#%]+(/(?!(\.|\.\.)(/|$))[^/?#%]+)*$'
           description: >-
             OPA data path appended under /v1/data/. Must be non-empty, must not
-            start with '/', must not contain percent-encoding, and must not
-            contain empty, '.', or '..' segments.
+            start with '/', must not contain percent-encoding, a query, or a
+            fragment, and must not contain empty, '.', or '..' segments.
           example: "ferrum/authz/allow"
         headers:
           type: object
+          propertyNames:
+            type: string
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+            not:
+              pattern: '^[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Tt][Yy][Pp][Ee]$'
           additionalProperties:
             type: string
+            pattern: '^[\u0009\u0020-\u007E]*$'
           default: {}
           description: >-
-            Static HTTP headers sent to OPA on every decision request. The
+            Static HTTP headers sent to OPA on every decision request. Names use
+            HTTP token syntax and values are visible ASCII (plus tab). The
             `content-type` header is managed by the plugin and cannot be
-            configured here.
+            configured here, case-insensitively.
           example:
             Authorization: "Bearer opa-client-token"
         timeout_ms:
@@ -23390,13 +23753,14 @@ components:
             value is accepted; the effective runtime timeout is capped at
             30000 milliseconds.
         max_response_bytes:
-          type: integer
+          type: [integer, "null"]
           format: uint64
           minimum: 1
           default: 262144
           description: >-
             Maximum decoded OPA response size. Oversized declared or streamed
-            responses use the configured fail-open/fail-closed posture.
+            responses use the configured fail-open/fail-closed posture. An
+            explicit null selects the default, exactly like omitting the key.
         fail_open:
           type: boolean
           default: false
@@ -23404,7 +23768,9 @@ components:
         fail_closed:
           type: boolean
           default: true
-          description: Inverse of `fail_open`; do not set both fields.
+          description: >-
+            Inverse of `fail_open`. Configuring both fields is rejected at
+            config load, even when the two values agree.
         deny_status:
           type: integer
           format: uint16
@@ -23418,8 +23784,14 @@ components:
           description: Response body returned on policy denial.
         deny_headers:
           type: object
+          propertyNames:
+            type: string
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+            not:
+              pattern: '^([Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Ee]|[Tt][Rr][Aa][Ii][Ll][Ee][Rr]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee])$'
           additionalProperties:
             type: string
+            pattern: '^[\u0009\u0020-\u007E]*$'
           default: {}
           description: >-
             Headers added to the policy-denial response. Names and values are
@@ -23444,8 +23816,14 @@ components:
           description: Response body returned on fail-closed OPA errors.
         fail_closed_headers:
           type: object
+          propertyNames:
+            type: string
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+            not:
+              pattern: '^([Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Ee]|[Tt][Rr][Aa][Ii][Ll][Ee][Rr]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee])$'
           additionalProperties:
             type: string
+            pattern: '^[\u0009\u0020-\u007E]*$'
           default: {}
           description: >-
             Headers added to fail-closed OPA error responses. Same name/value
@@ -23491,7 +23869,7 @@ components:
             body. UTF-8 bodies use `body`; non-UTF-8 raw bytes use
             `body_base64`.
         max_body_bytes:
-          type: integer
+          type: [integer, "null"]
           format: uint64
           minimum: 1
           default: 1048576
@@ -23499,7 +23877,8 @@ components:
             Plugin-local request body ceiling when include_body is enabled.
             The strictest of this value and the positive global request body
             limit is enforced; this value remains active when the global
-            limit is unlimited (0).
+            limit is unlimited (0). An explicit null selects the default,
+            exactly like omitting the key.
         include_consumer:
           type: boolean
           default: true
@@ -23537,6 +23916,8 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           default:
             - authorization
             - proxy-authorization
@@ -26079,6 +26460,14 @@ components:
         matching uses the URI; `prefix` is serialization metadata only;
         members that collide with a modeled name but not its XML construct or
         namespace are rejected fail-closed rather than dropped or rebound).
+        Scalar elements contain text without structural members; namespace
+        declarations remain valid. A present empty wrapped array becomes [];
+        array containers reject unmodeled attributes, text, and wrapper children.
+        UTF-8 binary bodies receive full string-schema validation. Non-UTF-8
+        binary bodies support boolean schemas, optional string-compatible type,
+        byte-count minLength/maxLength, format: binary, and the annotations
+        listed in docs/openapi_validator.md. Other assertions require a text
+        representation and fail validation for non-UTF-8 bodies.
         Usually generated by `x-ferrum-validate` on
         `POST /api-specs` or `PUT /api-specs/{id}`; direct creation requires a
         proxy-scoped plugin attached to a proxy with `api_spec_id` set.
@@ -26091,7 +26480,7 @@ components:
         (media types, response status keys, `bypass.header_present`, encoding
         property names) stay open but their keys are shape-validated.
         Response schema failures emit only a fixed generic message plus the
-        operator/schema-controlled schema location; backend instance values and
+        allowlisted JSON Schema keyword; raw schema locations, backend instance values and
         JSON property names never appear in client problem bodies or
         `openapi_validator.response_error` metadata.
         The REQUEST contract is decided in the dedicated
@@ -26121,8 +26510,7 @@ components:
           type: array
           uniqueItems: true
           items:
-            type: string
-            pattern: "^(?:\\*/\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+/(?:\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+))(?:;.*)?$"
+            $ref: "#/components/schemas/OpenapiValidatorMediaType"
           default:
             - application/json
             - application/xml
@@ -26136,8 +26524,7 @@ components:
           type: array
           uniqueItems: true
           items:
-            type: string
-            pattern: "^(?:\\*/\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+/(?:\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+))(?:;.*)?$"
+            $ref: "#/components/schemas/OpenapiValidatorMediaType"
           default:
             - application/json
             - application/xml
@@ -26172,8 +26559,9 @@ components:
           type: integer
           format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           default: 1048576
-          description: Maximum raw or decompressed body size to validate.
+          description: Maximum raw or decompressed body size to validate; also bounded by the target's usize range.
         schema_draft:
           type: string
           enum: [auto, draft7, draft2020-12]
@@ -26202,24 +26590,27 @@ components:
               type: array
               items:
                 type: string
+                minLength: 1
               default: []
               description: Regex paths that skip validation.
             methods:
               type: array
               items:
                 type: string
+                minLength: 1
               default: []
               description: HTTP methods that skip validation.
             consumers:
               type: array
               items:
                 type: string
+                minLength: 1
               default: []
               description: Consumer identities that skip validation.
             header_present:
               type: object
               propertyNames:
-                pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+                pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$(?![\\s\\S])"
               additionalProperties:
                 type: [string, "null"]
               default: {}
@@ -26256,19 +26647,21 @@ components:
                 so remapping schema failures does not also remap media-type
                 refusals. `log_only` records the same decision and continues.
             content_type:
-              type: string
-              pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+/[!#$%&'*+.^_`|~0-9A-Za-z-]+(?:;.*)?$"
+              $ref: "#/components/schemas/OpenapiValidatorConcreteMediaType"
               default: application/problem+json
         error_truncate_chars:
           type: integer
           format: uint64
+          minimum: 0
+          maximum: 18446744073709551615
           default: 1024
           description: >
             Size bound on the validation diagnostic written to
             openapi_validator.request_error / openapi_validator.response_error
             metadata and to the problem body. Only ever narrows: the effective
             cap is min(error_truncate_chars, 256). This is not a
-            confidentiality control. Diagnostics are payload-free by
+            confidentiality control. Admission also enforces the target's usize
+            range. Diagnostics are payload-free by
             construction and never contain the rejected instance value, an
             expected enum/const constant, a raw schema path or schema-library
             / XML-parser rendering, a configured XML name or namespace, a
@@ -26283,6 +26676,27 @@ components:
         object schemas and OpenAPI 3.1 boolean schemas (`true` / `false`). Dialect
         selection is controlled by the top-level OpenapiValidatorConfig.schema_draft
         field, not per operation.
+
+    OpenapiValidatorMediaType:
+      type: string
+      pattern: '^(?![\s\S]*[\x00-\x1F\x7F-\x9F])[ \u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*(?:\*/\*|(?!\*/)[!#$%&''*+.^_`{|}~0-9A-Za-z-]+/[!#$%&''*+.^_`{|}~0-9A-Za-z-]+)[ \u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*(?:;[\s\S]*)?$(?![\s\S])'
+      description: >-
+        Media selector or map key. The base type uses MIME tokens (including
+        braces), permits type/* and */*, trims surrounding Unicode whitespace,
+        and is ASCII case-insensitive. Control characters are rejected anywhere;
+        parameters after the first semicolon are ignored for selection. Lists
+        and maps must be unique after trimming, ASCII lowercasing, and removing
+        parameters. This normalized uniqueness is checked by the constructor;
+        JSON Schema uniqueItems detects only literal duplicates.
+
+    OpenapiValidatorConcreteMediaType:
+      type: string
+      pattern: '^(?:[!#$%&''+.^_`|~0-9A-Za-z-][!#$%&''*+.^_`|~0-9A-Za-z-]*|\*[!#$%&''*+.^_`|~0-9A-Za-z-]+)/(?:[!#$%&''+.^_`|~0-9A-Za-z-][!#$%&''*+.^_`|~0-9A-Za-z-]*|\*[!#$%&''*+.^_`|~0-9A-Za-z-]+)(?:[ \t]*;[ \t]*[!#$%&''*+.^_`|~0-9A-Za-z-]+=(?:[!#$%&''*+.^_`|~0-9A-Za-z-]+|"(?:[^"\\\x00-\x08\x0A-\x1F\x7F]|\\[^\x00-\x08\x0A-\x1F\x7F])*"))*[ \t]*$(?![\s\S])'
+      description: >-
+        Concrete RFC 9110 type/subtype and valid HTTP field value. Wildcard
+        type/subtype, braces in tokens, leading whitespace, malformed parameters,
+        and control bytes other than horizontal tab are rejected. Parameter
+        names require token or quoted-string values.
 
     OpenapiValidatorOperation:
       type: object
@@ -26299,9 +26713,11 @@ components:
       properties:
         method:
           type: string
-          description: Uppercase HTTP method.
+          minLength: 1
+          description: Nonempty method, normalized to uppercase by the constructor.
         path_template:
           type: string
+          minLength: 1
           description: >-
             Effective OpenAPI path template used for metadata and path specificity
             ordering. When generated from a spec, this is the Paths key joined to the
@@ -26309,6 +26725,7 @@ components:
             one entry per distinct server pathname when multiple servers apply.
         path_regex:
           type: string
+          minLength: 1
           description: >-
             Regex used to match the full inbound request path, compiled at plugin load.
             Auto-generated specs derive it from the effective path template (including
@@ -26317,6 +26734,7 @@ components:
             substring-match an unintended superstring path.
         operation_label:
           type: string
+          minLength: 1
           description: Optional metadata label. Defaults to "`METHOD path_template`".
         request_required:
           type: boolean
@@ -26325,6 +26743,22 @@ components:
         request_body:
           type: object
           additionalProperties: false
+          allOf:
+            - if:
+                required: [content_type, encoding]
+              then:
+                properties:
+                  content_type:
+                    pattern: '^\s*(?:[Aa][Pp][Pp][Ll][Ii][Cc][Aa][Tt][Ii][Oo][Nn]/[Xx]-[Ww][Ww][Ww]-[Ff][Oo][Rr][Mm]-[Uu][Rr][Ll][Ee][Nn][Cc][Oo][Dd][Ee][Dd]|[Mm][Uu][Ll][Tt][Ii][Pp][Aa][Rr][Tt]/[Ff][Oo][Rr][Mm]-[Dd][Aa][Tt][Aa])\s*(?:;[\s\S]*)?$'
+            - if:
+                required: [content_type]
+                properties:
+                  content_type:
+                    pattern: '^\s*[Aa][Pp][Pp][Ll][Ii][Cc][Aa][Tt][Ii][Oo][Nn]/[Xx]-[Ww][Ww][Ww]-[Ff][Oo][Rr][Mm]-[Uu][Rr][Ll][Ee][Nn][Cc][Oo][Dd][Ee][Dd]\s*(?:;[\s\S]*)?$'
+              then:
+                properties:
+                  encoding:
+                    $ref: "#/components/schemas/OpenapiValidatorFormEncodingMap"
           oneOf:
             - required: [content]
               not:
@@ -26337,12 +26771,7 @@ components:
                 required: [content]
           properties:
             content:
-              type: object
-              minProperties: 1
-              propertyNames:
-                pattern: "^(?:\\*/\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+/(?:\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+))(?:;.*)?$"
-              additionalProperties:
-                $ref: "#/components/schemas/OpenapiValidatorMediaTypeContent"
+              $ref: "#/components/schemas/OpenapiValidatorRequestContent"
               description: >
                 Media type to schema map. Each entry is either a bare JSON Schema
                 (object or boolean) or, when encoding metadata is present, a Media
@@ -26351,8 +26780,7 @@ components:
                 Exactly one of `content` or the `content_type` + `schema` form is
                 allowed; the object is never treated as its own media map.
             content_type:
-              type: string
-              pattern: "^(?:\\*/\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+/(?:\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+))(?:;.*)?$"
+              $ref: "#/components/schemas/OpenapiValidatorMediaType"
               description: Alternate single-schema form. Requires `schema`.
             schema:
               $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
@@ -26366,7 +26794,7 @@ components:
         responses:
           type: object
           propertyNames:
-            pattern: "^(?:[1-5][0-9]{2}|[1-5][Xx]{2}|[Dd][Ee][Ff][Aa][Uu][Ll][Tt])$"
+            pattern: "^(?:[1-5][0-9]{2}|[1-5][Xx]{2}|[Dd][Ee][Ff][Aa][Uu][Ll][Tt])$(?![\\s\\S])"
           additionalProperties:
             $ref: "#/components/schemas/OpenapiValidatorResponse"
           description: >
@@ -26390,12 +26818,14 @@ components:
       oneOf:
         - type: object
           propertyNames:
-            pattern: "^(?:description|(?:\\*/\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+/(?:\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+))(?:;.*)?)$"
+            anyOf:
+              - const: description
+              - $ref: "#/components/schemas/OpenapiValidatorMediaType"
           properties:
             description:
               type: [string, "null"]
           additionalProperties:
-            $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
+            $ref: "#/components/schemas/OpenapiValidatorResponseSchema"
         - type: object
           required: [content]
           additionalProperties: false
@@ -26405,9 +26835,44 @@ components:
             content:
               type: object
               propertyNames:
-                pattern: "^(?:\\*/\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+/(?:\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+))(?:;.*)?$"
+                $ref: "#/components/schemas/OpenapiValidatorMediaType"
               additionalProperties:
-                $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
+                $ref: "#/components/schemas/OpenapiValidatorResponseSchema"
+
+    OpenapiValidatorResponseSchema:
+      allOf:
+        - $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
+        - not:
+            type: object
+            required: [encoding]
+      description: Response media schemas cannot carry an Encoding Object.
+
+    OpenapiValidatorRequestContent:
+      type: object
+      minProperties: 1
+      propertyNames:
+        $ref: "#/components/schemas/OpenapiValidatorMediaType"
+      patternProperties:
+        '^\s*[Aa][Pp][Pp][Ll][Ii][Cc][Aa][Tt][Ii][Oo][Nn]/[Xx]-[Ww][Ww][Ww]-[Ff][Oo][Rr][Mm]-[Uu][Rr][Ll][Ee][Nn][Cc][Oo][Dd][Ee][Dd]\s*(?:;[\s\S]*)?$':
+          allOf:
+            - $ref: "#/components/schemas/OpenapiValidatorMediaTypeContent"
+            - properties:
+                encoding:
+                  $ref: "#/components/schemas/OpenapiValidatorFormEncodingMap"
+        '^\s*[Mm][Uu][Ll][Tt][Ii][Pp][Aa][Rr][Tt]/[Ff][Oo][Rr][Mm]-[Dd][Aa][Tt][Aa]\s*(?:;[\s\S]*)?$':
+          $ref: "#/components/schemas/OpenapiValidatorMediaTypeContent"
+      additionalProperties:
+        $ref: "#/components/schemas/OpenapiValidatorResponseSchema"
+
+    OpenapiValidatorFormEncodingMap:
+      allOf:
+        - $ref: "#/components/schemas/OpenapiValidatorEncodingMap"
+        - additionalProperties:
+            not:
+              anyOf:
+                - required: [headers]
+                - required: [contentType]
+      description: Form-urlencoded encodings cannot declare multipart headers or contentType.
 
     OpenapiValidatorMediaTypeContent:
       description: >
@@ -26436,11 +26901,37 @@ components:
       description: >
         OpenAPI Encoding Object map keyed by schema property name. Supported for
         application/x-www-form-urlencoded and multipart/form-data. Unsupported
-        style/explode combinations are rejected at admission.
+        style/explode combinations are rejected at admission. The constructor
+        also checks that every key names a declared schema property, deepObject
+        selects an object, and spaceDelimited/pipeDelimited select an array or
+        object. Exploded object child keys must not overlap root siblings or
+        another exploded object; a free-form exploded object cannot coexist
+        with another exploded object. These schema-dependent checks cannot be
+        expressed by this map component alone.
 
     OpenapiValidatorEncodingObject:
       type: object
       additionalProperties: false
+      allOf:
+        - if:
+            required: [style]
+            properties:
+              style:
+                enum: [spaceDelimited, pipeDelimited]
+          then:
+            properties:
+              explode:
+                const: false
+        - if:
+            required: [style]
+            properties:
+              style:
+                const: deepObject
+          then:
+            required: [explode]
+            properties:
+              explode:
+                const: true
       properties:
         style:
           type: string
@@ -26466,15 +26957,20 @@ components:
         contentType:
           type: string
           minLength: 1
-          maxLength: 4096
+          pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           description: >
             Expected multipart part Content-Type (comma-separated list allowed).
-            Only valid for multipart/form-data.
+            Only valid for multipart/form-data. Trimmed before use; must be
+            nonempty and at most 4096 UTF-8 bytes after trimming (the byte
+            limit is checked by the constructor).
         headers:
           type: object
           maxProperties: 32
           propertyNames:
-            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+            allOf:
+              - pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*[!#$%&''*+.^_`|~0-9A-Za-z-]{1,256}[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$(?![\s\S])'
+              - not:
+                  pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-(?:[Tt][Yy][Pp][Ee]|[Dd][Ii][Ss][Pp][Oo][Ss][Ii][Tt][Ii][Oo][Nn]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg])[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$'
           additionalProperties:
             $ref: "#/components/schemas/OpenapiValidatorEncodingHeader"
           description: >
@@ -26493,7 +26989,9 @@ components:
         Ferrum's historical required-header form. A Header Object is selected
         by exactly one of `schema` or `content` and is closed so misspelled
         presence controls cannot weaken validation. Schema form accepts the
-        OAS schema-form fields (`style`/`explode`/`example`/`examples`); content
+        OAS schema-form fields (`style`/`explode`/`example`/`examples`). Simple
+        serialization decodes comma-separated arrays and object key/value pairs;
+        explode=true objects use comma-separated name=value members. Content
         form accepts only the common fields plus `content`. Header-location
         `allowEmptyValue` and `allowReserved` are rejected. The `content` form
         requires exactly one concrete media type whose Media Type Object
@@ -26524,6 +27022,7 @@ components:
               enum: [simple]
             explode:
               type: boolean
+              default: false
             schema:
               $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
             example: true
@@ -26547,11 +27046,10 @@ components:
               minProperties: 1
               maxProperties: 1
               propertyNames:
-                # Concrete type/subtype only: each side is an RFC 9110 token that
-                # is not exactly `*` (so `*/*` and `application/*` fail closed,
-                # while `*` remains allowed inside a longer token). Parameters
-                # require token names and token or quoted-string values.
-                pattern: '^(?:[!#$%&''+.^_`|~0-9A-Za-z-][!#$%&''*+.^_`|~0-9A-Za-z-]*|\*[!#$%&''*+.^_`|~0-9A-Za-z-]+)/(?:[!#$%&''+.^_`|~0-9A-Za-z-][!#$%&''*+.^_`|~0-9A-Za-z-]*|\*[!#$%&''*+.^_`|~0-9A-Za-z-]+)(?:[ \t]*;[ \t]*[!#$%&''*+.^_`|~0-9A-Za-z-]+=(?:[!#$%&''*+.^_`|~0-9A-Za-z-]+|"(?:[^"\\\x00-\x08\x0A-\x1F\x7F]|\\[^\x00-\x08\x0A-\x1F\x7F])*"))*[ \t]*$'
+                allOf:
+                  - $ref: "#/components/schemas/OpenapiValidatorConcreteMediaType"
+                  - not:
+                      pattern: '^[Mm][Uu][Ll][Tt][Ii][Pp][Aa][Rr][Tt]/[Ff][Oo][Rr][Mm]-[Dd][Aa][Tt][Aa](?:[ \t]*;|[ \t]*$)'
               additionalProperties:
                 $ref: "#/components/schemas/OpenapiValidatorEncodingHeaderContentMedia"
               description: >
@@ -26560,6 +27058,7 @@ components:
                 any parameters, must be a valid RFC 9110 media type and HTTP
                 header value. The header value is decoded as that media type
                 under multipart header-size limits before schema validation.
+                multipart/form-data is not supported as header content.
 
     OpenapiValidatorEncodingHeaderContentMedia:
       type: object
@@ -27583,30 +28082,35 @@ components:
 
     ResponseCachingConfig:
       type: object
-      description: "Plugin: response_caching — In-memory HTTP response caching. Cache keys are opaque SHA-256 digests over typed, length-framed fields: the effective post-routing destination (proxy, listen path, upstream or direct host/port/scheme, authority, rewritten path), the original authority, method, path, backend-effective outbound query, a mandatory caller-authorization partition (authentication mechanism, resolved identity/consumer, peer SPIFFE identity, and digests of every credential header presented — taken over both the pristine inbound wire header view and the live backend-visible one, so an earlier ai_stream_router credential rewrite cannot erase the original caller distinction; every caller also binds its canonical peer address, and only an anonymous caller's binding is relaxable per anonymous_caller_scope), and a digest of the complete configured/origin-selected Vary tuple including every name, presence flag, and value. Authorization, Proxy-Authorization, and Cookie are mandatory dimensions on every retained response, including anonymous responses, and are emitted in Vary so downstream shared caches cannot cross Ferrum's private caller partition. No raw delimiter concatenation is used anywhere in key construction, so an attacker-supplied header or query value cannot forge a field boundary and collide two distinct requests onto one key. Keys are never logged. GET/HEAD lookup requires a private transport-owned proof that the complete H1/H2/H3 upload is empty; non-empty or unproven bodies bypass, and admission rejects deferred request-body transforms that could synthesize bytes after lookup. Honors Cache-Control freshness, upstream Age/Date, current Age generation on hits, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Retained entries are sanitized: connection-scoped and proxy-authentication fields (Connection and everything it nominates, Keep-Alive, Proxy-Authenticate, Proxy-Authorization, Proxy-Connection, TE, Trailer, Transfer-Encoding, Upgrade) plus every field the origin qualified with private=\"…\" or no-cache=\"…\" are dropped before storage, so no replay can emit them. Responses to requests carrying Authorization in either the pristine inbound or live backend-visible view are stored only with an explicit origin shared-cache opt-in (public, must-revalidate, or s-maxage); cache_key_include_consumer changes key partitioning only and cannot override that requirement. Partial (206) and validator-only (304) responses, and any response carrying Content-Range, are never stored as reusable representations. Includes a bounded FIFO cacheability predictor (amortized O(1) admission, no full-map sort at capacity) that suppresses repeat cache lookups for variants known to be uncacheable. Unsafe-method invalidation is deferred until a non-error origin response (private provenance recorded before after_proxy hooks), is classified independently of cacheable_methods storage eligibility, skips served cache HITs that never contacted the origin, and is confined to the same normalized/transformed Host/authority partition as lookup. Multiple instances on one proxy namespace request staging metadata under response_caching.<instance_id>.* so differing query/consumer/Vary/method/SSE/status policies remain independent across priority order and reload generations. Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions so misspelled Vary, consumer, query, Cache-Control, status/method, capacity, or invalidation fields cannot silently weaken isolation or retention. HTTP only."
+      description: "Plugin: response_caching — In-memory HTTP response caching. Cache keys are opaque SHA-256 digests over typed, length-framed fields: the effective post-routing destination (proxy, listen path, upstream or direct host/port/scheme, authority, rewritten path), the original authority, method, path, backend-effective outbound query, a mandatory caller-authorization partition (authentication mechanism, resolved identity/consumer, peer SPIFFE identity, and digests of every credential header presented — taken over both the pristine inbound wire header view and the live backend-visible one, so an earlier ai_stream_router credential rewrite cannot erase the original caller distinction; every caller also binds its canonical peer address, and only an anonymous caller's binding is relaxable per anonymous_caller_scope), and a digest of the complete configured/origin-selected Vary tuple including every name, presence flag, and value. Authorization, Proxy-Authorization, and Cookie are mandatory dimensions on every retained response, including anonymous responses, and are emitted in Vary so downstream shared caches cannot cross Ferrum's private caller partition. That Vary list is published on the MISS response itself as well as on later hits, so the first publicly cacheable response a downstream cache stores already carries the same selection; an origin Vary: * is left untouched. No raw delimiter concatenation is used anywhere in key construction, so an attacker-supplied header or query value cannot forge a field boundary and collide two distinct requests onto one key. Keys are never logged. GET/HEAD lookup requires a private transport-owned proof that the complete H1/H2/H3 upload is empty; non-empty or unproven bodies bypass, and admission rejects deferred request-body transforms that could synthesize bytes after lookup. Honors Cache-Control freshness, upstream Age/Date (a comma-folded repeated Age uses its first member rather than resetting to zero), current Age generation on hits, ETag/Last-Modified revalidation (304, tolerating a bounded number of empty entity-tag list members), Vary, and never caches responses with Set-Cookie. Retained entries are sanitized: connection-scoped and proxy-authentication fields (Connection and everything it nominates, Keep-Alive, Proxy-Authenticate, Proxy-Authorization, Proxy-Connection, TE, Trailer, Transfer-Encoding, Upgrade) plus every field the origin qualified with private=\"…\" or no-cache=\"…\" are dropped before storage, so no replay can emit them. Responses to requests carrying Authorization in either the pristine inbound or live backend-visible view are stored only with an explicit origin shared-cache opt-in (public, must-revalidate, or s-maxage); cache_key_include_consumer changes key partitioning only and cannot override that requirement. Partial (206) and validator-only (304) responses, and any response carrying Content-Range, are never stored as reusable representations. Gateway-generated transport failures are refused from typed backend-dispatch provenance on every HTTP version, so listing 502/504 in cacheable_status_codes retains genuine origin error pages without pinning a local connect/read failure over a recovered origin. Includes a bounded FIFO cacheability predictor (amortized O(1) admission, no full-map sort at capacity) that suppresses repeat cache lookups for variants known to be uncacheable. Unsafe-method invalidation is deferred until a non-error origin response (private provenance recorded before after_proxy hooks), is classified independently of cacheable_methods storage eligibility, skips served cache HITs that never contacted the origin, is confined to the same normalized/transformed Host/authority partition as lookup, and treats a slash-terminated mutated path (including the root) as its own descendant boundary so its children are invalidated too. Multiple instances on one proxy namespace request staging metadata under response_caching.<instance_id>.* so differing query/consumer/Vary/method/SSE/status policies remain independent across priority order and reload generations. Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions so misspelled Vary, consumer, query, Cache-Control, status/method, capacity, or invalidation fields cannot silently weaken isolation or retention. HTTP only."
       additionalProperties: false
       properties:
         ttl_seconds:
           type: [integer, "null"]
           format: uint64
+          minimum: 0
+          maximum: 18446744073709551615
           default: 300
-          description: "Fallback freshness lifetime in seconds when the backend response has no s-maxage, max-age, or Expires, or when respect_cache_control is explicitly false. With the default true policy, precedence is s-maxage > max-age > Expires minus Date > ttl_seconds; missing Date uses response receipt time. Invalid or repeated Expires, or invalid/repeated Date for Expires-based freshness, means already expired. Upstream Age, Date, response delay, and cache residency still reduce remaining freshness."
+          description: "Fallback freshness lifetime in seconds when the backend response has no s-maxage, max-age, or Expires, or when respect_cache_control is explicitly false. Must be an unsigned 64-bit integer: a negative value or one above 18446744073709551615 is rejected at admission. With the default true policy, precedence is s-maxage > max-age > Expires minus Date > ttl_seconds; missing Date uses response receipt time. Invalid or repeated Expires, or invalid/repeated Date for Expires-based freshness, means already expired. Upstream Age, Date, response delay, and cache residency still reduce remaining freshness."
         max_entries:
           type: [integer, "null"]
           format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           default: 10000
           description: Maximum number of cached entries. Overflow is evicted oldest-first from an insertion-ordered queue in amortized O(1) per admitted entry — no full-map clone or sort is performed while the accounting mutex is held. Must be greater than zero.
         max_entry_size_bytes:
           type: [integer, "null"]
           format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           default: 1048576
           description: Maximum size of a single cached response body (1 MiB by default). Larger responses are not cached. Must be greater than zero.
         max_total_size_bytes:
           type: [integer, "null"]
           format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           default: 104857600
           description: Maximum accounted retained in-memory response-entry footprint across all entries (100 MiB by default). Concurrent stores and replacements are admitted atomically. When the byte cap is the limiting dimension, every expired entry is reclaimed in expiration order through an ordered index; fresh entries are never evicted to admit a new representation, and the store is refused if it still does not fit. Reclamation cost is bounded by entries actually retired rather than by cache size. An entry larger than the cap alone is never cached. Must be greater than zero.
         cacheable_methods:
@@ -27614,9 +28118,9 @@ components:
           minItems: 1
           items:
             type: string
-            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+            pattern: "^([Gg][Ee][Tt]|[Hh][Ee][Aa][Dd])$"
           default: ["GET", "HEAD"]
-          description: "HTTP methods eligible for caching (uppercased). Must contain at least one entry, and every entry must be a valid RFC 9110 HTTP method token that is also a bodyless retrieval method — only GET and HEAD are accepted. A body-bearing method is rejected at admission because cache lookup runs in before_proxy, ahead of on_final_request_body, so the exact backend-visible request body cannot be bound into the key. At runtime the transport must observe the complete H1/H2/H3 upload and privately prove it is empty before lookup; a non-empty or unproven body, any Transfer-Encoding, or a non-zero/unparsable Content-Length bypasses lookup and storage."
+          description: "HTTP methods eligible for caching (uppercased before use, so any letter casing of the two accepted tokens is admitted). Must contain at least one entry, and every entry must be a valid RFC 9110 HTTP method token that is also a bodyless retrieval method — only GET and HEAD are accepted; every other method token, including POST and OPTIONS, is rejected at admission. A body-bearing method is rejected at admission because cache lookup runs in before_proxy, ahead of on_final_request_body, so the exact backend-visible request body cannot be bound into the key. At runtime the transport must observe the complete H1/H2/H3 upload and privately prove it is empty before lookup; a non-empty or unproven body, any Transfer-Encoding, or a non-zero/unparsable Content-Length bypasses lookup and storage."
         cacheable_status_codes:
           type: array
           minItems: 1
@@ -27643,7 +28147,7 @@ components:
             type: string
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           default: []
-          description: "Additional request header names (lowercased) to include in the cache key even when the backend does not send Vary. Merged with any backend Vary response header. Every entry must be a valid RFC 9110 HTTP field-name token."
+          description: "Additional request header names (lowercased) to include in the cache key even when the backend does not send Vary. Merged with any backend Vary response header, with the dimensions already published for the base key, and with the mandatory authorization/cookie/proxy-authorization names; the merged list is emitted on the MISS response as well as on later hits. Every entry must be a valid RFC 9110 HTTP field-name token."
         cache_key_include_query:
           type: [boolean, "null"]
           default: true
@@ -27654,17 +28158,17 @@ components:
           description: "Legacy key-partition toggle. Caller isolation no longer depends on it: every cache key binds a mandatory caller-authorization partition (authentication mechanism, resolved identity/consumer, peer SPIFFE identity, and SHA-256 digests of every credential header presented), so two credentials that resolve to one display subject with different scopes can never share an entry. The flag is still bound into the key digest so flipping it yields a disjoint keyspace rather than reusing entries minted under the other setting. It does not authorize shared storage of a response to an Authorization-bearing request: the origin must still send Cache-Control public, must-revalidate, or s-maxage, so backend-side revocation, expiry, and scope changes remain authoritative."
         anonymous_caller_scope:
           type: [string, "null"]
-          enum: ["caller_address", "shared", null]
+          pattern: '^\s*([Cc][Aa][Ll][Ll][Ee][Rr][_-][Aa][Dd][Dd][Rr][Ee][Ss][Ss]|[Ss][Hh][Aa][Rr][Ee][Dd])\s*$'
           default: "caller_address"
-          description: "How anonymous callers (no gateway identity, no credential header, no peer SPIFFE identity) are partitioned. caller_address (default) binds the gateway-resolved canonical peer address, which the origin observes through Ferrum's regenerated X-Forwarded-For; a request whose canonical address cannot be parsed bypasses the cache entirely rather than being keyed incompletely. shared is an explicit operator attestation that the origin does not vary its response by caller address on this route and lets anonymous callers share one retained representation — only set it when that is known-safe, because it re-opens cross-caller replay for address-sensitive origins. It applies to anonymous callers only: an authenticated caller always binds its canonical peer address, because the backend receives Ferrum's regenerated forwarding identity for that caller too and may vary policy or content by it."
+          description: "How anonymous callers (no gateway identity, no credential header, no peer SPIFFE identity) are partitioned. The value is trimmed and ASCII-lowercased before it is matched, and caller-address is an accepted alias of caller_address, so caller_address, caller-address, and shared are admitted in any letter casing and with surrounding whitespace. caller_address (default) binds the gateway-resolved canonical peer address, which the origin observes through Ferrum's regenerated X-Forwarded-For; a request whose canonical address cannot be parsed bypasses the cache entirely rather than being keyed incompletely. shared is an explicit operator attestation that the origin does not vary its response by caller address on this route and lets anonymous callers share one retained representation — only set it when that is known-safe, because it re-opens cross-caller replay for address-sensitive origins. It applies to anonymous callers only: an authenticated caller always binds its canonical peer address, because the backend receives Ferrum's regenerated forwarding identity for that caller too and may vary policy or content by it."
         add_cache_status_header:
           type: [boolean, "null"]
           default: true
-          description: "Add X-Cache-Status (MISS, HIT, BYPASS, REVALIDATED, PREDICTED-BYPASS) to downstream responses. Cache hits also emit a current Age header."
+          description: "Add X-Cache-Status (MISS, HIT, BYPASS, REVALIDATED, PREDICTED-BYPASS) to downstream responses. Cache hits also emit a current Age header. Publication of the downstream Vary contract on a MISS is independent of this flag."
         invalidate_on_unsafe_methods:
           type: [boolean, "null"]
           default: true
-          description: "After a non-error origin response (status < 400) to an unsafe method (POST, PUT, PATCH, DELETE, and extension/custom methods, which fail closed as unsafe), invalidate cached entries for the matched path (and descendants under the same path prefix) within the same matched-proxy and normalized/transformed Host/authority partition used by cache lookup. Invalidation is an indexed exact lookup plus one ordered range over the mutated path's descendants, so its cost is bounded by the entries it removes rather than by cache size. Method safety is independent of cacheable_methods: an unsafe method listed there still invalidates after an origin MISS and non-error response; a served cache HIT that never contacted the origin does not. Safe methods outside cacheable_methods (OPTIONS, or HEAD under a GET-only set) bypass without invalidating. Error responses, transport failures, and gateway-only synthetics do not invalidate. Invalidation uses private origin-status provenance recorded before after_proxy hooks, so an earlier response hook that replaces the client-visible response cannot suppress eviction after a successful mutation."
+          description: "After a non-error origin response (status < 400) to an unsafe method (POST, PUT, PATCH, DELETE, and extension/custom methods, which fail closed as unsafe), invalidate cached entries for the matched path (and descendants under the same path prefix) within the same matched-proxy and normalized/transformed Host/authority partition used by cache lookup. The descendant boundary is the mutated path plus exactly one / separator, so a path that already ends in / — including the root / — is its own boundary and its children are invalidated as well. Invalidation is an indexed exact lookup plus one ordered range over the mutated path's descendants, so its cost is bounded by the entries it removes rather than by cache size. Method safety is independent of cacheable_methods: an unsafe method listed there still invalidates after an origin MISS and non-error response; a served cache HIT that never contacted the origin does not. Safe methods outside cacheable_methods (OPTIONS, or HEAD under a GET-only set) bypass without invalidating. Error responses, transport failures, and gateway-only synthetics do not invalidate. Invalidation uses private origin-status provenance recorded before after_proxy hooks, so an earlier response hook that replaces the client-visible response cannot suppress eviction after a successful mutation."
 
     GraphqlConfig:
       type: object

@@ -391,7 +391,7 @@ Sends transaction summaries as JSON to an external HTTP endpoint. Entries are bu
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `endpoint_url` | String | `""` | URL to POST transaction logs to |
+| `endpoint_url` | String | *(required)* | URL to POST transaction logs to. Must be `http://` or `https://` with a hostname or IP; empty strings are rejected. |
 | `custom_headers` | Object | *(none)* | Key-value pairs of custom HTTP headers to include on every batch request |
 | `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch (1–10000) |
 | `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (100–600000) |
@@ -405,7 +405,7 @@ Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elap
 
 Unknown top-level keys are rejected at construction (for example a misspelled `endpont_url` cannot silently leave logs undelivered). Registration is `OptionalFailOpen`: Admin create/update still returns HTTP 400 for an invalid enabled config, while file-mode `validate`/load and plugin-cache rebuild warn, naming the unknown key, and omit this instance rather than failing the gateway.
 
-Retries fire on transport errors and 5xx responses. A **4xx response other than 408 or 429 aborts the batch immediately** (retrying a malformed or unauthorized payload just delays the drop) — fix the endpoint URL, authorization header, or field schema rather than waiting through `max_retries × retry_delay_ms`. 408 (Request Timeout) and 429 (Too Many Requests) are transient throttling signals and are retried within the configured budget.
+Retries fire on transport errors and 5xx responses. A **4xx response other than 408 or 429 aborts the batch immediately** (retrying a malformed or unauthorized payload just delays the drop) — fix the endpoint URL, authorization header, or field schema rather than waiting through `max_retries × retry_delay_ms`. 408 (Request Timeout) and 429 (Too Many Requests) are transient throttling signals and are retried within the configured budget. Permanent 4xx discards increment `ferrum_plugin_log_sink_records_dropped_total{plugin="http_logging",reason="batch_discard"}` once per lost record; the counter is process-cumulative and is not reset by a plugin-cache reload.
 
 Response bodies are never logged or retained. After reading the status, each batch response is asynchronously drained and discarded under a 1 MiB hard cap and a one-second drain timeout so HTTP/1.1 keep-alive connections can be reused. Oversized, stalled, or malformed acknowledgement bodies abort the drain without changing the status classification (2xx remains success; non-retryable 4xx remains a discard).
 
@@ -437,15 +437,15 @@ The table below summarizes how to configure `http_logging` for popular log inges
 | **Sumo Logic** | `https://<endpoint>.sumologic.com/receiver/v1/http/<token>` | `X-Sumo-Category`, `X-Sumo-Name`, `X-Sumo-Host` (optional metadata) | Token embedded in URL | Yes | 1MB default | No auth header needed — token is in the URL path |
 | **Elastic / OpenSearch** | Requires intermediary (Logstash/Fluent Bit NDJSON transform) | `Authorization: "Basic <b64>"` or `Authorization: "Bearer <token>"` (at the intermediary) | Standard Authorization header | **No** — `_bulk` requires NDJSON action/source lines and `_doc` accepts one document object | N/A | Cannot POST the plugin's JSON array directly; see the Elastic / OpenSearch section below |
 | **Azure Monitor** | `https://<dce>.ingest.monitor.azure.com/dataCollectionRules/<dcr-id>/streams/<stream>?api-version=2023-01-01` | `Authorization: "Bearer <aad-token>"` | Azure AD OAuth2 bearer token | Yes (custom tables) | 1MB per call | Requires Data Collection Endpoint + Rule; fields map to custom table columns |
-| **AWS CloudWatch** | Requires intermediary (Fluent Bit/Firehose HTTP endpoint) | `Authorization: "Bearer <token>"` or custom | Varies by intermediary | **No** — needs `PutLogEvents` API format | N/A | Cannot POST directly; use a Firehose HTTP endpoint or Fluent Bit as intermediary |
+| **AWS CloudWatch** | Requires intermediary (Fluent Bit HTTP input) | Varies by intermediary | Varies by intermediary | **No** — needs `PutLogEvents` API format | N/A | Cannot POST directly; Fluent Bit (or another HTTP ingest bridge) must transform records and call CloudWatch |
 | **Google Cloud Logging** | Requires intermediary (Fluent Bit/custom) | `Authorization: "Bearer <token>"` | OAuth2 bearer token | **No** — needs `entries.write` format | N/A | Cannot POST directly; use Fluent Bit or a custom HTTP bridge |
 | **Logtail / Better Stack** | `https://in.logs.betterstack.com` | `Authorization: "Bearer <source-token>"` | Standard Authorization header | Yes | 10MB | Fields auto-parsed from JSON |
 | **Axiom** | `https://api.axiom.co/v1/datasets/<dataset>/ingest` | `Authorization: "Bearer <api-token>"` | Standard Authorization header | Yes | 10MB | Fields auto-parsed; supports `Content-Type: application/json` |
-| **Mezmo (LogDNA)** | `https://logs.mezmo.com/logs/ingest?hostname=<host>&apikey=<key>` | *(none — key in query string)* | API key in URL query parameter | Yes (lines API) | 10MB | Hostname is a required query parameter |
+| **Mezmo (LogDNA)** | Requires intermediary (Fluent Bit/custom HTTP bridge) | `apikey: "<ingestion-key>"` at the intermediary | Ingestion-key header (`apikey`) or query parameter at the intermediary | **No** — ingest API requires `{"lines":[...]}` | N/A | Cannot POST the plugin's JSON array directly; see the Mezmo section below |
 
 > **TLS verification:** If any service uses an internal CA, set `FERRUM_TLS_CA_BUNDLE_PATH` to your CA bundle so the plugin's HTTP client can verify the endpoint's certificate.
 
-> **Credentials in `endpoint_url`:** Prefer `custom_headers` — it is the supported authentication channel for every service that offers one, and header values are never logged. Some collectors have no header option (Sumo Logic puts its token in the URL path; Mezmo puts its API key in the query string), so `endpoint_url` may legitimately carry a reusable credential. Ferrum therefore never renders a configured `endpoint_url` in operational output. Diagnostics — egress-policy denial, DNS/TLS/connect failure, retry, slow-call warnings, and batch-failure error strings — show only a structurally redacted form (`https://host:port/redacted`) with the entire path, query, and fragment replaced. The admin API's audit and non-admin read projections apply the schema-aware sensitivity contract instead, keeping only `scheme://host[:port]` with `[REDACTED_PATH]`/`[REDACTED_QUERY]`/`[REDACTED_FRAGMENT]` markers (see `docs/admin_api.md`). The complete URL is used only to build the outbound request.
+> **Credentials in `endpoint_url`:** Prefer `custom_headers` — it is the supported authentication channel for every service that offers one, and header values are never logged. Some collectors have no header option (Sumo Logic puts its token in the URL path), so `endpoint_url` may legitimately carry a reusable credential. Mezmo ingestion keys can be sent as an `apikey` header at an HTTP bridge; do not put them in `endpoint_url` unless the collector itself requires a query credential. Ferrum therefore never renders a configured `endpoint_url` in operational output. Diagnostics — egress-policy denial, DNS/TLS/connect failure, retry, slow-call warnings, and batch-failure error strings — show only a structurally redacted form (`https://host:port/redacted`) with the entire path, query, and fragment replaced. The admin API's audit and non-admin read projections apply the schema-aware sensitivity contract instead, keeping only `scheme://host[:port]` with `[REDACTED_PATH]`/`[REDACTED_QUERY]`/`[REDACTED_FRAGMENT]` markers (see `docs/admin_api.md`). The complete URL is used only to build the outbound request.
 >
 > Userinfo credentials (`https://user:password@host/...`) are **rejected at configuration time** for `http_logging`, `loki_logging`, and `ai_transcript_audit`. Use `custom_headers` (for example `Authorization: "Basic <base64>"`) instead.
 
@@ -464,7 +464,7 @@ The `http_logging` plugin works with [Splunk HTTP Event Collector (HEC)](https:/
 3. **Configure the HEC token** — edit the token's settings:
    - **Source type**: set to `_json` (built-in) or your custom `ferrum_edge_logs`
    - **Index**: choose your target index
-   - **Enable indexer acknowledgement**: optional, for guaranteed delivery
+   - **Enable indexer acknowledgement**: leave this **disabled**. `http_logging` treats HTTP 2xx as delivery success and does not send `X-Splunk-Request-Channel` or poll `/services/collector/ack`. Tokens with indexer acknowledgment enabled reject requests that lack a channel, and a channel header alone cannot provide confirmed indexing. Ordinary HTTP acceptance is not the same as confirmed indexing; use a Splunk-aware intermediary if you need acknowledgment.
 
 4. **Configure the plugin** — point `endpoint_url` at the raw HEC endpoint and set the Splunk auth token via `custom_headers`:
 
@@ -564,6 +564,24 @@ config:
   flush_interval_ms: 2000
 ```
 
+#### Mezmo (LogDNA) Integration
+
+Mezmo's ingest API expects a JSON **object** with a `lines` array of log-line entries, not a top-level JSON array of `TransactionSummary` objects. Posting this plugin's payload directly to `https://logs.mezmo.com/logs/ingest` is a contract mismatch (typically a 4xx, which the plugin treats as a terminal discard). Mezmo does support header authentication via the `apikey` header; it is not limited to a query-string key.
+
+Use an HTTP bridge that accepts the plugin's JSON array and re-wraps each summary into Mezmo's log-line envelope (`{"lines":[{"line":"<json>","app":"ferrum-edge",...}]}`):
+
+```yaml
+plugin_name: http_logging
+config:
+  # Fluent Bit HTTP input (or a custom bridge) that transforms the JSON
+  # array into Mezmo's {"lines":[...]} envelope and authenticates with Mezmo.
+  endpoint_url: "http://fluent-bit.internal:8888/ferrum"
+  batch_size: 100
+  flush_interval_ms: 2000
+```
+
+> **Note:** Configure the intermediary with the Mezmo ingestion key (`apikey` header or the documented query parameter) and a `hostname`. Do not point `endpoint_url` at Mezmo's ingest URL directly — the plugin does not emit the `lines` envelope.
+
 #### Elastic / OpenSearch Integration
 
 Elasticsearch and OpenSearch cannot ingest this plugin's payload directly. The plugin always POSTs a JSON **array** of log-entry objects, while the index-document API (`/<index>/_doc`) accepts a **single** JSON document and the bulk API (`/<index>/_bulk`) requires newline-delimited action/source records (NDJSON), not a JSON array. Posting the array to either endpoint returns an ordinary 4xx, which the plugin treats as a terminal discard — the batch is dropped, not retried — so a direct configuration silently loses logs.
@@ -600,7 +618,9 @@ config:
 
 #### AWS CloudWatch Logs Integration
 
-CloudWatch Logs does not have an HTTP JSON intake API. Use [Fluent Bit](https://docs.fluentbit.io/manual/pipeline/outputs/cloudwatch) or an [Amazon Kinesis Data Firehose HTTP endpoint](https://docs.aws.amazon.com/firehose/latest/dev/create-destination.html#create-destination-http) as an intermediary:
+CloudWatch Logs does not have an HTTP JSON intake API. Use [Fluent Bit](https://docs.fluentbit.io/manual/pipeline/outputs/cloudwatch) (or another HTTP ingest bridge that you operate) as an intermediary that receives this plugin's JSON arrays, transforms records, and authenticates to the CloudWatch `PutLogEvents` API.
+
+Amazon Data Firehose HTTP endpoints are **outbound destinations**: Firehose sends records *to* an URL you configure. They are not an inbound HTTP-to-CloudWatch bridge, and pointing `endpoint_url` at a Firehose destination URL cannot produce a CloudWatch pipeline.
 
 ```yaml
 plugin_name: http_logging
@@ -632,19 +652,19 @@ Sends transaction metrics to a StatsD-compatible server (StatsD, Datadog DogStat
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `host` | String | *(required)* | StatsD server hostname or IP address |
+| `host` | String | *(required)* | StatsD server hostname or IP address (non-empty; no scheme, path, query, fragment, credentials, or `host:port`) |
 | `port` | Integer | `8125` | StatsD server UDP port (1–65535) |
-| `prefix` | String | `FERRUM_NAMESPACE` | Metric name prefix (e.g., `ferrum.request.count`). Defaults to the gateway's `FERRUM_NAMESPACE` value (default: `"ferrum"`). Sanitized for line-protocol safety; max 256 bytes after sanitization. |
+| `prefix` | String | `FERRUM_NAMESPACE` | Metric name prefix (e.g., `ferrum.request.count`). Defaults to the gateway's `FERRUM_NAMESPACE` value (default: `"ferrum"`). Leading/trailing whitespace is trimmed; empty after trim is rejected. Sanitized for line-protocol safety; max 256 bytes after sanitization. |
 | `global_tags` | Object | *(none)* | Extra DogStatsD tags appended to every metric. Keys cannot override reserved runtime tags (`namespace`, `method`, `status`, `status_class`, `grpc_status`, `proxy`, `protocol`, `error`, `cause`, `direction`, `body_outcome`, `body_error`, `result`, `io_side`, `error_class`) or any effective key introduced by a schema rename. Encoded `global_tags` + authoritative `namespace` tag are capped at 400 bytes. |
 | `flush_interval_ms` | Integer | `500` | Max milliseconds before flushing buffered metrics (50–600000) |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full (1–1000000) |
 | `max_batch_lines` | Integer | `50` | Max metric entries to batch before flushing (1–10000) |
-| `max_entry_bytes` | Integer | `65536` | Maximum rendered StatsD line-protocol size of one admitted transaction (1024–1048576). Oversized renders are dropped before enqueue. |
+| `max_entry_bytes` | Integer | `65536` | Maximum rendered StatsD line-protocol size of one admitted transaction (1024–1048576). Construction rejects a prefix / global-tags / schema combination that cannot hold even the smallest ordinary record (HTTP, gRPC, stream, or WebSocket). Request-shaped fields can still overflow at runtime and are dropped before enqueue. |
 | `buffer_max_bytes` | Integer | `16777216` | Aggregate retained rendered-content budget across queued entries, one MTU-bounded datagram buffer, and retries (must be ≥ `2 * (max_entry_bytes + 1)`; hard max 268435456). Admission reserves before rendering. |
 | `max_retries` | Integer | `0` | Retry attempts after the initial UDP send fails (0–10; shared batching logger) |
 | `retry_delay_ms` | Integer | `0` | Delay in milliseconds between retry attempts (0–60000) |
-| `schema` | Object | *(none)* | Inline summary schema; only `rename` / `omit` / `summary_type` affect StatsD tags. Rename targets must pass the same tag-key grammar and must not collide with reserved tags. |
-| `schema_ref` | String | *(none)* | Named schema from `transaction_log_schema`; mutually exclusive with `schema` |
+| `schema` | Object | *(none)* | Inline summary schema; only `rename` / `omit` / `summary_type` affect StatsD tags. Rename targets must pass the same tag-key grammar and must not collide with reserved tags. Mutually exclusive with `schema_ref`. |
+| `schema_ref` | String | *(none)* | Non-empty named schema from `transaction_log_schema`; mutually exclusive with `schema` |
 
 Metrics are flushed when `max_batch_lines` is reached **or** `flush_interval_ms` elapses, whichever comes first. Hot-path admission reserves a queue slot and a provisional `max_entry_bytes` lease before rendering attacker-shaped summary fields into StatsD line protocol, then shrinks that lease to the exact retained size. Batches are packed into UDP datagrams that never exceed a **1452-byte** conservative IPv4/IPv6 payload ceiling; delivery retains the admitted batch plus at most one datagram buffer (it does not materialize every datagram copy up front). Multi-line batches split only on newline boundaries; an individual metric line larger than the ceiling is dropped and warned (it is never fragmented mid-line, and sibling valid lines in the same batch are still sent).
 
@@ -774,7 +794,7 @@ leave the sink disconnected).
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `endpoint_url` | String | *(required)* | WebSocket URL (`ws://` or `wss://`) to send transaction logs to. Must include a hostname and must not include URL userinfo. Path/query may carry collector tokens when required; operational diagnostics always emit a structurally redacted form (`scheme://host[:port]/redacted`). Malformed or non-WebSocket schemes are rejected at config load time. |
+| `endpoint_url` | String | *(required)* | WebSocket URL (`ws://` or `wss://`) to send transaction logs to. Must include a hostname and must not include URL userinfo. Path/query may carry collector tokens when required; operational diagnostics always emit a structurally redacted form (`scheme://host[:port]/redacted`). Malformed or non-WebSocket schemes are rejected at config load time. The constructor canonicalizes the value (lowercase scheme, percent-encoded path) before the collector handshake so admitted representations match the tungstenite request URI. |
 | `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch (1–10000) |
 | `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (100–600000) |
 | `max_retries` | Integer | `3` | Retry attempts on failed batch delivery (0–10) |
@@ -797,7 +817,7 @@ HTTP/gRPC and TCP/UDP summaries. Disconnect-specific keys such as `event`,
 `timestamp_disconnected`, `direction`, and `io_side` can be renamed, omitted,
 or reordered; see the log-schema reference for the complete field list.
 
-`endpoint_url` must be a valid `ws://` or `wss://` URL with a hostname and no userinfo. Malformed or non-WebSocket URLs reject plugin creation at config load time.
+`endpoint_url` must be a valid `ws://` or `wss://` URL with a hostname and no userinfo. Malformed or non-WebSocket URLs reject plugin creation at config load time. Scheme case and path encoding are normalized to the handshake representation at admission.
 
 ```yaml
 plugin_name: ws_logging
@@ -1618,9 +1638,9 @@ Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `endpoint_url` | string | (required) | HTTP(S) Loki push API URL; URL user information is rejected |
+| `endpoint_url` | string | (required) | HTTP(S) Loki push API URL; URL user information is rejected; leading/trailing whitespace is ignored; ports must be 0–65535 |
 | `authorization_header` | string | (none) | `Authorization` header value (Bearer/Basic); leading/trailing whitespace is rejected |
-| `custom_headers` | object | `{}` | Extra HTTP headers (e.g., `X-Scope-OrgID`); names use HTTP token syntax and are at most 65,535 bytes |
+| `custom_headers` | object | `{}` | Extra HTTP headers (e.g., `X-Scope-OrgID`); names use HTTP token syntax and are at most 65,535 bytes; values may be UTF-8 (`café`) but cannot contain NUL/CR/LF |
 | `labels` | object | `{"service":"ferrum-edge"}` | Static labels; names beginning `__` and reserved `ferrum_emitter` are rejected; names are at most 1,024 characters and values at most 2,048 characters |
 | `include_proxy_id_label` | bool | `true` | Add `proxy_id` as a label |
 | `include_status_class_label` | bool | `true` | Add `status_class` (2xx/3xx/4xx/5xx) as a label |
@@ -1629,11 +1649,11 @@ Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push
 | `flush_interval_ms` | integer | `1000` | Flush timer interval (100–600000) |
 | `buffer_capacity` | integer | `10000` | Channel buffer capacity (1–1,000,000) |
 | `max_entry_bytes` | integer | `65536` | Maximum retained bytes for one JSON line plus labels (1,024–1,048,576); the configured serializer's minimum HTTP and stream lines plus static, reserved, and worst-case dynamic label values must fit |
-| `buffer_max_bytes` | integer | `16777216` | Per-plugin retained-content budget across queued, batched, and retrying entries (1,024–268,435,456; at least `max_entry_bytes`) |
+| `buffer_max_bytes` | integer | `16777216` | Per-plugin retained-content budget across queued, batched, and retrying entries (1,024–268,435,456; at least `max_entry_bytes`; when `max_entry_bytes` is omitted the default 65,536 ceiling applies) |
 | `max_retries` | integer | `3` | Retries after the initial attempt (0–10) |
 | `retry_delay_ms` | integer | `1000` | Initial exponential-backoff delay (1–60,000 ms) |
-| `schema` | object | (none) | Inline transaction-log schema |
-| `schema_ref` | string | (none) | Named `transaction_log_schema` reference; mutually exclusive with `schema` |
+| `schema` | object | (none) | Inline transaction-log schema; mutually exclusive with `schema_ref` |
+| `schema_ref` | string | (none) | Non-empty named `transaction_log_schema` reference; mutually exclusive with `schema` |
 
 HTTP **204 No Content** is Loki's canonical delivery success. A received 204 is treated as committed even if the best-effort response drain is incomplete, because retrying after the sink accepted the batch can duplicate entries. Other 2xx responses from Loki-compatible receivers or intermediaries are accepted only when their response drains completely and is empty. Loki's blocked-ingestion status **260**, non-empty or anomalously drained compatible-success responses, 3xx, and non-retryable 4xx responses are terminal; transport failures, 408, 429, and 5xx retry with capped exponential backoff and full jitter. Response bodies are never logged or retained: they are discarded with a 1 MiB cap and a one-second timeout, and diagnostics contain only status and bounded size/drain classifications.
 
@@ -2395,36 +2415,47 @@ Validates opaque or structured OAuth2 bearer tokens against RFC 7662 introspecti
 
 | Parameter | Type | Description |
 |---|---|---|
-| `providers` | Array | Introspection provider configurations (required) |
+| `providers` | Array | Introspection provider configurations (required, 1–16 entries) |
 | `allow_provider_fanout` | Boolean | Submit an Authorization bearer token to multiple providers (default `false`). Enable only when all providers share one credential trust boundary |
-| `providers[].introspection_endpoint` | String | Direct token introspection endpoint URL (`https` required for non-loopback hosts) |
-| `providers[].discovery_url` | String | OIDC discovery URL used to resolve `introspection_endpoint` (`https` required for non-loopback hosts) |
-| `providers[].issuer` | String (optional) | Expected `iss` claim in active introspection responses |
+| `providers[].introspection_endpoint` | String | Direct token introspection endpoint URL (`https` required for non-loopback hosts). Exactly one of this or `discovery_url` |
+| `providers[].discovery_url` | String | OIDC discovery URL used to resolve `introspection_endpoint` (`https` required for non-loopback hosts). Exactly one of this or `introspection_endpoint` |
+| `providers[].issuer` | String (optional) | Expected `iss` claim in active introspection responses; also the `aud` of `private_key_jwt` client assertions |
 | `providers[].audiences` | String[] (optional) | Accepted `aud` values; OR-matched |
-| `providers[].client_auth.method` | String | `client_secret_basic`, `client_secret_post`, `private_key_jwt`, or `none` |
-| `providers[].client_auth.client_id` | String | OAuth client ID for authenticated methods |
-| `providers[].client_auth.client_secret` | String | Client secret for `client_secret_basic` or `client_secret_post` |
-| `providers[].client_auth.private_key_pem` | String | PEM private key for `private_key_jwt` |
-| `providers[].client_auth.private_key_jwt_alg` | String | `RS256`, `RS384`, `RS512`, `ES256`, `ES384`, or `EdDSA` |
+| `providers[].client_auth.method` | String | `client_secret_basic` (default), `client_secret_post`, `private_key_jwt`, or `none` |
+| `providers[].client_auth.client_id` | String | OAuth client ID; required for every method except `none` |
+| `providers[].client_auth.client_secret` | String | Client secret; required for `client_secret_basic` and `client_secret_post` |
+| `providers[].client_auth.private_key_pem` | String | PEM private key; required for `private_key_jwt`. Must be usable with `private_key_jwt_alg` |
+| `providers[].client_auth.private_key_jwt_alg` | String | `RS256` (default), `RS384`, `RS512`, `ES256`, `ES384`, or `EdDSA` |
 | `providers[].client_auth.private_key_jwt_kid` | String (optional) | Optional `kid` for private key JWT assertions |
-| `providers[].from_headers` | Array (optional) | Header token locations, each `{ "name": "...", "prefix": "..." }` |
+| `providers[].from_headers` | Array (optional) | Header token locations, each `{ "name": "...", "prefix": "..." }`. `prefix` may be `null` or omitted for "no prefix" |
 | `providers[].from_params` | String[] (optional) | Query parameter token locations |
+| `providers[].token_hint_param` | String or null (optional) | Sent as the RFC 7662 `token_type_hint` form field on every introspection request (for example `access_token`). `null` or omitted sends no hint |
 | `providers[].forward_original_token` | Boolean | Forward the original token-bearing header/query param (default `true`) |
-| `providers[].positive_cache_ttl_secs` | u64 | Active-token cache TTL cap (default `60`) |
-| `providers[].negative_cache_ttl_secs` | u64 | Inactive-token cache TTL (default `10`) |
+| `providers[].positive_cache_ttl_secs` | u64 | Active-token cache TTL cap (default `60`, range `0..=86400`; `0` disables positive caching) |
+| `providers[].negative_cache_ttl_secs` | u64 | Inactive-token cache TTL (default `10`, range `0..=300`; `0` disables negative caching) |
 | `providers[].max_cache_entries` | usize | Per-provider entry ceiling (default `10000`, range `100..=100000`) |
 | `providers[].max_cache_entry_bytes` | usize | Maximum normalized active result retained for one token (default `16384`, range `256..=65536`) |
 | `providers[].max_cache_total_bytes` | usize | Total per-provider retained cache bytes, including fixed eviction indexes and entry/key state (default `16777216`, range `1048576..=67108864`) |
-| `providers[].request_timeout_ms` | u64 | Introspection request timeout (default `5000`) |
+| `providers[].request_timeout_ms` | u64 | Introspection request timeout (default `5000`, range `100..=30000`) |
 | `providers[].required_scopes` | String[] (optional) | Scopes that must all be present |
 | `providers[].required_roles` | String[] (optional) | Roles where any one must be present |
+| `providers[].scope_claim` | String (optional) | Per-provider override of the global `scope_claim` |
+| `providers[].role_claim` | String (optional) | Per-provider override of the global `role_claim` |
+| `providers[].consumer_identity_claim` | String (optional) | Per-provider override of the global `consumer_identity_claim` |
+| `providers[].consumer_header_claim` | String (optional) | Per-provider override of the global `consumer_header_claim` |
 | `providers[].claim_headers` | Object (optional) | Claim-to-header mappings; keys are claim paths and values are upstream header names |
 | `scope_claim` | String | Global scope claim path (default: `"scope"`) |
 | `role_claim` | String | Global role claim path (default: `"roles"`) |
 | `consumer_identity_claim` | String | Global claim used for consumer lookup (default: `"username"`) |
-| `consumer_header_claim` | String | Global claim used for `X-Consumer-Username` when no consumer maps |
+| `consumer_header_claim` | String | Global claim used for `X-Consumer-Username` when no consumer maps; defaults to the effective `consumer_identity_claim` |
+
+Every claim path is a dot path (`realm_access.roles`) with no empty segments, and every non-empty string list entry is trimmed and must not be blank. A provider override replaces the global value for that provider only.
 
 Credentialed `client_auth.method` values (`client_secret_basic`, `client_secret_post`, `private_key_jwt`) require an `https` `introspection_endpoint`/`discovery_url` when the host is not loopback/localhost; `http` is only accepted for loopback endpoints so client credentials are never sent over plaintext to a remote host. The `none` method is loopback-only regardless of scheme. `client_secret_basic` form-encodes the client ID and secret separately before constructing the Basic credential, as required by OAuth 2.0. Discovery-provided introspection endpoints must use the discovery URL's exact origin (scheme, normalized host, and effective port). Claim header mappings reject reserved headers.
+
+`private_key_jwt` proves the configured key at config load, not at request time: the constructor signs one throwaway assertion with `private_key_pem` and `private_key_jwt_alg` and rejects the provider if that fails. An EC curve that does not match the selected algorithm (a P-384 key with `ES256`, a P-256 key with `ES384`) and an RSA key below the signing backend's minimum modulus are therefore configuration errors, instead of a configuration that validates and then returns `503` on every request without ever contacting the provider. The probe performs no network I/O and starts no background task.
+
+Configured endpoint URLs may carry a credential in their path or query. The gateway's own operational diagnostics — slow-call warnings, transport retries, and egress-policy denials from the shared plugin HTTP client — record only the endpoint origin (scheme, host, port), and discovery failures are reported as an error class rather than a formatted transport error. The complete URL is still used for the request itself.
 
 Configuration is strict at the plugin, provider, client-auth, and header-location layers: unknown fields reject validation and reload. At most 16 providers and 8 KiB bearer tokens are accepted. Introspection work is capped at 32 concurrent calls per provider and 128 process-wide; identical in-flight token checks are coalesced by a SHA-256 token key. Introspection responses are capped at 64 KiB and discovery documents at 128 KiB.
 
@@ -2456,7 +2487,7 @@ config:
 
 Runs a browser-oriented OpenID Connect relying party flow with authorization code + PKCE, encrypted gateway sessions with a sliding idle window and proactive refresh-token rotation, ID token validation through provider JWKS, optional UserInfo merge, scope/role checks, claim header fan-out, and RP-initiated logout. Concurrent refresh-due requests carrying the same refresh token share one token-endpoint call per instance, and a refresh token the provider reports as `invalid_grant` is never re-sealed into a `Set-Cookie`; see [OIDC Relying Party](oidc_relying_party.md#concurrent-refreshes-and-spent-refresh-tokens) for the multi-replica caveat.
 
-Logout expires the browser cookie and, with an authentic session cookie, sends `id_token_hint` to the provider and attempts discovered refresh-token revocation. No cookie or an invalid cookie returns the local logged-out page. Stateless cookie copies remain usable within the claims and absolute/idle lifetime limits even after logout; see [Logout](oidc_relying_party.md#logout) for residual validity and best-effort revocation behavior.
+Active in `on_request_received` (callback and logout paths), `authenticate` (session validation, refresh, and browser challenge), `before_proxy` (claim headers and session-cookie hiding), and `after_proxy` (rolling `Set-Cookie` emission). Logout expires the browser cookie and, with an authentic session cookie, sends `id_token_hint` to the provider and attempts discovered refresh-token revocation. No cookie or an invalid cookie returns the local logged-out page. Stateless cookie copies remain usable within the claims and absolute/idle lifetime limits even after logout; see [Logout](oidc_relying_party.md#logout) for residual validity and best-effort revocation behavior.
 
 **Priority:** 1075
 
@@ -2468,27 +2499,48 @@ Logout expires the browser cookie and, with an authentic session cookie, sends `
 | `providers[].authorization_endpoint` | String | Explicit authorization endpoint when discovery is not used |
 | `providers[].token_endpoint` | String | Explicit token endpoint when discovery is not used |
 | `providers[].jwks_uri` | String | Explicit JWKS URI when discovery is not used |
-| `providers[].userinfo_endpoint` | String (optional) | UserInfo endpoint used to enrich session claims |
+| `providers[].userinfo_endpoint` | String (optional) | UserInfo endpoint used to enrich session claims; explicit values win over discovery |
+| `providers[].end_session_endpoint` | String (optional) | RP-initiated logout endpoint; explicit values win over discovery |
+| `providers[].post_logout_redirect_uri` | String (optional) | Absolute URI sent to the provider after RP-initiated logout |
 | `providers[].client_id` | String | OIDC client ID |
-| `providers[].client_auth.method` | String | `client_secret_basic`, `client_secret_post`, `private_key_jwt`, or `none` |
-| `providers[].redirect_uri` | String | Absolute callback URI registered with the provider; its host must match the browser request host before Ferrum issues a challenge (ports are ignored) |
+| `providers[].client_auth.method` | String | `client_secret_basic` (default), `client_secret_post`, `private_key_jwt`, or `none` |
+| `providers[].client_auth.client_secret` | String | Required for `client_secret_basic` and `client_secret_post` |
+| `providers[].client_auth.private_key_pem` | String | Required for `private_key_jwt`; must support the selected algorithm |
+| `providers[].client_auth.private_key_jwt_alg` | String | `RS256` (default), `RS384`, `RS512`, `ES256`, `ES384`, or `EdDSA` |
+| `providers[].client_auth.private_key_jwt_kid` | String (optional) | `kid` header placed on the signed client assertion |
+| `providers[].redirect_uri` | String | Absolute callback URI registered with the provider, with no fragment; its host must match the browser request host before Ferrum issues a challenge (ports are ignored) |
 | `providers[].callback_path` | String | Callback path Ferrum handles (default: `/oauth/callback`); must equal the path in `redirect_uri` |
-| `providers[].logout_path` | String | Local logout path (default: `/oauth/logout`) |
+| `providers[].logout_path` | String | Local logout path (default: `/oauth/logout`); must not resolve to the same path as `callback_path` |
 | `providers[].scopes` | String[] | OIDC scopes; must include `openid` |
 | `providers[].audiences` | String[] | Accepted ID token audiences |
 | `providers[].required_scopes` | String[] (optional) | Scopes that must all be present in session claims |
 | `providers[].required_roles` | String[] (optional) | Roles where any one must be present |
 | `providers[].claim_headers` | Object (optional) | Session claim-to-header mappings |
+| `providers[].scope_claim` | String | Claim holding granted scopes (default: `scope`) |
+| `providers[].role_claim` | String | Claim holding roles (default: `roles`) |
+| `providers[].consumer_identity_claim` | String | Claim resolved against the consumer index (default: `sub`) |
+| `providers[].consumer_header_claim` | String | Claim emitted as the consumer username header (default: `sub`) |
+| `providers[].id_token_clock_skew_secs` | u64 | ID token expiry leeway (default: `60`; `0`–`3600`) |
 | `session.encryption_secret` | String | At least 32 bytes; encrypts and authenticates session cookies and sealed pending-flow correlation cookies |
 | `session.encryption_secret_previous` | String (optional) | Previous secret accepted for session and pending-flow cookie rotation |
 | `session.store` | String | Session backend; only `cookie` is implemented |
-| `session.cookie_name` | String (optional) | Explicit name opts out of automatic naming; default is context-derived and prefixed `__Host-` (secure, no domain, root path), `__Secure-` (secure, otherwise), or unprefixed when `session.secure` is false |
-| `session.ttl_secs` | u64 | Absolute session lifetime (default: `3600`) |
-| `session.idle_ttl_secs` | u64 | Idle timeout (default: `1800`) |
-| `session.max_cookie_bytes` | u64 | Maximum sealed session and pending-flow cookie size (default: `8000`) |
-| `session.domain` | String (optional) | Durable session Domain only; correlation cookies never inherit it and secure correlation cookies use browser-enforced `__Host-` scope (`Path=/`) |
+| `session.cookie_name` | String (optional) | Explicit name opts out of automatic naming and must be an RFC 6265 `cookie-name` token; an explicit `__Host-`/`__Secure-` name must satisfy that prefix's attribute rules. Default is context-derived and prefixed `__Host-` (secure, no domain, root path), `__Secure-` (secure, otherwise), or unprefixed when `session.secure` is false |
+| `session.ttl_secs` | u64 | Absolute session lifetime (default: `3600`; `1`–`31536000`) |
+| `session.idle_ttl_secs` | u64 | Idle timeout (default: `1800`; `1`–`31536000`) |
+| `session.max_cookie_bytes` | u64 | Maximum sealed session and pending-flow cookie size (default: `8000`; `1024`–`8000`) |
+| `session.domain` | String (optional) | Bare DNS name (optional leading dot); durable session Domain only. Correlation cookies never inherit it, and secure correlation cookies use browser-enforced `__Host-` scope (`Path=/`) |
 | `session.secure` | Boolean | Default `true`; when false, generated cookie names carry no `__Host-`/`__Secure-` prefix because a prefixed cookie without `Secure` is rejected by browsers |
+| `session.hide_session_cookie` | Boolean | Default `true`; strip this plugin's session and correlation cookies from the `Cookie` header forwarded upstream, leaving unrelated cookies intact |
+| `session.http_only` | Boolean | `HttpOnly` on the session cookie (default: `true`) |
+| `session.same_site` | String | `lax` (default), `strict`, or `none`; case-insensitive. `none` requires `session.secure: true` |
+| `session.path` | String | Session cookie `Path` (default: `/`) |
 | `behavior.rp_initiated_logout` | Boolean | Default `true`; send the sealed session ID token as a logout hint and attempt discovered refresh-token revocation (five-second bound) |
+| `behavior.state_ttl_secs` | u64 | Pending authorization-flow lifetime (default: `600`; `1`–`3600`) |
+| `behavior.refresh_skew_secs` | u64 | Refresh lead time before token expiry (default: `30`; must be `<= session.ttl_secs / 2`) |
+| `behavior.challenge_html_status` | u64 | Browser challenge status: `302` (default), `303`, or `307` |
+| `behavior.challenge_api_status` | u64 | Non-browser challenge status: `401` (default) or `403` |
+| `behavior.html_accept_substrings` | String[] | `Accept` substrings that mark a browser request (default: `["text/html"]`) |
+| `behavior.post_login_redirect_param` | String (optional) | Query parameter carrying the post-login target; requires `behavior.trusted_redirect_hosts` |
 | `behavior.state_cache_max_entries` | u64 | Per-instance maximum pending login starts (default: `10000`); does not block cross-replica callbacks |
 | `behavior.state_cache_max_entries_per_source` | u64 | Per-instance per-client-IP pending login start cap (default: `32`) |
 | `behavior.post_login_default_path` | String | Redirect target when no trusted original URL exists |
@@ -2501,7 +2553,9 @@ config:
     - issuer: "https://idp.example.com/"
       discovery_url: "https://idp.example.com/.well-known/openid-configuration"
       client_id: ferrum-edge
+      scopes: ["openid", "profile", "email"]
       redirect_uri: "https://edge.example.com/oidc/callback"
+      callback_path: "/oidc/callback"
       client_auth:
         method: client_secret_basic
         client_secret: "${OIDC_CLIENT_SECRET}"
@@ -2899,16 +2953,17 @@ Authenticates requests by extracting HTTP Basic credentials and validating them 
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `ldap_url` | string | (required) | LDAP server URL. Use `ldaps://` or `ldap://` with `starttls: true`; embedded URL credentials are rejected. Hostnames retain their configured identity for TLS/SNI while each connection dials a freshly resolved, policy-screened IP |
+| `ldap_url` | string | (required) | LDAP server URL. Use `ldaps://` or `ldap://` with `starttls: true`. The scheme is matched case-sensitively (`LDAP://` is rejected), the value must carry no leading or trailing whitespace, a hostname is required, and an explicit port must be 0–65535. Embedded URL credentials are rejected. Hostnames retain their configured identity for TLS/SNI while each connection dials a freshly resolved, policy-screened IP |
 | `bind_dn_template` | string | (none) | Direct bind DN template with `{username}` placeholder (e.g., `uid={username},ou=users,dc=example,dc=com`) |
 | `search_base_dn` | string | (none) | Base DN for search-then-bind user search |
-| `search_filter` | string | (none) | LDAP search filter with `{username}` placeholder (e.g., `(&(objectClass=user)(sAMAccountName={username}))`) |
+| `search_filter` | string | (none) | LDAP search filter with `{username}` placeholder (e.g., `(&(objectClass=user)(sAMAccountName={username}))`). The template must also parse as an RFC 4515 search filter |
 | `canonical_identity_attribute` | string | (required) | Required in both bind modes. The authenticated entry must return exactly one value for this attribute; that value becomes the Ferrum identity, Consumer mapping key, custom group-filter `{username}`, and default `memberUid` value. Direct bind reads it with a base-scope search on the bound DN; search-then-bind reads it from the uniquely selected search entry |
 | `service_account_dn` | string | (none) | DN for the service account used in search-then-bind |
-| `service_account_password` | string | (none) | Password for the service account |
+| `service_account_password` | string | (none) | Password for the service account. Taken **verbatim** — unlike every other string field it is never trimmed, so a secret with leading or trailing whitespace binds as configured. Only an empty string is rejected |
 | `group_base_dn` | string | (none) | Base DN for group membership search (required when `required_groups` is set) |
-| `group_filter` | string | auto | Group search filter. A custom filter must contain `{user_dn}` or `{username}` when `required_groups` is set. `{username}` is the authenticated canonical identity read from `canonical_identity_attribute` in both bind modes, never the presented login. Default checks `member`, `uniqueMember`, and canonical-identity `memberUid`; custom-filter matches are rechecked against the returned group entry using those attributes before authorization |
+| `group_filter` | string | auto | Group search filter. The template must parse as an RFC 4515 search filter, and a custom filter must contain `{user_dn}` or `{username}` when `required_groups` is set. `{username}` is the authenticated canonical identity read from `canonical_identity_attribute` in both bind modes, never the presented login. Default checks `member`, `uniqueMember`, and canonical-identity `memberUid`; custom-filter matches are rechecked against the returned group entry using those attributes before authorization |
 | `required_groups` | string[] | `[]` | List of LDAP/AD group names the user must belong to (OR logic — at least one must match) |
+| `hide_credentials` | bool | `true` | Remove the verified `Authorization: Basic` credential from the backend request, including when another mechanism wins a multi-auth chain. Only the `Basic` scheme this plugin consumes is removed; an `Authorization` header carrying another scheme reaches the backend unchanged. Set to `false` only for a legacy backend that explicitly requires the directory password |
 | `group_attribute` | string | `cn` | Attribute containing the group name for matching against `required_groups`; LDAP attribute-name matching is case-insensitive |
 | `starttls` | bool | `false` | Use STARTTLS to upgrade `ldap://` connections to TLS (cannot be used with `ldaps://`) |
 | `allow_plaintext` | bool | `false` | Development-only override for non-loopback `ldap://` without STARTTLS. Credentials have no transport confidentiality when enabled |
@@ -2916,7 +2971,7 @@ Authenticates requests by extracting HTTP Basic credentials and validating them 
 | `request_timeout_seconds` | u64 | `max(15, connect timeout)` | Strict wall-clock deadline (1–300s) for the complete uncached authentication and group-check flow. Set it explicitly to use a shorter deadline than an individual operation |
 | `max_concurrent_requests` | u64 | `64` | Per-plugin cap (1–1,024) on concurrent uncached LDAP flows; excess requests fail immediately |
 | `cache_ttl_seconds` | u64 | `0` | How long to cache successful auth results (`0` = disabled, maximum `86400`). Cache keys are process-random HMACs over the presented username/password |
-| `max_cache_entries` | u64 | `10000` | Strict cache cap. Atomic admission preserves the cap under concurrency, and a saturated cache replaces one entry without a full-map scan |
+| `max_cache_entries` | u64 | `10000` | Strict cache cap (1–1,000,000). Atomic admission preserves the cap under concurrency, and a saturated cache replaces one entry without a full-map scan |
 | `consumer_mapping` | bool | `true` | Whether to look up a matching gateway Consumer via `consumer_index.find_by_identity()` |
 
 **Authentication modes** (must configure one):
@@ -2968,6 +3023,14 @@ In both modes the plugin sets `ctx.authenticated_identity` to the validated `can
 | Backend/config failure — directory unreachable, service-account bind failure/rejection, or search RPC error | `500` |
 
 A directory outage or a misconfigured service account therefore returns `500` (`LDAP authentication temporarily unavailable`), **not** `401` — returning `401` would tell the client its credentials are wrong, prompting useless re-submission and masking the operational problem. The specific cause is logged (via `warn!`) but never sent to the client.
+
+**Authentication challenge:** `ldap_auth` consumes RFC 7617 `Authorization: Basic` credentials, so a missing or malformed credential is answered with `401` and `WWW-Authenticate: Basic realm="ferrum-edge", charset="UTF-8"` — the same challenge `basic_auth` advertises. Clients that drive Basic authentication off the challenge therefore prompt for credentials on an LDAP-protected route.
+
+**Upstream credential removal:** The verified `Authorization: Basic` header is removed from the backend request by default (`hide_credentials: true`), including on chains where another mechanism authenticated the request. A directory password is a reusable, often corporate credential; forwarding it would place it inside the application trust boundary even though the backend already receives the authenticated identity. Only the `Basic` scheme is removed — an `Authorization` header carrying a different scheme belongs to another policy and is forwarded unchanged. The header is also always omitted from diagnostics and policy calls, regardless of this setting.
+
+**Filter admission:** `search_filter` and `group_filter` are parsed as RFC 4515 search filters at load, after their placeholders are substituted. A malformed template (an unbalanced parenthesis, an empty `()` branch) is rejected by `ferrum-edge validate`, the admin API, and startup, rather than being accepted and turning every request on the route into a `500` when the directory rejects the filter.
+
+**Required-group matching:** A group entry returned by the membership search satisfies `required_groups` when one of its `group_attribute` values matches (case-insensitively). When the directory does not return that attribute, the plugin falls back to the entry's **own** relative distinguished name: the first RDN is parsed per RFC 4514 (honoring `\,` and `\XX` escapes and multi-valued RDNs), and it matches only when its attribute type is `group_attribute` or `cn` and its decoded value matches a required group. The rest of the DN is never consulted, so an entry that merely lives *under* a required group (`uid=visitors,cn=admins,ou=groups,…`) or whose RDN value contains an escaped comma (`ou=visitors\,cn=admins,…`) is not that group. A DN this parser cannot decode fails closed as a non-match.
 
 **Group search and service accounts:** When `required_groups` is set, the group-membership search binds with the service account if one is configured. With direct bind and **no** service account, the search runs over an **anonymous** bind — many directories deny anonymous reads of group objects / `member` attributes, in which case the search returns no entries and an entitled user is wrongly denied (`403`). The plugin logs a startup warning for this configuration and a per-request warning when an anonymous group search returns zero entries. **Configure a service account whenever you use `required_groups`** unless the directory is known to permit anonymous group searches.
 
@@ -3477,13 +3540,13 @@ Delegates HTTP-family request authorization to [Open Policy Agent](https://www.o
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `opa_host` | String | **required** | Base OPA URL, `http://` or `https://`. Do not include URL credentials; use `headers` for OPA auth. |
+| `opa_host` | String | **required** | Base OPA URL, `http://` or `https://`. URL credentials, a query string, and a fragment are rejected; use `headers` for OPA auth. A base path is accepted and is prepended to `/v1/data/{policy_path}`. |
 | `policy_path` | String | **required** | OPA data path appended under `/v1/data/`, for example `ferrum/authz/allow`. Must not start with `/`, contain percent-encoding, or contain empty, `.`, or `..` path segments. |
 | `headers` | Object | `{}` | Static headers sent to OPA on every decision request. `content-type` is managed by the plugin and cannot be configured. |
 | `timeout_ms` | Integer | `1000` | Requested per-decision timeout. Every positive value is accepted; the effective timeout is capped at `30000` ms. |
-| `max_response_bytes` | Integer | `262144` | Maximum decoded OPA response size. Oversized declared or streamed responses use the configured fail posture. |
+| `max_response_bytes` | Integer or null | `262144` | Maximum decoded OPA response size. Oversized declared or streamed responses use the configured fail posture. An explicit `null` selects the default, exactly like omitting the key. |
 | `fail_open` | Boolean | `false` | Continue the request when OPA is unavailable, times out, returns non-2xx, returns malformed JSON, or exceeds `max_response_bytes`. |
-| `fail_closed` | Boolean | `true` | Inverse of `fail_open`, accepted for explicit fail-closed configs. Do not set both fields. |
+| `fail_closed` | Boolean | `true` | Inverse of `fail_open`, accepted for explicit fail-closed configs. Configuring both fields is rejected at config load, even when the two values agree. |
 | `deny_status` | Integer | `403` | HTTP 4xx/5xx status returned when OPA returns a policy denial. |
 | `deny_body` | String | `{"error":"forbidden by policy"}` | Response body returned on policy denial. |
 | `deny_headers` | Object | `{}` | Headers added to the policy-denial response. Names and values are validated at config load; protocol-managed hop-by-hop / framing destinations (`Connection`, `Content-Length`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, case-insensitive) are rejected — see [Final response framing](#final-response-framing). |
@@ -3497,15 +3560,15 @@ Delegates HTTP-family request authorization to [Open Policy Agent](https://www.o
 | `include_query_credentials` | Boolean | `false` | Unsafe opt-in to send built-in and authentication-plugin-marked query credentials to OPA. Explicit `redact_query_keys` remain omitted. |
 | `include_headers` | Boolean | `true` | Include request headers as `input.headers` after redaction. |
 | `include_body` | Boolean | `false` | After authentication succeeds, buffer and forward the request body. UTF-8 bodies use `input.body`; non-UTF-8 raw bytes use `input.body_base64`. |
-| `max_body_bytes` | Integer | `1048576` | Positive plugin-local request-body ceiling for `include_body`. The strictest of this value and the positive global limit applies; it remains bounded when the global limit is `0`. |
+| `max_body_bytes` | Integer or null | `1048576` | Positive plugin-local request-body ceiling for `include_body`. The strictest of this value and the positive global limit applies; it remains bounded when the global limit is `0`. An explicit `null` selects the default, exactly like omitting the key. |
 | `include_consumer` | Boolean | `true` | Include mapped Consumer data or external authenticated identity. |
 | `include_client_ip` | Boolean | `true` | Include `input.client_ip`. |
 | `include_service` | Boolean | `true` | Include matched proxy/service data. |
 | `query_ambiguity_policy` | String | `reject` | What to do when the query cannot be decoded to one value OPA and the backend are guaranteed to read identically. `reject` denies with `deny_status` / `deny_body` before calling OPA. `delegate` calls OPA anyway and lets Rego decide from `input.query_pairs` + `input.query_ambiguity`; `input.query` is omitted in that case, and the policy itself must deny on a classification it does not handle. |
-| `redact_headers` | String[] | built-ins | Additional request headers to omit from `input.headers`; built-in sensitive headers and active authentication credential headers are always omitted. |
+| `redact_headers` | String[] | built-ins | Additional request headers to omit from `input.headers`; entries must be non-empty valid HTTP header names. Built-in sensitive headers and active authentication credential headers are always omitted. |
 | `redact_query_keys` | String[] | `[]` | Additional query parameter names to omit from `input.query` and `input.query_pairs`, matched case-insensitively. Built-in credential names and query locations used by authentication plugins are omitted automatically. |
 
-Unknown or misspelled top-level OPA config keys are rejected at config load.
+Unknown or misspelled top-level OPA config keys are rejected at config load. `policy_path` must be non-empty, must not start with `/`, and must contain no percent-encoding, `?`, `#`, or empty / `.` / `..` segments. `headers`, `deny_headers`, and `fail_closed_headers` names must be HTTP tokens and their values visible ASCII; `headers` additionally rejects `content-type` (case-insensitively), and the two response maps reject protocol-managed hop-by-hop and framing destinations.
 
 #### Query canonicalization (advisories GHSA-j2j6-f9c7-hh85, GHSA-gr4p-3qw3-87r5)
 
@@ -3541,6 +3604,8 @@ Built-in request-header redaction always removes `authorization`, `proxy-authori
 `include_body` collection occurs only after authentication succeeds, so a `401` does not retain an OPA body copy. OPA's positive `max_body_bytes` limit is always enforced, including when `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0`. Successful OPA responses are streamed through the positive `max_response_bytes` ceiling before JSON parsing; body contents are never written to OPA error logs.
 
 The outbound OPA call uses the shared `PluginHttpClient`, so it shares connection pooling, DNS cache warmup, slow-call telemetry, and global outbound TLS settings such as `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`. Per-proxy backend TLS overrides do not apply; see [configuration.md#tls--mtls](configuration.md#tls--mtls).
+
+The measured boundary is the **complete decision**, not just its response headers. `latency_plugin_external_io_ms` and the `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS` slow-call warning both cover the request round trip plus the bounded read of the decision body, including a body read that fails, because the authorization decision is not made until the whole document has arrived. JSON parsing and policy evaluation happen after that boundary and are not counted as network I/O. The decision URL is recorded in those diagnostics as its origin only (scheme, host, port), so a credential in a configured base path never reaches process logs.
 
 ```yaml
 plugin_name: opa
@@ -5292,6 +5357,10 @@ Validates request and response bodies against operation schemas generated from a
 
 Config admission is closed: unknown keys at the root and in `bypass`, `error_response`, each `operations[]` entry, and `request_body` are rejected at construction with a spelling suggestion; explicit `null` cannot stand in for an omitted non-null field; and free-form media/status map keys are shape-validated. (`null` values in `bypass.header_present` intentionally mean “match any value.”) Response selection is status-first — an exact status precludes wildcard-range and `default` fallback, media selection happens only inside the selected response object, and an empty backend or gateway-generated synthetic body is parsed against the selected schema except for HEAD / 1xx / 204 / 205 / 304. Validation diagnostics are payload-free by construction on both sides (`GHSA-5p2h-fq6q-gwh9`): the client problem `detail` and the `openapi_validator.request_error` / `.response_error` metadata every logging plugin exports carry only a compiled-in failure category, an allowlisted JSON Schema keyword, and — request side only — a bounded instance location whose object-member segments survive only when the configured schema declares them as JSON properties (numeric pointer segments render as `#`; any other member name renders as `~`; depth, segment count, and total length are capped). No rejected instance value, expected `enum` / `const` constant, raw schema path (`$defs` / reference names), raw `jsonschema` or `roxmltree` rendering, configured XML name/namespace, hostile content-coding token, backend `Content-Type`, request target, or payload-chosen XML / form / multipart name is ever formatted into them. Response-side conversion and decode failures collapse further, to a single fixed sentence, because even the class of failure describes an upstream representation the client was never entitled to observe. There is no raw-diagnostic escape hatch in configuration or tracing.
 
+The client-contract phase precedes `body_validator` request checks in `before_proxy`; priorities apply within a phase. XML scalar elements must contain only text and namespace declarations. Wrapped arrays preserve an empty wrapper as `[]` and reject unmodeled wrapper content. Multipart Header Objects use simple serialization for scalar, array, and object schemas (`explode` defaults to false), with full header validation on every associated part. Non-UTF-8 binary bodies support boolean schemas or optional string-compatible `type`, byte-count `minLength`/`maxLength`, `format: binary`, and the annotations listed in the dedicated guide. Other assertions require a text representation and fail validation on non-UTF-8 bodies. UTF-8 binary bodies receive full string-schema validation.
+
+`max_body_bytes` accepts 1–18446744073709551615 and `error_truncate_chars` accepts 0–18446744073709551615, also subject to the target's `usize` range. Operation methods, paths, regexes, explicit labels, and bypass list entries must be nonempty. Error statuses accept 400–599; the error content type requires concrete RFC 9110 media syntax and valid parameters. Media selectors/map keys use MIME tokens (including braces), reject control characters, trim base-type whitespace, lowercase ASCII, and discard parameters before checking uniqueness. Normalized uniqueness, encoding-key membership in schema properties, and exploded-object key collisions are constructor checks. Encoding is limited to form-urlencoded/multipart requests, with `headers`/`contentType` limited to multipart; space/pipe-delimited styles require array/object properties and `explode: false`, and deepObject requires an object and explicit `explode: true`. Multipart contentType is nonempty and at most 4096 UTF-8 bytes after trimming. Response descriptions belong outside nested content maps, and responses cannot carry encoding metadata.
+
 See [openapi_validator.md](openapi_validator.md) for the full generated config shape, `x-ferrum-validate` options, and emergency override behavior.
 
 ### `request_size_limiting`
@@ -5408,18 +5477,18 @@ Configuration must be a top-level object. The only accepted keys are `ttl_second
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `ttl_seconds` | u64 | `300` | Fallback freshness lifetime when the backend response provides no `s-maxage`, `max-age`, or `Expires`, or when `respect_cache_control` is explicitly disabled; upstream `Age`, `Date`, and response delay still reduce remaining freshness |
+| `ttl_seconds` | u64 | `300` | Fallback freshness lifetime when the backend response provides no `s-maxage`, `max-age`, or `Expires`, or when `respect_cache_control` is explicitly disabled; upstream `Age`, `Date`, and response delay still reduce remaining freshness. Zero is accepted; a negative value, a non-integer, or one above `18446744073709551615` is refused at admission, as it is for the three capacity fields |
 | `max_entries` | u64 | `10000` | Maximum number of in-memory cache entries. Overflow is evicted oldest-first from an insertion-ordered queue in amortized O(1) per admitted entry — the accounting mutex never holds a full-map clone or sort (must be > 0) |
 | `max_entry_size_bytes` | u64 | `1048576` | Maximum size of a single cached response body (must be > 0) |
 | `max_total_size_bytes` | u64 | `104857600` | Maximum accounted retained response-entry footprint across all entries (must be > 0) |
-| `cacheable_methods` | String[] | `["GET","HEAD"]` | Methods eligible for caching. Must contain at least one entry, and every entry must be a valid HTTP method token that is also a **bodyless retrieval method** — only `GET` and `HEAD` are accepted. Body-bearing methods are refused at admission because lookup runs in `before_proxy`, ahead of `on_final_request_body`, so the exact backend-visible request body does not exist yet and cannot be bound into the key |
+| `cacheable_methods` | String[] | `["GET","HEAD"]` | Methods eligible for caching. Must contain at least one entry, and every entry must be a valid HTTP method token that is also a **bodyless retrieval method** — only `GET` and `HEAD` are accepted, in any letter casing (entries are uppercased before use). Every other method token, including `POST` and `OPTIONS`, is refused at admission because lookup runs in `before_proxy`, ahead of `on_final_request_body`, so the exact backend-visible request body does not exist yet and cannot be bound into the key |
 | `cacheable_status_codes` | u16[] | `[200,301,404]` | Response status codes eligible for caching. Must contain at least one entry, and every entry must be a final status between 200 and 599 whose caching semantics the plugin implements. `1xx`, `206`, and `304` are rejected at admission |
 | `respect_cache_control` | bool | `true` | Honor backend `Cache-Control` directives such as `no-store`, `private`, `max-age`, and `s-maxage`, including the qualified field-name forms `private="x-account"` and `no-cache="x-secret"`, and explicit `Expires`. Setting this to `false` explicitly overrides origin freshness with `ttl_seconds` |
 | `respect_no_cache` | bool | `true` | Bypass cache lookup when the client sends `Cache-Control: no-cache` or `no-store`. A header containing only bare, argument-free refresh members addresses the existing entry partition; argument-bearing directives and mixed refresh plus arbitrary/unimplemented directives stay bound as origin-visible context. When disabled, the entire request `Cache-Control` value stays bound because it is not an honored cache operation |
 | `vary_by_headers` | String[] | `[]` | Request headers to promote into the additional `Vary` tuple and downstream `Vary` contract even when the backend does not nominate them. The conservative base partition already binds every origin-visible request header. Every entry must be a valid HTTP header-name token |
 | `cache_key_include_query` | bool | `true` | Legacy keyspace toggle. The backend-effective query is now always bound because an origin may vary on it; this flag remains in the digest so changing it rotates the keyspace but can no longer authorize cross-query replay |
 | `cache_key_include_consumer` | bool | `false` | Legacy key-partition toggle. Caller isolation no longer depends on it: every key binds a mandatory caller-authorization partition (see below). The flag is still bound into the key digest so flipping it yields a disjoint keyspace. It does not authorize storage of a response to an `Authorization`-bearing request; the response still requires `public`, `must-revalidate`, or `s-maxage`. |
-| `anonymous_caller_scope` | String | `"caller_address"` | How **anonymous** callers are partitioned. `caller_address` binds the gateway-resolved canonical peer address (which the origin observes through Ferrum's regenerated `X-Forwarded-For`); a request whose canonical address cannot be parsed bypasses the cache rather than being keyed incompletely. `shared` is an explicit operator attestation that the origin does not vary by caller address on this route — it re-opens cross-caller replay for address-sensitive origins and must only be set when that is known-safe. It does not apply to authenticated callers, which always bind their canonical address. |
+| `anonymous_caller_scope` | String | `"caller_address"` | How **anonymous** callers are partitioned. The value is trimmed and ASCII-lowercased before it is matched, and `caller-address` is an accepted alias, so `caller_address`, `caller-address`, and `shared` are admitted in any letter casing and with surrounding whitespace; every other spelling is refused at admission. `caller_address` binds the gateway-resolved canonical peer address (which the origin observes through Ferrum's regenerated `X-Forwarded-For`); a request whose canonical address cannot be parsed bypasses the cache rather than being keyed incompletely. `shared` is an explicit operator attestation that the origin does not vary by caller address on this route — it re-opens cross-caller replay for address-sensitive origins and must only be set when that is known-safe. It does not apply to authenticated callers, which always bind their canonical address. |
 | `add_cache_status_header` | bool | `true` | Add `X-Cache-Status` (`MISS`, `HIT`, `BYPASS`, `REVALIDATED`) to downstream responses. Must be `false` when this PluginConfig carries a per-instance `trigger`, because the enabled form declares contextless response-trailer ownership |
 | `invalidate_on_unsafe_methods` | bool | `true` | After a non-error origin response (status below 400) to an unsafe method (`POST`, `PUT`, `PATCH`, `DELETE`, and any extension/custom method, which fails closed as unsafe), invalidate cached entries for the same matched proxy, normalized/transformed Host/authority partition, and path prefix (including descendants). Method safety is classified independently of `cacheable_methods`: an unsafe method listed there still invalidates after an origin MISS and non-error response, while a served cache HIT that never contacted the origin does not. Safe methods that are not in `cacheable_methods` (such as `OPTIONS`, or `HEAD` under a GET-only set) bypass without invalidating. Error responses, transport failures, and gateway-only synthetics that never receive a non-error origin status do not invalidate. Invalidation uses private origin-status provenance recorded before `after_proxy` hooks, so an earlier response hook that replaces the client-visible response cannot suppress eviction after a successful mutation |
 
@@ -5429,10 +5498,10 @@ Behavior:
 - A cache `HIT` or conditional `REVALIDATED` (`304`) sets a private `RequestContext` finalized-replay capability (shared with `request_deduplication` idempotent replay). The shared H1/H2/H3 synthetic rejection finalizer still runs response inspectors, final-body validators, and reject-path observability/`after_proxy` hooks, but skips ordinary presentation transforms — including `response_transformer` body rules and static/route-level header sequences — so non-idempotent rule sequences cannot mutate the stored representation again. Public request metadata cannot set or spoof that capability; unrelated synthetic short-circuits (mocks, faults, federation) do not inherit it.
 - Backend `Vary` is honored automatically. If the origin returns `Vary: Accept-Encoding`, compressed and uncompressed representations are cached separately.
 - Freshness uses one shared lifetime calculation for final-header classification and storage, retained on the entry for HIT decisions: `s-maxage` > `max-age` > `Expires - Date` > `ttl_seconds`. When `Date` is absent, the response receipt time supplies the baseline. Past expiry saturates to zero; invalid `Expires` (including `0`) is already expired and never falls back to the configured TTL. Repeated `Expires` fields, even identical ones, are conservatively expired; a present invalid or repeated `Date` also makes an Expires-based lifetime zero. Higher-priority `s-maxage`/`max-age` still override these dates. Repeated lifetime directives keep the shortest value, and any malformed member of that directive contributes zero, independently of order or header-name case.
-- Corrected initial age is the greater of apparent age from `Date` and upstream `Age` plus response delay. Cache residency consumes the remaining lifetime, and hits replace stored `Age` with current age. With `respect_cache_control: false`, the operator explicitly overrides both origin Cache-Control and Expires freshness with `ttl_seconds`; age accounting and the other storage safety checks still apply.
-- Unsafe methods (`POST`, `PUT`, `PATCH`, `DELETE`, and unrecognized extension/custom methods, which fail closed as unsafe) invalidate cached entries for the matched path under the **same normalized/transformed Host/authority partition used by cache lookup** when `invalidate_on_unsafe_methods` is enabled. Method safety is separate from `cacheable_methods` storage eligibility: an unsafe method that is also cacheable still invalidates after an origin MISS and non-error response, and a served cache HIT that never contacted the origin does not. Invalidation is deferred until proxy core records a non-error origin status (status below 400) — before any `after_proxy` hook can reject and replace the client-visible response — matching RFC 9111 §4.4. A failed or unauthorized mutation, transport failure, gateway-only synthetic, or any 4xx/5xx does not evict. Safe methods that are absent from `cacheable_methods` (such as `OPTIONS`, or `HEAD` under a GET-only set) bypass without invalidating.
+- Corrected initial age is the greater of apparent age from `Date` and upstream `Age` plus response delay. `Age` is a singleton field, so an origin that emits it on more than one field line arrives comma-folded (`Age: 90, 0`); the **first** member is used (RFC 9110 §5.5) rather than the whole list being discarded, so a response that was already stale on arrival stays stale instead of being silently rejuvenated to age zero. An oversized numeric age still saturates, and a first member that is not a plain `delta-seconds` is ignored exactly as a single malformed value is. Cache residency consumes the remaining lifetime, and hits replace stored `Age` with current age. With `respect_cache_control: false`, the operator explicitly overrides both origin Cache-Control and Expires freshness with `ttl_seconds`; age accounting and the other storage safety checks still apply.
+- Unsafe methods (`POST`, `PUT`, `PATCH`, `DELETE`, and unrecognized extension/custom methods, which fail closed as unsafe) invalidate cached entries for the matched path under the **same normalized/transformed Host/authority partition used by cache lookup** when `invalidate_on_unsafe_methods` is enabled. Method safety is separate from `cacheable_methods` storage eligibility: an unsafe method that is also cacheable still invalidates after an origin MISS and non-error response, and a served cache HIT that never contacted the origin does not. The descendant boundary is the mutated path plus exactly one `/` separator, so a path that already ends in `/` — including the root `/` — is its own boundary and its children are invalidated too; `POST /tree/` and `POST /tree` refresh the same descendants. Invalidation is deferred until proxy core records a non-error origin status (status below 400) — before any `after_proxy` hook can reject and replace the client-visible response — matching RFC 9111 §4.4. A failed or unauthorized mutation, transport failure, gateway-only synthetic, or any 4xx/5xx does not evict. Safe methods that are absent from `cacheable_methods` (such as `OPTIONS`, or `HEAD` under a GET-only set) bypass without invalidating.
 - When a store would exceed `max_total_size_bytes`, expired entries are reclaimed in expiration order under the accounting lock; the new entry is skipped only if it still does not fit, and a *fresh* retained representation is never dropped to make room for a new one. Expired entries therefore cannot trap the byte budget even when a later-inserted short-lived response expires behind an older long-lived one or `max_entries` was never exceeded. Byte-cap reclaim uses an ordered live-expiry index, while entry-count eviction uses an insertion-ordered queue; each path is bounded by the entries it actually retires rather than by cache size.
-- Conditional GET/HEAD requests can return `304 Not Modified` directly from the edge cache only for fresh stored successful (`2xx`) responses, including a current `Age` header. A valid standalone `If-None-Match: *` matches an existing eligible representation even without an `ETag`; entity-tag lists use weak comparison, and malformed wildcard/list values do not match. When `If-None-Match` is present it takes precedence over `If-Modified-Since`, including on a non-match or malformed value. Otherwise, a valid `If-Modified-Since` matches when the stored `Last-Modified` is no later than that date. Cached redirects and negative responses (for example `301`, `404`, or `410`) retain their stored status, body, and headers, including `Location`, regardless of either validator; they never become a cache-generated `304`.
+- Conditional GET/HEAD requests can return `304 Not Modified` directly from the edge cache only for fresh stored successful (`2xx`) responses, including a current `Age` header. A valid standalone `If-None-Match: *` matches an existing eligible representation even without an `ETag`; entity-tag lists use weak comparison, and malformed wildcard/list values do not match. A bounded number of empty list members — leading, interior, or trailing, as in `If-None-Match: , "v1"` or `"v1",` — is tolerated as RFC 9110 §5.6.1.2 requires, so a list that does name the stored representation still returns `304` instead of replaying the full `200`; a nonempty malformed member, and a value made only of separators, still do not match. When `If-None-Match` is present it takes precedence over `If-Modified-Since`, including on a non-match or malformed value. Otherwise, a valid `If-Modified-Since` matches when the stored `Last-Modified` is no later than that date. Cached redirects and negative responses (for example `301`, `404`, or `410`) retain their stored status, body, and headers, including `Location`, regardless of either validator; they never become a cache-generated `304`.
 - **Cache keys are opaque, canonically framed digests.** A key is `sha256(base partition)`, optionally followed by `.` and `sha256(complete Vary tuple)`. Every component is written as a typed, length-framed field, so no attacker-supplied header, path, or query byte can forge a field boundary and collide two structurally different requests onto one key. Keys are never logged.
 - **The base partition binds every stable backend-visible dimension**: the effective *post-routing* destination (proxy id/namespace, listen path, upstream id or direct host/port/scheme, route authority, rewritten path — `response_caching` runs after every route-dispatch plugin, so this is the destination that will serve a miss), the original authority, `Host`, method, path, effective outbound query, every origin-visible request header, and the caller-authorization partition below. Only entry-operation headers whose semantics this cache actually implements are omitted from the raw-header dimension: `If-None-Match` / `If-Modified-Since`, zero-length `Content-Length`, and a request `Cache-Control` value consisting entirely of bare, argument-free `no-cache` / `no-store` refresh members while `respect_no_cache` is enabled. A `correlation_id` header is omitted from that dimension *and* from the Vary digest only when private request provenance records that this instance generated the live value because the client omitted a valid inbound field (issue #3929). Client-supplied correlation values stay bound, including custom header names and each admitted instance independently; `x-request-id` is never globally ignored, and public metadata cannot mark a header as generated. The generated header is still forwarded to the origin and echoed downstream as configured. `Range` remains bound because this cache does not implement range selection; it refuses `206` / `Content-Range` responses instead. Argument-bearing directives and mixed refresh plus arbitrary/unimplemented directives remain fully bound, as does every `Cache-Control` value when `respect_no_cache` is disabled. The complete backend-nominated and operator-configured `Vary` tuple is appended as an additional digest (see below), credential/session values remain hashed, and cross-caller isolation is the mandatory caller partition. An origin therefore cannot cause cross-tenant replay merely by omitting a selector from `Vary`.
 - **Caller authorization, not a display subject.** Authenticated callers bind the authentication mechanism, the resolved identity and consumer, the peer SPIFFE identity, and SHA-256 digests of every credential header presented (`Authorization`, `Proxy-Authorization`, `Cookie`, `X-API-Key`, `API-Key`, `APIKey`, `X-Goog-Api-Key`, `X-Forwarded-Authorization`, `X-Amz-Security-Token`, `X-Auth-Token`, `X-Access-Token`). Two tokens that resolve to the same `sub` with different scopes, audiences, or tenancy claims therefore land in different partitions. Digests are taken over **both** the pristine inbound wire headers and the live backend-visible headers, under separate provenance labels: `response_caching` runs after `ai_stream_router`, which strips the client credential and injects the provider's, so binding only the live view would collapse two distinct client tokens onto one entry. **Every** caller — authenticated or not — also binds its canonical peer address, because the origin receives Ferrum's regenerated `X-Forwarded-For` for authenticated callers too; only an anonymous caller's address binding can be relaxed via `anonymous_caller_scope: shared`, and a caller whose canonical address cannot be derived bypasses the cache. This is unconditional — `cache_key_include_consumer` cannot disable it.
@@ -5444,6 +5513,8 @@ Behavior:
 - **Partial and validator-only responses are never stored as reusable representations.** `1xx`, `206`, and `304` are rejected when configured in `cacheable_status_codes`, refused again at store time, and never replayed if an entry somehow carries one. Any response carrying `Content-Range` is refused as well: a caller-selected byte range describes bytes, not the resource, so it must not become the entry a later unconditional request receives. Assembling ranges, freshening stored metadata from a `304`, and proving range applicability are not implemented, so eligibility is limited to statuses whose semantics the plugin fully implements.
 - The effective outbound query is always hashed byte-for-byte without parsing, sorting, percent-decoding, or normalizing, so duplicate parameters, parameter order, percent-encoded names, bare flags, empty values, and request-transformer rewrites remain distinct. `cache_key_include_query` is retained only as a legacy keyspace toggle.
 - Every cacheable response varies on `Authorization`, `Proxy-Authorization`, and `Cookie`; present values are hashed into the key and absent values remain distinct, so distinct credentials or sessions cannot share an entry and anonymous responses retain a safe downstream `Vary` boundary.
+- **The downstream `Vary` contract is published on the miss, not only on the hit.** These mandatory dimensions and every configured `vary_by_headers` name exist because a downstream shared cache cannot observe Ferrum's private caller partition — so the same merged, sorted list (origin `Vary` + configured names + already-published dimensions for the base key + `authorization`, `cookie`, `proxy-authorization`) is written onto the `X-Cache-Status: MISS` response itself, before it is emitted. Otherwise the *first*, publicly cacheable response — the one a downstream cache actually stores — would carry only whatever `Vary` the origin sent, and that cache could replay an anonymous representation to a credential- or session-bearing request until the entry expired. A `HIT`/`REVALIDATED` replays the identical list from the stored entry, and an origin `Vary: *` is left untouched because it is a stronger downstream refusal than any name list. `BYPASS` / `PREDICTED-BYPASS` responses establish no partition and are not rewritten.
+- **Gateway transport failures are never stored as origin responses.** A connection refused before the request reached the wire, or a peer that vanished mid-exchange, leaves proxy core to mint the `502`/`504` the client receives. Storage is refused from the typed backend-dispatch provenance rather than from the status or any metadata marker, so listing `502`/`504` in `cacheable_status_codes` to retain genuine origin error pages cannot pin a local transport error over a resource whose origin has already recovered, and behaves identically on HTTP/1.1, HTTP/2, and HTTP/3. An authoritative origin `502` under that configuration is still stored, and a transport failure is not an uncacheable-*resource* signal, so it does not teach the predictor.
 - Authorized responses are not cached unless the backend explicitly allows shared caching via `Cache-Control: public`, `must-revalidate`, or `s-maxage`. `cache_key_include_consumer` changes key partitioning only and cannot override this requirement.
 - **Responses containing `Set-Cookie` headers are never cached.** Set-Cookie headers are per-client and replaying them from a shared cache would leak session cookies to other users (RFC 7234 §8).
 - The plugin stores arbitrary response bytes, so binary responses and backend-compressed payloads can be cached safely.
