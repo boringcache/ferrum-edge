@@ -1697,7 +1697,7 @@ fn the_decoder_working_set_is_reserved_before_the_decoder_is_constructed() {
         .find("if !scratch.reserve_in(budget, coding.scratch_bytes())")
         .expect("the codec working set must be reserved against the aggregate budget");
     for decoder in [
-        "flate2::read::MultiGzDecoder::new(data)",
+        "flate2::bufread::GzDecoder::new(data)",
         "StrictBrotliReader::new(data)",
     ] {
         let constructed = decode

@@ -618,8 +618,8 @@ impl CompressionPlugin {
                 other => return Err(format!("unsupported content-encoding '{other}'")),
             }
         }
-        // Preserve the original member spelling only for the single-coding case
-        // used by legacy observability markers; chains record the full list.
+        // A single coding records its canonical member (`parse_content_codings`
+        // folds `x-gzip` into `gzip`); chains record the canonical list.
         let marker = if codings.len() == 1 {
             codings[0].clone()
         } else {

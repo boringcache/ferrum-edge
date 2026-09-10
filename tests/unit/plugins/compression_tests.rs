@@ -3753,11 +3753,13 @@ async fn test_single_member_gzip_request_normalization_decodes_with_charged_deco
             assert_eq!(body, plaintext);
             assert!(!headers.contains_key("content-encoding"));
             assert!(!headers.contains_key("content-length"));
+            // `parse_content_codings` canonicalizes `x-gzip` to `gzip`, so the
+            // handoff marker carries the canonical member for both spellings.
             assert_eq!(
                 headers
                     .get("x-ferrum-original-content-encoding")
                     .map(String::as_str),
-                Some(coding)
+                Some("gzip")
             );
             assert!(ctx.metadata.contains_key("compression:request_decoded"));
         }
