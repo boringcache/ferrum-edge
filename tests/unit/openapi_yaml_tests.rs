@@ -4719,7 +4719,7 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
     let runtime_overlay = spec
         .pointer("/components/schemas/RequestTransformerConfig/properties/runtime_overlay_scope")
         .expect("runtime_overlay_scope remains published");
-    assert_eq!(runtime_overlay["type"], json!("string"));
+    assert_eq!(runtime_overlay["type"], json!(["string", "null"]));
     assert_eq!(runtime_overlay["minLength"], json!(1));
     assert_eq!(runtime_overlay["pattern"], json!("\\S"));
     assert_eq!(
@@ -4727,6 +4727,52 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
             .expect("default_enabled remains published")["default"],
         json!(true)
     );
+
+    // Every optional field whose constructor treats explicit `null` as absent
+    // must admit `null` in the schema too.
+    for field in [
+        "apply_route_overrides",
+        "default_enabled",
+        "runtime_overlay_resolved_enabled",
+    ] {
+        let property = spec
+            .pointer(&format!(
+                "/components/schemas/RequestTransformerConfig/properties/{field}"
+            ))
+            .unwrap_or_else(|| panic!("{field} remains published"));
+        assert_eq!(
+            property["type"],
+            json!(["boolean", "null"]),
+            "{field} must admit the explicit null the constructor accepts"
+        );
+    }
+
+    // The no-effect config is rejected by the schema, not only by the
+    // constructor: either a non-empty `rules` array or the route-only opt-in.
+    assert!(
+        spec.pointer("/components/schemas/RequestTransformerConfig/anyOf")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|branches| branches.len() == 2),
+        "RequestTransformerConfig must model non-empty rules vs route-only opt-in"
+    );
+
+    // Per-operation field sets ARE expressible in Draft 2020-12, and every rule
+    // variant composes the one shared contract.
+    let contract = json!("#/components/schemas/TransformerOperationFieldExactness");
+    for variant in [
+        "RequestTransformerHeaderRule",
+        "RequestTransformerQueryRule",
+        "RequestTransformerBodyRule",
+    ] {
+        let composed = spec
+            .pointer(&format!("/components/schemas/{variant}/allOf"))
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| panic!("{variant} must compose the operation contract"));
+        assert!(
+            composed.iter().any(|branch| branch["$ref"] == contract),
+            "{variant} must reference the shared operation-field contract"
+        );
+    }
 
     for config in [
         json!({
@@ -4810,6 +4856,47 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
                 "value": "tab\there"
             }]
         }),
+        // Route-only opt-in: the translator-owned consumer carries no static
+        // rules at all.
+        json!({"apply_route_overrides": true}),
+        json!({"rules": [], "apply_route_overrides": true}),
+        // Explicit `null` on a field the constructor treats as absent.
+        json!({
+            "rules": [{"operation": "remove", "target": "header", "key": "x-audit"}],
+            "default_enabled": null
+        }),
+        json!({
+            "rules": [{"operation": "remove", "target": "header", "key": "x-audit"}],
+            "apply_route_overrides": null,
+            "runtime_overlay_scope": null,
+            "runtime_overlay_resolved_enabled": null
+        }),
+        // A numeric segment is an ordinary array index for add/update/remove.
+        json!({
+            "rules": [{
+                "operation": "update",
+                "target": "body",
+                "key": "items.0.name",
+                "value": "first"
+            }]
+        }),
+        // An ESCAPED numeric segment is a literal key, so rename still accepts it.
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "body",
+                "key": "counts\\.0",
+                "new_key": "counts_first"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "body",
+                "key": "user.old",
+                "new_key": "user.new"
+            }]
+        }),
     ] {
         assert_component_validity(&spec, "RequestTransformerConfig", &config, true);
         assert!(
@@ -4868,6 +4955,113 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
                 "vaule": "green"
             }]
         }),
+        // A config with no effect.
+        json!({}),
+        json!({"rules": []}),
+        json!({"apply_route_overrides": false}),
+        json!({"apply_route_overrides": null}),
+        // Per-operation required / forbidden properties, for every target.
+        json!({"rules": [{"operation": "update", "target": "header", "key": "x-audit"}]}),
+        json!({"rules": [{"operation": "add", "target": "query", "key": "audit"}]}),
+        json!({"rules": [{"operation": "add", "target": "body", "key": "audit"}]}),
+        json!({"rules": [{"operation": "rename", "target": "header", "key": "x-old"}]}),
+        json!({
+            "rules": [{
+                "operation": "remove",
+                "target": "header",
+                "key": "x-audit",
+                "value": "unused"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "remove",
+                "target": "query",
+                "key": "audit",
+                "new_key": "moved"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "header",
+                "key": "X-Old",
+                "new_key": "X-New",
+                "value": "blue"
+            }]
+        }),
+        // Operation-incompatible extras are rejected by PRESENCE, so an explicit
+        // `null` fails exactly as a string would — body rules included.
+        json!({
+            "rules": [{
+                "operation": "update",
+                "target": "header",
+                "key": "X-Color",
+                "value": "blue",
+                "new_key": null
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "remove",
+                "target": "body",
+                "key": "secret",
+                "new_key": null
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "update",
+                "target": "body",
+                "key": "state",
+                "value": "public",
+                "new_key": null
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "remove",
+                "target": "body",
+                "key": "secret",
+                "value": null
+            }]
+        }),
+        // Header field-name grammar.
+        json!({"rules": [{"operation": "remove", "target": "header", "key": "bad name"}]}),
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "header",
+                "key": "X-Old",
+                "new_key": "bad name"
+            }]
+        }),
+        // CR / LF in query strings is request-target injection.
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "query",
+                "key": "audit",
+                "value": "yes\r\nx: 1"
+            }]
+        }),
+        // Array indices are not renameable.
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "body",
+                "key": "items.0",
+                "new_key": "first"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "body",
+                "key": "first",
+                "new_key": "items.0"
+            }]
+        }),
     ] {
         assert_component_validity(&spec, "RequestTransformerConfig", &config, false);
         assert!(
@@ -4875,23 +5069,6 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
             "runtime accepted OpenAPI-invalid request_transformer config: {config}"
         );
     }
-
-    // Operation-incompatible extras are known OpenAPI properties but still fail
-    // runtime construction (schema cannot encode per-operation field sets).
-    let incompatible = json!({
-        "rules": [{
-            "operation": "update",
-            "target": "header",
-            "key": "X-Color",
-            "value": "blue",
-            "new_key": "X-Ignored"
-        }]
-    });
-    assert_component_validity(&spec, "RequestTransformerConfig", &incompatible, true);
-    assert!(
-        RequestTransformer::new(&incompatible).is_err(),
-        "runtime must reject operation-incompatible header fields: {incompatible}"
-    );
 }
 
 #[test]
@@ -4965,7 +5142,7 @@ fn response_transformer_schema_matches_runtime_target_and_value_contract() {
     let runtime_overlay = spec
         .pointer("/components/schemas/ResponseTransformerConfig/properties/runtime_overlay_scope")
         .expect("runtime_overlay_scope remains published");
-    assert_eq!(runtime_overlay["type"], json!("string"));
+    assert_eq!(runtime_overlay["type"], json!(["string", "null"]));
     assert_eq!(runtime_overlay["minLength"], json!(1));
     assert_eq!(runtime_overlay["pattern"], json!("\\S"));
     assert_eq!(
@@ -4973,6 +5150,45 @@ fn response_transformer_schema_matches_runtime_target_and_value_contract() {
             .expect("default_enabled remains published")["default"],
         json!(true)
     );
+
+    for field in [
+        "apply_route_overrides",
+        "default_enabled",
+        "runtime_overlay_resolved_enabled",
+    ] {
+        let property = spec
+            .pointer(&format!(
+                "/components/schemas/ResponseTransformerConfig/properties/{field}"
+            ))
+            .unwrap_or_else(|| panic!("{field} remains published"));
+        assert_eq!(
+            property["type"],
+            json!(["boolean", "null"]),
+            "{field} must admit the explicit null the constructor accepts"
+        );
+    }
+
+    assert!(
+        spec.pointer("/components/schemas/ResponseTransformerConfig/anyOf")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|branches| branches.len() == 2),
+        "ResponseTransformerConfig must model non-empty rules vs route-only opt-in"
+    );
+
+    let contract = json!("#/components/schemas/TransformerOperationFieldExactness");
+    for variant in [
+        "ResponseTransformerHeaderRule",
+        "ResponseTransformerBodyRule",
+    ] {
+        let composed = spec
+            .pointer(&format!("/components/schemas/{variant}/allOf"))
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| panic!("{variant} must compose the operation contract"));
+        assert!(
+            composed.iter().any(|branch| branch["$ref"] == contract),
+            "{variant} must reference the shared operation-field contract"
+        );
+    }
 
     for config in [
         json!({
@@ -5000,6 +5216,32 @@ fn response_transformer_schema_matches_runtime_target_and_value_contract() {
         json!({
             "rules": [{
                 "operation": "add", "target": "header", "key": "X-Edge", "value": "tab\there"
+            }]
+        }),
+        json!({"apply_route_overrides": true}),
+        json!({"rules": [], "apply_route_overrides": true}),
+        json!({
+            "rules": [{"operation": "remove", "target": "header", "key": "X-Internal"}],
+            "apply_route_overrides": null,
+            "runtime_overlay_scope": null,
+            "default_enabled": null,
+            "runtime_overlay_resolved_enabled": null
+        }),
+        // Set-Cookie is renameable neither way, but every other operation on it
+        // stays available.
+        json!({"rules": [{"operation": "remove", "target": "header", "key": "Set-Cookie"}]}),
+        json!({
+            "rules": [{
+                "operation": "add", "target": "header", "key": "Set-Cookie", "value": "a=1"
+            }]
+        }),
+        json!({"rules": [{"operation": "remove", "target": "body", "key": "items.0"}]}),
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "body",
+                "key": "counts\\.0",
+                "new_key": "counts_first"
             }]
         }),
     ] {
@@ -5040,6 +5282,72 @@ fn response_transformer_schema_matches_runtime_target_and_value_contract() {
                 "vaule": "green"
             }]
         }),
+        json!({}),
+        json!({"rules": []}),
+        json!({"apply_route_overrides": false}),
+        json!({"rules": [{"operation": "update", "target": "header", "key": "x-audit"}]}),
+        json!({"rules": [{"operation": "add", "target": "body", "key": "audit"}]}),
+        json!({"rules": [{"operation": "rename", "target": "header", "key": "x-old"}]}),
+        json!({
+            "rules": [{
+                "operation": "remove",
+                "target": "header",
+                "key": "x-audit",
+                "value": "unused"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "update",
+                "target": "header",
+                "key": "X-Color",
+                "value": "blue",
+                "new_key": null
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "remove",
+                "target": "body",
+                "key": "secret",
+                "new_key": null
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "update",
+                "target": "body",
+                "key": "state",
+                "value": "public",
+                "new_key": null
+            }]
+        }),
+        json!({"rules": [{"operation": "remove", "target": "header", "key": "bad name"}]}),
+        // Set-Cookie's newline-joined multi-value encoding is name-bound.
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "header",
+                "key": "Set-Cookie",
+                "new_key": "X-Cookies"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "header",
+                "key": "X-Cookies",
+                "new_key": "SET-COOKIE"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "body",
+                "key": "items.0",
+                "new_key": "first"
+            }]
+        }),
     ] {
         assert_component_validity(&spec, "ResponseTransformerConfig", &config, false);
         assert!(
@@ -5047,23 +5355,6 @@ fn response_transformer_schema_matches_runtime_target_and_value_contract() {
             "runtime accepted OpenAPI-invalid response_transformer config: {config}"
         );
     }
-
-    // Operation-incompatible extras are known OpenAPI properties but still fail
-    // runtime construction (schema cannot encode per-operation field sets).
-    let incompatible = json!({
-        "rules": [{
-            "operation": "update",
-            "target": "header",
-            "key": "X-Color",
-            "value": "blue",
-            "new_key": "X-Ignored"
-        }]
-    });
-    assert_component_validity(&spec, "ResponseTransformerConfig", &incompatible, true);
-    assert!(
-        ResponseTransformer::new(&incompatible).is_err(),
-        "runtime must reject operation-incompatible header fields: {incompatible}"
-    );
 }
 
 #[test]
