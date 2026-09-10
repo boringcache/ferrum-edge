@@ -2226,8 +2226,11 @@ fn test_response_buffering_skips_range_responses_via_metadata_marker() {
         .insert("ferrum:range_response".to_string(), "true".to_string());
 
     // Live headers look like a plain compressible 200 (Content-Range stripped).
+    // The length is deliberately above the default `min_content_length` (256)
+    // and carries no `Content-Encoding`, so neither header-knowable exclusion
+    // (issue #5094) can be what decides either assertion below.
     let mut resp_headers = HashMap::new();
-    resp_headers.insert("content-length".to_string(), "100".to_string());
+    resp_headers.insert("content-length".to_string(), "5000".to_string());
     assert!(!plugin.should_buffer_response_body_for_content_type(
         &ctx,
         Some("text/html"),
@@ -3061,11 +3064,25 @@ async fn test_gzip_request_decompression() {
     encoder.write_all(original).unwrap();
     let compressed = encoder.finish().unwrap();
 
+    // `before_proxy` owns the decode: it claims request-decode ownership,
+    // validates the body, and hands the plaintext to the ownership-scoped
+    // transform. The context-FREE hook is inert by design (issue #5093), so it
+    // is not the one asked here.
+    let mut ctx = make_request_ctx_with_body("gzip", &compressed);
     let mut headers = HashMap::new();
     headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
 
     let decompressed = plugin
-        .transform_request_body(&compressed, Some("application/json"), &headers)
+        .transform_request_body_with_context(
+            &mut ctx,
+            &compressed,
+            Some("application/json"),
+            &headers,
+        )
         .await
         .expect("should decompress");
 
@@ -3096,10 +3113,16 @@ async fn test_before_proxy_strips_client_supplied_internal_marker() {
         "no real content-encoding was present; metadata must not be set"
     );
 
-    // transform_request_body should NOT attempt decompression on a plaintext
-    // body when only the client-supplied marker was present (now removed).
+    // The production transform must NOT attempt decompression on a plaintext
+    // body when only the client-supplied marker was present (now removed): no
+    // instance claimed the decode, so no instance may rewrite the bytes.
     let result = plugin
-        .transform_request_body(b"plaintext body", Some("application/json"), &headers)
+        .transform_request_body_with_context(
+            &mut ctx,
+            b"plaintext body",
+            Some("application/json"),
+            &headers,
+        )
         .await;
     assert!(result.is_none());
 }
@@ -3117,11 +3140,23 @@ async fn test_brotli_request_decompression() {
     let params = brotli::enc::BrotliEncoderParams::default();
     brotli::BrotliCompress(&mut &original[..], &mut compressed, &params).unwrap();
 
+    // Same ownership handoff as the gzip case: the decode happens once, in
+    // `before_proxy`, and the context-aware transform publishes the plaintext.
+    let mut ctx = make_request_ctx_with_body("br", &compressed);
     let mut headers = HashMap::new();
     headers.insert("content-encoding".to_string(), "br".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
 
     let decompressed = plugin
-        .transform_request_body(&compressed, Some("application/json"), &headers)
+        .transform_request_body_with_context(
+            &mut ctx,
+            &compressed,
+            Some("application/json"),
+            &headers,
+        )
         .await
         .expect("should decompress");
 
@@ -3132,11 +3167,29 @@ async fn test_brotli_request_decompression() {
 async fn test_request_decompression_disabled_by_default() {
     let plugin = make_plugin(json!({})); // decompress_request defaults false
 
+    let compressed = gzip_bytes(b"some compressed data");
+    let mut ctx = make_request_ctx_with_body("gzip", &compressed);
     let mut headers = HashMap::new();
     headers.insert("content-encoding".to_string(), "gzip".to_string());
 
+    // Nothing is claimed and no representation metadata is stripped, so the
+    // backend receives the client's encoded request exactly as sent.
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+
     let result = plugin
-        .transform_request_body(b"some compressed data", Some("application/json"), &headers)
+        .transform_request_body_with_context(
+            &mut ctx,
+            &compressed,
+            Some("application/json"),
+            &headers,
+        )
         .await;
     assert!(result.is_none());
 }
@@ -3156,12 +3209,25 @@ async fn test_request_decompression_zip_bomb_protection() {
     encoder.write_all(&big_body).unwrap();
     let compressed = encoder.finish().unwrap();
 
+    let mut ctx = make_request_ctx_with_body("gzip", &compressed);
     let mut headers = HashMap::new();
     headers.insert("content-encoding".to_string(), "gzip".to_string());
 
-    // Should fail (return None) due to size limit
+    // The ceiling is enforced where the decode now lives. The request is
+    // refused as a representation fault, nothing is claimed, and no plaintext
+    // is staged — so the ownership-scoped transform has nothing to publish and
+    // the over-expanded bytes never reach a backend.
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 400),
+        other => panic!("expected Reject for an oversize gzip body, got {other:?}"),
+    }
     let result = plugin
-        .transform_request_body(&compressed, Some("application/json"), &headers)
+        .transform_request_body_with_context(
+            &mut ctx,
+            &compressed,
+            Some("application/json"),
+            &headers,
+        )
         .await;
     assert!(result.is_none());
 }
@@ -3792,7 +3858,12 @@ async fn test_request_cache_control_no_transform_still_decompresses_request_body
     );
 
     let transformed = plugin
-        .transform_request_body(&compressed, Some("application/octet-stream"), &headers)
+        .transform_request_body_with_context(
+            &mut ctx,
+            &compressed,
+            Some("application/octet-stream"),
+            &headers,
+        )
         .await;
     assert_eq!(
         transformed.as_deref(),
@@ -3842,7 +3913,12 @@ async fn test_original_request_no_transform_marker_restores_header_and_decompres
     );
 
     let transformed = plugin
-        .transform_request_body(&compressed, Some("application/octet-stream"), &headers)
+        .transform_request_body_with_context(
+            &mut ctx,
+            &compressed,
+            Some("application/octet-stream"),
+            &headers,
+        )
         .await;
     assert_eq!(
         transformed.as_deref(),
@@ -3962,10 +4038,17 @@ async fn test_decompressed_payload_that_is_itself_gzip_is_accepted() {
         "one transport gzip layer is valid even when the payload is itself gzip"
     );
 
-    // And the body transform yields exactly the inner .gz file bytes (one layer
-    // removed), not a rejection or truncation.
+    // And the ownership-scoped body transform yields exactly the inner .gz file
+    // bytes (one layer removed), not a rejection or truncation. Exactly one
+    // layer: a second decode here would deliver the archive's CONTENTS instead
+    // of the archive (issue #5093).
     let decoded = plugin
-        .transform_request_body(&outer_gz, Some("application/octet-stream"), &headers)
+        .transform_request_body_with_context(
+            &mut ctx,
+            &outer_gz,
+            Some("application/octet-stream"),
+            &headers,
+        )
         .await
         .expect("one gzip layer should decode to the inner .gz bytes");
     assert_eq!(decoded, inner_gz);
