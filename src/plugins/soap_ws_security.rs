@@ -6249,10 +6249,6 @@ fn exclusive_canonicalize(
     Ok(output.into_bytes())
 }
 
-// Reached only via the lib target's `_test_support` shim (external unit tests);
-// the bin target duplicates the module tree with no caller, so it sees this as
-// dead code.
-#[allow(dead_code)]
 /// Canonicalize one element under an EXPLICIT budget, returning the outcome
 /// together with whatever budget is left.
 ///
