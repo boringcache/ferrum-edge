@@ -5,7 +5,13 @@ use ferrum_edge::{
     config::{BackendAllowIps, BackendEgressPolicy},
     plugins::{
         Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult, RequestContext,
-        ResponseStreamAction, ResponseStreamInspector, ai_tool_governor::AiToolGovernor,
+        ResponseStreamAction, ResponseStreamInspector,
+        ai_tool_governor::{
+            AI_TOOL_GOVERNOR_APPROVAL_KEYS, AI_TOOL_GOVERNOR_BLOCKED_PATTERN_KEYS,
+            AI_TOOL_GOVERNOR_CONFIG_KEYS, AI_TOOL_GOVERNOR_INSPECT_KEYS,
+            AI_TOOL_GOVERNOR_OBSERVABILITY_KEYS, AI_TOOL_GOVERNOR_RESPONSE_KEYS,
+            AI_TOOL_GOVERNOR_TOOL_POLICY_KEYS, AiToolGovernor,
+        },
         available_plugins, correlation_id::CorrelationId, create_plugin_with_http_client,
         create_response_stream_inspector, plugin_failure_policy, priority, validate_plugin_config,
     },
@@ -11957,4 +11963,342 @@ async fn streaming_unknown_shape_enforce_cut_still_records_observation() {
         Some("unrecognized_tool_call_shape"),
         "a cut stream must still explain itself in the summary"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Typed configuration admission and OpenAPI parity (#5286, #5287, #5288, #5291)
+// ---------------------------------------------------------------------------
+
+/// Compile the published `AiToolGovernorConfig` component so admission cases can
+/// be checked against the schema operator tooling actually consumes.
+fn openapi_config_validator() -> jsonschema::Validator {
+    let spec: Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/AiToolGovernorConfig",
+        "components": spec["components"].clone()
+    });
+    jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("AiToolGovernorConfig compiles")
+}
+
+/// Runtime admission and the published schema must reach the same verdict.
+fn assert_admission_parity(
+    validator: &jsonschema::Validator,
+    config: &Value,
+    admitted: bool,
+    label: &str,
+) {
+    let runtime_error = try_make(config.clone()).err();
+    assert_eq!(
+        runtime_error.is_none(),
+        admitted,
+        "{label}: runtime admission disagreed ({runtime_error:?})"
+    );
+    assert_eq!(
+        validator.is_valid(config),
+        admitted,
+        "{label}: openapi schema disagreed"
+    );
+}
+
+/// Issue #5286: a present-but-non-string `risk` is an operator mistake, not an
+/// omission, and must never resolve to the `low` default.
+#[test]
+fn non_string_tool_risk_is_rejected_rather_than_defaulted() {
+    let validator = openapi_config_validator();
+    let with_risk = |risk: Value| {
+        json!({
+            "default_action": "deny",
+            "tools": { "lookup": { "action": "allow", "risk": risk } }
+        })
+    };
+
+    for wrong in [
+        json!(7),
+        json!(null),
+        json!(false),
+        json!(["high"]),
+        json!({ "level": "high" }),
+    ] {
+        let config = with_risk(wrong.clone());
+        let err = try_make(config.clone())
+            .err()
+            .expect("a present non-string risk must fail admission");
+        assert!(err.contains("'risk'"), "{err}");
+        assert!(err.contains("must be a string"), "{err}");
+        assert!(err.contains("lookup"), "error must name the tool: {err}");
+        assert!(!validator.is_valid(&config), "schema must reject {wrong}");
+    }
+
+    // A non-enum *string* keeps its existing, distinct diagnostic.
+    let misspelled = with_risk(json!("severe"));
+    let err = try_make(misspelled.clone())
+        .err()
+        .expect("an unknown risk band must fail admission");
+    assert!(err.contains("invalid risk"), "{err}");
+    assert!(!validator.is_valid(&misspelled));
+
+    // Omission and every valid spelling are unchanged.
+    for spelling in ["low", "medium", "high", "critical"] {
+        assert_admission_parity(&validator, &with_risk(json!(spelling)), true, spelling);
+    }
+    let omitted = json!({
+        "default_action": "deny",
+        "tools": { "lookup": { "action": "allow" } }
+    });
+    assert_admission_parity(&validator, &omitted, true, "risk omitted");
+}
+
+/// The omission default itself must not regress while the type check is added.
+#[tokio::test]
+async fn omitted_tool_risk_still_reports_low() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "danger": { "action": "deny" } }
+    }));
+    let mut ctx = create_test_context();
+    let body = response_with_tool_call("danger", "{}");
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+            .await,
+        Some(403),
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.risk")
+            .map(String::as_str),
+        Some("low")
+    );
+}
+
+/// Issue #5286: the same rule for the approval error policy, whose silent
+/// default is the fail-closed `reject` posture.
+#[test]
+fn non_string_approval_fail_on_error_is_rejected_rather_than_defaulted() {
+    let validator = openapi_config_validator();
+    let with_policy = |fail_on_error: Value| {
+        json!({
+            "default_action": "deny",
+            "tools": { "deploy": { "action": "require_approval" } },
+            "approval": {
+                "endpoint_url": "https://approval.example/decide",
+                "fail_on_error": fail_on_error
+            }
+        })
+    };
+
+    for wrong in [json!(7), json!(null), json!(true), json!([]), json!({})] {
+        let config = with_policy(wrong.clone());
+        let err = try_make(config.clone())
+            .err()
+            .expect("a present non-string fail_on_error must fail admission");
+        assert!(err.contains("approval.fail_on_error"), "{err}");
+        assert!(err.contains("must be a string"), "{err}");
+        assert!(!validator.is_valid(&config), "schema must reject {wrong}");
+    }
+
+    let misspelled = with_policy(json!("refuse"));
+    let err = try_make(misspelled.clone())
+        .err()
+        .expect("an unknown error policy must fail admission");
+    assert!(err.contains("must be one of"), "{err}");
+    assert!(!validator.is_valid(&misspelled));
+
+    for spelling in ["reject", "warn", "allow"] {
+        assert_admission_parity(&validator, &with_policy(json!(spelling)), true, spelling);
+    }
+    let omitted = json!({
+        "default_action": "deny",
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": { "endpoint_url": "https://approval.example/decide" }
+    });
+    assert_admission_parity(&validator, &omitted, true, "fail_on_error omitted");
+}
+
+/// Issue #5288: `url::Url` normalizes the scheme before the http/https check, so
+/// the published pattern must admit the same case variants the runtime does.
+#[test]
+fn approval_endpoint_scheme_case_matches_runtime_url_normalization() {
+    let validator = openapi_config_validator();
+    let with_url = |url: &str| {
+        json!({
+            "default_action": "deny",
+            "tools": { "deploy": { "action": "require_approval" } },
+            "approval": { "endpoint_url": url }
+        })
+    };
+
+    for url in [
+        "http://approval.example/decide",
+        "https://approval.example/decide",
+        "HTTP://approval.example/decide",
+        "HTTPS://approval.example/decide",
+        "HtTpS://approval.example/decide",
+    ] {
+        assert_admission_parity(&validator, &with_url(url), true, url);
+    }
+
+    for url in [
+        "ftp://approval.example/decide",
+        "FTP://approval.example/decide",
+        "file:///etc/passwd",
+        "not-a-url",
+    ] {
+        assert_admission_parity(&validator, &with_url(url), false, url);
+    }
+}
+
+/// Issue #5287: unknown-key rejection runs before the `enabled: false` short
+/// circuit and reaches every nested fixed-shape layer, so the disabled schema
+/// branch must close those layers too — while still tolerating the ignored
+/// values a never-parsed draft may carry.
+#[test]
+fn disabled_config_schema_and_runtime_agree_on_nested_keys() {
+    let validator = openapi_config_validator();
+
+    // Unknown property names fail closed at every nesting level, even inert.
+    assert_admission_parity(
+        &validator,
+        &json!({ "enabled": false, "modde": "enforce" }),
+        false,
+        "root typo",
+    );
+    assert_admission_parity(
+        &validator,
+        &json!({ "enabled": false, "inspect": { "typo": true } }),
+        false,
+        "inspect typo",
+    );
+    assert_admission_parity(
+        &validator,
+        &json!({ "enabled": false, "tools": { "lookup": { "typo": true } } }),
+        false,
+        "tool policy typo",
+    );
+    assert_admission_parity(
+        &validator,
+        &json!({
+            "enabled": false,
+            "tools": { "lookup": { "blocked_arg_patterns": [{ "nmae": "s", "regex": "x" }] } }
+        }),
+        false,
+        "blocked pattern typo",
+    );
+    assert_admission_parity(
+        &validator,
+        &json!({ "enabled": false, "approval": { "endpoint_ur": "https://a.example/x" } }),
+        false,
+        "approval typo",
+    );
+    assert_admission_parity(
+        &validator,
+        &json!({ "enabled": false, "response": { "deny_status": 403 } }),
+        false,
+        "response typo",
+    );
+    assert_admission_parity(
+        &validator,
+        &json!({ "enabled": false, "observability": { "emit_meta": true } }),
+        false,
+        "observability typo",
+    );
+
+    // Known names keep ignored-value semantics: a disabled draft is never
+    // parsed, so wrong-typed and out-of-range values stay admissible.
+    assert_admission_parity(&validator, &json!({ "enabled": false }), true, "minimal");
+    assert_admission_parity(
+        &validator,
+        &json!({ "enabled": false, "mode": 7, "tools": null }),
+        true,
+        "ignored scalars",
+    );
+    assert_admission_parity(
+        &validator,
+        &json!({ "enabled": false, "inspect": "off", "response": 3 }),
+        true,
+        "non-object nested values",
+    );
+    assert_admission_parity(
+        &validator,
+        &json!({ "enabled": false, "tools": { "lookup": 7 } }),
+        true,
+        "non-object tool policy",
+    );
+    assert_admission_parity(
+        &validator,
+        &json!({
+            "enabled": false,
+            "tools": { "lookup": { "action": "allow", "risk": 7 } }
+        }),
+        true,
+        "wrong-typed tool policy value",
+    );
+    assert_admission_parity(
+        &validator,
+        &json!({
+            "enabled": false,
+            "tools": { "lookup": { "blocked_arg_patterns": "nope" } }
+        }),
+        true,
+        "non-array blocked patterns",
+    );
+    assert_admission_parity(
+        &validator,
+        &json!({
+            "enabled": false,
+            "tools": { "lookup": { "json_schema": { "anything": true } } }
+        }),
+        true,
+        "open json_schema document",
+    );
+    assert_admission_parity(
+        &validator,
+        &json!({
+            "enabled": false,
+            "approval": { "endpoint_url": 7, "cache_ttl_seconds": 99999999 }
+        }),
+        true,
+        "wrong-typed approval values",
+    );
+}
+
+/// Issue #5291: the overview calls the dedicated guide the complete schema, so
+/// every key the runtime allowlists must appear in its configuration reference.
+#[test]
+fn configuration_guide_documents_every_accepted_key() {
+    let guide = include_str!("../../../docs/plugins/ai_tool_governor.md");
+    let reference = guide
+        .split_once("## Configuration reference")
+        .expect("guide must carry a configuration reference")
+        .1
+        .split_once("\n## Examples")
+        .expect("the configuration reference must end before the examples")
+        .0;
+
+    for key in AI_TOOL_GOVERNOR_CONFIG_KEYS
+        .iter()
+        .chain(AI_TOOL_GOVERNOR_INSPECT_KEYS)
+        .chain(AI_TOOL_GOVERNOR_TOOL_POLICY_KEYS)
+        .chain(AI_TOOL_GOVERNOR_BLOCKED_PATTERN_KEYS)
+        .chain(AI_TOOL_GOVERNOR_APPROVAL_KEYS)
+        .chain(AI_TOOL_GOVERNOR_RESPONSE_KEYS)
+        .chain(AI_TOOL_GOVERNOR_OBSERVABILITY_KEYS)
+    {
+        assert!(
+            reference.contains(&format!("`{key}`")),
+            "configuration reference omits '{key}'"
+        );
+    }
+
+    // Bounds and defaults an operator cannot guess from the key name alone.
+    for documented in ["2592000", "30000", "1500", "`300`", "`0` disables"] {
+        assert!(
+            reference.contains(documented),
+            "configuration reference omits {documented}"
+        );
+    }
 }
