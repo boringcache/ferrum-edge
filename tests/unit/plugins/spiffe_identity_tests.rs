@@ -594,6 +594,90 @@ async fn test_stream_pre_stamped_identity_is_never_certificate_bounded() {
     assert!(ctx.credential_deadline_at().is_none());
 }
 
+/// ~7,900 years out: the "no well-defined expiration" shape RFC 5280 spells
+/// `99991231235959Z`, expressed as an offset `time::OffsetDateTime` can still
+/// represent. Whether it converts to a monotonic `Instant` depends on the host
+/// clock, which is exactly the platform split issue #5396 is about.
+const NO_EXPIRATION_OFFSET_SECS: i64 = 250_000_000_000;
+
+#[tokio::test]
+async fn test_http_request_admits_an_svid_with_no_well_defined_expiration() {
+    // A valid long-lived SVID must admit its principal on every platform: an
+    // expiry the monotonic clock cannot express is not an invalid credential
+    // and must not become the fixed 403 (issue #5396).
+    let cert_der = svid_with_validity(LIFETIME_SVID, -60, NO_EXPIRATION_OFFSET_SECS);
+    let plugin = SpiffeIdentity::new(&json!({})).unwrap();
+    let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+    ctx.tls_client_cert_der = Some(Arc::new(cert_der));
+
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.peer_spiffe_id.as_ref().map(SpiffeId::as_str),
+        Some(LIFETIME_SVID)
+    );
+    assert!(ctx.has_certificate_spiffe_principal());
+    assert!(request_is_authenticated(&ctx));
+
+    // Where the expiry IS representable the leaf's own bound wins; where it is
+    // not, the credential carries none and the finite authenticated-stream
+    // maximum bounds the request instead. Either way an admitted principal is
+    // still bounded.
+    let plan = effective_request_auth_deadline(&ctx, 3_600)
+        .expect("an admitted SPIFFE principal must have an authorization deadline");
+    if request_credential_deadline_at(&ctx).is_none() {
+        assert_eq!(
+            plan.termination,
+            StreamAuthTermination::AuthenticatedStreamMaxLifetime
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_stream_connect_admits_an_svid_with_no_well_defined_expiration() {
+    let cert_der = svid_with_validity(LIFETIME_SVID, -60, NO_EXPIRATION_OFFSET_SECS);
+    let plugin = SpiffeIdentity::new(&json!({})).unwrap();
+    let mut ctx = empty_stream_ctx(Some(cert_der));
+
+    assert!(matches!(
+        plugin.on_stream_connect(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(ctx.has_certificate_spiffe_principal());
+    assert!(ctx.is_authenticated());
+}
+
+#[test]
+fn test_admission_admits_an_unrepresentable_expiry_instead_of_refusing_it() {
+    // Shape contract for the branch a Linux CI clock cannot reach: the
+    // far-future arm publishes no bound, and only the unusable-interval arm
+    // reaches the fixed 403 (issue #5396).
+    let source = include_str!("../../../src/plugins/mesh/spiffe_identity.rs");
+    for hook in ["fn on_request_received(", "fn on_stream_connect("] {
+        let body = source
+            .split(hook)
+            .nth(1)
+            .expect("the hook must exist")
+            .split("CredentialDeadline::Unbounded =>")
+            .nth(1)
+            .expect("the far-future arm must be handled explicitly")
+            .split("CredentialDeadline::Invalid =>")
+            .next()
+            .expect("bounded far-future arm");
+        assert!(
+            !body.contains("invalid_svid_reject"),
+            "an expiry beyond the representable monotonic range must admit the \
+             SVID, not refuse it"
+        );
+    }
+    assert!(
+        source.contains("CredentialDeadline::Invalid =>"),
+        "an unusable validity interval must still refuse the SVID"
+    );
+}
+
 #[test]
 fn test_spiffe_identity_keeps_a_tcp_tls_listener_off_the_ktls_handoff() {
     // A kTLS leg is relayed by splice(2), where the session's authorization

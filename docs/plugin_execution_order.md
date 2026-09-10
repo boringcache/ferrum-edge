@@ -1569,6 +1569,8 @@ The plugin is also active on three response phases, which is where result policy
 
 `a2a_gateway` sits at priority 2993: it runs after MCP handling and before final mesh route dispatch. It observes HTTP JSON-RPC, HTTP+JSON/REST, and gRPC A2A methods, applies optional method policy, rewrites HTTP and unary gRPC Agent Card responses, and emits `a2a.*` metadata. It preserves SSE and non-card gRPC streaming and does not own A2A task state.
 
+JSON-RPC method policy is re-decided in `on_final_request_body`, over the exact representation the backend will receive, so a later body transformer cannot rewrite the `method` member after the arrival-time decision admitted the request. Agent Card production is a declared bounded response producer on both bindings. It normally runs in the semantic transform stage; when `grpc_web` is also configured, the unary gRPC card is instead rewritten in the earlier `normalize_response_body` phase, because the translator re-frames the body in that same transform stage at a lower priority and the card would otherwise be handed to the rewriter already carrying a gRPC-Web trailer frame.
+
 `mesh_route_dispatch` intentionally sits at priority 2995: authentication, `mesh_authz`, and rate limiting evaluate the original public proxy identity, then route overrides apply before request transformers, mirror/serverless/caching plugins, and backend dispatch. For node-waypoint Service egress with scoped mesh policies, `mesh_authz` stamps the authorized Service upstream and `mesh_route_dispatch` rejects any matching rule that would rewrite that request to a different upstream or direct backend. When multiple instances are attached to the same proxy, each matching instance replaces the complete override destination and route-local timeout/retry policy from earlier instances; a non-matching later instance leaves any earlier match in place. Per-rule `backend_tls` is only valid for direct `backend_host`/`backend_port` destinations; `upstream_id` destinations use TLS from the referenced `Upstream`. For WebSockets, the override selects only the upgrade handshake backend; the upgraded connection is pinned to that backend and frame hooks do not re-route individual frames. HBONE CONNECT traffic flows through the standard `before_proxy` chain before the HBONE relay consumes route overrides; inner H2 frames are not re-classified per stream.
 
 `reject_unmatched` is evaluated across all attached `mesh_route_dispatch`
@@ -1636,7 +1638,7 @@ Given all built-in plugins enabled, the execution order is:
 | 43 | `ai_tool_governor` | 2978 | before_proxy, on_final_request_body, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated |
 | 44 | `ai_stream_router` | 2984 | before_proxy, transform_request_body, enforce_final_backend_header_policy, on_final_request_body, normalize_response_body, response_stream_inspector |
 | 45 | `mcp_gateway` | 2992 | before_proxy, transform_request_body, transform_response_body, after_proxy, on_final_response_body, on_response_committed |
-| 46 | `a2a_gateway` | 2993 | before_proxy, after_proxy, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector |
+| 46 | `a2a_gateway` | 2993 | before_proxy, on_final_request_body, after_proxy, normalize_response_body, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector |
 | 47 | `mesh_route_dispatch` | 2995 | before_proxy |
 | 48 | `request_transformer` | 3000 | before_proxy, transform_request_body |
 | 49 | `request_deduplication` | 3010 | before_proxy, on_final_response_body, on_response_stream_terminated, on_response_committed |
@@ -1813,7 +1815,10 @@ Request transformers run after authentication and authorization, so they only mo
 
 ### Compression runs after response transformation (4050)
 
-Decoded `ai_semantic_cache` hits defer the compression `after_proxy` hook and
+Decoded `ai_semantic_cache` hits preserve the finalized application body, skipping
+ordinary body rewrites already reflected in the entry. Body inspection and
+mandatory policy rewrites still run under private replay provenance; live header
+rules remain active. Hits defer the compression `after_proxy` hook and
 transport transform until after the synthetic reject-path header chain and
 its final plaintext body-policy recheck. The hook is invoked once in this late
 phase, so live header rules (including `no-transform` and strong `ETag`) govern

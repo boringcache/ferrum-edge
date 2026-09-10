@@ -273,6 +273,292 @@ fn transaction_log_schema_closed_object_keys_match_openapi() {
 }
 
 #[test]
+fn transaction_log_schema_openapi_matches_constructor_admission() {
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    // Issue #5168: the document admitted schema shapes the constructor
+    // rejects — empty names, empty list entries / rename targets / derived
+    // names / static keys, null static values, duplicate `order` entries, and
+    // control characters in a metadata prefix — so schema-driven tooling
+    // approved configurations that fail at load. Both surfaces must agree.
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/TransactionLogSchemaConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("TransactionLogSchemaConfig schema compiles");
+
+    for config in [
+        json!({ "schemas": {} }),
+        json!({ "schemas": { "": {} } }),
+        json!({ "schemas": { "basic": { "omit": [""] } } }),
+        json!({ "schemas": { "basic": { "rename": { "proxy_id": "" } } } }),
+        json!({ "schemas": { "basic": { "rename": { "": "route_id" } } } }),
+        json!({ "schemas": { "basic": { "order": ["*", "*"] } } }),
+        json!({ "schemas": { "basic": { "static_fields": { "stamp": null } } } }),
+        json!({ "schemas": { "basic": { "static_fields": { "": "v1" } } } }),
+        json!({
+            "schemas": { "basic": { "derived_fields": [{ "name": "", "kind": "outcome" }] } }
+        }),
+        json!({
+            "schemas": { "basic": { "metadata": { "mode": "flatten", "prefix": "bad\u{1}" } } }
+        }),
+        json!({ "schemas": { "basic": { "metadata": { "mode": "nested", "prefix": 3 } } } }),
+        json!({
+            "schemas": { "basic": { "metadata": { "mode": "omit", "on_collision": "bad" } } }
+        }),
+    ] {
+        let documented = validator.validate(&config);
+        let runtime = validate_plugin_config("transaction_log_schema", &config);
+        assert!(documented.is_err(), "schema should reject: {config}");
+        assert!(runtime.is_err(), "runtime should reject: {config}");
+    }
+
+    for config in [
+        json!({ "schemas": { "basic": {} } }),
+        json!({
+            "schemas": {
+                "basic": {
+                    "summary_type": "http",
+                    "omit": ["request_user_agent"],
+                    "rename": { "proxy_id": "route_id" },
+                    "order": ["route_id", "*"],
+                    "static_fields": { "env": "production" },
+                    "derived_fields": [{ "name": "outcome", "kind": "outcome" }],
+                    "metadata": { "mode": "flatten", "prefix": "meta_" },
+                    "timestamp_format": "epoch_ms"
+                }
+            }
+        }),
+    ] {
+        let documented = validator.validate(&config);
+        let runtime = validate_plugin_config("transaction_log_schema", &config);
+        assert!(documented.is_ok(), "schema should accept: {config}");
+        assert!(runtime.is_ok(), "runtime should accept: {config}");
+    }
+
+    // Non-global scope is rejected by the admin write path, so the
+    // `PluginConfig` branch must not admit it either.
+    let plugin_branch = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/PluginConfig",
+        "components": spec["components"].clone()
+    });
+    let plugin_validator = jsonschema::draft202012::options()
+        .build(&plugin_branch)
+        .expect("PluginConfig schema compiles");
+    let mut plugin = json!({
+        "plugin_name": "transaction_log_schema",
+        "scope": "global",
+        "enabled": true,
+        "config": { "schemas": { "basic": {} } }
+    });
+    assert!(plugin_validator.validate(&plugin).is_ok());
+    plugin["scope"] = json!("proxy_group");
+    assert!(plugin_validator.validate(&plugin).is_err());
+}
+
+#[test]
+fn api_chargeback_sink_schema_matches_constructor_admission() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::api_chargeback_sink::ApiChargebackSink;
+    use ferrum_edge::plugins::transaction_log_schema::TransactionLogSchema;
+    use ferrum_edge::plugins::utils::log_schema::{CHARGE_EVENT_FIELDS, registry};
+
+    // Issue #5393: keep the shared log-schema constraints, then narrow only
+    // the sink's projection to the charge-event family used by its constructor.
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/ApiChargebackSinkConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("ApiChargebackSinkConfig schema compiles");
+    let shared_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/SummaryLogSchema",
+        "components": spec["components"].clone()
+    });
+    let shared_validator = jsonschema::draft202012::options()
+        .build(&shared_schema)
+        .expect("SummaryLogSchema schema compiles");
+    let base = json!({
+        "clickhouse": { "url": "https://clickhouse.example:8443" },
+        "spool": { "enabled": false },
+        "pricing_tiers": [{ "status_codes": [200], "price_per_call": 0.01 }]
+    });
+    let http_client = PluginHttpClient::default();
+    let assert_admission = |config: &serde_json::Value, expected: bool| {
+        let documented = validator.validate(config);
+        let runtime = ApiChargebackSink::new(config, http_client.clone(), "ferrum");
+        assert_eq!(
+            documented.is_ok(),
+            expected,
+            "unexpected schema admission for {config}: {documented:?}"
+        );
+        assert_eq!(
+            runtime.is_ok(),
+            expected,
+            "unexpected constructor admission for {config}: {:?}",
+            runtime.err()
+        );
+    };
+    assert_admission(&base, true);
+
+    for projection in [
+        json!({ "summary_type": "http" }),
+        json!({ "summary_type": "stream" }),
+        json!({ "summary_type": "both" }),
+        json!({ "timestamp_format": "rfc3339" }),
+        json!({ "timestamp_format": "epoch_ms" }),
+        json!({ "timestamp_format": "epoch_s" }),
+        json!({ "metadata": {} }),
+        json!({ "metadata": { "mode": "nested" } }),
+        json!({ "metadata": { "mode": "omit" } }),
+        json!({ "metadata": { "mode": "flatten" } }),
+        json!({ "derived_fields": [{ "name": "host", "kind": "backend_host" }] }),
+    ] {
+        assert!(
+            shared_validator.validate(&projection).is_ok(),
+            "other logging families retain support for {projection}"
+        );
+        let mut config = base.clone();
+        config["schema"] = projection;
+        assert_admission(&config, false);
+    }
+
+    for projection in [
+        json!({}),
+        json!({ "order": ["*"] }),
+        json!({ "omit": ["node_id", "node_id"] }),
+        json!({
+            "omit": ["node_id", "pricing_version"],
+            "rename": { "proxy_id": "route_key", "charge_total": "amount" },
+            "order": ["amount", "record_kind", "*"],
+            "static_fields": { "ledger": "prod", "shard": 3 },
+            "derived_fields": [
+                { "name": "status_group", "kind": "status_class" },
+                { "name": "record_kind", "kind": "summary_kind" },
+                { "name": "call_outcome", "kind": "outcome" }
+            ]
+        }),
+    ] {
+        let mut config = base.clone();
+        config["schema"] = projection;
+        assert_admission(&config, true);
+    }
+
+    for projection in [
+        json!(null),
+        json!([]),
+        json!({ "summary_type": null }),
+        json!({ "timestamp_format": null }),
+        json!({ "metadata": null }),
+        json!({ "unknown": true }),
+        json!({ "omit": [""] }),
+        json!({ "omit": ["latency_total_ms"] }),
+        json!({ "rename": { "backend_target": "backend" } }),
+        json!({ "rename": { "proxy_id": "" } }),
+        json!({ "order": ["*", "*"] }),
+        json!({ "static_fields": { "stamp": null } }),
+        json!({ "static_fields": { "": "v1" } }),
+        json!({ "derived_fields": [{ "name": "", "kind": "outcome" }] }),
+        json!({ "derived_fields": [{ "name": "result", "kind": "unknown" }] }),
+        json!({ "derived_fields": [{ "name": "result", "kind": "outcome", "extra": 1 }] }),
+    ] {
+        let mut config = base.clone();
+        config["schema"] = projection;
+        assert_admission(&config, false);
+    }
+
+    let documented_fields: BTreeSet<&str> = spec
+        .pointer("/components/schemas/ApiChargebackSinkLogField/enum")
+        .and_then(serde_json::Value::as_array)
+        .expect("charge-event field inventory")
+        .iter()
+        .map(|field| field.as_str().expect("field name"))
+        .collect();
+    let runtime_fields: BTreeSet<&str> =
+        CHARGE_EVENT_FIELDS.iter().map(|field| field.name).collect();
+    assert_eq!(documented_fields, runtime_fields);
+    for field in runtime_fields {
+        for projection in [
+            json!({ "omit": [field] }),
+            json!({ "rename": { (field): "projected_value" } }),
+        ] {
+            let mut config = base.clone();
+            config["schema"] = projection;
+            assert_admission(&config, true);
+        }
+    }
+
+    for reference in [json!(""), json!(null), json!(7), json!({}), json!([])] {
+        let mut config = base.clone();
+        config["schema_ref"] = reference;
+        assert_admission(&config, false);
+    }
+    for projection in [json!({}), json!(null)] {
+        for reference in [json!("portable"), json!(null)] {
+            let mut config = base.clone();
+            config["schema"] = projection.clone();
+            config["schema_ref"] = reference;
+            assert_admission(&config, false);
+        }
+    }
+
+    // A reference is only a string in OpenAPI. Its definition must pass the
+    // same family checks when resolved; staging keeps the live registry intact.
+    let definitions = json!({
+        "schemas": {
+            "portable": { "rename": { "proxy_id": "route_key" }, "order": ["*"] },
+            "summary": { "summary_type": "both" },
+            "timestamp": { "timestamp_format": "rfc3339" },
+            "metadata": { "metadata": { "mode": "nested" } },
+            "backend": { "derived_fields": [{ "name": "host", "kind": "backend_host" }] },
+            "summary_field": { "omit": ["latency_total_ms"] }
+        }
+    });
+    registry::begin_reload().expect("begin isolated schema staging");
+    let registered = TransactionLogSchema::new(&definitions);
+    let results: Vec<_> = [
+        ("portable", true),
+        ("summary", false),
+        ("timestamp", false),
+        ("metadata", false),
+        ("backend", false),
+        ("summary_field", false),
+        ("missing", false),
+    ]
+    .into_iter()
+    .map(|(name, expected)| {
+        let mut config = base.clone();
+        config["schema_ref"] = json!(name);
+        let documented = validator.validate(&config).is_ok();
+        let runtime = ApiChargebackSink::new(&config, http_client.clone(), "ferrum");
+        (name, expected, documented, runtime)
+    })
+    .collect();
+    registry::abort_reload().expect("discard isolated schema staging");
+    assert!(registered.is_ok(), "portable definitions must compile");
+    for (name, expected, documented, runtime) in results {
+        assert!(documented, "nonempty reference is schema-valid: {name}");
+        assert_eq!(
+            runtime.is_ok(),
+            expected,
+            "unexpected resolved admission for {name}: {:?}",
+            runtime.err()
+        );
+    }
+}
+
+#[test]
 fn typed_component_properties_match_serde_field_inventories() {
     use ferrum_edge::config::types::{
         ActiveHealthCheck, BackendTlsConfig, CircuitBreakerConfig, ConsulConfig, Consumer,
@@ -2129,6 +2415,445 @@ fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
     }
 }
 
+const REDIS_URL_DATABASE_SELECTOR_PATTERN: &str =
+    r"^rediss?://[^/?#\s]+(?:/\d{0,10})?(?:\?[^\s#]*)?$";
+
+fn plugin_docs_section<'a>(plugin_docs: &'a str, plugin_name: &str) -> &'a str {
+    plugin_docs
+        .split(&format!("### `{plugin_name}`"))
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .unwrap_or_else(|| panic!("{plugin_name} docs section"))
+}
+
+fn component_validator(spec: &serde_json::Value, schema_name: &str) -> jsonschema::Validator {
+    let validator_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": format!("#/components/schemas/{schema_name}"),
+        "components": spec["components"].clone()
+    });
+    jsonschema::draft202012::options()
+        .build(&validator_schema)
+        .unwrap_or_else(|error| panic!("{schema_name} schema compiles: {error}"))
+}
+
+fn assert_schema_and_constructor(
+    validator: &jsonschema::Validator,
+    plugin_name: &str,
+    name: &str,
+    config: &serde_json::Value,
+    schema_valid: bool,
+    constructor_valid: bool,
+) {
+    assert_eq!(
+        validator.validate(config).is_ok(),
+        schema_valid,
+        "{plugin_name} {name}: unexpected schema result for {config}"
+    );
+    match (
+        ferrum_edge::plugins::create_plugin(plugin_name, config),
+        constructor_valid,
+    ) {
+        (Ok(Some(_)), true) | (Err(_), false) => {}
+        (Ok(None), _) => panic!("{plugin_name} {name}: factory returned None"),
+        (Ok(Some(_)), false) => {
+            panic!("{plugin_name} {name}: constructor accepted {config}")
+        }
+        (Err(err), true) => {
+            panic!("{plugin_name} {name}: constructor rejected {config}: {err}")
+        }
+    }
+}
+
+fn redis_sync_mode_guard<'a>(
+    schema: &'a serde_json::Value,
+    schema_name: &str,
+) -> &'a serde_json::Value {
+    schema["allOf"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{schema_name} allOf"))
+        .iter()
+        .find(|guard| {
+            guard["if"]["properties"]["sync_mode"]["pattern"] == json!("^[rR][eE][dD][iI][sS]$")
+        })
+        .unwrap_or_else(|| panic!("{schema_name} sync_mode=redis conditional guard"))
+}
+
+/// Issue #5358 / #5360: `WsRateLimitingConfig` must admit the same configs the
+/// constructor admits, except arithmetic burst/refill residuals the schema
+/// cannot express. `redis_key_prefix` must not promise shared instance budgets.
+#[test]
+fn ws_rate_limiting_schema_matches_constructor_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/WsRateLimitingConfig")
+        .expect("WsRateLimitingConfig component exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(
+        schema["properties"]["sync_mode"]["pattern"],
+        json!("^([lL][oO][cC][aA][lL]|[rR][eE][dD][iI][sS])$")
+    );
+    assert!(schema["properties"]["sync_mode"].get("enum").is_none());
+    assert_eq!(
+        schema["properties"]["redis_key_prefix"]["minLength"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["redis_connect_timeout_seconds"]["minimum"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["redis_connect_timeout_seconds"]["maximum"].as_f64(),
+        Some(u64::MAX as f64),
+    );
+    assert_eq!(
+        schema["properties"]["redis_health_check_interval_seconds"]["minimum"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["redis_health_check_interval_seconds"]["maximum"].as_f64(),
+        Some(u64::MAX as f64),
+    );
+    let redis_guard = redis_sync_mode_guard(schema, "WsRateLimitingConfig");
+    assert_eq!(redis_guard["if"]["required"], json!(["sync_mode"]));
+    assert_eq!(redis_guard["then"]["required"], json!(["redis_url"]));
+
+    let prefix_description = schema["properties"]["redis_key_prefix"]["description"]
+        .as_str()
+        .expect("redis_key_prefix description");
+    assert!(
+        prefix_description.contains("per-instance UUID"),
+        "redis_key_prefix must describe the instance UUID that partitions keys"
+    );
+    assert!(
+        !prefix_description.contains("every instance configured with the same prefix increments"),
+        "redis_key_prefix must not promise shared per-connection budgets"
+    );
+
+    let docs = plugin_docs_section(include_str!("../../docs/plugins.md"), "ws_rate_limiting");
+    assert!(
+        docs.contains("per-instance UUID"),
+        "docs/plugins.md ws_rate_limiting section must describe instance UUID isolation"
+    );
+    assert!(
+        !docs.contains(
+            "setting it explicitly is the documented opt-in for a deliberately shared budget"
+        ),
+        "docs/plugins.md ws_rate_limiting must not promise shared instance budgets"
+    );
+    assert!(
+        docs.contains("Parsed case-insensitively"),
+        "docs/plugins.md ws_rate_limiting must document sync_mode case folding"
+    );
+
+    let validator = component_validator(&spec, "WsRateLimitingConfig");
+    let accepted = [
+        json!({}),
+        json!({"frames_per_second": 50, "burst_size": 100}),
+        json!({"sync_mode": "LOCAL"}),
+        json!({
+            "sync_mode": "REDIS",
+            "redis_url": "redis://cache.internal:6379/0"
+        }),
+        json!({
+            "frames_per_second": 50,
+            "burst_size": 100,
+            "close_reason": "Rate limit exceeded",
+            "sync_mode": "redis",
+            "redis_url": "redis://redis-host:6379/2"
+        }),
+        json!({"close_reason": "レート制限"}),
+    ];
+    for config in &accepted {
+        assert_schema_and_constructor(
+            &validator,
+            "ws_rate_limiting",
+            "accepted",
+            config,
+            true,
+            true,
+        );
+    }
+
+    let rejected = [
+        json!({"sync_mode": "redis"}),
+        json!({"redis_key_prefix": ""}),
+        json!({"redis_health_check_interval_seconds": 0}),
+        json!({"redis_health_check_interval_seconds": -1}),
+        json!({"redis_connect_timeout_seconds": 0}),
+        json!({"frames_per_second": 0}),
+        json!({"sync_mode": "mysql"}),
+        json!({"frames_per_secod": 10}),
+    ];
+    for config in &rejected {
+        assert_schema_and_constructor(
+            &validator,
+            "ws_rate_limiting",
+            "rejected",
+            config,
+            false,
+            false,
+        );
+    }
+
+    // Integer-multiple / refill-window constraints stay constructor-only.
+    assert_schema_and_constructor(
+        &validator,
+        "ws_rate_limiting",
+        "non-integral burst residual",
+        &json!({"frames_per_second": 3, "burst_size": 10}),
+        true,
+        false,
+    );
+    assert_schema_and_constructor(
+        &validator,
+        "ws_rate_limiting",
+        "refill window residual",
+        &json!({"frames_per_second": 1, "burst_size": 4000}),
+        true,
+        false,
+    );
+}
+
+/// Issue #5359 / #5361: `UdpRateLimitingConfig` must require Redis URLs, bound
+/// numeric fields, accept case-normalized sync_mode, and describe per-second
+/// rates rather than per-window caps.
+#[test]
+fn udp_rate_limiting_schema_matches_constructor_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/UdpRateLimitingConfig")
+        .expect("UdpRateLimitingConfig component exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(
+        schema["properties"]["sync_mode"]["pattern"],
+        json!("^([lL][oO][cC][aA][lL]|[rR][eE][dD][iI][sS])$")
+    );
+    assert!(schema["properties"]["sync_mode"].get("enum").is_none());
+    assert_eq!(
+        schema["properties"]["redis_key_prefix"]["minLength"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["redis_connect_timeout_seconds"]["minimum"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["redis_connect_timeout_seconds"]["maximum"].as_f64(),
+        Some(u64::MAX as f64),
+    );
+    assert_eq!(
+        schema["properties"]["redis_health_check_interval_seconds"]["minimum"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["redis_health_check_interval_seconds"]["maximum"].as_f64(),
+        Some(u64::MAX as f64),
+    );
+    assert_eq!(
+        schema["properties"]["datagrams_per_second"]["maximum"].as_f64(),
+        Some(u64::MAX as f64),
+    );
+    assert_eq!(
+        schema["properties"]["bytes_per_second"]["maximum"].as_f64(),
+        Some(u64::MAX as f64),
+    );
+    let redis_guard = redis_sync_mode_guard(schema, "UdpRateLimitingConfig");
+    assert_eq!(redis_guard["if"]["required"], json!(["sync_mode"]));
+    assert_eq!(redis_guard["then"]["required"], json!(["redis_url"]));
+
+    for field in ["datagrams_per_second", "bytes_per_second"] {
+        let description = schema["properties"][field]["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{field} description"));
+        assert!(
+            description.contains("per second"),
+            "{field} must be documented as a per-second rate"
+        );
+        assert!(
+            description.contains("× window_seconds") || description.contains("* window_seconds"),
+            "{field} must give rate × window_seconds as the effective cap"
+        );
+        assert!(
+            !description.contains("Maximum datagrams per `window_seconds`")
+                && !description.contains("Maximum bytes per `window_seconds`"),
+            "{field} must not label the input rate as a per-window cap"
+        );
+    }
+
+    let docs = plugin_docs_section(include_str!("../../docs/plugins.md"), "udp_rate_limiting");
+    assert!(
+        docs.contains("Sustained datagram rate per second"),
+        "docs/plugins.md udp_rate_limiting must describe a per-second datagram rate"
+    );
+    assert!(
+        docs.contains("Sustained payload-byte rate per second"),
+        "docs/plugins.md udp_rate_limiting must describe a per-second byte rate"
+    );
+    assert!(
+        !docs.contains("Maximum datagrams per `window_seconds`"),
+        "docs/plugins.md must not label datagrams_per_second as a per-window cap"
+    );
+    assert!(
+        docs.contains("window_seconds: 4"),
+        "docs/plugins.md udp_rate_limiting must include a non-unit-window example"
+    );
+    assert!(
+        docs.contains("Parsed case-insensitively"),
+        "docs/plugins.md udp_rate_limiting must document sync_mode case folding"
+    );
+
+    let validator = component_validator(&spec, "UdpRateLimitingConfig");
+    let accepted = [
+        json!({"datagrams_per_second": 1}),
+        json!({"bytes_per_second": 1}),
+        json!({"datagrams_per_second": 1000, "bytes_per_second": 1048576}),
+        json!({"datagrams_per_second": 1, "sync_mode": "LOCAL"}),
+        json!({
+            "datagrams_per_second": 1,
+            "sync_mode": "REDIS",
+            "redis_url": "redis://cache.internal:6379/0"
+        }),
+        json!({"datagrams_per_second": 1, "window_seconds": 4}),
+        json!({
+            "datagrams_per_second": 1000,
+            "bytes_per_second": 1048576,
+            "window_seconds": 4
+        }),
+    ];
+    for config in &accepted {
+        assert_schema_and_constructor(
+            &validator,
+            "udp_rate_limiting",
+            "accepted",
+            config,
+            true,
+            true,
+        );
+    }
+
+    let rejected = [
+        json!({}),
+        json!({"datagrams_per_second": 1, "sync_mode": "redis"}),
+        json!({"datagrams_per_second": 1, "redis_key_prefix": ""}),
+        json!({"datagrams_per_second": 1, "redis_connect_timeout_seconds": 0}),
+        json!({"datagrams_per_second": 1, "redis_health_check_interval_seconds": 0}),
+        json!({"datagrams_per_second": 1, "redis_health_check_interval_seconds": -1}),
+        json!({"datagrams_per_second": 1, "window_seconds": 2678401}),
+        json!({"datagrams_per_second": 1, "sync_mdoe": "redis"}),
+    ];
+    for config in &rejected {
+        assert_schema_and_constructor(
+            &validator,
+            "udp_rate_limiting",
+            "rejected",
+            config,
+            false,
+            false,
+        );
+    }
+
+    // Checked rate × window overflow stays constructor-only.
+    assert_schema_and_constructor(
+        &validator,
+        "udp_rate_limiting",
+        "rate-window overflow residual",
+        &json!({"datagrams_per_second": u64::MAX, "window_seconds": 2}),
+        true,
+        false,
+    );
+}
+
+/// Issue #5394: the four Redis-backed rate-limit components publish the
+/// constructor's numeric database-selector rule on `redis_url`.
+#[test]
+fn redis_url_database_selector_schema_matches_constructor_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let expected_pattern = json!(REDIS_URL_DATABASE_SELECTOR_PATTERN);
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    for (schema_name, plugin_name, redis_config) in [
+        (
+            "RateLimitingConfig",
+            "rate_limiting",
+            json!({
+                "limits": [{"scope": "default", "requests_per_minute": 10}],
+                "sync_mode": "redis"
+            }),
+        ),
+        (
+            "AiRateLimiterConfig",
+            "ai_rate_limiter",
+            json!({"token_limit": 1000, "sync_mode": "redis"}),
+        ),
+        (
+            "WsRateLimitingConfig",
+            "ws_rate_limiting",
+            json!({"sync_mode": "redis"}),
+        ),
+        (
+            "UdpRateLimitingConfig",
+            "udp_rate_limiting",
+            json!({"datagrams_per_second": 1, "sync_mode": "redis"}),
+        ),
+    ] {
+        let schema = spec
+            .pointer(&format!("/components/schemas/{schema_name}"))
+            .unwrap_or_else(|| panic!("{schema_name} component exists"));
+        assert_eq!(
+            schema["properties"]["redis_url"]["pattern"], expected_pattern,
+            "{schema_name} redis_url pattern must admit only numeric database selectors"
+        );
+        let description = schema["properties"]["redis_url"]["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{schema_name} redis_url description"));
+        assert!(
+            description.contains("2147483647"),
+            "{schema_name} redis_url must document the i32 database-selector ceiling"
+        );
+        let docs = plugin_docs_section(plugin_docs, plugin_name);
+        assert!(
+            docs.contains("2147483647"),
+            "docs/plugins.md {plugin_name} redis_url row must document the selector ceiling"
+        );
+
+        let validator = component_validator(&spec, schema_name);
+        let mut accepted = redis_config.clone();
+        accepted["redis_url"] = json!("redis://cache.internal:6379/0");
+        assert!(
+            validator.validate(&accepted).is_ok(),
+            "{schema_name} must accept a numeric database selector: {accepted}"
+        );
+        let mut ceiling = redis_config.clone();
+        ceiling["redis_url"] = json!("redis://cache.internal:6379/2147483647");
+        assert!(
+            validator.validate(&ceiling).is_ok(),
+            "{schema_name} must accept the i32 selector ceiling: {ceiling}"
+        );
+        let mut no_path = redis_config.clone();
+        no_path["redis_url"] = json!("redis://cache.internal:6379");
+        assert!(
+            validator.validate(&no_path).is_ok(),
+            "{schema_name} must accept a URL with no database path: {no_path}"
+        );
+
+        for (name, url) in [
+            ("non-numeric", "redis://cache.internal:6379/banana"),
+            ("multi-segment", "redis://cache.internal:6379/0/1"),
+            ("eleven-digit", "redis://cache.internal:6379/21474836480"),
+        ] {
+            let mut rejected = redis_config.clone();
+            rejected["redis_url"] = json!(url);
+            assert!(
+                validator.validate(&rejected).is_err(),
+                "{schema_name} must reject {name} database selector: {rejected}"
+            );
+        }
+    }
+}
+
 #[test]
 fn graphql_config_schema_matches_runtime_validation() {
     use ferrum_edge::plugins::create_plugin;
@@ -3295,6 +4020,71 @@ fn ai_stream_router_schema_rejects_unknown_keys_and_matches_runtime_surface() {
         // matching the constructor's fail-closed admission.
         json!({"providers": [{"name": "p", "provider_type": "openai", "endpoint": "https://a.example.com/v1", "api_key": "k", "model_patterns": ["gpt-*"]}], "fallback": {"enabled": true, "on_connect_error": true, "on_5xx_before_first_byte": true, "max_attempts": 2}}),
         json!({"providers": [{"name": "p", "provider_type": "openai", "endpoint": "https://a.example.com/v1", "api_key": "k", "model_patterns": ["gpt-*"]}], "fallback": {}}),
+    ] {
+        assert_component_validity(&spec, "AiStreamRouterConfig", &invalid, false);
+    }
+
+    // Issue #5303: the component must accept nothing the constructor rejects,
+    // and must accept the explicit nulls the constructor reads as omission.
+    let provider_with = |overrides: serde_json::Value| {
+        let mut provider = json!({
+            "name": "p",
+            "provider_type": "openai",
+            "endpoint": "https://a.example.com/v1",
+            "api_key": "k",
+            "model_patterns": ["gpt-*"]
+        });
+        if let (Some(base), Some(extra)) = (provider.as_object_mut(), overrides.as_object()) {
+            for (key, value) in extra {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+        json!({ "providers": [provider] })
+    };
+
+    for valid in [
+        // Every optional field the constructor treats as omitted when null.
+        json!({
+            "enabled": null,
+            "fail_on_missing_model": null,
+            "fail_on_no_matching_provider": null,
+            "inject_usage_options": null,
+            "normalize_response_stream": null,
+            "providers": [{
+                "name": "p",
+                "provider_type": "anthropic",
+                "endpoint": "https://a.example.com/v1",
+                "api_key": "k",
+                "model_patterns": ["claude-*"],
+                "priority": null,
+                "allow_plaintext": null,
+                "anthropic_version": null,
+                "inherit_backend_tls": null
+            }]
+        }),
+        // Plaintext with the opt-in the constructor requires.
+        provider_with(json!({
+            "endpoint": "http://internal.example.com/v1",
+            "allow_plaintext": true
+        })),
+        provider_with(json!({"priority": 4294967295u64})),
+    ] {
+        assert_component_validity(&spec, "AiStreamRouterConfig", &valid, true);
+    }
+
+    for invalid in [
+        provider_with(json!({"priority": 4294967296u64})),
+        provider_with(json!({"name": ""})),
+        provider_with(json!({"api_key": ""})),
+        provider_with(json!({"model_patterns": [""]})),
+        provider_with(json!({"endpoint": "not-url"})),
+        provider_with(json!({"endpoint": "ftp://api.example.com/a"})),
+        // HTTP without the plaintext opt-in, and with it explicitly disabled.
+        provider_with(json!({"endpoint": "http://internal.example.com/v1"})),
+        provider_with(json!({
+            "endpoint": "http://internal.example.com/v1",
+            "allow_plaintext": false
+        })),
     ] {
         assert_component_validity(&spec, "AiStreamRouterConfig", &invalid, false);
     }
@@ -14068,6 +14858,235 @@ fn mesh_plugin_config_roots_are_closed_and_match_openapi() {
         let runtime_fields: BTreeSet<&str> = runtime_keys.iter().copied().collect();
         assert_eq!(schema_fields, runtime_fields, "{schema_name} key drift");
     }
+}
+
+/// Issues #5380–#5383: `__mesh_bpf_metrics` OpenAPI and docs must match
+/// constructor admission. The constructor is the source of truth.
+#[test]
+fn mesh_bpf_metrics_schema_matches_constructor_admission() {
+    use ferrum_edge::plugins::mesh::bpf_metrics::{
+        DEFAULT_METRIC_PREFIX, MESH_BPF_METRICS_CONFIG_KEYS, MeshBpfMetrics,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/MeshBpfMetricsConfig")
+        .expect("MeshBpfMetricsConfig component exists");
+    let description = schema["description"]
+        .as_str()
+        .expect("MeshBpfMetricsConfig description");
+    for contract in [
+        "OptionalFailOpen",
+        "scope: global",
+        "ferrum_mesh_bpf",
+        "Non-object configs",
+        "trimmed",
+    ] {
+        assert!(
+            description.contains(contract),
+            "MeshBpfMetricsConfig description missing `{contract}`"
+        );
+    }
+
+    assert_eq!(
+        schema["type"],
+        json!(["object", "null", "string", "array", "number", "boolean"])
+    );
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(
+        schema["properties"]["prefix"]["pattern"],
+        json!(r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*$")
+    );
+    assert_eq!(
+        schema["properties"]["prefix"]["default"],
+        json!(DEFAULT_METRIC_PREFIX)
+    );
+    assert_eq!(MESH_BPF_METRICS_CONFIG_KEYS, ["prefix"].as_slice());
+
+    let bpf_branch = spec["components"]["schemas"]["PluginConfig"]["allOf"]
+        .as_array()
+        .expect("PluginConfig allOf")
+        .iter()
+        .find(|entry| {
+            entry
+                .pointer("/if/properties/plugin_name/const")
+                .and_then(serde_json::Value::as_str)
+                == Some("__mesh_bpf_metrics")
+        })
+        .expect("__mesh_bpf_metrics PluginConfig branch");
+    assert_eq!(
+        bpf_branch.pointer("/then/if/properties/enabled/const"),
+        Some(&json!(true))
+    );
+    assert_eq!(
+        bpf_branch.pointer("/then/then/properties/scope/const"),
+        Some(&json!("global"))
+    );
+
+    let component_cases = [
+        (json!({}), true),
+        (json!({"prefix": "tenantA_bpf"}), true),
+        (json!({"prefix": " tenantA_bpf "}), true),
+        (json!({"prefix": "\ttenantB_bpf\n"}), true),
+        (json!({"prefix": "_leading_underscore"}), true),
+        (serde_json::Value::Null, true),
+        (json!("ignored"), true),
+        (json!([]), true),
+        (json!(7), true),
+        (json!(false), true),
+        (json!({"prefix": ""}), false),
+        (json!({"prefix": "  "}), false),
+        (json!({"prefix": "1tenant_bpf"}), false),
+        (json!({"prefix": "with spaces"}), false),
+        (json!({"prefix": "tenant-A"}), false),
+        (json!({"prefix": "tenantA.bpf"}), false),
+        (json!({"prefix": 7}), false),
+        (json!({"prefix": null}), false),
+        (json!({"prefix": ["tenantA_bpf"]}), false),
+        (json!({"prefx": "tenantA_bpf"}), false),
+        (json!({"prefix": "tenantA_bpf", "extra": true}), false),
+    ];
+    for (config, expected_valid) in component_cases {
+        assert_component_validity(&spec, "MeshBpfMetricsConfig", &config, expected_valid);
+        let constructed = MeshBpfMetrics::new(&config);
+        assert_eq!(
+            constructed.is_ok(),
+            expected_valid,
+            "constructor disagrees with MeshBpfMetricsConfig for {config}: {:?}",
+            constructed.err()
+        );
+    }
+
+    let wrapper_cases = [
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "global",
+                "enabled": true,
+                "config": {}
+            }),
+            true,
+        ),
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "global",
+                "enabled": true,
+                "config": {"prefix": "tenantA_bpf"}
+            }),
+            true,
+        ),
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "global",
+                "enabled": true,
+                "config": {"prefix": " tenantA_bpf "}
+            }),
+            true,
+        ),
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "proxy",
+                "enabled": true,
+                "proxy_id": "http",
+                "config": {}
+            }),
+            false,
+        ),
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "proxy_group",
+                "enabled": true,
+                "config": {}
+            }),
+            false,
+        ),
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "proxy",
+                "enabled": false,
+                "proxy_id": "http",
+                "config": {}
+            }),
+            true,
+        ),
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "global",
+                "enabled": true,
+                "config": {"prefx": "x"}
+            }),
+            false,
+        ),
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "global",
+                "enabled": true,
+                "config": {"prefix": "  "}
+            }),
+            false,
+        ),
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "global",
+                "enabled": true,
+                "config": null
+            }),
+            false,
+        ),
+    ];
+    for (instance, expected_valid) in wrapper_cases {
+        assert_component_validity(&spec, "PluginConfig", &instance, expected_valid);
+    }
+
+    let plugins_docs = include_str!("../../docs/plugins.md");
+    let section = plugins_docs
+        .split("### `__mesh_bpf_metrics`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .expect("__mesh_bpf_metrics docs section");
+    for needle in [
+        "| `prefix` | String | `ferrum_mesh_bpf` |",
+        "`str::trim`",
+        "[A-Za-z_][A-Za-z0-9_]*",
+        "OptionalFailOpen",
+        "scope: global",
+        "prefix: tenantA_bpf",
+        "no declared length limit",
+    ] {
+        assert!(
+            section.contains(needle),
+            "docs/plugins.md __mesh_bpf_metrics section missing `{needle}`"
+        );
+    }
+
+    let mesh_docs = include_str!("../../docs/mesh.md");
+    for needle in [
+        "capped exponential backoff",
+        "1s, 2s, 4s, 8s, 16s, and 30s",
+        "does not stop the consumer",
+        "never start the consumer task",
+        "`str::trim`",
+        "[A-Za-z_][A-Za-z0-9_]*",
+        "default `ferrum_mesh_bpf`",
+    ] {
+        assert!(
+            mesh_docs.contains(needle),
+            "docs/mesh.md missing `{needle}`"
+        );
+    }
+    assert!(
+        !mesh_docs.contains("the consumer logs one info line at startup and exits"),
+        "docs/mesh.md must not claim a missing pin stops the consumer"
+    );
 }
 
 /// Issues #5111–#5115: size-limiting plugin configs are closed objects whose
