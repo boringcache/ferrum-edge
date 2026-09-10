@@ -19614,15 +19614,41 @@ components:
       properties:
         providers:
           type: array
+          minItems: 1
           items:
             type: object
             additionalProperties: false
+            oneOf:
+              - required: [jwks_uri]
+              - required: [discovery_url]
+              - required: [jwks]
+                not:
+                  required: [jwks_max_stale_seconds]
+            allOf:
+              - if:
+                  required: [require_dpop]
+                  properties:
+                    require_dpop:
+                      const: true
+                then:
+                  required: [issuer, dpop_replay_scope]
+              - if:
+                  required: [dpop_replay_scope]
+                then:
+                  required: [require_dpop]
+                  properties:
+                    require_dpop:
+                      const: true
             properties:
               jwks_uri:
                 type: string
-                description: Direct URL to the IdP's JWKS endpoint. HTTPS is required except for literal loopback or localhost endpoints. URL userinfo is rejected.
+                format: uri
+                pattern: "^\\s*(https://[^\\s/?#@]+([/?#]\\S*)?|http://([lL][oO][cC][aA][lL][hH][oO][sS][tT]|127\\.[0-9.]+|\\[[0-9A-Fa-f:.]+\\])(:[0-9]+)?([/?#]\\S*)?)\\s*$"
+                description: Direct URL to the IdP's JWKS endpoint. HTTPS is required except for literal loopback or localhost endpoints. URL userinfo is rejected. Exactly one of jwks_uri, discovery_url, or jwks may be configured per provider.
               discovery_url:
                 type: string
+                format: uri
+                pattern: "^\\s*(https://[^\\s/?#@]+([/?#]\\S*)?|http://([lL][oO][cC][aA][lL][hH][oO][sS][tT]|127\\.[0-9.]+|\\[[0-9A-Fa-f:.]+\\])(:[0-9]+)?([/?#]\\S*)?)\\s*$"
                 description: >-
                   OIDC discovery URL (auto-discovers jwks_uri). The discovered
                   jwks_uri must use the same origin as the discovery URL
@@ -19637,6 +19663,8 @@ components:
                 description: Inline JWKS JSON string or object
               issuer:
                 type: string
+                minLength: 1
+                pattern: "\\S"
                 description: >-
                   Expected JWT iss claim — routes tokens to this provider.
                   When set, the token MUST carry iss and it must match exactly;
@@ -19652,13 +19680,17 @@ components:
                   issuer is refused as a bearer-only bypass.
               audience:
                 type: string
-                description: Expected JWT aud claim; presence is required when set (same contract as audiences)
+                minLength: 1
+                pattern: "\\S"
+                description: Expected JWT aud claim; presence is required when set (same contract as audiences). Must not be blank.
               audiences:
                 type: array
                 items:
                   type: string
+                  minLength: 1
+                  pattern: "\\S"
                 description: >-
-                  Accepted JWT aud claims; OR matched. When non-empty the token
+                  Accepted JWT aud claims; OR matched. No entry may be blank. When non-empty the token
                   MUST carry aud and at least one value must match. When empty,
                   tokens without aud are accepted and a token that carries aud is
                   rejected because no acceptable audience is configured (RFC 7519
@@ -19672,16 +19704,19 @@ components:
                   properties:
                     name:
                       type: string
-                      description: Header name to read the token from
+                      pattern: "^\\s*[!#$%&'*+.^_`|~0-9A-Za-z-]+\\s*$"
+                      description: Header name to read the token from; must be a valid HTTP header name (surrounding whitespace is trimmed)
                     prefix:
-                      type: string
-                      description: Optional token prefix to strip; empty string is treated as no prefix
+                      type: [string, "null"]
+                      description: Optional token prefix to strip; an empty string or null is treated as no prefix
                 description: Custom header token locations
               from_params:
                 type: array
                 items:
                   type: string
-                description: Custom query parameter token locations
+                  minLength: 1
+                  pattern: "\\S"
+                description: Custom query parameter token locations; no entry may be blank
               forward_original_token:
                 type: boolean
                 default: true
@@ -19697,24 +19732,46 @@ components:
                 type: array
                 items:
                   type: string
-                description: Scopes that must all be present in the token
+                  minLength: 1
+                  pattern: "\\S"
+                description: >-
+                  Scopes that must all be present in the token; no entry may be
+                  blank. Equivalent providers that share one exact issuer must
+                  declare the same list and, when it is non-empty, the same
+                  effective scope_claim.
               required_roles:
                 type: array
                 items:
                   type: string
-                description: Roles where any one must be present
+                  minLength: 1
+                  pattern: "\\S"
+                description: >-
+                  Roles where any one must be present; no entry may be blank.
+                  Equivalent providers that share one exact issuer must declare
+                  the same list and, when it is non-empty, the same effective
+                  role_claim.
               scope_claim:
                 type: string
-                description: Per-provider override for scope claim path
+                pattern: "^\\s*[^.\\s][^.]*(\\.[^.]+)*\\s*$"
+                description: >-
+                  Per-provider override for scope claim path. A dot path with no
+                  empty segments. Equivalent providers that share one exact
+                  issuer and require scopes must resolve to the same effective
+                  path.
               role_claim:
                 type: string
-                description: Per-provider override for role claim path
+                pattern: "^\\s*[^.\\s][^.]*(\\.[^.]+)*\\s*$"
+                description: >-
+                  Per-provider override for role claim path. A dot path with no
+                  empty segments. Same equivalence requirement as scope_claim.
               consumer_identity_claim:
                 type: string
-                description: Per-provider override for consumer identity claim (falls back to global)
+                pattern: "^\\s*[^.\\s][^.]*(\\.[^.]+)*\\s*$"
+                description: Per-provider override for consumer identity claim (falls back to global); a dot path with no empty segments
               consumer_header_claim:
                 type: string
-                description: Per-provider override for consumer header claim (falls back to global)
+                pattern: "^\\s*[^.\\s][^.]*(\\.[^.]+)*\\s*$"
+                description: Per-provider override for consumer header claim (falls back to global); a dot path with no empty segments
               claim_headers:
                 type: object
                 additionalProperties:
@@ -19728,7 +19785,8 @@ components:
                   forwarding client-supplied input.
               claim_headers_separator:
                 type: string
-                description: Separator for array claim header values
+                minLength: 1
+                description: Separator for array claim header values; must not be empty
               output_claim_headers:
                 type: array
                 maxItems: 16
@@ -19740,11 +19798,18 @@ components:
                     header:
                       type: string
                       maxLength: 128
-                      description: Backend-visible request header the claim is published to
+                      pattern: "^\\s*[!#$%&'*+.^_`|~0-9A-Za-z-]+\\s*$"
+                      description: >-
+                        Backend-visible request header the claim is published
+                        to; must be a valid HTTP header name. Reserved,
+                        framing, provenance, and credential-bearing
+                        destinations are additionally rejected at config load
+                        (the closed list is not expressible as a pattern).
                     claim:
                       type: string
                       maxLength: 256
-                      description: Dot-path claim to publish
+                      pattern: "^\\s*[^.\\s]+(\\.[^.\\s]+)*\\s*$"
+                      description: Dot-path claim to publish; no empty segments, and no whitespace or control characters
                 description: >-
                   Istio RequestAuthentication jwtRules[].outputClaimToHeaders
                   projection. An ordered list rather than a map, because one claim
@@ -19770,7 +19835,13 @@ components:
                   Require and validate an RFC 9449 DPoP proof. Requires a
                   nonblank exact issuer (the replay realm) and
                   dpop_replay_scope, because an accepted proof must be made
-                  single-use against a declared replay authority. Equivalent
+                  single-use against a declared replay authority. The access
+                  token is accepted under either the DPoP (RFC 9449 7.1) or
+                  Bearer authorization scheme, and the DPoP scheme is matched
+                  only against providers that set this flag. Validated proof
+                  claims are htm, htu, iat, jti and ath (RFC 9449 4.2); exp is
+                  not an RFC 9449 proof claim and is not required, but a proof
+                  that carries one is rejected once it has passed. Equivalent
                   providers that share one exact issuer must agree on this
                   flag; matching order would otherwise let a sibling skip the
                   proof.
@@ -19781,7 +19852,9 @@ components:
                 minimum: 0
                 maximum: 300
                 description: >-
-                  DPoP iat/exp clock skew allowance in seconds. Bounded because
+                  DPoP proof clock skew allowance in seconds, applied to iat
+                  (and to exp when a client sends the non-standard claim).
+                  Bounded because
                   the fixed replay retention horizon (601s) is derived from twice
                   this ceiling, so no reload can shorten an already-admitted
                   proof's protection.
@@ -19825,23 +19898,30 @@ components:
                   Per-provider maximum monotonic age of the last validated
                   non-empty remote JWKS. Overrides the plugin default. Zero is
                   invalid and cannot disable bounded stale-key expiry. Applies
-                  only to jwks_uri and discovery_url sources.
+                  only to jwks_uri and discovery_url sources; supplying it on an
+                  inline jwks provider is rejected. jwks_refresh_interval_secs
+                  must not exceed this value — a cross-field rule JSON Schema
+                  cannot express, enforced at config load.
           description: Array of identity provider configurations
         scope_claim:
           type: string
           default: scope
-          description: Global scope claim path
+          pattern: "^\\s*[^.\\s][^.]*(\\.[^.]+)*\\s*$"
+          description: Global scope claim path; a dot path with no empty segments
         role_claim:
           type: string
           default: roles
-          description: Global role claim path
+          pattern: "^\\s*[^.\\s][^.]*(\\.[^.]+)*\\s*$"
+          description: Global role claim path; a dot path with no empty segments
         consumer_identity_claim:
           type: string
           default: sub
-          description: JWT claim for consumer lookup
+          pattern: "^\\s*[^.\\s][^.]*(\\.[^.]+)*\\s*$"
+          description: JWT claim for consumer lookup; a dot path with no empty segments
         consumer_header_claim:
           type: string
-          description: JWT claim for X-Consumer-Username header (default same as consumer_identity_claim)
+          pattern: "^\\s*[^.\\s][^.]*(\\.[^.]+)*\\s*$"
+          description: JWT claim for X-Consumer-Username header (default same as consumer_identity_claim); a dot path with no empty segments
         claim_headers:
           type: object
           additionalProperties:
@@ -19856,7 +19936,8 @@ components:
         claim_headers_separator:
           type: string
           default: ","
-          description: Separator for array claim header values
+          minLength: 1
+          description: Separator for array claim header values; must not be empty
         emit_mesh_request_principal_metadata:
           type: boolean
           default: false
@@ -20353,28 +20434,49 @@ components:
       type: object
       description: "Plugin: jwt_auth — HS256 JWT Bearer token authentication."
       additionalProperties: false
+      not:
+        required: [expected_issuer, expected_issuers]
       properties:
         token_lookup:
           type: string
           default: "header:Authorization"
-          description: "Where to find the token (header:<name> or query:<name>)"
+          pattern: "^(header:[!#$%&'*+.^_`|~0-9A-Za-z-]+|query:\\S+)$"
+          description: >-
+            Exact credential location (header:<name> or query:<name>).
+            Whitespace is not trimmed; header names must be valid HTTP tokens,
+            and query names must be non-empty and contain no whitespace. A
+            location no request could satisfy is rejected at config admission.
         consumer_claim_field:
           type: string
           default: sub
-          description: JWT claim identifying the consumer
+          minLength: 1
+          pattern: "\\S"
+          description: JWT claim identifying the consumer; must not be blank
         expected_issuer:
           type: string
-          description: Required iss claim; mutually exclusive with expected_issuers
+          minLength: 1
+          pattern: "\\S"
+          description: >-
+            Required iss claim; must not be blank. Mutually exclusive with
+            expected_issuers — supplying both is rejected.
         expected_issuers:
           type: array
           items:
             type: string
-          description: Accepted iss claims
+            minLength: 1
+            pattern: "\\S"
+          description: >-
+            Accepted iss claims; no entry may be blank. Mutually exclusive with
+            expected_issuer.
         audiences:
           type: array
           items:
             type: string
-          description: Accepted aud claims; audience validation is disabled when empty
+            minLength: 1
+            pattern: "\\S"
+          description: >-
+            Accepted aud claims; audience validation is disabled when empty and
+            no entry may be blank
         require_exp:
           type: boolean
           default: true
@@ -20387,6 +20489,7 @@ components:
           type: integer
           format: uint64
           default: 0
+          minimum: 0
           maximum: 300
           description: Clock leeway for time-based JWT claims
 
