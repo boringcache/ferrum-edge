@@ -29,6 +29,11 @@ fn start_http_logging(plugin: &HttpLogging) {
     plugin.commit_background_tasks();
 }
 
+// Tests that increment or observe `http_logging` `batch_discard` share the
+// `http_logging_sink_loss` lock: those counters are process-global, and cargo
+// runs this file in parallel. A concurrent 401 discard is what made the
+// 3-record 4xx delta read as 4 in hosted CI.
+
 async fn spawn_http_logging_keepalive_server(
     responses: Vec<(u16, &'static [u8])>,
 ) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
@@ -498,6 +503,7 @@ async fn test_http_logging_buffer_full_drops_gracefully() {
 }
 
 #[tokio::test]
+#[serial_test::serial(http_logging_sink_loss)]
 async fn test_http_logging_stream_disconnect_does_not_panic() {
     let plugin = HttpLogging::new(
         &json!({
@@ -742,6 +748,7 @@ async fn malformed_endpoint_rejection_does_not_echo_credentials() {
 /// `slow_threshold_ms = 0` forces the slow-call warning on the same request, so
 /// one fixture covers three of the advisory's failure classes at once.
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(http_logging_sink_loss)]
 async fn connect_failure_retry_and_slow_call_diagnostics_are_redacted() {
     let (logs, guard) = super::plugin_utils::capture_logs();
 
@@ -793,6 +800,7 @@ async fn connect_failure_retry_and_slow_call_diagnostics_are_redacted() {
 
 /// Non-2xx status classification must not name the endpoint either.
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(http_logging_sink_loss)]
 async fn status_failure_diagnostics_are_redacted() {
     let (logs, guard) = super::plugin_utils::capture_logs();
 
@@ -840,6 +848,7 @@ async fn status_failure_diagnostics_are_redacted() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(http_logging_sink_loss)]
 async fn non_retryable_4xx_records_batch_discard_once_per_record() {
     for (status, records) in [
         (reqwest::StatusCode::BAD_REQUEST, 4u64),
@@ -898,6 +907,7 @@ async fn non_retryable_4xx_records_batch_discard_once_per_record() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(http_logging_sink_loss)]
 async fn http_logging_permanent_4xx_counts_records_once_and_survives_reload() {
     let dropped_before = dropped_total("http_logging", SinkLossReason::BatchDiscard);
     let (endpoint, _connections, requests) =
@@ -919,8 +929,10 @@ async fn http_logging_permanent_4xx_counts_records_once_and_survives_reload() {
         plugin.log(&summary).await;
     }
     wait_for_count(&requests, 1).await;
+    // Exact +3: `>=` would also trip if another http_logging 4xx test leaked
+    // into this process-global series (CI saw left: 4 from a concurrent 401).
     for _ in 0..100 {
-        if dropped_total("http_logging", SinkLossReason::BatchDiscard) >= dropped_before + 3 {
+        if dropped_total("http_logging", SinkLossReason::BatchDiscard) == dropped_before + 3 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
