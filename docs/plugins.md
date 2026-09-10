@@ -1061,6 +1061,12 @@ Hot-path admission is lock-free: Ferrum reserves both a bounded channel slot and
 | `ssl_key_location` | String | *(none)* | Path to client private key for mTLS |
 | `producer_config` | Object | *(none)* | Escape hatch: additional librdkafka producer properties as string key-value pairs. Cannot override `bootstrap.servers` or top-level TLS/SASL controls, including official aliases (`sasl.mechanisms`), PEM/keystore identity alternatives, or hostname-verification disablement. `transactional.id` is refused outright: the logging lifecycle never calls `init_transactions`/`begin_transaction`/`commit_transaction`, so a transactional producer would reject every record — refusing it at admission avoids publishing a permanently unusable sink. TLS-namespace properties require `ssl`/`sasl_ssl`; SASL/HTTPS-auth properties require `sasl_plaintext`/`sasl_ssl`. Queue/message byte budgets cannot exceed Ferrum hard maxima. `ssl.crl.location` cannot conflict with the gateway CRL baseline when verification is enabled. Values carrying inline PEM private-key material are rejected regardless of property name — use `ssl_key_location` or an external secret reference; the rejection names only the property, never the material. In admin projections every property outside a compiled-in safe-tuning allow-list is replaced by `[REDACTED]`, so librdkafka properties that are (or become) sensitive upstream are covered by default |
 
+Delivery reporting is plugin-owned: `producer_config.delivery.report.only.error`
+is rejected regardless of value or casing. Ferrum always enables successful
+delivery reports. Retained-byte leases remain charged through terminal delivery,
+terminal failure, or purge-on-destroy; immediate send rejection also returns the
+lease. Local producer queue admission does not release it.
+
 #### Gateway TLS Integration
 
 Kafka uses its own binary protocol over TCP/TLS (not HTTP), so TLS is handled by librdkafka (OpenSSL) rather than the gateway's rustls stack. However, the plugin integrates with the gateway's TLS settings as defaults:

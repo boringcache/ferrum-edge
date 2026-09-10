@@ -18292,6 +18292,9 @@ components:
               - type: string
                 minLength: 1
                 pattern: '^\S(?:[\s\S]*\S)?$'
+              # Delivery reporting is plugin-owned in every property-name casing.
+              - not:
+                  pattern: '^[dD][eE][lL][iI][vV][eE][rR][yY]\.[rR][eE][pP][oO][rR][tT]\.[oO][nN][lL][yY]\.[eE][rR][rR][oO][rR]$'
               # Properties the constructor refuses outright: bootstrap aliases,
               # every alias of an authoritative top-level TLS/SASL control, and
               # transactional.id (the sink owns no Kafka transaction). The
@@ -18351,7 +18354,11 @@ components:
             file-backed gateway CRL source when verification is enabled.
             transactional.id is refused outright: the logging lifecycle never
             calls init_transactions/begin_transaction/commit_transaction, so a
-            transactional producer would reject every record. Values carrying
+            transactional producer would reject every record.
+            delivery.report.only.error is refused regardless of value or casing:
+            Ferrum owns delivery reporting and always enables successful delivery
+            reports. Retained-byte leases release at terminal delivery, terminal
+            failure, purge-on-destroy, or immediate send rejection. Values carrying
             inline PEM private-key material are refused by shape, which JSON
             Schema does not model here.
         schema:
