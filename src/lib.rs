@@ -8604,14 +8604,15 @@ pub mod _test_support {
     }
 
     /// Fallible Unix-to-monotonic conversion with injected clocks, so external
-    /// tests can prove a wall-clock rollback would extend a *fresh* conversion
-    /// and that unrepresentable inputs fail closed.
+    /// tests can prove a wall-clock rollback would extend a *fresh* conversion,
+    /// that an unusable interval fails closed, and that an expiry beyond the
+    /// representable monotonic range admits with no bound (issue #5396).
     pub fn try_credential_deadline_from_unix_seconds_at_for_test(
         expires_at_unix: i64,
         leeway_seconds: u64,
         now_unix: u64,
         now_mono: tokio::time::Instant,
-    ) -> Option<tokio::time::Instant> {
+    ) -> crate::plugins::utils::auth_flow::CredentialDeadline {
         crate::plugins::utils::auth_flow::try_credential_deadline_from_unix_seconds_at(
             expires_at_unix,
             leeway_seconds,

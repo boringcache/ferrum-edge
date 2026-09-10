@@ -2617,6 +2617,445 @@ fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
     }
 }
 
+const REDIS_URL_DATABASE_SELECTOR_PATTERN: &str =
+    r"^rediss?://[^/?#\s]+(?:/\d{0,10})?(?:\?[^\s#]*)?$";
+
+fn plugin_docs_section<'a>(plugin_docs: &'a str, plugin_name: &str) -> &'a str {
+    plugin_docs
+        .split(&format!("### `{plugin_name}`"))
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .unwrap_or_else(|| panic!("{plugin_name} docs section"))
+}
+
+fn component_validator(spec: &serde_json::Value, schema_name: &str) -> jsonschema::Validator {
+    let validator_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": format!("#/components/schemas/{schema_name}"),
+        "components": spec["components"].clone()
+    });
+    jsonschema::draft202012::options()
+        .build(&validator_schema)
+        .unwrap_or_else(|error| panic!("{schema_name} schema compiles: {error}"))
+}
+
+fn assert_schema_and_constructor(
+    validator: &jsonschema::Validator,
+    plugin_name: &str,
+    name: &str,
+    config: &serde_json::Value,
+    schema_valid: bool,
+    constructor_valid: bool,
+) {
+    assert_eq!(
+        validator.validate(config).is_ok(),
+        schema_valid,
+        "{plugin_name} {name}: unexpected schema result for {config}"
+    );
+    match (
+        ferrum_edge::plugins::create_plugin(plugin_name, config),
+        constructor_valid,
+    ) {
+        (Ok(Some(_)), true) | (Err(_), false) => {}
+        (Ok(None), _) => panic!("{plugin_name} {name}: factory returned None"),
+        (Ok(Some(_)), false) => {
+            panic!("{plugin_name} {name}: constructor accepted {config}")
+        }
+        (Err(err), true) => {
+            panic!("{plugin_name} {name}: constructor rejected {config}: {err}")
+        }
+    }
+}
+
+fn redis_sync_mode_guard<'a>(
+    schema: &'a serde_json::Value,
+    schema_name: &str,
+) -> &'a serde_json::Value {
+    schema["allOf"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{schema_name} allOf"))
+        .iter()
+        .find(|guard| {
+            guard["if"]["properties"]["sync_mode"]["pattern"] == json!("^[rR][eE][dD][iI][sS]$")
+        })
+        .unwrap_or_else(|| panic!("{schema_name} sync_mode=redis conditional guard"))
+}
+
+/// Issue #5358 / #5360: `WsRateLimitingConfig` must admit the same configs the
+/// constructor admits, except arithmetic burst/refill residuals the schema
+/// cannot express. `redis_key_prefix` must not promise shared instance budgets.
+#[test]
+fn ws_rate_limiting_schema_matches_constructor_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/WsRateLimitingConfig")
+        .expect("WsRateLimitingConfig component exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(
+        schema["properties"]["sync_mode"]["pattern"],
+        json!("^([lL][oO][cC][aA][lL]|[rR][eE][dD][iI][sS])$")
+    );
+    assert!(schema["properties"]["sync_mode"].get("enum").is_none());
+    assert_eq!(
+        schema["properties"]["redis_key_prefix"]["minLength"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["redis_connect_timeout_seconds"]["minimum"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["redis_connect_timeout_seconds"]["maximum"].as_f64(),
+        Some(u64::MAX as f64),
+    );
+    assert_eq!(
+        schema["properties"]["redis_health_check_interval_seconds"]["minimum"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["redis_health_check_interval_seconds"]["maximum"].as_f64(),
+        Some(u64::MAX as f64),
+    );
+    let redis_guard = redis_sync_mode_guard(schema, "WsRateLimitingConfig");
+    assert_eq!(redis_guard["if"]["required"], json!(["sync_mode"]));
+    assert_eq!(redis_guard["then"]["required"], json!(["redis_url"]));
+
+    let prefix_description = schema["properties"]["redis_key_prefix"]["description"]
+        .as_str()
+        .expect("redis_key_prefix description");
+    assert!(
+        prefix_description.contains("per-instance UUID"),
+        "redis_key_prefix must describe the instance UUID that partitions keys"
+    );
+    assert!(
+        !prefix_description.contains("every instance configured with the same prefix increments"),
+        "redis_key_prefix must not promise shared per-connection budgets"
+    );
+
+    let docs = plugin_docs_section(include_str!("../../docs/plugins.md"), "ws_rate_limiting");
+    assert!(
+        docs.contains("per-instance UUID"),
+        "docs/plugins.md ws_rate_limiting section must describe instance UUID isolation"
+    );
+    assert!(
+        !docs.contains(
+            "setting it explicitly is the documented opt-in for a deliberately shared budget"
+        ),
+        "docs/plugins.md ws_rate_limiting must not promise shared instance budgets"
+    );
+    assert!(
+        docs.contains("Parsed case-insensitively"),
+        "docs/plugins.md ws_rate_limiting must document sync_mode case folding"
+    );
+
+    let validator = component_validator(&spec, "WsRateLimitingConfig");
+    let accepted = [
+        json!({}),
+        json!({"frames_per_second": 50, "burst_size": 100}),
+        json!({"sync_mode": "LOCAL"}),
+        json!({
+            "sync_mode": "REDIS",
+            "redis_url": "redis://cache.internal:6379/0"
+        }),
+        json!({
+            "frames_per_second": 50,
+            "burst_size": 100,
+            "close_reason": "Rate limit exceeded",
+            "sync_mode": "redis",
+            "redis_url": "redis://redis-host:6379/2"
+        }),
+        json!({"close_reason": "レート制限"}),
+    ];
+    for config in &accepted {
+        assert_schema_and_constructor(
+            &validator,
+            "ws_rate_limiting",
+            "accepted",
+            config,
+            true,
+            true,
+        );
+    }
+
+    let rejected = [
+        json!({"sync_mode": "redis"}),
+        json!({"redis_key_prefix": ""}),
+        json!({"redis_health_check_interval_seconds": 0}),
+        json!({"redis_health_check_interval_seconds": -1}),
+        json!({"redis_connect_timeout_seconds": 0}),
+        json!({"frames_per_second": 0}),
+        json!({"sync_mode": "mysql"}),
+        json!({"frames_per_secod": 10}),
+    ];
+    for config in &rejected {
+        assert_schema_and_constructor(
+            &validator,
+            "ws_rate_limiting",
+            "rejected",
+            config,
+            false,
+            false,
+        );
+    }
+
+    // Integer-multiple / refill-window constraints stay constructor-only.
+    assert_schema_and_constructor(
+        &validator,
+        "ws_rate_limiting",
+        "non-integral burst residual",
+        &json!({"frames_per_second": 3, "burst_size": 10}),
+        true,
+        false,
+    );
+    assert_schema_and_constructor(
+        &validator,
+        "ws_rate_limiting",
+        "refill window residual",
+        &json!({"frames_per_second": 1, "burst_size": 4000}),
+        true,
+        false,
+    );
+}
+
+/// Issue #5359 / #5361: `UdpRateLimitingConfig` must require Redis URLs, bound
+/// numeric fields, accept case-normalized sync_mode, and describe per-second
+/// rates rather than per-window caps.
+#[test]
+fn udp_rate_limiting_schema_matches_constructor_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/UdpRateLimitingConfig")
+        .expect("UdpRateLimitingConfig component exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(
+        schema["properties"]["sync_mode"]["pattern"],
+        json!("^([lL][oO][cC][aA][lL]|[rR][eE][dD][iI][sS])$")
+    );
+    assert!(schema["properties"]["sync_mode"].get("enum").is_none());
+    assert_eq!(
+        schema["properties"]["redis_key_prefix"]["minLength"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["redis_connect_timeout_seconds"]["minimum"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["redis_connect_timeout_seconds"]["maximum"].as_f64(),
+        Some(u64::MAX as f64),
+    );
+    assert_eq!(
+        schema["properties"]["redis_health_check_interval_seconds"]["minimum"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["redis_health_check_interval_seconds"]["maximum"].as_f64(),
+        Some(u64::MAX as f64),
+    );
+    assert_eq!(
+        schema["properties"]["datagrams_per_second"]["maximum"].as_f64(),
+        Some(u64::MAX as f64),
+    );
+    assert_eq!(
+        schema["properties"]["bytes_per_second"]["maximum"].as_f64(),
+        Some(u64::MAX as f64),
+    );
+    let redis_guard = redis_sync_mode_guard(schema, "UdpRateLimitingConfig");
+    assert_eq!(redis_guard["if"]["required"], json!(["sync_mode"]));
+    assert_eq!(redis_guard["then"]["required"], json!(["redis_url"]));
+
+    for field in ["datagrams_per_second", "bytes_per_second"] {
+        let description = schema["properties"][field]["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{field} description"));
+        assert!(
+            description.contains("per second"),
+            "{field} must be documented as a per-second rate"
+        );
+        assert!(
+            description.contains("× window_seconds") || description.contains("* window_seconds"),
+            "{field} must give rate × window_seconds as the effective cap"
+        );
+        assert!(
+            !description.contains("Maximum datagrams per `window_seconds`")
+                && !description.contains("Maximum bytes per `window_seconds`"),
+            "{field} must not label the input rate as a per-window cap"
+        );
+    }
+
+    let docs = plugin_docs_section(include_str!("../../docs/plugins.md"), "udp_rate_limiting");
+    assert!(
+        docs.contains("Sustained datagram rate per second"),
+        "docs/plugins.md udp_rate_limiting must describe a per-second datagram rate"
+    );
+    assert!(
+        docs.contains("Sustained payload-byte rate per second"),
+        "docs/plugins.md udp_rate_limiting must describe a per-second byte rate"
+    );
+    assert!(
+        !docs.contains("Maximum datagrams per `window_seconds`"),
+        "docs/plugins.md must not label datagrams_per_second as a per-window cap"
+    );
+    assert!(
+        docs.contains("window_seconds: 4"),
+        "docs/plugins.md udp_rate_limiting must include a non-unit-window example"
+    );
+    assert!(
+        docs.contains("Parsed case-insensitively"),
+        "docs/plugins.md udp_rate_limiting must document sync_mode case folding"
+    );
+
+    let validator = component_validator(&spec, "UdpRateLimitingConfig");
+    let accepted = [
+        json!({"datagrams_per_second": 1}),
+        json!({"bytes_per_second": 1}),
+        json!({"datagrams_per_second": 1000, "bytes_per_second": 1048576}),
+        json!({"datagrams_per_second": 1, "sync_mode": "LOCAL"}),
+        json!({
+            "datagrams_per_second": 1,
+            "sync_mode": "REDIS",
+            "redis_url": "redis://cache.internal:6379/0"
+        }),
+        json!({"datagrams_per_second": 1, "window_seconds": 4}),
+        json!({
+            "datagrams_per_second": 1000,
+            "bytes_per_second": 1048576,
+            "window_seconds": 4
+        }),
+    ];
+    for config in &accepted {
+        assert_schema_and_constructor(
+            &validator,
+            "udp_rate_limiting",
+            "accepted",
+            config,
+            true,
+            true,
+        );
+    }
+
+    let rejected = [
+        json!({}),
+        json!({"datagrams_per_second": 1, "sync_mode": "redis"}),
+        json!({"datagrams_per_second": 1, "redis_key_prefix": ""}),
+        json!({"datagrams_per_second": 1, "redis_connect_timeout_seconds": 0}),
+        json!({"datagrams_per_second": 1, "redis_health_check_interval_seconds": 0}),
+        json!({"datagrams_per_second": 1, "redis_health_check_interval_seconds": -1}),
+        json!({"datagrams_per_second": 1, "window_seconds": 2678401}),
+        json!({"datagrams_per_second": 1, "sync_mdoe": "redis"}),
+    ];
+    for config in &rejected {
+        assert_schema_and_constructor(
+            &validator,
+            "udp_rate_limiting",
+            "rejected",
+            config,
+            false,
+            false,
+        );
+    }
+
+    // Checked rate × window overflow stays constructor-only.
+    assert_schema_and_constructor(
+        &validator,
+        "udp_rate_limiting",
+        "rate-window overflow residual",
+        &json!({"datagrams_per_second": u64::MAX, "window_seconds": 2}),
+        true,
+        false,
+    );
+}
+
+/// Issue #5394: the four Redis-backed rate-limit components publish the
+/// constructor's numeric database-selector rule on `redis_url`.
+#[test]
+fn redis_url_database_selector_schema_matches_constructor_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let expected_pattern = json!(REDIS_URL_DATABASE_SELECTOR_PATTERN);
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    for (schema_name, plugin_name, redis_config) in [
+        (
+            "RateLimitingConfig",
+            "rate_limiting",
+            json!({
+                "limits": [{"scope": "default", "requests_per_minute": 10}],
+                "sync_mode": "redis"
+            }),
+        ),
+        (
+            "AiRateLimiterConfig",
+            "ai_rate_limiter",
+            json!({"token_limit": 1000, "sync_mode": "redis"}),
+        ),
+        (
+            "WsRateLimitingConfig",
+            "ws_rate_limiting",
+            json!({"sync_mode": "redis"}),
+        ),
+        (
+            "UdpRateLimitingConfig",
+            "udp_rate_limiting",
+            json!({"datagrams_per_second": 1, "sync_mode": "redis"}),
+        ),
+    ] {
+        let schema = spec
+            .pointer(&format!("/components/schemas/{schema_name}"))
+            .unwrap_or_else(|| panic!("{schema_name} component exists"));
+        assert_eq!(
+            schema["properties"]["redis_url"]["pattern"], expected_pattern,
+            "{schema_name} redis_url pattern must admit only numeric database selectors"
+        );
+        let description = schema["properties"]["redis_url"]["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{schema_name} redis_url description"));
+        assert!(
+            description.contains("2147483647"),
+            "{schema_name} redis_url must document the i32 database-selector ceiling"
+        );
+        let docs = plugin_docs_section(plugin_docs, plugin_name);
+        assert!(
+            docs.contains("2147483647"),
+            "docs/plugins.md {plugin_name} redis_url row must document the selector ceiling"
+        );
+
+        let validator = component_validator(&spec, schema_name);
+        let mut accepted = redis_config.clone();
+        accepted["redis_url"] = json!("redis://cache.internal:6379/0");
+        assert!(
+            validator.validate(&accepted).is_ok(),
+            "{schema_name} must accept a numeric database selector: {accepted}"
+        );
+        let mut ceiling = redis_config.clone();
+        ceiling["redis_url"] = json!("redis://cache.internal:6379/2147483647");
+        assert!(
+            validator.validate(&ceiling).is_ok(),
+            "{schema_name} must accept the i32 selector ceiling: {ceiling}"
+        );
+        let mut no_path = redis_config.clone();
+        no_path["redis_url"] = json!("redis://cache.internal:6379");
+        assert!(
+            validator.validate(&no_path).is_ok(),
+            "{schema_name} must accept a URL with no database path: {no_path}"
+        );
+
+        for (name, url) in [
+            ("non-numeric", "redis://cache.internal:6379/banana"),
+            ("multi-segment", "redis://cache.internal:6379/0/1"),
+            ("eleven-digit", "redis://cache.internal:6379/21474836480"),
+        ] {
+            let mut rejected = redis_config.clone();
+            rejected["redis_url"] = json!(url);
+            assert!(
+                validator.validate(&rejected).is_err(),
+                "{schema_name} must reject {name} database selector: {rejected}"
+            );
+        }
+    }
+}
+
 #[test]
 fn graphql_config_schema_matches_runtime_validation() {
     use ferrum_edge::plugins::create_plugin;
@@ -16057,4 +16496,147 @@ fn mesh_custom_authorization_failure_documentation_matches_the_runtime() {
         mesh_docs.contains("capped at **128 process-wide**"),
         "docs/mesh.md must state the shared process-wide check budget"
     );
+}
+
+/// Issues #5176, #5177, #5178, #5181, #5189: the published
+/// `serverless_function` grammar and the constructor's admission rules must
+/// describe the same set of accepted configurations.
+#[test]
+fn serverless_function_schema_matches_runtime_admission() {
+    use ferrum_edge::plugins::create_plugin;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let properties = spec
+        .pointer("/components/schemas/ServerlessFunctionConfig/properties")
+        .expect("ServerlessFunctionConfig properties exist");
+
+    fn compile_pattern(value: &serde_json::Value) -> Regex {
+        let raw = value["pattern"].as_str().expect("published pattern");
+        Regex::new(raw).expect("published pattern compiles")
+    }
+    let pattern_for = |field: &str| compile_pattern(&properties[field]);
+
+    // Issue #5177: `format: uint64` is not an assertion, so the ceiling the
+    // runtime can actually represent must be published as `maximum`.
+    for field in ["timeout_ms", "max_response_body_bytes"] {
+        assert_eq!(
+            properties[field]["maximum"].as_u64(),
+            Some(u64::MAX),
+            "{field} must publish the u64 ceiling"
+        );
+        assert_eq!(properties[field]["minimum"].as_u64(), Some(1), "{field}");
+    }
+
+    // Issue #5176: `forward_headers` entries are HTTP field-name tokens.
+    let header_item = &properties["forward_headers"]["items"];
+    assert_eq!(header_item["minLength"].as_u64(), Some(1));
+    let header_pattern = compile_pattern(header_item);
+    assert!(header_pattern.is_match("x-request-id"));
+    assert!(header_pattern.is_match("X-Request-ID"));
+    assert!(!header_pattern.is_match(""));
+    assert!(!header_pattern.is_match("bad header"));
+    assert!(!header_pattern.is_match("bad:header"));
+
+    // Issue #5189: a credential must be representable as an HTTP field value.
+    for field in ["azure_function_key", "gcp_bearer_token"] {
+        let pattern = pattern_for(field);
+        assert!(pattern.is_match("ordinary-credential=="), "{field}");
+        assert!(!pattern.is_match("audit\ncredential"), "{field}");
+        assert!(!pattern.is_match("audit\rcredential"), "{field}");
+        assert!(!pattern.is_match("audit\u{0}credential"), "{field}");
+        assert!(!pattern.is_match("audit\u{7f}credential"), "{field}");
+    }
+
+    // Issue #5181: the Lambda Invoke identifier grammars.
+    assert_eq!(
+        properties["aws_function_name"]["maxLength"].as_u64(),
+        Some(170)
+    );
+    assert_eq!(properties["aws_qualifier"]["maxLength"].as_u64(), Some(128));
+    let name_pattern = pattern_for("aws_function_name");
+    for accepted in [
+        "my-function",
+        "my_function.v2",
+        "my-function:prod",
+        "my-function:$LATEST",
+        "123456789012:function:my-function",
+        "arn:aws:lambda:us-east-1:123456789012:function:my-function",
+        "arn:aws-cn:lambda:cn-north-1:123456789012:function:my-function:prod",
+    ] {
+        assert!(name_pattern.is_match(accepted), "name={accepted}");
+    }
+    for rejected in [" ", "my function", "my/function", "my-function:bad alias"] {
+        assert!(!name_pattern.is_match(rejected), "name={rejected:?}");
+    }
+    let qualifier_pattern = pattern_for("aws_qualifier");
+    for accepted in ["$LATEST", "prod", "1", "blue-green_2"] {
+        assert!(qualifier_pattern.is_match(accepted), "qualifier={accepted}");
+    }
+    for rejected in ["not a qualifier", "bad/alias", ""] {
+        assert!(
+            !qualifier_pattern.is_match(rejected),
+            "qualifier={rejected:?}"
+        );
+    }
+
+    // Issue #5178: one lexical URL contract for both URL-valued fields.
+    let url_pattern = pattern_for("function_url");
+    for accepted in [
+        "http://127.0.0.1/a%20b",
+        "https://functions.example/api/transform",
+        "https://functions.example:65535/api/transform",
+        "https://[2001:db8::1]:8443/api/transform",
+        "http://127.0.0.1:0/pre",
+    ] {
+        assert!(url_pattern.is_match(accepted), "url={accepted}");
+    }
+    for rejected in [
+        "https://:1234",
+        "https://127.0.0.1:65536/pre",
+        "http://127.0.0.1/a b",
+        "http://user:pass@127.0.0.1/pre",
+        "https://functions.example/api#fragment",
+    ] {
+        assert!(!url_pattern.is_match(rejected), "url={rejected}");
+    }
+    let endpoint_pattern = pattern_for("aws_endpoint_url");
+    for accepted in ["http://localhost:4566", "http://localhost:4566/"] {
+        assert!(endpoint_pattern.is_match(accepted), "endpoint={accepted}");
+    }
+    for rejected in [
+        "https://example.com/lambda",
+        "https://example.com?token=secret",
+        "https://:1234",
+        "https://127.0.0.1:65536",
+    ] {
+        assert!(!endpoint_pattern.is_match(rejected), "endpoint={rejected}");
+    }
+
+    // Runtime parity for the same inputs: every schema rejection above is also
+    // a constructor rejection, and the accepted base configuration builds.
+    let base = json!({
+        "provider": "azure_functions",
+        "function_url": "http://127.0.0.1:45678/pre"
+    });
+    assert!(create_plugin("serverless_function", &base).is_ok());
+    for extra in [
+        json!({"function_url": "https://:1234"}),
+        json!({"function_url": "https://127.0.0.1:65536/pre"}),
+        json!({"function_url": "http://127.0.0.1/a b"}),
+        json!({"forward_headers": [""]}),
+        json!({"forward_headers": ["bad header"]}),
+        json!({"azure_function_key": "audit\ncredential"}),
+        json!({"gcp_bearer_token": "audit\ncredential"}),
+        json!({"aws_function_name": "bad name"}),
+        json!({"aws_qualifier": "not a qualifier"}),
+        json!({"aws_endpoint_url": "https://example.com/lambda"}),
+    ] {
+        let mut config = base.clone();
+        merge_into_object(&mut config, &extra);
+        assert!(
+            create_plugin("serverless_function", &config).is_err(),
+            "runtime must reject the schema-invalid config: {config}"
+        );
+    }
 }
