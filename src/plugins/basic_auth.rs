@@ -304,17 +304,20 @@ fn authorization_value_is_basic(value: &str) -> bool {
         .eq_ignore_ascii_case("Basic")
 }
 
-/// Remove every `Authorization` field carrying the `Basic` scheme from a
-/// backend-bound header map.
+/// Whether one backend-bound header entry is an `Authorization` field carrying
+/// the `Basic` scheme.
 ///
 /// The materialized map is lowercase, but a plugin can insert a mixed-case key,
-/// so names are matched ASCII case-insensitively. Removal is keyed on the value:
-/// a `Bearer` (or any other) scheme survives untouched.
+/// so the name is matched ASCII case-insensitively. The decision is keyed on the
+/// VALUE as well: a `Bearer` (or any other) scheme is not this plugin's.
+fn is_basic_authorization_field(name: &str, value: &str) -> bool {
+    name.eq_ignore_ascii_case("authorization") && authorization_value_is_basic(value)
+}
+
+/// Remove every `Authorization` field carrying the `Basic` scheme from a
+/// backend-bound header map.
 fn strip_basic_authorization(headers: &mut std::collections::HashMap<String, String>) {
-    headers.retain(|name, value| {
-        !(name.eq_ignore_ascii_case("authorization")
-            && authorization_value_is_basic(value.as_str()))
-    });
+    headers.retain(|name, value| !is_basic_authorization_field(name, value));
 }
 
 auth_flow::impl_auth_plugin!(
