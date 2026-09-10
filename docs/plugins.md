@@ -4100,6 +4100,20 @@ Each `limits[]` rule configures rate windows in one of two ways:
 1. `window_seconds` + `max_requests` — exact custom window
 2. One or more of `requests_per_second` / `requests_per_minute` / `requests_per_hour`
 
+**Schema parity.** `RateLimitingConfig` and `RateLimitingRuleConfig` in
+`openapi.yaml` encode the constructor's admission rules, so a schema-driven
+editor agrees with file and admin admission: exactly one `scope: default` rule,
+`scope: consumers` only with `limit_by: consumer`, `sync_mode: redis` requiring
+`redis_url`, positive `redis_connect_timeout_seconds` /
+`redis_health_check_interval_seconds`, a non-empty `redis_key_prefix`, unique
+identities within one `consumers` list, and the case-insensitive spellings of
+`limit_by` / `sync_mode` / `scope` (`limit_by: null` means `ip`, exactly as
+omitting it does). Three residual rules JSON Schema cannot express are enforced
+by the constructor alone and are documented on the fields themselves: one
+consumer identity named in two *different* `scope: consumers` rules, an
+out-of-range TCP port in `redis_url`, and a `redis_url` database index above the
+server's own `databases` setting.
+
 **Configuration bounds.** Every explicit `window_seconds` accepted by the
 rate-limit plugins is capped at `2678400` seconds (31 days). Ordinary HTTP,
 GraphQL, and gRPC method request caps are capped at `1000000`; zero and values
@@ -4143,8 +4157,8 @@ At least one rate window must be configured in every rule. Do not combine the cu
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:rate_limiting:{plugin-config-id}` | Redis key namespace prefix. Defaults to the gateway namespace, the plugin name, and this plugin config's stable resource id (for example `ferrum:rate_limiting:rl-public-api`), so two independent policies of this type in one namespace never share counters. Must be non-empty when set; setting it explicitly is the documented opt-in for a deliberately shared budget. |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Sizes a bounded pool of non-reconnecting `MultiplexedConnection` slots selected round-robin on the hot path; a broken slot is never silently re-dialed by redis-rs — it is cleared and re-established through Ferrum's DNS/egress/`INFO CLUSTER` screening path |
-| `redis_connect_timeout_seconds` | u64 | `5` | Effective Redis connection-attempt timeout in seconds (must be > 0). Applied to redis-rs inner connection config for cached, dedicated, and health-check paths (TCP connect, TLS handshake when enabled, Redis protocol handshake), and as the deadline for the proactive `INFO CLUSTER` topology screen on those connections. Gateway DNS screening/resolution of the Redis hostname runs before this timeout starts |
-| `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
+| `redis_connect_timeout_seconds` | u64 | `5` | Effective Redis connection-attempt timeout in seconds (must be > 0). Applied to redis-rs inner connection config for cached, dedicated, and health-check paths (TCP connect, TLS handshake when enabled, Redis protocol handshake), and as the deadline for the proactive `INFO CLUSTER` topology screen (plus the no-eviction memory screen) on those connections — the redis-rs 500 ms command-response cap is lifted for the screen and reinstalled on the connection once it is screened, so a server that answers `INFO` in 750 ms fits a configured 2-second deadline while ordinary commands stay bounded. Gateway DNS screening/resolution of the Redis hostname runs before this timeout starts |
+| `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable (must be > 0) |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | — | Redis password |
 | `redis_failure_policy` | String | `fail_closed` | Behavior when the centralized store cannot be consulted (outage, egress/DNS screen failure, or an endpoint rejected as Redis Cluster). `fail_closed` refuses with `503`; `local_fallback` explicitly opts into per-process budgets for availability. Only meaningful when `sync_mode: "redis"`, but validated in either mode |
@@ -4160,6 +4174,8 @@ At least one rate window must be configured in every rule. Do not combine the cu
 The resolved request client identity canonicalizes IPv4-mapped IPv6 to native IPv4 once before plugin execution. Every local or Redis fallback key therefore uses the same canonical text without reparsing it in each limiter.
 
 **Rate limit headers** (when `expose_headers: true`): `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-window`. Every admitted (counted) request's client-visible response carries them — including gateway-generated responses such as cache hits, response mocks, serverless short-circuits, and rejections raised by plugins that run after `rate_limiting`; requests that never reached the rate-limit check carry no metadata and get no synthesized headers. The limiter key/identity is never exposed: for `limit_by: "consumer"`/`"spiffe_identity"` it would echo the gateway's internal caller identity (consumer username) or the peer workload SVID back to the client.
+
+**Composed limiters publish one verdict.** The three header names are a single public contract, so when a route carries more than one `rate_limiting` instance exactly one instance's values are published, and the choice does not depend on plugin order. A limiter that *refuses* the request owns the header set: its `limit` / `remaining: 0` / `window` survive the shared rejection finalizer, and a sibling that admitted the same request earlier never re-publishes its positive budget over the `429`. When every limiter admitted, the tightest remaining budget wins — the same rule one instance already applies across its own windows — so the client backs off against the limit that will refuse it next. Two responses carry no rate-limit headers at all: a refusal from a limiter configured with `expose_headers: false` (that policy's verdict is that the client is told no budget), and any fail-closed `503`, where the gateway has no authoritative counter to report.
 
 Returns HTTP `429 Too Many Requests` when exceeded.
 
@@ -4219,7 +4235,7 @@ Prevents duplicate API calls by tracking idempotency keys. When a request arrive
 | `anonymous_caller_scope` | String | `"caller_address"` | How **anonymous** callers are partitioned. `caller_address` binds the gateway-resolved canonical peer address; a request whose canonical address cannot be parsed is not deduplicated (and is refused with `503` when `enforce_required` is set) rather than keyed incompletely. `shared` is an explicit operator attestation that the origin does not vary by caller address on this route. It does not apply to authenticated callers, which always bind their canonical address |
 | `enforce_required` | bool | `false` | Reject requests missing the idempotency header with 400 |
 | `sync_mode` | String | `"local"` | `local` (in-memory) or `redis` (centralized) |
-| `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`). Must use the `redis://` or `rediss://` scheme with a hostname. Must not carry a URL fragment (`#insecure` or otherwise); TLS skip-verify is only `FERRUM_TLS_NO_VERIFY` |
+| `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`). Must use the `redis://` or `rediss://` scheme with a hostname. Must not carry a URL fragment (`#insecure` or otherwise); TLS skip-verify is only `FERRUM_TLS_NO_VERIFY`. The path, when present, is the database selector and is validated at plugin admission: a single non-negative integer no greater than `2147483647` (`redis://host:6379/0`). A non-numeric, multi-segment, negative, or out-of-range selector is refused at construction rather than failing at first use. |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `"{FERRUM_NAMESPACE}:dedup"` | Redis key namespace prefix. Defaults to `ferrum:dedup` when namespace is `"ferrum"`. Must be non-empty when supplied. Sibling instances stay isolated under a shared default/explicit prefix via stable `plugin_config_id` in logical keys, and matched proxy namespaces remain isolated even when an explicit prefix is shared across namespaces |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Sizes a bounded pool of non-reconnecting `MultiplexedConnection` slots selected round-robin on the hot path; a broken slot is never silently re-dialed by redis-rs — it is cleared and re-established through Ferrum's DNS/egress/`INFO CLUSTER` screening path |
@@ -5875,7 +5891,7 @@ Request buffering is only enabled when at least one GraphQL policy is configured
 | `type_rate_limits` | Object | `{}` | Rate limits by operation type. Only exact lowercase `query`, `mutation`, and `subscription` keys are accepted; unknown keys are rejected. |
 | `operation_rate_limits` | Object | `{}` | Rate limits by named operation. Keys must be valid GraphQL Names (`[_A-Za-z][_0-9A-Za-z]*`). |
 | `sync_mode` | String | `local` | Exact lowercase `local` (in-memory per instance) or `redis` (centralized) for GraphQL rate-limit counters |
-| `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`). Must not carry a URL fragment (`#insecure` or otherwise); TLS skip-verify is only `FERRUM_TLS_NO_VERIFY` |
+| `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`). Must not carry a URL fragment (`#insecure` or otherwise); TLS skip-verify is only `FERRUM_TLS_NO_VERIFY`. The path, when present, is the database selector and is validated at plugin admission: a single non-negative integer no greater than `2147483647` (`redis://host:6379/0`). A non-numeric, multi-segment, negative, or out-of-range selector is refused at construction rather than failing at first use. |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:graphql:{plugin-config-id}` | Redis key namespace prefix. Defaults to the gateway namespace, the plugin name, and this plugin config's stable resource id (for example `ferrum:graphql:rl-public-api`), so two independent policies of this type in one namespace never share counters. Must be non-empty when set; setting it explicitly is the documented opt-in for a deliberately shared budget. |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Sizes a bounded pool of non-reconnecting `MultiplexedConnection` slots selected round-robin on the hot path; a broken slot is never silently re-dialed by redis-rs — it is cleared and re-established through Ferrum's DNS/egress/`INFO CLUSTER` screening path |
@@ -6045,7 +6061,7 @@ Enables per-method access control and rate limiting for canonical gRPC paths (`/
 | `method_rate_limits` | Object or null | `{}` | Per-method rate limits keyed by full method path. Each entry accepts only `max_requests` (1–1000000) and `window_seconds` (1–2678400); unknown keys are rejected. `null` is the same as omission. |
 | `limit_by` | String or null | `ip` | Rate limit key: `ip` or `consumer`. ASCII case is ignored (`CONSUMER` and `Ip` are admitted). `null` is the same as omission (`ip`). Other values are rejected at plugin load time. |
 | `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) for method rate-limit counters. ASCII case is ignored (`LOCAL` and `Redis` are admitted). `redis_failure_policy` remains case-sensitive. |
-| `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`). Must not carry a URL fragment (`#insecure` or otherwise); TLS skip-verify is only `FERRUM_TLS_NO_VERIFY` |
+| `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`). Must not carry a URL fragment (`#insecure` or otherwise); TLS skip-verify is only `FERRUM_TLS_NO_VERIFY`. The path, when present, is the database selector and is validated at plugin admission: a single non-negative integer no greater than `2147483647` (`redis://host:6379/0`). A non-numeric, multi-segment, negative, or out-of-range selector is refused at construction rather than failing at first use. |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:grpc_method_router:{plugin-config-id}` | Redis key namespace prefix. Defaults to the gateway namespace, the plugin name, and this plugin config's stable resource id (for example `ferrum:grpc_method_router:rl-public-api`), so two independent policies of this type in one namespace never share counters. Must be non-empty when set; setting it explicitly is the documented opt-in for a deliberately shared budget. |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Sizes a bounded pool of non-reconnecting `MultiplexedConnection` slots selected round-robin on the hot path; a broken slot is never silently re-dialed by redis-rs — it is cleared and re-established through Ferrum's DNS/egress/`INFO CLUSTER` screening path |
