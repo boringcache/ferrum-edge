@@ -3237,7 +3237,7 @@ impl<S: FrameSource + Unpin> FrameSource for SizeLimitedFrameSource<S> {
 
 /// Default flush target for the [`Coalescing`] adapter when no explicit
 /// target is supplied (HTTP/1.1 + HTTP/2-via-reqwest path).
-const COALESCE_TARGET: usize = 128 * 1024;
+pub(crate) const COALESCE_TARGET: usize = 128 * 1024;
 
 pub(crate) trait FrameSource {
     /// A source may prove that no further frames exist before its first poll.
@@ -3739,10 +3739,97 @@ impl<S: H3RecvStream + Unpin> FrameSource for H3FrameSource<S> {
     }
 }
 
+/// Lazily-allocated accumulator behind the [`Coalescing`] adapter.
+///
+/// A response that yields exactly one DATA frame — the common case for a small
+/// streamed RPC message — never allocates an aggregation buffer at all: the
+/// frame's own `Bytes` is held by value and handed straight back on flush, so
+/// the storage the backend produced is the storage the client receives. The
+/// `BytesMut` appears only when a SECOND frame actually has to be merged with
+/// the first (issue #5040).
+///
+/// `Single` and `Merged` are never empty: [`Coalescing::buffer_data`] drops
+/// empty frames before they reach [`CoalesceBuffer::push`], so `is_empty()` is
+/// exactly `matches!(self, CoalesceBuffer::Empty)` and any flush of a
+/// non-`Empty` state yields a non-empty frame — the invariant the trailer- and
+/// error-stashing paths depend on.
+///
+/// Flushing a `Merged` state hands the region's unused tail back to
+/// `Coalescing::spare`, so a stream that repeatedly flushes below the target
+/// keeps the pre-#5040 amortization (one region shared by several flushes,
+/// promoted to shared storage once) instead of allocating a fresh region per
+/// flush.
+enum CoalesceBuffer {
+    Empty,
+    Single(Bytes),
+    Merged(BytesMut),
+}
+
+impl CoalesceBuffer {
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Single(data) => data.len(),
+            Self::Merged(merged) => merged.len(),
+        }
+    }
+
+    /// Append a NON-EMPTY payload, reaching for an aggregation region only on
+    /// the transition from one held frame to two merged frames: `spare` (the
+    /// tail of a previously flushed region) when it still fits, otherwise a
+    /// fresh region of the adapter's configured `capacity` — or of what the
+    /// pair needs, when that is larger.
+    fn push(&mut self, data: Bytes, capacity: usize, spare: &mut Option<BytesMut>) {
+        match std::mem::replace(self, Self::Empty) {
+            Self::Empty => *self = Self::Single(data),
+            Self::Single(first) => {
+                let needed = first.len().saturating_add(data.len());
+                let mut merged = match spare.take() {
+                    Some(region) if region.capacity() >= needed => region,
+                    _ => BytesMut::with_capacity(capacity.max(needed)),
+                };
+                merged.extend_from_slice(&first);
+                merged.extend_from_slice(&data);
+                *self = Self::Merged(merged);
+            }
+            Self::Merged(mut merged) => {
+                merged.extend_from_slice(&data);
+                *self = Self::Merged(merged);
+            }
+        }
+    }
+
+    fn state_name(&self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Single(_) => "single",
+            Self::Merged(_) => "merged",
+        }
+    }
+
+    fn aggregation_capacity(&self) -> usize {
+        match self {
+            Self::Merged(merged) => merged.capacity(),
+            Self::Empty | Self::Single(_) => 0,
+        }
+    }
+}
+
 pub(crate) struct Coalescing<S: FrameSource> {
     inner: S,
     target_bytes: usize,
-    buffer: BytesMut,
+    /// Capacity requested for the aggregation `BytesMut` the first time two
+    /// frames must be merged. Nothing is reserved up front (issue #5040).
+    buffer_capacity: usize,
+    buffer: CoalesceBuffer,
+    /// Unused tail of the last flushed aggregation region, reused by the next
+    /// merge. Only a merge ever fills it, so a body that never merges — one
+    /// frame, or none — holds no region at all.
+    spare: Option<BytesMut>,
     stashed_trailer: Option<Frame<Bytes>>,
     stashed_error: Option<BoxError>,
     done: bool,
@@ -3753,31 +3840,26 @@ pub(crate) struct Coalescing<S: FrameSource> {
 }
 
 impl<S: FrameSource> Coalescing<S> {
-    fn new(inner: S, target_bytes: usize, content_length: Option<u64>) -> Self {
+    pub(crate) fn new(inner: S, target_bytes: usize, content_length: Option<u64>) -> Self {
         Self::with_flush_after(inner, target_bytes, content_length, None)
     }
 
-    fn with_flush_after(
+    pub(crate) fn with_flush_after(
         inner: S,
         target_bytes: usize,
         content_length: Option<u64>,
         flush_after: Option<Duration>,
     ) -> Self {
-        Self {
+        Self::with_flush_after_and_capacity(
             inner,
             target_bytes,
-            buffer: BytesMut::with_capacity(target_bytes.min(COALESCE_TARGET)),
-            stashed_trailer: None,
-            stashed_error: None,
-            done: false,
+            target_bytes.min(COALESCE_TARGET),
             content_length,
             flush_after,
-            flush_timer: None,
-            flush_timer_armed: false,
-        }
+        )
     }
 
-    fn with_flush_after_and_capacity(
+    pub(crate) fn with_flush_after_and_capacity(
         inner: S,
         target_bytes: usize,
         buffer_capacity: usize,
@@ -3787,7 +3869,9 @@ impl<S: FrameSource> Coalescing<S> {
         Self {
             inner,
             target_bytes,
-            buffer: BytesMut::with_capacity(buffer_capacity),
+            buffer_capacity,
+            buffer: CoalesceBuffer::Empty,
+            spare: None,
             stashed_trailer: None,
             stashed_error: None,
             done: false,
@@ -3833,22 +3917,65 @@ impl<S: FrameSource> Coalescing<S> {
     }
 
     fn flush_buffer(&mut self) -> Option<Frame<Bytes>> {
-        if self.buffer.is_empty() {
-            self.flush_timer_armed = false;
-            return None;
-        }
-
         self.flush_timer_armed = false;
-        Some(Frame::data(self.buffer.split().freeze()))
+        match std::mem::replace(&mut self.buffer, CoalesceBuffer::Empty) {
+            CoalesceBuffer::Empty => None,
+            // The one-frame flush: the backend's own storage, uncopied.
+            CoalesceBuffer::Single(data) => Some(Frame::data(data)),
+            CoalesceBuffer::Merged(mut merged) => {
+                let flushed = merged.split().freeze();
+                // `merged` is now the region's unused tail. Keeping it lets the
+                // next merge reuse the region (and its one shared-storage
+                // promotion) instead of allocating per flush.
+                if merged.capacity() > 0 {
+                    self.spare = Some(merged);
+                }
+                Some(Frame::data(flushed))
+            }
+        }
     }
 
-    fn buffer_data(&mut self, data: &Bytes) {
+    fn buffer_data(&mut self, data: Bytes) {
         if data.is_empty() {
             return;
         }
-        self.buffer.extend_from_slice(data);
+        self.buffer
+            .push(data, self.buffer_capacity, &mut self.spare);
         if self.flush_after.is_some() && !self.flush_timer_armed {
             self.arm_flush_timer();
+        }
+    }
+
+    /// Test-only introspection of the lazy accumulator: `"empty"`, `"single"`
+    /// (one frame held with no aggregation buffer) or `"merged"`.
+    ///
+    /// Reached only through `crate::_test_support`, so the issue #5040
+    /// laziness contract is asserted on the production adapter.
+    #[allow(dead_code)]
+    pub(crate) fn buffer_state_name(&self) -> &'static str {
+        self.buffer.state_name()
+    }
+
+    /// Test-only introspection: capacity of the aggregation `BytesMut`, or `0`
+    /// while none has been allocated.
+    #[allow(dead_code)]
+    pub(crate) fn aggregation_capacity(&self) -> usize {
+        self.buffer.aggregation_capacity()
+    }
+
+    /// Test-only introspection: bytes currently held pending a flush.
+    #[allow(dead_code)]
+    pub(crate) fn buffered_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Test-only introspection: capacity of the retained aggregation region the
+    /// next merge would reuse, or `0` when the adapter holds no region.
+    #[allow(dead_code)]
+    pub(crate) fn retained_region_capacity(&self) -> usize {
+        match self.spare.as_ref() {
+            Some(region) => region.capacity(),
+            None => 0,
         }
     }
 }
@@ -3888,25 +4015,31 @@ impl<S: FrameSource + Unpin> http_body::Body for Coalescing<S> {
         loop {
             match Pin::new(&mut this.inner).poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => {
-                    if let Some(data) = frame.data_ref() {
-                        if this.buffer.is_empty() && data.len() >= this.target_bytes {
-                            return Poll::Ready(Some(Ok(frame)));
-                        }
+                    let frame = match frame.into_data() {
+                        Ok(data) => {
+                            if this.buffer.is_empty() && data.len() >= this.target_bytes {
+                                // Large-frame bypass: hand the backend's own
+                                // storage downstream without ever allocating
+                                // an aggregation buffer.
+                                return Poll::Ready(Some(Ok(Frame::data(data))));
+                            }
 
-                        this.buffer_data(data);
-                        if this.buffer.len() >= this.target_bytes
-                            && let Some(flushed) = this.flush_buffer()
-                        {
-                            return Poll::Ready(Some(Ok(flushed)));
+                            this.buffer_data(data);
+                            if this.buffer.len() >= this.target_bytes
+                                && let Some(flushed) = this.flush_buffer()
+                            {
+                                return Poll::Ready(Some(Ok(flushed)));
+                            }
+                            continue;
                         }
-                        continue;
-                    }
+                        Err(frame) => frame,
+                    };
 
-                    if !this.buffer.is_empty() {
+                    // A trailer (or any other non-DATA frame) ends aggregation:
+                    // flush what is held first and stash the frame so the next
+                    // poll still delivers it.
+                    if let Some(flushed) = this.flush_buffer() {
                         this.stashed_trailer = Some(frame);
-                        let flushed = this
-                            .flush_buffer()
-                            .expect("non-empty buffer must flush before stashed trailer");
                         return Poll::Ready(Some(Ok(flushed)));
                     }
 
@@ -3915,11 +4048,8 @@ impl<S: FrameSource + Unpin> http_body::Body for Coalescing<S> {
                 }
                 Poll::Ready(Some(Err(err))) => {
                     this.done = true;
-                    if !this.buffer.is_empty() {
+                    if let Some(flushed) = this.flush_buffer() {
                         this.stashed_error = Some(err);
-                        let flushed = this
-                            .flush_buffer()
-                            .expect("non-empty buffer must flush before stashed error");
                         return Poll::Ready(Some(Ok(flushed)));
                     }
                     return Poll::Ready(Some(Err(err)));
@@ -6021,12 +6151,20 @@ mod tests {
             Some(Duration::from_millis(2)),
         ));
 
-        body.buffer.extend_from_slice(b"stashed-");
+        // Hold one frame, then clear the armed flag by hand: this is the state
+        // a fired-but-unflushed timer leaves behind while data is still held.
+        body.buffer_data(Bytes::from_static(b"stashed-"));
+        body.flush_timer_armed = false;
         assert!(!body.buffer.is_empty());
-        assert!(!body.flush_timer_armed);
+        assert_eq!(body.buffer_state_name(), "single");
 
-        body.buffer_data(&Bytes::from_static(b"tail"));
+        body.buffer_data(Bytes::from_static(b"tail"));
         assert!(body.flush_timer_armed);
+        assert_eq!(
+            body.buffer_state_name(),
+            "merged",
+            "a second frame must allocate the aggregation buffer"
+        );
 
         tokio::time::sleep(Duration::from_millis(5)).await;
 

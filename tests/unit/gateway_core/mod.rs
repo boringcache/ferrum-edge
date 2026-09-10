@@ -143,6 +143,8 @@ mod request_representation_tests;
 mod request_trailer_boundary_tests;
 mod response_body_mode_tests;
 mod response_buffer_budget_tests;
+mod response_coalescing_allocation_tests;
+mod response_coalescing_lazy_tests;
 mod response_pipeline_ordering_tests;
 mod response_representation_tests;
 mod response_trailer_policy_tests;

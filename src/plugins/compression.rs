@@ -5,13 +5,16 @@
 //! decompression is opt-in: when enabled, `Content-Encoding` is parsed as an
 //! ordered coding list (OWS-tolerant), supported chains are decoded in reverse
 //! application order under per-layer/cumulative/amplification limits, and
-//! malformed or unsupported members fail closed. Decoding runs in the shared
-//! pre-`before_proxy` normalization phase so earlier body consumers (for
-//! example `soap_ws_security`) inspect validated plaintext. The same plaintext
-//! is forwarded to the backend after encoding/length headers are stripped only
-//! on successful decode. Rare buffered fallback paths that strip headers without
-//! a mutable body view stage the validated plaintext onto the request context
-//! so the later transform emits those bytes instead of re-decoding.
+//! malformed or unsupported members fail closed. Each gzip coding must contain
+//! exactly one complete member; trailing bytes or additional members receive
+//! `400`, matching the shared representation gates' single-member rule.
+//! Decoding runs in the shared pre-`before_proxy` normalization phase so earlier
+//! body consumers (for example `soap_ws_security`) inspect validated plaintext.
+//! The same plaintext is forwarded to the backend after encoding/length headers
+//! are stripped only on successful decode. Rare buffered fallback paths that
+//! strip headers without a mutable body view stage the validated plaintext onto
+//! the request context so the later transform emits those bytes instead of
+//! re-decoding.
 //!
 //! Gzip/Brotli codec CPU runs on a bounded `spawn_blocking` pool guarded by an
 //! admission semaphore so Tokio workers are not monopolized. Queue saturation
@@ -615,8 +618,8 @@ impl CompressionPlugin {
                 other => return Err(format!("unsupported content-encoding '{other}'")),
             }
         }
-        // Preserve the original member spelling only for the single-coding case
-        // used by legacy observability markers; chains record the full list.
+        // A single coding records its canonical member (`parse_content_codings`
+        // folds `x-gzip` into `gzip`); chains record the canonical list.
         let marker = if codings.len() == 1 {
             codings[0].clone()
         } else {
