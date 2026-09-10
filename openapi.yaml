@@ -18851,6 +18851,15 @@ components:
             trimmed before the 128-character maximum is applied. Requires
             log_request_body or log_response_body true when the array is
             nonempty. An empty array is valid without a capture switch.
+            Independently of this list, everything under an Azure "On Your
+            Data" `parameters` object inside a `data_sources` / `dataSources` /
+            `data-sources` container is replaced wholesale. Recognizing that
+            container name never short-circuits the ordinary visitor: a
+            captured body is arbitrary JSON, so a value under that name which
+            is not the provider's conventional array (an object, string,
+            number, boolean, or null) is still traversed with the same
+            member-name and credential-shaped-string rules as the rest of the
+            body.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
@@ -29475,46 +29484,100 @@ components:
       type: object
       required: [sink]
       additionalProperties: false
-      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (3010); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and allow-listed cache telemetry (namespaced `ai_semantic_cache.<id>.{cache_status,cache_match,cache_similarity}`, legacy `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity`, and `request_deduplication.replayed`; never `cache_key`), then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Retention is bounded by BOTH record count (sink.buffer_capacity) and an aggregate retained-byte budget (limits.buffer_max_bytes / limits.max_entry_bytes) covering staged candidates, fail-closed pre-commit reservations, active fail-open stream capture, exact pre-serialized queue payloads, JSON-array assembly, and every sequential retry. A fail-open stream reserves the maximum retained-record charge before copying response bytes and transfers that lease at terminal enqueue; a fail-closed stream reuses its pre-commit lease. Retry clones share immutable Bytes rather than deep-cloning records; reqwest receives the already-escaped exact-capacity JSON body rather than reserializing it. In redacted_body, limits.max_redaction_scan_bytes is checked before JSON classification/model/tool extraction/redaction; oversized JSON POSTs are conservatively audited as possible streaming AI requests with explicit omission evidence rather than bypassing audit. Streamed keyed hashing is bounded by capture.stream_hash, and active-stream reservations by limits.max_stream_reservation_secs. Authenticated /health exposes effective admitted ceilings plus live retained_bytes/retained_byte_drops/stream_reservations_expired/sink_healthy gauges without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only and conservatively classified oversized capture. In-flight staging is hard-bounded at 4096 entries per plugin instance while candidate/record_id/sample markers remain shared across co-located instances: a saturated instance neither erases a peer's live candidate nor borrows it for response buffering, response hooks, stream reservations, sampling/admission, or record emission. The local staging entry is consumed by atomic removal at buffered or ordinary stream-terminal commit. Expiry first revokes capture/hash work and releases all staging/queue/byte owners; its single-fire request-owned terminal slot carries only the local sampling roll needed for a body-free best-effort fallback and cannot be created from shared peer markers. Orphan/reservation sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP by default; native gRPC capture requires an explicit descriptor-based grpc enrollment block (enrolled methods only). Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults. Redacted captures replace malformed function.arguments JSON with [UNPARSEABLE] and set arguments_redaction_failed=true on the captured function object; valid arguments retain member-name redaction. Explicit full_body raw capture is unchanged."
+      allOf:
+        # mode: full_body captures UNREDACTED payloads, so the constructor
+        # requires the explicit allow_full_body opt-in.
+        - if:
+            required: [mode]
+            properties:
+              mode: {const: full_body}
+          then:
+            required: [allow_full_body]
+            properties:
+              allow_full_body: {const: true}
+        # An explicitly emptied pattern set makes the redactor a silent
+        # pass-through while records still claim redaction. redacted_body
+        # exports body excerpts and metadata_only exports request-derived
+        # model/tool_names, so both refuse it; hash_only and full_body export no
+        # redacted request-derived strings and are exempt. An absent mode is the
+        # redacted_body default and is covered here.
+        - if:
+            required: [redaction]
+            properties:
+              mode: {enum: [redacted_body, metadata_only, null]}
+              redaction:
+                type: object
+                required: [builtins]
+                properties:
+                  builtins: {type: array, maxItems: 0}
+                  custom_patterns: {maxItems: 0}
+          then: false
+        # privacy.path_mode: redact would export the literal path unchanged
+        # under the same empty pattern set, so it is refused in every mode —
+        # including the two the body guard above exempts.
+        - if:
+            required: [privacy, redaction]
+            properties:
+              privacy:
+                type: object
+                required: [path_mode]
+                properties:
+                  path_mode: {const: redact}
+              redaction:
+                type: object
+                required: [builtins]
+                properties:
+                  builtins: {type: array, maxItems: 0}
+                  custom_patterns: {maxItems: 0}
+          then: false
+      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (3010); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and allow-listed cache telemetry (namespaced `ai_semantic_cache.<id>.{cache_status,cache_match,cache_similarity}`, legacy `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity`, and `request_deduplication.replayed`; never `cache_key`), then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Retention is bounded by BOTH record count (sink.buffer_capacity) and an aggregate retained-byte budget (limits.buffer_max_bytes / limits.max_entry_bytes) covering staged candidates, fail-closed pre-commit reservations, active fail-open stream capture, exact pre-serialized queue payloads, JSON-array assembly, and every sequential retry. A fail-open stream reserves the maximum retained-record charge before copying response bytes and transfers that lease at terminal enqueue; a fail-closed stream reuses its pre-commit lease. Retry clones share immutable Bytes rather than deep-cloning records; reqwest receives the already-escaped exact-capacity JSON body rather than reserializing it. In redacted_body, limits.max_redaction_scan_bytes is checked before JSON classification/model/tool extraction/redaction; oversized JSON POSTs are conservatively audited as possible streaming AI requests with explicit omission evidence rather than bypassing audit. Streamed keyed hashing is bounded by capture.stream_hash, and active-stream reservations by limits.max_stream_reservation_secs. Authenticated /health exposes effective admitted ceilings plus live retained_bytes/retained_byte_drops/stream_reservations_expired/sink_healthy gauges without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only and conservatively classified oversized capture. In-flight staging is hard-bounded at 4096 entries per plugin instance while candidate/record_id/sample markers remain shared across co-located instances: a saturated instance neither erases a peer's live candidate nor borrows it for response buffering, response hooks, stream reservations, sampling/admission, or record emission. The local staging entry is consumed by atomic removal at buffered or ordinary stream-terminal commit. Expiry first revokes capture/hash work and releases all staging/queue/byte owners; its single-fire request-owned terminal slot carries only the local sampling roll needed for a body-free best-effort fallback and cannot be created from shared peer markers. Orphan/reservation sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP by default; native gRPC capture requires an explicit descriptor-based grpc enrollment block (enrolled methods only). Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults. Redacted captures replace malformed function.arguments JSON with [UNPARSEABLE] and set arguments_redaction_failed=true on the captured function object; valid arguments retain member-name redaction. Explicit full_body raw capture is unchanged. Every fixed scalar whose runtime default is used when the key is omitted also accepts an explicit null; the batching keys (sink.batch_size, sink.flush_interval_ms, sink.buffer_capacity, sink.max_retries, sink.retry_delay_ms), sink.endpoint_url, sink.custom_headers, redaction.custom_patterns, grpc, grpc.descriptor_path, and grpc.methods do NOT — null is a type error for those, exactly as the schema states. RUNTIME-ONLY CHECKS this component deliberately cannot express, all of which still reject the configuration at construction: (1) arithmetic relationships between limits — limits.max_entry_bytes must be >= the worst-case serialized-JSON contract implied by the configured capture limits, limits.buffer_max_bytes must be >= both 65536 and the retained charge of limits.max_entry_bytes, and max_request_bytes + max_response_bytes + max_stream_capture_bytes must be <= 2097152; (2) Rust `regex` crate compilation of every redaction.builtins entry and every redaction.custom_patterns[].regex, and rejection of an unknown redaction.builtins name beyond the enum; (3) sink.endpoint_url authority, userinfo, and backend-egress SSRF screening, plus the rule that cleartext http:// is admitted only with sink.allow_insecure_loopback: true AND a localhost / loopback-IP host; (4) sink.custom_headers name/value validity and the ${secret:NAME} template grammar (a resolvable FERRUM_TRANSCRIPT_SINK_SECRET_<NAME> is checked later still, when the background worker activates); (5) node-local existence and decodability of grpc.descriptor_path, and resolution of each method's request_type / response_type / text_fields against that descriptor — Admin/CP admission validates shape only; (6) grpc.methods key normalization (trim plus one optional leading slash) and the rejection of two keys that normalize to the same method path; (7) grpc.methods[].text_fields segment trimming, the per-path segment-depth ceiling, and duplicate detection after normalization, which catches pairs that uniqueItems cannot (\"a.b\" versus \"a . b\"); and (8) the plugin-cache composition rule that refuses a priority override placing this instance at or after a co-located request_deduplication instance."
       properties:
         mode:
-          type: string
-          enum: [metadata_only, redacted_body, full_body, hash_only]
+          type: [string, "null"]
+          enum: [metadata_only, redacted_body, full_body, hash_only, null]
           default: redacted_body
-          description: "metadata_only: keyed body hashes + model/provider/token/guardrail metadata, no body. redacted_body: capped, PII-redacted request/response excerpts. Values beneath normalized sensitive JSON keys (password/auth/cookie/session/credential/private-key/client-secret/API-key/token variants) are replaced regardless of value shape; JSON objects/arrays encoded inside strings (including tool arguments) are recursively decoded/redacted to a depth cap of 64. Uniform OpenAI chat.completion.chunk SSE is reassembled before redaction with exact shape {sse_reassembled:true,object:'chat.completion.chunk',completion_text:{'<choice>':'…'},tool_calls:{'<choice>':[{index,id,type,function:{name,arguments}}]},finish_reason:{'<choice>':'…'}}; absent categories are omitted, and text/tool fragments are concatenated by choice/tool index under max_stream_capture_bytes. Only a provider-declared unsigned index correlates fragments across deltas; array position is intra-delta identity only (exported as 'position:<n>' choice keys and a tool-call 'position' field, never as a fabricated index). Malformed optional fields do not abort reassembly (that would drop back to per-frame redaction, which cannot see a secret split across fragments): ignorable ones (finish_reason, delta, delta.content, tool_calls, id, type, function, function.name, function.arguments) are skipped, while a malformed identity-bearing index (choices[].index, tool_calls[].index) takes a collision-free per-occurrence bucket ('unattributed:<n>' choice key, index_unattributed:true plus occurrence:<n> on a tool call) rather than collapsing onto index 0, sharing one unattributed bucket, or being dropped. Where identity is a guess, payload is withheld instead of joined or split: ambiguous completion text becomes '[REDACTED:ambiguous_choice]' with choice_identity_ambiguous:true and completion_text_withheld:true, and ambiguous tool arguments become '[REDACTED:ambiguous_tool_call]' with arguments_withheld:true. Skipped or re-routed fields are listed in a sorted malformed_fields array of compiled-in field paths (never provider values); the key is omitted for well-formed streams. Other or non-parseable SSE stays per-frame. full_body: capped unredacted excerpts (requires allow_full_body). hash_only: keyed body hashes + envelope only. Body hashes are keyed HMAC-SHA256 in every mode, never plain SHA-256."
+          description: "Null keeps the default, as for every other fixed scalar here. metadata_only: keyed body hashes + model/provider/token/guardrail metadata, no body. redacted_body: capped, PII-redacted request/response excerpts. Values beneath normalized sensitive JSON keys (password/auth/cookie/session/credential/private-key/client-secret/API-key/token variants) are replaced regardless of value shape; everything under an Azure 'On Your Data' parameters object inside a data_sources / dataSources / data-sources container is additionally replaced wholesale, and recognizing that container name never short-circuits the ordinary visitor — a value under it that is not the provider's conventional array (object, string, number, boolean, null) is still traversed with the same member-name and pattern rules; JSON objects/arrays encoded inside strings (including tool arguments) are recursively decoded/redacted to a depth cap of 64. Uniform OpenAI chat.completion.chunk SSE is reassembled before redaction with exact shape {sse_reassembled:true,object:'chat.completion.chunk',completion_text:{'<choice>':'…'},tool_calls:{'<choice>':[{index,id,type,function:{name,arguments}}]},finish_reason:{'<choice>':'…'}}; absent categories are omitted, and text/tool fragments are concatenated by choice/tool index under max_stream_capture_bytes. Only a provider-declared unsigned index correlates fragments across deltas; array position is intra-delta identity only (exported as 'position:<n>' choice keys and a tool-call 'position' field, never as a fabricated index). Malformed optional fields do not abort reassembly (that would drop back to per-frame redaction, which cannot see a secret split across fragments): ignorable ones (finish_reason, delta, delta.content, tool_calls, id, type, function, function.name, function.arguments) are skipped, while a malformed identity-bearing index (choices[].index, tool_calls[].index) takes a collision-free per-occurrence bucket ('unattributed:<n>' choice key, index_unattributed:true plus occurrence:<n> on a tool call) rather than collapsing onto index 0, sharing one unattributed bucket, or being dropped. Where identity is a guess, payload is withheld instead of joined or split: ambiguous completion text becomes '[REDACTED:ambiguous_choice]' with choice_identity_ambiguous:true and completion_text_withheld:true, and ambiguous tool arguments become '[REDACTED:ambiguous_tool_call]' with arguments_withheld:true. Skipped or re-routed fields are listed in a sorted malformed_fields array of compiled-in field paths (never provider values); the key is omitted for well-formed streams. Other or non-parseable SSE stays per-frame. full_body: capped unredacted excerpts (requires allow_full_body). hash_only: keyed body hashes + envelope only. Body hashes are keyed HMAC-SHA256 in every mode, never plain SHA-256."
         allow_full_body:
-          type: boolean
+          type: [boolean, "null"]
           default: false
           description: "Required guardrail for mode=full_body, which captures unredacted payloads. Construction fails if full_body is set without this opt-in."
         capture:
           type: [object, "null"]
           additionalProperties: false
-          description: "What to capture. Omit or null to keep defaults."
+          description: "What to capture. Omit or null to keep defaults. At least one of request, response, or streaming_response must stay enabled."
+          not:
+            type: object
+            required: [request, response]
+            properties:
+              request: {const: false}
+              response: {const: false}
+              streaming_response: {enum: [false, "false", null]}
           properties:
             request:
-              type: boolean
+              type: [boolean, "null"]
               default: true
             response:
-              type: boolean
+              type: [boolean, "null"]
               default: true
             streaming_response:
               default: false
-              description: "Capture SSE response excerpts. false | true | 'sampled'. true forces every AI-candidate request's response onto the stream-inspection path. 'sampled' tees only requests that win the sampling.rate roll (or whose request-side guardrail fired when always_capture_on_guardrail is set — the tee decision is evaluated at dispatch time, after the request-phase guardrail plugins ran); error responses and response-side guardrail hits on un-sampled streaming requests still emit records via the log fallback, but without a response body/hash — teeing every stream to cover those late triggers would defeat sampled capture."
+              description: "Capture SSE response excerpts. false | true | 'sampled', or the string spellings 'true' / 'false', or null for the default. true forces every AI-candidate request's response onto the stream-inspection path. 'sampled' tees only requests that win the sampling.rate roll (or whose request-side guardrail fired when always_capture_on_guardrail is set — the tee decision is evaluated at dispatch time, after the request-phase guardrail plugins ran); error responses and response-side guardrail hits on un-sampled streaming requests still emit records via the log fallback, but without a response body/hash — teeing every stream to cover those late triggers would defeat sampled capture."
               oneOf:
                 - type: boolean
                 - type: string
-                  enum: [sampled]
+                  enum: [sampled, "true", "false"]
+                - type: "null"
             headers:
-              type: boolean
+              type: [boolean, "null"]
               default: false
               description: "Capture response headers (redacted by key). Also gated by privacy.include_raw_headers."
             tool_calls:
-              type: boolean
+              type: [boolean, "null"]
               default: true
               description: "Extract tool/function names from the request body."
             stream_hash:
-              type: string
-              enum: [capped, full]
+              type: [string, "null"]
+              enum: [capped, full, null]
               default: capped
               description: "How much of a streamed (SSE) response the exported keyed HMAC-SHA256 response_hash covers. capped (default) stops hashing at limits.max_stream_capture_bytes, so limits.max_stream_capture_bytes bounds audit CPU as well as retained bytes and an indefinitely long high-bandwidth stream cannot keep a keyed hash running for the life of the connection; the digest is then marked response_hash_scope=partial, carries the exact response_hash_bytes it covered, and is domain-separated so it can never collide with or be presented as a full-stream digest. full is the explicit opt-in for deployments whose evidence chain genuinely re-derives the provider's complete response, and accepts unbounded per-byte keyed-hashing cost. The response_hash is a tamper-evidence/correlation token over the captured transcript, not an integrity attestation of the client's byte stream — abnormally terminated and downstream-cut streams already omit it entirely. Buffered (non-streamed) responses are complete by construction and always hash full."
         sampling:
@@ -29523,34 +29586,35 @@ components:
           description: "Sampling controls. Omit or null to keep defaults."
           properties:
             rate:
-              type: number
+              type: [number, "null"]
               minimum: 0.0
               maximum: 1.0
               default: 1.0
               description: "Fraction of eligible AI transactions emitted as full records. Guardrail/error captures override the roll."
             always_capture_on_guardrail:
-              type: boolean
+              type: [boolean, "null"]
               default: true
               description: "Override a losing sampling roll for a fired guardrail. A non-empty ai_tool_governor.decision other than allow (deny, dry_run, require_approval, or redact_args) fires this override on request, buffered-response, and terminal-stream paths; ordinary allow does not. Exported guardrails include bounded ai_tool_governor.enabled, mode, decision, tool_names, risk, policy_ids, approval_id, arguments_hashes, and redacted_tools fields."
             always_capture_on_error:
-              type: boolean
+              type: [boolean, "null"]
               default: true
             max_records_per_minute:
-              type: integer
+              type: [integer, "null"]
               minimum: 0
+              maximum: 18446744073709551615
               default: 0
-              description: "Records-per-minute cap (0 = unlimited). Over the cap, records are dropped (never reject traffic)."
+              description: "Records-per-minute cap (0 = unlimited). Over the cap, records are dropped and traffic is NEVER rejected: a record the window has already refused takes no queue permit or retained-byte reservation and cannot select a fail-closed 503, so sink.on_buffer_full/on_sink_error: reject cannot deny traffic for an audit record that could not have been written. Suppression is bounded by the window — the first record admitted after it rolls over flushes normally, which is the same background-send recovery probe that restores sink health elsewhere. The admitted maximum is the unsigned 64-bit ceiling (a larger literal is a type error, not a clamp); the effective in-window ceiling is clamped to 4294967294."
         redaction:
           type: [object, "null"]
           additionalProperties: false
           description: "PII redaction policy for captured excerpts. Omit or null to keep defaults. In mode=redacted_body and mode=metadata_only the pattern set must not be empty: builtins=[] with no custom_patterns is rejected at construction (a pass-through redactor would export unredacted data — body excerpts in redacted_body, the request-derived model/tool_names in both — without the full_body opt-in; hash_only exports no request-derived strings and is exempt). redacted_body also replaces values beneath normalized sensitive parent keys and recursively redacts JSON-encoded object/array strings before applying regex patterns."
           properties:
             builtins:
-              type: array
+              type: [array, "null"]
               items:
                 type: string
                 enum: [ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban]
-              description: "Built-in PII patterns, shared with ai_prompt_shield/ai_response_guard."
+              description: "Built-in PII patterns, shared with ai_prompt_shield/ai_response_guard. Omit or null for the default set; an explicit empty array with no custom_patterns is refused in redacted_body/metadata_only, and under privacy.path_mode: redact in every mode."
             custom_patterns:
               type: array
               items:
@@ -29563,17 +29627,17 @@ components:
                   regex:
                     type: string
             placeholder:
-              type: string
+              type: [string, "null"]
               default: "[REDACTED:{type}]"
               description: "Non-hashing replacement template; {type} is substituted with the pattern name."
             hash_redacted_values:
-              type: boolean
+              type: [boolean, "null"]
               default: true
               description: "Replace matches with [REDACTED:<type>:<hmac-prefix>] so identical values stay correlatable without storing the raw value. The digest is a keyed HMAC-SHA256 (see hash_secret), never a plain hash — most PII value spaces are small enough to brute-force offline from an unsalted digest."
             hash_secret:
-              type: string
+              type: [string, "null"]
               minLength: 16
-              description: "Optional key for the redacted-value HMAC and the exported request/response body hashes. When set (min 16 chars), hashed placeholders and body hashes are stable across gateway instances and restarts, so values correlate fleet-wide. When omitted, each process generates a random key at startup: digests still correlate within one process lifetime but never across restarts/instances, and can never be dictionary-attacked from exported records. Treat like any other secret — do not log or export it."
+              description: "Optional key for the redacted-value HMAC and the exported request/response body hashes. The minimum length is counted in CHARACTERS (Unicode code points), matching this minLength — not in UTF-8 bytes, so an 8-character multi-byte secret is refused even though it carries 16 bytes. When set (min 16 characters), hashed placeholders and body hashes are stable across gateway instances and restarts, so values correlate fleet-wide. When omitted or null, each process generates a random key at startup: digests still correlate within one process lifetime but never across restarts/instances, and can never be dictionary-attacked from exported records. Treat like any other secret — do not log or export it."
         limits:
           type: [object, "null"]
           additionalProperties: false
@@ -29587,7 +29651,7 @@ components:
             aggregate tool-name bytes <= 4096). Omit or null to keep defaults.
           properties:
             max_request_bytes:
-              type: integer
+              type: [integer, "null"]
               minimum: 1
               maximum: 1048576
               default: 65536
@@ -29596,7 +29660,7 @@ components:
                 1048576. Counts toward the cross-field aggregate with
                 max_response_bytes and max_stream_capture_bytes.
             max_response_bytes:
-              type: integer
+              type: [integer, "null"]
               minimum: 1
               maximum: 1048576
               default: 65536
@@ -29604,7 +29668,7 @@ components:
                 Maximum retained buffered response-body excerpt bytes. Hard
                 maximum 1048576. Counts toward the cross-field aggregate.
             max_stream_capture_bytes:
-              type: integer
+              type: [integer, "null"]
               minimum: 1
               maximum: 1048576
               default: 65536
@@ -29613,7 +29677,7 @@ components:
                 1048576. Counts toward the cross-field aggregate. Also bounds
                 the streamed keyed digest unless capture.stream_hash is full.
             max_redaction_scan_bytes:
-              type: integer
+              type: [integer, "null"]
               minimum: 4096
               maximum: 8388608
               default: 1048576
@@ -29641,7 +29705,7 @@ components:
                 caps on a UTF-8 boundary first and never scans past the cap, so
                 it is unaffected.
             max_entry_bytes:
-              type: integer
+              type: [integer, "null"]
               minimum: 1
               maximum: 16777216
               description: >-
@@ -29656,7 +29720,7 @@ components:
                 exceeds this ceiling is dropped/rejected, never partially
                 serialized.
             buffer_max_bytes:
-              type: integer
+              type: [integer, "null"]
               minimum: 65536
               maximum: 268435456
               default: 134217728
@@ -29679,7 +29743,7 @@ components:
                 2 * (max_entry_bytes + 1) + 128. Live retained_bytes and
                 retained_byte_drops are exposed on authenticated /health.
             max_stream_reservation_secs:
-              type: integer
+              type: [integer, "null"]
               minimum: 1
               maximum: 86400
               default: 900
@@ -29723,15 +29787,17 @@ components:
           description: "Async batched HTTPS sink. The endpoint is SSRF-screened against the backend egress policy at construction (literal IPs) and at send time (resolved hostnames). Cleartext HTTP requires allow_insecure_loopback=true and is then limited to localhost or a loopback IP. Unknown sink keys are rejected; custom_headers remains an open string map."
           properties:
             type:
-              type: string
-              enum: [http]
+              type: [string, "null"]
+              enum: [http, null]
               default: http
             endpoint_url:
               type: string
               format: uri
-              description: "Collector URL. HTTPS is required by default. HTTP is accepted only for localhost or a loopback IP when allow_insecure_loopback is explicitly true. Userinfo credentials (https://user:pass@host) are rejected — authenticate with custom_headers. A collector that requires a credential in the URL path or query is supported, and this value is never rendered in operational output: egress-denial, DNS/TLS, retry, slow-call, and batch-failure diagnostics show only a structurally redacted scheme://host:port/redacted form. The admin audit and non-admin read projections apply the schema-aware sensitivity contract instead, keeping only scheme://host[:port] with `[REDACTED_PATH]` / `[REDACTED_QUERY]` / `[REDACTED_FRAGMENT]` markers."
+              minLength: 1
+              pattern: '^[Hh][Tt][Tt][Pp][Ss]?://'
+              description: "Collector URL. Only the http and https schemes are admitted (the pattern is spelled case-insensitively because URL schemes are). HTTPS is required by default. HTTP is accepted only for localhost or a loopback IP when allow_insecure_loopback is explicitly true. Userinfo credentials (https://user:pass@host) are rejected — authenticate with custom_headers. A collector that requires a credential in the URL path or query is supported, and this value is never rendered in operational output: egress-denial, DNS/TLS, retry, slow-call, and batch-failure diagnostics show only a structurally redacted scheme://host:port/redacted form. The admin audit and non-admin read projections apply the schema-aware sensitivity contract instead, keeping only scheme://host[:port] with `[REDACTED_PATH]` / `[REDACTED_QUERY]` / `[REDACTED_FRAGMENT]` markers."
             allow_insecure_loopback:
-              type: boolean
+              type: [boolean, "null"]
               default: false
               description: "Allow an http:// collector only when endpoint_url uses localhost or a loopback IP. This never permits remote cleartext delivery."
             custom_headers:
@@ -29766,28 +29832,28 @@ components:
               default: 1000
               description: "Fixed delay between batch send retries for transient collector failures."
             on_buffer_full:
-              type: string
-              enum: [drop, reject]
+              type: [string, "null"]
+              enum: [drop, reject, null]
               default: drop
               description: "drop: silently drop when the queue or per-instance 4096-entry staging bound is full (never block). reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit when staging or a queue slot cannot be reserved. Shared candidate markers from co-located peers do not bypass this bound. Streaming admission honors sampling plus configured error/guardrail overrides."
             on_sink_error:
-              type: string
-              enum: [warn, reject]
+              type: [string, "null"]
+              enum: [warn, reject, null]
               default: warn
               description: "warn: log and drop on permanent sink failure. reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit while the sink is unhealthy. Streaming admission honors sampling plus configured error/guardrail overrides. Sink health is published from the COMPLETE delivery outcome, never from response headers alone: the acknowledgement body is drained and validated under sink.ack_max_bytes / sink.ack_timeout_ms first, and a 2xx whose acknowledgement stalls, overruns its bound, fails transport, or fails ack_policy validation is an ambiguous delivery that marks the sink unhealthy AND returns the batch for retry. Any non-2xx collector response also marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired token) whose batch is discarded rather than retried — so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Hysteresis: health drops on the first failed or ambiguous delivery with no damping, and is restored only by a 2xx whose acknowledgement fully drained and validated; each retry attempt re-publishes, so recovery happens on the attempt that actually succeeded. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe."
             ack_policy:
-              type: string
-              enum: [drain, json]
+              type: [string, "null"]
+              enum: [drain, json, null]
               default: drain
               description: "How a collector acknowledgement is validated before sink health is published. drain: read the acknowledgement to EOF under sink.ack_max_bytes and sink.ack_timeout_ms, discarding the bytes (content is not inspected). json: additionally require a JSON object that does not report rejected records — a non-object/unparseable body, a non-zero/non-empty errors|failed|rejected|error_count field, or a status string outside the unequivocal affirmative set ok|success|accepted|created fails the batch. Ambiguous partial-delivery values such as partial_ok are unhealthy even without an explicit failure count. Acknowledgement bytes are never retained beyond the bound and never logged; only compiled-in failure classes appear in diagnostics, so a hostile collector cannot echo captured transcript content back into gateway logs."
             ack_max_bytes:
-              type: integer
+              type: [integer, "null"]
               minimum: 64
               maximum: 1048576
               default: 65536
               description: "Hard bound on the acknowledgement body read from the collector. An advertised Content-Length above this, or a stream that exceeds it, fails the batch instead of buffering unbounded collector output into the flush worker."
             ack_timeout_ms:
-              type: integer
+              type: [integer, "null"]
               minimum: 1
               maximum: 30000
               default: 1000
@@ -29798,17 +29864,17 @@ components:
           description: "Identity/header/path export controls. Omit or null to keep defaults."
           properties:
             include_consumer_username:
-              type: boolean
+              type: [boolean, "null"]
               default: true
             include_client_ip:
-              type: boolean
+              type: [boolean, "null"]
               default: false
             include_raw_headers:
-              type: boolean
+              type: [boolean, "null"]
               default: false
             path_mode:
-              type: string
-              enum: [omit, template, redact, hash, raw]
+              type: [string, "null"]
+              enum: [omit, template, redact, hash, raw, null]
               description: "How the request path is exported. Applications often embed emails/account-ids/document-names/tokens in path segments, so a privacy mode never exports the literal path by default. omit: no path. template: export the matched route identifier (proxy listen_path, else proxy name; omitted when unavailable) instead of the user-controlled path. redact: literal path with the configured PII redactor applied (requires at least one redaction.builtins/custom_patterns pattern). hash: keyed HMAC-SHA256 hex digest of the literal path (shares redaction.hash_secret; not brute-forceable offline). raw: literal path verbatim. Default is template for metadata_only/redacted_body/hash_only and raw for full_body (the deliberate raw-capture opt-in)."
 
         grpc:
@@ -29876,18 +29942,25 @@ components:
                 additionalProperties: false
                 properties:
                   request_type:
-                    type: string
+                    type: [string, "null"]
                     minLength: 1
                     pattern: '\S'
-                    description: Fully-qualified protobuf request message type.
+                    description: >-
+                      Fully-qualified protobuf request message type. Null (or a
+                      blank string) is treated exactly as absent, so the other
+                      direction must then be set.
                   response_type:
-                    type: string
+                    type: [string, "null"]
                     minLength: 1
                     pattern: '\S'
-                    description: Fully-qualified protobuf response message type.
+                    description: >-
+                      Fully-qualified protobuf response message type. Null (or a
+                      blank string) is treated exactly as absent, so the other
+                      direction must then be set.
                   text_fields:
-                    type: array
+                    type: [array, "null"]
                     minItems: 1
+                    uniqueItems: true
                     items:
                       type: string
                       minLength: 1
@@ -29897,13 +29970,24 @@ components:
                       exported. Each path must end at a string field and may
                       not traverse a map field. Repeated fields retain every
                       selected value under indexed paths such as tags.0 or
-                      messages.2.text. Omit to cover every string field
-                      recursively.
+                      messages.2.text. Omit, or set null, to cover every string
+                      field recursively; an explicit empty array is refused.
+                      The runtime additionally trims each dotted segment before
+                      comparing, so it rejects duplicates uniqueItems cannot see
+                      ("a.b" versus "a . b"), rejects an empty segment, and
+                      rejects a path deeper than the message-nesting ceiling.
+                # `required` is satisfied by an explicit null, so each branch
+                # also demands a non-blank string — the runtime treats a null or
+                # blank value as absent.
                 anyOf:
                   - required: [request_type]
+                    properties:
+                      request_type: {type: string, minLength: 1, pattern: '\S'}
                   - required: [response_type]
+                    properties:
+                      response_type: {type: string, minLength: 1, pattern: '\S'}
             max_message_bytes:
-              type: integer
+              type: [integer, "null"]
               minimum: 1
               maximum: 8388608
               default: 1048576
@@ -29917,7 +30001,7 @@ components:
                 equal to the hard maximum of that aggregate scan ceiling — a
                 larger per-message value could never produce a capture.
             max_messages:
-              type: integer
+              type: [integer, "null"]
               minimum: 1
               maximum: 1024
               default: 64

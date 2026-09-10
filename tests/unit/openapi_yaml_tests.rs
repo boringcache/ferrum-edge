@@ -9572,6 +9572,507 @@ async fn ai_transcript_audit_schema_matches_runtime_unknown_key_contract() {
     }
 }
 
+/// Table-driven component-versus-constructor contract for every admission rule
+/// the component can express (issue #5273).
+///
+/// The unknown-key test above proves the two key SETS agree; this one proves
+/// the two ADMISSION decisions agree for the type, null, enum, non-empty,
+/// conditional, numeric, and string-grammar constraints.
+///
+/// Descriptor-file dependencies are deliberately kept out: `grpc.descriptor_path`
+/// points at a path that does not exist, which the constructor treats as
+/// "enrollment retained, body excerpts omitted" rather than a config error, so
+/// these cases compare schema against shape and never against node-local file
+/// state.
+#[tokio::test]
+async fn ai_transcript_audit_schema_matches_runtime_admission_contract() {
+    use ferrum_edge::plugins::ai_transcript_audit::AiTranscriptAudit;
+    use ferrum_edge::plugins::utils::PluginHttpClient;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let http_client = PluginHttpClient::default();
+
+    // The minimum admissible sink, plus whatever a case overrides on it.
+    let sink = |extra: serde_json::Value| {
+        let overlay = extra.as_object().expect("sink overlay is an object");
+        let mut base = json!({"endpoint_url": "https://audit.example.com/ingest"});
+        for (key, value) in overlay {
+            base[key] = value.clone();
+        }
+        base
+    };
+    // A single-method gRPC enrollment whose descriptor is intentionally absent.
+    let grpc = |method: serde_json::Value| {
+        json!({
+            "descriptor_path": "/nonexistent/ferrum-ai-transcript-audit-descriptor.bin",
+            "methods": {"/test.Greeter/SayHello": method}
+        })
+    };
+    // 8 code points, 16 UTF-8 bytes: admitted under a byte-counted minimum,
+    // refused under the character-counted one the schema and the constructor
+    // now agree on.
+    let short_multibyte_secret = "\u{00e9}".repeat(8);
+
+    let cases: Vec<(&str, serde_json::Value, bool)> = vec![
+        // ---- null keeps the documented default for every fixed scalar ----
+        (
+            "mode null",
+            json!({
+                "mode": null,
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "capture.request null",
+            json!({
+                "capture": {"request": null},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "sink.on_sink_error null",
+            json!({
+                "sink": sink(json!({"on_sink_error": null}))
+            }),
+            true,
+        ),
+        (
+            "limits.max_entry_bytes null",
+            json!({
+                "limits": {"max_entry_bytes": null},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "privacy.path_mode null",
+            json!({
+                "privacy": {"path_mode": null},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "redaction.builtins null",
+            json!({
+                "redaction": {"builtins": null},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        // ---- null is a TYPE ERROR where the runtime has no default path ----
+        (
+            "sink null",
+            json!({
+                "sink": null
+            }),
+            false,
+        ),
+        (
+            "sink.batch_size null",
+            json!({
+                "sink": sink(json!({"batch_size": null}))
+            }),
+            false,
+        ),
+        (
+            "sink.custom_headers null",
+            json!({
+                "sink": sink(json!({"custom_headers": null}))
+            }),
+            false,
+        ),
+        (
+            "redaction.custom_patterns null",
+            json!({
+                "redaction": {"custom_patterns": null},
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "grpc null",
+            json!({
+                "grpc": null,
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        // ---- capture.streaming_response accepts the string spellings ----
+        (
+            "streaming_response 'true'",
+            json!({
+                "capture": {"streaming_response": "true"},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "streaming_response 'false'",
+            json!({
+                "capture": {"streaming_response": "false"},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "streaming_response 'sampled'",
+            json!({
+                "capture": {"streaming_response": "sampled"},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "streaming_response 'maybe'",
+            json!({
+                "capture": {"streaming_response": "maybe"},
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        // ---- full_body needs the explicit unredacted-capture opt-in ----
+        (
+            "full_body without opt-in",
+            json!({
+                "mode": "full_body",
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "full_body with opt-in",
+            json!({
+                "mode": "full_body",
+                "allow_full_body": true,
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        // ---- at least one capture direction must stay enabled ----
+        (
+            "every capture direction off",
+            json!({
+                "capture": {
+                    "request": false,
+                    "response": false,
+                    "streaming_response": false
+                },
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "request+response off, streaming defaulted off",
+            json!({
+                "capture": {"request": false, "response": false},
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "request+response off, streaming on",
+            json!({
+                "capture": {
+                    "request": false,
+                    "response": false,
+                    "streaming_response": true
+                },
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        // ---- an emptied pattern set is a silent pass-through redactor ----
+        (
+            "empty pattern set in redacted_body",
+            json!({
+                "redaction": {"builtins": []},
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "empty pattern set in metadata_only",
+            json!({
+                "mode": "metadata_only",
+                "redaction": {"builtins": []},
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "empty builtins with a custom pattern",
+            json!({
+                "redaction": {
+                    "builtins": [],
+                    "custom_patterns": [{"name": "ticket", "regex": "T-[0-9]+"}]
+                },
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "empty pattern set in hash_only",
+            json!({
+                "mode": "hash_only",
+                "redaction": {"builtins": []},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "empty pattern set in hash_only under path_mode redact",
+            json!({
+                "mode": "hash_only",
+                "redaction": {"builtins": []},
+                "privacy": {"path_mode": "redact"},
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        // ---- the hash_secret minimum is counted in CHARACTERS ----
+        (
+            "hash_secret of 16 characters",
+            json!({
+                "redaction": {"hash_secret": "fleet-stable-key"},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "hash_secret of 8 characters / 16 bytes",
+            json!({
+                "redaction": {"hash_secret": short_multibyte_secret},
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        // ---- numeric and string grammar ----
+        (
+            "max_records_per_minute at the u64 ceiling",
+            json!({
+                "sampling": {"max_records_per_minute": u64::MAX},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "negative max_records_per_minute",
+            json!({
+                "sampling": {"max_records_per_minute": -1},
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "ftp collector scheme",
+            json!({
+                "sink": sink(json!({"endpoint_url": "ftp://audit.example.com/ingest"}))
+            }),
+            false,
+        ),
+        (
+            "uppercase https collector scheme",
+            json!({
+                "sink": sink(json!({"endpoint_url": "HTTPS://audit.example.com/ingest"}))
+            }),
+            true,
+        ),
+        (
+            "empty collector url",
+            json!({
+                "sink": sink(json!({"endpoint_url": ""}))
+            }),
+            false,
+        ),
+        // ---- gRPC method shape ----
+        (
+            "duplicate grpc text_fields",
+            json!({
+                "grpc": grpc(json!({
+                    "request_type": "test.Hello",
+                    "text_fields": ["name", "name"]
+                })),
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "distinct grpc text_fields",
+            json!({
+                "grpc": grpc(json!({
+                    "request_type": "test.Hello",
+                    "text_fields": ["name"]
+                })),
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "null grpc text_fields",
+            json!({
+                "grpc": grpc(json!({
+                    "request_type": "test.Hello",
+                    "text_fields": null
+                })),
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "empty grpc text_fields",
+            json!({
+                "grpc": grpc(json!({
+                    "request_type": "test.Hello",
+                    "text_fields": []
+                })),
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "grpc method with only a null request_type",
+            json!({
+                "grpc": grpc(json!({"request_type": null})),
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "grpc method with a null request_type and a real response_type",
+            json!({
+                "grpc": grpc(json!({
+                    "request_type": null,
+                    "response_type": "test.Reply"
+                })),
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "grpc max_messages null",
+            json!({
+                "grpc": {
+                    "descriptor_path": "/nonexistent/ferrum-descriptor.bin",
+                    "methods": {"/test.Greeter/SayHello": {"request_type": "test.Hello"}},
+                    "max_messages": null
+                },
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+    ];
+
+    for (label, config, expected_valid) in cases {
+        assert_component_validity(&spec, "AiTranscriptAuditConfig", &config, expected_valid);
+        let runtime_valid = AiTranscriptAudit::new(&config, http_client.clone()).is_ok();
+        assert_eq!(
+            runtime_valid, expected_valid,
+            "runtime/schema admission drift for {label}: {config}"
+        );
+    }
+
+    // Checks ordinary JSON Schema cannot express. The component documents each
+    // of these as runtime-only; the contract here is that the schema stays
+    // permissive while the constructor still refuses, so a schema-driven editor
+    // never blocks a valid config and never claims one of these is admissible.
+    let runtime_only: Vec<(&str, serde_json::Value)> = vec![
+        (
+            "max_entry_bytes below the worst-case serialized-record contract",
+            json!({
+                "limits": {"max_entry_bytes": 1},
+                "sink": sink(json!({}))
+            }),
+        ),
+        (
+            "buffer_max_bytes below the max_entry_bytes retained charge",
+            json!({
+                "limits": {"max_entry_bytes": 16777216, "buffer_max_bytes": 65536},
+                "sink": sink(json!({}))
+            }),
+        ),
+        (
+            "capture limits over the cross-field aggregate",
+            json!({
+                "limits": {
+                    "max_request_bytes": 1048576,
+                    "max_response_bytes": 1048576,
+                    "max_stream_capture_bytes": 1048576
+                },
+                "sink": sink(json!({}))
+            }),
+        ),
+        (
+            "custom pattern that is not a valid Rust regex",
+            json!({
+                "redaction": {"custom_patterns": [{"name": "bad", "regex": "([a-z"}]},
+                "sink": sink(json!({}))
+            }),
+        ),
+        (
+            "cleartext collector without the loopback opt-in",
+            json!({
+                "sink": sink(json!({"endpoint_url": "http://127.0.0.1:9000/ingest"}))
+            }),
+        ),
+        (
+            "cleartext non-loopback collector with the loopback opt-in",
+            json!({
+                "sink": sink(json!({
+                    "endpoint_url": "http://audit.example.com/ingest",
+                    "allow_insecure_loopback": true
+                }))
+            }),
+        ),
+        (
+            "collector url carrying userinfo credentials",
+            json!({
+                "sink": sink(json!({"endpoint_url": "https://u:p@audit.example.com/x"}))
+            }),
+        ),
+        (
+            "sink header template referencing the process environment",
+            json!({
+                "sink": sink(json!({"custom_headers": {"X-A": "${FERRUM_DB_URL}"}}))
+            }),
+        ),
+        (
+            "two grpc method keys that normalize to one path",
+            json!({
+                "grpc": {
+                    "descriptor_path": "/nonexistent/ferrum-descriptor.bin",
+                    "methods": {
+                        "/test.Greeter/SayHello": {"request_type": "test.Hello"},
+                        "test.Greeter/SayHello": {"request_type": "test.Hello"}
+                    }
+                },
+                "sink": sink(json!({}))
+            }),
+        ),
+        (
+            "grpc text_fields that differ only by segment whitespace",
+            json!({
+                "grpc": grpc(json!({
+                    "request_type": "test.Hello",
+                    "text_fields": ["outer.name", "outer . name"]
+                })),
+                "sink": sink(json!({}))
+            }),
+        ),
+    ];
+
+    for (label, config) in runtime_only {
+        assert_component_validity(&spec, "AiTranscriptAuditConfig", &config, true);
+        assert!(
+            AiTranscriptAudit::new(&config, http_client.clone()).is_err(),
+            "runtime must still refuse the documented runtime-only check {label}: {config}"
+        );
+    }
+}
+
 /// `grpc.max_message_bytes` / `grpc.max_messages` carry immutable deployment
 /// maxima. The decoded-byte scan budget bounds decoded payload, not frame
 /// count, so an unbounded `max_messages` would let a body of legal zero-length

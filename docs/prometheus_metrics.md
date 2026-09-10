@@ -297,7 +297,9 @@ endpoint, topic, namespace, policy id, or record content:
   took ownership.
 - `batch_discard` — a whole batch was discarded after its retry budget was
   exhausted, or a non-retryable HTTP 4xx permanently rejected it, with no
-  durable fallback. Counts records, not batches.
+  durable fallback. Counts records, not batches. `ai_transcript_audit` counts a
+  permanently rejected batch at its classification point rather than letting
+  the shared retry loop see the discard as a delivery.
 - `shutdown` — the flush worker was closed, or had not started yet.
 - `sink_error` — a per-record delivery or serialization failure that retrying
   could not fix.
