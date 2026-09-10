@@ -1954,7 +1954,11 @@ async fn test_all_mode_redacts_nonstructural_and_sensitive_fields() {
     let body_bytes = serde_json::to_vec(&body).unwrap();
 
     let transformed = plugin
-        .transform_request_body(&body_bytes, Some("application/json"), &make_transform_headers())
+        .transform_request_body(
+            &body_bytes,
+            Some("application/json"),
+            &make_transform_headers(),
+        )
         .await
         .expect("expected redacted body when match present");
 
@@ -1996,7 +2000,11 @@ async fn test_all_mode_uses_structured_redaction_when_messages_present() {
     let body_bytes = serde_json::to_vec(&body).unwrap();
 
     let transformed = plugin
-        .transform_request_body(&body_bytes, Some("application/json"), &make_transform_headers())
+        .transform_request_body(
+            &body_bytes,
+            Some("application/json"),
+            &make_transform_headers(),
+        )
         .await
         .expect("expected redacted body when match present");
 
@@ -2038,7 +2046,11 @@ async fn test_all_mode_redacts_sibling_fields_when_messages_present() {
     let body_bytes = serde_json::to_vec(&body).unwrap();
 
     let transformed = plugin
-        .transform_request_body(&body_bytes, Some("application/json"), &make_transform_headers())
+        .transform_request_body(
+            &body_bytes,
+            Some("application/json"),
+            &make_transform_headers(),
+        )
         .await
         .expect("expected redacted body when match present");
 
@@ -2109,7 +2121,11 @@ async fn test_all_mode_redacts_pii_nested_under_structural_key() {
     let body_bytes = serde_json::to_vec(&body).unwrap();
 
     let transformed = plugin
-        .transform_request_body(&body_bytes, Some("application/json"), &make_transform_headers())
+        .transform_request_body(
+            &body_bytes,
+            Some("application/json"),
+            &make_transform_headers(),
+        )
         .await
         .expect("expected redacted body when nested PII present");
     let v: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
@@ -2156,7 +2172,11 @@ async fn test_all_mode_redacts_deeply_nested_pii_under_structural_key() {
     let body_bytes = serde_json::to_vec(&body).unwrap();
 
     let transformed = plugin
-        .transform_request_body(&body_bytes, Some("application/json"), &make_transform_headers())
+        .transform_request_body(
+            &body_bytes,
+            Some("application/json"),
+            &make_transform_headers(),
+        )
         .await
         .expect("expected redacted body");
     let serialized = String::from_utf8(transformed).unwrap();
