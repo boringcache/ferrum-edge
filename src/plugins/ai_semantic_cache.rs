@@ -2935,7 +2935,7 @@ fn append_family_extra_context(
                 && !shape_fields.contains(&field.as_str())
         })
         .collect();
-    fields.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    fields.sort_unstable_by_key(|(field, _)| *field);
     for (field, value) in fields {
         start_key_part(key_input, has_part);
         key_input.push_str("context:");
@@ -3042,7 +3042,7 @@ fn append_object_state(
         .iter()
         .filter(|(field, _)| !excluded_fields.contains(&field.as_str()))
         .collect();
-    fields.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    fields.sort_unstable_by_key(|(field, _)| *field);
     for (field, value) in fields {
         append_len_prefixed(key_input, field);
         key_input.push('=');
