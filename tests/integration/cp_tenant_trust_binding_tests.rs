@@ -588,7 +588,14 @@ fn grpc_jwt_rejects_future_nbf_before_namespace_resolution() {
     assert!(identity.allowed_namespaces.allows(TENANT_A));
 }
 
-#[tokio::test(start_paused = true)]
+/// Real time, not a paused clock: this test drives real loopback tonic streams,
+/// and a paused Tokio clock auto-advances whenever the runtime has no ready
+/// task — which is exactly the state a pending socket read leaves it in. The
+/// bounded lease window below would then expire in microseconds of wall time,
+/// before the OS ever delivered the terminal status the server sent. The
+/// virtual-time coverage stays on the in-memory `AuthorizedResponseStream`
+/// tests, which have no transport to outrun (issue #4988).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn finite_server_lease_closes_every_bearer_configuration_stream() {
     let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
     let (addr, handle) = start_all_stream_surfaces(verifier, Duration::from_millis(150)).await;
@@ -1039,7 +1046,14 @@ async fn xds_revocation_terminates_sotw_and_delta_with_buffered_transport_data()
     handle.abort();
 }
 
-#[tokio::test(start_paused = true)]
+/// Real time, not a paused clock: this test drives real loopback tonic streams,
+/// and a paused Tokio clock auto-advances whenever the runtime has no ready
+/// task — which is exactly the state a pending socket read leaves it in. The
+/// bounded lease window below would then expire in microseconds of wall time,
+/// before the OS ever delivered the terminal status the server sent. The
+/// virtual-time coverage stays on the in-memory `AuthorizedResponseStream`
+/// tests, which have no transport to outrun (issue #4988).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn namespace_binding_narrowing_revokes_stream_using_the_old_ceiling() {
     let verifier = Arc::new(CpDpVerifierStore::new(tenant_a_broad_verifier()));
     let (addr, handle) = start_all_stream_surfaces(verifier.clone(), Duration::from_secs(5)).await;
@@ -1074,7 +1088,14 @@ async fn namespace_binding_narrowing_revokes_stream_using_the_old_ceiling() {
     handle.abort();
 }
 
-#[tokio::test(start_paused = true)]
+/// Real time, not a paused clock: this test drives real loopback tonic streams,
+/// and a paused Tokio clock auto-advances whenever the runtime has no ready
+/// task — which is exactly the state a pending socket read leaves it in. The
+/// bounded lease window below would then expire in microseconds of wall time,
+/// before the OS ever delivered the terminal status the server sent. The
+/// virtual-time coverage stays on the in-memory `AuthorizedResponseStream`
+/// tests, which have no transport to outrun (issue #4988).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accepted_token_expiry_closes_stream_without_heartbeat_extension() {
     let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
     let (addr, handle) = start_all_stream_surfaces(verifier, Duration::from_secs(5)).await;
