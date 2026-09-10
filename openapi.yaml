@@ -32311,39 +32311,48 @@ components:
     A2aGatewayConfig:
       type: object
       required: [discovery]
-      description: "Plugin: a2a_gateway — transparent Agent-to-Agent protocol gateway for HTTP JSON-RPC, HTTP+JSON/REST, and gRPC/grpcs A2A traffic. The implemented A2A protocol version is 0.3.x, whose canonical gRPC service is a2a.v1.A2AService (package a2a.v1); A2A 1.0's lf.a2a.v1.A2AService carries a renumbered AgentCard and is never decoded as 0.3. Detects standard A2A methods, optionally denies methods by gateway policy, rewrites HTTP JSON and unary gRPC Agent Card endpoint URLs to the gateway address, preserves SSE/gRPC streaming for non-card traffic, and emits a2a.* metadata for existing Ferrum logging, tracing, chargeback, WAF, and alerting plugins. It does not manage A2A task state or aggregate multiple agents in V1. Cannot be composed with request_deduplication on the same proxy while discovery.public_base_url is unset and discovery.trust_forwarded_headers is true; admission rejects that pairing with 400 because the rewritten Agent Card origin is then derived from per-request forwarded headers and the connection's TLS SNI, neither of which a replay fingerprint binds. A configured discovery.public_base_url composes normally."
+      additionalProperties: false
+      description: "Plugin: a2a_gateway — transparent Agent-to-Agent protocol gateway for HTTP JSON-RPC, HTTP+JSON/REST, and gRPC/grpcs A2A traffic. The implemented A2A protocol version is 0.3.x, whose canonical gRPC service is a2a.v1.A2AService (package a2a.v1); A2A 1.0's lf.a2a.v1.A2AService carries a renumbered AgentCard and is never decoded as 0.3. Detects standard A2A methods, optionally denies methods by gateway policy, rewrites HTTP JSON and unary gRPC Agent Card endpoint URLs to the gateway address, preserves SSE/gRPC streaming for non-card traffic, and emits a2a.* metadata for existing Ferrum logging, tracing, chargeback, WAF, and alerting plugins. It does not manage A2A task state or aggregate multiple agents in V1. Cannot be composed with request_deduplication on the same proxy while discovery.public_base_url is unset and discovery.trust_forwarded_headers is true; admission rejects that pairing with 400 because the rewritten Agent Card origin is then derived from per-request forwarded headers and the connection's TLS SNI, neither of which a replay fingerprint binds. A configured discovery.public_base_url composes normally. Null is accepted everywhere a value is optional and means the same thing as omitting the key. Unknown keys are rejected at construction, at the root and inside every nested fixed-shape object."
       properties:
         enabled:
-          type: boolean
+          type: [boolean, "null"]
           default: true
         mode:
-          type: string
-          enum: [transparent_proxy]
+          type: [string, "null"]
+          enum: [transparent_proxy, null]
           default: transparent_proxy
         endpoint:
-          type: object
+          type: [object, "null"]
+          additionalProperties: false
           properties:
             path:
-              type: string
+              type: [string, "null"]
+              minLength: 1
+              pattern: '^/'
               default: /a2a
-              description: Public JSON-RPC A2A endpoint path.
+              description: Public JSON-RPC A2A endpoint path. Must be a non-empty absolute path beginning with /.
             agent_card_path:
-              type: string
+              type: [string, "null"]
+              minLength: 1
+              pattern: '^/'
               default: /.well-known/agent-card.json
-              description: Public Agent Card discovery path suffix.
+              description: Public Agent Card discovery path suffix. Must be a non-empty absolute path beginning with /.
             protocol_versions:
-              type: array
+              type: [array, "null"]
               minItems: 1
               items:
                 type: string
+                minLength: 1
+                pattern: '\S'
               default: ["0.3.0"]
               description: Supported A2A protocol versions as EXACT version strings. There is no family, range, or wildcard syntax - listing 0.3.0 admits 0.3.0 and not 0.3.99. The first entry is the gateway's preferred version for a2a.protocol_version metadata. gRPC Agent Card rewriting additionally requires the responding gRPC service to declare the a2a-0.3 card schema (see endpoint.grpc_services) AND the matched version to belong to the implemented A2A 0.3 wire layout, so an exactly-configured 1.0.0 is still refused.
             grpc_services:
-              type: array
+              type: [array, "null"]
               minItems: 1
               items:
                 oneOf:
                   - type: string
+                    pattern: '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$'
                     description: Fully-qualified gRPC service name. A published A2A service name resolves to the Agent Card wire layout the A2A specification gives it - a2a.v1.A2AService is A2A 0.3 (card_schema a2a-0.3) and lf.a2a.v1.A2AService is A2A 1.0 (card_schema a2a-1.0). Any other name is a custom service with no published layout and resolves to card_schema none.
                   - type: object
                     required: [service]
@@ -32351,42 +32360,50 @@ components:
                     properties:
                       service:
                         type: string
-                        description: Fully-qualified gRPC service name.
+                        pattern: '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$'
+                        description: Fully-qualified gRPC service name. Required; null is not accepted here. Duplicate service names across entries are rejected.
                       card_schema:
-                        type: string
-                        enum: [a2a-0.3, a2a-1.0, none]
+                        type: [string, "null"]
+                        enum: [a2a-0.3, a2a-1.0, none, null]
                         description: Agent Card protobuf wire layout this service is declared to serve. a2a-0.3 is the only layout the gateway decodes and rewrites; a2a-1.0 and none are detected and policed but fail card rewriting closed. Omitted means the published layout for a published A2A service name and none for a custom one. Declaring a value that contradicts a published A2A service name is rejected - the layout is a property of the protocol, not of the deployment.
               default: ["a2a.v1.A2AService", "lf.a2a.v1.A2AService"]
               description: "Fully-qualified gRPC service names recognized as A2A services, each with a declared Agent Card wire layout. RPCs on these services are detected, mapped to canonical a2a.method names, and gated by method policy from request metadata alone - request protobuf payloads are never decoded. The defaults recognize both the canonical A2A 0.3 service a2a.v1.A2AService (package a2a.v1 in a2aproject/A2A at tag v0.3.0) and A2A 1.0's lf.a2a.v1.A2AService so upgrades preserve method-policy enforcement for either published identity. The 0.3 service is the identity whose card layout the default endpoint.protocol_versions 0.3.0 describes. The 1.0 service uses package lf.a2a.v1 with a renumbered AgentCard; it is detected and policed by default while card rewriting on it fails closed with agent_card_grpc_schema_unsupported rather than decoding a 1.0 card as 0.3. The one decoded payload is the unary Agent Card reply (GetAgentCard / GetExtendedAgentCard) on an a2a-0.3 service when discovery.rewrite_agent_card_urls is enabled - a proven-successful reply is decoded against the A2A 0.3.x Agent Card wire layout, rewritten, and re-encoded as a single uncompressed frame, and anything unsupported or malformed fails closed with a fixed diagnostic. A card RPC on a service whose declared layout is none fails closed with agent_card_grpc_schema_undeclared; set discovery.rewrite_agent_card_urls false or declare card_schema a2a-0.3 for such a deployment. All other gRPC responses, including streaming ones, pass through undecoded."
         detection:
-          type: object
+          type: [object, "null"]
+          additionalProperties: false
           properties:
             bindings:
-              type: array
+              type: [array, "null"]
               minItems: 1
               items:
                 type: string
-                enum: [jsonrpc, rest, grpc]
+                enum: [jsonrpc, "json-rpc", rest, http_json, "http+json", grpc]
               default: [jsonrpc, rest, grpc]
+              description: A2A bindings to detect. Each entry is one of three bindings, and two of them accept aliases that normalize to the canonical name - "json-rpc" is "jsonrpc", and "http_json" and "http+json" are "rest". The list must be non-empty; repeating a binding under two spellings is accepted and deduplicates.
             version_header:
-              type: string
+              type: [string, "null"]
+              minLength: 1
+              pattern: '^[!#$%&''*+.^_`|~0-9A-Za-z-]+$'
               default: A2A-Version
-              description: Header used to record/accept A2A protocol version hints.
+              description: Header used to record/accept A2A protocol version hints. Must be a valid non-empty HTTP field name.
             max_request_body_size:
-              type: integer
+              type: [integer, "null"]
               format: uint64
+              minimum: 0
+              maximum: 18446744073709551615
               default: 1048576
               description: Maximum JSON-RPC request body bytes parsed for A2A detection; 0 means no plugin-level detection limit. Oversized JSON-RPC candidates fail closed when default_action is deny or any per-method deny rule is configured.
             allow_unknown_methods_with_version_header:
-              type: boolean
+              type: [boolean, "null"]
               default: true
               description: Treat JSON-RPC requests carrying the version header as A2A even when the method is not in the built-in standard-method table. Metadata records method as unknown to bound cardinality.
             strip_accept_encoding:
-              type: boolean
+              type: [boolean, "null"]
               default: true
               description: Remove Accept-Encoding on non-streaming A2A HTTP requests whose responses may be parsed or rewritten by the plugin. Enabling this plugin with the default true value marks request headers mutable for all traffic on the proxy.
         discovery:
           type: object
+          additionalProperties: false
           anyOf:
             - required: [rewrite_agent_card_urls]
               properties:
@@ -32401,51 +32418,93 @@ components:
                   minItems: 1
           properties:
             rewrite_agent_card_urls:
-              type: boolean
+              type: [boolean, "null"]
               default: true
               description: Rewrite Agent Card endpoint URLs for detected HTTP JSON and unary gRPC card requests. Rewrites JSON-RPC endpoint URLs, preserves non-JSONRPC interface URLs such as GRPC and HTTP+JSON, removes stale signatures after mutation, and re-encodes A2A 0.3.x protobuf Agent Cards on the gRPC path. The gRPC path only inspects a proven-successful reply - HTTP 200 with a terminal grpc-status of exactly 0 - so a non-OK upstream response is forwarded as written rather than mistaken for a card. It rewrites the A2A 0.3.x wire layout only and requires positive proof of it TWICE - the responding gRPC service must be declared to carry the a2a-0.3 card schema (endpoint.grpc_services; a service declared a2a-1.0 or none fails closed with agent_card_grpc_schema_unsupported / agent_card_grpc_schema_undeclared before a byte is decoded) AND the card must carry an explicit protocol_version that exactly matches a configured endpoint.protocol_versions entry AND belongs to the 0.3 family. A card with an absent or empty protocol_version fails closed with a trailers-only gRPC INTERNAL under HTTP 200 and an unsupported_agent_card_protobuf_version diagnostic, and is not assumed to be 0.3.x even when endpoint.protocol_versions lists only 0.3.x. A2A renumbered AgentCard for 1.0, so guessing would corrupt the card and re-serve it under a stale signature. All seventeen known 0.3 top-level fields are schema-validated before any rewrite - each must carry the wire type the 0.3 schema declares (a canonical 0/1 varint for supports_authenticated_extended_card), each singular field may appear at most once, and every known string that is re-emitted must be valid UTF-8. url and every AgentInterface url must parse as a bounded absolute http/https URL with a real host and no embedded credentials, and an AgentInterface without a url is refused rather than counted as a usable endpoint. Faults fail closed with agent_card_protobuf_field_wire_mismatch, agent_card_protobuf_field_duplicated, agent_card_protobuf_string_invalid, agent_card_protobuf_bool_invalid, agent_card_protobuf_interface_url_missing, or agent_card_protobuf_url_layout_mismatch. The submessages the rewriter preserves rather than parses - provider, capabilities, security_schemes, security, skills, and signatures - are checked for wire type and multiplicity only; their contents are never decoded and are not claimed to be well formed. Unknown fields with any valid wire type are preserved untouched. Diagnostics are fixed strings; response bytes are never reflected into grpc-message or metadata. Set this to false when fronting a non-0.3 A2A backend; leaving it true refuses such cards rather than serving un-rewritten internal URLs.
             public_base_url:
-              type: string
+              type: [string, "null"]
               format: uri
+              maxLength: 4096
+              pattern: '^[Hh][Tt][Tt][Pp][Ss]?://(?![^/?#]*@)[^/?#\s\\][^\s?#\\]*$'
               description: Explicit public gateway base URL, for example https://agents.example.com. Rewriting defaults to enabled and requires this value or trust_forwarded_headers=true with nonempty allowed_public_origins. Empty plugin configurations fail admission. Explicit rewrite_agent_card_urls=false selects unchanged backend cards. When deriving an origin, X-Forwarded-* and Host must select an allowed normalized origin; missing, malformed, comma-separated or unlisted origins fail closed before backend dispatch with agent_card_public_origin_unavailable (HTTP 502 or gRPC INTERNAL). Configuring this value is also what makes the Agent Card rewrite a pure function of configuration, which is required to compose this plugin with request_deduplication on the same proxy.
             trust_forwarded_headers:
-              type: boolean
+              type: [boolean, "null"]
               default: false
               description: Derive the public gateway origin from X-Forwarded-Proto, X-Forwarded-Host, and Host when discovery.public_base_url is omitted. Requires nonempty allowed_public_origins when rewriting is enabled; the trusted front door must replace forwarded headers. Schemes and ports must match an allowed normalized origin. In that request-derived mode the origin also depends on whether the connection carried a TLS SNI hostname, which no replay fingerprint binds, so admission rejects the pair with request_deduplication on the same proxy with 400 (fatal in file mode, rejected update in DP) and the runtime retains and replays nothing. Setting discovery.public_base_url resolves it; a configured public base composes normally.
             allowed_public_origins:
-              type: array
+              type: [array, "null"]
               default: []
               items:
                 type: string
                 format: uri
+                maxLength: 4096
+                pattern: '^[Hh][Tt][Tt][Pp][Ss]?://(?![^/?#]*@)[^/?#\s\\]+/?$'
               description: Allowed absolute HTTP(S) origins for request-derived card URLs, without paths, credentials, queries or fragments. Required with trust_forwarded_headers when rewriting is enabled and public_base_url is absent. Compared after URL origin normalization, including scheme and non-default port. A configured public_base_url takes precedence.
         observability:
-          type: object
+          type: [object, "null"]
+          additionalProperties: false
           properties:
             emit_metadata:
-              type: boolean
+              type: [boolean, "null"]
               default: true
               description: Emit a2a.* request and response metadata for downstream logging, tracing, authz, and chargeback plugins. When true (default), detected non-streaming A2A HTTP responses are buffered so response metadata (a2a.task_id, a2a.context_id, a2a.task_state, a2a.error) can be extracted; SSE and non-card gRPC responses are never buffered for metadata. Detected unary gRPC Agent Card responses are buffered when discovery.rewrite_agent_card_urls is true so protobuf cards can be rewritten. Detected 2xx SSE streams are observed without buffering and write a2a.stream_events plus any observed a2a.task_id, a2a.context_id, and a2a.task_state into transaction metadata at stream termination, where key-based metadata redaction applies. The buffer is bounded by the global FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES limit, not max_payload_size. Set false together with discovery.rewrite_agent_card_urls=false to keep responses fully streaming; request detection and method policy still apply.
             log_payloads:
-              type: boolean
+              type: [boolean, "null"]
               default: false
               description: Copies bounded A2A response payloads into metadata. Payloads can contain secrets or PII and are copied verbatim into a2a.payload.response rather than field-redacted; enable only for protected logging paths. Request payloads are not logged. Requires emit_metadata=true, because payload capture writes the a2a.payload.response metadata key; with emit_metadata=false this option has no effect.
             max_payload_size:
-              type: integer
+              type: [integer, "null"]
               format: uint64
               default: 1048576
               minimum: 1
+              maximum: 18446744073709551615
               description: Payload logging byte limit. Task and context identifiers, textual errors and protocol-version metadata are capped at min(max_payload_size, 1024) UTF-8 bytes including a trailing ~ marker, with a companion .truncated flag. Task states are normalized to the protocol state set; unrecognized states become unknown with .unrecognized=true, and normalized states too large for this limit are omitted with .truncated=true. Applies to request hints, JSON replies and SSE completion metadata; does not cap response buffering or alter response bytes.
         policy:
-          type: object
+          type: [object, "null"]
+          additionalProperties: false
           properties:
             default_action:
-              type: string
-              enum: [allow, deny]
+              type: [string, "null"]
+              enum: [allow, deny, null]
               default: allow
               description: With deny or any per-method deny rule, unrecognized requests inside the configured endpoint, discovery or gRPC-service scope fail closed, including unsupported payloads, methods, paths and disabled bindings. Known batch members are individually policed. Unrelated sibling paths and services are outside scope.
             methods:
-              type: object
+              type: [object, "null"]
+              propertyNames:
+                enum:
+                  - message/send
+                  - message/stream
+                  - tasks/get
+                  - tasks/list
+                  - tasks/cancel
+                  - tasks/resubscribe
+                  - tasks/pushNotificationConfig/set
+                  - tasks/pushNotificationConfig/get
+                  - tasks/pushNotificationConfig/list
+                  - tasks/pushNotificationConfig/delete
+                  - agent/getCard
+                  - agent/getExtendedAgentCard
+                  - agent/getAuthenticatedExtendedCard
+                  - unknown
+                  - SendMessage
+                  - SendStreamingMessage
+                  - GetTask
+                  - ListTasks
+                  - CancelTask
+                  - SubscribeToTask
+                  - TaskSubscription
+                  - CreateTaskPushNotificationConfig
+                  - CreateTaskPushNotification
+                  - GetTaskPushNotificationConfig
+                  - GetTaskPushNotification
+                  - ListTaskPushNotificationConfigs
+                  - ListTaskPushNotificationConfig
+                  - ListTaskPushNotification
+                  - DeleteTaskPushNotificationConfig
+                  - DeleteTaskPushNotification
+                  - GetAgentCard
+                  - GetExtendedAgentCard
+                  - GetAuthenticatedExtendedCard
               description: >-
                 Per-method policy overrides. Keys must be a canonical A2A method name —
                 message/send, message/stream, tasks/get, tasks/list, tasks/cancel,
@@ -32455,14 +32514,20 @@ components:
                 agent/getExtendedAgentCard, agent/getAuthenticatedExtendedCard — or the
                 literal "unknown". PascalCase gRPC/REST aliases such as SendMessage or
                 GetTask are accepted and normalized to these canonical names.
-                Unrecognized keys are rejected at config validation.
+                Unrecognized keys are rejected at config validation. Two keys that
+                canonicalize to the same method — for example "tasks/get" and
+                "GetTask", or "SubscribeToTask" and "TaskSubscription" — are a
+                duplicate and are rejected; that cross-key restriction is not
+                expressible in this schema.
               additionalProperties:
                 type: object
                 required: [action]
+                additionalProperties: false
                 properties:
                   action:
                     type: string
                     enum: [allow, deny]
+                    description: Required; null is not accepted here.
 
     McpGatewayConfig:
       type: object
