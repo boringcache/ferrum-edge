@@ -3021,6 +3021,31 @@ pub mod _test_support {
         crate::plugins::kafka_logging::validate_producer_admission(config, http_client)
     }
 
+    /// Deterministic probe: terminal broker failures and immediate librdkafka
+    /// rejections must reach the process-cumulative per-plugin loss family.
+    ///
+    /// Returns `(sink_error_delta, queue_full_delta, delivery_failed,
+    /// queue_rejected)`. The two deltas read process-wide counters a concurrent
+    /// test can only increase, so assert on them as lower bounds.
+    pub fn kafka_logging_probe_terminal_loss_accounting_for_test(
+        record_count: usize,
+        queue_max_messages: Option<u32>,
+    ) -> Result<(u64, u64, u64, u64), String> {
+        crate::plugins::kafka_logging::probe_terminal_loss_accounting_for_test(
+            record_count,
+            queue_max_messages,
+        )
+    }
+
+    /// The exact SASL credential bytes the constructor would hand librdkafka,
+    /// so the verbatim-credential contract can be asserted directly.
+    pub fn kafka_logging_parsed_sasl_credentials_for_test(
+        config: &serde_json::Value,
+        http_client: &crate::plugins::PluginHttpClient,
+    ) -> Result<(Option<String>, Option<String>), String> {
+        crate::plugins::kafka_logging::parsed_sasl_credentials_for_test(config, http_client)
+    }
+
     pub fn kafka_logging_serialize_http_with_config_for_test(
         config: &serde_json::Value,
         summary: &crate::plugins::TransactionSummary,

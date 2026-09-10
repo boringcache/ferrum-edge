@@ -18101,6 +18101,33 @@ components:
             required: [sasl_password]
           then:
             required: [sasl_username]
+        # resolve_schema refuses both together.
+        - not:
+            required: [schema, schema_ref]
+        # producer_config namespace dependencies. security_protocol defaults to
+        # plaintext, so an absent field must take the non-TLS / non-SASL branch.
+        - if:
+            required: [security_protocol]
+            properties:
+              security_protocol:
+                enum: [ssl, sasl_ssl]
+          else:
+            properties:
+              producer_config:
+                propertyNames:
+                  not:
+                    pattern: '^(ssl\.|enable\.ssl\.)'
+        - if:
+            required: [security_protocol]
+            properties:
+              security_protocol:
+                enum: [sasl_plaintext, sasl_ssl]
+          else:
+            properties:
+              producer_config:
+                propertyNames:
+                  not:
+                    pattern: '^(sasl\.|enable\.sasl\.|https\.)'
       properties:
         broker_list:
           type: string
@@ -18110,13 +18137,33 @@ components:
         topic:
           type: string
           minLength: 1
-          pattern: '\S'
-          description: Kafka topic to produce messages to
+          maxLength: 249
+          # Apache Kafka Topic.validate: ASCII letters, digits, '.', '_', '-',
+          # and never "." or "..". Matched verbatim by the constructor.
+          pattern: '^[A-Za-z0-9._-]+$'
+          not:
+            anyOf:
+              - enum: [".", ".."]
+              # Belt-and-braces for dialects (Python's re) whose `$` also
+              # matches before a trailing newline; the constructor takes the
+              # topic byte for byte.
+              - pattern: '\s'
+          description: >-
+            Kafka topic to produce messages to. Held to Kafka's own topic
+            syntax at admission: 1-249 characters drawn from ASCII letters,
+            digits, '.', '_', and '-', and never "." or "..". Whether an
+            otherwise valid topic exists (or may be auto-created) is still a
+            broker decision.
         key_field:
           type: string
           enum: [client_ip, proxy_id, none]
           default: client_ip
-          description: "Partition key field: client_ip (groups by client), proxy_id (groups by route), none (round-robin)"
+          description: >-
+            Partition key field: client_ip (groups by client), proxy_id (groups
+            by route), none (omits the record key and delegates partition
+            selection to the configured librdkafka partitioner — by default
+            consistent_random with sticky batching, NOT a Ferrum per-record
+            rotation). Matched exactly: lowercase, no surrounding whitespace.
         buffer_capacity:
           type: integer
           default: 10000
@@ -18141,9 +18188,13 @@ components:
             Aggregate Ferrum retained-content byte budget across queued records
             awaiting librdkafka admission and transient serializers. Admission
             reserves max_entry_bytes before serialization and shrinks that lease
-            to the exact retained record size. Must be at least max_entry_bytes.
-            Bytes are released when librdkafka send returns. Hard maximum
-            268435456.
+            to the exact retained record size. Must be at least max_entry_bytes
+            (a cross-field bound JSON Schema cannot express; the constructor
+            enforces it). The charge is NOT released when librdkafka send
+            returns: it is transferred into the record's delivery opaque and
+            covers librdkafka's own retained copy until terminal delivery,
+            terminal failure, purge-on-destroy, or an immediate send rejection.
+            Hard maximum 268435456.
         compression:
           type: string
           enum: [none, gzip, snappy, lz4, zstd]
@@ -18161,7 +18212,11 @@ components:
           description: "Delivery acknowledgment level: 0 (fire-and-forget local completion still observed via delivery callback), 1 (leader ack), all/-1 (full ISR ack)"
         message_timeout_ms:
           type: integer
-          description: Timeout for message delivery in milliseconds
+          minimum: 0
+          maximum: 2147483647
+          description: >-
+            Timeout for message delivery in milliseconds. librdkafka's own
+            range; 0 means no local timeout.
         security_protocol:
           type: string
           enum: [plaintext, ssl, sasl_plaintext, sasl_ssl]
@@ -18207,9 +18262,54 @@ components:
         producer_config:
           type: object
           propertyNames:
-            type: string
-            minLength: 1
-            pattern: '^\S(?:[\s\S]*\S)?$'
+            allOf:
+              - type: string
+                minLength: 1
+                pattern: '^\S(?:[\s\S]*\S)?$'
+              # Properties the constructor refuses outright: bootstrap aliases,
+              # every alias of an authoritative top-level TLS/SASL control, and
+              # transactional.id (the sink owns no Kafka transaction). The
+              # constructor matches these case-insensitively, which JSON Schema
+              # cannot express without a non-portable inline flag, so a re-cased
+              # spelling is still refused at admission though it passes here.
+              - not:
+                  enum:
+                    - bootstrap.servers
+                    - metadata.broker.list
+                    - transactional.id
+                    - security.protocol
+                    - enable.ssl.certificate.verification
+                    - ssl.endpoint.identification.algorithm
+                    - ssl.ca.location
+                    - ssl.ca.pem
+                    - ssl.ca.certificate.stores
+                    - ssl.certificate.location
+                    - ssl.certificate.pem
+                    - ssl.key.location
+                    - ssl.key.pem
+                    - ssl.keystore.location
+                    - sasl.mechanism
+                    - sasl.mechanisms
+                    - sasl.username
+                    - sasl.password
+          properties:
+            # Ferrum re-derives these three budgets and caps them at its own
+            # hard maxima, so the admitted string is a bounded decimal integer.
+            # Case-insensitively matched by the constructor, as above: a
+            # re-cased spelling falls through to additionalProperties here and
+            # is still bound-checked at admission.
+            queue.buffering.max.messages:
+              type: string
+              description: "librdkafka producer queue depth, 1-100000."
+              pattern: '^([1-9][0-9]{0,4}|100000)$'
+            queue.buffering.max.kbytes:
+              type: string
+              description: "librdkafka producer queue size in KiB, 1-262144."
+              pattern: '^([1-9][0-9]{0,4}|1[0-9]{5}|2[0-5][0-9]{4}|26[01][0-9]{3}|2620[0-9]{2}|2621[0-3][0-9]|26214[0-4])$'
+            message.max.bytes:
+              type: string
+              description: "librdkafka maximum message size in bytes, 1-4194304."
+              pattern: '^([1-9][0-9]{0,5}|[1-3][0-9]{6}|40[0-9]{5}|41[0-8][0-9]{4}|419[0-3][0-9]{3}|4194[0-2][0-9]{2}|419430[0-4])$'
           additionalProperties:
             type: string
             minLength: 1
@@ -18223,10 +18323,17 @@ components:
             sasl_plaintext/sasl_ssl. Queue/message budgets cannot exceed Ferrum
             hard maxima. ssl.crl.location cannot conflict with gateway
             file-backed gateway CRL source when verification is enabled.
+            transactional.id is refused outright: the logging lifecycle never
+            calls init_transactions/begin_transaction/commit_transaction, so a
+            transactional producer would reject every record. Values carrying
+            inline PEM private-key material are refused by shape, which JSON
+            Schema does not model here.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
           type: string
+          minLength: 1
+          pattern: '\S'
           description: >-
             Name of a schema registered by a `transaction_log_schema` plugin.
             Mutually exclusive with `schema`. Note: Kafka partition keys

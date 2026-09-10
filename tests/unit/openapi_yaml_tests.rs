@@ -5713,6 +5713,11 @@ fn kafka_logging_schema_rejects_unknown_root_keys_and_is_closed() {
         schema["properties"]["security_protocol"]["default"],
         json!("plaintext")
     );
+    assert_eq!(schema["properties"]["topic"]["maxLength"], json!(249));
+    assert_eq!(
+        schema["properties"]["message_timeout_ms"]["maximum"],
+        json!(2147483647)
+    );
 
     for valid in [
         json!({"broker_list": "localhost:9092", "topic": "logs"}),
@@ -5756,6 +5761,160 @@ fn kafka_logging_schema_rejects_unknown_root_keys_and_is_closed() {
         json!({"broker_list": "localhost:9092", "topic": "logs", "security_protocol": "sasl_plaintext", "ssl_ca_location": "/etc/ferrum/ca.pem"}),
         json!({"broker_list": "localhost:9092", "topic": "logs", "security_protocol": "sasl_ssl", "sasl_username": "alice"}),
         json!({"broker_list": "localhost:9092", "topic": "logs", "security_protocol": "ssl", "ssl_certificate_location": "/etc/ferrum/client.pem"}),
+    ] {
+        assert_component_validity(&spec, "KafkaLoggingConfig", &invalid, false);
+    }
+}
+
+/// The retained-byte lease and the `key_field: none` partitioning contract must
+/// not drift back to their pre-#5218 / pre-#5219 text on any operator surface.
+///
+/// Both claims were stale in opposite directions: the budget was described as
+/// released at `send`, when it is held through terminal delivery; and `none` was
+/// described as round-robin, when it simply omits the key and lets librdkafka's
+/// own (sticky, consistent-random) partitioner choose.
+#[test]
+fn kafka_logging_operator_surfaces_describe_the_implemented_behavior() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/KafkaLoggingConfig")
+        .expect("KafkaLoggingConfig exists");
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let kafka_section = plugin_docs
+        .split_once("### `kafka_logging`")
+        .and_then(|(_, rest)| rest.split_once("\n### "))
+        .map(|(section, _)| section)
+        .expect("docs/plugins.md has a bounded kafka_logging section");
+
+    let buffer_description = schema["properties"]["buffer_max_bytes"]["description"]
+        .as_str()
+        .expect("buffer_max_bytes description");
+    assert!(
+        buffer_description.contains("NOT released when librdkafka send returns"),
+        "the OpenAPI budget description must state that the lease survives handoff"
+    );
+    assert!(
+        !buffer_description.contains("Bytes are released when librdkafka send returns"),
+        "the OpenAPI budget description must not claim release at handoff"
+    );
+    assert!(
+        kafka_section.contains("The charge is **not** released when `send` returns"),
+        "docs/plugins.md must state that the lease survives handoff"
+    );
+    assert!(
+        !kafka_section.contains("Bytes release when librdkafka `send` returns"),
+        "docs/plugins.md must not claim release at handoff"
+    );
+
+    let key_field_description = schema["properties"]["key_field"]["description"]
+        .as_str()
+        .expect("key_field description");
+    assert!(
+        key_field_description.contains("consistent_random"),
+        "the OpenAPI key_field description must name the librdkafka partitioner"
+    );
+    assert!(
+        !key_field_description.contains("round-robin"),
+        "the OpenAPI key_field description must not promise round-robin"
+    );
+    assert!(
+        kafka_section.contains("consistent_random"),
+        "docs/plugins.md must name the librdkafka partitioner for key_field none"
+    );
+    assert!(
+        !kafka_section.contains("round-robin"),
+        "docs/plugins.md must not promise round-robin partition assignment"
+    );
+
+    // The retained-bytes gauge HELP is published from the contract inventory.
+    for surface in [
+        include_str!("../../docs/prometheus_metrics.md"),
+        include_str!("../../docs/prometheus_metric_contract.json"),
+    ] {
+        assert!(
+            !surface.contains("awaiting librdkafka admission"),
+            "the retained-bytes gauge must not describe a userspace-only budget"
+        );
+    }
+}
+
+/// The component must admit exactly what `KafkaLogging::new` admits (#5217).
+///
+/// Every syntactic case below was reproduced against the constructor; a client
+/// generated from this schema has to reach the same verdict, or preflight is
+/// useless. Two constraints stay deliberately outside the schema because JSON
+/// Schema cannot express them: `buffer_max_bytes >= max_entry_bytes` (an
+/// unrestricted sibling-number comparison) and whether a `schema_ref` names a
+/// schema some `transaction_log_schema` plugin actually registered. Both are
+/// stated in the component descriptions instead.
+#[test]
+fn kafka_logging_schema_matches_runtime_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let long_topic = "a".repeat(249);
+    let too_long_topic = "a".repeat(250);
+    let base = |extra: serde_json::Value| -> serde_json::Value {
+        let mut config = json!({"broker_list": "127.0.0.1:9092", "topic": "audit-logs"});
+        for (key, value) in extra.as_object().expect("overrides are an object") {
+            config[key] = value.clone();
+        }
+        config
+    };
+
+    for valid in [
+        base(json!({"topic": long_topic})),
+        base(json!({"topic": "a.b_c-d"})),
+        base(json!({"topic": "..."})),
+        base(json!({"message_timeout_ms": 0})),
+        base(json!({"message_timeout_ms": 2147483647})),
+        base(json!({"schema_ref": "named"})),
+        base(json!({"producer_config": {"linger.ms": "50"}})),
+        base(json!({"producer_config": {"queue.buffering.max.messages": "100000"}})),
+        base(json!({"producer_config": {"queue.buffering.max.kbytes": "262144"}})),
+        base(json!({"producer_config": {"message.max.bytes": "4194304"}})),
+        base(json!({
+            "security_protocol": "ssl",
+            "producer_config": {"ssl.cipher.suites": "DEFAULT"}
+        })),
+        base(json!({
+            "security_protocol": "sasl_ssl",
+            "sasl_username": " padded ",
+            "sasl_password": " padded ",
+            "producer_config": {"sasl.kerberos.service.name": "kafka"}
+        })),
+    ] {
+        assert_component_validity(&spec, "KafkaLoggingConfig", &valid, true);
+    }
+
+    for invalid in [
+        // Kafka topic syntax (#5213).
+        base(json!({"topic": "."})),
+        base(json!({"topic": ".."})),
+        base(json!({"topic": "bad/name"})),
+        base(json!({"topic": "bad name"})),
+        base(json!({"topic": too_long_topic})),
+        // Runtime integer bounds and the non-empty schema reference (#5217).
+        base(json!({"message_timeout_ms": -1})),
+        base(json!({"message_timeout_ms": 2147483648u64})),
+        base(json!({"schema_ref": ""})),
+        base(json!({"schema": {}, "schema_ref": "named"})),
+        // Normalized enum spellings the constructor refuses (#5217).
+        base(json!({"security_protocol": "PLAINTEXT"})),
+        base(json!({"key_field": " none "})),
+        base(json!({"acks": " 1 "})),
+        base(json!({"compression": " gzip "})),
+        // producer_config refusals, namespaces, and budgets (#5215, #5217).
+        base(json!({"producer_config": {"security.protocol": "ssl"}})),
+        base(json!({"producer_config": {"sasl.password": "secret"}})),
+        base(json!({"producer_config": {"transactional.id": "audit"}})),
+        base(json!({"producer_config": {"queue.buffering.max.messages": "100001"}})),
+        base(json!({"producer_config": {"queue.buffering.max.messages": "0"}})),
+        base(json!({"producer_config": {"queue.buffering.max.kbytes": "262145"}})),
+        base(json!({"producer_config": {"message.max.bytes": "4194305"}})),
+        base(json!({"producer_config": {"ssl.cipher.suites": "DEFAULT"}})),
+        base(json!({"producer_config": {"sasl.kerberos.service.name": "kafka"}})),
     ] {
         assert_component_validity(&spec, "KafkaLoggingConfig", &invalid, false);
     }
