@@ -8205,57 +8205,65 @@ async fn validate_tool_results_rejects_malformed_json_rpc_protocol_errors() {
     .unwrap()
     .unwrap();
     let session_id = initialize(&plugin).await;
+    // An output-validation refusal names the ADMITTED REQUEST id (JSON-RPC 2.0
+    // section 5): the gateway knows exactly which call is still pending, and the
+    // id a malformed upstream envelope claims is untrusted — reflecting it would
+    // answer an id the client never sent. Only a request that admitted no
+    // singleton id is eligible for `id: null`.
     let malformed = [
         (
             "non-object envelope",
             json!(["not", "a", "response"]),
-            Value::Null,
+            json!(161),
         ),
         (
             "missing jsonrpc",
             json!({"id": 1, "error": {"code": -32603, "message": "bad"}}),
-            json!(1),
+            json!(163),
         ),
         (
             "wrong jsonrpc",
             json!({"jsonrpc": "1.0", "id": 2, "error": {"code": -32603, "message": "bad"}}),
-            json!(2),
+            json!(165),
         ),
         (
             "missing id",
             json!({"jsonrpc": "2.0", "error": {"code": -32603, "message": "bad"}}),
-            Value::Null,
+            json!(167),
         ),
         (
             "object id",
             json!({"jsonrpc": "2.0", "id": {}, "error": {"code": -32603, "message": "bad"}}),
-            Value::Null,
+            json!(169),
         ),
         (
             "array id",
             json!({"jsonrpc": "2.0", "id": [], "error": {"code": -32603, "message": "bad"}}),
-            Value::Null,
+            json!(171),
         ),
         (
             "boolean id",
             json!({"jsonrpc": "2.0", "id": true, "error": {"code": -32603, "message": "bad"}}),
-            Value::Null,
+            json!(173),
         ),
         (
             "non-integer error code",
             json!({"jsonrpc": "2.0", "id": 3, "error": {"code": 1.5, "message": "bad"}}),
-            json!(3),
+            json!(175),
         ),
         (
             "non-string error message",
             json!({"jsonrpc": "2.0", "id": 4, "error": {"code": -32603, "message": 4}}),
-            json!(4),
+            json!(177),
         ),
     ];
 
     for (offset, (case, upstream_value, expected_id)) in malformed.into_iter().enumerate() {
-        let mut ctx =
-            route_validated_tool_call(&plugin, &session_id, 160 + offset as i64 * 2).await;
+        // The table names the id of the request THIS iteration dispatches:
+        // `route_validated_tool_call` sends its tools/call under `base + 1`.
+        let base = 160 + offset as i64 * 2;
+        assert_eq!(expected_id, json!(base + 1), "{case}");
+        let mut ctx = route_validated_tool_call(&plugin, &session_id, base).await;
         let upstream_response = serde_json::to_vec(&upstream_value).unwrap();
         let headers = known_json_response_headers(&upstream_response);
         let (status, body, _) = reject_json(
@@ -8320,42 +8328,47 @@ async fn validate_tool_results_rejects_malformed_json_rpc_result_envelopes() {
             "conditions": "Clear"
         }
     });
+    // The same contract as the protocol-error corpus above: the refusal carries
+    // the admitted REQUEST id, never the id the malformed envelope claimed.
     let malformed = [
         (
             "missing jsonrpc",
             json!({"id": 157, "result": valid_result}),
-            json!(157),
+            json!(221),
         ),
         (
             "wrong jsonrpc",
             json!({"jsonrpc": "1.0", "id": 158, "result": valid_result}),
-            json!(158),
+            json!(223),
         ),
         (
             "missing id",
             json!({"jsonrpc": "2.0", "result": valid_result}),
-            Value::Null,
+            json!(225),
         ),
         (
             "object id",
             json!({"jsonrpc": "2.0", "id": {}, "result": valid_result}),
-            Value::Null,
+            json!(227),
         ),
         (
             "array id",
             json!({"jsonrpc": "2.0", "id": [], "result": valid_result}),
-            Value::Null,
+            json!(229),
         ),
         (
             "boolean id",
             json!({"jsonrpc": "2.0", "id": false, "result": valid_result}),
-            Value::Null,
+            json!(231),
         ),
     ];
 
     for (offset, (case, upstream_value, expected_id)) in malformed.into_iter().enumerate() {
-        let mut ctx =
-            route_validated_tool_call(&plugin, &session_id, 220 + offset as i64 * 2).await;
+        // The table names the id of the request THIS iteration dispatches:
+        // `route_validated_tool_call` sends its tools/call under `base + 1`.
+        let base = 220 + offset as i64 * 2;
+        assert_eq!(expected_id, json!(base + 1), "{case}");
+        let mut ctx = route_validated_tool_call(&plugin, &session_id, base).await;
         let upstream_response = serde_json::to_vec(&upstream_value).unwrap();
         let headers = known_json_response_headers(&upstream_response);
         let (status, body, _) = reject_json(
@@ -8387,6 +8400,7 @@ async fn validate_tool_results_rejects_malformed_and_oversized_results() {
     );
     assert_eq!(status, 200);
     assert_eq!(body["error"]["code"], -32012);
+    assert_eq!(body["id"], json!(161));
 
     let oversized = vec![b'x'; 8 * 1024];
     let oversized_headers = known_json_response_headers(&oversized);
@@ -8397,6 +8411,9 @@ async fn validate_tool_results_rejects_malformed_and_oversized_results() {
     );
     assert_eq!(status, 200);
     assert_eq!(body["error"]["code"], -32012);
+    // The oversized body carries no readable id at all; the retained request id
+    // is what keeps the client's pending call correlated.
+    assert_eq!(body["id"], json!(161));
 }
 
 #[tokio::test]
@@ -8476,11 +8493,14 @@ async fn validate_tool_results_rejects_uninspectable_response_headers() {
         ),
     ];
     for (offset, (case, mut headers)) in cases.into_iter().enumerate() {
-        let mut ctx =
-            route_validated_tool_call(&plugin, &session_id, 172 + offset as i64 * 2).await;
+        let request_id = 172 + offset as i64 * 2;
+        let mut ctx = route_validated_tool_call(&plugin, &session_id, request_id).await;
         let (status, body, _) = reject_json(plugin.after_proxy(&mut ctx, 200, &mut headers).await);
         assert_eq!(status, 200, "{case}");
         assert_eq!(body["error"]["code"], -32012, "{case}");
+        // A header-time refusal is authored with no response body to read an id
+        // from, so it must name the admitted request the client is waiting on.
+        assert_eq!(body["id"], json!(request_id + 1), "{case}");
     }
 }
 
@@ -9771,8 +9791,15 @@ async fn cancel_notification(
     (result, ctx)
 }
 
+/// Aggregate plugin with multiplexed SSE explicitly enabled.
+///
+/// `sessions.sse_multiplexing` defaults to `false` because multiplexed delivery
+/// moves a POST request's response onto the session `GET` stream, which the
+/// advertised Streamable HTTP transport does not permit. Every test that
+/// exercises it opts in exactly the way an operator must.
 fn mcp_plugin() -> Arc<dyn ferrum_edge::plugins::Plugin> {
-    let config = aggregate_config("http://github-mcp.example:8080/mcp");
+    let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
+    config["sessions"] = json!({ "sse_multiplexing": true });
     create_plugin("mcp_gateway", &config).unwrap().unwrap()
 }
 
@@ -10115,6 +10142,7 @@ async fn aggregate_sse_unrepresentable_id_falls_back_to_inline_json() {
 async fn aggregate_sse_retention_overflow_answers_inline_and_keeps_listener() {
     let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
     config["sessions"] = json!({
+        "sse_multiplexing": true,
         "sse_max_retained_events": 1,
         "sse_max_replay_events": 0
     });
@@ -10259,12 +10287,11 @@ async fn route_tool_call_with_listener(
 #[tokio::test]
 async fn aggregate_sse_multiplexes_a_synthetic_list_and_a_routed_call_on_one_listener() {
     let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
-    let plugin = create_plugin(
-        "mcp_gateway",
-        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
-    )
-    .unwrap()
-    .unwrap();
+    // Multiplexed SSE delivery is the opt-in Ferrum transport extension, so
+    // this fixture names it explicitly rather than relying on a default.
+    let mut config = aggregate_output_validation_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({ "sse_multiplexing": true });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
     let session_id = initialize(&plugin).await;
     // Warm the per-session catalog before attaching so the multiplexed
     // tools/list below is answered from cache rather than upstream discovery.
@@ -10426,7 +10453,7 @@ async fn aggregate_sse_gateway_authored_error_is_staged_not_published_by_before_
 #[tokio::test]
 async fn aggregate_sse_late_response_replacement_aborts_reserved_event() {
     let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
-    config["sessions"] = json!({ "sse_max_streams_per_session": 1 });
+    config["sessions"] = json!({ "sse_multiplexing": true, "sse_max_streams_per_session": 1 });
     let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
     let session_id = initialize(&plugin).await;
     let mut stream = attach_sse_body(&plugin, &session_id).await;
@@ -10472,7 +10499,7 @@ async fn aggregate_sse_late_response_replacement_aborts_reserved_event() {
 #[tokio::test]
 async fn aggregate_sse_final_body_policy_rejection_answers_inline_and_publishes_nothing() {
     let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
-    config["sessions"] = json!({ "sse_max_streams_per_session": 1 });
+    config["sessions"] = json!({ "sse_multiplexing": true, "sse_max_streams_per_session": 1 });
     let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
     let session_id = initialize(&plugin).await;
     let mut stream = attach_sse_body(&plugin, &session_id).await;
@@ -10614,12 +10641,11 @@ async fn aggregate_sse_cancellation_after_staging_suppresses_the_gateway_authore
 #[tokio::test]
 async fn aggregate_sse_preserves_non_ok_upstream_http_status_inline() {
     let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
-    let plugin = create_plugin(
-        "mcp_gateway",
-        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
-    )
-    .unwrap()
-    .unwrap();
+    // Multiplexed SSE delivery is the opt-in Ferrum transport extension, so
+    // this fixture names it explicitly rather than relying on a default.
+    let mut config = aggregate_output_validation_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({ "sse_multiplexing": true });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
     let session_id = initialize(&plugin).await;
     let _ = aggregate_tool_names(&plugin, &session_id, 1).await;
     let mut stream = attach_sse_body(&plugin, &session_id).await;
@@ -10657,12 +10683,11 @@ async fn aggregate_sse_preserves_non_ok_upstream_http_status_inline() {
 #[tokio::test]
 async fn aggregate_sse_cancellation_marks_an_open_routed_request_and_suppresses_its_result() {
     let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
-    let plugin = create_plugin(
-        "mcp_gateway",
-        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
-    )
-    .unwrap()
-    .unwrap();
+    // Multiplexed SSE delivery is the opt-in Ferrum transport extension, so
+    // this fixture names it explicitly rather than relying on a default.
+    let mut config = aggregate_output_validation_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({ "sse_multiplexing": true });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
     let session_id = initialize(&plugin).await;
     let _ = aggregate_tool_names(&plugin, &session_id, 1).await;
     let mut stream = attach_sse_body(&plugin, &session_id).await;
@@ -10716,7 +10741,7 @@ async fn aggregate_sse_cancellation_marks_an_open_routed_request_and_suppresses_
 async fn aggregate_sse_policy_replacement_answers_inline_and_returns_the_identity() {
     let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
     let mut config = aggregate_output_validation_config(&format!("{}/mcp", server.uri()));
-    config["sessions"] = json!({ "sse_max_streams_per_session": 1 });
+    config["sessions"] = json!({ "sse_multiplexing": true, "sse_max_streams_per_session": 1 });
     let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
     let session_id = initialize(&plugin).await;
     let _ = aggregate_tool_names(&plugin, &session_id, 1).await;
@@ -10763,7 +10788,7 @@ async fn aggregate_sse_policy_replacement_answers_inline_and_returns_the_identit
 async fn aggregate_sse_dropped_request_releases_the_identity_exactly_once() {
     let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
     let mut config = aggregate_output_validation_config(&format!("{}/mcp", server.uri()));
-    config["sessions"] = json!({ "sse_max_streams_per_session": 1 });
+    config["sessions"] = json!({ "sse_multiplexing": true, "sse_max_streams_per_session": 1 });
     let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
     let session_id = initialize(&plugin).await;
     let _ = aggregate_tool_names(&plugin, &session_id, 1).await;
@@ -10806,6 +10831,7 @@ async fn aggregate_sse_dropped_request_releases_the_identity_exactly_once() {
 async fn aggregate_sse_repeated_retention_overflow_cannot_exhaust_stream_capacity() {
     let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
     config["sessions"] = json!({
+        "sse_multiplexing": true,
         "sse_max_streams_per_session": 2,
         "sse_max_retained_events": 1,
         "sse_max_replay_events": 0
@@ -11391,4 +11417,962 @@ async fn aggregate_sessions_are_unchanged_without_an_authentication_plugin() {
     // principal is not reusable by an authenticated one.
     let authenticated = caller_as_consumer(tools_list_body(4), "consumer-a", "alice");
     assert_session_refused(reuse_session_as(&plugin, &session_id, authenticated).await);
+}
+
+// ---------------------------------------------------------------------------
+// Plugin-audit regressions (#5339–#5349, #5357)
+// ---------------------------------------------------------------------------
+
+/// Issue #5344: media types and structured suffixes are case-insensitive, so an
+/// otherwise identical request must not be accepted or refused on casing alone.
+#[tokio::test]
+async fn request_json_media_types_are_matched_case_insensitively() {
+    let plugin = create_plugin("mcp_gateway", &aggregate_config("http://127.0.0.1:9/mcp"))
+        .unwrap()
+        .unwrap();
+    for content_type in [
+        "application/json",
+        "APPLICATION/JSON",
+        "Application/Json-RPC",
+        "application/vnd.audit+json",
+        "application/vnd.audit+JSON",
+        "APPLICATION/VND.AUDIT+JSON; charset=UTF-8",
+        "  application/vnd.audit+Json  ",
+    ] {
+        let (mut ctx, mut headers) = mcp_ctx(json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "ping",
+            "params": {}
+        }));
+        headers.insert("content-type".to_string(), content_type.to_string());
+        let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(status, 200, "{content_type}");
+        assert_eq!(body["id"], json!(10), "{content_type}");
+        assert!(body["result"].is_object(), "{content_type}");
+    }
+
+    // A genuinely different media type is still refused.
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "ping",
+        "params": {}
+    }));
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    assert_eq!(body["error"]["code"], json!(-32600));
+}
+
+/// Issue #5345: result logging/hashing had no producer anywhere in the plugin,
+/// so the settings are rejected at admission rather than accepted and ignored.
+#[tokio::test]
+async fn result_logging_settings_are_rejected_rather_than_accepted_inert() {
+    for field in ["log_raw_results", "log_result_hash"] {
+        let mut observability = serde_json::Map::new();
+        observability.insert(field.to_string(), json!(true));
+        let mut config = aggregate_config("http://127.0.0.1:9/mcp");
+        config["observability"] = Value::Object(observability);
+        let error = create_plugin("mcp_gateway", &config)
+            .err()
+            .unwrap_or_else(|| panic!("observability.{field} must not be admitted"));
+        assert!(error.contains(field), "{error}");
+    }
+
+    // The implemented argument-side settings stay accepted.
+    let mut config = aggregate_config("http://127.0.0.1:9/mcp");
+    config["observability"] = json!({
+        "emit_metadata": true,
+        "log_argument_hash": true,
+        "log_raw_arguments": false
+    });
+    assert!(create_plugin("mcp_gateway", &config).is_ok());
+}
+
+/// Route one `tools/call` and return the request context so the caller can
+/// inspect the argument observability metadata it produced.
+async fn route_tool_call_arguments(
+    validate_tool_arguments: bool,
+    log_argument_hash: bool,
+    log_raw_arguments: bool,
+    arguments: Value,
+) -> ferrum_edge::plugins::RequestContext {
+    let server = start_mcp_catalog_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["validation"] = json!({ "validate_tool_arguments": validate_tool_arguments });
+    config["observability"] = json!({
+        "emit_metadata": true,
+        "log_argument_hash": log_argument_hash,
+        "log_raw_arguments": log_raw_arguments
+    });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    let _ = aggregate_tool_names(&plugin, &session_id, 900).await;
+
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 901,
+        "method": "tools/call",
+        "params": { "name": "github.create_pr", "arguments": arguments }
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id);
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    ctx
+}
+
+/// Issue #5357: argument observation is its own setting. Turning schema
+/// validation off must not silently turn the requested observation off with it.
+#[tokio::test]
+async fn argument_observation_is_independent_of_argument_validation() {
+    // Validation off, both observations on: the arguments are still observed —
+    // and these arguments would not even have passed the schema.
+    let ctx = route_tool_call_arguments(false, true, true, json!({ "repo": 42 })).await;
+    assert!(
+        ctx.metadata.contains_key("mcp.arguments_hash"),
+        "log_argument_hash must not inherit validate_tool_arguments"
+    );
+    assert_eq!(
+        ctx.metadata.get("mcp.arguments").map(String::as_str),
+        Some(r#"{"repo":42}"#),
+        "log_raw_arguments must not inherit validate_tool_arguments"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.schema_validation")
+            .map(String::as_str),
+        Some("skipped"),
+        "validation was disabled, so the verdict stays at its neutral baseline"
+    );
+
+    // Validation on, both observations off: neither key is emitted, and the
+    // schema verdict still is.
+    let ctx =
+        route_tool_call_arguments(true, false, false, json!({ "repo": "payments-api" })).await;
+    assert!(!ctx.metadata.contains_key("mcp.arguments_hash"));
+    assert!(!ctx.metadata.contains_key("mcp.arguments"));
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.schema_validation")
+            .map(String::as_str),
+        Some("pass")
+    );
+
+    // Everything off: nothing is derived at all.
+    let ctx =
+        route_tool_call_arguments(false, false, false, json!({ "repo": "payments-api" })).await;
+    assert!(!ctx.metadata.contains_key("mcp.arguments_hash"));
+    assert!(!ctx.metadata.contains_key("mcp.arguments"));
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.schema_validation")
+            .map(String::as_str),
+        Some("skipped")
+    );
+
+    // Hash only, with validation on: the raw arguments stay opt-in.
+    let ctx = route_tool_call_arguments(true, true, false, json!({ "repo": "payments-api" })).await;
+    assert!(ctx.metadata.contains_key("mcp.arguments_hash"));
+    assert!(!ctx.metadata.contains_key("mcp.arguments"));
+}
+
+/// Issue #5339: namespacing renames a prompt, it does not strip its descriptor.
+/// A conforming upstream prompt keeps its `title` and its standard `arguments`
+/// array so a client can still discover what `prompts/get` needs.
+#[tokio::test]
+async fn aggregate_prompts_list_preserves_standard_arguments_and_title() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "initialize"})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("mcp-session-id", "upstream-session")
+                .set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": {"protocolVersion": "2025-11-25", "capabilities": {}}
+                })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "prompts/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "prompts",
+            "result": {"prompts": [
+                {
+                    "name": "welcome",
+                    "title": "Welcome prompt",
+                    "description": "Greets a named visitor",
+                    "arguments": [
+                        {
+                            "name": "visitor",
+                            "title": "Visitor",
+                            "description": "Display name",
+                            "required": true
+                        },
+                        { "name": "tone" }
+                    ]
+                },
+                {
+                    // A non-array `arguments` is not a conforming argument list.
+                    "name": "legacy",
+                    "arguments": {"type": "object"},
+                    "argumentsSchema": {"type": "object"}
+                }
+            ]}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "prompts/get"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "get",
+            "result": {"messages": []}
+        })))
+        .mount(&server)
+        .await;
+
+    let config = single_server_family_config(&format!("{}/mcp", server.uri()), false, true, false);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (status, body, _) =
+        aggregate_request_with_metadata(&plugin, &session_id, 930, "prompts/list", json!({})).await;
+    assert_eq!(status, 200);
+    let prompts = body["result"]["prompts"].as_array().unwrap();
+    let welcome = prompts
+        .iter()
+        .find(|prompt| prompt["name"] == json!("github.welcome"))
+        .unwrap_or_else(|| panic!("namespaced prompt missing: {body}"));
+    assert_eq!(welcome["title"], json!("Welcome prompt"));
+    assert_eq!(
+        welcome["description"],
+        json!("[github] Greets a named visitor")
+    );
+    assert_eq!(
+        welcome["arguments"],
+        json!([
+            {
+                "name": "visitor",
+                "title": "Visitor",
+                "description": "Display name",
+                "required": true
+            },
+            { "name": "tone" }
+        ]),
+        "the standard prompt argument array must survive namespacing verbatim"
+    );
+
+    let legacy = prompts
+        .iter()
+        .find(|prompt| prompt["name"] == json!("github.legacy"))
+        .unwrap_or_else(|| panic!("second prompt missing: {body}"));
+    assert!(
+        legacy["arguments"].is_null(),
+        "a non-array arguments value is not republished"
+    );
+    assert_eq!(legacy["argumentsSchema"], json!({"type": "object"}));
+
+    // The namespaced name still routes: argument names are prompt-local and are
+    // never rewritten, so the upstream sees its own prompt name unchanged.
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 931,
+        "method": "prompts/get",
+        "params": { "name": "github.welcome", "arguments": { "visitor": "Pat" } }
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id);
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.upstream_prompt_name")
+            .map(String::as_str),
+        Some("welcome")
+    );
+}
+
+/// Aggregate config on a non-default endpoint, so two instances can be composed.
+fn aggregate_config_on_endpoint(upstream_url: &str, path: &str) -> Value {
+    let mut config = aggregate_output_validation_config(upstream_url);
+    config["endpoint"]["path"] = json!(path);
+    config
+}
+
+/// Issue #5340: response-phase policy belongs to the instance that admitted the
+/// request. A sibling on a disjoint endpoint — even a disabled one — must not
+/// consume its validator claim or apply its own response bounds.
+#[tokio::test]
+async fn sibling_instances_do_not_apply_response_policy_to_another_endpoint() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let upstream = format!("{}/mcp", server.uri());
+
+    // The serving instance: endpoint `/mcp`, result validation on, 4 KiB cap.
+    let serving = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&upstream),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&serving).await;
+
+    let upstream_response = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 941,
+        "result": {
+            "structuredContent": { "temperature": 22.5, "conditions": "Partly cloudy" },
+            "content": [{ "type": "text", "text": "a normal response with room to spare" }]
+        }
+    }))
+    .unwrap();
+    assert!(
+        upstream_response.len() > 100,
+        "the sibling's 100-byte cap must actually be exceeded"
+    );
+    let response_headers = known_json_response_headers(&upstream_response);
+
+    for sibling_enabled in [true, false] {
+        // The unrelated instance: endpoint `/other`, a 100-byte response cap,
+        // and no result validation of its own.
+        let mut sibling_config = aggregate_config_on_endpoint(&upstream, "/other");
+        sibling_config["enabled"] = json!(sibling_enabled);
+        sibling_config["validation"] = json!({
+            "validate_tool_arguments": true,
+            "max_upstream_response_bytes": 100
+        });
+        let sibling = create_plugin("mcp_gateway", &sibling_config)
+            .unwrap()
+            .unwrap();
+
+        let mut ctx = route_validated_tool_call(&serving, &session_id, 940).await;
+        assert!(
+            !sibling.may_enforce_response_body_policy(&ctx),
+            "enabled={sibling_enabled}: a sibling must not claim another endpoint's enforcement"
+        );
+        assert!(
+            !sibling.should_buffer_response_body(&ctx),
+            "enabled={sibling_enabled}: a sibling must not buffer another endpoint's response"
+        );
+        let mut sibling_headers = response_headers.clone();
+        assert!(
+            matches!(
+                sibling
+                    .after_proxy(&mut ctx, 200, &mut sibling_headers)
+                    .await,
+                PluginResult::Continue
+            ),
+            "enabled={sibling_enabled}: a sibling must not refuse another endpoint's response"
+        );
+        assert!(
+            matches!(
+                sibling
+                    .on_final_response_body(&mut ctx, 200, &response_headers, &upstream_response)
+                    .await,
+                PluginResult::Continue
+            ),
+            "enabled={sibling_enabled}: a sibling must not enforce on another endpoint's body"
+        );
+
+        // The serving instance still behaves exactly as it does alone.
+        let mut serving_headers = response_headers.clone();
+        assert!(matches!(
+            serving
+                .after_proxy(&mut ctx, 200, &mut serving_headers)
+                .await,
+            PluginResult::Continue
+        ));
+        assert!(matches!(
+            serving
+                .on_final_response_body(&mut ctx, 200, &response_headers, &upstream_response)
+                .await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            ctx.metadata
+                .get("mcp.result_schema_validation")
+                .map(String::as_str),
+            Some("pass")
+        );
+    }
+}
+
+/// Route one validated `tools/call` under an arbitrary JSON-RPC id token.
+async fn route_validated_tool_call_with_id(
+    plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
+    session_id: &str,
+    warm_id: i64,
+    call_id: Value,
+) -> ferrum_edge::plugins::RequestContext {
+    let _ = aggregate_tool_names(plugin, session_id, warm_id).await;
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": call_id,
+        "method": "tools/call",
+        "params": { "name": "github.create_pr", "arguments": { "repo": "payments-api" } }
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id.to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    ctx
+}
+
+/// Issue #5341: a response-phase refusal must name the pending request. The
+/// upstream failure paths in particular have no readable JSON-RPC id of their
+/// own, so an `id: null` there leaves the caller waiting for its own timeout.
+#[tokio::test]
+async fn response_phase_refusals_name_the_admitted_request_id() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+
+    // An upstream error page: not inspectable JSON, refused at header time.
+    let mut ctx =
+        route_validated_tool_call_with_id(&plugin, &session_id, 950, json!("call-alpha")).await;
+    let mut error_page_headers = HashMap::from([
+        ("content-type".to_string(), "text/html".to_string()),
+        ("content-length".to_string(), "64".to_string()),
+    ]);
+    let (status, body, _) = reject_json(
+        plugin
+            .after_proxy(&mut ctx, 503, &mut error_page_headers)
+            .await,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body["error"]["code"], json!(-32012));
+    assert_eq!(body["id"], json!("call-alpha"));
+
+    // An exact numeric wire token is reflected byte-for-byte, not through f64.
+    let mut ctx = route_validated_tool_call_with_id(&plugin, &session_id, 951, json!(952)).await;
+    let id = "18446744073709551616";
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"github.create_pr","arguments":{{"repo":"payments-api"}}}}}}"#
+    );
+    let (mut ctx_raw, mut headers) = mcp_ctx_raw(body.into_bytes());
+    headers.insert("mcp-session-id".to_string(), session_id.clone());
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx_raw, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let mut event_stream_headers = HashMap::from([
+        ("content-type".to_string(), "text/event-stream".to_string()),
+        ("content-length".to_string(), "64".to_string()),
+    ]);
+    let (_, refused, _) = reject_raw(
+        plugin
+            .after_proxy(&mut ctx_raw, 200, &mut event_stream_headers)
+            .await,
+    );
+    assert_eq!(raw_response_id(&refused), id);
+
+    // Each in-flight request keeps its own identity: the ordinary numeric call
+    // above is refused under its own id, not the huge token's.
+    let mut plain_headers = HashMap::from([
+        ("content-type".to_string(), "text/plain".to_string()),
+        ("content-length".to_string(), "64".to_string()),
+    ]);
+    let (_, refused, _) = reject_json(plugin.after_proxy(&mut ctx, 200, &mut plain_headers).await);
+    assert_eq!(refused["error"]["code"], json!(-32012));
+    assert_eq!(refused["id"], json!(952));
+}
+
+/// Issue #5342: multiplexed SSE moves a POST request's response onto the
+/// session GET stream, which MCP Streamable HTTP does not permit, so it must be
+/// opt-in rather than the default.
+#[tokio::test]
+async fn aggregate_sse_multiplexing_is_off_unless_explicitly_enabled() {
+    // No `sessions` block at all: GET keeps the 405 and POSTs answer inline.
+    let plugin = create_plugin("mcp_gateway", &aggregate_config("http://127.0.0.1:9/mcp"))
+        .unwrap()
+        .unwrap();
+    let (mut ctx, mut headers) = sse_get_ctx(None, Some("text/event-stream"));
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        status, 405,
+        "aggregate SSE multiplexing must be off by default"
+    );
+    assert!(body["error"].as_str().unwrap().contains("disabled"));
+
+    let session_id = initialize(&plugin).await;
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    let (status, _, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 405);
+    assert!(
+        !mcp_aggregate_sse_listener_is_staged_for_test(&ctx),
+        "no listener may be staged while multiplexing is off"
+    );
+
+    // The request's response stays on its own POST, as the transport requires.
+    let (status, body, _) = reject_json(ping(&plugin, &session_id, json!("inline")).await);
+    assert_eq!(status, 200);
+    assert_eq!(body["id"], json!("inline"));
+    assert!(body["result"].is_object());
+
+    // Opting in restores the listener.
+    let opted_in = mcp_plugin();
+    let session_id = initialize(&opted_in).await;
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    let (status, _, response_headers) =
+        reject_raw(opted_in.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    assert_eq!(
+        response_headers.get("content-type").map(String::as_str),
+        Some("text/event-stream")
+    );
+}
+
+/// Issue #5349: the parity metadata must name every phase the plugin is active
+/// on, including the response hooks it declares through the trait itself.
+#[tokio::test]
+async fn mcp_gateway_parity_metadata_names_its_active_response_phases() {
+    let meta = ferrum_edge::plugins::BUILTIN_PLUGIN_PARITY_META
+        .iter()
+        .find(|meta| meta.name == "mcp_gateway")
+        .expect("mcp_gateway parity metadata");
+    for phase in [
+        "before_proxy",
+        "transform_request_body",
+        "transform_response_body",
+        "after_proxy",
+        "on_final_response_body",
+        "on_response_committed",
+    ] {
+        assert!(
+            meta.active_phases.contains(phase),
+            "parity metadata omits the active {phase} phase: {}",
+            meta.active_phases
+        );
+    }
+
+    // `on_response_committed` is declared through the trait, so the metadata
+    // above cannot silently drop it while the hook stays wired.
+    let plugin = create_plugin("mcp_gateway", &aggregate_config("http://127.0.0.1:9/mcp"))
+        .unwrap()
+        .unwrap();
+    assert!(plugin.requires_response_committed_hook());
+    assert!(
+        meta.active_phases.contains("on_response_committed"),
+        "a declared committed hook must appear in the documented phase list"
+    );
+}
+
+/// The published `McpGatewayConfig` component, compiled as a Draft 2020-12
+/// validator with the rest of `openapi.yaml` available for local `$ref`s.
+fn mcp_gateway_component_validator() -> jsonschema::Validator {
+    let spec: Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/McpGatewayConfig",
+        "components": spec["components"].clone()
+    });
+    jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("McpGatewayConfig schema compiles")
+}
+
+fn schema_fixture_base() -> Value {
+    json!({
+        "mode": "aggregate_router",
+        "endpoint": { "path": "/mcp" },
+        "servers": {
+            "demo": { "upstream_url": "http://127.0.0.1:9/mcp", "namespace": "demo" }
+        }
+    })
+}
+
+fn schema_fixture(overrides: Value) -> Value {
+    let mut config = schema_fixture_base();
+    let object = config.as_object_mut().expect("fixture base is an object");
+    for (key, value) in overrides.as_object().expect("overrides are an object") {
+        object.insert(key.clone(), value.clone());
+    }
+    config
+}
+
+/// Issue #5346: the component is the plugin's published admission contract, so
+/// a differential corpus must agree with the constructor rather than accepting
+/// configs the runtime refuses or refusing defaults the runtime accepts.
+#[tokio::test]
+async fn mcp_gateway_openapi_component_matches_runtime_admission() {
+    let validator = mcp_gateway_component_validator();
+
+    let transparent = json!({
+        "mode": "transparent_proxy",
+        "endpoint": { "path": "/mcp" },
+        "servers": {
+            "demo": { "upstream_url": "http://127.0.0.1:9/mcp", "namespace": "demo" }
+        }
+    });
+    let transparent_with = |overrides: Value| {
+        let mut config = transparent.clone();
+        let object = config
+            .as_object_mut()
+            .expect("transparent base is an object");
+        for (key, value) in overrides.as_object().expect("overrides are an object") {
+            object.insert(key.clone(), value.clone());
+        }
+        config
+    };
+
+    let fixtures: Vec<(&str, Value)> = vec![
+        // Minimal and documented shapes.
+        ("minimal aggregate", schema_fixture_base()),
+        ("minimal transparent", transparent.clone()),
+        (
+            "documented example",
+            json!({
+                "enabled": true,
+                "mode": "aggregate_router",
+                "endpoint": { "path": "/mcp", "protocol_versions": ["2025-11-25"] },
+                "discovery": {
+                    "namespace_separator": ".",
+                    "cache_ttl_seconds": 300,
+                    "on_new_tool": "hide_until_configured",
+                    "on_schema_change": "hide_until_configured"
+                },
+                "sessions": {
+                    "downstream_session_header": "mcp-session-id",
+                    "upstream_session_header": "mcp-session-id",
+                    "initialize_upstreams": "lazy",
+                    "session_ttl_seconds": 3600,
+                    "max_sessions": 16384
+                },
+                "servers": {
+                    "github": {
+                        "upstream_url": "http://github-mcp.example/mcp",
+                        "namespace": "github",
+                        "expose_tools": true
+                    },
+                    "jira": {
+                        "upstream_url": "http://jira-mcp.example/mcp",
+                        "namespace": "jira",
+                        "expose_tools": true
+                    }
+                },
+                "policy": {
+                    "default_action": "deny",
+                    "tools": {
+                        "github.create_pr": { "action": "allow" },
+                        "jira.create_issue": { "action": "allow" }
+                    }
+                },
+                "validation": {
+                    "validate_tool_arguments": true,
+                    "validate_tool_results": false,
+                    "max_batch_items": 32,
+                    "max_batch_bytes": 1048576,
+                    "max_batch_item_bytes": 262144,
+                    "max_batch_response_bytes": 1048576
+                }
+            }),
+        ),
+        // Explicit nulls the constructor treats exactly as omission.
+        ("null enabled", schema_fixture(json!({ "enabled": null }))),
+        (
+            "null discovery",
+            schema_fixture(json!({ "discovery": null })),
+        ),
+        ("null sessions", schema_fixture(json!({ "sessions": null }))),
+        (
+            "null capabilities",
+            schema_fixture(json!({ "capabilities": null })),
+        ),
+        ("null policy", schema_fixture(json!({ "policy": null }))),
+        (
+            "null validation",
+            schema_fixture(json!({ "validation": null })),
+        ),
+        (
+            "null observability",
+            schema_fixture(json!({ "observability": null })),
+        ),
+        (
+            "null protocol_versions",
+            schema_fixture(json!({ "endpoint": { "path": "/mcp", "protocol_versions": null } })),
+        ),
+        (
+            "null max_sessions",
+            schema_fixture(json!({ "sessions": { "max_sessions": null } })),
+        ),
+        (
+            "null cache_ttl_seconds",
+            schema_fixture(json!({ "discovery": { "cache_ttl_seconds": null } })),
+        ),
+        (
+            "null server enabled",
+            schema_fixture(json!({
+                "servers": {
+                    "demo": {
+                        "upstream_url": "http://127.0.0.1:9/mcp",
+                        "namespace": "demo",
+                        "enabled": null
+                    }
+                }
+            })),
+        ),
+        (
+            "null policy.tools",
+            schema_fixture(json!({ "policy": { "tools": null } })),
+        ),
+        // Unknown keys, at every placement the constructor closes.
+        ("unknown root key", schema_fixture(json!({ "bogus": 1 }))),
+        (
+            "unknown endpoint key",
+            schema_fixture(json!({ "endpoint": { "path": "/mcp", "bogus": 1 } })),
+        ),
+        (
+            "unknown discovery key",
+            schema_fixture(json!({ "discovery": { "bogus": 1 } })),
+        ),
+        (
+            "unknown sessions key",
+            schema_fixture(json!({ "sessions": { "bogus": 1 } })),
+        ),
+        (
+            "unknown capabilities key",
+            schema_fixture(json!({ "capabilities": { "bogus": 1 } })),
+        ),
+        (
+            "unknown policy key",
+            schema_fixture(json!({ "policy": { "bogus": 1 } })),
+        ),
+        (
+            "unknown validation key",
+            schema_fixture(json!({ "validation": { "bogus": 1 } })),
+        ),
+        (
+            "unknown observability key",
+            schema_fixture(json!({ "observability": { "bogus": 1 } })),
+        ),
+        (
+            "unknown server key",
+            schema_fixture(json!({
+                "servers": {
+                    "demo": {
+                        "upstream_url": "http://127.0.0.1:9/mcp",
+                        "namespace": "demo",
+                        "bogus": 1
+                    }
+                }
+            })),
+        ),
+        (
+            "unknown tool policy key",
+            schema_fixture(json!({
+                "policy": { "tools": { "demo.thing": { "action": "allow", "bogus": 1 } } }
+            })),
+        ),
+        (
+            "stdio spawn server",
+            schema_fixture(json!({
+                "servers": {
+                    "demo": {
+                        "upstream_url": "http://127.0.0.1:9/mcp",
+                        "namespace": "demo",
+                        "command": "npx"
+                    }
+                }
+            })),
+        ),
+        (
+            "inert result logging",
+            schema_fixture(json!({ "observability": { "log_raw_results": true } })),
+        ),
+        (
+            "inert result hashing",
+            schema_fixture(json!({ "observability": { "log_result_hash": true } })),
+        ),
+        // Expressible scalar constraints.
+        (
+            "root endpoint",
+            schema_fixture(json!({ "endpoint": { "path": "/" } })),
+        ),
+        (
+            "dot-segment endpoint",
+            schema_fixture(json!({ "endpoint": { "path": "/mcp/../admin" } })),
+        ),
+        (
+            "percent-escaped endpoint",
+            schema_fixture(json!({ "endpoint": { "path": "/%2fmcp" } })),
+        ),
+        (
+            "relative endpoint",
+            schema_fixture(json!({ "endpoint": { "path": "mcp" } })),
+        ),
+        (
+            "blank protocol version",
+            schema_fixture(json!({ "endpoint": { "path": "/mcp", "protocol_versions": [" "] } })),
+        ),
+        (
+            "empty protocol versions",
+            schema_fixture(json!({ "endpoint": { "path": "/mcp", "protocol_versions": [] } })),
+        ),
+        (
+            "zero cache ttl",
+            schema_fixture(json!({ "discovery": { "cache_ttl_seconds": 0 } })),
+        ),
+        (
+            "empty namespace separator",
+            schema_fixture(json!({ "discovery": { "namespace_separator": "" } })),
+        ),
+        (
+            "blank namespace",
+            schema_fixture(json!({
+                "servers": {
+                    "demo": { "upstream_url": "http://127.0.0.1:9/mcp", "namespace": " " }
+                }
+            })),
+        ),
+        (
+            "invalid session header",
+            schema_fixture(json!({ "sessions": { "downstream_session_header": "bad header" } })),
+        ),
+        (
+            "non-http upstream",
+            schema_fixture(json!({
+                "servers": { "demo": { "upstream_url": "stdio://x", "namespace": "demo" } }
+            })),
+        ),
+        (
+            "query-bearing upstream",
+            schema_fixture(json!({
+                "servers": {
+                    "demo": { "upstream_url": "http://127.0.0.1:9/mcp?a=1", "namespace": "demo" }
+                }
+            })),
+        ),
+        (
+            "fragment-bearing upstream",
+            schema_fixture(json!({
+                "servers": {
+                    "demo": { "upstream_url": "http://127.0.0.1:9/mcp#f", "namespace": "demo" }
+                }
+            })),
+        ),
+        (
+            "credential-bearing upstream",
+            schema_fixture(json!({
+                "servers": {
+                    "demo": { "upstream_url": "http://u:p@127.0.0.1:9/mcp", "namespace": "demo" }
+                }
+            })),
+        ),
+        ("no servers", schema_fixture(json!({ "servers": {} }))),
+        // Expressible mode constraints.
+        (
+            "transparent result validation",
+            transparent_with(json!({ "validation": { "validate_tool_results": true } })),
+        ),
+        (
+            "transparent result validation disabled",
+            transparent_with(json!({ "validation": { "validate_tool_results": false } })),
+        ),
+        (
+            "transparent discovery field",
+            transparent_with(json!({ "discovery": { "cache_ttl_seconds": 300 } })),
+        ),
+        (
+            "transparent policy field",
+            transparent_with(json!({ "policy": { "default_action": "allow" } })),
+        ),
+        (
+            "advertise logging without passthrough",
+            schema_fixture(json!({ "capabilities": { "advertise_logging": true } })),
+        ),
+        (
+            "advertise tasks without passthrough",
+            schema_fixture(json!({ "capabilities": { "advertise_tasks": true } })),
+        ),
+        (
+            "advertise completions with passthrough",
+            schema_fixture(json!({
+                "capabilities": {
+                    "advertise_completions": true,
+                    "passthrough_unknown_methods": true
+                }
+            })),
+        ),
+    ];
+
+    for (name, config) in fixtures {
+        let schema_admits = validator.is_valid(&config);
+        let runtime_admits = create_plugin("mcp_gateway", &config).is_ok();
+        assert_eq!(
+            schema_admits, runtime_admits,
+            "{name}: schema={schema_admits} runtime={runtime_admits} config={config}"
+        );
+    }
+
+    // Relationships between sibling values are deliberately left to plugin
+    // load: portable JSON Schema cannot compare them. These must therefore pass
+    // the schema and fail the constructor, and the component description says so.
+    let runtime_only: Vec<(&str, Value)> = vec![
+        (
+            "batch item bound above the batch bound",
+            schema_fixture(json!({
+                "validation": { "max_batch_bytes": 1024, "max_batch_item_bytes": 4096 }
+            })),
+        ),
+        (
+            "SSE event bound above the retention budget",
+            schema_fixture(json!({
+                "sessions": { "sse_max_event_bytes": 100, "sse_max_retained_bytes": 50 }
+            })),
+        ),
+        (
+            "no exposed catalog family",
+            schema_fixture(json!({
+                "servers": {
+                    "demo": {
+                        "upstream_url": "http://127.0.0.1:9/mcp",
+                        "namespace": "demo",
+                        "expose_tools": false
+                    }
+                }
+            })),
+        ),
+        (
+            "two enabled transparent servers",
+            transparent_with(json!({
+                "servers": {
+                    "one": { "upstream_url": "http://127.0.0.1:9/mcp", "namespace": "one" },
+                    "two": { "upstream_url": "http://127.0.0.1:10/mcp", "namespace": "two" }
+                }
+            })),
+        ),
+        (
+            "duplicate namespaces",
+            schema_fixture(json!({
+                "servers": {
+                    "one": { "upstream_url": "http://127.0.0.1:9/mcp", "namespace": "same" },
+                    "two": { "upstream_url": "http://127.0.0.1:10/mcp", "namespace": "same" }
+                }
+            })),
+        ),
+    ];
+    for (name, config) in runtime_only {
+        assert!(
+            validator.is_valid(&config),
+            "{name}: portable JSON Schema cannot express this relationship"
+        );
+        assert!(
+            create_plugin("mcp_gateway", &config).is_err(),
+            "{name}: the constructor must still enforce it"
+        );
+    }
 }
