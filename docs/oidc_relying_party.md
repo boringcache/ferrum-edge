@@ -113,7 +113,7 @@ When discovery advertises a validated `revocation_endpoint` and the session cont
 
 The `OidcRelyingPartyConfig` component in `openapi.yaml` models what constructor admission accepts, including the required `openid` scope, the discovery/explicit-endpoint alternatives and their mutual exclusion, method-specific client credentials, the 32-byte encryption-secret minimum, cookie-name/path/domain syntax, the session lifetime and cookie-size bounds, the allowed challenge statuses, and `SameSite=None` requiring `secure`. Optional string fields accept `null` as "unset" and `same_site` is case-insensitive, both matching runtime behavior.
 
-Four rules span more than one object and are enforced only by the constructor: `behavior.refresh_skew_secs <= session.ttl_secs / 2`, `behavior.state_cache_max_entries_per_source <= behavior.state_cache_max_entries`, `providers[].redirect_uri`'s path equalling `providers[].callback_path` (and not colliding with `logout_path`), and a `private_key_jwt` key that supports the selected algorithm.
+Five rules relate two values and are enforced only by the constructor: `behavior.refresh_skew_secs <= session.ttl_secs / 2`, `behavior.state_cache_max_entries_per_source <= behavior.state_cache_max_entries`, `providers[].redirect_uri`'s path equalling `providers[].callback_path`, `providers[].logout_path` not colliding with `providers[].callback_path`, and a `private_key_jwt` key that supports the selected algorithm.
 
 ## Related Plugins
 
