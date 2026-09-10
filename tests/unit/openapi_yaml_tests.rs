@@ -2821,6 +2821,127 @@ fn ws_rate_limiting_schema_matches_constructor_admission() {
     );
 }
 
+/// Issue #5317: `AiRateLimiterConfig` must admit exactly what the constructor
+/// admits — the unsigned bounds on `token_limit` and the Redis durations, the
+/// non-empty key prefix, the `sync_mode: redis` → `redis_url` dependency, and
+/// the case/whitespace-normalized `provider` / `sync_mode` spellings.
+///
+/// One residual stays constructor-only: a `token_limit` ABOVE `u64::MAX`. The
+/// schema publishes `maximum: 18446744073709551615`, but a JSON parser that
+/// normalizes an out-of-range integer literal to `f64` cannot distinguish it
+/// from the bound itself, so the case is not asserted through this validator.
+#[test]
+fn ai_rate_limiter_schema_matches_constructor_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiRateLimiterConfig")
+        .expect("AiRateLimiterConfig component exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(schema["properties"]["token_limit"]["minimum"], json!(1));
+    assert_eq!(
+        schema["properties"]["token_limit"]["maximum"].as_f64(),
+        Some(u64::MAX as f64),
+    );
+    assert_eq!(
+        schema["properties"]["sync_mode"]["pattern"],
+        json!("^([lL][oO][cC][aA][lL]|[rR][eE][dD][iI][sS])$")
+    );
+    assert!(schema["properties"]["sync_mode"].get("enum").is_none());
+    assert_eq!(
+        schema["properties"]["redis_key_prefix"]["minLength"],
+        json!(1)
+    );
+    for duration in [
+        "redis_connect_timeout_seconds",
+        "redis_health_check_interval_seconds",
+    ] {
+        assert_eq!(
+            schema["properties"][duration]["minimum"],
+            json!(1),
+            "{duration} must publish the constructor's positive bound"
+        );
+        assert_eq!(
+            schema["properties"][duration]["maximum"].as_f64(),
+            Some(u64::MAX as f64),
+            "{duration} must publish the constructor's unsigned ceiling"
+        );
+    }
+    let redis_guard = redis_sync_mode_guard(schema, "AiRateLimiterConfig");
+    assert_eq!(redis_guard["if"]["required"], json!(["sync_mode"]));
+    assert_eq!(redis_guard["then"]["required"], json!(["redis_url"]));
+
+    let docs = plugin_docs_section(include_str!("../../docs/plugins.md"), "ai_rate_limiter");
+    assert!(
+        docs.contains("parsed case-insensitively"),
+        "docs/plugins.md ai_rate_limiter must document sync_mode case folding"
+    );
+    assert!(
+        docs.contains("positive unsigned 64-bit integer"),
+        "docs/plugins.md ai_rate_limiter must document the positive duration bounds"
+    );
+
+    let validator = component_validator(&spec, "AiRateLimiterConfig");
+    let accepted = [
+        json!({"token_limit": 100}),
+        json!({"token_limit": 1, "window_seconds": 2678400}),
+        json!({"token_limit": 100, "provider": " OPENAI "}),
+        json!({"token_limit": 100, "provider": "OpenAi"}),
+        json!({"token_limit": 100, "sync_mode": "LOCAL"}),
+        json!({"token_limit": 100, "redis_key_prefix": "shared"}),
+        json!({"token_limit": 100, "redis_connect_timeout_seconds": 1}),
+        json!({"token_limit": 100, "redis_health_check_interval_seconds": 1}),
+        json!({
+            "token_limit": 500000,
+            "window_seconds": 3600,
+            "count_mode": "total_tokens",
+            "limit_by": "consumer",
+            "expose_headers": true,
+            "on_unmetered_response": "charge_estimate",
+            "sync_mode": "redis",
+            "redis_url": "redis://cache.internal:6379/0",
+            "redis_failure_policy": "fail_closed"
+        }),
+    ];
+    for config in &accepted {
+        assert_schema_and_constructor(
+            &validator,
+            "ai_rate_limiter",
+            "accepted",
+            config,
+            true,
+            true,
+        );
+    }
+
+    let rejected = [
+        json!({}),
+        json!({"token_limit": 0}),
+        json!({"token_limit": -1}),
+        json!({"token_limit": 100, "window_seconds": 2678401}),
+        json!({"token_limit": 100, "provider": "gemini"}),
+        json!({"token_limit": 100, "sync_mode": "database"}),
+        json!({"token_limit": 100, "sync_mode": "redis"}),
+        json!({"token_limit": 100, "redis_key_prefix": ""}),
+        json!({"token_limit": 100, "redis_connect_timeout_seconds": 0}),
+        json!({"token_limit": 100, "redis_connect_timeout_seconds": -1}),
+        json!({"token_limit": 100, "redis_health_check_interval_seconds": 0}),
+        json!({"token_limit": 100, "redis_health_check_interval_seconds": -1}),
+        json!({"token_limit": 100, "count_mode": "completion_token"}),
+        json!({"token_limit": 100, "toke_limit": 100}),
+    ];
+    for config in &rejected {
+        assert_schema_and_constructor(
+            &validator,
+            "ai_rate_limiter",
+            "rejected",
+            config,
+            false,
+            false,
+        );
+    }
+}
+
 /// Issue #5359 / #5361: `UdpRateLimitingConfig` must require Redis URLs, bound
 /// numeric fields, accept case-normalized sync_mode, and describe per-second
 /// rates rather than per-window caps.
@@ -14695,27 +14816,28 @@ fn ai_rate_limiter_provider_enum_matches_runtime() {
 
     let provider_schema =
         spec["components"]["schemas"]["AiRateLimiterConfig"]["properties"]["provider"].clone();
-    let enum_values: Vec<String> = provider_schema["enum"]
-        .as_array()
-        .expect("provider enum must be present")
-        .iter()
-        .map(|v| v.as_str().expect("enum entry is string").to_string())
-        .collect();
-    assert_eq!(
-        enum_values,
-        vec![
-            "auto",
-            "openai",
-            "anthropic",
-            "google",
-            "cohere",
-            "mistral",
-            "bedrock",
-            "tgi"
-        ],
-        "provider enum must match the runtime accepted set"
+    // Issue #5317: the constructor trims Unicode whitespace and lower-cases the
+    // value, which an `enum` cannot express — it rejected normalized spellings
+    // the gateway admits. The accepted-spelling pattern replaces it.
+    assert!(
+        provider_schema.get("enum").is_none(),
+        "provider must publish an accepted-spelling pattern, not a canonical-only enum"
+    );
+    assert!(
+        provider_schema["pattern"].is_string(),
+        "provider must publish an accepted-spelling pattern"
     );
 
+    let enum_values = [
+        "auto",
+        "openai",
+        "anthropic",
+        "google",
+        "cohere",
+        "mistral",
+        "bedrock",
+        "tgi",
+    ];
     for supported in &enum_values {
         let config = json!({ "token_limit": 100000, "provider": supported });
         assert!(
@@ -14726,7 +14848,26 @@ fn ai_rate_limiter_provider_enum_matches_runtime() {
             .unwrap_or_else(|err| panic!("runtime must accept provider '{supported}': {err}"));
     }
 
-    for rejected in &["gemini", "vertex", "openai_compatible", "gpt", ""] {
+    // Normalized spellings the constructor admits must validate too.
+    for normalized in &[" OPENAI ", "OpenAi", "\tTgi\n", "  bedrock"] {
+        let config = json!({ "token_limit": 100000, "provider": normalized });
+        assert!(
+            validator.validate(&config).is_ok(),
+            "normalized provider '{normalized}' should be accepted by the schema"
+        );
+        AiRateLimiter::new(&config, PluginHttpClient::default())
+            .unwrap_or_else(|err| panic!("runtime must accept provider '{normalized}': {err}"));
+    }
+
+    for rejected in &[
+        "gemini",
+        "vertex",
+        "openai_compatible",
+        "gpt",
+        "",
+        " ",
+        "open ai",
+    ] {
         let config = json!({ "token_limit": 100000, "provider": rejected });
         assert!(
             validator.validate(&config).is_err(),
