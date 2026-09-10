@@ -19010,17 +19010,26 @@ components:
 
     PrometheusMetricsConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: prometheus_metrics — Exports gateway metrics in Prometheus
         format. At most one enabled instance is permitted and it must use
         global scope because the registry and tunables are process-wide.
+        Unknown keys are rejected. `schema` and `schema_ref` are not accepted
+        properties.
       properties:
         render_cache_ttl_seconds:
           type: integer
+          format: uint64
+          minimum: 0
+          maximum: 18446744073709551615
           default: 5
           description: How long the cached /metrics response is served before rebuilding (seconds)
         stale_entry_ttl_seconds:
           type: integer
+          format: uint64
+          minimum: 0
+          maximum: 18446744073709551615
           default: 3600
           description: How long idle metric entries live before eviction (seconds). Prevents unbounded memory growth from deleted/recreated proxies
         mesh_series_budget_per_family:
@@ -19039,6 +19048,9 @@ components:
             there is no unlimited mode.
         cache_invalidation_min_age_ms:
           type: integer
+          format: uint64
+          minimum: 0
+          maximum: 18446744073709551615
           default: 500
           description: Minimum age (ms) of the render cache before record() will invalidate it. Under extreme load this prevents an allocation per request
 

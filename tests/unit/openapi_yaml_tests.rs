@@ -8550,6 +8550,97 @@ fn jwt_auth_schema_rejects_unknown_config_keys() {
 }
 
 #[test]
+fn prometheus_metrics_config_is_closed_and_bounds_unsigned_timing_fields() {
+    use ferrum_edge::plugins::prometheus_metrics::PrometheusMetrics;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/PrometheusMetricsConfig")
+        .expect("PrometheusMetricsConfig component exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    let schema_fields: BTreeSet<&str> = schema["properties"]
+        .as_object()
+        .expect("PrometheusMetricsConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        schema_fields,
+        BTreeSet::from([
+            "cache_invalidation_min_age_ms",
+            "mesh_series_budget_per_family",
+            "render_cache_ttl_seconds",
+            "stale_entry_ttl_seconds",
+        ])
+    );
+    assert!(
+        !schema_fields.contains("schema") && !schema_fields.contains("schema_ref"),
+        "schema/schema_ref must not be accepted properties"
+    );
+
+    let uint64_max = json!(u64::MAX);
+    for field in [
+        "render_cache_ttl_seconds",
+        "stale_entry_ttl_seconds",
+        "cache_invalidation_min_age_ms",
+    ] {
+        assert_eq!(schema["properties"][field]["format"], json!("uint64"));
+        assert_eq!(schema["properties"][field]["minimum"], json!(0));
+        assert_eq!(schema["properties"][field]["maximum"], uint64_max);
+    }
+    assert_eq!(
+        schema["properties"]["mesh_series_budget_per_family"]["minimum"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["mesh_series_budget_per_family"]["maximum"],
+        json!(1_000_000)
+    );
+
+    for config in [
+        json!({}),
+        json!({"render_cache_ttl_seconds": 0}),
+        json!({"render_cache_ttl_seconds": u64::MAX}),
+        json!({"stale_entry_ttl_seconds": u64::MAX}),
+        json!({"cache_invalidation_min_age_ms": u64::MAX}),
+        json!({"mesh_series_budget_per_family": 1}),
+        json!({"mesh_series_budget_per_family": 1_000_000}),
+    ] {
+        assert_component_validity(&spec, "PrometheusMetricsConfig", &config, true);
+        PrometheusMetrics::new(&config, "ferrum")
+            .unwrap_or_else(|err| panic!("constructor must accept {config}: {err}"));
+    }
+
+    for config in [
+        json!({"render_cache_ttl_secnds": 10}),
+        json!({"schema": {}}),
+        json!({"schema_ref": "x"}),
+        json!({"render_cache_ttl_seconds": -1}),
+        json!({"stale_entry_ttl_seconds": -1}),
+        json!({"cache_invalidation_min_age_ms": -1}),
+        json!({"mesh_series_budget_per_family": 0}),
+        json!({"mesh_series_budget_per_family": 1_000_001}),
+    ] {
+        assert_component_validity(&spec, "PrometheusMetricsConfig", &config, false);
+        assert!(
+            PrometheusMetrics::new(&config, "ferrum").is_err(),
+            "constructor must reject {config}"
+        );
+    }
+
+    let over = serde_json::from_str("18446744073709551616")
+        .expect("u64::MAX+1 must parse as a JSON number");
+    let mut over_range = json!({});
+    over_range
+        .as_object_mut()
+        .expect("object")
+        .insert("render_cache_ttl_seconds".to_string(), over);
+    assert_component_validity(&spec, "PrometheusMetricsConfig", &over_range, false);
+}
+
+#[test]
 fn proxy_alerts_schema_rejects_unknown_keys_and_keeps_open_maps() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");

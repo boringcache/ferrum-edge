@@ -1760,7 +1760,11 @@ the authenticated `/metrics` endpoint; this plugin records HTTP/gRPC requests,
 WebSocket completions, and TCP/UDP stream metrics. At most one enabled
 `prometheus_metrics` config is permitted per process and it must have `global`
 scope. This keeps the process-wide registry, render-cache policy, and namespace
-label deterministic across reloads.
+label deterministic across reloads. Those process-wide tunables are published
+only after a complete plugin-cache generation is accepted; validating or
+constructing a candidate that is later rejected leaves the live registry
+untouched.
+
 Mesh deployments also get `ferrum_mesh_hbone_relay_failures_total` for HBONE
 CONNECT tunnels that fail after the `200 OK` response has already been sent,
 labelled by `proxy_id`, relay `direction`, and `error_class`.
@@ -1775,6 +1779,8 @@ labelled by `proxy_id`, relay `direction`, and `error_class`.
 | `cache_invalidation_min_age_ms` | Integer | `500` | Minimum age (ms) of the render cache before `record()` will invalidate it. Under extreme load this prevents an allocation per request — the render TTL is the real freshness guarantee |
 
 Unknown top-level keys are rejected at construction (for example a misspelled `render_cache_ttl_secnds` cannot silently leave the default TTL). Registration is `OptionalFailOpen`: Admin create/update still returns HTTP 400 for an invalid enabled config, while file-mode `validate`/load and plugin-cache rebuild warn, naming the unknown key, and omit this instance rather than failing the gateway. `schema` / `schema_ref` remain unsupported and fail with an explicit diagnostic.
+
+**Hooks:** `on_request_received` and `on_stream_connect` mark the transaction as observed so mesh TCP lifecycle accounting and gRPC message counters can complete later; they always return Continue. `log`, `on_stream_disconnect`, and `on_ws_disconnect` record the terminal HTTP/gRPC, stream, and WebSocket series.
 
 `ferrum_requests_total` labels standard HTTP methods individually and maps every
 extension/unknown method to `method="OTHER"`, keeping request-controlled method
