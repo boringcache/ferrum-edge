@@ -8087,6 +8087,15 @@ pub async fn log_with_mirror(
     } else {
         None
     };
+    if plugins
+        .iter()
+        .any(|plugin| plugin.records_mesh_service_graph(summary))
+    {
+        crate::plugins::mesh::service_graph::record_transaction_with_mesh_key(
+            summary,
+            mesh_key.as_ref(),
+        );
+    }
     for plugin in plugins {
         // Transaction logging is gateway cleanup after the client-visible
         // outcome is final. A client RPC deadline must bound request handling,
@@ -9177,6 +9186,17 @@ pub trait Plugin: Send + Sync {
     /// `FERRUM_REAL_IP_HEADER`, or ambiguous writers.
     #[doc(hidden)]
     fn correlation_id_header_name(&self) -> Option<&str> {
+        None
+    }
+
+    /// Whether this transaction contributes to the shared mesh service graph.
+    /// Wrappers must honor the same memoized decision as terminal logging.
+    fn records_mesh_service_graph(&self, _summary: &TransactionSummary) -> bool {
+        false
+    }
+
+    /// Cold-path custom trace tag names used to bound effective mesh chains.
+    fn workload_custom_trace_attributes(&self) -> Option<&str> {
         None
     }
 

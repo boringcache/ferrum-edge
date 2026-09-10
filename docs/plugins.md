@@ -8483,7 +8483,104 @@ Adds Istio/GAMMA workload identity labels to request, stream, and log metadata, 
 
 HBONE `source.principal` attribution uses the same trusted-assertor relation as `mesh_authz`. Direct / user-created instances honor that relation from this plugin's own `trusted_hbone_assertors` / `trust_domain_aliases` config. Mesh injection additionally stamps an internal `_effective_mesh_authz_baggage_gates` list that is an exact, fail-closed conjunction of every enabled global `mesh_authz` baggage gate PluginCache will execute (including a force-injected reserved `__mesh_authz` under transparent inbound capture). Disabled operator rows are omitted; each gate keeps its own absent/null/default, explicit `[]`, and alias contract; a sibling cannot silently widen another gate. Malformed or over-bound internal lists fail construction. See [Trusted HBONE Assertors](mesh.md#trusted-hbone-assertors).
 
-Unknown top-level keys are rejected at construction (for example a misspelled `trusted_hbone_asserters` cannot silently restore the built-in assertor defaults and undo a `trusted_hbone_assertors: []` lockdown).
+Configuration must be an object. Unknown top-level keys and wrong types for recognized fields are rejected at construction, including non-string map values and string-valued disable flags. Every disable alias must be boolean even when a higher-precedence alias is present. `workload_metrics` uses OptionalFailOpen: file/runtime validation warns and omits an invalid optional instance; direct admin admission rejects it. Omit fields for defaults; null is supported only where explicitly listed below.
+
+#### Standalone configuration
+
+This complete file-mode example labels requests and exports sampled spans to an OTLP/HTTP collector. Point the backend and collector URLs at your services; the collector must accept OTLP JSON at `/v1/traces`.
+
+```yaml
+version: "1"
+proxies:
+  - id: reviews
+    name: reviews
+    listen_path: /reviews
+    backend_scheme: http
+    backend_host: 127.0.0.1
+    backend_port: 8081
+plugin_configs:
+  - id: reviews-telemetry
+    plugin_name: workload_metrics
+    scope: global
+    enabled: true
+    config:
+      namespace: default
+      workload_spiffe_id: spiffe://cluster.local/ns/default/sa/gateway
+      labels:
+        app: gateway
+      sampling_percentage: 100
+      custom_tags:
+        deployment_region: local
+      tracing_provider:
+        kind: opentelemetry
+        config:
+          endpoint: http://127.0.0.1:4318/v1/traces
+      batch_size: 50
+      flush_interval_ms: 5000
+      metrics:
+        tag_overrides:
+          - metric: REQUEST_COUNT
+            name: destination_service
+            operation:
+              type: set
+              value: reviews
+          - metric: REQUEST_DURATION
+            name: response_code
+            operation:
+              type: set_expr
+              cel: string(response.code)
+```
+
+The plugin stamps metric plans; configure `prometheus_metrics` to export those metric families. Standalone workload labels are hints and do not authenticate a remote peer. With no listener direction, source labels describe the configured local workload and destination labels describe the routed proxy.
+
+| Field | Type / default | Admission and behavior |
+|---|---|---|
+| `node_id`, `topology` | String; omitted | Optional `mesh.node_id` / `mesh.topology` hints. Blank strings are treated as absent. |
+| `namespace` | String; omitted | Local workload namespace and fallback span service-name suffix. Blank means absent. |
+| `workload_spiffe_id` | String; omitted | Valid SPIFFE ID, or blank for no identity hint. |
+| `labels` | String map; `{}` | Workload label hints. Workload chooses the first nonblank `service.istio.io/canonical-name`, `app.kubernetes.io/name`, `app`, `k8s-app`, or `workload`, then SPIFFE service account, then `unknown`. App chooses `app.kubernetes.io/name`, `app`, or `k8s-app`; service chooses `service.istio.io/canonical-name`, `service`, or `app`; both fall back to workload. Other keys are accepted but unused. |
+| `trusted_hbone_assertors` | Array or null; `[ztunnel, waypoint]` | Strings name service accounts or exact SPIFFE IDs; objects specify `assertor` with optional `asserts` or `scope`. Omitted/null uses defaults; `[]` trusts no baggage assertors. See [trusted assertor rules](mesh.md#trusted-hbone-assertors). |
+| `trust_domain_aliases` | String array or null; `[]` | Valid SPIFFE trust domains treated as equivalent for baggage attribution. Null means empty. |
+| `sampling_percentage` | Number; omitted | Inclusive 0–100. Omission leaves new roots unsampled. Valid upstream W3C/B3 sampling decisions take precedence; metric/graph recording is independent of sampling. |
+| `custom_tags` | String map; `{}` | Literal transaction and span tags; values at most 1024 UTF-8 bytes. |
+| `custom_header_tags` | String map; `{}` | Tag name → valid HTTP header name. Source names are normalized; sensitive headers are rejected. A present value of at most 1024 bytes overrides the literal/environment fallback; absent or oversized headers leave the fallback. Streams have no request headers. |
+| `custom_env_tags` | String map; `{}` | Tag name → portable environment name (`[A-Za-z_][A-Za-z0-9_]*`, at most 256 bytes). Resolved in the data-plane process at construction/reload. Present values, including empty strings, override literals; missing variables retain literals or omit the tag. Non-UTF-8 or oversized values reject construction. Sensitive variable names are rejected. |
+| `metrics` | Object; `{}` | Optional `disabled_metrics` array and `tag_overrides` array; nested unknown keys are ignored. See operations below. |
+| `tracing_provider` | Provider object or null; omitted | Singular fallback; ignored whenever `tracing_providers` is present. Null means no provider. |
+| `tracing_providers` | Provider array or null; omitted | Fan-out to each configured exporter. Present null or `[]` selects no exporters, including when the singular field is set. |
+| `direction_emit` | Object or null; `{server: true, client: false}` | Boolean `server` and `client` members select inbound SERVER and outbound CLIENT spans; omitted members use those defaults. Unstamped direction uses `server`. Null selects defaults; unknown members are ignored. |
+| `span_reporting_disabled` | Boolean; `false` | Suppresses span export while preserving configuration and trace-context propagation. |
+| `disable_span_reporting`, `disableSpanReporting` | Boolean; omitted | Aliases, in decreasing precedence after `span_reporting_disabled`. First present spelling wins, including explicit false. |
+| `service_name` | String; derived | Defaults to `ferrum-edge-mesh-<namespace>` for a nonblank namespace, otherwise `ferrum-edge-mesh`. Active exporters require a nonblank explicit value and trim it. |
+| `deployment_environment` | String; omitted | Exported `deployment.environment` resource attribute. Active exporters require a nonblank value and trim it. |
+| `batch_size` | Unsigned integer; `50` | Active exporter range: 1–10000 spans per batch. |
+| `flush_interval_ms` | Unsigned integer; `5000` | Active exporter range: 100–600000 milliseconds. |
+| `buffer_capacity` | Unsigned integer; `10000` | Active exporter range: 1–100000 queued spans. |
+| `buffer_max_bytes` | Unsigned integer; `16777216` | Active exporter range: 65536–268435456 retained queue bytes; also subject to the process-wide observability byte ceiling. |
+| `max_retries` | Unsigned integer; `2` | Active exporter range: 0–10 retries. |
+| `retry_delay_ms` | Unsigned integer; `1000` | Active exporter range: 0–60000 milliseconds; retry backoff follows the shared exporter policy. |
+| `_effective_mesh_authz_baggage_gates` | Internal object array; omitted | Mesh injection only: 1–16 objects, each containing only `trusted_hbone_assertors` and/or `trust_domain_aliases`, with the same null/default contracts as above. Direct instances normally omit this field. |
+
+Exporter-specific ranges, nonblank resource names, endpoint validation, and Lightstep credential lookup apply when at least one provider is selected and span reporting is enabled. Numeric options always require unsigned 64-bit integer values. Sampling at zero does not disable exporter admission.
+
+Custom names contain 1–128 ASCII letters, digits, `.`, `_`, or `-`; reserved telemetry names and sensitive names are rejected. The union across the three tag maps and all effective instances on a proxy is limited to 32 distinct names, including potentially triggered instances. Exceeding the effective-chain bound rejects publication. Executed instances compose their allowed names for every exporter; later values win for names they stamp. Empty or skipped instances do not remove earlier names. Within an instance, precedence is present valid header > resolved environment > literal fallback. A header-backed tag clears its previous value when restamped, so without its own fallback an absent header does not retain a stale earlier value.
+
+Direct providers use these envelopes (they are different from Istio's name-only provider references):
+
+| `kind` | Required `config` fields | Optional fields / behavior |
+|---|---|---|
+| `opentelemetry` | `endpoint` string | OTLP/HTTP JSON; supply the complete `/v1/traces` URL. |
+| `zipkin` | `url` string | Zipkin v2 JSON; supply the complete `/api/v2/spans` URL. |
+| `datadog` | `agent_url` string | Optional `service` string or null overrides the span service name; the exporter appends `/v0.3/traces` if needed. |
+| `lightstep` | `collector_url`, `access_token_env` strings | OTLP with a local environment bearer token; `accessTokenEnv` is an accepted alias, but supplying both spellings is an error. |
+
+Provider objects require `kind` and `config`; unknown nested keys are ignored. Active endpoint URLs must be absolute HTTP(S), have a host, and contain no embedded credentials. Lightstep's variable must be readable and its value valid for the bearer header.
+
+`metrics.disabled_metrics` accepts `ALL_METRICS`, `REQUEST_COUNT`, `REQUEST_DURATION`, `REQUEST_SIZE`, `RESPONSE_SIZE`, `TCP_OPENED_CONNECTIONS`, `TCP_CLOSED_CONNECTIONS`, `TCP_SENT_BYTES`, `TCP_RECEIVED_BYTES`, `GRPC_REQUEST_MESSAGES`, `GRPC_RESPONSE_MESSAGES`, or the corresponding `ferrum_mesh_*` names. Selectors are trimmed and case-insensitive. Unknown names fail direct construction; Istio translation separately warns and omits recognized families Ferrum does not emit.
+
+Each `metrics.tag_overrides` entry requires `name` and `operation`; optional `metric` uses the same selectors, with omitted/null meaning all metrics. Names and rename targets must belong to the fixed mesh label vocabulary (Istio underscore or Ferrum `mesh.*` spelling). Operations are `remove`, `rename` with string `new_name`, `set` with string `value` (at most 256 UTF-8 bytes), or `set_expr` with string `cel` or compiled `expression` (the latter takes precedence). CEL uses the [bounded mesh attribute language](mesh.md#telemetry-api): at most 512 source bytes, 32 tokens, depth 8, and 24 AST nodes. Compiled ASTs require the operation-specific fields shown in OpenAPI and reject unknown fields. HTTP-only attributes cannot target TCP or all metrics. At most 128 entries and 16384 encoded plan bytes are admitted per instance and across the surviving effective family plans. Later instances replace only the families they configure.
+
+The HTTP-family service graph records each terminal client transaction once across effective instances, using final metadata and the memoized execution triggers. HTTP errors, transport/body failures, and nonzero finalized gRPC status contribute to error totals; mirror attempts are excluded. Each configured tracing exporter remains independent.
 
 See [Mesh Observability](mesh.md#observability) for metric names, service graph aggregation, and tracing behavior.
 
