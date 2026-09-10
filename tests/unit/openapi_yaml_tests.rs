@@ -2514,8 +2514,7 @@ fn redis_url_database_selector_schema_matches_constructor_admission() {
             .pointer(&format!("/components/schemas/{schema_name}"))
             .unwrap_or_else(|| panic!("{schema_name} component exists"));
         assert_eq!(
-            schema["properties"]["redis_url"]["pattern"],
-            expected_pattern,
+            schema["properties"]["redis_url"]["pattern"], expected_pattern,
             "{schema_name} redis_url pattern must admit only numeric database selectors"
         );
         let description = schema["properties"]["redis_url"]["description"]
