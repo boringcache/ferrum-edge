@@ -2190,10 +2190,24 @@ sanitized endpoint, so redaction does not move existing artifacts.
 JSONEachRow row delivered to ClickHouse and the durable spool artifact that
 replays it. Renaming a field renames the column the row inserts into, so the
 target table must agree — including its sort key, which is what makes replay
-idempotent (see [docs/log_schema.md](log_schema.md)). `summary_type`,
-`timestamp_format`, the `metadata`
-policy, and the `backend_host` derived kind are rejected for this surface.
-Pricing, accumulator identities, and snapshot keys are unaffected. See [docs/log_schema.md](log_schema.md).
+idempotent (see [docs/log_schema.md](log_schema.md)). The OpenAPI
+`ApiChargebackSinkLogSchema` refinement admits `omit`, `rename`, `order`,
+`static_fields`, and `derived_fields`; omit/rename source names must be native
+charge-event fields. Supported derived kinds are `status_class` (from billable
+`status_code`), `summary_kind` (always `charge_event`), and `outcome` (`error`
+for `status_code >= 500` or nonzero `grpc_status`, otherwise `ok`).
+`summary_type`, `timestamp_format`, and `metadata` are rejected by key presence,
+even with null/default values, and `backend_host` is rejected. `received_at`
+remains an epoch-nanosecond integer.
+
+`schema` and `schema_ref` are mutually exclusive by key presence. `schema_ref`
+must be a nonempty registered name whose definition also satisfies the sink
+refinement when recompiled at construction. Named definitions first compile
+against the transaction-summary inventory, so use inline `schema` for fields
+unique to charge events. Reference existence, output-key collisions,
+sensitive-data restrictions, omit/rename conflicts, and complete `order`
+coverage remain constructor checks. Pricing, accumulator identities, and
+snapshot keys are unaffected. See [docs/log_schema.md](log_schema.md).
 
 Each spool is partitioned
 by a non-secret owner identity (plugin config id, Ferrum namespace/ledger,

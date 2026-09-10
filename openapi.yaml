@@ -32991,6 +32991,66 @@ components:
             api_chargeback instance must resolve to the same projection because
             one render cache serves them all. See docs/log_schema.md.
 
+    ApiChargebackSinkLogField:
+      type: string
+      description: Native exported charge-event field available to omit or rename.
+      enum:
+        - event_id
+        - received_at
+        - node_id
+        - namespace
+        - consumer_id
+        - consumer_name
+        - proxy_id
+        - proxy_name
+        - route_id
+        - status_code
+        - http_status_code
+        - grpc_status
+        - protocol
+        - call_count
+        - charge_call
+        - bytes_sent
+        - bytes_received
+        - charge_bytes_sent
+        - charge_bytes_received
+        - charge_total
+        - currency
+        - pricing_version
+        - request_id
+        - trace_id
+        - snapshot_id
+
+    ApiChargebackSinkLogSchema:
+      description: >-
+        Projection of the exported charge-event record. Supports omit, rename,
+        order, static_fields, and derived_fields. The summary_type,
+        timestamp_format, and metadata keys are forbidden, even with null or
+        default values. received_at remains an epoch-nanosecond integer.
+        Derived kinds are status_class (from billable status_code), summary_kind
+        (always charge_event), and outcome (error for status_code >= 500 or a
+        nonzero grpc_status, otherwise ok). backend_host is unavailable.
+        Shared constructor checks still enforce output-key uniqueness,
+        sensitive-data restrictions, omit/rename conflicts, and order coverage
+        against the final output keys. See docs/log_schema.md.
+      allOf:
+        - $ref: "#/components/schemas/SummaryLogSchema"
+        - properties:
+            summary_type: false
+            timestamp_format: false
+            metadata: false
+            omit:
+              items:
+                $ref: "#/components/schemas/ApiChargebackSinkLogField"
+            rename:
+              propertyNames:
+                $ref: "#/components/schemas/ApiChargebackSinkLogField"
+            derived_fields:
+              items:
+                properties:
+                  kind:
+                    enum: [status_class, summary_kind, outcome]
+
     ApiChargebackSinkConfig:
       type: object
       additionalProperties: false
@@ -33056,6 +33116,8 @@ components:
         `validate` can still abort serving startup on a node missing those
         files or variables.
       allOf:
+        - not:
+            required: [schema, schema_ref]
         - anyOf:
             - required: [pricing_tiers]
               properties:
@@ -33619,12 +33681,19 @@ components:
                 additionally requires the value to be at least one bounded
                 charge-event size.
         schema:
-          $ref: "#/components/schemas/SummaryLogSchema"
+          $ref: "#/components/schemas/ApiChargebackSinkLogSchema"
         schema_ref:
           type: string
+          minLength: 1
           description: >-
-            Name of a schema registered by a `transaction_log_schema` plugin.
-            Mutually exclusive with `schema`. Projects the exported charge-event
+            Nonempty name of a schema registered by a `transaction_log_schema`
+            plugin. Mutually exclusive with `schema` by key presence, including
+            null values. The referenced definition must also satisfy
+            ApiChargebackSinkLogSchema; existence and compatibility are checked
+            at construction, since JSON Schema cannot resolve registry contents.
+            Named definitions must first compile against the transaction-summary
+            field inventory, so use inline schema for charge-event-only fields.
+            Projects the exported charge-event
             record (the JSONEachRow row delivered to ClickHouse and the durable
             spool artifact that replays it), not the pricing, the accumulator
             identities, or the snapshot keys. Renaming a field renames the

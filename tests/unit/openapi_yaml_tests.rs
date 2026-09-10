@@ -363,6 +363,201 @@ fn transaction_log_schema_openapi_matches_constructor_admission() {
 }
 
 #[test]
+fn api_chargeback_sink_schema_matches_constructor_admission() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::api_chargeback_sink::ApiChargebackSink;
+    use ferrum_edge::plugins::transaction_log_schema::TransactionLogSchema;
+    use ferrum_edge::plugins::utils::log_schema::{CHARGE_EVENT_FIELDS, registry};
+
+    // Issue #5393: keep the shared log-schema constraints, then narrow only
+    // the sink's projection to the charge-event family used by its constructor.
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/ApiChargebackSinkConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("ApiChargebackSinkConfig schema compiles");
+    let shared_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/SummaryLogSchema",
+        "components": spec["components"].clone()
+    });
+    let shared_validator = jsonschema::draft202012::options()
+        .build(&shared_schema)
+        .expect("SummaryLogSchema schema compiles");
+    let base = json!({
+        "clickhouse": { "url": "https://clickhouse.example:8443" },
+        "spool": { "enabled": false },
+        "pricing_tiers": [{ "status_codes": [200], "price_per_call": 0.01 }]
+    });
+    let http_client = PluginHttpClient::default();
+    let assert_admission = |config: &serde_json::Value, expected: bool| {
+        let documented = validator.validate(config);
+        let runtime = ApiChargebackSink::new(config, http_client.clone(), "ferrum");
+        assert_eq!(
+            documented.is_ok(),
+            expected,
+            "unexpected schema admission for {config}: {documented:?}"
+        );
+        assert_eq!(
+            runtime.is_ok(),
+            expected,
+            "unexpected constructor admission for {config}: {:?}",
+            runtime.err()
+        );
+    };
+    assert_admission(&base, true);
+
+    for projection in [
+        json!({ "summary_type": "http" }),
+        json!({ "summary_type": "stream" }),
+        json!({ "summary_type": "both" }),
+        json!({ "timestamp_format": "rfc3339" }),
+        json!({ "timestamp_format": "epoch_ms" }),
+        json!({ "timestamp_format": "epoch_s" }),
+        json!({ "metadata": {} }),
+        json!({ "metadata": { "mode": "nested" } }),
+        json!({ "metadata": { "mode": "omit" } }),
+        json!({ "metadata": { "mode": "flatten" } }),
+        json!({ "derived_fields": [{ "name": "host", "kind": "backend_host" }] }),
+    ] {
+        assert!(
+            shared_validator.validate(&projection).is_ok(),
+            "other logging families retain support for {projection}"
+        );
+        let mut config = base.clone();
+        config["schema"] = projection;
+        assert_admission(&config, false);
+    }
+
+    for projection in [
+        json!({}),
+        json!({ "order": ["*"] }),
+        json!({ "omit": ["node_id", "node_id"] }),
+        json!({
+            "omit": ["node_id", "pricing_version"],
+            "rename": { "proxy_id": "route_key", "charge_total": "amount" },
+            "order": ["amount", "record_kind", "*"],
+            "static_fields": { "ledger": "prod", "shard": 3 },
+            "derived_fields": [
+                { "name": "status_group", "kind": "status_class" },
+                { "name": "record_kind", "kind": "summary_kind" },
+                { "name": "call_outcome", "kind": "outcome" }
+            ]
+        }),
+    ] {
+        let mut config = base.clone();
+        config["schema"] = projection;
+        assert_admission(&config, true);
+    }
+
+    for projection in [
+        json!(null),
+        json!([]),
+        json!({ "summary_type": null }),
+        json!({ "timestamp_format": null }),
+        json!({ "metadata": null }),
+        json!({ "unknown": true }),
+        json!({ "omit": [""] }),
+        json!({ "omit": ["latency_total_ms"] }),
+        json!({ "rename": { "backend_target": "backend" } }),
+        json!({ "rename": { "proxy_id": "" } }),
+        json!({ "order": ["*", "*"] }),
+        json!({ "static_fields": { "stamp": null } }),
+        json!({ "static_fields": { "": "v1" } }),
+        json!({ "derived_fields": [{ "name": "", "kind": "outcome" }] }),
+        json!({ "derived_fields": [{ "name": "result", "kind": "unknown" }] }),
+        json!({ "derived_fields": [{ "name": "result", "kind": "outcome", "extra": 1 }] }),
+    ] {
+        let mut config = base.clone();
+        config["schema"] = projection;
+        assert_admission(&config, false);
+    }
+
+    let documented_fields: BTreeSet<&str> = spec
+        .pointer("/components/schemas/ApiChargebackSinkLogField/enum")
+        .and_then(serde_json::Value::as_array)
+        .expect("charge-event field inventory")
+        .iter()
+        .map(|field| field.as_str().expect("field name"))
+        .collect();
+    let runtime_fields: BTreeSet<&str> = CHARGE_EVENT_FIELDS.iter().map(|field| field.name).collect();
+    assert_eq!(documented_fields, runtime_fields);
+    for field in runtime_fields {
+        for projection in [
+            json!({ "omit": [field] }),
+            json!({ "rename": { (field): "projected_value" } }),
+        ] {
+            let mut config = base.clone();
+            config["schema"] = projection;
+            assert_admission(&config, true);
+        }
+    }
+
+    for reference in [json!(""), json!(null), json!(7), json!({}), json!([])] {
+        let mut config = base.clone();
+        config["schema_ref"] = reference;
+        assert_admission(&config, false);
+    }
+    for projection in [json!({}), json!(null)] {
+        for reference in [json!("portable"), json!(null)] {
+            let mut config = base.clone();
+            config["schema"] = projection.clone();
+            config["schema_ref"] = reference;
+            assert_admission(&config, false);
+        }
+    }
+
+    // A reference is only a string in OpenAPI. Its definition must pass the
+    // same family checks when resolved; staging keeps the live registry intact.
+    let definitions = json!({
+        "schemas": {
+            "portable": { "rename": { "proxy_id": "route_key" }, "order": ["*"] },
+            "summary": { "summary_type": "both" },
+            "timestamp": { "timestamp_format": "rfc3339" },
+            "metadata": { "metadata": { "mode": "nested" } },
+            "backend": { "derived_fields": [{ "name": "host", "kind": "backend_host" }] },
+            "summary_field": { "omit": ["latency_total_ms"] }
+        }
+    });
+    registry::begin_reload().expect("begin isolated schema staging");
+    let registered = TransactionLogSchema::new(&definitions);
+    let results: Vec<_> = [
+        ("portable", true),
+        ("summary", false),
+        ("timestamp", false),
+        ("metadata", false),
+        ("backend", false),
+        ("summary_field", false),
+        ("missing", false),
+    ]
+    .into_iter()
+    .map(|(name, expected)| {
+        let mut config = base.clone();
+        config["schema_ref"] = json!(name);
+        let documented = validator.validate(&config).is_ok();
+        let runtime = ApiChargebackSink::new(&config, http_client.clone(), "ferrum");
+        (name, expected, documented, runtime)
+    })
+    .collect();
+    registry::abort_reload().expect("discard isolated schema staging");
+    assert!(registered.is_ok(), "portable definitions must compile");
+    for (name, expected, documented, runtime) in results {
+        assert!(documented, "nonempty reference is schema-valid: {name}");
+        assert_eq!(
+            runtime.is_ok(),
+            expected,
+            "unexpected resolved admission for {name}: {:?}",
+            runtime.err()
+        );
+    }
+}
+
+#[test]
 fn typed_component_properties_match_serde_field_inventories() {
     use ferrum_edge::config::types::{
         ActiveHealthCheck, BackendTlsConfig, CircuitBreakerConfig, ConsulConfig, Consumer,
