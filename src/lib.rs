@@ -12140,6 +12140,66 @@ pub mod _test_support {
         }
     }
 
+    /// What the shared charged content-coding chain decoder — the one
+    /// `compression`'s opt-in `decompress_request` normalizer now runs
+    /// (`GHSA-q76p-952x-7c3v`) — decided for one coding list, projected so
+    /// external tests can assert on it without reaching into the crate-private
+    /// error type.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum ChargedCodingChainOutcome {
+        /// Decoded under every bound, with the working-set charge released.
+        Decoded(Vec<u8>),
+        /// A coding token the strict decoder does not implement.
+        Unsupported,
+        /// Malformed, truncated, Large-Window Brotli, or trailing data.
+        Malformed,
+        /// Over a per-layer, cumulative, or amplification bound.
+        TooLarge,
+        /// The aggregate budget could not admit the decode's working set. The
+        /// GATEWAY-local capacity terminal, deliberately not a byte fault.
+        CapacityRefused,
+    }
+
+    /// Decode one canonical coding list through the PRODUCTION charged decoder,
+    /// charged against an ISOLATED budget so a parallel test binary can observe
+    /// admission and release deterministically.
+    ///
+    /// `codings` are lowercase tokens in APPLICATION order, exactly as
+    /// `compression` hands them over after classification.
+    pub fn decode_charged_coding_chain_in(
+        probe: &ResponseBufferBudgetProbe,
+        codings: &[String],
+        body: &[u8],
+        max_decoded_bytes: usize,
+        max_cumulative_bytes: usize,
+        max_amplification_ratio: u32,
+    ) -> ChargedCodingChainOutcome {
+        use crate::plugins::charged_decode::{
+            ChargedDecodeError, decode_charged_content_coding_chain,
+        };
+        let limits = crate::plugins::utils::content_encoding::DecodeLimits {
+            max_decoded_bytes,
+            max_cumulative_bytes,
+            // The caller bounds the layer COUNT before classification; this
+            // decoder is handed an already-bounded list.
+            max_codings: codings.len().max(1),
+            max_amplification_ratio,
+        };
+        match decode_charged_content_coding_chain(codings, body, limits, probe.0.handle()) {
+            Ok(plaintext) => ChargedCodingChainOutcome::Decoded(plaintext),
+            Err(ChargedDecodeError::Unsupported) => ChargedCodingChainOutcome::Unsupported,
+            Err(ChargedDecodeError::Malformed) => ChargedCodingChainOutcome::Malformed,
+            Err(ChargedDecodeError::TooLarge) => ChargedCodingChainOutcome::TooLarge,
+            Err(ChargedDecodeError::CapacityRefused) => ChargedCodingChainOutcome::CapacityRefused,
+        }
+    }
+
+    /// The exact backend-request header filter the H3 cross-protocol bridge
+    /// applies to both its plain and gRPC builders (issue #5110).
+    pub fn cross_protocol_backend_header_is_stripped_for_test(name: &str) -> bool {
+        crate::http3::cross_protocol::should_skip_cross_protocol_backend_header(name)
+    }
+
     /// Whether an error class is neutral to circuit-breaker, passive-health, and
     /// adaptive-concurrency accounting.
     pub fn error_class_is_health_neutral_for_test(class: crate::retry::ErrorClass) -> bool {

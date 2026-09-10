@@ -549,7 +549,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "compression",
         classification: BuiltinPluginClassification::Public,
         priority: 4050,
-        active_phases: "normalize_buffered_request_body_before_before_proxy, before_proxy, after_proxy, transform_request_body, transform_response_body",
+        active_phases: "normalize_buffered_request_body_before_before_proxy, before_proxy, after_proxy, transform_request_body_with_context, transform_response_body_with_context",
         matrix_protocols: HTTP_ONLY_PROTOCOLS,
         protocol_rationale: "HTTP response compression and request decompression (gzip, brotli)",
     },

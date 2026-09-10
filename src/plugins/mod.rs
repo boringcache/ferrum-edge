@@ -2848,6 +2848,18 @@ pub struct RequestContext {
     /// fails closed with 406 when identity is prohibited) instead of buffering
     /// for a compression it cannot run; `after_proxy` must not reacquire.
     compression_response_admission_declined: bool,
+    /// Effective `compression` instances that registered in `before_proxy` and
+    /// have not yet taken their `after_proxy` response decision.
+    ///
+    /// Content negotiation is a decision about the whole configured chain, not
+    /// about one instance: an instance whose `algorithms` or `content_types`
+    /// cannot serve this response says nothing about whether a later sibling
+    /// can. Counting the outstanding decisions is what lets the fixed `406`
+    /// terminal wait until every eligible instance has declined, instead of the
+    /// first one refusing on behalf of the rest (issue #5092). `0` — the
+    /// `before_proxy` chain never reached compression, as on a short-circuited
+    /// `response_caching` HIT — means this instance is the only decider left.
+    compression_response_decisions_pending: u32,
     /// Reserved response-buffer admission permit for gateway compression.
     /// Codec CPU admission is acquired separately, immediately before the
     /// blocking transform, and this permit is held across that transform so the
@@ -3527,6 +3539,7 @@ impl RequestContext {
             compression_response_encode_owner: None,
             compression_response_admission_owner: None,
             compression_response_admission_declined: false,
+            compression_response_decisions_pending: 0,
             compression_response_buffer_permit: HeldResponseBufferPermit::default(),
             compression_staged_request_plaintext: None,
             compression_response_encode_aborted: false,
@@ -4070,6 +4083,34 @@ impl RequestContext {
 
     pub(crate) fn compression_response_admission_declined(&self) -> bool {
         self.compression_response_admission_declined
+    }
+
+    /// Register one effective `compression` instance as still owing an
+    /// `after_proxy` response decision for this request.
+    ///
+    /// Saturating: an implausible instance count must not wrap the tally down
+    /// into a smaller one, because a smaller tally is the fail-OPEN direction
+    /// for the negotiation terminal it gates.
+    pub(crate) fn register_compression_response_decision(&mut self) {
+        self.compression_response_decisions_pending = self
+            .compression_response_decisions_pending
+            .saturating_add(1);
+    }
+
+    /// Settle this instance's `after_proxy` response decision, reporting whether
+    /// it was the LAST one outstanding.
+    ///
+    /// `true` means no further `compression` instance is expected to decide, so
+    /// a refusal taken now is a refusal on behalf of the whole configured chain.
+    /// Saturating at zero: a tally that never registered (the `before_proxy`
+    /// chain did not reach compression) reports `true` immediately, which
+    /// preserves the fail-closed single-instance behavior instead of losing the
+    /// terminal.
+    pub(crate) fn settle_compression_response_decision(&mut self) -> bool {
+        self.compression_response_decisions_pending = self
+            .compression_response_decisions_pending
+            .saturating_sub(1);
+        self.compression_response_decisions_pending == 0
     }
 
     /// Drop this request's reserved response-buffer admission (permit + owner)
@@ -4821,6 +4862,10 @@ impl RequestContext {
             compression_response_encode_owner: self.compression_response_encode_owner,
             compression_response_admission_owner: self.compression_response_admission_owner,
             compression_response_admission_declined: self.compression_response_admission_declined,
+            // The response decision happens on the real context, after this
+            // request-side clone is discarded; carrying the tally keeps the two
+            // views consistent without giving the clone a second vote.
+            compression_response_decisions_pending: self.compression_response_decisions_pending,
             // The reserved response-buffer permit stays on the donor (live)
             // context: this compatibility clone runs only the request-body hooks,
             // never the response-body transform that consumes the permit. Moving

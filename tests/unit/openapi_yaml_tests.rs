@@ -7211,6 +7211,81 @@ async fn compression_schema_matches_strict_runtime_config_contract() {
             "runtime accepted OpenAPI-invalid compression config: {config}"
         );
     }
+
+    // Constructor admission is the source of truth; the schema previously
+    // ACCEPTED each of these while `validate` exited 1 (issue #5095), and
+    // accepted content-type rules the matcher can never equal (issue #5096).
+    for config in [
+        json!({"algorithms": []}),
+        json!({"content_types": []}),
+        json!({"content_types": [""]}),
+        json!({"content_types": ["\u{e9}"]}),
+        json!({"content_types": [" "]}),
+        json!({"content_types": ["application/json; charset=utf-8"]}),
+        json!({"content_types": ["application/json "]}),
+        json!({"content_types": null}),
+        json!({"min_content_length": -1}),
+        json!({"max_decompressed_request_size": 0}),
+        json!({"max_decompressed_request_size": 33_554_433}),
+        json!({"brotli_quality": 12}),
+    ] {
+        assert_component_validity(&spec, "CompressionConfig", &config, false);
+        assert!(
+            CompressionPlugin::new(&config).is_err(),
+            "runtime accepted a config the schema now rejects: {config}"
+        );
+    }
+
+    // A `min_content_length` past `u64::MAX` is runtime-rejected (it is not an
+    // unsigned integer any more). The schema's `maximum` cannot bind it: the
+    // value only survives JSON parsing as an `f64`, and `u64::MAX` rounds to the
+    // same `f64`, so this stays a runtime-only assertion rather than a parity
+    // case that would silently depend on float behaviour.
+    let past_u64: serde_json::Value =
+        serde_json::from_str(r#"{"min_content_length": 18446744073709551616}"#)
+            .expect("oversized literal parses");
+    assert!(
+        CompressionPlugin::new(&past_u64).is_err(),
+        "runtime must reject a min_content_length past u64::MAX"
+    );
+
+    // Explicit null is "omitted" for every optional field the constructor reads
+    // through its `optional_*` helpers. `content_types` is deliberately NOT one
+    // of them, and is covered above.
+    for field in [
+        "algorithms",
+        "min_content_length",
+        "max_decompressed_request_size",
+        "gzip_level",
+        "brotli_quality",
+        "remove_accept_encoding",
+        "decompress_request",
+    ] {
+        let mut object = serde_json::Map::new();
+        object.insert(field.to_string(), serde_json::Value::Null);
+        let config = serde_json::Value::Object(object);
+        assert_component_validity(&spec, "CompressionConfig", &config, true);
+        assert!(
+            CompressionPlugin::new(&config).is_ok(),
+            "runtime must treat an explicit null {field} as omitted"
+        );
+    }
+
+    // Values both surfaces must keep accepting, so the tightened bounds did not
+    // over-constrain the documented shapes.
+    for config in [
+        json!({"content_types": ["application/vnd.api+json", "text/csv"]}),
+        json!({"min_content_length": 0}),
+        json!({"max_decompressed_request_size": 1}),
+        json!({"max_decompressed_request_size": 33_554_432}),
+        json!({"brotli_quality": 11}),
+    ] {
+        assert_component_validity(&spec, "CompressionConfig", &config, true);
+        assert!(
+            CompressionPlugin::new(&config).is_ok(),
+            "runtime rejected a schema-valid compression config: {config}"
+        );
+    }
 }
 
 #[test]

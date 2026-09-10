@@ -1646,7 +1646,7 @@ Given all built-in plugins enabled, the execution order is:
 | 55 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
 | 56 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_headers, on_final_response_body |
 | 57 | `response_transformer` | 4000 | after_proxy, transform_response_body |
-| 58 | `compression` | 4050 | normalize_buffered_request_body_before_before_proxy, before_proxy, after_proxy, transform_request_body, transform_response_body |
+| 58 | `compression` | 4050 | normalize_buffered_request_body_before_before_proxy, before_proxy, after_proxy, transform_request_body_with_context, transform_response_body_with_context |
 | 59 | `ai_prompt_compressor` | 4055 | before_proxy, transform_request_body_with_context, on_final_request_body_with_context |
 | 60 | `ai_semantic_cache` | 4057 | on_final_request_body_with_context, after_proxy, on_final_response_body |
 | 61 | `ai_federation` | 4060 | before_proxy, transform_request_body_with_context, finalized request egress, enforce_final_backend_header_policy, on_final_request_body_with_context, origin response-header boundary, after_proxy, response_stream_inspector, on_response_stream_terminated (HTTP only) |

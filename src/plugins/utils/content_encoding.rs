@@ -2,8 +2,16 @@
 //!
 //! This utility never mutates the caller's body or headers. It is intended for
 //! observability/security inspection paths that need a plaintext view while the
-//! encoded representation must remain client-visible. The compression plugin
-//! reuses the same parser/decoder for opt-in request decompression.
+//! encoded representation must remain client-visible.
+//!
+//! It shares the strict, Large-Window-refusing `br` primitive with
+//! [`crate::plugins::charged_decode`], but NOT that module's aggregate budget:
+//! nothing here reserves the decoder's own heap or the output allocation before
+//! asking for them. Callers that decode attacker-supplied bytes and REWRITE the
+//! request — the `compression` plugin's opt-in `decompress_request` normalizer —
+//! must use [`crate::plugins::charged_decode::decode_charged_content_coding_chain`]
+//! instead (`GHSA-q76p-952x-7c3v`); only [`parse_content_codings`] is shared with
+//! them.
 
 use std::borrow::Cow;
 use std::io::Read;
