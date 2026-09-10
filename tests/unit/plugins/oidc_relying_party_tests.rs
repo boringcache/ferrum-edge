@@ -66,14 +66,9 @@ async fn discovery_transport_errors_use_the_redacted_endpoint() {
         "unsupported://test-user:test-password@example.test/",
         "private-path?key=test-query#test-fragment"
     );
-    let error = oidc_resolve_discovery_for_test(
-        &PluginHttpClient::default(),
-        endpoint,
-        None,
-        None,
-    )
-    .await
-    .expect_err("unsupported transport must fail");
+    let error = oidc_resolve_discovery_for_test(&PluginHttpClient::default(), endpoint, None, None)
+        .await
+        .expect_err("unsupported transport must fail");
     assert!(error.contains("discovery request failed"), "{error}");
     assert!(error.contains("example.test/redacted"), "{error}");
     let diagnostics = format!("{error}\n{}", logs.contents());
