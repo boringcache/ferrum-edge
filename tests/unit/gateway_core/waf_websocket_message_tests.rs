@@ -285,8 +285,7 @@ async fn log_to_stdout_monitor_mode_logs_monitored_effective_action() {
         "configured enforce action must remain visible: {captured}"
     );
     assert!(
-        !hit
-            .split_whitespace()
+        !hit.split_whitespace()
             .any(|field| field.trim_end_matches(',') == "action=block"),
         "must not log the legacy exact action=block field: {captured}"
     );

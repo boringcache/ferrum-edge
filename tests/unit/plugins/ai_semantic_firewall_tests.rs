@@ -5864,9 +5864,7 @@ async fn detect_mode_logs_sanitized_provider_failure_once_per_response() {
         "provider failures must be bounded once per response: {logs}"
     );
     assert!(failures[0].contains("enforcement=\"detect\""));
-    assert!(
-        failures[0].contains("provider_error=\"embedding request failed\"")
-    );
+    assert!(failures[0].contains("provider_error=\"embedding request failed\""));
     assert!(!logs.contains("/private/secret/embeddings"));
 }
 
@@ -5921,9 +5919,7 @@ async fn detect_mode_sanitizes_malformed_provider_response() {
                 && line.contains("streaming detect: embedding provider evaluation failed")
         })
         .expect("each provider failure retains its debug diagnostic");
-    assert!(
-        failure.contains("provider_error=\"embedding response parse failed\"")
-    );
+    assert!(failure.contains("provider_error=\"embedding response parse failed\""));
     assert!(!logs.contains("provider raw secret payload"));
 }
 
