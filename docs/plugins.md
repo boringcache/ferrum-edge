@@ -2092,6 +2092,37 @@ under `/metrics`. See
 configuration, OpenAPI/runtime admission layers, spool sizing, replay, the
 ownership/claim protocol, and reconciliation guidance.
 
+`include_request_id` and `include_trace_id` (both Boolean, default `true`)
+control whether the exported row carries the transaction's `request_id` and
+`trace_id`. They apply to per-event rows only — snapshot deltas aggregate many
+transactions and always omit both. A disabled or unavailable value omits the
+JSON key entirely rather than writing an empty string. `currency` and
+`pricing_version` are required operator labels copied verbatim into every row;
+each is admitted up to 512 UTF-8 bytes and is rejected rather than truncated,
+because truncation would merge two distinct billing identities.
+
+Admission runs in three phases. The OpenAPI component covers shape and every
+bound JSON Schema can express; the runtime-free constructor (what
+`ferrum-edge validate` runs) adds cross-field relationships and byte bounds
+without touching the filesystem, the process environment, or the network; and
+activation at serving startup adds secret resolution, TLS file reading, and
+spool-directory creation/permissions. A configuration `validate` accepts can
+still abort `ferrum-edge run` on a node missing a referenced secret or file.
+
+Snapshot emission writes bounded artifacts: one spool file holds at most 10,000
+rows while `snapshot.max_entries` admits far more identities, so every periodic
+tick, final emission, and compact recovery splits its batch and settles
+baselines per chunk. A partially durable emission retries only the rows that
+never landed, keeping each `event_id` so replay stays idempotent. Because a
+snapshot row is durable before it is enqueued for low-latency delivery, it
+enters the per-event ledger already settled as persisted and a failed delivery
+never reports billing loss for it.
+
+`GET /charges/sink/status` renders each instance's ClickHouse endpoint in the
+structural `scheme://host:port/redacted` form, so user-info, path, query, and
+fragment never reach any admin role. Spool ownership still binds the full
+sanitized endpoint, so redaction does not move existing artifacts.
+
 `schema` / `schema_ref` project the exported charge-event record — the
 JSONEachRow row delivered to ClickHouse and the durable spool artifact that
 replays it. Renaming a field renames the column the row inserts into, so the
