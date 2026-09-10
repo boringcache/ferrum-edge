@@ -461,7 +461,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "a2a_gateway",
         classification: BuiltinPluginClassification::Public,
         priority: 2993,
-        active_phases: "before_proxy, after_proxy, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector",
+        active_phases: "before_proxy, on_final_request_body, after_proxy, normalize_response_body, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector",
         matrix_protocols: HTTP_GRPC_PROTOCOLS,
         protocol_rationale: "Detects A2A HTTP/REST/gRPC methods, rewrites HTTP and gRPC Agent Cards, applies method policy, and emits `a2a.*` metadata",
     },

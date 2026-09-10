@@ -7602,6 +7602,70 @@ config:
         action: deny
 ```
 
+**Configuration reference.** Every accepted key, with the domain the constructor
+actually admits. Anything not listed is rejected at construction, at the root and
+inside each nested object. **`null` is accepted wherever a value is optional and
+means exactly the same thing as omitting the key** — the one exception is
+`discovery` itself, which is effectively required because rewriting defaults to
+enabled (see *Public origin admission* below), plus
+`endpoint.grpc_services[].service` and `policy.methods.<name>.action`, which are
+required and reject `null`.
+
+| Key | Type | Default | Accepted values and constraints |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `true` | `false` makes the instance inert; it still contributes to replay provenance. |
+| `mode` | string | `transparent_proxy` | Only `transparent_proxy` in V1. |
+| `endpoint.path` | string | `/a2a` | Non-empty absolute path beginning with `/`. The JSON-RPC endpoint, the REST prefix, and the policy scope. |
+| `endpoint.agent_card_path` | string | `/.well-known/agent-card.json` | Non-empty absolute path beginning with `/`. Matched as a **suffix** of the request path, so `/agents/planner/.well-known/agent-card.json` is in scope. |
+| `endpoint.protocol_versions` | string array | `["0.3.0"]` | Non-empty list; every entry must be non-empty and not whitespace-only. Compared as **exact** strings after trimming — no family, range, or wildcard syntax. |
+| `endpoint.grpc_services` | array | `["a2a.v1.A2AService", "lf.a2a.v1.A2AService"]` | Non-empty list of either a service-name string or `{service, card_schema}`. Names are dot-separated gRPC identifiers (`[A-Za-z_][A-Za-z0-9_]*`). Duplicate service names are rejected, as is a `card_schema` contradicting a published A2A service name. |
+| `endpoint.grpc_services[].card_schema` | string | published layout, else `none` | `a2a-0.3`, `a2a-1.0`, or `none`. |
+| `detection.bindings` | string array | `[jsonrpc, rest, grpc]` | Non-empty. Three bindings, six accepted spellings: `jsonrpc` (alias `json-rpc`), `rest` (aliases `http_json`, `http+json`), and `grpc`. Aliases normalize to the canonical name, so listing a binding twice under two spellings is accepted and deduplicates. |
+| `detection.version_header` | string | `A2A-Version` | Non-empty, valid HTTP field name. |
+| `detection.max_request_body_size` | integer (uint64) | `1048576` | `0` **disables** the plugin-level detection size check entirely; any other value is the byte ceiling above which a JSON-RPC candidate is not parsed. Negative and non-integer values are rejected. |
+| `detection.allow_unknown_methods_with_version_header` | boolean | `true` | Treats a version-header-bearing JSON-RPC request as A2A even when the method is unknown; metadata still records `unknown`. |
+| `detection.strip_accept_encoding` | boolean | `true` | Removes `Accept-Encoding` (and `grpc-accept-encoding` for gRPC card requests) on requests whose response the plugin may parse or rewrite. It controls compression negotiation only — Agent Card discovery works identically with it disabled. `true` marks request headers mutable for all traffic on the proxy. |
+| `discovery.rewrite_agent_card_urls` | boolean | `true` | `false` is explicit passthrough and also disables the protobuf card schema gate. |
+| `discovery.public_base_url` | string | none | Absolute `http`/`https` URL, at most 4096 bytes, with an explicit `://` authority, no ASCII whitespace or control characters, no credentials, no query, and no fragment. An intended base path is preserved. The **canonicalized** form is what gets published (see *Public origin admission*). |
+| `discovery.trust_forwarded_headers` | boolean | `false` | Derives the origin from `X-Forwarded-Proto` / `X-Forwarded-Host` / `Host`; requires a non-empty `allowed_public_origins` when rewriting is on and no public base is configured. |
+| `discovery.allowed_public_origins` | string array | `[]` | Absolute `http`/`https` origins only — scheme, host, optional port; no paths, credentials, queries, or fragments. Compared after origin normalization. |
+| `observability.emit_metadata` | boolean | `true` | Emits the `a2a.*` metadata keys and enables response buffering for metadata extraction. |
+| `observability.log_payloads` | boolean | `false` | Copies bounded response payloads into `a2a.payload.response` verbatim. Has no effect unless `emit_metadata` is also `true`. |
+| `observability.max_payload_size` | integer (uint64) | `1048576` | Must be **greater than zero** — `0` is rejected, it is not an "unlimited" spelling. Caps payload logging and retained semantic metadata, never the response buffer. |
+| `policy.default_action` | string | `allow` | `allow` or `deny`. |
+| `policy.methods` | object | `{}` | Keys are canonical A2A method names, the literal `unknown`, or a PascalCase gRPC/REST alias. Two keys that canonicalize to the same method (`tasks/get` and `GetTask`, or `SubscribeToTask` and `TaskSubscription`) are a duplicate and are rejected. |
+| `policy.methods.<name>.action` | string | required | `allow` or `deny`. |
+
+**Method policy is decided on the backend-visible body.** For the JSON-RPC
+binding the operation lives in the request body, and request-body transformers
+run after the arrival-time classification, so the policy is re-decided in the
+final request-body phase over the exact representation that will be dispatched.
+A method a later transformer substituted is refused there, with the same
+response shape the arrival-time refusal uses. REST and gRPC carry the operation
+in the request path and are unaffected. An observability-only configuration — no
+`deny` anywhere — takes no enforcement decision and does not claim the finalized
+representation.
+
+**Batch refusals answer every request member.** A JSON-RPC batch containing a
+denied member is refused as a whole and no member is dispatched, so the response
+array carries one Response object per non-notification member, in wire order,
+preserving each `id`'s exact JSON type and value. The member the policy named
+carries the specific refusal and its canonical method; the others carry the same
+error code with a batch-level reason, because they were never evaluated
+individually. Notification members (no `id`) are correctly unanswered, as
+[JSON-RPC 2.0 §6](https://www.jsonrpc.org/specification#batch) requires. A batch
+with more than 1024 members is refused with the single-response shape carrying
+`"truncated": true` instead of being enumerated; the default
+`detection.max_request_body_size` puts that far above any reachable batch.
+
+**Multiple instances.** Two `a2a_gateway` instances may be attached to one proxy.
+Detection is per instance and so is the response phase: the instance whose
+endpoint, discovery, or gRPC-service scope matched the request owns it, and a
+sibling whose scope did not match neither buffers the response, nor captures
+payloads under its own `observability` settings, nor rewrites the Agent Card to
+its own public base. Request-phase method policy still runs independently in
+every instance whose scope matched.
+
 JSON-RPC detection parses `POST endpoint.path` requests with JSON content and recognizes current PascalCase A2A methods such as `SendMessage`, `SendStreamingMessage`, `GetTask`, `ListTasks`, `CancelTask`, `SubscribeToTask`, push-notification config methods, and Agent Card methods. Legacy slash-style method names such as `message/send` are also accepted and normalized to canonical `a2a.method` values for policy and metadata. When a JSON-RPC request exceeds `detection.max_request_body_size`, the plugin fails closed if `policy.default_action: deny` or any per-method deny rule is configured; otherwise it skips detection for observability-only deployments. REST detection matches standard A2A paths under `endpoint.path`, such as `/a2a/message:send`, `/a2a/message:stream`, `/a2a/tasks/{id}`, `/a2a/tasks/{id}:cancel`, `/a2a/tasks/{id}:subscribe`, `/a2a/tasks`, `/a2a/extendedAgentCard`, optional tenant-prefixed forms such as `/a2a/{tenant}/message:send`, the legacy `/a2a/v1/...` form, plus the configured Agent Card discovery suffix. gRPC detection matches configured services — `a2a.v1.A2AService` and `lf.a2a.v1.A2AService` by default — and maps RPC names (`SendMessage`, `SendStreamingMessage`, `GetTask`, `CancelTask`, `TaskSubscription`/`SubscribeToTask`, push-notification config RPCs, `GetExtendedAgentCard`) to canonical A2A method names.
 
 When policy has `default_action: deny` or any per-method deny rule, every request within `endpoint.path` (at a path-segment boundary), the configured discovery suffix, or a configured gRPC service must be classified before forwarding. Unrecognized payloads, methods, paths, and disabled bindings in that scope are refused; an `unknown: allow` rule does not waive failed inspection. Known JSON-RPC methods, including every member of a batch, still receive their own method policy. An observability-only configuration with no deny rules continues forwarding unrecognized requests. Unrelated sibling paths and services remain outside this policy scope.
@@ -7664,10 +7728,16 @@ Unproven versions, layout mismatches, schema faults, malformed frames, and non-i
 | Decoding | `agent_card_protobuf_varint_noncanonical` | A varint is redundantly padded. |
 | Decoding | `agent_card_protobuf_wire_type_unsupported` | A group (or otherwise unsupported) wire type appears. |
 | Emission | `agent_card_protobuf_rewrite_unstable` | The measuring and writing passes disagreed, so the declared length would not describe the emitted bytes. |
-| Emission | `agent_card_public_origin_unavailable` | No admitted public origin is available for the card; no backend card is returned. |
-| Emission | `agent_card_grpc_rewrite_not_applied` | An admitted card's rewrite never reported an outcome, so it must not be served un-rewritten. |
+| Emission | `agent_card_public_origin_unavailable` | No admitted public origin is available for the card; no backend card is returned. Also reachable on the HTTP bindings, where it is an HTTP `502` with a JSON diagnostic body. |
+| Emission | `agent_card_grpc_rewrite_not_applied` | An admitted card's rewrite never reported an outcome, so it must not be served un-rewritten. Also reachable on the HTTP bindings, with the same `502` shape. |
 
 A card the plugin admitted whose rewrite never reaches the client fails closed the same way, so "the rewrite silently did not run" can never be mistaken for "no rewrite was needed". A rewrite that would exceed the per-response retained-response ceiling is refused during construction and surfaces as the shared health-neutral gateway capacity terminal instead. Operators fronting a non-0.3 A2A backend should therefore set `discovery.rewrite_agent_card_urls: false` — with it enabled, such cards are refused rather than silently served with un-rewritten internal URLs. **Public origin admission:** rewriting defaults to enabled, so an empty plugin configuration is rejected. Set `discovery.public_base_url` explicitly, or set both `discovery.trust_forwarded_headers: true` and a nonempty `discovery.allowed_public_origins` list of absolute HTTP(S) origins (scheme, host, optional port; no paths, credentials, queries, or fragments). For example, `allowed_public_origins: [https://agents.example.com]`. Request-derived origins must match this list after URL origin normalization; schemes and non-default ports remain significant. Comma-separated forwarded chains, malformed values, missing origins, and origins outside the list are refused before contacting the agent, with HTTP 502 or gRPC INTERNAL and `agent_card_public_origin_unavailable`. Configure the trusted front door to replace forwarded headers; the allowlist constrains the advertised destination even if a caller supplies them. A configured public base takes precedence. To intentionally publish backend cards unchanged, set `discovery.rewrite_agent_card_urls: false`; this explicit passthrough also disables the protobuf rewrite/schema gate. Existing configurations without a public base must make one of these choices.
+
+**The published base URL is the canonicalized one.** `discovery.public_base_url` is validated through a normalizing URL parser, and it is the parser's canonical serialization — not the operator's raw string — that every rewritten card URL is built from, with any trailing slash removed and an intended base path preserved. IDNA, case, default-port, and percent-encoding normalization therefore happen once, at admission. Spellings a normalizing parser silently repairs are refused outright rather than stored, because the value it accepted would not be the value that was written: leading or trailing whitespace, embedded tabs, newlines, or other ASCII control characters, and authority-less forms such as `https:agents.example.com` or `https:/agents.example.com`. `discovery.allowed_public_origins` entries are held to the same requirements. The same proof is applied to backend-supplied card URLs before they are rewritten.
+
+**Agent Card production is bounded.** Both card representations are produced the same way: an admission pass proves the response is a rewritable card without emitting a byte, and the replacement is then written through the per-response retained-response sink inside the reserved producer window, so an amplifying rewrite is refused *while* it is being written rather than materialized in full and rejected afterwards. A refusal on capacity surfaces as the shared health-neutral gateway capacity terminal, never as a gateway fault; a card the plugin admitted whose rewrite never reached the client fails closed with `agent_card_grpc_rewrite_not_applied` on either binding (HTTP `502` with a JSON diagnostic body, or the trailers-only gRPC `INTERNAL` described above). The public endpoint and card URLs are built once per response rather than once per advertised interface.
+
+**Composition with `grpc_web`.** The gRPC-Web translator re-frames the response body — appending the terminal trailer frame, and base64-encoding it in text mode — in the ordinary response transform stage, at a lower priority than this plugin. So when both plugins are configured, the unary Agent Card is rewritten one phase earlier, in the response normalize phase, while the body is still exactly one native gRPC frame; the rewritten card is then what the translator frames, and downstream response guardrails see the client-visible URLs. Native gRPC without the translator is unchanged and keeps the ordinary staged transform. Either way the outcome is reported through the same fail-closed lifecycle, and the translator's own request handling is untouched.
 
 **Composition with `request_deduplication`.** Agent Card rewriting is a client-facing presentation transform, and a deduplicated replay is served as an already-finalized representation without re-running such transforms. So `a2a_gateway` stamps every retained response with a content digest of its whole accepted configuration — `discovery.public_base_url`, `endpoint.path`, `endpoint.agent_card_path`, `endpoint.protocol_versions`, `discovery.rewrite_agent_card_urls`, and the `enabled` switch — and a stored representation replays only while that digest still matches. Changing the public base, the endpoint path, the admitted protocol versions, or enabling/disabling the plugin therefore retires every representation captured under the old settings rather than replaying a card that advertises a superseded endpoint.
 
@@ -7676,6 +7746,8 @@ That proof is only available when the rewritten origin comes from configuration.
 Metadata keys include `a2a.enabled`, `a2a.mode`, `a2a.binding`, `a2a.method`, `a2a.protocol_version`, `a2a.streaming`, `a2a.policy_decision`, `a2a.task_id`, `a2a.context_id`, `a2a.task_state`, `a2a.error`, `a2a.response_body_size`, and `a2a.ttfb_ms` for streaming responses when headers arrive. For detected 2xx SSE streams, the observe-only inspector writes `a2a.stream_events` and, when observed, `a2a.task_state`, `a2a.task_id`, and `a2a.context_id` into the request's transaction metadata at stream termination (before the transaction summary is built), so they appear in `TransactionSummary.metadata` alongside the buffered-path keys and are subject to the same key-based metadata redaction (`FERRUM_LOG_REDACT_METADATA_KEYS`). They are no longer emitted as raw structured trace fields, which bypassed metadata redaction. `observability.log_payloads` is disabled by default because it copies bounded response payloads into `a2a.payload.response` verbatim; payload contents are not field-redacted by key-based metadata redaction, and request payloads are not logged. Because `a2a.payload.response` is itself a metadata key, payload capture is part of metadata emission: `observability.log_payloads` has no effect unless `observability.emit_metadata` is also `true`.
 
 Because `detection.strip_accept_encoding` defaults to `true`, attaching this plugin to a proxy marks request headers as mutable and can force a per-request header clone even for non-A2A traffic on mixed high-QPS listeners. Operators that do not need Agent Card rewriting or response metadata parsing can set `detection.strip_accept_encoding: false` and `discovery.rewrite_agent_card_urls: false` to avoid that path.
+
+The option controls compression negotiation and nothing else. Setting `detection.strip_accept_encoding: false` while leaving Agent Card rewriting enabled is a supported combination: the public origin is resolved from the request hook's own header map and the admitted result is retained for the response phase, so a forwarded-origin card request is served identically whether or not the plugin declares request-header mutation.
 
 **Bounded semantic metadata.** Request hints, buffered JSON replies, and completed SSE observations use the same bounds. `a2a.task_id`, `a2a.context_id`, textual `a2a.error`, and `a2a.protocol_version` are capped at `min(observability.max_payload_size, 1024)` UTF-8 bytes per field, including a trailing `~` marker when truncated. A companion `<key>.truncated: true` distinguishes the diagnostic prefix from a complete identifier; truncated identifiers must not be used as exact correlation keys. Ordinary identifiers are unchanged. Task states normalize to `submitted`, `working`, `input-required`, `completed`, `canceled`, `failed`, `rejected`, `auth-required`, or `unknown`; arbitrary states become `unknown` with `a2a.task_state.unrecognized: true`. A normalized state that cannot fit the configured bound is omitted instead of publishing a partial state. Oversized state inputs and omitted states carry `a2a.task_state.truncated: true`. These limits apply even when payload logging is disabled and do not change forwarded response bytes.
 
