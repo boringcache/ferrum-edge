@@ -5714,9 +5714,9 @@ Supports both encoding modes:
 - **Binary** (`application/grpc-web`, `application/grpc-web+proto`): same length-prefixed framing as native gRPC — request body passes through unchanged.
 - **Text** (`application/grpc-web-text`, `application/grpc-web-text+proto`): base64-encoded binary frames — decoded on request and re-encoded on response.
 
-Message-format suffixes (`+proto`, `+json`, `+thrift`, or another valid custom `+subtype`) are preserved on the negotiated response `Content-Type`.
+Message-format suffixes (`+proto`, `+json`, `+thrift`, or another valid custom `+subtype`) name the message serialization, which translation never changes. They are preserved in both directions: on the negotiated response `Content-Type`, and on the native `Content-Type` the backend receives.
 
-On the request path, the plugin rewrites `content-type` to `application/grpc` so downstream plugins (`grpc_method_router`, `grpc_deadline`, etc.) treat the request as native gRPC. `grpc_method_router` may populate provisional client-method metadata at its priority, but its authorization and rate decision is deferred until the backend-effective path is finalized. Request-body decoding mode follows request `Content-Type` only.
+On the request path, the plugin rewrites `content-type` to the matching native gRPC type so downstream plugins (`grpc_method_router`, `grpc_deadline`, etc.) treat the request as native gRPC. `application/grpc-web-text+json` and `application/grpc-web+json` both dispatch as `application/grpc+json`; a bare `application/grpc-web*` and an explicit `+proto` both dispatch as the canonical bare `application/grpc`, which the wire format defines as the same implicit `proto` serialization. A backend that selects its codec from the native content-type therefore sees the codec the browser actually sent. `grpc_method_router` may populate provisional client-method metadata at its priority, but its authorization and rate decision is deferred until the backend-effective path is finalized. Request-body decoding mode follows request `Content-Type` only.
 
 After text-mode base64 decoding, binary and text requests share one complete
 envelope validator. It accepts one or more `0x00` uncompressed DATA frames and
@@ -5749,6 +5749,11 @@ client as a gRPC-Web terminal frame) before any backend dispatch:
   refused.
 - Names are lowercased and must match the gRPC Custom-Metadata charset; values
   must be printable ASCII, and a `-bin` value must be base64 (padded or not).
+  A repeated binary field may arrive comma-coalesced (`x-bin: YQ==,Yg==`), which
+  the gRPC HTTP/2 mapping defines as equivalent to the repeated form: each
+  member is validated independently (surrounding spaces/tabs allowed, padded or
+  unpadded), an empty member is refused, and the coalesced value is forwarded
+  unchanged so the logical sequence is preserved.
 - Forbidden at end of stream: pseudo-headers, connection/framing fields
   (`connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`,
   `content-length`, `content-type`, `content-encoding`, `host`, …),
@@ -5767,9 +5772,13 @@ client as a gRPC-Web terminal frame) before any backend dispatch:
   consume the whole body budget.
 
 Duplicate names are preserved as repeated trailer entries. Retries replay the
-same complete request, trailers included. Request streaming is unchanged: only
-the already-buffered gRPC-Web envelope is inspected, and native gRPC requests
-keep their streaming fast path and backpressure.
+same complete request, trailers included. The validated block is staged as
+request-private transport state for dispatch and is **omitted entirely** from
+every transaction-log projection (native serializers and custom log schemas
+alike), so application trailing metadata is never written to a log sink.
+Request streaming is unchanged: only the already-buffered gRPC-Web envelope is
+inspected, and native gRPC requests keep their streaming fast path and
+backpressure.
 
 On the response path, `grpc_web` streams backend DATA as it arrives and embeds HTTP/2 trailers — `grpc-status`, `grpc-message`, `grpc-status-details-bin`, and valid ASCII custom trailing metadata such as `request-id` — as exactly one final length-prefixed trailer frame (flag byte `0x80`) in the response body. Binary mode forwards each bounded DATA chunk without an additional translation copy; text mode base64-encodes each runtime flush independently, including protocol-permitted padding at flush boundaries, so neither mode waits for backend EOF before publishing server-streaming messages. Backpressure, cancellation, resets, absolute deadlines, response-size enforcement, load-balancer/admission guards, and deferred logging remain attached to the live body pipeline. The configured response-size ceiling applies to native backend DATA before text expansion; client-visible byte accounting records the encoded bytes and terminal frame.
 
@@ -5789,11 +5798,12 @@ Browser gRPC-Web request streaming and full-duplex transport remain subject to u
 - Absent or empty `Accept` defaults to the request `Content-Type`'s mode and message-format suffix.
 - Lists, parameters, quality values (`q=`), and wildcards (`*/*`, `application/*`) are honored; more specific entries override wildcards, and an explicit `q=0` refusal is not revived by `*`.
 - `Accept` selects binary versus text encoding but does not transcode message payloads. An exact media range with a different `+proto` / `+json` / `+thrift` / custom suffix is ineligible; the negotiated response preserves the request's effective message format (a missing suffix means `+proto`).
+- Media-range parameters other than `q` still match when the range's type, subtype, and suffix match the candidate (RFC 9110 §12.5.1 type matching). They are ignored for precedence and quality selection and cannot veto an unparameterized representation: `Accept: application/grpc-web+proto;q=1, application/grpc-web+proto;version=2;q=0` is served as `application/grpc-web+proto`, and `Accept: application/grpc-web-text; charset=utf-8` is served rather than `406`. A range whose type or suffix does not match (including parameterized `text/html` or a different `+json` / `+thrift` suffix) still yields `406`. Parameters that follow `q` are Accept extension parameters and do not constrain the range.
 - A present `Accept` that is structurally malformed, or that refuses every gRPC-Web representation the gateway can produce, fails closed with HTTP `406 Not Acceptable`.
 - Translated responses and gateway-generated gRPC-Web errors emit `Vary: Accept` (merged with any existing `Vary` value) so shared caches cannot mix binary, text, or message-format variants.
 - When `Accept` selects text while `Content-Type` is binary (or the reverse), request decoding and response encoding stay independent.
 
-**Malformed / non-gRPC backend responses:** When the backend or an intermediary returns a response without a present, numeric `grpc-status` (empty or non-numeric values count as absent), `grpc_web` synthesizes the trailer `grpc-status` from the official HTTP-to-gRPC client mapping ([http-grpc-status-mapping.md](https://github.com/grpc/grpc/blob/master/doc/http-grpc-status-mapping.md)): `400→INTERNAL(13)`, `401→UNAUTHENTICATED(16)`, `403→PERMISSION_DENIED(7)`, `404→UNIMPLEMENTED(12)`, `429/502/503/504→UNAVAILABLE(14)`, and every other HTTP status (including `200`) → `UNKNOWN(2)`. A valid supplied `grpc-status` remains authoritative and is never overridden by the HTTP status. Existing `grpc-message` / `grpc-status-details-bin` metadata is preserved when present; synthesis does not invent a message. The client-visible HTTP status is left unchanged on this path (Ferrum does not force HTTP `200` for translated gRPC-Web backend responses), so wire observers still see the backend/intermediary HTTP failure while gRPC-Web clients read the mapped code from the body trailer frame.
+**Malformed / non-gRPC backend responses:** When the backend or an intermediary returns a response without a present, numeric `grpc-status` (empty or non-numeric values count as absent), `grpc_web` synthesizes the trailer `grpc-status` from the official HTTP-to-gRPC client mapping ([http-grpc-status-mapping.md](https://github.com/grpc/grpc/blob/master/doc/http-grpc-status-mapping.md)): `400→INTERNAL(13)`, `401→UNAUTHENTICATED(16)`, `403→PERMISSION_DENIED(7)`, `404→UNIMPLEMENTED(12)`, `429/502/503/504→UNAVAILABLE(14)`, and every other HTTP status (including `200`) → `UNKNOWN(2)`. A valid supplied `grpc-status` remains authoritative and is never overridden by the HTTP status. Existing `grpc-message` / `grpc-status-details-bin` metadata is preserved when present; synthesis does not invent a message. The client-visible HTTP status is left unchanged on this path (Ferrum does not force HTTP `200` for translated gRPC-Web backend responses), so wire observers still see the backend/intermediary HTTP failure while gRPC-Web clients read the mapped code from the body trailer frame. When such a non-`200` response also carries a **non-gRPC entity** — a `text/plain` or `text/html` error document written by the origin or an intermediary, or a body under no gRPC content-type at all — that entity is dropped instead of being framed. gRPC-Web bodies are a frame sequence, so prepending an HTTP error document to the synthesized trailer frame would make the whole response unparseable and put the mapped status out of the client's reach. The client receives a valid terminal-only gRPC-Web body carrying the mapped status, identically on the streaming and buffered paths, in binary and text mode, and on H1/H2/H3. Both conditions are required: an HTTP `200` reply is always forwarded verbatim, and a backend that genuinely framed its error under `application/grpc*` keeps its frames.
 
 **Multiple instances:** A proxy may carry several `grpc_web` configs (for example two proxy-scoped instances after a same-named global is shadowed, or distinct `priority_override` values). Body translation is not idempotent, so the first effective instance in configured order claims request-scoped ownership and performs content-type rewrite, text-mode request decode, response trailer-frame embedding, and text-mode base64 encode exactly once. Sibling instances keep namespaced per-instance staging and contribute only their `expose_headers` union into `Access-Control-Expose-Headers`. Missing or malformed owner staging fails closed (no second claim, no speculative body rewrite). Reload snapshots remain atomic: an in-flight request sees one plugin generation end-to-end on H1, H2, and H3.
 
@@ -5802,7 +5812,9 @@ Browser gRPC-Web request streaming and full-duplex transport remain subject to u
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `expose_headers` | String[] | `[]` | Additional response headers to include in `Access-Control-Expose-Headers` for browser CORS compatibility. `grpc-status` and `grpc-message` are always exposed. When multiple `grpc_web` instances are effective, their lists are unioned in configured order. |
+| `expose_headers` | String[] \| null | `[]` | Additional response headers to include in `Access-Control-Expose-Headers` for browser CORS compatibility. `grpc-status` and `grpc-message` are always exposed. When multiple `grpc_web` instances are effective, their lists are unioned in configured order. |
+
+`expose_headers` accepts an array of strings or an explicit `null`; both an omitted field and `null` mean the empty list. Each item is trimmed of surrounding spaces and tabs and must then be a non-empty HTTP field name (token characters only), so `" X-Ok "` is accepted as `x-ok` while `""`, `" "`, `"bad name"`, and `"bad:name"` are rejected with a path-qualified diagnostic. Accepted names are lowercased and de-duplicated in first-seen order, so entries differing only in case collapse to one.
 
 Config must be a JSON/YAML object whose only accepted key is `expose_headers`. Empty `{}` is valid and uses defaults. Explicit top-level `null`, arrays, strings, numbers, and booleans are rejected with `grpc_web: config must be an object` — `null` is not an alias for `{}`. Unknown or misspelled keys (for example `expose_header`) are rejected with path-qualified diagnostics and spelling suggestions. The shared constructor enforces this for admin API, file mode, database/CP validation, and DP snapshot application; a rejected reload keeps the last-known-good plugin generation (`KeepLastKnownGood`).
 

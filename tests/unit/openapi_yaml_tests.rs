@@ -7385,6 +7385,14 @@ fn grpc_web_schema_matches_the_strict_runtime_shape() {
         json!({}),
         json!({"expose_headers": ["x-request-id"]}),
         json!({"expose_headers": []}),
+        // Field-level parity (issue #5134): the constructor treats an explicit
+        // null as the empty list and trims ASCII OWS off each item, and the
+        // schema has to say the same thing.
+        json!({"expose_headers": null}),
+        json!({"expose_headers": [" X-Ok "]}),
+        json!({"expose_headers": ["custom-header-bin", "x-request-id"]}),
+        // Names differing only in case are accepted and collapse to one entry.
+        json!({"expose_headers": ["X-Request-Id", "x-request-id"]}),
     ] {
         assert_component_validity(&spec, "GrpcWebConfig", &config, true);
         assert!(
@@ -7401,6 +7409,13 @@ fn grpc_web_schema_matches_the_strict_runtime_shape() {
         json!(true),
         json!({"expose_header": ["x-request-id"]}),
         json!({"expose_headers": ["x-request-id"], "extra": true}),
+        // Item constraints the schema previously did not model at all.
+        json!({"expose_headers": [""]}),
+        json!({"expose_headers": ["   "]}),
+        json!({"expose_headers": ["bad name"]}),
+        json!({"expose_headers": ["bad:name"]}),
+        json!({"expose_headers": ["x-request-id\r\nx-injected"]}),
+        json!({"expose_headers": [1]}),
     ] {
         assert_component_validity(&spec, "GrpcWebConfig", &config, false);
         assert!(

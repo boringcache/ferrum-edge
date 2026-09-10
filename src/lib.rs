@@ -11145,7 +11145,19 @@ pub mod _test_support {
         http_status: u16,
         initial_terminal_metadata: Option<HashMap<String, String>>,
     ) -> crate::proxy::ProxyBody {
-        body.into_grpc_web_streaming(content_type, http_status, initial_terminal_metadata)
+        body.into_grpc_web_streaming(content_type, http_status, initial_terminal_metadata, false)
+    }
+
+    /// Same as [`proxy_body_into_grpc_web_streaming_for_test`], with the
+    /// non-gRPC HTTP error entity suppression the translation owner records for
+    /// an unframed backend error document.
+    pub fn proxy_body_into_grpc_web_streaming_suppressed_for_test(
+        body: crate::proxy::ProxyBody,
+        content_type: &str,
+        http_status: u16,
+        initial_terminal_metadata: Option<HashMap<String, String>>,
+    ) -> crate::proxy::ProxyBody {
+        body.into_grpc_web_streaming(content_type, http_status, initial_terminal_metadata, true)
     }
 
     pub fn take_streaming_initial_terminal_metadata_for_test(
