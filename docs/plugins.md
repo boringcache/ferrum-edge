@@ -2395,36 +2395,47 @@ Validates opaque or structured OAuth2 bearer tokens against RFC 7662 introspecti
 
 | Parameter | Type | Description |
 |---|---|---|
-| `providers` | Array | Introspection provider configurations (required) |
+| `providers` | Array | Introspection provider configurations (required, 1–16 entries) |
 | `allow_provider_fanout` | Boolean | Submit an Authorization bearer token to multiple providers (default `false`). Enable only when all providers share one credential trust boundary |
-| `providers[].introspection_endpoint` | String | Direct token introspection endpoint URL (`https` required for non-loopback hosts) |
-| `providers[].discovery_url` | String | OIDC discovery URL used to resolve `introspection_endpoint` (`https` required for non-loopback hosts) |
-| `providers[].issuer` | String (optional) | Expected `iss` claim in active introspection responses |
+| `providers[].introspection_endpoint` | String | Direct token introspection endpoint URL (`https` required for non-loopback hosts). Exactly one of this or `discovery_url` |
+| `providers[].discovery_url` | String | OIDC discovery URL used to resolve `introspection_endpoint` (`https` required for non-loopback hosts). Exactly one of this or `introspection_endpoint` |
+| `providers[].issuer` | String (optional) | Expected `iss` claim in active introspection responses; also the `aud` of `private_key_jwt` client assertions |
 | `providers[].audiences` | String[] (optional) | Accepted `aud` values; OR-matched |
-| `providers[].client_auth.method` | String | `client_secret_basic`, `client_secret_post`, `private_key_jwt`, or `none` |
-| `providers[].client_auth.client_id` | String | OAuth client ID for authenticated methods |
-| `providers[].client_auth.client_secret` | String | Client secret for `client_secret_basic` or `client_secret_post` |
-| `providers[].client_auth.private_key_pem` | String | PEM private key for `private_key_jwt` |
-| `providers[].client_auth.private_key_jwt_alg` | String | `RS256`, `RS384`, `RS512`, `ES256`, `ES384`, or `EdDSA` |
+| `providers[].client_auth.method` | String | `client_secret_basic` (default), `client_secret_post`, `private_key_jwt`, or `none` |
+| `providers[].client_auth.client_id` | String | OAuth client ID; required for every method except `none` |
+| `providers[].client_auth.client_secret` | String | Client secret; required for `client_secret_basic` and `client_secret_post` |
+| `providers[].client_auth.private_key_pem` | String | PEM private key; required for `private_key_jwt`. Must be usable with `private_key_jwt_alg` |
+| `providers[].client_auth.private_key_jwt_alg` | String | `RS256` (default), `RS384`, `RS512`, `ES256`, `ES384`, or `EdDSA` |
 | `providers[].client_auth.private_key_jwt_kid` | String (optional) | Optional `kid` for private key JWT assertions |
-| `providers[].from_headers` | Array (optional) | Header token locations, each `{ "name": "...", "prefix": "..." }` |
+| `providers[].from_headers` | Array (optional) | Header token locations, each `{ "name": "...", "prefix": "..." }`. `prefix` may be `null` or omitted for "no prefix" |
 | `providers[].from_params` | String[] (optional) | Query parameter token locations |
+| `providers[].token_hint_param` | String or null (optional) | Sent as the RFC 7662 `token_type_hint` form field on every introspection request (for example `access_token`). `null` or omitted sends no hint |
 | `providers[].forward_original_token` | Boolean | Forward the original token-bearing header/query param (default `true`) |
-| `providers[].positive_cache_ttl_secs` | u64 | Active-token cache TTL cap (default `60`) |
-| `providers[].negative_cache_ttl_secs` | u64 | Inactive-token cache TTL (default `10`) |
+| `providers[].positive_cache_ttl_secs` | u64 | Active-token cache TTL cap (default `60`, range `0..=86400`; `0` disables positive caching) |
+| `providers[].negative_cache_ttl_secs` | u64 | Inactive-token cache TTL (default `10`, range `0..=300`; `0` disables negative caching) |
 | `providers[].max_cache_entries` | usize | Per-provider entry ceiling (default `10000`, range `100..=100000`) |
 | `providers[].max_cache_entry_bytes` | usize | Maximum normalized active result retained for one token (default `16384`, range `256..=65536`) |
 | `providers[].max_cache_total_bytes` | usize | Total per-provider retained cache bytes, including fixed eviction indexes and entry/key state (default `16777216`, range `1048576..=67108864`) |
-| `providers[].request_timeout_ms` | u64 | Introspection request timeout (default `5000`) |
+| `providers[].request_timeout_ms` | u64 | Introspection request timeout (default `5000`, range `100..=30000`) |
 | `providers[].required_scopes` | String[] (optional) | Scopes that must all be present |
 | `providers[].required_roles` | String[] (optional) | Roles where any one must be present |
+| `providers[].scope_claim` | String (optional) | Per-provider override of the global `scope_claim` |
+| `providers[].role_claim` | String (optional) | Per-provider override of the global `role_claim` |
+| `providers[].consumer_identity_claim` | String (optional) | Per-provider override of the global `consumer_identity_claim` |
+| `providers[].consumer_header_claim` | String (optional) | Per-provider override of the global `consumer_header_claim` |
 | `providers[].claim_headers` | Object (optional) | Claim-to-header mappings; keys are claim paths and values are upstream header names |
 | `scope_claim` | String | Global scope claim path (default: `"scope"`) |
 | `role_claim` | String | Global role claim path (default: `"roles"`) |
 | `consumer_identity_claim` | String | Global claim used for consumer lookup (default: `"username"`) |
-| `consumer_header_claim` | String | Global claim used for `X-Consumer-Username` when no consumer maps |
+| `consumer_header_claim` | String | Global claim used for `X-Consumer-Username` when no consumer maps; defaults to the effective `consumer_identity_claim` |
+
+Every claim path is a dot path (`realm_access.roles`) with no empty segments, and every non-empty string list entry is trimmed and must not be blank. A provider override replaces the global value for that provider only.
 
 Credentialed `client_auth.method` values (`client_secret_basic`, `client_secret_post`, `private_key_jwt`) require an `https` `introspection_endpoint`/`discovery_url` when the host is not loopback/localhost; `http` is only accepted for loopback endpoints so client credentials are never sent over plaintext to a remote host. The `none` method is loopback-only regardless of scheme. `client_secret_basic` form-encodes the client ID and secret separately before constructing the Basic credential, as required by OAuth 2.0. Discovery-provided introspection endpoints must use the discovery URL's exact origin (scheme, normalized host, and effective port). Claim header mappings reject reserved headers.
+
+`private_key_jwt` proves the configured key at config load, not at request time: the constructor signs one throwaway assertion with `private_key_pem` and `private_key_jwt_alg` and rejects the provider if that fails. An EC curve that does not match the selected algorithm (a P-384 key with `ES256`, a P-256 key with `ES384`) and an RSA key below the signing backend's minimum modulus are therefore configuration errors, instead of a configuration that validates and then returns `503` on every request without ever contacting the provider. The probe performs no network I/O and starts no background task.
+
+Configured endpoint URLs may carry a credential in their path or query. The gateway's own operational diagnostics — slow-call warnings, transport retries, and egress-policy denials from the shared plugin HTTP client — record only the endpoint origin (scheme, host, port), and discovery failures are reported as an error class rather than a formatted transport error. The complete URL is still used for the request itself.
 
 Configuration is strict at the plugin, provider, client-auth, and header-location layers: unknown fields reject validation and reload. At most 16 providers and 8 KiB bearer tokens are accepted. Introspection work is capped at 32 concurrent calls per provider and 128 process-wide; identical in-flight token checks are coalesced by a SHA-256 token key. Introspection responses are capped at 64 KiB and discovery documents at 128 KiB.
 
@@ -3509,13 +3520,13 @@ Delegates HTTP-family request authorization to [Open Policy Agent](https://www.o
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `opa_host` | String | **required** | Base OPA URL, `http://` or `https://`. Do not include URL credentials; use `headers` for OPA auth. |
+| `opa_host` | String | **required** | Base OPA URL, `http://` or `https://`. URL credentials, a query string, and a fragment are rejected; use `headers` for OPA auth. A base path is accepted and is prepended to `/v1/data/{policy_path}`. |
 | `policy_path` | String | **required** | OPA data path appended under `/v1/data/`, for example `ferrum/authz/allow`. Must not start with `/`, contain percent-encoding, or contain empty, `.`, or `..` path segments. |
 | `headers` | Object | `{}` | Static headers sent to OPA on every decision request. `content-type` is managed by the plugin and cannot be configured. |
 | `timeout_ms` | Integer | `1000` | Requested per-decision timeout. Every positive value is accepted; the effective timeout is capped at `30000` ms. |
-| `max_response_bytes` | Integer | `262144` | Maximum decoded OPA response size. Oversized declared or streamed responses use the configured fail posture. |
+| `max_response_bytes` | Integer or null | `262144` | Maximum decoded OPA response size. Oversized declared or streamed responses use the configured fail posture. An explicit `null` selects the default, exactly like omitting the key. |
 | `fail_open` | Boolean | `false` | Continue the request when OPA is unavailable, times out, returns non-2xx, returns malformed JSON, or exceeds `max_response_bytes`. |
-| `fail_closed` | Boolean | `true` | Inverse of `fail_open`, accepted for explicit fail-closed configs. Do not set both fields. |
+| `fail_closed` | Boolean | `true` | Inverse of `fail_open`, accepted for explicit fail-closed configs. Configuring both fields is rejected at config load, even when the two values agree. |
 | `deny_status` | Integer | `403` | HTTP 4xx/5xx status returned when OPA returns a policy denial. |
 | `deny_body` | String | `{"error":"forbidden by policy"}` | Response body returned on policy denial. |
 | `deny_headers` | Object | `{}` | Headers added to the policy-denial response. Names and values are validated at config load; protocol-managed hop-by-hop / framing destinations (`Connection`, `Content-Length`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, case-insensitive) are rejected — see [Final response framing](#final-response-framing). |
@@ -3529,15 +3540,15 @@ Delegates HTTP-family request authorization to [Open Policy Agent](https://www.o
 | `include_query_credentials` | Boolean | `false` | Unsafe opt-in to send built-in and authentication-plugin-marked query credentials to OPA. Explicit `redact_query_keys` remain omitted. |
 | `include_headers` | Boolean | `true` | Include request headers as `input.headers` after redaction. |
 | `include_body` | Boolean | `false` | After authentication succeeds, buffer and forward the request body. UTF-8 bodies use `input.body`; non-UTF-8 raw bytes use `input.body_base64`. |
-| `max_body_bytes` | Integer | `1048576` | Positive plugin-local request-body ceiling for `include_body`. The strictest of this value and the positive global limit applies; it remains bounded when the global limit is `0`. |
+| `max_body_bytes` | Integer or null | `1048576` | Positive plugin-local request-body ceiling for `include_body`. The strictest of this value and the positive global limit applies; it remains bounded when the global limit is `0`. An explicit `null` selects the default, exactly like omitting the key. |
 | `include_consumer` | Boolean | `true` | Include mapped Consumer data or external authenticated identity. |
 | `include_client_ip` | Boolean | `true` | Include `input.client_ip`. |
 | `include_service` | Boolean | `true` | Include matched proxy/service data. |
 | `query_ambiguity_policy` | String | `reject` | What to do when the query cannot be decoded to one value OPA and the backend are guaranteed to read identically. `reject` denies with `deny_status` / `deny_body` before calling OPA. `delegate` calls OPA anyway and lets Rego decide from `input.query_pairs` + `input.query_ambiguity`; `input.query` is omitted in that case, and the policy itself must deny on a classification it does not handle. |
-| `redact_headers` | String[] | built-ins | Additional request headers to omit from `input.headers`; built-in sensitive headers and active authentication credential headers are always omitted. |
+| `redact_headers` | String[] | built-ins | Additional request headers to omit from `input.headers`; entries must be non-empty valid HTTP header names. Built-in sensitive headers and active authentication credential headers are always omitted. |
 | `redact_query_keys` | String[] | `[]` | Additional query parameter names to omit from `input.query` and `input.query_pairs`, matched case-insensitively. Built-in credential names and query locations used by authentication plugins are omitted automatically. |
 
-Unknown or misspelled top-level OPA config keys are rejected at config load.
+Unknown or misspelled top-level OPA config keys are rejected at config load. `policy_path` must be non-empty, must not start with `/`, and must contain no percent-encoding, `?`, `#`, or empty / `.` / `..` segments. `headers`, `deny_headers`, and `fail_closed_headers` names must be HTTP tokens and their values visible ASCII; `headers` additionally rejects `content-type` (case-insensitively), and the two response maps reject protocol-managed hop-by-hop and framing destinations.
 
 #### Query canonicalization (advisories GHSA-j2j6-f9c7-hh85, GHSA-gr4p-3qw3-87r5)
 
@@ -3573,6 +3584,8 @@ Built-in request-header redaction always removes `authorization`, `proxy-authori
 `include_body` collection occurs only after authentication succeeds, so a `401` does not retain an OPA body copy. OPA's positive `max_body_bytes` limit is always enforced, including when `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0`. Successful OPA responses are streamed through the positive `max_response_bytes` ceiling before JSON parsing; body contents are never written to OPA error logs.
 
 The outbound OPA call uses the shared `PluginHttpClient`, so it shares connection pooling, DNS cache warmup, slow-call telemetry, and global outbound TLS settings such as `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`. Per-proxy backend TLS overrides do not apply; see [configuration.md#tls--mtls](configuration.md#tls--mtls).
+
+The measured boundary is the **complete decision**, not just its response headers. `latency_plugin_external_io_ms` and the `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS` slow-call warning both cover the request round trip plus the bounded read of the decision body, including a body read that fails, because the authorization decision is not made until the whole document has arrived. JSON parsing and policy evaluation happen after that boundary and are not counted as network I/O. The decision URL is recorded in those diagnostics as its origin only (scheme, host, port), so a credential in a configured base path never reaches process logs.
 
 ```yaml
 plugin_name: opa

@@ -13114,3 +13114,404 @@ fn merge_into_object(target: &mut serde_json::Value, extra: &serde_json::Value) 
         target.insert(key.clone(), value.clone());
     }
 }
+
+/// One table, both directions: every row must be admitted — or refused — by
+/// the published component and by the constructor alike.
+///
+/// The component is what generated clients, config forms, and external
+/// validation tooling enforce, so a row either side accepts alone is a config
+/// an operator can be told is valid and then cannot start (issue #5013).
+#[test]
+fn oauth2_introspection_schema_and_constructor_admit_the_same_configs() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::oauth2_introspection::Oauth2Introspection;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    // Every provider override the constructor accepts must be representable.
+    let provider_properties = spec
+        .pointer(
+            "/components/schemas/Oauth2IntrospectionConfig/properties/providers/items/properties",
+        )
+        .and_then(serde_json::Value::as_object)
+        .expect("OAuth2 introspection provider properties exist");
+    for field in [
+        "token_hint_param",
+        "scope_claim",
+        "role_claim",
+        "consumer_identity_claim",
+        "consumer_header_claim",
+    ] {
+        assert!(
+            provider_properties.contains_key(field),
+            "the provider schema must declare the accepted key {field}"
+        );
+    }
+
+    // Loopback endpoints keep `client_auth.method: none` admissible, so the
+    // rows below isolate the field under test.
+    let loopback = "http://127.0.0.1:32123/introspect";
+    let provider = |patch: serde_json::Value| -> serde_json::Value {
+        let mut object = json!({
+            "introspection_endpoint": loopback,
+            "client_auth": {"method": "none"}
+        });
+        let object_map = object.as_object_mut().expect("provider object");
+        for (key, value) in patch.as_object().expect("patch object") {
+            object_map.insert(key.clone(), value.clone());
+        }
+        json!({"providers": [object]})
+    };
+
+    let cases = [
+        ("minimal loopback provider", provider(json!({})), true),
+        (
+            "documented https example",
+            json!({"providers": [{
+                "introspection_endpoint": "https://idp.example.com/oauth2/introspect",
+                "issuer": "https://idp.example.com/",
+                "audiences": ["api://edge"],
+                "client_auth": {
+                    "method": "client_secret_basic",
+                    "client_id": "ferrum-edge",
+                    "client_secret": "introspection-client-secret"
+                },
+                "required_scopes": ["orders:read"],
+                "claim_headers": {"sub": "X-Authenticated-Subject"}
+            }]}),
+            true,
+        ),
+        ("empty provider", json!({"providers": [{}]}), false),
+        (
+            "both endpoints",
+            json!({"providers": [{
+                "introspection_endpoint": loopback,
+                "discovery_url": "http://127.0.0.1:32123/.well-known/openid-configuration",
+                "client_auth": {"method": "none"}
+            }]}),
+            false,
+        ),
+        (
+            "discovery only",
+            json!({"providers": [{
+                "discovery_url": "http://127.0.0.1:32123/.well-known/openid-configuration",
+                "client_auth": {"method": "none"}
+            }]}),
+            true,
+        ),
+        (
+            "client_auth omitted",
+            json!({"providers": [{"introspection_endpoint": loopback}]}),
+            false,
+        ),
+        (
+            "client_secret_basic without credentials",
+            json!({"providers": [{
+                "introspection_endpoint": loopback,
+                "client_auth": {"method": "client_secret_basic"}
+            }]}),
+            false,
+        ),
+        (
+            "unused client_auth key of the wrong type",
+            json!({"providers": [{
+                "introspection_endpoint": loopback,
+                "client_auth": {"method": "none", "client_secret": 123}
+            }]}),
+            false,
+        ),
+        (
+            "timeout below range",
+            provider(json!({"request_timeout_ms": 99})),
+            false,
+        ),
+        (
+            "timeout zero",
+            provider(json!({"request_timeout_ms": 0})),
+            false,
+        ),
+        (
+            "timeout above range",
+            provider(json!({"request_timeout_ms": 30001})),
+            false,
+        ),
+        (
+            "timeout in range",
+            provider(json!({"request_timeout_ms": 5000})),
+            true,
+        ),
+        (
+            "positive TTL above range",
+            provider(json!({"positive_cache_ttl_secs": 86401})),
+            false,
+        ),
+        (
+            "positive TTL disabled",
+            provider(json!({"positive_cache_ttl_secs": 0})),
+            true,
+        ),
+        (
+            "negative TTL above range",
+            provider(json!({"negative_cache_ttl_secs": 301})),
+            false,
+        ),
+        ("blank issuer", provider(json!({"issuer": ""})), false),
+        (
+            "blank audience",
+            provider(json!({"audiences": [""]})),
+            false,
+        ),
+        (
+            "blank query location",
+            provider(json!({"from_params": [""]})),
+            false,
+        ),
+        (
+            "claim path with an empty segment",
+            provider(json!({"scope_claim": "x..y"})),
+            false,
+        ),
+        (
+            "claim header targeting a reserved name",
+            provider(json!({"claim_headers": {"sub": "authorization"}})),
+            false,
+        ),
+        (
+            "claim header with an invalid name",
+            provider(json!({"claim_headers": {"sub": "bad header"}})),
+            false,
+        ),
+        (
+            "token location with an invalid header name",
+            provider(json!({"from_headers": [{"name": "bad header"}]})),
+            false,
+        ),
+        (
+            "token location with a null prefix",
+            provider(json!({"from_headers": [{"name": "x-token", "prefix": null}]})),
+            true,
+        ),
+        (
+            "blank token hint",
+            provider(json!({"token_hint_param": ""})),
+            false,
+        ),
+        (
+            "null token hint",
+            provider(json!({"token_hint_param": null})),
+            true,
+        ),
+        (
+            "token hint",
+            provider(json!({"token_hint_param": "access_token"})),
+            true,
+        ),
+        (
+            "unsupported endpoint scheme",
+            provider(json!({"introspection_endpoint": "file:///tmp/x"})),
+            false,
+        ),
+        (
+            "unparseable endpoint",
+            provider(json!({"introspection_endpoint": "nonsense"})),
+            false,
+        ),
+        (
+            "empty endpoint",
+            provider(json!({"introspection_endpoint": ""})),
+            false,
+        ),
+        (
+            "unknown provider key",
+            provider(json!({"introspection_endpoiint": loopback})),
+            false,
+        ),
+        (
+            "blank global claim path",
+            json!({"providers": [{
+                "introspection_endpoint": loopback,
+                "client_auth": {"method": "none"}
+            }], "scope_claim": ""}),
+            false,
+        ),
+    ];
+
+    for (label, config, expected_valid) in cases {
+        assert_component_validity(&spec, "Oauth2IntrospectionConfig", &config, expected_valid);
+        let constructed = Oauth2Introspection::new(&config, PluginHttpClient::default());
+        assert_eq!(
+            constructed.is_ok(),
+            expected_valid,
+            "{label}: constructor disagrees with the component; error: {:?}",
+            constructed.err()
+        );
+    }
+}
+
+/// The OPA counterpart of the table above (issue #5058).
+///
+/// `max_cache_total_bytes`-style cross-field rules stay runtime-only and are
+/// documented rather than modelled; every row here is expressible in both.
+#[test]
+fn opa_schema_and_constructor_admit_the_same_configs() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::opa::Opa;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let base = |patch: serde_json::Value| -> serde_json::Value {
+        let mut config = json!({
+            "opa_host": "http://127.0.0.1:8181",
+            "policy_path": "ferrum/authz/allow"
+        });
+        let config_map = config.as_object_mut().expect("config object");
+        for (key, value) in patch.as_object().expect("patch object") {
+            config_map.insert(key.clone(), value.clone());
+        }
+        config
+    };
+
+    let cases = [
+        ("minimal", base(json!({})), true),
+        (
+            "null response ceiling",
+            base(json!({"max_response_bytes": null})),
+            true,
+        ),
+        (
+            "null body ceiling",
+            base(json!({"max_body_bytes": null})),
+            true,
+        ),
+        (
+            "zero response ceiling",
+            base(json!({"max_response_bytes": 0})),
+            false,
+        ),
+        (
+            "zero body ceiling",
+            base(json!({"max_body_bytes": 0})),
+            false,
+        ),
+        (
+            "both fail-posture flags",
+            base(json!({"fail_open": false, "fail_closed": true})),
+            false,
+        ),
+        ("fail_open alone", base(json!({"fail_open": true})), true),
+        (
+            "fail_closed alone",
+            base(json!({"fail_closed": true})),
+            true,
+        ),
+        (
+            "timeout above the clamp",
+            base(json!({"timeout_ms": 30001})),
+            true,
+        ),
+        ("empty policy path", base(json!({"policy_path": ""})), false),
+        (
+            "absolute policy path",
+            base(json!({"policy_path": "/audit/allow"})),
+            false,
+        ),
+        (
+            "empty policy segment",
+            base(json!({"policy_path": "audit//allow"})),
+            false,
+        ),
+        (
+            "percent-encoded policy path",
+            base(json!({"policy_path": "audit%2Fallow"})),
+            false,
+        ),
+        (
+            "policy path with a query",
+            base(json!({"policy_path": "audit/allow?x=y"})),
+            false,
+        ),
+        (
+            "policy path with a fragment",
+            base(json!({"policy_path": "audit/allow#x"})),
+            false,
+        ),
+        (
+            "dot policy segment",
+            base(json!({"policy_path": "a/./b"})),
+            false,
+        ),
+        (
+            "unsupported host scheme",
+            base(json!({"opa_host": "ftp://localhost"})),
+            false,
+        ),
+        (
+            "host with a query",
+            base(json!({"opa_host": "http://127.0.0.1:8181?x=y"})),
+            false,
+        ),
+        (
+            "host with credentials",
+            base(json!({"opa_host": "http://user:pass@127.0.0.1:8181"})),
+            false,
+        ),
+        (
+            "host with a base path",
+            base(json!({"opa_host": "http://127.0.0.1:8181/base"})),
+            true,
+        ),
+        (
+            "outbound content-type override",
+            base(json!({"headers": {"Content-Type": "text/plain"}})),
+            false,
+        ),
+        (
+            "invalid outbound header name",
+            base(json!({"headers": {"Bad Header": "x"}})),
+            false,
+        ),
+        (
+            "protocol-managed deny header",
+            base(json!({"deny_headers": {"Content-Length": "3"}})),
+            false,
+        ),
+        (
+            "protocol-managed fail-closed header",
+            base(json!({"fail_closed_headers": {"Connection": "close"}})),
+            false,
+        ),
+        (
+            "ordinary deny header",
+            base(json!({"deny_headers": {"X-Policy": "denied"}})),
+            true,
+        ),
+        (
+            "blank redaction name",
+            base(json!({"redact_headers": [""]})),
+            false,
+        ),
+        (
+            "invalid redaction name",
+            base(json!({"redact_headers": ["Bad Header"]})),
+            false,
+        ),
+        (
+            "unknown key",
+            base(json!({"decision_pointr": ["result"]})),
+            false,
+        ),
+    ];
+
+    for (label, config, expected_valid) in cases {
+        assert_component_validity(&spec, "OpaPluginConfig", &config, expected_valid);
+        let constructed = Opa::new(&config, PluginHttpClient::default());
+        assert_eq!(
+            constructed.is_ok(),
+            expected_valid,
+            "{label}: constructor disagrees with the component; error: {:?}",
+            constructed.err()
+        );
+    }
+}
