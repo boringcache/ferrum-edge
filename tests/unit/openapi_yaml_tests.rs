@@ -1921,6 +1921,12 @@ fn access_control_schema_matches_runtime_validation() {
             "runtime should reject schema-invalid config: {config}"
         );
     }
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    assert!(
+        plugin_docs.contains("at most 255 Unicode characters"),
+        "access_control docs must state the 255-character username and group limits"
+    );
 }
 
 #[test]
@@ -3803,6 +3809,7 @@ fn plugin_config_schema_applies_plugin_specific_config() {
 
     for (plugin_name, config) in [
         ("correlation_id", json!({})),
+        ("security_headers", json!({})),
         ("bot_detection", json!({})),
         ("udp_rate_limiting", json!({"datagrams_per_second": 100})),
         (
@@ -3835,6 +3842,12 @@ fn plugin_config_schema_applies_plugin_specific_config() {
         ("correlation_id", Some(serde_json::Value::Null)),
         ("correlation_id", Some(json!([]))),
         ("correlation_id", Some(json!({"echo_downsteam": false}))),
+        ("security_headers", None),
+        ("security_headers", Some(serde_json::Value::Null)),
+        (
+            "security_headers",
+            Some(json!({"set": {"Content-Length": "ordinary"}})),
+        ),
         ("bot_detection", None),
         ("bot_detection", Some(serde_json::Value::Null)),
         ("bot_detection", Some(json!([]))),
@@ -5015,6 +5028,8 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
         json!({"header_name": "x-request-id", "echo_downstream": false}),
         json!({"header_name": "X-Correlation-ID", "echo_downstream": true}),
         json!({"header_name": " X-Trimmed-ID "}),
+        json!({"header_name": "\u{0085}x-audit\u{0085}"}),
+        json!({"header_name": "a".repeat(65_535)}),
         json!({"header_name": null, "echo_downstream": null}),
     ] {
         assert_component_validity(&spec, "CorrelationIdConfig", &valid, true);
@@ -5030,6 +5045,8 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
         json!(true),
         json!({"echo_downsteam": false}),
         json!({"header_name": "x:request-id"}),
+        json!({"header_name": "\u{feff}x-audit\u{feff}"}),
+        json!({"header_name": "a".repeat(65_536)}),
         json!({"header_name": 42}),
         json!({"echo_downstream": "true"}),
         json!({"header_name": "API-Key"}),
@@ -5982,6 +5999,10 @@ fn ip_restriction_schema_matches_the_strict_runtime_shape() {
         json!({"allow": ["10.0.0.0/8"]}),
         json!({"allow": [], "deny": ["192.0.2.0/24"]}),
         json!({"allow": ["2001:db8::/32"], "deny": [], "mode": "deny_first"}),
+        json!({"allow": ["0.0.0.0/0", "255.255.255.255/32"]}),
+        json!({"allow": ["::/0", "2001:db8::1/128"]}),
+        json!({"allow": ["::ffff:127.0.0.1/96", "::ffff:127.0.0.1/128"]}),
+        json!({"allow": [" [::1] ", " fe80::1%eth0/64 "]}),
     ] {
         assert_component_validity(&spec, "IpRestrictionConfig", &config, true);
         assert!(
@@ -6003,6 +6024,13 @@ fn ip_restriction_schema_matches_the_strict_runtime_shape() {
         json!({"allow": "10.0.0.0/8"}),
         json!({"allow": [""]}),
         json!({"allow": ["   "]}),
+        json!({"allow": ["not-an-ip"]}),
+        json!({"allow": ["300.1.1.1"]}),
+        json!({"allow": ["127.0.0.1/33"]}),
+        json!({"allow": ["::/129"]}),
+        json!({"allow": ["::ffff:127.0.0.1/95"]}),
+        json!({"allow": ["010.1.2.3"]}),
+        json!({"allow": ["+10.1.2.3"]}),
     ] {
         assert_component_validity(&spec, "IpRestrictionConfig", &config, false);
         assert!(
@@ -7912,6 +7940,53 @@ fn adaptive_concurrency_schema_rejects_unknown_config_keys() {
         validator.validate(&json!({"max_limt": 32})).is_err(),
         "schema must reject unknown adaptive_concurrency policy keys"
     );
+
+    for field in [
+        "max_tracked_keys",
+        "min_limit",
+        "initial_limit",
+        "max_limit",
+        "min_samples",
+        "increase_step",
+    ] {
+        assert_eq!(
+            schema["properties"][field]["maximum"],
+            json!(u64::MAX),
+            "{field} must publish the u64 maximum"
+        );
+        assert_eq!(schema["properties"][field]["format"], json!("uint64"));
+        let mut at_max = serde_json::Map::new();
+        at_max.insert(field.to_string(), json!(u64::MAX));
+        assert_component_validity(
+            &spec,
+            "AdaptiveConcurrencyConfig",
+            &serde_json::Value::Object(at_max),
+            true,
+        );
+        let above_json = format!(r#"{{"{field}": 18446744073709551616}}"#);
+        let above = serde_json::from_str(&above_json)
+            .unwrap_or_else(|error| panic!("{field} 2^64 JSON number parses: {error}"));
+        assert_component_validity(&spec, "AdaptiveConcurrencyConfig", &above, false);
+        let mut admitted = json!({
+            "min_limit": 1,
+            "initial_limit": 32,
+            "max_limit": 1024,
+            "max_tracked_keys": 10000,
+            "min_samples": 20,
+            "increase_step": 1
+        });
+        admitted[field] = json!(u64::MAX);
+        if matches!(field, "min_limit" | "initial_limit") {
+            admitted["initial_limit"] = json!(u64::MAX);
+            admitted["max_limit"] = json!(u64::MAX);
+        }
+        ferrum_edge::plugins::validate_plugin_config("adaptive_concurrency", &admitted)
+            .unwrap_or_else(|error| panic!("{field}=u64::MAX must be admitted: {error}"));
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("adaptive_concurrency", &above).is_err(),
+            "{field} above u64 must be rejected at runtime"
+        );
+    }
 }
 
 #[test]
@@ -9047,6 +9122,8 @@ fn ai_response_guard_schema_matches_strict_runtime_constraints() {
 
 #[test]
 fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
+    use ferrum_edge::plugins::security_headers::SecurityHeaders;
+
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
     let schema = spec
@@ -9103,6 +9180,64 @@ fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
     ] {
         assert_component_validity(&spec, "SecurityHeadersConfig", &non_ascii_value, false);
     }
+
+    for valid in [
+        json!({}),
+        json!({"override_existing": null}),
+        json!({"hsts": {"max_age": null, "include_subdomains": null, "preload": null}}),
+        json!({"hsts": {"max_age": u64::MAX}}),
+    ] {
+        assert_component_validity(&spec, "SecurityHeadersConfig", &valid, true);
+        SecurityHeaders::new(&valid).unwrap_or_else(|error| {
+            panic!("schema-valid security_headers config {valid} failed runtime: {error}")
+        });
+    }
+
+    for invalid in [
+        json!({"set": {"Content-Length": "ordinary"}}),
+        json!({"set": {"Connection": "close"}}),
+        json!({"set": {"Keep-Alive": "timeout=5"}}),
+        json!({"set": {"Proxy-Authenticate": "Basic"}}),
+        json!({"set": {"Proxy-Connection": "close"}}),
+        json!({"set": {"TE": "trailers"}}),
+        json!({"set": {"Trailer": "X-Checksum"}}),
+        json!({"set": {"Transfer-Encoding": "chunked"}}),
+        json!({"set": {"Upgrade": "websocket"}}),
+        json!({
+            "content_type_options": false,
+            "frame_options": false,
+            "referrer_policy": false,
+            "remove": []
+        }),
+        json!({
+            "content_type_options": "",
+            "frame_options": "",
+            "referrer_policy": "",
+            "remove": null
+        }),
+    ] {
+        assert_component_validity(&spec, "SecurityHeadersConfig", &invalid, false);
+        assert!(
+            SecurityHeaders::new(&invalid).is_err(),
+            "schema-invalid security_headers config passed runtime: {invalid}"
+        );
+    }
+
+    assert_eq!(
+        schema["properties"]["hsts"]["oneOf"][3]["properties"]["max_age"]["maximum"],
+        json!(u64::MAX)
+    );
+    let above_hsts = serde_json::from_str(r#"{"hsts":{"max_age":18446744073709551616}}"#)
+        .expect("2^64 JSON number parses");
+    assert_component_validity(&spec, "SecurityHeadersConfig", &above_hsts, false);
+    assert!(
+        SecurityHeaders::new(&above_hsts).is_err(),
+        "hsts.max_age above u64 must be rejected at runtime"
+    );
+    assert!(
+        SecurityHeaders::new(&json!({"hsts": {"max_age": 1.0}})).is_err(),
+        "hsts.max_age JSON floats must be rejected at runtime"
+    );
 }
 
 #[test]
@@ -9264,6 +9399,28 @@ fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract()
         "TcpConnectionThrottleConfig",
         &json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 86401}),
         false,
+    );
+    assert_eq!(
+        schema["properties"]["max_connections_per_key"]["maximum"],
+        json!(u64::MAX)
+    );
+    assert_component_validity(
+        &spec,
+        "TcpConnectionThrottleConfig",
+        &json!({"max_connections_per_key": u64::MAX}),
+        true,
+    );
+    let above = serde_json::from_str(r#"{"max_connections_per_key": 18446744073709551616}"#)
+        .expect("2^64 JSON number parses");
+    assert_component_validity(&spec, "TcpConnectionThrottleConfig", &above, false);
+    ferrum_edge::plugins::validate_plugin_config(
+        "tcp_connection_throttle",
+        &json!({"max_connections_per_key": u64::MAX}),
+    )
+    .expect("u64::MAX connection limit must be admitted");
+    assert!(
+        ferrum_edge::plugins::validate_plugin_config("tcp_connection_throttle", &above).is_err(),
+        "connection limit above u64 must be rejected at runtime"
     );
     for text in [schema_text.as_str(), plugin_docs, cache_docs] {
         assert!(
