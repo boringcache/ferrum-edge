@@ -1825,6 +1825,27 @@ construction rather than silently omitting that dimension and billing at
 zero. Nested `bandwidth_pricing` and `stream_connection_pricing` objects are
 likewise closed.
 
+**Precise admission rules.** "At least one block" means *effective* pricing, not
+merely a present key: a nonempty `pricing_tiers` array qualifies even when every
+`price_per_call` is `0` (an explicitly zero-priced tier still meters calls), but
+a bandwidth-only or stream-only configuration must price something **above**
+zero — `{"bandwidth_pricing":{}}`, `{"bandwidth_pricing":{"price_per_byte_sent":0}}`,
+and `{"stream_connection_pricing":{"price_per_connection":0}}` all record nothing
+and are rejected. `currency` is trimmed and must not be empty or whitespace-only.
+Every `pricing_tiers[].status_codes` entry must be a real HTTP status in
+`100–599`, distinct within its tier, and must not repeat across tiers.
+`render_cache_ttl_seconds`, `stale_entry_ttl_seconds`,
+`cache_invalidation_min_age_ms`, `cleanup_interval_seconds`, `max_entries`, and
+`max_retained_bytes` must each be an unsigned 64-bit integer — a negative,
+fractional, or over-wide value fails construction. `schema` and `schema_ref` are
+mutually exclusive, and the inline `schema` is the billing-row projection, so
+`summary_type`, `timestamp_format`, `metadata`, `order`, and every derived kind
+except `summary_kind` are rejected for it. Two constraints stay runtime-only
+because they need state the config document does not carry: a `schema_ref` must
+name a definition some `transaction_log_schema` plugin registered, and every
+enabled instance must resolve to the same shared tunables and the same
+projection.
+
 Charges accumulate in-memory and are exposed via the admin `/charges` endpoint
 in both Prometheus text and JSON formats for external billing system
 integration.
@@ -1863,20 +1884,53 @@ or operator-configured Consumer username — including one equal to the
 human-looking label `__cardinality_overflow__` or to the sentinel string
 itself.
 Already-admitted rows keep accumulating normally and capacity is recovered
-by ordinary `stale_entry_ttl_seconds` eviction. Admission pressure is exported
+by ordinary `stale_entry_ttl_seconds` eviction, subject to the collection
+contract below. Admission pressure is exported
 as fixed-cardinality, identity-free series
 (`ferrum_api_chargeback_registry_entries`,
 `ferrum_api_chargeback_registry_max_entries`,
 `ferrum_api_chargeback_registry_retained_bytes`,
 `ferrum_api_chargeback_registry_max_retained_bytes`,
 `ferrum_api_chargeback_identity_overflow_total`,
-`ferrum_api_chargeback_dropped_charges_total`) and as the `registry` object in
-the JSON format. `dropped_charges_total` is the only genuine loss path: it can
+`ferrum_api_chargeback_dropped_charges_total`,
+`ferrum_api_chargeback_uncollected_retained_entries`) and as the `registry`
+object in the JSON format. `dropped_charges_total` is the only genuine loss path: it can
 advance only when even the aggregate row cannot reserve bytes, which means
 `max_retained_bytes` is set below the space the configured proxy/status matrix
 needs. Because `/charges` renders the whole registry in one pass, render cost is
 bounded by `max_entries`; size it for the row cardinality you are willing to
 scrape.
+
+**Collection contract for idle-age eviction (issue #5276):** the in-memory
+registry is the authoritative ledger for `GET /charges` — there is no other
+copy of those call and byte counters, and the optional `api_chargeback_sink`
+plugin keeps its own independent accumulator rather than draining this one.
+`stale_entry_ttl_seconds` therefore marks a row *eligible* for eviction; it does
+not by itself delete one. A row is removed only once **a completed `/charges`
+export has already collected its current counters** — that is, the export
+started its registry walk after the row's last update, and the document it
+returned to the collector was accepted. Both eviction entrypoints share that
+rule: the periodic `cleanup_interval_seconds` task and the eviction pass each
+export runs before rendering. An idle row whose counters no export has seen is
+retained instead of discarded, and counted into
+`ferrum_api_chargeback_uncollected_retained_entries` / the JSON
+`registry.uncollected_retained_entries` field. A failed render (a non-finite
+monetary value) acknowledges nothing.
+
+Retention stays bounded: held rows keep their `max_entries` /
+`max_retained_bytes` reservations, and a registry at either ceiling folds
+further new rows into the fixed-cardinality aggregate overflow row exactly as
+before — the budgets, not the TTL, are what bound memory. A deployment that
+never scrapes `/charges` (for example one that bills only through
+`api_chargeback_sink`) will therefore see
+`uncollected_retained_entries` climb toward `max_entries` and then lose
+per-identity attribution to the overflow row rather than lose the charges
+themselves. If you do not intend to scrape `/charges`, do not enable this
+plugin. Counters remain cumulative and still reset to zero on gateway restart —
+this contract governs eviction while the process is running, not durability
+across restarts; use `api_chargeback_sink` when you need durable charge
+records.
+
 Neither budget accepts `0` — there is no unlimited mode. Budgets (and the other
 process-global tunables) are applied only once a plugin generation is accepted
 and installed, so admin validation and a rejected reload candidate never repoint
@@ -1950,7 +2004,7 @@ An explicit zero-price tier still counts matching calls. Successful H1, H2, and 
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `currency` | String | `"USD"` | Currency label included in Prometheus metrics and JSON output. Informational only — the plugin does not perform currency conversion. Scoped per plugin instance: each `api_chargeback` instance on a distinct proxy stamps its own currency onto the charges it records and emits it per row. Multiple effective instances on one proxy are rejected (exactly-once `/charges` accounting) |
+| `currency` | String | `"USD"` | Currency label included in Prometheus metrics and JSON output. Informational only — the plugin does not perform currency conversion. Trimmed at admission; an empty or whitespace-only value is rejected. Scoped per plugin instance: each `api_chargeback` instance on a distinct proxy stamps its own currency onto the charges it records and emits it per row. Multiple effective instances on one proxy are rejected (exactly-once `/charges` accounting) |
 | `pricing_tiers` | Array | _(optional)_ | Per-call HTTP-family pricing. Each tier maps ordinary HTTP status codes or canonical effective gRPC status mappings to a per-call price |
 | `pricing_tiers[].status_codes` | Array\<Integer\> | _(required inside a tier)_ | Billable status codes that trigger this tier's charge. Native gRPC and gRPC-Web terminal codes use the documented effective-HTTP mapping. A status code must appear in exactly one tier |
 | `pricing_tiers[].price_per_call` | Number | _(required inside a tier)_ | Charge per HTTP call (e.g. `0.00001`). Must be finite, non-negative, and ≤ `1e288` so `u64` counter × price stays finite in IEEE-754 binary64 |
@@ -1959,13 +2013,13 @@ An explicit zero-price tier still counts matching calls. Successful H1, H2, and 
 | `bandwidth_pricing.price_per_byte_received` | Number | `0.0` | Per-byte charge for bytes flowed backend→client. Finite, non-negative, ≤ `1e288` |
 | `stream_connection_pricing` | Object | _(optional)_ | Per-connection pricing for stream proxies (TCP/TCP+TLS/UDP/DTLS) |
 | `stream_connection_pricing.price_per_connection` | Number | _(required when block is set)_ | Per-session charge applied at stream disconnect. Finite, non-negative, ≤ `1e288` |
-| `render_cache_ttl_seconds` | Integer | `5` | How long the cached `/charges` response is served before rebuilding. Process-global: every enabled instance must use the same value |
-| `stale_entry_ttl_seconds` | Integer | `3600` | How long idle chargeback entries live before eviction. Process-global: every enabled instance must use the same value |
-| `cache_invalidation_min_age_ms` | Integer | `500` | Minimum age (ms) of the render cache before `record()` will invalidate it. Process-global: every enabled instance must use the same value |
-| `cleanup_interval_seconds` | Integer | `300` | How often (seconds) a background task evicts entries idle longer than `stale_entry_ttl_seconds`. Set to `0` to disable the periodic cleanup task. Process-global: every enabled instance must use the same value. Reloading updates, disables, or re-enables the singleton task without retaining the prior interval |
-| `max_entries` | Integer | `100000` | Hard ceiling on retained billing rows (complete registry entry keys) in the shared registry. One principal can occupy many slots because keys also include proxy, status, protocol family, currency, namespace, and prices. A new row beyond the ceiling is folded into the internal `__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1` aggregate row instead of being dropped (per-identity attribution lost; invoice totals preserved). Must be `> 0` — there is no unlimited mode. Process-global: every enabled instance must use the same value |
-| `max_retained_bytes` | Integer | `67108864` | Hard ceiling on estimated retained registry bytes, covering ordinary billing rows and aggregate overflow rows together. Must be `> 0`. Process-global: every enabled instance must use the same value |
-| `schema` | Object | *(none)* | Inline projection for the `/charges` per-proxy billing row (see [docs/log_schema.md](log_schema.md)); mutually exclusive with `schema_ref`. Process-global: every enabled instance must resolve to the same projection |
+| `render_cache_ttl_seconds` | Integer (u64) | `5` | How long the cached `/charges` response is served before rebuilding. Process-global: every enabled instance must use the same value |
+| `stale_entry_ttl_seconds` | Integer (u64) | `3600` | How long a chargeback entry may sit idle before it becomes *eligible* for eviction. Eligibility is not deletion: an idle entry is removed only after a completed `/charges` export has collected its current counters (see the collection contract above), so uncollected billing state is never discarded on age alone. Process-global: every enabled instance must use the same value |
+| `cache_invalidation_min_age_ms` | Integer (u64) | `500` | Minimum age (ms) of a render cache before `record()` will invalidate it. Evaluated **per format** against that document's own timestamp, so a JSON-only collector gets the same protection as a Prometheus one and neither format's cache lifetime depends on whether the other is being scraped. An already-empty cache is left alone rather than restamped. Process-global: every enabled instance must use the same value |
+| `cleanup_interval_seconds` | Integer (u64) | `300` | How often (seconds) a background task evicts entries that are idle longer than `stale_entry_ttl_seconds` **and** already collected. Set to `0` to disable the periodic cleanup task. Process-global: every enabled instance must use the same value. Reloading updates, disables, or re-enables the singleton task without retaining the prior interval |
+| `max_entries` | Integer (u64) | `100000` | Hard ceiling on retained billing rows (complete registry entry keys) in the shared registry. One principal can occupy many slots because keys also include proxy, status, protocol family, currency, namespace, and prices. A new row beyond the ceiling is folded into the internal `__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1` aggregate row instead of being dropped (per-identity attribution lost; invoice totals preserved). Must be `> 0` — there is no unlimited mode. Process-global: every enabled instance must use the same value |
+| `max_retained_bytes` | Integer (u64) | `67108864` | Hard ceiling on estimated retained registry bytes, covering ordinary billing rows and aggregate overflow rows together. Must be `> 0`. Process-global: every enabled instance must use the same value |
+| `schema` | Object | *(none)* | Inline projection for the `/charges` per-proxy billing row (see [docs/log_schema.md](log_schema.md)); mutually exclusive with `schema_ref`. `summary_type`, `timestamp_format`, `metadata`, `order`, and every derived kind except `summary_kind` are rejected for this record family; `omit` names and `rename` sources must be billing-row fields. Process-global: every enabled instance must resolve to the same projection |
 | `schema_ref` | String | *(none)* | Named schema from `transaction_log_schema`; mutually exclusive with `schema` |
 
 **Admin endpoint:** `GET /charges` requires a valid admin JWT in
@@ -1975,8 +2029,8 @@ authentication policy.
 
 | Query Parameter | Description |
 |---|---|
-| _(none)_ | Prometheus text exposition format. Counter families: `ferrum_api_chargeable_calls_total` and `ferrum_api_charges_total` (HTTP-family per-call counts and charges, labelled by billable status: wire status for ordinary HTTP and canonical effective status for gRPC/gRPC-Web); `ferrum_api_stream_connections_total` and `ferrum_api_stream_connection_charges_total` (stream session counts and per-session charges); `ferrum_api_bytes_sent_total` / `ferrum_api_bytes_received_total` (bandwidth byte counters aggregated per `consumer`/`proxy_id`/`currency`/`protocol_family`); and `ferrum_api_bandwidth_charges_total` (bandwidth charges, with `direction="sent"`/`"received"` and `protocol_family="http"`/`"stream"`). All metrics include `currency` and `namespace` labels. Registry saturation is additionally exported as the identity-free gauges/counters `ferrum_api_chargeback_registry_entries`, `ferrum_api_chargeback_registry_max_entries`, `ferrum_api_chargeback_registry_retained_bytes`, `ferrum_api_chargeback_registry_max_retained_bytes`, `ferrum_api_chargeback_identity_overflow_total`, and `ferrum_api_chargeback_dropped_charges_total` |
-| `?format=json` | JSON format with nested consumer → proxy breakdown. Each proxy carries its `currency`, a `protocol_family` (`http`, `stream`, or `mixed` when one `proxy_id` carries both), per-billable-status `by_status` calls/charges, a `bandwidth` block (`bytes_sent`, `bytes_received`, `charge_sent`, `charge_received`), and a `stream` block (session counts + per-connection charges) whenever the proxy recorded stream activity — so a `mixed` proxy shows both `by_status` and `stream` and the breakdown reconciles with the totals. The top-level `currency` is the single currency in use, or `"mixed"` when instances disagree; an empty registry reports the deterministic default `"USD"` because no recorded entry has an authoritative instance currency. Single-currency consumer totals split into `per_call_charges`, `stream_connection_charges`, and `bandwidth_charges`. When one consumer spans multiple currencies, those flat monetary fields are `null` and `charges_by_currency` partitions the same components per currency (never sum USD+EUR into a unitless headline total); `total_calls` remains a unitless sum. A top-level `registry` object reports admission budget occupancy (`entries` / `max_entries` count retained billing rows / complete entry keys, not distinct principals; also `retained_bytes`, `max_retained_bytes`, `identity_overflow_total`, `dropped_charges_total`, `overflow_consumer_id`) with no identity values |
+| _(none)_ | Prometheus text exposition format. Counter families: `ferrum_api_chargeable_calls_total` and `ferrum_api_charges_total` (HTTP-family per-call counts and charges, labelled by billable status: wire status for ordinary HTTP and canonical effective status for gRPC/gRPC-Web); `ferrum_api_stream_connections_total` and `ferrum_api_stream_connection_charges_total` (stream session counts and per-session charges); `ferrum_api_bytes_sent_total` / `ferrum_api_bytes_received_total` (bandwidth byte counters aggregated per `consumer`/`proxy_id`/`currency`/`protocol_family`); and `ferrum_api_bandwidth_charges_total` (bandwidth charges, with `direction="sent"`/`"received"` and `protocol_family="http"`/`"stream"`). All metrics include `currency` and `namespace` labels. Registry saturation is additionally exported as the identity-free gauges/counters `ferrum_api_chargeback_registry_entries`, `ferrum_api_chargeback_registry_max_entries`, `ferrum_api_chargeback_registry_retained_bytes`, `ferrum_api_chargeback_registry_max_retained_bytes`, `ferrum_api_chargeback_identity_overflow_total`, `ferrum_api_chargeback_dropped_charges_total`, and `ferrum_api_chargeback_uncollected_retained_entries` (rows held past `stale_entry_ttl_seconds` awaiting collection) |
+| `?format=json` | JSON format with nested consumer → proxy breakdown. Each proxy carries its `currency`, a `protocol_family` (`http`, `stream`, or `mixed` when one `proxy_id` carries both), per-billable-status `by_status` calls/charges, a `bandwidth` block (`bytes_sent`, `bytes_received`, `charge_sent`, `charge_received`), and a `stream` block (session counts + per-connection charges) whenever the proxy recorded stream activity — so a `mixed` proxy shows both `by_status` and `stream` and the breakdown reconciles with the totals. The top-level `currency` is the single currency in use, or `"mixed"` when instances disagree; an empty registry reports the deterministic default `"USD"` because no recorded entry has an authoritative instance currency. Single-currency consumer totals split into `per_call_charges`, `stream_connection_charges`, and `bandwidth_charges`. When one consumer spans multiple currencies, those flat monetary fields are `null` and `charges_by_currency` partitions the same components per currency (never sum USD+EUR into a unitless headline total); `total_calls` remains a unitless sum. A top-level `registry` object reports admission budget occupancy (`entries` / `max_entries` count retained billing rows / complete entry keys, not distinct principals; also `retained_bytes`, `max_retained_bytes`, `identity_overflow_total`, `dropped_charges_total`, `uncollected_retained_entries`, `overflow_consumer_id`) with no identity values |
 
 **Multi-node deployments (CP/DP):** Each gateway node (DP) accumulates charges
 independently in memory. In CP/DP topologies, the CP does not proxy traffic and
