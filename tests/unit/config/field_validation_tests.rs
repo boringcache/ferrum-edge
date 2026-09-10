@@ -687,6 +687,74 @@ fn test_consumer_username_empty_rejected() {
     );
 }
 
+// ── Issue #5009: a colon-bearing username cannot present Basic credentials ──
+//
+// RFC 7617 §2 splits the decoded `user-id ":" password` at the FIRST colon, so
+// no `Authorization: Basic` value can carry a user-id containing one. Such a
+// consumer used to start fine and then fail every login with 401.
+
+#[test]
+fn test_consumer_colon_username_with_basicauth_is_rejected() {
+    let mut consumer = make_consumer("test", "alice:admin");
+    consumer.credentials.insert(
+        "basicauth".into(),
+        serde_json::json!([{"password_hash": format!("hmac_sha256:{}", "a".repeat(64))}]),
+    );
+    let errs = consumer.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("username must not contain ':'") && e.contains("basicauth")),
+        "unusable Basic user-id must be refused at admission: {errs:?}"
+    );
+}
+
+#[test]
+fn test_consumer_colon_username_without_basicauth_is_admitted() {
+    // The restriction is Basic-specific: other credential types represent a
+    // colon-bearing identity perfectly well.
+    let mut consumer = make_consumer("test", "alice:admin");
+    consumer
+        .credentials
+        .insert("keyauth".into(), serde_json::json!([{"key": "the-key"}]));
+    assert!(
+        consumer.validate_fields().is_ok(),
+        "{:?}",
+        consumer.validate_fields()
+    );
+}
+
+#[test]
+fn test_consumer_basicauth_password_may_contain_a_colon() {
+    // Only the user-id is delimiter-constrained; colons in the password are
+    // valid RFC 7617 and must keep working.
+    let mut consumer = make_consumer("test", "alice");
+    consumer.credentials.insert(
+        "basicauth".into(),
+        serde_json::json!([{"password": "audit:password"}]),
+    );
+    assert!(
+        consumer.validate_fields().is_ok(),
+        "{:?}",
+        consumer.validate_fields()
+    );
+}
+
+#[test]
+fn test_consumer_colon_username_with_empty_basicauth_array_is_still_reported() {
+    // An empty credential array is already refused; the username rule must not
+    // be the only thing keeping this configuration out, but it must not crash
+    // or silently pass either.
+    let mut consumer = make_consumer("test", "alice:admin");
+    consumer
+        .credentials
+        .insert("basicauth".into(), serde_json::json!([]));
+    let errs = consumer.validate_fields().unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("must not be empty")),
+        "{errs:?}"
+    );
+}
+
 #[test]
 fn test_consumer_credential_value_too_long() {
     let mut consumer = make_consumer("test", "alice");
