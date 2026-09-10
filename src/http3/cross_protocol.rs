@@ -8466,7 +8466,17 @@ pub(crate) async fn dispatch_grpc_streaming(
     // Final upload byte count (codex P2): in bidi/client-streaming the pump can
     // forward request DATA while the response is streaming, so re-read after the
     // pump terminates rather than trusting the header-time snapshot.
-    outcome.bytes_sent = request_bytes_forwarded.load(Ordering::Relaxed);
+    let forwarded_request_bytes = request_bytes_forwarded.load(Ordering::Relaxed);
+    outcome.bytes_sent = forwarded_request_bytes;
+    // Mirror the same count into the shared request-byte counter so every
+    // consumer reading the request context — response-stream-termination hooks
+    // and any summary builder that reloads the atomic — agrees with the
+    // `bytes_sent` this outcome reports (GHSA-8x5h-g4xh-hgc9). `fetch_max`
+    // matches every other writer and cannot lower an earlier observation.
+    if forwarded_request_bytes > 0 {
+        ctx.bytes_sent_observed
+            .fetch_max(forwarded_request_bytes, Ordering::Release);
+    }
     Ok(outcome)
 }
 
