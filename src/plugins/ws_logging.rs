@@ -1431,7 +1431,11 @@ async fn send_batch(
     // Post-admission loss: these records were already counted as accepted.
     // Count every discarded RECORD, matching the shared batching sender and
     // the `batch_discard` sink-loss contract.
-    sink_loss::record_dropped(WS_PLUGIN_NAME, SinkLossReason::BatchDiscard, entry_count as u64);
+    sink_loss::record_dropped(
+        WS_PLUGIN_NAME,
+        SinkLossReason::BatchDiscard,
+        entry_count as u64,
+    );
     warn!(
         "WebSocket logging batch discarded after {} attempts ({} entries lost)",
         total_attempts, entry_count,
