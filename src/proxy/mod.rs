@@ -41286,10 +41286,14 @@ pub(crate) async fn proxy_to_backend_retry(
                 .and_then(|len| usize::try_from(len).ok());
 
             // Fast path: reject immediately when Content-Length exceeds limit.
-            if effective_max_response_body_size_bytes > 0
-                && let Some(len) = content_length
-                && len > effective_max_response_body_size_bytes
-            {
+            // HEAD / 1xx / 204 / 205 / 304 advertise a representation length,
+            // not transferred body bytes, so they skip this comparison.
+            if let Some(len) = declared_response_length_exceeds_limit(
+                method,
+                status,
+                &resp_headers,
+                effective_max_response_body_size_bytes,
+            ) {
                 warn!(
                     "Backend response body ({} bytes) exceeds limit ({} bytes)",
                     len, effective_max_response_body_size_bytes
@@ -45158,13 +45162,18 @@ async fn proxy_to_backend(
                 // failing to parse and skipping this reject
                 // (`GHSA-xrfj-852f-645j`). An ambiguous declaration yields `None`
                 // and falls through to the bounded collect/stream paths below,
-                // which never trust a declared length.
+                // which never trust a declared length. HEAD / 1xx / 204 / 205 /
+                // 304 keep a representation Content-Length without transferring
+                // those bytes, so they are not compared against the ceiling.
                 let content_length = canonical_header_content_length(response.headers())
                     .and_then(|len| usize::try_from(len).ok());
 
-                if let Some(len) = content_length
-                    && len > effective_max_response_body_size_bytes
-                {
+                if let Some(len) = declared_response_length_exceeds_limit(
+                    method,
+                    status,
+                    &resp_headers,
+                    effective_max_response_body_size_bytes,
+                ) {
                     warn!(
                         "Backend response body ({} bytes) exceeds limit ({} bytes)",
                         len, effective_max_response_body_size_bytes
@@ -49553,12 +49562,14 @@ async fn proxy_to_backend_hbone_after_ready(
     };
 
     let status = response.status().as_u16();
-    let content_length = canonical_header_content_length(response.headers())
-        .and_then(|len| usize::try_from(len).ok());
-    if effective_max_response_body_size_bytes > 0
-        && let Some(len) = content_length
-        && len > effective_max_response_body_size_bytes
-    {
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    collect_hyper_response_headers(response.headers(), &mut resp_headers);
+    if let Some(len) = declared_response_length_exceeds_limit(
+        method,
+        status,
+        &resp_headers,
+        effective_max_response_body_size_bytes,
+    ) {
         return (
             hbone_response_body_too_large_response(
                 proxy,
@@ -49570,8 +49581,6 @@ async fn proxy_to_backend_hbone_after_ready(
             None,
         );
     }
-    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
-    collect_hyper_response_headers(response.headers(), &mut resp_headers);
 
     // Content-type-aware buffer -> stream downgrade (see `proxy_to_backend`).
     let stream_response = refine_stream_response_for_content_type(
@@ -50341,10 +50350,14 @@ async fn proxy_to_backend_unix(
     let status = response.status().as_u16();
     let content_length = canonical_header_content_length(response.headers())
         .and_then(|len| usize::try_from(len).ok());
-    if effective_max_response_body_size_bytes > 0
-        && let Some(len) = content_length
-        && len > effective_max_response_body_size_bytes
-    {
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    collect_hyper_response_headers(response.headers(), &mut resp_headers);
+    if let Some(len) = declared_response_length_exceeds_limit(
+        method,
+        status,
+        &resp_headers,
+        effective_max_response_body_size_bytes,
+    ) {
         return (
             unix_response_body_too_large_response(
                 proxy,
@@ -50356,8 +50369,6 @@ async fn proxy_to_backend_unix(
             None,
         );
     }
-    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
-    collect_hyper_response_headers(response.headers(), &mut resp_headers);
 
     let stream_response = refine_stream_response_for_content_type(
         stream_response,
@@ -51905,12 +51916,14 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
     };
 
     let status = response.status().as_u16();
-    let content_length = canonical_header_content_length(response.headers())
-        .and_then(|len| usize::try_from(len).ok());
-    if effective_max_response_body_size_bytes > 0
-        && let Some(len) = content_length
-        && len > effective_max_response_body_size_bytes
-    {
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    collect_hyper_response_headers(response.headers(), &mut resp_headers);
+    if let Some(len) = declared_response_length_exceeds_limit(
+        method,
+        status,
+        &resp_headers,
+        effective_max_response_body_size_bytes,
+    ) {
         return (
             if is_grpc_flavored {
                 mesh_grpc_response_body_too_large_response(
@@ -51931,8 +51944,6 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
             None,
         );
     }
-    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
-    collect_hyper_response_headers(response.headers(), &mut resp_headers);
 
     // Content-type-aware buffer -> stream downgrade (see `proxy_to_backend`).
     let stream_response = refine_stream_response_for_content_type(
@@ -53102,6 +53113,8 @@ async fn proxy_to_backend_http2(
     collect_hyper_response_headers(response.headers(), &mut resp_headers);
 
     if let Some(len) = declared_response_length_exceeds_limit(
+        method,
+        status,
         &resp_headers,
         effective_max_response_body_size_bytes,
     ) {
@@ -53621,6 +53634,7 @@ async fn proxy_to_backend_http3(
                                 h3_streaming_backend_response(
                                     response,
                                     proxy,
+                                    method,
                                     resolved_ip,
                                     effective_max_response_body_size_bytes,
                                 ),
@@ -54018,6 +54032,7 @@ async fn proxy_to_backend_http3(
                 h3_streaming_backend_response(
                     response,
                     proxy,
+                    method,
                     resolved_ip,
                     effective_max_response_body_size_bytes,
                 ),
@@ -54137,6 +54152,7 @@ async fn proxy_to_backend_http3(
                         h3_streaming_backend_response(
                             response,
                             proxy,
+                            method,
                             resolved_ip,
                             effective_max_response_body_size_bytes,
                         ),
@@ -54235,12 +54251,16 @@ async fn proxy_to_backend_http3(
 fn h3_streaming_backend_response(
     response: crate::http3::client::H3StreamingResponse,
     proxy: &Proxy,
+    method: &str,
     resolved_ip: Option<String>,
     max_response_body_size_bytes: usize,
 ) -> retry::BackendResponse {
-    if let Some(len) =
-        declared_response_length_exceeds_limit(&response.headers, max_response_body_size_bytes)
-    {
+    if let Some(len) = declared_response_length_exceeds_limit(
+        method,
+        response.status,
+        &response.headers,
+        max_response_body_size_bytes,
+    ) {
         return h3_response_body_too_large_response(
             proxy,
             resolved_ip,
@@ -54555,11 +54575,20 @@ fn h3_response_body_too_large_response(
 /// failed and skipped this fast path (`GHSA-xrfj-852f-645j`). An ambiguous fold
 /// yields `None` here and is bounded by the collection/streaming ceiling
 /// instead, which never trusts a declared length.
+///
+/// Bodyless semantics (`HEAD`, `1xx`, `204`/`205`/`304`) may advertise a
+/// representation `Content-Length` while transferring zero body bytes (RFC 9110
+/// §8.6 / §6.4.1). That value is not a transferable-body size and must not be
+/// compared against the ceiling.
 pub(crate) fn declared_response_length_exceeds_limit(
+    method: &str,
+    status: u16,
     headers: &HashMap<String, String>,
     max_response_body_size_bytes: usize,
 ) -> Option<usize> {
-    if max_response_body_size_bytes == 0 {
+    if max_response_body_size_bytes == 0
+        || crate::plugins::utils::synthetic_response::synthetic_response_omits_body(method, status)
+    {
         return None;
     }
     let len = canonical_header_content_length_from_map(headers)?;
@@ -54718,6 +54747,8 @@ async fn proxy_to_backend_http3_retry(
                 // oversized declared body unguarded (the downstream H3 body
                 // builder only size-limits when Content-Length is absent).
                 if let Some(len) = declared_response_length_exceeds_limit(
+                    method,
+                    response.status,
                     &response.headers,
                     effective_max_response_body_size_bytes,
                 ) {
@@ -62152,22 +62183,44 @@ mod tests {
 
     /// Guards the declared-Content-Length fast-path reject used by every
     /// streaming H3 retry attempt: only a nonzero limit with a parseable
-    /// over-limit Content-Length triggers the pre-stream 502.
+    /// over-limit Content-Length on a body-bearing response triggers the
+    /// pre-stream 502. HEAD / 1xx / 204 / 205 / 304 keep a representation length.
     #[test]
     fn declared_response_length_exceeds_limit_only_when_header_is_over_cap() {
         let mut headers = HashMap::new();
-        assert_eq!(declared_response_length_exceeds_limit(&headers, 10), None);
+        assert_eq!(
+            declared_response_length_exceeds_limit("GET", 200, &headers, 10),
+            None
+        );
 
         headers.insert("content-length".to_string(), "11".to_string());
-        assert_eq!(declared_response_length_exceeds_limit(&headers, 0), None);
-        assert_eq!(declared_response_length_exceeds_limit(&headers, 11), None);
         assert_eq!(
-            declared_response_length_exceeds_limit(&headers, 10),
+            declared_response_length_exceeds_limit("GET", 200, &headers, 0),
+            None
+        );
+        assert_eq!(
+            declared_response_length_exceeds_limit("GET", 200, &headers, 11),
+            None
+        );
+        assert_eq!(
+            declared_response_length_exceeds_limit("GET", 200, &headers, 10),
             Some(11)
         );
 
         headers.insert("content-length".to_string(), "not-a-number".to_string());
-        assert_eq!(declared_response_length_exceeds_limit(&headers, 10), None);
+        assert_eq!(
+            declared_response_length_exceeds_limit("GET", 200, &headers, 10),
+            None
+        );
+
+        headers.insert("content-length".to_string(), "11".to_string());
+        for (method, status) in [("HEAD", 200), ("GET", 304), ("GET", 204)] {
+            assert_eq!(
+                declared_response_length_exceeds_limit(method, status, &headers, 10),
+                None,
+                "bodyless {method} {status} must not trip the declared-length ceiling"
+            );
+        }
     }
 
     /// The 502 built for an over-limit H3 response must not replay (no

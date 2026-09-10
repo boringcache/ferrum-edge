@@ -7102,6 +7102,8 @@ async fn handle_h3_request(
 
         // Enforce response body size limit via Content-Length fast path
         if let Some(len) = crate::proxy::declared_response_length_exceeds_limit(
+            &method,
+            response_status,
             &response_headers,
             effective_max_response_body_size_bytes,
         ) && !response_omits_body
@@ -10875,8 +10877,13 @@ async fn collect_h3_open_response_body(
     // honored by both the ceiling check and the preallocation hint below
     // (`GHSA-xrfj-852f-645j`).
     let content_length = crate::proxy::canonical_header_content_length_from_map(&response_headers);
-    if effective_max_response_body_size_bytes > 0
-        && content_length.is_some_and(|len| len > effective_max_response_body_size_bytes as u64)
+    if crate::proxy::declared_response_length_exceeds_limit(
+        method,
+        response_status,
+        &response_headers,
+        effective_max_response_body_size_bytes,
+    )
+    .is_some()
     {
         return H3BufferedDispatchResult {
             status: 502,
@@ -11143,6 +11150,8 @@ async fn stream_h3_open_response_to_client(
     let effective_max_response_body_size_bytes = ctx.effective_max_response_body_size_bytes();
     // A HEAD representation length is metadata, not bytes to retain or relay.
     if let Some(len) = crate::proxy::declared_response_length_exceeds_limit(
+        method,
+        response_status,
         &response_headers,
         effective_max_response_body_size_bytes,
     ) && !response_omits_body
@@ -13402,6 +13411,8 @@ async fn dispatch_grpc_native_h3(
     // apply — NOT the request-side gRPC receive cap, so a large-but-valid gRPC
     // response is not spuriously rejected.
     if let Some(len) = crate::proxy::declared_response_length_exceeds_limit(
+        method,
+        response_status,
         &response_headers,
         effective_max_response_body_size_bytes,
     ) {
@@ -15220,6 +15231,8 @@ async fn proxy_to_backend_h3_streaming(
     );
     // Enforce response body size limit via Content-Length fast path
     if let Some(len) = crate::proxy::declared_response_length_exceeds_limit(
+        method,
+        response_status,
         &response_headers,
         effective_max_response_body_size_bytes,
     ) && !response_omits_body
