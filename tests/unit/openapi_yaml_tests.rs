@@ -5930,6 +5930,113 @@ async fn loki_logging_schema_matches_strict_runtime_config_contract() {
 }
 
 #[tokio::test]
+async fn ws_logging_schema_matches_strict_runtime_config_contract() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::ws_logging::{
+        WS_DEFAULT_BUFFER_MAX_BYTES, WS_DEFAULT_MAX_ENTRY_BYTES, WS_LOGGING_CONFIG_KEYS,
+        WS_MAX_BUFFER_MAX_BYTES, WS_MAX_MAX_ENTRY_BYTES, WsLogging,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/WsLoggingConfig")
+        .expect("WsLoggingConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(schema["properties"]["endpoint_url"]["minLength"], 1);
+    assert_eq!(schema["properties"]["schema_ref"]["minLength"], 1);
+    assert_eq!(
+        schema["allOf"][0]["not"]["required"],
+        json!(["schema", "schema_ref"])
+    );
+    let budget_desc = schema["properties"]["buffer_max_bytes"]["description"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        budget_desc.contains("2 * (max_entry_bytes + 1)") && budget_desc.contains("Runtime"),
+        "buffer_max_bytes must document the sibling-field runtime bound: {budget_desc}"
+    );
+
+    let documented = schema["properties"]
+        .as_object()
+        .expect("WsLogging properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime = WS_LOGGING_CONFIG_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(documented, runtime, "ws_logging runtime/OpenAPI key drift");
+    assert_eq!(
+        schema["properties"]["max_entry_bytes"]["default"],
+        json!(WS_DEFAULT_MAX_ENTRY_BYTES)
+    );
+    assert_eq!(
+        schema["properties"]["max_entry_bytes"]["maximum"],
+        json!(WS_MAX_MAX_ENTRY_BYTES)
+    );
+    assert_eq!(
+        schema["properties"]["buffer_max_bytes"]["default"],
+        json!(WS_DEFAULT_BUFFER_MAX_BYTES)
+    );
+    assert_eq!(
+        schema["properties"]["buffer_max_bytes"]["maximum"],
+        json!(WS_MAX_BUFFER_MAX_BYTES)
+    );
+
+    let valid = json!({
+        "endpoint_url": "WS://127.0.0.1:39999/ingest",
+        "batch_size": 50,
+        "flush_interval_ms": 1000,
+        "buffer_capacity": 10000,
+        "max_entry_bytes": WS_DEFAULT_MAX_ENTRY_BYTES,
+        "buffer_max_bytes": WS_DEFAULT_BUFFER_MAX_BYTES,
+        "schema": {}
+    });
+    assert_component_validity(&spec, "WsLoggingConfig", &valid, true);
+    assert!(WsLogging::new(&valid, PluginHttpClient::default()).is_ok());
+    let valid_minima = json!({"endpoint_url": "ws://127.0.0.1:39999/ingest"});
+    assert_component_validity(&spec, "WsLoggingConfig", &valid_minima, true);
+    assert!(WsLogging::new(&valid_minima, PluginHttpClient::default()).is_ok());
+
+    let runtime_and_schema_invalid = [
+        json!({"endpoint_url": "ws://127.0.0.1:39999/ingest", "unexpected": true}),
+        json!({"endpoint_url": ""}),
+        json!({"endpoint_url": "http://127.0.0.1:39999/ingest"}),
+        json!({"endpoint_url": "ws://user:password@127.0.0.1:39999/ingest"}),
+        json!({"endpoint_url": "ws:///ingest"}),
+        json!({
+            "endpoint_url": "ws://127.0.0.1:39999/ingest",
+            "schema": {},
+            "schema_ref": "example"
+        }),
+        json!({"endpoint_url": "ws://127.0.0.1:39999/ingest", "schema_ref": ""}),
+        json!({"endpoint_url": "ws://127.0.0.1:39999/ingest", "batch_size": 0}),
+        json!({"endpoint_url": "ws://127.0.0.1:39999/ingest", "flush_interval_ms": 99}),
+    ];
+    for config in runtime_and_schema_invalid {
+        assert_component_validity(&spec, "WsLoggingConfig", &config, false);
+        assert!(
+            WsLogging::new(&config, PluginHttpClient::default()).is_err(),
+            "runtime accepted OpenAPI-invalid ws_logging config: {config}"
+        );
+    }
+
+    // Sibling-field arithmetic cannot be expressed in standard JSON Schema.
+    let runtime_only = json!({
+        "endpoint_url": "ws://127.0.0.1:39999/ingest",
+        "max_entry_bytes": 65536,
+        "buffer_max_bytes": 2050
+    });
+    assert_component_validity(&spec, "WsLoggingConfig", &runtime_only, true);
+    assert!(
+        WsLogging::new(&runtime_only, PluginHttpClient::default()).is_err(),
+        "runtime must still reject a buffer below 2 * (max_entry_bytes + 1)"
+    );
+}
+
+#[tokio::test]
 async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
     use ferrum_edge::plugins::PluginHttpClient;
     use ferrum_edge::plugins::statsd_logging::{STATSD_LOGGING_CONFIG_KEYS, StatsdLogging};
