@@ -2510,24 +2510,28 @@ mod tests {
     /// A dedicated Sidecar ingress bind address change must retire the old
     /// socket and rebind — port/class alone are not enough restart identity.
     ///
-    /// The two addresses are the owned loopback and the wildcard, because those
+    /// The two addresses are the wildcard and the owned loopback, because those
     /// are the only two an unprivileged process can bind on every supported
     /// host: a second loopback alias such as `127.0.0.2` is configured by
     /// default on Linux but not on macOS, where binding it fails with
-    /// `EADDRNOTAVAIL` (issue #4983). Since the wildcard and the loopback can
-    /// coexist on the same port on some hosts, the drift proof does not rest on
-    /// the address alone: the accept-loop task identity must also change, which
-    /// is only true if the old socket was actually retired and a new one bound.
+    /// `EADDRNOTAVAIL` (issue #4983). Drifting wildcard -> loopback (rather than
+    /// the reverse) also means the second bind cannot lose a race: holding the
+    /// wildcard excluded every other holder of that port, so releasing it leaves
+    /// the loopback bind free.
+    ///
+    /// The wildcard and the loopback can coexist on one port on some hosts, so
+    /// the drift proof does not rest on the address alone: the accept-loop task
+    /// identity must also change, which is only true if the old socket was
+    /// actually retired and a new one bound. The final bind differs from the
+    /// process-wide default, which is what makes it visibly ownership.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bind_address_change_restarts_live_listener() {
-        let first = IpAddr::from([127, 0, 0, 1]);
-        let second = IpAddr::from([0, 0, 0, 0]);
+        let first = IpAddr::from([0, 0, 0, 0]);
+        let second = IpAddr::from([127, 0, 0, 1]);
         let (port, state, manager) = bind_manager_with_retry_state(|port| {
             let state = test_state(config_with_dedicated_bind(port, first));
             let manager = GatewayListenerManager::new(
                 state.clone(),
-                // Distinct from the FIRST override so that bind is visibly
-                // ownership, not the process-wide proxy bind.
                 IpAddr::from([0, 0, 0, 0]),
                 GatewayListenerTls::default(),
             );
