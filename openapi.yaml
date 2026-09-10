@@ -22605,13 +22605,29 @@ components:
           type: array
           items:
             type: string
+            anyOf:
+              - pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$'
+              - pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*(?:\*\.)?[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*\.*(?::(?:\*|0*(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])))?[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$'
+              - pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*(?:(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?|[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,5})?|[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){1}::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,4})?|[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){2}::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,3})?|[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){3}::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,2})?|[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){4}::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,1})?|[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){5}::(?:[0-9A-Fa-f]{1,4})?|[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){6}::|(?:(?:[0-9A-Fa-f]{1,4}:){6}|::(?:[0-9A-Fa-f]{1,4}:){0,5}|[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0,4}|[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){1}::(?:[0-9A-Fa-f]{1,4}:){0,3}|[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){2}::(?:[0-9A-Fa-f]{1,4}:){0,2}|[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){3}::(?:[0-9A-Fa-f]{1,4}:){0,1}|[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){4}::(?:[0-9A-Fa-f]{1,4}:){0,0})(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3})(?::\*)?[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$'
+              - pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*\[(?:(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?|[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,5})?|[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){1}::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,4})?|[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){2}::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,3})?|[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){3}::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,2})?|[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){4}::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,1})?|[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){5}::(?:[0-9A-Fa-f]{1,4})?|[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){6}::|(?:(?:[0-9A-Fa-f]{1,4}:){6}|::(?:[0-9A-Fa-f]{1,4}:){0,5}|[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0,4}|[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){1}::(?:[0-9A-Fa-f]{1,4}:){0,3}|[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){2}::(?:[0-9A-Fa-f]{1,4}:){0,2}|[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){3}::(?:[0-9A-Fa-f]{1,4}:){0,1}|[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){4}::(?:[0-9A-Fa-f]{1,4}:){0,0})(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3})\](?::(?:\*|0*(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])))?[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$'
           default: []
           description: |
             Known destinations. Bare hostnames match requests with no
             explicit `Host` port. `host:port` entries match only that port.
             `host:*` entries match any explicit port. Wildcard entries
             (`*.example.com[:port|:*]`) match one DNS label below the
-            suffix.
+            suffix. Hostname labels use ASCII letters, digits, and interior
+            hyphens; supply internationalized names in punycode. IPv4 names
+            and IPv6 literals are supported; bracket IPv6 when specifying a
+            numeric port. Bare IPv6 and IPv6:* are also accepted.
+            Numeric destination ports are decimal 1–65535 (leading zeros
+            allowed). Surrounding whitespace, hostname case, trailing
+            hostname dots, and IPv6 spelling are normalized. Empty or
+            whitespace-only entries are ignored; an empty effective registry
+            rejects all destinations wherever enforcement applies.
+            URLs, paths, userinfo, internal whitespace, malformed brackets,
+            misplaced wildcards, and invalid ports fail construction with
+            the zero-based registry entry index.
         reject_status:
           type: integer
           format: uint16
@@ -22627,18 +22643,24 @@ components:
             type: integer
             format: uint16
             minimum: 1
+            maximum: 65535
           default: []
           description: |
             Optional frontend listener ports where the registry is enforced.
             Empty means enforce on every HTTP-family request that reaches
             the plugin (operator-managed default). Mesh auto-injection sets
             this to the outbound capture listener port so the global plugin
-            does not apply to inbound listeners. Port `0` is rejected at
-            runtime construction; use `[]` for intentional global scope.
+            does not apply to inbound listeners. Ports must be 1–65535;
+            use `[]` for intentional global scope.
         namespace:
           type: string
           default: ferrum
-          description: Mesh namespace label used by the Prometheus decision counter.
+          description: |
+            Value of the mesh_namespace label on
+            ferrum_mesh_outbound_registry_decisions_total. Mesh injection
+            explicitly supplies the runtime namespace. Direct instances use
+            this config value (default ferrum), independently of the enclosing
+            PluginConfig resource namespace.
 
     MeshRouteDispatchConfig:
       type: object
