@@ -331,7 +331,9 @@ async fn kafka_rejects_overrides_of_managed_delivery_reporting() {
 async fn kafka_successful_deliveries_release_leases_before_finalization() {
     let cluster = MockCluster::new(1).expect("create Kafka mock cluster");
     let topic = "delivery-accounting";
-    cluster.create_topic(topic, 1, 1).expect("create mock topic");
+    cluster
+        .create_topic(topic, 1, 1)
+        .expect("create mock topic");
     let client = default_http_client();
 
     for key_field in ["client_ip", "none"] {
