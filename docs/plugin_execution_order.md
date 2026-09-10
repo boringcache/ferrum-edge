@@ -1993,7 +1993,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `request_deduplication` | ✓ | | | | | HTTP-only request deduplication and response replay |
 | `request_size_limiting` | ✓ | ✓ | | | | Enforces per-proxy request body size limits |
 | `ws_message_size_limiting` | | | ✓ | | | Enforces actual-frame and bounded-reassembly limits on WebSocket connections |
-| `graphql` | ✓ | | ✓ | | | GraphQL JSON over HTTP and GraphQL subscriptions over WebSocket |
+| `graphql` | ✓ | | ✓ | | | GraphQL JSON over HTTP; WebSocket upgrade handshakes are refused fail-closed and post-upgrade frames are never inspected |
 | `rate_limiting` | ✓ | ✓ | ✓ | ✓ | ✓ | Connection/session rate applies everywhere |
 | `ws_rate_limiting` | | | ✓ | | | Per-connection frame rate limiting for WebSocket |
 | `udp_rate_limiting` | | | | | ✓ | Per-client-IP datagram and byte rate limiting for UDP proxies |

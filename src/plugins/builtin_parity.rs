@@ -342,7 +342,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         priority: 2850,
         active_phases: "before_proxy, on_final_request_body",
         matrix_protocols: &[ProxyProtocol::Http, ProxyProtocol::WebSocket],
-        protocol_rationale: "GraphQL JSON over HTTP and GraphQL subscriptions over WebSocket",
+        protocol_rationale: "GraphQL JSON over HTTP; WebSocket upgrade handshakes are refused fail-closed and post-upgrade frames are never inspected",
     },
     BuiltinPluginParityMeta {
         name: "rate_limiting",
