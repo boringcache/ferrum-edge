@@ -26547,7 +26547,13 @@ components:
         a 64 MiB process-wide retained-body budget. Synthetic and fan-out
         headers reuse the canonical secondary-request sanitizer shared with
         request_mirror (Connection-listed hop-by-hop, Trailer, framing, Ferrum
-        markers, proxy-owned X-Forwarded-*), preserving Host for routing.
+        markers, proxy-owned X-Forwarded-*), preserving Host for routing. That
+        snapshot is taken from the original client headers, not from the
+        already-transformed map, so an earlier request_transformer chain is
+        applied exactly once to the synthetic cohort as well. Synthetic and
+        fan-out requests are sent over HTTP/1.1 so the preserved Host is the
+        request authority; over HTTP/2 the two would disagree and ingress
+        validation would correctly reject every replay.
       required:
         - key
         - concurrent_clients
@@ -26594,12 +26600,15 @@ components:
           type: [integer, "null"]
           format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           default: 1048576
           description: >-
-            Maximum response bytes the synthetic client consumes per request.
-            Must be greater than zero. The client stops reading at the cap,
-            bounding its own work and memory without changing the backend
-            response.
+            Maximum response bytes the synthetic client consumes per request
+            (1–18446744073709551615). The runtime parses this as an unsigned
+            64-bit integer, so the finite upper bound is part of the admitted
+            contract; a larger value is rejected. The client stops reading at
+            the cap, bounding its own work and memory without changing the
+            backend response.
         gateway_port:
           type: [integer, "null"]
           format: uint16
@@ -26607,9 +26616,11 @@ components:
           maximum: 65535
           description: >-
             Local gateway port for synthetic requests (1–65535). Defaults to
-            FERRUM_PROXY_HTTP_PORT (or FERRUM_PROXY_HTTPS_PORT when gateway_tls
-            is enabled) or 8000/8443. A resolved port of 0 (disabled listener)
-            is rejected.
+            the effective FERRUM_PROXY_HTTP_PORT (or FERRUM_PROXY_HTTPS_PORT
+            when gateway_tls is enabled) resolved with the same environment >
+            ferrum.conf/--settings precedence the listener itself uses, then
+            8000/8443. A resolved port of 0 (disabled listener) is rejected
+            whichever configuration source supplied it.
         gateway_tls:
           type: [boolean, "null"]
           default: false
@@ -26625,6 +26636,14 @@ components:
           items:
             type: string
             minLength: 1
+            pattern: '^[hH][tT][tT][pP][sS]?://[^/?#@\s]+(?:/[^?#\s]*)?$'
+            description: >-
+              An http(s) URL with a non-empty authority and no URL userinfo,
+              query, or fragment. This pattern models only the intrinsic URL
+              grammar the constructor admits; the environment-dependent checks
+              below (loopback-alias equality against the selected local target,
+              normalized duplicate origins, and backend egress screening) need
+              runtime context and stay runtime-only.
           description: >-
             Remote gateway URLs for one-hop fan-out from the originating
             controller (at most 32). Peers receive X-Loadtesting-Fanout and

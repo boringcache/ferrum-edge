@@ -12,6 +12,11 @@
 //! - **HTTP/2 prior knowledge companion**: [`PluginHttpClient::get_http2`] for
 //!   cleartext h2c / TLS ALPN-h2 destinations (native gRPC mirrors) without
 //!   forcing ordinary plugin HTTP onto HTTP/2-only
+//! - **HTTP/1.1-pinned companion**: [`PluginHttpClient::get_http1`] for
+//!   Ferrum-generated requests that re-enter a Ferrum HTTP frontend while
+//!   preserving the triggering client's `Host` and dialing a different
+//!   authority, where a negotiated `h2` connection would make `Host` and
+//!   `:authority` disagree
 //! - **Idle timeout**: Stale connections cleaned up automatically
 //! - **DNS caching**: Uses the gateway's `DnsCache` for shared, warmed DNS
 //! - **No ambient proxy discovery**: standard client builders ignore
@@ -169,6 +174,14 @@ pub struct PluginHttpClient {
     /// no-proxy invariants as [`Self::client`]. Used by native gRPC mirror
     /// traffic; ordinary plugin HTTP continues to use [`Self::client`].
     http2_client: Option<Arc<reqwest::Client>>,
+    /// HTTP/1.1-pinned companion built with `http1_only()`. Shares the same DNS
+    /// resolver, TLS posture, pool/keepalive tuning, redirect, and no-proxy
+    /// invariants as [`Self::client`]. Used by Ferrum-generated requests that
+    /// re-enter a Ferrum HTTP frontend carrying the triggering client's `Host`
+    /// while dialing a different authority (`load_testing` peer fan-out); over
+    /// a negotiated HTTP/2 connection that pair is `:authority` != `host`,
+    /// which every frontend correctly rejects before routing.
+    http1_client: Option<Arc<reqwest::Client>>,
     /// Threshold above which outbound plugin HTTP calls are logged as slow.
     /// Configured via `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS` (default: 1000ms).
     slow_threshold: Duration,
@@ -249,6 +262,7 @@ impl std::fmt::Debug for PluginHttpClient {
         f.debug_struct("PluginHttpClient")
             .field("has_shared_client", &self.client.is_some())
             .field("has_http2_client", &self.http2_client.is_some())
+            .field("has_http1_client", &self.http1_client.is_some())
             .field("slow_threshold", &self.slow_threshold)
             .field("max_retries", &self.max_retries)
             .field("retry_delay", &self.retry_delay)
@@ -752,6 +766,43 @@ fn build_configured_plugin_client(
     }
 }
 
+/// Build an HTTP/1.1-pinned plugin `reqwest::Client`.
+///
+/// Ferrum-generated requests that re-enter a Ferrum HTTP frontend preserve the
+/// triggering client's `Host` for virtual-host routing while dialing a
+/// different authority (a loopback listener port, or a peer node's configured
+/// address). RFC 9113 §8.3.1 / RFC 9114 §4.3.1 do not permit `Host` and
+/// `:authority` to disagree, and Ferrum's ingress consistency check correctly
+/// returns 400 before routing when they do — so a negotiated `h2` connection
+/// silently defeats the replay. Pinning ALPN to `http/1.1` keeps `Host` the
+/// request authority and preserves the intended virtual host without
+/// weakening inbound validation.
+///
+/// Shares [`build_configured_plugin_client`]'s TLS trust posture, DNS
+/// resolver, connect/request timeouts, redirect and no-proxy invariants. A
+/// terminal failure is returned as `Err` so the companion stays absent and its
+/// callers fail closed rather than falling back to an ambient-proxy default.
+fn build_http1_only_plugin_client(
+    pool_config: &PoolConfig,
+    dns_cache: Option<DnsCache>,
+    tls_posture: &PluginTlsPosture,
+) -> Result<reqwest::Client, PluginHttpClientBuildError> {
+    PLUGIN_HTTP_CLIENT_BUILDS.fetch_add(1, Ordering::Relaxed);
+    let crypto_provider = crate::fips::ensure_internal_client_crypto_provider();
+    let mut builder = plugin_client_no_proxy_no_redirect()
+        .http1_only()
+        .pool_max_idle_per_host(pool_config.max_idle_per_host)
+        .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds));
+    builder = attach_plugin_client_dns(builder, dns_cache.as_ref());
+    builder = tls_posture.apply_or_inert(builder, crypto_provider.is_err());
+    if pool_config.enable_http_keep_alive {
+        builder = builder.tcp_keepalive(Duration::from_secs(pool_config.tcp_keepalive_seconds));
+    }
+    builder
+        .build()
+        .map_err(PluginHttpClientBuildError::from_reqwest)
+}
+
 impl PluginHttpClient {
     /// Build a plugin HTTP client from the gateway's global pool configuration,
     /// using the gateway's DNS cache for hostname resolution.
@@ -798,13 +849,23 @@ impl PluginHttpClient {
             "Failed to build the shared plugin HTTP client",
         );
         let http2_client = accept_plugin_http_client(
-            build_configured_plugin_client(pool_config, Some(dns_cache), &tls_posture, true),
+            build_configured_plugin_client(
+                pool_config,
+                Some(dns_cache.clone()),
+                &tls_posture,
+                true,
+            ),
             "Failed to build the HTTP/2 plugin HTTP companion client",
+        );
+        let http1_client = accept_plugin_http_client(
+            build_http1_only_plugin_client(pool_config, Some(dns_cache), &tls_posture),
+            "Failed to build the HTTP/1.1 plugin HTTP companion client",
         );
 
         Self {
             client,
             http2_client,
+            http1_client,
             slow_threshold: Duration::from_millis(slow_threshold_ms),
             max_retries,
             retry_delay: Duration::from_millis(retry_delay_ms),
@@ -863,10 +924,15 @@ impl PluginHttpClient {
             build_configured_plugin_client(config, None, &tls_posture, true),
             "Failed to build the HTTP/2 plugin HTTP companion client",
         );
+        let http1_client = accept_plugin_http_client(
+            build_http1_only_plugin_client(config, None, &tls_posture),
+            "Failed to build the HTTP/1.1 plugin HTTP companion client",
+        );
 
         Self {
             client,
             http2_client,
+            http1_client,
             slow_threshold: Duration::from_millis(1000),
             max_retries: 0,
             retry_delay: Duration::from_millis(100),
@@ -1169,6 +1235,22 @@ impl PluginHttpClient {
             .ok_or(PluginHttpClientUnavailable)
     }
 
+    /// Get the HTTP/1.1-pinned companion client.
+    ///
+    /// Returns `Err` when companion construction failed closed. Callers must
+    /// fail closed without substituting an ambient-proxy-aware default client.
+    ///
+    /// For Ferrum-generated requests that re-enter a Ferrum HTTP frontend while
+    /// preserving the triggering client's `Host` and dialing a different
+    /// authority. Shares DNS, TLS posture, pool/keepalive, redirect, and
+    /// no-proxy invariants with [`get`]. Pass builders from this client through
+    /// [`execute_http1_redacted`] so redaction and egress screening still run.
+    pub fn get_http1(&self) -> Result<&reqwest::Client, PluginHttpClientUnavailable> {
+        self.http1_client
+            .as_deref()
+            .ok_or(PluginHttpClientUnavailable)
+    }
+
     /// Send a pre-built request with automatic slow-call logging.
     ///
     /// Times the network round-trip and emits a `warn!` if the elapsed time
@@ -1257,6 +1339,45 @@ impl PluginHttpClient {
             format!("{error_class} building request to {redacted_url}")
         })?;
         let Some(client) = self.http2_client.as_ref() else {
+            return Err(format!(
+                "{} calling {redacted_url}",
+                ErrorClass::ConnectionPoolError
+            ));
+        };
+        self.execute_request_with_client(
+            client,
+            request,
+            label,
+            None,
+            Some(redacted_url),
+            RetryDisposition::SharedPolicy,
+        )
+        .await
+        .map_err(|e| {
+            let error_class = classify_reqwest_error(&e);
+            format!("{error_class} calling {redacted_url}")
+        })
+    }
+
+    /// Send a request through the HTTP/1.1-pinned companion while logging only
+    /// a caller-supplied redacted URL.
+    ///
+    /// Intentionally separate from [`execute_redacted`] for the same reason
+    /// [`execute_http2_redacted`] is: ordinary plugin calls stay pinned to the
+    /// default shared client and callers cannot select an arbitrary embedded
+    /// `reqwest::Client` through their request builder. Egress screening,
+    /// slow-call logging, and error redaction are identical.
+    pub async fn execute_http1_redacted(
+        &self,
+        request: reqwest::RequestBuilder,
+        label: &str,
+        redacted_url: &str,
+    ) -> Result<reqwest::Response, String> {
+        let request = request.build().map_err(|e| {
+            let error_class = classify_reqwest_error(&e);
+            format!("{error_class} building request to {redacted_url}")
+        })?;
+        let Some(client) = self.http1_client.as_ref() else {
             return Err(format!(
                 "{} calling {redacted_url}",
                 ErrorClass::ConnectionPoolError
