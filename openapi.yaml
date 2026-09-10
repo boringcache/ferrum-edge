@@ -13000,6 +13000,29 @@ components:
         Unknown keys (for example `client_certpath` or
         `verify_server_certificate`) fail admission instead of silently
         disabling intended mTLS materials or verification.
+
+        `client_cert_path` and `client_key_path` must be supplied together.
+        A `system://` `server_ca_cert_path` cannot be combined with
+        `verify_server_cert: false` (the same contradiction Proxy and Upstream
+        admission reject); that pairing is a runtime check because the schema
+        cannot condition on a value prefix and a sibling boolean at once.
+      allOf:
+        - if:
+            required: [client_cert_path]
+            properties:
+              client_cert_path: {type: string}
+          then:
+            required: [client_key_path]
+            properties:
+              client_key_path: {type: string}
+        - if:
+            required: [client_key_path]
+            properties:
+              client_key_path: {type: string}
+          then:
+            required: [client_cert_path]
+            properties:
+              client_cert_path: {type: string}
       properties:
         client_cert_path:
           type: [string, "null"]
@@ -13030,23 +13053,34 @@ components:
       description: |
         Strict route-local retry policy for mesh_route_dispatch. Unknown keys
         (for example `max_retry` or `retry_on_connect_failur`) fail admission
-        instead of silently falling back to defaults.
+        instead of silently falling back to defaults. The numeric bounds below
+        mirror the shared gateway `RetryConfig` field validation the route
+        policy runs after deserialization.
       properties:
         max_retries:
           type: integer
           format: uint32
+          minimum: 0
+          maximum: 100
           default: 3
         retryable_status_codes:
           type: array
+          maxItems: 500
           items:
             type: integer
             format: uint16
+            minimum: 100
+            maximum: 599
           default: []
         retryable_methods:
           type: array
           items:
             type: string
-            enum: [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS, TRACE, CONNECT]
+            pattern: '^(?:[Gg][Ee][Tt]|[Pp][Oo][Ss][Tt]|[Pp][Uu][Tt]|[Pp][Aa][Tt][Cc][Hh]|[Dd][Ee][Ll][Ee][Tt][Ee]|[Hh][Ee][Aa][Dd]|[Oo][Pp][Tt][Ii][Oo][Nn][Ss]|[Tt][Rr][Aa][Cc][Ee]|[Cc][Oo][Nn][Nn][Ee][Cc][Tt])$'
+            description: |
+              One of GET / POST / PUT / PATCH / DELETE / HEAD / OPTIONS /
+              TRACE / CONNECT. The validator ASCII-uppercases before
+              comparing, so `get` and `Get` are accepted.
           maxItems: 9
           default: [GET, HEAD, OPTIONS, PUT, DELETE]
         backoff:
@@ -13056,7 +13090,12 @@ components:
           default: true
 
     MeshRouteBackoffStrategy:
-      description: Strict route-local retry delay strategy for mesh_route_dispatch.
+      description: |
+        Strict route-local retry delay strategy for mesh_route_dispatch. Each
+        delay is bounded to `[0, 300000]` ms by the shared gateway
+        `RetryConfig` field validation the route policy runs; `base_ms` must
+        additionally not exceed `max_ms`, which JSON Schema cannot express
+        across two sibling properties and is therefore a runtime-only check.
       oneOf:
         - type: object
           title: Fixed delay
@@ -13071,6 +13110,8 @@ components:
                 delay_ms:
                   type: integer
                   format: uint64
+                  minimum: 0
+                  maximum: 300000
                   default: 100
         - type: object
           title: Exponential backoff
@@ -13085,9 +13126,13 @@ components:
                 base_ms:
                   type: integer
                   format: uint64
+                  minimum: 0
+                  maximum: 300000
                 max_ms:
                   type: integer
                   format: uint64
+                  minimum: 0
+                  maximum: 300000
       default:
         fixed:
           delay_ms: 100
@@ -22695,13 +22740,54 @@ components:
             type: object
             additionalProperties: false
             description: |
-              One ordered route rule. `destination` is required unless the
-              rule carries a `redirect` (which answers the request itself and
-              needs no backend). First match wins.
+              One ordered route rule. `destination` is required — and must
+              carry at least one override field — unless the rule carries a
+              `redirect` (which answers the request itself and needs no
+              backend). First match wins.
             anyOf:
-              - required: [destination]
               - required: [redirect]
+                properties:
+                  redirect: {type: object}
+              - required: [destination]
+                properties:
+                  destination:
+                    anyOf:
+                      - required: [upstream_id]
+                        properties: {upstream_id: {type: string}}
+                      - required: [backend_host]
+                        properties: {backend_host: {type: string}}
+                      - required: [backend_port]
+                        properties: {backend_port: {type: integer}}
+                      - required: [backend_tls]
+                        properties: {backend_tls: {type: object}}
             allOf:
+              - anyOf:
+                  - required: [match]
+                    properties:
+                      match:
+                        anyOf:
+                          - required: [methods]
+                            properties: {methods: {type: array, minItems: 1}}
+                          - required: [headers]
+                            properties: {headers: {type: object, minProperties: 1}}
+                          - required: [query_params]
+                            properties: {query_params: {type: object, minProperties: 1}}
+                          - required: [authority]
+                            properties: {authority: {not: {type: "null"}}}
+                          - required: [source_namespace]
+                            properties: {source_namespace: {type: string}}
+                          - required: [uri]
+                            properties: {uri: {not: {type: "null"}}}
+                  - required: [request_transform]
+                    properties: {request_transform: {type: array, minItems: 1}}
+                  - required: [response_transform]
+                    properties: {response_transform: {type: array, minItems: 1}}
+                  - required: [fault]
+                    properties: {fault: {type: object}}
+                  - required: [rewrite]
+                    properties: {rewrite: {type: object}}
+                  - required: [redirect]
+                    properties: {redirect: {type: object}}
               - if:
                   required: [timeout_disabled]
                   properties:
@@ -22728,48 +22814,101 @@ components:
                   Match criteria — all configured fields must match for the
                   rule to fire. At least one of `methods`/`headers`/
                   `query_params`/`authority`/`source_namespace`/`uri` must be
-                  configured (an empty match is rejected at load time).
+                  configured, UNLESS the rule carries a route action
+                  (`request_transform`, `response_transform`, `fault`,
+                  `rewrite`, or `redirect`), which makes an empty match the
+                  translator's deliberate action-only catch-all. An empty
+                  match with no route action is rejected at load time because
+                  it would silently shadow every later rule. `ignore_uri_case`
+                  is not a predicate: it decorates `uri` and is rejected
+                  without one.
+                allOf:
+                  - if:
+                      required: [ignore_uri_case]
+                      properties:
+                        ignore_uri_case: {const: true}
+                    then:
+                      required: [uri]
+                      properties:
+                        uri: {not: {type: "null"}}
                 properties:
                   methods:
                     type: array
                     items:
                       oneOf:
                         - type: string
-                          description: Bare-string back-compat form, interpreted as Exact.
+                          pattern: '^[-!#$%&''*+.^_`|~0-9A-Za-z]+$'
+                          description: |
+                            Bare-string back-compat form, interpreted as Exact.
+                            Must be a non-empty RFC 9110 method token: the hot
+                            path compares it with `==` against the request
+                            method, so an operand carrying a space or another
+                            non-token character can never match and is
+                            rejected at config load.
                         - type: object
                           description: |
-                            Istio StringMatch shape — exactly one of
-                            `exact` / `prefix` / `regex`. Prefix patterns are
-                            uppercased at compile time (methods are uppercase
-                            ASCII per RFC 9110 §9.1); regex patterns are
-                            interpreted verbatim inside full-input anchors.
+                            Istio StringMatch shape — EXACTLY one of
+                            `exact` / `prefix` / `regex`. The runtime is an
+                            externally tagged enum, so both `{}` and
+                            `{"exact": "GET", "prefix": "G"}` are rejected.
+                            Prefix patterns are uppercased at compile time
+                            (methods are uppercase ASCII per RFC 9110 §9.1);
+                            regex patterns are interpreted verbatim inside
+                            full-input anchors. `exact` / `prefix` operands
+                            must be non-empty method tokens (case and
+                            extension methods such as `PROPFIND` are
+                            preserved); `regex` is a pattern rather than a
+                            token and is only checked for regex validity.
                           additionalProperties: false
+                          minProperties: 1
+                          maxProperties: 1
                           properties:
                             exact:
                               type: string
+                              pattern: '^[-!#$%&''*+.^_`|~0-9A-Za-z]+$'
                             prefix:
                               type: string
+                              pattern: '^[-!#$%&''*+.^_`|~0-9A-Za-z]+$'
                             regex:
                               type: string
+                              minLength: 1
                     description: HTTP methods (any-of). Empty = no method restriction.
                   headers:
                     type: object
+                    propertyNames:
+                      pattern: '^[-!#$%&''*+.^_`|~0-9A-Za-z]+$'
+                      description: |
+                        Header names are RFC 9110 tokens, normalized to ASCII
+                        lowercase at config load. A name outside the token
+                        grammar (empty, `x bad`, `x:bad`) can never appear in
+                        a parsed request header map, so it is rejected at
+                        config load rather than admitted as a rule that
+                        silently never fires.
                     additionalProperties:
                       oneOf:
                         - type: string
                           description: Bare-string back-compat form, interpreted as Exact.
                         - type: object
                           description: |
-                            Istio StringMatch shape — exactly one of
-                            `exact` / `prefix` / `regex`.
+                            Istio StringMatch shape — EXACTLY one of
+                            `exact` / `prefix` / `regex`. The runtime is an
+                            externally tagged enum, so both `{}` and
+                            `{"exact": "a", "prefix": "b"}` are rejected.
+                            An empty `exact` is a legitimate "header present
+                            and empty" predicate; empty `prefix` / `regex`
+                            operands are rejected at config load.
                           additionalProperties: false
+                          minProperties: 1
+                          maxProperties: 1
                           properties:
                             exact:
                               type: string
                             prefix:
                               type: string
+                              minLength: 1
                             regex:
                               type: string
+                              minLength: 1
                     description: Header matches (all-of). Header names are case-insensitive.
                   query_params:
                     type: object
@@ -22798,24 +22937,28 @@ components:
                       route-order fallbacks that need dispatch-layer URI
                       precision. Regex patterns must match the full URI path.
                     oneOf:
+                      - type: "null"
                       - type: object
                         required: [exact]
                         additionalProperties: false
                         properties:
                           exact:
                             type: string
+                            minLength: 1
                       - type: object
                         required: [prefix]
                         additionalProperties: false
                         properties:
                           prefix:
                             type: string
+                            minLength: 1
                       - type: object
                         required: [regex]
                         additionalProperties: false
                         properties:
                           regex:
                             type: string
+                            minLength: 1
                   ignore_uri_case:
                     type: boolean
                     description: |
@@ -22826,6 +22969,8 @@ components:
                       the pattern. Requires `match.uri`.
                   source_namespace:
                     type: [string, "null"]
+                    minLength: 1
+                    pattern: '^\S+$'
                     description: |
                       Source workload Kubernetes namespace (exact match).
                       Mirrors Istio `VirtualService.http[].match.sourceNamespace`:
@@ -22853,7 +22998,9 @@ components:
                       admission — this is a per-rule predicate evaluated AFTER
                       routing has picked the proxy.
                     oneOf:
+                      - type: "null"
                       - type: string
+                        minLength: 1
                         description: Bare-string back-compat form, interpreted as Exact.
                       - type: object
                         required: [exact]
@@ -22861,34 +23008,97 @@ components:
                         properties:
                           exact:
                             type: string
+                            minLength: 1
                       - type: object
                         required: [prefix]
                         additionalProperties: false
                         properties:
                           prefix:
                             type: string
+                            minLength: 1
                       - type: object
                         required: [regex]
                         additionalProperties: false
                         properties:
                           regex:
                             type: string
+                            minLength: 1
               destination:
                 type: object
                 additionalProperties: false
                 description: |
-                  Override applied on match. At least one field must be set.
-                  `upstream_id` is mutually exclusive with the direct-backend
-                  fields (`backend_host`/`backend_port`/`backend_tls`).
+                  Override applied on match. At least one field must be set
+                  (enforced at rule level, where a `redirect` rule is allowed
+                  to omit `destination` entirely). `upstream_id` is mutually
+                  exclusive with the direct-backend fields
+                  (`backend_host`/`backend_port`/`backend_tls`);
+                  `backend_host` and `backend_port` must be set together, and
+                  `backend_tls` requires both.
+                allOf:
+                  - if:
+                      required: [backend_host]
+                      properties:
+                        backend_host: {type: string}
+                    then:
+                      required: [backend_port]
+                      properties:
+                        backend_port: {type: integer}
+                  - if:
+                      required: [backend_port]
+                      properties:
+                        backend_port: {type: integer}
+                    then:
+                      required: [backend_host]
+                      properties:
+                        backend_host: {type: string}
+                  - if:
+                      required: [upstream_id]
+                      properties:
+                        upstream_id: {type: string}
+                    then:
+                      properties:
+                        backend_host: {type: "null"}
+                        backend_port: {type: "null"}
+                        backend_tls: {type: "null"}
+                  - if:
+                      required: [backend_tls]
+                      properties:
+                        backend_tls: {type: object}
+                    then:
+                      required: [backend_host, backend_port]
+                      properties:
+                        backend_host: {type: string}
+                        backend_port: {type: integer}
                 properties:
                   upstream_id:
                     type: [string, "null"]
                   backend_host:
                     type: [string, "null"]
+                    minLength: 1
+                    maxLength: 255
+                    pattern: '^\s*(?:\[[0-9A-Fa-f:.]+\]|[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*|[^\s/?#@:\[\]]+)\s*$'
+                    description: |
+                      Direct-backend host. This is a BARE host — a DNS name,
+                      an IPv4 literal, or an IPv6 literal in either `::1` or
+                      `[::1]` form — with the port carried by `backend_port`.
+                      The dispatch path hands the value straight to DNS
+                      resolution, so an embedded authority port, scheme, path,
+                      query, fragment, or userinfo resolves to nothing and is
+                      rejected at config load rather than answering 502 on
+                      every matching request. Leading / trailing whitespace is
+                      trimmed and the value is ASCII-lowercased at load, so
+                      the length bound applies to the TRIMMED value at
+                      runtime while `maxLength` here counts the raw string.
+                      The pattern is likewise a conservative approximation:
+                      the runtime additionally parses the IPv6 forms, so a
+                      colon-bearing value that is not a valid IPv6 literal
+                      (`1:2:3`) passes this schema and is still refused at
+                      admission.
                   backend_port:
                     type: [integer, "null"]
                     format: uint16
                     minimum: 1
+                    maximum: 65535
                   backend_tls:
                     description: Optional per-rule backend TLS override (direct backends only).
                     oneOf:
@@ -22904,10 +23114,12 @@ components:
               timeout_ms:
                 type: [integer, "null"]
                 format: uint64
+                minimum: 0
                 description: |
                   Optional route-local backend response/read timeout in
                   milliseconds. Mutually exclusive with
-                  `timeout_disabled: true`.
+                  `timeout_disabled: true`. `0` means "no timeout" and is the
+                  value `timeout_disabled: true` resolves to.
               timeout_disabled:
                 type: boolean
                 default: false
@@ -23038,10 +23250,11 @@ components:
                       type: [string, "null"]
                       description: Required and non-null for add/update; omitted or null for remove.
               fault:
-                type: object
+                type: [object, "null"]
                 additionalProperties: false
                 description: |
-                  Optional per-rule fault action. Projects Istio
+                  Optional per-rule fault action; `null` is accepted and means
+                  "no fault", exactly as omitting the key does. Projects Istio
                   `VirtualService.http[].fault` onto the matched dispatch
                   rule (replacing the historical proxy-scoped
                   `fault_injection` plugin that could not be collapsed
@@ -23058,7 +23271,7 @@ components:
                   plugin instead.
                 properties:
                   delay:
-                    type: object
+                    type: [object, "null"]
                     additionalProperties: false
                     required: [duration_ms, percentage]
                     properties:
@@ -23084,7 +23297,7 @@ components:
                           to that first bucket so every accepted value can
                           trigger.
                   abort:
-                    type: object
+                    type: [object, "null"]
                     additionalProperties: false
                     required: [status_code, percentage]
                     properties:
@@ -23102,7 +23315,7 @@ components:
                           values below one 64-bit sampler bucket round up to
                           that first bucket so every accepted value can trigger.
                       grpc_status:
-                        type: integer
+                        type: [integer, "null"]
                         minimum: 0
                         maximum: 16
                         description: |
@@ -23115,10 +23328,11 @@ components:
                         type: [string, "null"]
                         description: Optional response body; empty when omitted.
               rewrite:
-                type: object
+                type: [object, "null"]
                 additionalProperties: false
                 description: |
-                  Optional per-rule URI / authority rewrite. Projects Istio
+                  Optional per-rule URI / authority rewrite; `null` is
+                  accepted and means "no rewrite". Projects Istio
                   `VirtualService.http[].rewrite` onto the matched dispatch
                   rule so a rewriting route can be collapsed with sibling
                   routes onto one Ferrum proxy without rewriting the siblings'
@@ -23127,6 +23341,8 @@ components:
                 properties:
                   uri:
                     type: [string, "null"]
+                    minLength: 1
+                    pattern: '^/'
                     description: |
                       Replacement request path forwarded to the backend. When
                       `match_prefix` is set (the source `match.uri` was a
@@ -23134,10 +23350,14 @@ components:
                       path is replaced. Must be a canonical absolute path
                       without a query or fragment. Percent escapes, dot
                       segments, backslashes, and CRLF are rejected at load
-                      time. The composed path is checked again before policy
-                      and dispatch; ambiguous paths are refused, not resolved.
+                      time (the schema only checks the leading `/`; full
+                      canonical-path admission is a runtime check). The
+                      composed path is checked again before policy and
+                      dispatch; ambiguous paths are refused, not resolved.
                   authority:
                     type: [string, "null"]
+                    minLength: 1
+                    pattern: '^\S+$'
                     description: |
                       Replacement `Host` / `:authority` forwarded to the
                       backend. CRLF / whitespace is rejected at load time.
@@ -23145,14 +23365,23 @@ components:
                     type: [string, "null"]
                     description: |
                       Literal path prefix the source `match.uri.prefix`
-                      matched. The plugin strips this prefix and prepends
-                      `uri` (Istio prefix-rewrite). Normally set by the
-                      VirtualService translator, not hand-authored.
+                      matched. The plugin replaces exactly this prefix with
+                      `uri` and appends the unmatched suffix VERBATIM (Istio
+                      `HTTPRewrite` / Envoy `prefix_rewrite`), so a prefix
+                      ending inside a path segment keeps that segment: with
+                      `match_prefix: /prefix/old` and `uri: /new`,
+                      `/prefix/oldtail` forwards as `/newtail`. A separator is
+                      never synthesized; a doubled one is collapsed when both
+                      sides carry a `/`. An empty string is normalized to
+                      "no prefix" (whole-path replacement). Normally set by
+                      the VirtualService translator, not hand-authored.
               redirect:
-                type: object
+                type: [object, "null"]
                 additionalProperties: false
                 description: |
-                  Optional per-rule HTTP redirect. Projects Istio
+                  Optional per-rule HTTP redirect; `null` is accepted and
+                  means "no redirect" (a rule that is `null` here still needs
+                  a `destination`). Projects Istio
                   `VirtualService.http[].redirect`. When the rule matches the
                   request is answered with a 3xx + `Location` and never reaches
                   a backend; takes precedence over `rewrite` and the route
@@ -23161,23 +23390,45 @@ components:
                   does not require a `destination`. `port` and `derive_port`
                   are mutually exclusive (Istio oneof); scheme-default ports
                   are omitted from Location.
+                allOf:
+                  - if:
+                      required: [port]
+                      properties:
+                        port: {type: integer}
+                    then:
+                      properties:
+                        derive_port: {type: "null"}
+                  - if:
+                      required: [derive_port]
+                      properties:
+                        derive_port: {type: string}
+                    then:
+                      properties:
+                        port: {type: "null"}
                 properties:
                   uri:
                     type: [string, "null"]
-                    description: Replacement path for the Location header; request path preserved when unset.
+                    minLength: 1
+                    description: Replacement path for the Location header; request path preserved when unset. Must be non-empty and CRLF-free.
                   match_prefix:
                     type: [string, "null"]
                     description: |
                       Literal matched path prefix replaced by `uri`; the
-                      unmatched suffix is preserved. Normally emitted by the
-                      VirtualService translator.
+                      unmatched suffix is appended verbatim, exactly as for
+                      `rewrite.match_prefix` (no separator is synthesized at a
+                      boundary that had none). An empty string is normalized
+                      to "no prefix". Normally emitted by the VirtualService
+                      translator.
                   authority:
                     type: [string, "null"]
+                    minLength: 1
+                    pattern: '^\S+$'
                     description: Replacement authority (host[:port]) for the Location header; request authority preserved when unset.
                   port:
                     type: [integer, "null"]
                     format: uint16
                     minimum: 1
+                    maximum: 65535
                     description: |
                       Replacement authority port (Istio `redirect.port`); request
                       host is preserved when authority is unset. Mutually
@@ -23197,8 +23448,12 @@ components:
                       headers. Mutually exclusive with `port`.
                   scheme:
                     type: [string, "null"]
-                    enum: [http, https, null]
-                    description: Replacement scheme for the Location header; request scheme preserved when unset.
+                    pattern: '^[Hh][Tt][Tt][Pp][Ss]?$'
+                    description: |
+                      Replacement scheme for the Location header; request
+                      scheme preserved when unset. The constructor
+                      ASCII-lowercases the value before checking it, so
+                      `HTTPS` and `Https` are accepted and stored as `https`.
                   redirect_code:
                     type: integer
                     minimum: 300

@@ -12105,6 +12105,272 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
         true,
     );
     MeshRouteDispatch::new(&status_only_redirect).expect("status-only redirects are runtime-valid");
+
+    // Component/runtime parity corpus (issue #5374): tagged match cardinality,
+    // accepted optional nulls, constructor normalization, destination /
+    // backend-TLS pairing, and numeric boundaries. Every entry must get the
+    // SAME verdict from the JSON Schema component and from the constructor.
+    fn parity_rule(patch: serde_json::Value) -> serde_json::Value {
+        let mut rule = json!({
+            "match": {"methods": ["GET"]},
+            "destination": {"backend_host": "api.internal", "backend_port": 8443}
+        });
+        if let (Some(base), Some(fields)) = (rule.as_object_mut(), patch.as_object()) {
+            for (key, value) in fields {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+        json!({"rules": [rule]})
+    }
+
+    for (label, config, accepted) in [
+        (
+            "methods_no_operator",
+            parity_rule(json!({"match": {"methods": [{}]}})),
+            false,
+        ),
+        (
+            "methods_two_operators",
+            parity_rule(json!({"match": {"methods": [{"exact": "GET", "prefix": "G"}]}})),
+            false,
+        ),
+        (
+            "methods_empty_exact",
+            parity_rule(json!({"match": {"methods": [{"exact": ""}]}})),
+            false,
+        ),
+        (
+            "methods_space_in_exact",
+            parity_rule(json!({"match": {"methods": ["GET POST"]}})),
+            false,
+        ),
+        (
+            "methods_lowercase_exact",
+            parity_rule(json!({"match": {"methods": ["get"]}})),
+            true,
+        ),
+        (
+            "methods_extension_exact",
+            parity_rule(json!({"match": {"methods": [{"exact": "M-SEARCH"}]}})),
+            true,
+        ),
+        (
+            "methods_regex_is_not_a_token",
+            parity_rule(json!({"match": {"methods": [{"regex": "^GET POST$"}]}})),
+            true,
+        ),
+        (
+            "headers_no_operator",
+            parity_rule(json!({"match": {"headers": {"x-a": {}}}})),
+            false,
+        ),
+        (
+            "headers_invalid_name",
+            parity_rule(json!({"match": {"headers": {"x bad": "v"}}})),
+            false,
+        ),
+        (
+            "headers_empty_name",
+            parity_rule(json!({"match": {"headers": {"": "v"}}})),
+            false,
+        ),
+        (
+            "match_uri_null",
+            parity_rule(json!({"match": {"methods": ["GET"], "uri": null}})),
+            true,
+        ),
+        (
+            "match_authority_null",
+            parity_rule(json!({"match": {"methods": ["GET"], "authority": null}})),
+            true,
+        ),
+        (
+            "match_source_namespace_empty",
+            parity_rule(json!({"match": {"source_namespace": ""}})),
+            false,
+        ),
+        (
+            "match_ignore_uri_case_without_uri",
+            parity_rule(json!({"match": {"methods": ["GET"], "ignore_uri_case": true}})),
+            false,
+        ),
+        (
+            "rule_fault_null_is_accepted",
+            parity_rule(json!({"fault": null})),
+            true,
+        ),
+        (
+            "rule_rewrite_null_is_accepted",
+            parity_rule(json!({"rewrite": null})),
+            true,
+        ),
+        (
+            "rule_redirect_null_is_accepted",
+            parity_rule(json!({"redirect": null})),
+            true,
+        ),
+        (
+            "fault_delay_null_with_abort",
+            parity_rule(json!({"fault": {
+                "delay": null,
+                "abort": {"status_code": 503, "percentage": 1.0}
+            }})),
+            true,
+        ),
+        (
+            "fault_abort_grpc_status_null",
+            parity_rule(json!({"fault": {"abort": {
+                "status_code": 503,
+                "percentage": 1.0,
+                "grpc_status": null
+            }}})),
+            true,
+        ),
+        (
+            "destination_backend_port_overflow",
+            parity_rule(json!({"destination": {
+                "backend_host": "api.internal",
+                "backend_port": 65536
+            }})),
+            false,
+        ),
+        (
+            "destination_host_without_port",
+            parity_rule(json!({"destination": {"backend_host": "api.internal"}})),
+            false,
+        ),
+        (
+            "destination_port_without_host",
+            parity_rule(json!({"destination": {"backend_port": 8443}})),
+            false,
+        ),
+        (
+            "destination_upstream_with_direct_backend",
+            parity_rule(json!({"destination": {
+                "upstream_id": "api",
+                "backend_host": "api.internal",
+                "backend_port": 8443
+            }})),
+            false,
+        ),
+        (
+            "destination_empty",
+            parity_rule(json!({"destination": {}})),
+            false,
+        ),
+        (
+            "destination_backend_host_with_embedded_port",
+            parity_rule(json!({"destination": {
+                "backend_host": "api.internal:8443",
+                "backend_port": 8443
+            }})),
+            false,
+        ),
+        (
+            "destination_backend_host_bare_ipv6",
+            parity_rule(json!({"destination": {"backend_host": "::1", "backend_port": 8443}})),
+            true,
+        ),
+        (
+            "destination_backend_host_bracketed_ipv6",
+            parity_rule(json!({"destination": {
+                "backend_host": "[2001:db8::1]",
+                "backend_port": 8443
+            }})),
+            true,
+        ),
+        (
+            "backend_tls_client_cert_without_key",
+            parity_rule(json!({"destination": {
+                "backend_host": "api.internal",
+                "backend_port": 8443,
+                "backend_tls": {"client_cert_path": "/tls/client.pem"}
+            }})),
+            false,
+        ),
+        (
+            "backend_tls_without_direct_backend",
+            parity_rule(json!({"destination": {
+                "upstream_id": "api",
+                "backend_tls": {"sni": "api.internal"}
+            }})),
+            false,
+        ),
+        (
+            "timeout_ms_negative",
+            parity_rule(json!({"timeout_ms": -1})),
+            false,
+        ),
+        (
+            "timeout_ms_zero_is_no_timeout",
+            parity_rule(json!({"timeout_ms": 0})),
+            true,
+        ),
+        (
+            "retry_max_retries_over_bound",
+            parity_rule(json!({"retry": {"max_retries": 999}})),
+            false,
+        ),
+        (
+            "retry_status_code_below_bound",
+            parity_rule(json!({"retry": {"retryable_status_codes": [99]}})),
+            false,
+        ),
+        (
+            "retry_methods_lowercase_normalize",
+            parity_rule(json!({"retry": {"retryable_methods": ["get"]}})),
+            true,
+        ),
+        (
+            "retry_backoff_over_bound",
+            parity_rule(json!({"retry": {"backoff": {"fixed": {"delay_ms": 300_001}}}})),
+            false,
+        ),
+        (
+            "redirect_scheme_uppercase_normalize",
+            parity_rule(json!({"redirect": {"scheme": "HTTPS"}})),
+            true,
+        ),
+        (
+            "redirect_scheme_unsupported",
+            parity_rule(json!({"redirect": {"scheme": "ftp"}})),
+            false,
+        ),
+        (
+            "redirect_port_with_derive_port",
+            parity_rule(json!({"redirect": {
+                "port": 8443,
+                "derive_port": "FROM_REQUEST_PORT"
+            }})),
+            false,
+        ),
+        (
+            "minimal_redirect_rule",
+            json!({"rules": [{"redirect": {}}]}),
+            true,
+        ),
+        (
+            "empty_match_without_route_action",
+            json!({"rules": [{"destination": {"upstream_id": "api"}}]}),
+            false,
+        ),
+        (
+            "action_only_catch_all",
+            json!({"rules": [{
+                "match": {},
+                "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+                "fault": {"abort": {"status_code": 503, "percentage": 100.0}}
+            }]}),
+            true,
+        ),
+    ] {
+        assert_component_validity(&spec, "MeshRouteDispatchConfig", &config, accepted);
+        assert_eq!(
+            MeshRouteDispatch::new(&config).is_ok(),
+            accepted,
+            "runtime disagreed with the component schema for {label}"
+        );
+    }
 }
 
 #[test]
