@@ -4276,6 +4276,8 @@ where
     // comma-folded member so a repeated identical declaration is honored rather
     // than skipping this reject (`GHSA-xrfj-852f-645j`).
     if let Some(len) = crate::proxy::declared_response_length_exceeds_limit(
+        method,
+        status,
         &response_headers,
         effective_max_response_body_size_bytes,
     ) {

@@ -11109,6 +11109,207 @@ fn mesh_plugin_config_roots_are_closed_and_match_openapi() {
     }
 }
 
+/// Issues #5111–#5115: size-limiting plugin configs are closed objects whose
+/// integer size fields advertise an enforceable uint64 maximum. `format: uint64`
+/// alone does not constrain Draft 2020-12 validators.
+#[test]
+fn size_limiting_plugin_configs_are_closed_and_bounded_in_openapi() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let uint64_max = json!(u64::MAX);
+    for (schema_name, runtime_keys, size_fields) in [
+        (
+            "RequestSizeLimitingConfig",
+            &["max_bytes"][..],
+            &["max_bytes"][..],
+        ),
+        (
+            "ResponseSizeLimitingConfig",
+            &["max_bytes", "require_buffered_check"][..],
+            &["max_bytes"][..],
+        ),
+        (
+            "WsMessageSizeLimitingConfig",
+            &["close_reason", "max_frame_bytes", "max_message_bytes"][..],
+            &["max_frame_bytes", "max_message_bytes"][..],
+        ),
+    ] {
+        let schema = spec
+            .pointer(&format!("/components/schemas/{schema_name}"))
+            .unwrap_or_else(|| panic!("{schema_name} component exists"));
+        assert_eq!(
+            schema["additionalProperties"],
+            json!(false),
+            "{schema_name} must reject unknown properties"
+        );
+
+        let schema_fields: BTreeSet<&str> = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{schema_name} properties"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let runtime_fields: BTreeSet<&str> = runtime_keys.iter().copied().collect();
+        assert_eq!(schema_fields, runtime_fields, "{schema_name} key drift");
+
+        for field in size_fields {
+            assert_eq!(
+                schema["properties"][field]["minimum"],
+                json!(1),
+                "{schema_name}.{field} must be a positive integer"
+            );
+            assert_eq!(
+                schema["properties"][field]["maximum"], uint64_max,
+                "{schema_name}.{field} must advertise the uint64 upper bound"
+            );
+            assert_eq!(
+                schema["properties"][field]["format"],
+                json!("uint64"),
+                "{schema_name}.{field} stays uint64"
+            );
+        }
+
+        let mut component_schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$ref": format!("#/components/schemas/{schema_name}")
+        });
+        component_schema
+            .as_object_mut()
+            .expect("schema should be object")
+            .insert("components".to_string(), spec["components"].clone());
+        let component_validator = jsonschema::draft202012::options()
+            .build(&component_schema)
+            .unwrap_or_else(|error| panic!("{schema_name} schema compiles: {error}"));
+
+        let minimal = match schema_name {
+            "RequestSizeLimitingConfig" | "ResponseSizeLimitingConfig" => {
+                json!({"max_bytes": 1})
+            }
+            "WsMessageSizeLimitingConfig" => json!({"max_frame_bytes": 1}),
+            _ => unreachable!(),
+        };
+        assert!(
+            component_validator.validate(&minimal).is_ok(),
+            "{schema_name} must accept the documented minimal config: {minimal}"
+        );
+
+        let mut unknown = minimal.clone();
+        unknown
+            .as_object_mut()
+            .expect("minimal config is an object")
+            .insert("max_bytez".to_string(), json!(64));
+        assert!(
+            component_validator.validate(&unknown).is_err(),
+            "{schema_name} must reject an unknown key: {unknown}"
+        );
+
+        let at_max = {
+            let mut at_max = minimal.clone();
+            for field in size_fields {
+                at_max
+                    .as_object_mut()
+                    .expect("minimal config is an object")
+                    .insert((*field).to_string(), json!(u64::MAX));
+            }
+            at_max
+        };
+        assert!(
+            component_validator.validate(&at_max).is_ok(),
+            "{schema_name} must accept u64::MAX: {at_max}"
+        );
+
+        let over = serde_json::from_str("18446744073709551616")
+            .expect("u64::MAX+1 must parse as a JSON number");
+        let mut over_range = minimal.clone();
+        over_range
+            .as_object_mut()
+            .expect("minimal config is an object")
+            .insert(size_fields[0].to_string(), over);
+        assert!(
+            component_validator.validate(&over_range).is_err(),
+            "{schema_name} must reject u64::MAX+1: {over_range}"
+        );
+    }
+
+    let mut plugin_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/PluginConfig"
+    });
+    plugin_schema
+        .as_object_mut()
+        .expect("schema should be object")
+        .insert("components".to_string(), spec["components"].clone());
+    let plugin_validator = jsonschema::draft202012::options()
+        .build(&plugin_schema)
+        .expect("PluginConfig schema compiles");
+
+    let plugin_config = |plugin_name: &str, config: serde_json::Value| -> serde_json::Value {
+        json!({
+            "plugin_name": plugin_name,
+            "scope": "global",
+            "enabled": true,
+            "config": config
+        })
+    };
+
+    for (plugin_name, minimal) in [
+        ("request_size_limiting", json!({"max_bytes": 1})),
+        ("response_size_limiting", json!({"max_bytes": 1})),
+        ("ws_message_size_limiting", json!({"max_frame_bytes": 1})),
+    ] {
+        assert!(
+            plugin_validator
+                .validate(&plugin_config(plugin_name, minimal.clone()))
+                .is_ok(),
+            "{plugin_name} PluginConfig branch must accept the documented minimal config"
+        );
+
+        let mut unknown = minimal.clone();
+        unknown
+            .as_object_mut()
+            .expect("minimal config is an object")
+            .insert("max_bytez".to_string(), json!(64));
+        assert!(
+            plugin_validator
+                .validate(&plugin_config(plugin_name, unknown))
+                .is_err(),
+            "{plugin_name} PluginConfig branch must reject an unknown key"
+        );
+
+        let mut at_max = minimal.clone();
+        let size_field = if plugin_name == "ws_message_size_limiting" {
+            "max_frame_bytes"
+        } else {
+            "max_bytes"
+        };
+        at_max
+            .as_object_mut()
+            .expect("minimal config is an object")
+            .insert(size_field.to_string(), json!(u64::MAX));
+        assert!(
+            plugin_validator
+                .validate(&plugin_config(plugin_name, at_max))
+                .is_ok(),
+            "{plugin_name} PluginConfig branch must accept u64::MAX"
+        );
+
+        let over = serde_json::from_str("18446744073709551616")
+            .expect("u64::MAX+1 must parse as a JSON number");
+        let mut over_range = minimal;
+        over_range
+            .as_object_mut()
+            .expect("minimal config is an object")
+            .insert(size_field.to_string(), over);
+        assert!(
+            plugin_validator
+                .validate(&plugin_config(plugin_name, over_range))
+                .is_err(),
+            "{plugin_name} PluginConfig branch must reject u64::MAX+1"
+        );
+    }
+}
+
 /// Three-way parity for the `ai_semantic_firewall` extraction-path allowlist.
 ///
 /// The same list exists in three places — the Rust constants that
