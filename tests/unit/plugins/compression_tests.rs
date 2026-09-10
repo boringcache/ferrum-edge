@@ -3670,37 +3670,100 @@ async fn test_out_of_range_q_value_is_ignored() {
     assert_eq!(selected, None);
 }
 
-// ──────────────── #60: multi-member gzip request decompression ────────────────
+// ──────────────── Single-member gzip request normalization (#5362) ────────────
 
-/// Concatenated multi-member gzip is rejected by the shared content-coding
-/// decoder (trailing bytes after the first member). Fail closed rather than
-/// silently truncating to the first member.
+/// Drive the live normalization hook: the context-free transform is inert and
+/// cannot prove that the charged decoder rejected the representation.
 #[tokio::test]
 async fn test_multi_member_gzip_request_decompression_fails_closed() {
-    use flate2::write::GzEncoder;
-    use std::io::Write;
+    let mut compressed = gzip_bytes(b"first gzip member payload; ");
+    compressed.extend_from_slice(&gzip_bytes(b"second gzip member payload!"));
+    assert_gzip_normalization_rejected(&compressed).await;
+}
 
-    let part_a = b"first gzip member payload; ";
-    let part_b = b"second gzip member payload!";
-
-    let mut compressed = Vec::new();
-    for part in [part_a.as_slice(), part_b.as_slice()] {
-        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(part).unwrap();
-        compressed.extend_from_slice(&encoder.finish().unwrap());
+#[tokio::test]
+async fn test_gzip_request_with_trailing_data_fails_closed() {
+    for suffix in [vec![0], b"trailing bytes".to_vec(), gzip_bytes(b"")] {
+        let mut compressed = gzip_bytes(b"ordinary upload");
+        compressed.extend_from_slice(&suffix);
+        assert_gzip_normalization_rejected(&compressed).await;
     }
+}
 
-    let plugin = make_plugin(json!({"decompress_request": true}));
-    let mut headers = HashMap::new();
-    headers.insert("content-encoding".to_string(), "gzip".to_string());
+async fn assert_gzip_normalization_rejected(compressed: &[u8]) {
+    for coding in ["gzip", "x-gzip"] {
+        let plugins: Vec<Arc<dyn Plugin>> =
+            vec![Arc::new(make_plugin(json!({"decompress_request": true})))];
+        let mut ctx = make_request_ctx_with_body(coding, compressed);
+        ctx.headers
+            .insert("content-length".to_string(), compressed.len().to_string());
+        let mut headers = std::mem::take(&mut ctx.headers);
+        let original_headers = headers.clone();
+        let mut body = compressed.to_vec();
 
-    let result = plugin
-        .transform_request_body(&compressed, Some("application/octet-stream"), &headers)
+        let result = apply_buffered_request_body_normalization_before_before_proxy_for_test(
+            &plugins,
+            &mut ctx,
+            &mut headers,
+            &mut body,
+        )
         .await;
-    assert!(
-        result.is_none(),
-        "concatenated multi-member gzip must fail closed instead of truncating"
-    );
+
+        match result {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 400);
+                assert_eq!(body, r#"{"error":"Malformed compressed request body"}"#);
+            }
+            other => panic!("expected normalization rejection for {coding}, got {other:?}"),
+        }
+        assert_eq!(body, compressed);
+        assert_eq!(headers, original_headers);
+        assert!(!ctx.metadata.contains_key("compression:request_decoded"));
+        assert!(!ctx.metadata.contains_key("compression:request_encoding"));
+    }
+}
+
+#[tokio::test]
+async fn test_single_member_gzip_request_normalization_decodes_with_charged_decoder() {
+    for plaintext in [b"ordinary upload".as_slice(), b"".as_slice()] {
+        for coding in ["gzip", "x-gzip"] {
+            // Also exercise a decoded body exactly at the configured ceiling.
+            let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(make_plugin(json!({
+                "decompress_request": true,
+                "max_decompressed_request_size": plaintext.len().max(1),
+            })))];
+            let compressed = gzip_bytes(plaintext);
+            let mut ctx = make_request_ctx_with_body(coding, &compressed);
+            ctx.headers
+                .insert("content-length".to_string(), compressed.len().to_string());
+            let mut headers = std::mem::take(&mut ctx.headers);
+            let mut body = compressed;
+
+            let result = apply_buffered_request_body_normalization_before_before_proxy_for_test(
+                &plugins,
+                &mut ctx,
+                &mut headers,
+                &mut body,
+            )
+            .await;
+
+            assert!(matches!(result, PluginResult::Continue));
+            assert_eq!(body, plaintext);
+            assert!(!headers.contains_key("content-encoding"));
+            assert!(!headers.contains_key("content-length"));
+            // `parse_content_codings` canonicalizes `x-gzip` to `gzip`, so the
+            // handoff marker carries the canonical member for both spellings.
+            assert_eq!(
+                headers
+                    .get("x-ferrum-original-content-encoding")
+                    .map(String::as_str),
+                Some("gzip")
+            );
+            assert!(ctx.metadata.contains_key("compression:request_decoded"));
+        }
+    }
 }
 
 // ──────── #59: malformed compressed request body is rejected, not forwarded ────

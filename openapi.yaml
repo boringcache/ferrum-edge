@@ -25980,7 +25980,7 @@ components:
         decompress_request:
           type: [boolean, "null"]
           default: false
-          description: "Enable decompression of gzip/brotli request Content-Encoding lists (OWS-tolerant ordered chains; malformed/unsupported members fail closed). Null selects the default."
+          description: "Enable decompression of gzip/brotli request Content-Encoding lists (OWS-tolerant ordered chains; malformed/unsupported members fail closed). Each gzip/x-gzip layer must contain exactly one complete member with a valid trailer and no remaining bytes; additional members (even empty ones), padding, and trailing data fail closed with 400. The shared request representation gate applies the same rule; a claimed response representation rejects these forms with its existing 502 inspection error (gRPC INTERNAL). Unclaimed encoded responses retain their existing pass-through behavior. Null selects the default."
 
     SseConfig:
       type: object

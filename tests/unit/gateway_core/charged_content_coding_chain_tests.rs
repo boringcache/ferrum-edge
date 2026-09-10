@@ -98,6 +98,39 @@ fn an_ordinary_gzip_upload_round_trips_and_releases_its_charge() {
 }
 
 #[test]
+fn gzip_suffixes_are_refused_at_every_layer_and_release_the_charge() {
+    let budget = generous_budget();
+    let total = budget.available_bytes();
+
+    for suffix in [
+        vec![0],
+        b"trailing bytes".to_vec(),
+        gzip(b""),
+        gzip(b"second member"),
+    ] {
+        let mut encoded = gzip(&document());
+        encoded.extend_from_slice(&suffix);
+        let wrapped = gzip(&encoded);
+
+        for (codings, body) in [
+            (vec!["gzip"], encoded.as_slice()),
+            (vec!["x-gzip"], encoded.as_slice()),
+            (vec!["gzip", "gzip"], wrapped.as_slice()),
+        ] {
+            assert_eq!(
+                decode(&budget, &codings, body),
+                ChargedCodingChainOutcome::Malformed
+            );
+            assert_eq!(
+                budget.available_bytes(),
+                total,
+                "a gzip suffix rejection must release scratch and output charges"
+            );
+        }
+    }
+}
+
+#[test]
 fn an_ordinary_brotli_upload_round_trips_and_releases_its_charge() {
     let plaintext = document();
     let budget = generous_budget();
