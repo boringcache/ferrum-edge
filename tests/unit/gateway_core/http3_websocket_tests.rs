@@ -297,7 +297,7 @@ fn masked_text_frame(mask: [u8; 4], payload: &[u8]) -> Vec<u8> {
 
 #[test]
 fn masked_h3_client_frame_is_unmasked_by_the_shared_relay_framer() {
-    let frame = masked_text_frame([b'a', b'b', b'c', b'd'], b"audit-echo");
+    let frame = masked_text_frame(*b"abcd", b"audit-echo");
     assert_eq!(
         frame[..6],
         [0x81, 0x8a, b'a', b'b', b'c', b'd'],
