@@ -8739,12 +8739,18 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
         "over_capture_limit",
         "unknown_length",
         "typed request provenance",
+        "metadata: {mode: omit}",
+        "default unprojected",
     ] {
         assert!(
             plugin_docs.contains(contract),
             "docs/plugins.md missing transaction_debugger contract `{contract}`"
         );
     }
+    assert!(
+        !plugin_docs.contains("The plugin never dumps the complete metadata map."),
+        "docs must not claim schema diagnostics omit the metadata map"
+    );
 
     // Instance-based schema/runtime parity for constructor admission.
     let padded_body_field = format!(" {} ", "x".repeat(128));
