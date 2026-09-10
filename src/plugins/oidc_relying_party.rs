@@ -945,8 +945,21 @@ impl OidcRelyingParty {
         let path =
             optional_string(session_obj, "path", "session")?.unwrap_or_else(|| "/".to_string());
         let secure = optional_bool(session_obj, "secure")?.unwrap_or(true);
+        // These three values are concatenated into `Set-Cookie` verbatim. A
+        // delimiter or control character here does not produce a broken cookie
+        // the browser ignores — it injects an attribute. The demonstrated case
+        // was a `;` in `session.path` that appended `Max-Age=0` and deleted
+        // every session the gateway issued, leaving a login loop (issue #5027).
+        validate_cookie_path(&path, "session.path")?;
+        if let Some(domain) = domain.as_deref() {
+            validate_cookie_domain(domain)?;
+        }
         let cookie_name = match optional_string(session_obj, "cookie_name", "session")? {
-            Some(explicit) => explicit,
+            Some(explicit) => {
+                validate_cookie_name(&explicit)?;
+                validate_explicit_cookie_prefix(&explicit, secure, domain.as_deref(), &path)?;
+                explicit
+            }
             None => {
                 let prefix = cookie_name_prefix(secure, domain.as_deref(), &path);
                 derived_cookie_name(&format!("{prefix}ferrum_session"), &context_seed)
@@ -3594,6 +3607,105 @@ fn validate_path_only(path: &str, field: &str) -> Result<(), String> {
         return Err(format!(
             "oidc_relying_party: provider[0].{field} must be a path-only value"
         ));
+    }
+    // `callback_path` also becomes the correlation cookie's `Path` attribute,
+    // so it carries the same delimiter and control-character rules.
+    if !is_cookie_path_value(path) {
+        return Err(format!(
+            "oidc_relying_party: provider[0].{field} must not contain control characters, spaces, commas, or ';'"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `value` is usable verbatim as an RFC 6265 §4.1.1 `path-value`.
+///
+/// The grammar forbids CTLs and `;`. Spaces and commas are additionally
+/// refused: neither belongs in a cookie path, and both are the delimiters a
+/// header-folding parser would split on.
+fn is_cookie_path_value(value: &str) -> bool {
+    value.is_ascii()
+        && !value
+            .chars()
+            .any(|c| c.is_ascii_control() || matches!(c, ';' | ',' | ' '))
+}
+
+/// Whether `c` is an RFC 9110 `token` character, i.e. legal in an RFC 6265
+/// §4.1.1 `cookie-name`.
+fn is_cookie_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c)
+}
+
+fn validate_cookie_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || !name.chars().all(is_cookie_token_char) {
+        return Err(
+            "oidc_relying_party: session.cookie_name must be an RFC 6265 cookie-name token (ASCII, no control characters, spaces, or separators such as ';' '=' ',' '\"')"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_cookie_path(path: &str, field: &str) -> Result<(), String> {
+    if !path.starts_with('/') {
+        return Err(format!("oidc_relying_party: {field} must start with '/'"));
+    }
+    if !is_cookie_path_value(path) {
+        return Err(format!(
+            "oidc_relying_party: {field} must not contain control characters, spaces, commas, or ';'"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate an RFC 6265 §4.1.1 `domain-value`: a DNS name, optionally with the
+/// legacy leading dot. A scheme, port, path, or attribute delimiter here would
+/// be emitted straight into `Set-Cookie`.
+fn validate_cookie_domain(domain: &str) -> Result<(), String> {
+    let candidate = domain.strip_prefix('.').unwrap_or(domain);
+    let valid = !candidate.is_empty()
+        && candidate.len() <= 253
+        && !candidate.ends_with('.')
+        && candidate.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        });
+    if !valid {
+        return Err(
+            "oidc_relying_party: session.domain must be a bare DNS name (no scheme, port, path, or attribute delimiters)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Enforce the browser rules an explicit `__Host-` / `__Secure-` cookie name
+/// commits to. A browser silently discards a prefixed cookie whose attributes
+/// violate the prefix, so admitting the combination produces a login loop with
+/// no gateway-side signal.
+fn validate_explicit_cookie_prefix(
+    name: &str,
+    secure: bool,
+    domain: Option<&str>,
+    path: &str,
+) -> Result<(), String> {
+    if name.starts_with("__Host-") {
+        if !secure || domain.is_some() || path != "/" {
+            return Err(
+                "oidc_relying_party: a __Host- session.cookie_name requires session.secure=true, no session.domain, and session.path='/'"
+                    .to_string(),
+            );
+        }
+    } else if name.starts_with("__Secure-") && !secure {
+        return Err(
+            "oidc_relying_party: a __Secure- session.cookie_name requires session.secure=true"
+                .to_string(),
+        );
     }
     Ok(())
 }

@@ -3590,3 +3590,95 @@ async fn client_secret_basic_form_encodes_credentials_before_basic_encoding() {
     assert_eq!(state.access_token, "rotated-access-token");
     server.verify().await;
 }
+
+/// `session.cookie_name`, `session.path`, and `session.domain` are concatenated
+/// into `Set-Cookie` verbatim, so a delimiter or control character injects an
+/// attribute instead of producing a cookie the browser merely ignores. The
+/// demonstrated case put `;` into `session.path` and appended `Max-Age=0`,
+/// deleting every session the gateway issued (issue #5027).
+#[test]
+fn new_rejects_cookie_names_paths_and_domains_that_are_not_cookie_syntax() {
+    for (field, value) in [
+        ("cookie_name", json!("bad;cookie")),
+        ("cookie_name", json!("bad\r\ncookie")),
+        ("cookie_name", json!("bad cookie")),
+        ("cookie_name", json!("bad=cookie")),
+        ("cookie_name", json!("ünicode")),
+        ("path", json!("/; Max-Age=0")),
+        ("path", json!("relative")),
+        ("path", json!("/tab\there")),
+        ("domain", json!("https://example.test")),
+        ("domain", json!("example.test; Max-Age=0")),
+        ("domain", json!("example.test:8443")),
+        ("domain", json!("example..test")),
+        ("domain", json!("example.test.")),
+    ] {
+        let mut config = base_config();
+        config["session"][field] = value.clone();
+        let error = validate_plugin_config("oidc_relying_party", &config)
+            .err()
+            .unwrap_or_else(|| panic!("session.{field}={value} must be rejected"));
+        assert!(
+            error.contains(&format!("session.{field}")),
+            "unexpected error for session.{field}={value}: {error}"
+        );
+    }
+
+    // Valid explicit values stay supported.
+    for (field, value) in [
+        ("cookie_name", json!("custom_session")),
+        ("path", json!("/app")),
+        ("domain", json!(".example.test")),
+    ] {
+        let mut config = base_config();
+        config["session"][field] = value.clone();
+        assert!(
+            validate_plugin_config("oidc_relying_party", &config).is_ok(),
+            "session.{field}={value} must remain accepted"
+        );
+    }
+}
+
+/// A browser silently discards a `__Host-`/`__Secure-` cookie whose attributes
+/// violate the prefix rules, so admitting the combination produces a login loop
+/// with no gateway-side signal (issue #5027).
+#[test]
+fn new_rejects_explicit_cookie_prefixes_that_contradict_their_attributes() {
+    for (name, secure, domain, path) in [
+        ("__Host-invalid", false, None, "/"),
+        ("__Host-invalid", true, Some("example.test"), "/"),
+        ("__Host-invalid", true, None, "/app"),
+        ("__Secure-invalid", false, None, "/"),
+    ] {
+        let mut config = base_config();
+        config["session"]["cookie_name"] = json!(name);
+        config["session"]["secure"] = json!(secure);
+        config["session"]["path"] = json!(path);
+        if let Some(domain) = domain {
+            config["session"]["domain"] = json!(domain);
+        }
+        let error = validate_plugin_config("oidc_relying_party", &config)
+            .err()
+            .unwrap_or_else(|| panic!("{name} must be rejected for secure={secure}"));
+        assert!(error.contains("cookie_name"), "unexpected error: {error}");
+    }
+
+    let mut config = base_config();
+    config["session"]["cookie_name"] = json!("__Host-valid");
+    config["session"]["secure"] = json!(true);
+    assert!(validate_plugin_config("oidc_relying_party", &config).is_ok());
+}
+
+/// `providers[].callback_path` becomes the correlation cookie's `Path`
+/// attribute, so it carries the same delimiter rules (issue #5027).
+#[test]
+fn new_rejects_callback_and_logout_paths_that_are_not_cookie_paths() {
+    for field in ["callback_path", "logout_path"] {
+        let mut config = base_config();
+        config["providers"][0][field] = json!("/oauth/x;Max-Age=0");
+        let error = validate_plugin_config("oidc_relying_party", &config)
+            .err()
+            .unwrap_or_else(|| panic!("provider[0].{field} must be rejected"));
+        assert!(error.contains(field), "unexpected error: {error}");
+    }
+}
