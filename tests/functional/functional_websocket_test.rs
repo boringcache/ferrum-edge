@@ -2337,7 +2337,14 @@ async fn test_foreign_listener_on_proxy_port_is_not_gateway_readiness() {
 
     // Held for the whole test: this listener keeps accepting, so a bare TCP
     // probe would report "ready" the entire time.
-    let squatter = TcpListener::bind("127.0.0.1:0")
+    //
+    // It binds the WILDCARD, which is the address the spawned gateway itself
+    // uses (`FERRUM_PROXY_BIND_ADDRESS` defaults to `0.0.0.0`). Contesting the
+    // exact same bind is what makes the gateway's bind fail on every host: with
+    // `SO_REUSEADDR`, a `127.0.0.1` listener and a `0.0.0.0` listener can hold
+    // one port simultaneously on Darwin, which would let the gateway start and
+    // dissolve the precondition (issue #4983).
+    let squatter = TcpListener::bind("0.0.0.0:0")
         .await
         .expect("bind foreign listener");
     let contested_port = squatter.local_addr().unwrap().port();

@@ -1186,6 +1186,14 @@ continuously. Issue #3816 tracks that gap.
 - **Boundaries are inclusive.** `notBefore` and `notAfter` themselves are inside
   the window, matching RFC 5280 "valid at" semantics. One second past `notAfter`
   is outside it.
+- **A far-future expiry is not an unusable time.** A leaf carrying RFC 5280's
+  "no well-defined expiration" value `99991231235959Z`, or any `notAfter`
+  further out than the host's monotonic clock can represent, is a valid
+  certificate and authenticates. It simply carries no credential deadline of its
+  own, and the finite `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` bounds
+  the admitted stream instead. Where that boundary sits is platform dependent —
+  a nanosecond-based `Instant` saturates centuries before a `timespec`-based one
+  — so this can never be allowed to decide whether a credential is valid.
 - **The connection cache stays, but never caches a time-dependent decision.**
   HTTP/3 memoizes the expensive X.509 parse, path verification, and identity
   extraction once per plugin instance and transport connection. What is cached
@@ -1202,6 +1210,19 @@ continuously. Issue #3816 tracks that gap.
   `notAfter`, the observed time, the subject, the SAN, the serial, the
   fingerprint, and the DER are never echoed to the client and never logged or
   exported as a metric label.
+- **The accepted issuer path bounds the decision too.** A pinned CA and the
+  presented issuing CAs are themselves valid only for a finite time, and the
+  connection cache retains the accepted `allowed_issuers` /
+  `allowed_ca_fingerprints_sha256` decision. The **earliest `notAfter` on the
+  path that actually satisfied the constraint** is therefore composed into the
+  retained window, so an issuer expiring before the leaf ends the authorization
+  at its own expiry. Within one path every certificate must still be valid
+  (earliest wins); across alternatives — several filters, or several verified
+  paths through cross-signed intermediates — the longest-lived matching path
+  wins, since refusing it would shorten an authorization the configuration
+  allows. With both constraint kinds configured, both must pass and the earlier
+  of their two bounds applies. An issuing CA already outside its own validity
+  window contributes no verified path, and the certificate is refused.
 
 A successful `mtls_auth` verification also publishes the leaf's `notAfter` as
 the request's authoritative **credential deadline** on the shared,
@@ -1231,8 +1252,9 @@ conversion back to a userspace rustls session.
 
 Eligibility is therefore decided **before the frontend handshake starts**, while
 the socket is still pristine. A TLS-terminating TCP listener whose plugin chain
-can admit an authenticated stream principal — today that means `mtls_auth` —
-does not take the kTLS handoff at all. Such a connection stays on the ordinary
+can admit an authenticated stream principal — today `mtls_auth` and
+`spiffe_identity`, which admits a certificate-derived SPIFFE principal with the
+leaf's `notAfter` as its deadline — does not take the kTLS handoff at all. Such a connection stays on the ordinary
 buffered rustls path, is relayed normally, and is bounded by the certificate
 deadline exactly as described above. Nothing is refused and no authentication is
 skipped; only the optional fast path is declined.

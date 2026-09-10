@@ -3021,6 +3021,31 @@ pub mod _test_support {
         crate::plugins::kafka_logging::validate_producer_admission(config, http_client)
     }
 
+    /// Deterministic probe: terminal broker failures and immediate librdkafka
+    /// rejections must reach the process-cumulative per-plugin loss family.
+    ///
+    /// Returns `(sink_error_delta, queue_full_delta, delivery_failed,
+    /// queue_rejected)`. The two deltas read process-wide counters a concurrent
+    /// test can only increase, so assert on them as lower bounds.
+    pub fn kafka_logging_probe_terminal_loss_accounting_for_test(
+        record_count: usize,
+        queue_max_messages: Option<u32>,
+    ) -> Result<(u64, u64, u64, u64), String> {
+        crate::plugins::kafka_logging::probe_terminal_loss_accounting_for_test(
+            record_count,
+            queue_max_messages,
+        )
+    }
+
+    /// The exact SASL credential bytes the constructor would hand librdkafka,
+    /// so the verbatim-credential contract can be asserted directly.
+    pub fn kafka_logging_parsed_sasl_credentials_for_test(
+        config: &serde_json::Value,
+        http_client: &crate::plugins::PluginHttpClient,
+    ) -> Result<(Option<String>, Option<String>), String> {
+        crate::plugins::kafka_logging::parsed_sasl_credentials_for_test(config, http_client)
+    }
+
     pub fn kafka_logging_serialize_http_with_config_for_test(
         config: &serde_json::Value,
         summary: &crate::plugins::TransactionSummary,
@@ -3236,6 +3261,22 @@ pub mod _test_support {
     // ── plugins/soap_ws_security ────────────────────────────────────────────
     pub fn soap_count_wsu_id_occurrences_for_test(xml: &str, id: &str) -> Result<usize, String> {
         crate::plugins::soap_ws_security::count_wsu_id_occurrences(xml, id)
+    }
+
+    pub fn soap_exclusive_canonicalize_with_budget_for_test(
+        xml: &str,
+        local_name: &str,
+        budget_bytes: usize,
+    ) -> (Result<String, String>, usize) {
+        crate::plugins::soap_ws_security::exclusive_canonicalize_with_budget_for_test(
+            xml,
+            local_name,
+            budget_bytes,
+        )
+    }
+
+    pub fn soap_canonicalization_source_len_for_test(xml: &str, local_name: &str) -> Option<usize> {
+        crate::plugins::soap_ws_security::canonicalization_source_len_for_test(xml, local_name)
     }
 
     pub fn soap_exclusive_canonicalize_element_for_test(
@@ -8554,14 +8595,15 @@ pub mod _test_support {
     }
 
     /// Fallible Unix-to-monotonic conversion with injected clocks, so external
-    /// tests can prove a wall-clock rollback would extend a *fresh* conversion
-    /// and that unrepresentable inputs fail closed.
+    /// tests can prove a wall-clock rollback would extend a *fresh* conversion,
+    /// that an unusable interval fails closed, and that an expiry beyond the
+    /// representable monotonic range admits with no bound (issue #5396).
     pub fn try_credential_deadline_from_unix_seconds_at_for_test(
         expires_at_unix: i64,
         leeway_seconds: u64,
         now_unix: u64,
         now_mono: tokio::time::Instant,
-    ) -> Option<tokio::time::Instant> {
+    ) -> crate::plugins::utils::auth_flow::CredentialDeadline {
         crate::plugins::utils::auth_flow::try_credential_deadline_from_unix_seconds_at(
             expires_at_unix,
             leeway_seconds,
@@ -11129,7 +11171,19 @@ pub mod _test_support {
         http_status: u16,
         initial_terminal_metadata: Option<HashMap<String, String>>,
     ) -> crate::proxy::ProxyBody {
-        body.into_grpc_web_streaming(content_type, http_status, initial_terminal_metadata)
+        body.into_grpc_web_streaming(content_type, http_status, initial_terminal_metadata, false)
+    }
+
+    /// Same as [`proxy_body_into_grpc_web_streaming_for_test`], with the
+    /// non-gRPC HTTP error entity suppression the translation owner records for
+    /// an unframed backend error document.
+    pub fn proxy_body_into_grpc_web_streaming_suppressed_for_test(
+        body: crate::proxy::ProxyBody,
+        content_type: &str,
+        http_status: u16,
+        initial_terminal_metadata: Option<HashMap<String, String>>,
+    ) -> crate::proxy::ProxyBody {
+        body.into_grpc_web_streaming(content_type, http_status, initial_terminal_metadata, true)
     }
 
     pub fn take_streaming_initial_terminal_metadata_for_test(
@@ -12138,6 +12192,66 @@ pub mod _test_support {
                 .try_reserve_request_permit(bytes)
                 .map(RequestBufferPermitProbe)
         }
+    }
+
+    /// What the shared charged content-coding chain decoder — the one
+    /// `compression`'s opt-in `decompress_request` normalizer now runs
+    /// (`GHSA-q76p-952x-7c3v`) — decided for one coding list, projected so
+    /// external tests can assert on it without reaching into the crate-private
+    /// error type.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum ChargedCodingChainOutcome {
+        /// Decoded under every bound, with the working-set charge released.
+        Decoded(Vec<u8>),
+        /// A coding token the strict decoder does not implement.
+        Unsupported,
+        /// Malformed, truncated, Large-Window Brotli, or trailing data.
+        Malformed,
+        /// Over a per-layer, cumulative, or amplification bound.
+        TooLarge,
+        /// The aggregate budget could not admit the decode's working set. The
+        /// GATEWAY-local capacity terminal, deliberately not a byte fault.
+        CapacityRefused,
+    }
+
+    /// Decode one canonical coding list through the PRODUCTION charged decoder,
+    /// charged against an ISOLATED budget so a parallel test binary can observe
+    /// admission and release deterministically.
+    ///
+    /// `codings` are lowercase tokens in APPLICATION order, exactly as
+    /// `compression` hands them over after classification.
+    pub fn decode_charged_coding_chain_in(
+        probe: &ResponseBufferBudgetProbe,
+        codings: &[String],
+        body: &[u8],
+        max_decoded_bytes: usize,
+        max_cumulative_bytes: usize,
+        max_amplification_ratio: u32,
+    ) -> ChargedCodingChainOutcome {
+        use crate::plugins::charged_decode::{
+            ChargedDecodeError, decode_charged_content_coding_chain,
+        };
+        let limits = crate::plugins::utils::content_encoding::DecodeLimits {
+            max_decoded_bytes,
+            max_cumulative_bytes,
+            // The caller bounds the layer COUNT before classification; this
+            // decoder is handed an already-bounded list.
+            max_codings: codings.len().max(1),
+            max_amplification_ratio,
+        };
+        match decode_charged_content_coding_chain(codings, body, limits, probe.0.handle()) {
+            Ok(plaintext) => ChargedCodingChainOutcome::Decoded(plaintext),
+            Err(ChargedDecodeError::Unsupported) => ChargedCodingChainOutcome::Unsupported,
+            Err(ChargedDecodeError::Malformed) => ChargedCodingChainOutcome::Malformed,
+            Err(ChargedDecodeError::TooLarge) => ChargedCodingChainOutcome::TooLarge,
+            Err(ChargedDecodeError::CapacityRefused) => ChargedCodingChainOutcome::CapacityRefused,
+        }
+    }
+
+    /// The exact backend-request header filter the H3 cross-protocol bridge
+    /// applies to both its plain and gRPC builders (issue #5110).
+    pub fn cross_protocol_backend_header_is_stripped_for_test(name: &str) -> bool {
+        crate::http3::cross_protocol::should_skip_cross_protocol_backend_header(name)
     }
 
     /// Whether an error class is neutral to circuit-breaker, passive-health, and
@@ -14074,5 +14188,308 @@ pub mod _test_support {
         crate::notifications::channels::EmailChannel::new_with_env_lookup(name, value, &|var| {
             env.get(var).cloned().ok_or(std::env::VarError::NotPresent)
         })
+    }
+
+    // ── Response coalescing (issue #5040) ───────────────────────────────────
+    //
+    // `proxy::body::Coalescing` is the ONE adapter every reqwest, direct-H2 /
+    // gRPC and native-H3 streaming response body is built on. The seam below
+    // scripts a `FrameSource` and drives `Body::poll_frame` one poll at a time
+    // so external tests assert the lazy-aggregation contract against the
+    // production adapter rather than a copy of it: construction reserves
+    // nothing, a one-frame response reaches the client on the backend's own
+    // `Bytes`, and an aggregation buffer exists only once a second frame has
+    // to be merged into the first.
+
+    /// Frame the scripted coalescing source yields.
+    type CoalesceFrame = http_body::Frame<bytes::Bytes>;
+
+    /// Error type the scripted coalescing source yields.
+    type CoalesceFrameError = crate::proxy::body::ProxyBodyError;
+
+    /// The production default flush target (128 KiB) the HTTP/1.1 and
+    /// HTTP/2-via-reqwest response paths construct the coalescer with.
+    pub fn default_coalesce_target_bytes() -> usize {
+        crate::proxy::body::COALESCE_TARGET
+    }
+
+    /// One scripted backend event for [`CoalesceProbe`].
+    #[derive(Clone, Debug)]
+    pub enum CoalesceStep {
+        /// A DATA frame carrying exactly these bytes (may be empty).
+        Data(bytes::Bytes),
+        /// A trailers frame.
+        Trailers(http::HeaderMap),
+        /// A source error carrying this message.
+        Error(String),
+        /// The backend has produced nothing yet.
+        Pending,
+        /// End of stream.
+        End,
+    }
+
+    /// What one `Body::poll_frame` on the coalescer produced.
+    #[derive(Debug)]
+    pub enum CoalesceOutcome {
+        Data(bytes::Bytes),
+        Trailers(http::HeaderMap),
+        Error(String),
+        Pending,
+        End,
+    }
+
+    impl CoalesceOutcome {
+        /// The DATA payload, or `None` for every other outcome.
+        pub fn data(&self) -> Option<&bytes::Bytes> {
+            match self {
+                Self::Data(data) => Some(data),
+                _ => None,
+            }
+        }
+
+        /// The trailer map, or `None` for every other outcome.
+        pub fn trailers(&self) -> Option<&http::HeaderMap> {
+            match self {
+                Self::Trailers(trailers) => Some(trailers),
+                _ => None,
+            }
+        }
+
+        /// The error message, or `None` for every other outcome.
+        pub fn error(&self) -> Option<&str> {
+            match self {
+                Self::Error(message) => Some(message.as_str()),
+                _ => None,
+            }
+        }
+
+        /// Stable short name, for assertion messages.
+        pub fn name(&self) -> &'static str {
+            match self {
+                Self::Data(_) => "data",
+                Self::Trailers(_) => "trailers",
+                Self::Error(_) => "error",
+                Self::Pending => "pending",
+                Self::End => "end",
+            }
+        }
+    }
+
+    /// A `FrameSource` that replays scripted steps, counts polls, and records
+    /// its own drop so a cancelled body can be observed after it is gone.
+    struct CoalesceScriptedSource {
+        steps: std::collections::VecDeque<CoalesceStep>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for CoalesceScriptedSource {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    impl crate::proxy::body::FrameSource for CoalesceScriptedSource {
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<CoalesceFrame, CoalesceFrameError>>> {
+            let this = self.get_mut();
+            this.polls.fetch_add(1, Ordering::Release);
+            match this.steps.pop_front().unwrap_or(CoalesceStep::End) {
+                CoalesceStep::Data(data) => {
+                    std::task::Poll::Ready(Some(Ok(http_body::Frame::data(data))))
+                }
+                CoalesceStep::Trailers(trailers) => {
+                    std::task::Poll::Ready(Some(Ok(http_body::Frame::trailers(trailers))))
+                }
+                CoalesceStep::Error(message) => {
+                    let err: CoalesceFrameError = Box::new(std::io::Error::other(message));
+                    std::task::Poll::Ready(Some(Err(err)))
+                }
+                CoalesceStep::Pending => std::task::Poll::Pending,
+                CoalesceStep::End => std::task::Poll::Ready(None),
+            }
+        }
+    }
+
+    /// A production `Coalescing` under test plus the scripted source feeding
+    /// it.
+    ///
+    /// The source is built by [`CoalesceProbe::new`] /
+    /// [`CoalesceProbe::with_flush_after`], the adapter itself only by
+    /// [`CoalesceProbe::construct`], so an allocation-counting test can measure
+    /// construction on its own with no probe setup inside the window.
+    pub struct CoalesceProbe {
+        source: Option<CoalesceScriptedSource>,
+        body: Option<crate::proxy::body::Coalescing<CoalesceScriptedSource>>,
+        target_bytes: usize,
+        buffer_capacity: Option<usize>,
+        content_length: Option<u64>,
+        flush_after: Option<Duration>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl CoalesceProbe {
+        /// The reqwest / direct-H2 shape: no timed flush, and the aggregation
+        /// capacity the production constructor derives from `target_bytes`.
+        pub fn new(
+            steps: Vec<CoalesceStep>,
+            target_bytes: usize,
+            content_length: Option<u64>,
+        ) -> Self {
+            Self::build(steps, target_bytes, None, content_length, None)
+        }
+
+        /// The native-HTTP/3 shape: an explicit aggregation capacity plus the
+        /// timed flush bounding how long a sub-target frame may be held.
+        pub fn with_flush_after(
+            steps: Vec<CoalesceStep>,
+            target_bytes: usize,
+            buffer_capacity: usize,
+            content_length: Option<u64>,
+            flush_after: Duration,
+        ) -> Self {
+            Self::build(
+                steps,
+                target_bytes,
+                Some(buffer_capacity),
+                content_length,
+                Some(flush_after),
+            )
+        }
+
+        fn build(
+            steps: Vec<CoalesceStep>,
+            target_bytes: usize,
+            buffer_capacity: Option<usize>,
+            content_length: Option<u64>,
+            flush_after: Option<Duration>,
+        ) -> Self {
+            let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let source = CoalesceScriptedSource {
+                steps: steps.into_iter().collect(),
+                polls: Arc::clone(&polls),
+                dropped: Arc::clone(&dropped),
+            };
+            Self {
+                source: Some(source),
+                body: None,
+                target_bytes,
+                buffer_capacity,
+                content_length,
+                flush_after,
+                polls,
+                dropped,
+            }
+        }
+
+        /// Build the adapter. Idempotent, and performed automatically by the
+        /// first [`CoalesceProbe::poll_once`]; call it explicitly to keep
+        /// construction outside an allocation-measurement window.
+        pub fn construct(&mut self) {
+            use crate::proxy::body::Coalescing;
+
+            if self.body.is_some() {
+                return;
+            }
+            let Some(source) = self.source.take() else {
+                return;
+            };
+            let body = match self.buffer_capacity {
+                Some(capacity) => Coalescing::with_flush_after_and_capacity(
+                    source,
+                    self.target_bytes,
+                    capacity,
+                    self.content_length,
+                    self.flush_after,
+                ),
+                None => Coalescing::new(source, self.target_bytes, self.content_length),
+            };
+            self.body = Some(body);
+        }
+
+        /// Drive exactly one `Body::poll_frame` with a no-op waker.
+        pub fn poll_once(&mut self) -> CoalesceOutcome {
+            self.construct();
+            let Some(body) = self.body.as_mut() else {
+                return CoalesceOutcome::End;
+            };
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            match http_body::Body::poll_frame(std::pin::Pin::new(body), &mut cx) {
+                std::task::Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(data) => CoalesceOutcome::Data(data),
+                    Err(frame) => match frame.into_trailers() {
+                        Ok(trailers) => CoalesceOutcome::Trailers(trailers),
+                        Err(_) => CoalesceOutcome::End,
+                    },
+                },
+                std::task::Poll::Ready(Some(Err(err))) => CoalesceOutcome::Error(err.to_string()),
+                std::task::Poll::Ready(None) => CoalesceOutcome::End,
+                std::task::Poll::Pending => CoalesceOutcome::Pending,
+            }
+        }
+
+        /// `Body::is_end_stream` on the constructed adapter.
+        pub fn is_end_stream(&self) -> bool {
+            match self.body.as_ref() {
+                Some(body) => http_body::Body::is_end_stream(body),
+                None => false,
+            }
+        }
+
+        /// The exact `Body::size_hint`, when the adapter publishes one.
+        pub fn size_hint_exact(&self) -> Option<u64> {
+            let body = self.body.as_ref()?;
+            http_body::Body::size_hint(body).exact()
+        }
+
+        /// Lazy-accumulator state: `"unconstructed"`, `"empty"`, `"single"`
+        /// (one frame held with no aggregation buffer) or `"merged"`.
+        pub fn buffer_state(&self) -> &'static str {
+            match self.body.as_ref() {
+                Some(body) => body.buffer_state_name(),
+                None => "unconstructed",
+            }
+        }
+
+        /// Capacity of the aggregation `BytesMut`, or `0` while none has been
+        /// allocated.
+        pub fn aggregation_capacity(&self) -> usize {
+            match self.body.as_ref() {
+                Some(body) => body.aggregation_capacity(),
+                None => 0,
+            }
+        }
+
+        /// Bytes currently held pending a flush.
+        pub fn buffered_len(&self) -> usize {
+            match self.body.as_ref() {
+                Some(body) => body.buffered_len(),
+                None => 0,
+            }
+        }
+
+        /// Capacity of the retained aggregation region the next merge would
+        /// reuse, or `0` when the adapter holds none.
+        pub fn retained_region_capacity(&self) -> usize {
+            match self.body.as_ref() {
+                Some(body) => body.retained_region_capacity(),
+                None => 0,
+            }
+        }
+
+        /// Times the scripted source has been polled. Shared, so it stays
+        /// readable after the probe is dropped.
+        pub fn source_polls(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+            Arc::clone(&self.polls)
+        }
+
+        /// Set once the scripted source has been dropped.
+        pub fn source_dropped(&self) -> Arc<std::sync::atomic::AtomicBool> {
+            Arc::clone(&self.dropped)
+        }
     }
 }

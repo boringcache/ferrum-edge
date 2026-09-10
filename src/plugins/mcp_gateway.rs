@@ -16,6 +16,7 @@ use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
@@ -81,6 +82,16 @@ const MAX_OUTPUT_SCHEMA_DEPTH: usize = 32;
 /// Maximum JSON nodes admitted while auditing a discovered tool `outputSchema`.
 const MAX_OUTPUT_SCHEMA_NODES: usize = 20_000;
 
+/// Process-wide `mcp_gateway` instance sequence.
+///
+/// Several instances may serve one proxy on disjoint `endpoint.path` scopes,
+/// and all of them are invoked on every response phase of every request, so the
+/// response phases need a positive identity for the instance that admitted a
+/// request rather than re-deriving one from a path a route rewrite can rebase.
+/// Monotonic and never reused, so a reloaded generation is never mistaken for
+/// the predecessor it replaced.
+static MCP_GATEWAY_INSTANCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 /// Authoritative closed sets of `mcp_gateway` configuration keys.
 const MCP_CONFIG_KEYS: &[&str] = &[
     "capabilities",
@@ -144,13 +155,8 @@ const MCP_VALIDATION_KEYS: &[&str] = &[
     "validate_tool_arguments",
     "validate_tool_results",
 ];
-const MCP_OBSERVABILITY_KEYS: &[&str] = &[
-    "emit_metadata",
-    "log_argument_hash",
-    "log_raw_arguments",
-    "log_raw_results",
-    "log_result_hash",
-];
+const MCP_OBSERVABILITY_KEYS: &[&str] =
+    &["emit_metadata", "log_argument_hash", "log_raw_arguments"];
 const MCP_SERVER_KEYS: &[&str] = &[
     "enabled",
     "expose_prompts",
@@ -316,10 +322,20 @@ struct McpSessionConfig {
     initialize_upstreams: InitializeStrategy,
     session_ttl: Duration,
     max_sessions: usize,
-    /// When true (default), aggregate-router GET with `Accept: text/event-stream`
-    /// attaches a multiplexed SSE listener. When false, GET keeps the legacy
-    /// 405 rejection so operators can disable multiplexing without changing
-    /// mode. Transparent mode never uses this flag.
+    /// When true, aggregate-router GET with `Accept: text/event-stream` attaches
+    /// a multiplexed SSE listener AND a POST carrying a JSON-RPC request is
+    /// answered with an empty `202` whose response is published on that
+    /// listener.
+    ///
+    /// Defaults to **false**, because that response placement is not MCP
+    /// Streamable HTTP: the advertised transport requires a POST carrying a
+    /// request to answer with `application/json` or its own `text/event-stream`
+    /// stream, and reserves `202` for a POST carrying only notifications and
+    /// responses; a GET stream may carry a response only when resuming a stream
+    /// an earlier POST began. Multiplexing is therefore a Ferrum transport
+    /// extension an operator opts into deliberately, not a default that
+    /// silently reinterprets the version the gateway advertises. When false,
+    /// aggregate GET keeps its 405. Transparent mode never uses this flag.
     sse_multiplexing: bool,
     sse_bounds: AggregateSseBounds,
 }
@@ -376,15 +392,14 @@ struct McpValidationConfig {
     max_batch_response_bytes: usize,
 }
 
+/// Result-side observation knobs are deliberately absent: `log_raw_results`
+/// and `log_result_hash` had no producer anywhere in the plugin, so they are
+/// rejected as unknown keys rather than accepted and ignored.
 #[derive(Debug, Clone)]
 struct McpObservabilityConfig {
     emit_metadata: bool,
     log_raw_arguments: bool,
     log_argument_hash: bool,
-    #[allow(dead_code)] // Parsed for V1 config compatibility; result logging is not emitted in V1.
-    log_raw_results: bool,
-    #[allow(dead_code)] // Parsed for V1 config compatibility; result hashing is not emitted in V1.
-    log_result_hash: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -658,7 +673,19 @@ struct PromptCatalogEntry {
     upstream_name: String,
     server_id: String,
     namespace: String,
+    title: Option<String>,
     description: Option<String>,
+    /// The MCP `Prompt.arguments` array exactly as the upstream declared it
+    /// (`name`, optional `title` / `description`, optional `required`).
+    ///
+    /// This is what a client reads to know which values to collect before
+    /// calling `prompts/get`, so it is retained and republished verbatim.
+    /// Argument names are prompt-local, not catalog-global, and are therefore
+    /// never namespaced. A non-array value is not a conforming argument list
+    /// and is dropped rather than republished under the standard field name.
+    arguments: Option<Value>,
+    /// Nonstandard upstream-declared `argumentsSchema`, carried through
+    /// unchanged for upstreams that publish one alongside `arguments`.
     arguments_schema: Option<Value>,
     enabled: bool,
     #[allow(dead_code)] // Stored for drift/operational metadata extensions.
@@ -933,6 +960,9 @@ struct UpstreamMcpSession {
 
 /// MCP-aware gateway/router plugin.
 pub struct McpGateway {
+    /// Identity this instance stamps onto the requests it admits, so its own
+    /// response-phase policies apply to those requests and to no others.
+    instance_id: u64,
     enabled: bool,
     mode: McpGatewayMode,
     endpoint_path: String,
@@ -1153,6 +1183,7 @@ impl McpGateway {
         // the live per-session `McpCatalog`, not from `config`; see
         // `response_presentation_policy`.
         Ok(Self {
+            instance_id: MCP_GATEWAY_INSTANCE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
             enabled,
             mode,
             endpoint_path,
@@ -1186,13 +1217,33 @@ impl McpGateway {
                 .is_some_and(|tail| tail.starts_with('/'))
     }
 
+    /// Claim this request for this instance. Called once, from the same
+    /// `before_proxy` guard that decides this instance serves the request.
+    fn claim_request(&self, ctx: &mut RequestContext) {
+        ctx.mcp_owner_instance = Some(self.instance_id);
+    }
+
+    /// Whether this instance admitted this request and may therefore act on it
+    /// in the response phases.
+    ///
+    /// Every configured `mcp_gateway` instance is invoked on every response
+    /// phase, so without this an instance scoped to `/a` would consume the
+    /// private claims staged by the instance scoped to `/b` and enforce its own
+    /// `validation.max_upstream_response_bytes` against them — and a sibling
+    /// whose inner `config.enabled` is `false` would do so while configured off.
+    fn owns_request(&self, ctx: &RequestContext) -> bool {
+        self.enabled && ctx.mcp_owner_instance == Some(self.instance_id)
+    }
+
+    /// Whether a request body may be read as JSON.
+    ///
+    /// Media types and subtypes are case-insensitive (RFC 9110 8.3.1), so this
+    /// shares the one classifier the response side already uses rather than
+    /// keeping a second, stricter copy: `application/vnd.audit+JSON` names the
+    /// same media type as `application/vnd.audit+json` and must be admitted
+    /// identically. A request with no `Content-Type` at all is still admitted.
     fn content_type_is_json(headers: &HashMap<String, String>) -> bool {
-        header_value(headers, "content-type").is_none_or(|value| {
-            let media_type = value.split(';').next().unwrap_or(value).trim();
-            media_type.eq_ignore_ascii_case("application/json")
-                || media_type.eq_ignore_ascii_case("application/json-rpc")
-                || media_type.ends_with("+json")
-        })
+        header_value(headers, "content-type").is_none_or(mcp_content_type_is_json)
     }
 
     /// Whether the raw request body is shaped like a JSON-RPC batch, decided
@@ -3360,17 +3411,32 @@ impl McpGateway {
             &self.discovery.namespace_separator,
             &name,
         );
+        let arguments = match item.get("arguments") {
+            Some(value) if value.is_array() => Some(value.clone()),
+            _ => None,
+        };
         let arguments_schema = item.get("argumentsSchema").cloned();
-        let schema_hash = hash_value(arguments_schema.as_ref().unwrap_or(&Value::Null));
+        // Drift is tracked over the whole declared parameter surface, so a
+        // change to the standard `arguments` array is as visible as one to the
+        // nonstandard schema field.
+        let schema_hash = hash_value(&json!({
+            "arguments": arguments,
+            "argumentsSchema": arguments_schema,
+        }));
         Some(PromptCatalogEntry {
             public_name,
             upstream_name: name,
             server_id: server.server_id.clone(),
             namespace: server.namespace.clone(),
+            title: item
+                .get("title")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
             description: item
                 .get("description")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
+            arguments,
             arguments_schema,
             enabled: true,
             discovered_at,
@@ -3786,19 +3852,32 @@ impl McpGateway {
                 .insert("mcp.policy_decision".to_string(), "allow".to_string());
         }
 
-        if self.validation.validate_tool_arguments {
-            let empty_arguments;
-            let arguments = match envelope
+        // Argument observation and argument validation are independent
+        // settings, so the arguments are derived once for whichever of them is
+        // configured. Observation must NOT inherit `validate_tool_arguments`:
+        // an operator who turns schema validation off still gets the
+        // `observability.log_argument_hash` / `log_raw_arguments` metadata the
+        // configuration surface promises. Raw emission stays opt-in.
+        let empty_arguments;
+        let arguments = if self.validation.validate_tool_arguments
+            || self.observability.log_argument_hash
+            || self.observability.log_raw_arguments
+        {
+            match envelope
                 .params
                 .as_ref()
                 .and_then(|params| params.get("arguments"))
             {
-                Some(arguments) => arguments,
+                Some(arguments) => Some(arguments),
                 None => {
                     empty_arguments = json!({});
-                    &empty_arguments
+                    Some(&empty_arguments)
                 }
-            };
+            }
+        } else {
+            None
+        };
+        if let Some(arguments) = arguments {
             if self.observability.log_argument_hash {
                 ctx.metadata
                     .insert("mcp.arguments_hash".to_string(), hash_value(arguments));
@@ -3807,26 +3886,28 @@ impl McpGateway {
                 ctx.metadata
                     .insert("mcp.arguments".to_string(), arguments.to_string());
             }
-            match validate_json_schema(&entry.input_validator, arguments) {
-                Ok(()) => {
-                    if self.observability.emit_metadata {
-                        ctx.metadata
-                            .insert("mcp.schema_validation".to_string(), "pass".to_string());
+            if self.validation.validate_tool_arguments {
+                match validate_json_schema(&entry.input_validator, arguments) {
+                    Ok(()) => {
+                        if self.observability.emit_metadata {
+                            ctx.metadata
+                                .insert("mcp.schema_validation".to_string(), "pass".to_string());
+                        }
                     }
-                }
-                Err(_) => {
-                    if self.observability.emit_metadata {
-                        ctx.metadata
-                            .insert("mcp.schema_validation".to_string(), "fail".to_string());
-                        ctx.metadata
-                            .insert("mcp.route_decision".to_string(), "deny".to_string());
+                    Err(_) => {
+                        if self.observability.emit_metadata {
+                            ctx.metadata
+                                .insert("mcp.schema_validation".to_string(), "fail".to_string());
+                            ctx.metadata
+                                .insert("mcp.route_decision".to_string(), "deny".to_string());
+                        }
+                        return json_rpc_error(
+                            envelope.id.clone(),
+                            -32602,
+                            "Invalid MCP tool arguments",
+                            None,
+                        );
                     }
-                    return json_rpc_error(
-                        envelope.id.clone(),
-                        -32602,
-                        "Invalid MCP tool arguments",
-                        None,
-                    );
                 }
             }
         }
@@ -5281,6 +5362,41 @@ impl McpGateway {
         }
     }
 
+    /// Name the pending request on a gateway-authored terminal.
+    ///
+    /// The admitted request id retained on the context is authoritative: it is
+    /// the exact wire token the client sent, and it is available on paths where
+    /// the response body carries no usable id at all (an upstream 5xx page, a
+    /// backend timeout, an uninspectable representation). The response body's
+    /// own id is only a fallback for a context that never admitted a singleton
+    /// id, and it can preserve an existing token but never fill in `null`.
+    fn correlate_gateway_terminal(
+        ctx: &RequestContext,
+        result: PluginResult,
+        body: &[u8],
+    ) -> PluginResult {
+        match ctx
+            .mcp_request_json_rpc_id
+            .clone()
+            .and_then(|id| RawValue::from_string(id).ok())
+        {
+            Some(id) => correlate_response_id(result, &id),
+            None => restore_response_id(result, raw_json_rpc_field(body, "id")),
+        }
+    }
+
+    /// Refuse a tool result at response-header time, naming the admitted
+    /// request id. No response body is available at this phase, so the retained
+    /// id is the only thing that can correlate the refusal.
+    fn reject_invalid_tool_result_for_request(
+        &self,
+        ctx: &mut RequestContext,
+        reason: &str,
+    ) -> PluginResult {
+        let rejection = self.reject_invalid_tool_result(ctx, None, reason);
+        Self::correlate_gateway_terminal(ctx, rejection, &[])
+    }
+
     fn reject_invalid_tool_result(
         &self,
         ctx: &mut RequestContext,
@@ -5406,6 +5522,7 @@ impl Plugin for McpGateway {
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         self.requires_response_body_buffering()
+            && self.owns_request(ctx)
             && (ctx.mcp_validate_tool_result.is_some()
                 // A routed request that opened a multiplexed stream needs its
                 // complete client-visible representation to publish one SSE
@@ -5470,6 +5587,9 @@ impl Plugin for McpGateway {
         if !self.enabled || !self.within_endpoint_scope(ctx) {
             return PluginResult::Continue;
         }
+        // From here on this instance owns the request. Every response phase
+        // reads that claim before touching this request's private MCP state.
+        self.claim_request(ctx);
         self.emit_base_metadata(ctx);
         if !self.matches_endpoint(ctx) {
             // A reserved descendant is refused, exactly like the 405 below, so
@@ -5583,6 +5703,19 @@ impl Plugin for McpGateway {
             Err(_) => return json_rpc_error(None, -32600, "Invalid MCP JSON-RPC request", None),
         };
         envelope.raw_cancel_id = raw_cancel_id;
+        // Retain the admitted request id privately. A gateway-authored terminal
+        // decided in a RESPONSE phase (result validation, an uninspectable
+        // upstream representation, an upstream transport failure) is authored
+        // long after the request body is gone, and an error carrying `id: null`
+        // never resolves the call the client is still waiting on. Only a
+        // bounded request-form id is retained; notifications, batch bodies, and
+        // unparsable requests stay eligible for `id: null`.
+        if envelope.message_kind == McpMessageKind::Request
+            && let Some(raw_id) = envelope.raw_id.as_deref()
+            && raw_id.get().len() <= MCP_MAX_REFLECTED_ID_BYTES
+        {
+            ctx.mcp_request_json_rpc_id = Some(raw_id.get().to_string());
+        }
         self.dispatch_post_envelope(ctx, headers, &envelope).await
     }
 
@@ -5856,7 +5989,7 @@ impl Plugin for McpGateway {
     }
 
     fn may_enforce_response_body_policy(&self, ctx: &RequestContext) -> bool {
-        self.enabled
+        self.owns_request(ctx)
             && self.mode == McpGatewayMode::AggregateRouter
             && self.validation.validate_tool_results
             && ctx.mcp_validate_tool_result.is_some()
@@ -5877,32 +6010,32 @@ impl Plugin for McpGateway {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if ctx.mcp_validate_tool_result.is_none() {
+        // Response-phase policy is instance-scoped: a sibling instance on a
+        // disjoint endpoint (or one configured off) must not consume this
+        // request's validator claim or apply its own response bounds to it.
+        if !self.owns_request(ctx) || ctx.mcp_validate_tool_result.is_none() {
             return PluginResult::Continue;
         }
         // Streamed SSE cannot be validated against a compiled output schema
         // without a separate streaming validator. Fail closed rather than
         // releasing an unvalidated tool result.
         if super::utils::sse::original_response_is_event_stream(ctx, response_headers) {
-            return self.reject_invalid_tool_result(
+            return self.reject_invalid_tool_result_for_request(
                 ctx,
-                None,
                 "event-stream tool results require a bounded JSON representation",
             );
         }
         if header_value(response_headers, "content-type")
             .is_some_and(|value| !mcp_content_type_is_json(value))
         {
-            return self.reject_invalid_tool_result(
+            return self.reject_invalid_tool_result_for_request(
                 ctx,
-                None,
                 "tool result content-type is not inspectable JSON",
             );
         }
         if !Self::response_encoding_allows_rewrite(response_headers) {
-            return self.reject_invalid_tool_result(
+            return self.reject_invalid_tool_result_for_request(
                 ctx,
-                None,
                 "encoded tool results require an identity representation",
             );
         }
@@ -5913,9 +6046,8 @@ impl Plugin for McpGateway {
         // bypass. The actual collected length is checked again in the final
         // hook to cover a lying upstream.
         if !self.response_length_allows_rewrite(response_headers) {
-            return self.reject_invalid_tool_result(
+            return self.reject_invalid_tool_result_for_request(
                 ctx,
-                None,
                 "tool result lacks a bounded acceptable content-length",
             );
         }
@@ -5948,11 +6080,14 @@ impl Plugin for McpGateway {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        if !self.owns_request(ctx) {
+            return PluginResult::Continue;
+        }
         let enforced =
             self.enforce_final_response_body(ctx, response_status, response_headers, body);
         if !matches!(enforced, PluginResult::Continue) {
             Self::settle_sse_stream_inline(ctx);
-            return restore_response_id(enforced, raw_json_rpc_field(body, "id"));
+            return Self::correlate_gateway_terminal(ctx, enforced, body);
         }
         match self.multiplex_final_response(ctx, response_status, response_headers, body) {
             Some(replacement) => replacement,
@@ -5971,6 +6106,9 @@ impl Plugin for McpGateway {
         _response_headers: &HashMap<String, String>,
         body: &[u8],
     ) {
+        if !self.owns_request(ctx) {
+            return;
+        }
         let Some(publication) = ctx.mcp_sse_publication.take() else {
             return;
         };
@@ -7372,11 +7510,20 @@ fn tool_entry_to_public_value(entry: &ToolCatalogEntry) -> Value {
 fn prompt_entry_to_public_value(entry: &PromptCatalogEntry) -> Value {
     let mut object = Map::new();
     object.insert("name".to_string(), Value::String(entry.public_name.clone()));
+    if let Some(title) = &entry.title {
+        object.insert("title".to_string(), Value::String(title.clone()));
+    }
     if let Some(description) = &entry.description {
         object.insert(
             "description".to_string(),
             Value::String(format!("[{}] {}", entry.namespace, description)),
         );
+    }
+    // Only the prompt NAME is namespaced. Argument names are prompt-local, so
+    // the declared argument list is republished exactly as discovered — a
+    // client that cannot see it cannot know what `prompts/get` requires.
+    if let Some(arguments) = &entry.arguments {
+        object.insert("arguments".to_string(), arguments.clone());
     }
     if let Some(arguments_schema) = &entry.arguments_schema {
         object.insert("argumentsSchema".to_string(), arguments_schema.clone());
@@ -7784,7 +7931,7 @@ fn parse_sessions(object: &Map<String, Value>) -> Result<McpSessionConfig, Strin
         initialize_upstreams,
         session_ttl: Duration::from_secs(session_ttl_seconds),
         max_sessions,
-        sse_multiplexing: optional_bool_from_object(sessions, "sse_multiplexing")?.unwrap_or(true),
+        sse_multiplexing: optional_bool_from_object(sessions, "sse_multiplexing")?.unwrap_or(false),
         sse_bounds: parse_sse_bounds(sessions)?,
     })
 }
@@ -8022,10 +8169,6 @@ fn parse_observability(object: &Map<String, Value>) -> Result<McpObservabilityCo
             .unwrap_or(false),
         log_argument_hash: optional_bool_from_object(observability, "log_argument_hash")?
             .unwrap_or(true),
-        log_raw_results: optional_bool_from_object(observability, "log_raw_results")?
-            .unwrap_or(false),
-        log_result_hash: optional_bool_from_object(observability, "log_result_hash")?
-            .unwrap_or(false),
     })
 }
 

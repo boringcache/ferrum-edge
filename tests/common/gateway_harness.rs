@@ -424,6 +424,64 @@ impl Drop for TestGateway {
     }
 }
 
+/// An owned, panic-safe handle to a spawned gateway child.
+///
+/// A raw [`std::process::Child`] does **not** kill its process when dropped, so
+/// any early exit between spawn and the explicit shutdown call — an assertion
+/// panic, a `?`, an early `return` — leaves a live gateway reparented to init,
+/// still owning its listen ports and contaminating every later run on those
+/// fixed ports (issue #4991). Wrapping the child the instant it is spawned
+/// makes teardown a property of scope instead of a property of reaching the
+/// last line of a test.
+///
+/// Teardown goes through [`shutdown_gateway_child`], so the coverage build
+/// still gets its SIGTERM grace period rather than an immediate `kill`.
+pub struct GatewayChildGuard {
+    child: Option<Child>,
+}
+
+impl GatewayChildGuard {
+    /// Take ownership of a freshly spawned gateway.
+    pub fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    /// Borrow the child for readiness probes (`try_wait`) and log reads.
+    pub fn child_mut(&mut self) -> &mut Child {
+        self.child
+            .as_mut()
+            .expect("gateway child was already reaped by this guard")
+    }
+
+    /// The child's OS process id while it is still owned.
+    pub fn id(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
+    }
+
+    /// Whether the child has already exited on its own.
+    pub fn has_exited(&mut self) -> bool {
+        match self.child.as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+            None => true,
+        }
+    }
+
+    /// Shut the gateway down now. Idempotent: the guard's `Drop` becomes a
+    /// no-op afterwards, so an explicit shutdown and an unwind cannot both
+    /// reap the same child.
+    pub fn shutdown(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            shutdown_gateway_child(&mut child);
+        }
+    }
+}
+
+impl Drop for GatewayChildGuard {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 pub fn shutdown_gateway_child(child: &mut Child) {
     if coverage_profiles_enabled() {
         terminate_child_for_coverage(child, Duration::from_secs(15));

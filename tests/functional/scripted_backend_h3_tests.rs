@@ -2416,6 +2416,16 @@ async fn h2_frontend_streaming_h3_recovers_graceful_goaway_after_complete_body()
 /// proxy-scoped `compression` plugin. compression buffers the response by
 /// default (when the client offers `accept-encoding`), forcing the buffered
 /// dispatch decision these tests need to exercise the downgrade.
+///
+/// The chain pins `min_content_length: 0` so that buffering decision depends
+/// only on what these protocol tests are about (the frontend/backend framing),
+/// never on how large a fixture body happens to be: compression declines to
+/// buffer a response whose declared `Content-Length` is under
+/// `min_content_length`, because it would decline to encode it in `after_proxy`
+/// too (issue #5094), and the plugin's default threshold is 256 bytes. The
+/// scripted bodies here are deliberately tiny (a few bytes, so a truncation or
+/// a mid-body stall is unambiguous), which is exactly the shape that exclusion
+/// releases.
 fn file_mode_yaml_for_h3_with_compression(port: u16) -> String {
     file_mode_yaml_for_h3_with_compression_and_read_timeout(port, 5000)
 }
@@ -2503,7 +2513,10 @@ fn file_mode_yaml_for_h3_with_compression_and_read_timeout(
                 "plugin_name": "compression",
                 "scope": "proxy",
                 "enabled": true,
-                "config": { "algorithms": ["gzip"] },
+                // `min_content_length: 0`: keep every scripted response on the
+                // buffered decision regardless of its declared Content-Length
+                // (see this helper's doc comment).
+                "config": { "algorithms": ["gzip"], "min_content_length": 0 },
             },
             {
                 "id": "h3-access-log",
@@ -2864,7 +2877,10 @@ async fn h3_native_pool_partial_data_read_timeout_returns_timeout_without_downgr
         // is disabled when the gateway limit is unlimited (0) or above the
         // 32 MiB compression ceiling, and only the buffered collect converts a
         // mid-body backend read timeout into a pre-commit 504 Backend timeout
-        // instead of a committed partial 200.
+        // instead of a committed partial 200. The declared `Content-Length: 64`
+        // stays on that path only because the harness config pins
+        // `min_content_length: 0`; at the plugin default (256) compression
+        // releases the body up front and this response would stream.
         &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "1048576")],
         200,
     )
@@ -2942,6 +2958,10 @@ async fn h3_frontend_refined_buffered_rejects_truncated_content_length_fin() {
         // above the 32 MiB compression ceiling, and only the buffered collect
         // (`collect_h3_open_response_body`) rejects a short Content-Length FIN
         // as a pre-commit 502 truncation instead of forwarding a committed 200.
+        // The 5-byte declared length stays on that path only because the
+        // harness config pins `min_content_length: 0`; at the plugin default
+        // (256) compression releases the body up front and the short body would
+        // stream out as a committed 200.
         &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "1048576")],
     )
     .await;

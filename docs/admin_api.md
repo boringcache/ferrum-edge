@@ -874,6 +874,8 @@ attachment surface there.
 
 Disabled plugin configs are stored without plugin-specific construction, so operators can stage configuration before runtime-only prerequisites are present. For example, `basic_auth` may be created or imported with `enabled: false` before `FERRUM_BASIC_AUTH_HMAC_SECRET` is provisioned. Enabling the config performs normal construction and fails closed unless the secret is present and at least 32 bytes. The shared OpenAPI wrapper matches that admission: plugin-specific `config` schemas apply only while `enabled` is true (or omitted on `POST`, which defaults to true), and plugins whose constructors accept JSON `null` (`stdout_logging`, `prometheus_metrics`, `mtls_auth`, `compression`) document `config` as `[object, null]`.
 
+Global-scope requirements for `transaction_log_schema` and `prometheus_metrics` still apply while disabled.
+
 Plugin-config reads by `viewer` and `operator` roles use the same redacted projection stored in admin audit diffs; `admin` reads remain raw.
 
 That projection is driven by a **schema-aware sensitivity contract** (`src/admin/plugin_config_projection.rs`), not by field-name guessing. Every built-in plugin has an entry declaring which config paths carry credentials, and a CI parity test fails if a new built-in ships without one. Three layers run in order, and each can only add redaction:
