@@ -8383,6 +8383,19 @@ impl Consumer {
         if let Err(e) = validate_string_field("username", &self.username, MAX_USERNAME_LENGTH) {
             errors.push(e);
         }
+        // RFC 7617 §2 splits the decoded `user-id ":" password` at the FIRST
+        // colon, so a colon-bearing user-id has no representation on the wire.
+        // Such a consumer starts fine and then fails every Basic login, which
+        // reads as a credential problem rather than an unusable configuration —
+        // reject the combination at admission instead. Colons inside a password
+        // remain valid, and a consumer without Basic credentials is unaffected.
+        if self.username.contains(':') && self.has_credential("basicauth") {
+            errors.push(
+                "username must not contain ':' when the consumer has basicauth credentials \
+                 — RFC 7617 Basic authentication cannot represent a colon in the user-id"
+                    .to_string(),
+            );
+        }
 
         // Custom ID
         if let Some(ref cid) = self.custom_id

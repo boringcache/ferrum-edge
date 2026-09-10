@@ -100,6 +100,16 @@ pub mod _test_support {
         (path, cloned_offset)
     }
 
+    /// Exercise the WebSocket-handshake body-digest proof (issue #5000) without
+    /// standing up a transport. `plugins` decides whether any configured policy
+    /// asked for digests; `ctx` supplies the handshake's framing headers.
+    pub fn publish_websocket_handshake_body_digests_for_test(
+        plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+    ) {
+        crate::proxy::publish_websocket_handshake_body_digests(plugins, ctx);
+    }
+
     pub fn websocket_backend_path_for_test(
         proxy: &crate::config::types::Proxy,
         path: &str,
@@ -799,6 +809,19 @@ pub mod _test_support {
         headers: Vec<String>,
     ) {
         ctx.set_request_headers_to_redact(Arc::new(headers));
+    }
+
+    /// Model proxy core's typed backend-dispatch provenance for direct plugin
+    /// lifecycle tests that never enter an HTTP dispatch path. `error_class:
+    /// None` records an authoritative backend response; a class with
+    /// `request_on_wire: false` records a pre-wire refusal, and with `true` an
+    /// ambiguous post-wire failure.
+    pub fn record_backend_dispatch_outcome_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        error_class: Option<crate::retry::ErrorClass>,
+        request_on_wire: bool,
+    ) {
+        ctx.record_backend_dispatch_outcome(error_class, request_on_wire);
     }
 
     /// Model the transport-owned empty-body proof for direct plugin lifecycle
@@ -3180,6 +3203,34 @@ pub mod _test_support {
                 probe.rejections,
             )
         })
+    }
+
+    /// Whether the trace exporter retries `status` for the named payload kind
+    /// (`"otlp"`, `"zipkin"`, `"datadog"`). `None` for an unknown kind.
+    pub fn otel_tracing_status_is_retryable_for_test(provider: &str, status: u16) -> Option<bool> {
+        crate::plugins::otel_tracing::trace_status_is_retryable_for_test(provider, status)
+    }
+
+    /// Parse a collector `Retry-After` value against a fixed clock, in
+    /// milliseconds. `None` when the value is absent or unparseable.
+    pub fn otel_tracing_parse_retry_after_for_test(value: &str, now_unix_secs: u64) -> Option<u64> {
+        crate::plugins::otel_tracing::parse_retry_after_for_test(value, now_unix_secs)
+    }
+
+    /// The exporter's delay in milliseconds before the retry following
+    /// `attempt` (`1` = the first retry), for fixed jitter entropy.
+    pub fn otel_tracing_retry_delay_ms_for_test(
+        base_ms: u64,
+        attempt: u32,
+        retry_after_ms: Option<u64>,
+        entropy: u64,
+    ) -> u64 {
+        crate::plugins::otel_tracing::trace_retry_delay_ms_for_test(
+            base_ms,
+            attempt,
+            retry_after_ms,
+            entropy,
+        )
     }
 
     // ── plugins/soap_ws_security ────────────────────────────────────────────
@@ -11307,6 +11358,35 @@ pub mod _test_support {
     /// Process-wide count of records rejected alone by the datagram gate.
     pub fn udp_logging_local_record_drops_for_test() -> u64 {
         crate::plugins::udp_logging::local_record_drops_for_test()
+    }
+
+    /// Lost-record total for injected split-batch retry sequences.
+    ///
+    /// Each inner slice is one attempt. Labels: `"reject"` (deterministic
+    /// local size rejection), `"ok"` (delivered), `"transport"` (transport
+    /// error). Matches production: local rejects count only on a completed
+    /// attempt; exhausting retries counts the original batch once.
+    pub fn udp_logging_split_retry_lost_record_count_for_test(attempts: &[&[&str]]) -> u64 {
+        use crate::plugins::udp_logging::SplitEntryOutcome;
+        let parsed: Vec<Vec<SplitEntryOutcome>> = attempts
+            .iter()
+            .map(|attempt| {
+                attempt
+                    .iter()
+                    .map(|label| match *label {
+                        "reject" => SplitEntryOutcome::LocalReject,
+                        "ok" => SplitEntryOutcome::Delivered,
+                        "transport" => SplitEntryOutcome::TransportError,
+                        other => panic!(
+                            "udp_logging split-retry fixture label must be \
+                             reject/ok/transport, got {other}"
+                        ),
+                    })
+                    .collect()
+            })
+            .collect();
+        let refs: Vec<&[SplitEntryOutcome]> = parsed.iter().map(Vec::as_slice).collect();
+        crate::plugins::udp_logging::split_retry_lost_record_count(&refs)
     }
 
     pub fn udp_logging_classify_serialized_summaries_for_test(
