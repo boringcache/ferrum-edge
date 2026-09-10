@@ -29907,6 +29907,7 @@ components:
             always_capture_on_error:
               type: [boolean, "null"]
               default: true
+              description: "Override a losing sampling roll for a failed transaction. Fires on an HTTP status >= 400, on a streamed body that did not complete, and on the final client-visible gRPC application status: a native gRPC call normally fails under HTTP 200 with a non-zero grpc-status, and that status (from the terminal trailers, a Trailers-Only header block, or the UNKNOWN a gRPC transaction with no terminal status carries) is treated as an error at buffered commit, stream termination, and the transaction-log fallback alike. grpc-status 0 remains a success and stays subject to ordinary sampling."
             max_records_per_minute:
               type: [integer, "null"]
               minimum: 0

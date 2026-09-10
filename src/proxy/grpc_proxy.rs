@@ -2210,6 +2210,15 @@ pub(crate) fn grpc_status_from_maps(
         .map(|status| parse_grpc_status_joined_value(status))
 }
 
+/// [`grpc_status_from_maps`] for a caller that only holds the initial HEADERS
+/// block and has no separate wire-trailer view — the Trailers-Only encoding,
+/// where the terminal status rides in the initial headers with END_STREAM.
+pub(crate) fn grpc_status_from_headers(headers: &HashMap<String, String>) -> Option<u32> {
+    headers
+        .get("grpc-status")
+        .map(|status| parse_grpc_status_joined_value(status))
+}
+
 /// Parse a peer-supplied gRPC status without allowing malformed values to look
 /// like success. `u32::MAX` is outside the standard 0..=16 range, maps to an
 /// HTTP 500 health outcome, and is rendered in the bounded `OTHER` metric
