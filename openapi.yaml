@@ -11590,6 +11590,7 @@ components:
     # ── WebSocket Plugin Configs ─────────────────────────────────────
     WsMessageSizeLimitingConfig:
       type: object
+      additionalProperties: false
       description: |
         Configuration for the `ws_message_size_limiting` plugin. Enforces an
         actual wire-frame payload ceiling before payload reservation and an
@@ -11603,6 +11604,7 @@ components:
           type: integer
           format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           description: >-
             Maximum frame payload size in bytes. Required and must be greater
             than zero — the plugin rejects configs with `max_frame_bytes` of 0
@@ -11615,6 +11617,7 @@ components:
           type: integer
           format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           description: >-
             Maximum reassembled Text/Binary message payload in bytes. Defaults
             to four times `max_frame_bytes` and must be greater than or equal to
@@ -24153,6 +24156,7 @@ components:
 
     RequestSizeLimitingConfig:
       type: object
+      additionalProperties: false
       description: |
         Plugin: request_size_limiting — Per-proxy request body size limits.
         Rejects oversized requests with HTTP 413 in three places: an early
@@ -24179,6 +24183,7 @@ components:
           type: integer
           format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           description: >-
             Maximum allowed request body size in bytes. Required and must be
             greater than zero — the gateway rejects plugin creation when
@@ -24732,6 +24737,7 @@ components:
           type: integer
           format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           description: >-
             Maximum allowed response body size in bytes. Required and must be
             greater than zero — the gateway rejects plugin creation when
