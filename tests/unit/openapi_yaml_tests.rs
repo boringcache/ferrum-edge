@@ -5723,6 +5723,146 @@ fn request_mirror_schema_matches_strict_runtime_config_contract() {
     assert!(err.contains("mirror_protcol"), "got: {err}");
     assert!(err.contains("allowed keys"), "got: {err}");
     validate_plugin_config("request_mirror", &typo).expect_err("shared admission must reject typo");
+
+    // Issue #5152: the component schema is compared against ACTUAL constructor
+    // admission, not just against the key inventory. Every case below must be
+    // accepted (or rejected) by both, so a schema-backed editor cannot reject a
+    // valid nullable/defaulted config or approve a malformed host, an
+    // incomplete credential-forwarding opt-in, or an invalid policy list.
+    let shared_client = PluginHttpClient::default();
+    let mut accepted: Vec<serde_json::Value> = vec![
+        // Minimal, plus both documented examples.
+        json!({"mirror_host": "127.0.0.1"}),
+        json!({
+            "mirror_host": "shadow.internal",
+            "mirror_port": 8443,
+            "mirror_protocol": "https",
+            "percentage": 50.0,
+            "mirror_request_body": true,
+            "max_in_flight": 64,
+            "max_retained_request_body_bytes": 33554432,
+            "max_mirrored_request_body_bytes": 4194304
+        }),
+        json!({
+            "mirror_host": "mirror.example.com",
+            "mirror_port": 8080,
+            "mirror_protocol": "https",
+            "mirror_path": "/shadow",
+            "percentage": 100.0,
+            "mirror_request_body": true,
+            "max_response_body_bytes": 1048576
+        }),
+        // The runtime lowercases the protocol, so uppercase is the same setting.
+        json!({"mirror_host": "127.0.0.1", "mirror_protocol": "HTTPS"}),
+        json!({"mirror_host": "[2001:db8::10]"}),
+        // Paired, fail-closed credential-forwarding opt-ins.
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_headers": true,
+            "forward_sensitive_header_allowlist": ["authorization"]
+        }),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["access_token"]
+        }),
+        json!({"mirror_host": "127.0.0.1", "sensitive_header_patterns": ["x-vault-"]}),
+        json!({"mirror_host": "127.0.0.1", "percentage": 0}),
+        json!({"mirror_host": "127.0.0.1", "mirror_path": ""}),
+    ];
+    // Every optional scalar and list accepts an explicit JSON null (the runtime
+    // treats null as omitted), so the schema must not reject it by type.
+    for key in REQUEST_MIRROR_CONFIG_KEYS
+        .iter()
+        .filter(|key| **key != "mirror_host")
+    {
+        let mut config = json!({"mirror_host": "127.0.0.1"});
+        config
+            .as_object_mut()
+            .expect("config object")
+            .insert((*key).to_string(), serde_json::Value::Null);
+        accepted.push(config);
+    }
+
+    let rejected: Vec<serde_json::Value> = vec![
+        json!({"mirror_host": "127.0.0.1", "mirror_protocol": "ftp"}),
+        // Host admission: a bare host only.
+        json!({"mirror_host": ""}),
+        json!({"mirror_host": " "}),
+        json!({"mirror_host": "https://example.test"}),
+        json!({"mirror_host": "example.test:80"}),
+        json!({"mirror_host": null}),
+        // Half an opt-in is a configuration error, never a partial grant.
+        json!({"mirror_host": "127.0.0.1", "forward_sensitive_headers": true}),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_headers": true,
+            "forward_sensitive_header_allowlist": []
+        }),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_header_allowlist": ["authorization"]
+        }),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_headers": true,
+            "forward_sensitive_header_allowlist": ["auth token"]
+        }),
+        json!({"mirror_host": "127.0.0.1", "forward_sensitive_query": true}),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query_allowlist": ["access_token"]
+        }),
+        // Operator pattern lists reject blank entries.
+        json!({"mirror_host": "127.0.0.1", "sensitive_header_patterns": [" "]}),
+        json!({"mirror_host": "127.0.0.1", "sensitive_query_patterns": [""]}),
+        // Numeric bounds.
+        json!({"mirror_host": "127.0.0.1", "max_in_flight": 0}),
+        json!({"mirror_host": "127.0.0.1", "max_response_body_bytes": 0}),
+        json!({"mirror_host": "127.0.0.1", "mirror_timeout_ms": 0}),
+        json!({"mirror_host": "127.0.0.1", "mirror_timeout_ms": 300001}),
+        json!({"mirror_host": "127.0.0.1", "mirror_path": "/a?b"}),
+    ];
+
+    for config in &accepted {
+        assert_component_validity(&spec, "RequestMirrorConfig", config, true);
+        assert!(
+            RequestMirror::new(config, shared_client.clone()).is_ok(),
+            "runtime must accept the schema-valid config {config}"
+        );
+    }
+    for config in &rejected {
+        assert_component_validity(&spec, "RequestMirrorConfig", config, false);
+        assert!(
+            RequestMirror::new(config, shared_client.clone()).is_err(),
+            "runtime must reject the schema-invalid config {config}"
+        );
+    }
+
+    // Documented, deliberate schema limitations: these runtime rules compare
+    // sibling values or inspect a JSON number's lexical form, which Draft
+    // 2020-12 cannot express. The component description names each one.
+    for runtime_only_rejection in [
+        // The allowlist entry is a valid header name but is not a header the
+        // deny-by-default policy strips.
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_headers": true,
+            "forward_sensitive_header_allowlist": ["x-page"]
+        }),
+        // An explicit per-body ceiling above the (defaulted) aggregate budget.
+        json!({
+            "mirror_host": "127.0.0.1",
+            "max_mirrored_request_body_bytes": 67108865
+        }),
+        // A whole-valued float is not an integer literal.
+        json!({"mirror_host": "127.0.0.1", "max_response_body_bytes": 1.0}),
+    ] {
+        assert!(
+            RequestMirror::new(&runtime_only_rejection, shared_client.clone()).is_err(),
+            "runtime must still reject {runtime_only_rejection}"
+        );
+    }
 }
 
 #[tokio::test]
