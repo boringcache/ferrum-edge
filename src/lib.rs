@@ -692,17 +692,11 @@ pub mod _test_support {
         ctx.mcp_aggregate_sse.is_some()
     }
 
-    /// Whether this request is still holding an OPEN multiplexed stream
+    /// Whether this request is still holding an OPEN JSON-RPC request stream
     /// identity. Used to prove the request-side open happens before the slow
     /// aggregate work, and that a terminal delivery released it.
     pub fn mcp_sse_stream_is_open_for_test(ctx: &crate::plugins::RequestContext) -> bool {
         ctx.mcp_sse_stream.is_some()
-    }
-
-    /// Whether final body policy reserved an aggregate-SSE event that is still
-    /// invisible pending the committed-response boundary.
-    pub fn mcp_sse_publication_is_pending_for_test(ctx: &crate::plugins::RequestContext) -> bool {
-        ctx.mcp_sse_publication.is_some()
     }
 
     /// Drop just the multiplexed stream lease, modelling a request that ended
