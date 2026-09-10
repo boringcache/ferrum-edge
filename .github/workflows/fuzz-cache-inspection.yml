@@ -35,6 +35,8 @@ jobs:
           fail-on-cache-error: true
 
       - name: Restore the published fuzz target
+        env:
+          RUST_LOG: error,boring_cache_cli::storage_transfer=warn
         run: |
           boringcache --version
           df -h .
