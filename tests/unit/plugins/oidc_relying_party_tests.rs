@@ -58,6 +58,56 @@ fn base_config() -> serde_json::Value {
     })
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn discovery_transport_errors_use_the_redacted_endpoint() {
+    let (logs, _guard) = super::plugin_utils::capture_logs();
+    // An unsupported scheme fails before network I/O.
+    let endpoint = concat!(
+        "unsupported://test-user:test-password@example.test/",
+        "private-path?key=test-query#test-fragment"
+    );
+    let error = oidc_resolve_discovery_for_test(
+        &PluginHttpClient::default(),
+        endpoint,
+        None,
+        None,
+    )
+    .await
+    .expect_err("unsupported transport must fail");
+    assert!(error.contains("discovery request failed"), "{error}");
+    assert!(error.contains("example.test/redacted"), "{error}");
+    let diagnostics = format!("{error}\n{}", logs.contents());
+    for component in [
+        "test-user",
+        "test-password",
+        "private-path",
+        "test-query",
+        "test-fragment",
+    ] {
+        assert!(!diagnostics.contains(component), "{diagnostics}");
+    }
+}
+
+#[test]
+fn every_oidc_provider_call_uses_the_shared_redacted_error_boundary() {
+    let source = include_str!("../../../src/plugins/oidc_relying_party.rs");
+    assert!(!source.contains(".execute("));
+    for label in ["oidc_rp_token", "oidc_rp_userinfo", "oidc_rp_discovery"] {
+        let call = source
+            .split(".execute_redacted(")
+            .skip(1)
+            .find(|call| call.split(".await").next().unwrap().contains(label))
+            .unwrap_or_else(|| panic!("{label} must redact returned errors"));
+        assert!(
+            call.split(".await")
+                .next()
+                .unwrap()
+                .contains("redacted_endpoint_url_str("),
+            "{label} must redact its endpoint label"
+        );
+    }
+}
+
 fn html_ctx() -> RequestContext {
     let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
     ctx.request_is_secure = true;
