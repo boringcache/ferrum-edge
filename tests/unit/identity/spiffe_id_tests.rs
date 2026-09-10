@@ -439,7 +439,10 @@ fn spiffe_id_accepts_spec_legal_boundary_and_length_trust_domains() {
     let over_limit = "a".repeat(MAX_TRUST_DOMAIN_LEN + 1);
     assert!(matches!(
         SpiffeId::new(format!("spiffe://{over_limit}/workload")),
-        Err(SpiffeIdError::InvalidTrustDomain(_, TrustDomainError::TooLong(_, _)))
+        Err(SpiffeIdError::InvalidTrustDomain(
+            _,
+            TrustDomainError::TooLong(_, _)
+        ))
     ));
     assert!(MAX_SPIFFE_ID_LEN > MAX_TRUST_DOMAIN_LEN + "spiffe://".len());
 }

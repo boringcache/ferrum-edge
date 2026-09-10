@@ -1,3 +1,6 @@
+use ferrum_edge::_test_support::{
+    request_credential_deadline_at, request_credential_deadline_remaining,
+};
 use ferrum_edge::config::types::{BackendScheme, Consumer};
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::identity::spiffe::{SpiffeId, spiffe_id_to_san};
@@ -5,9 +8,6 @@ use ferrum_edge::plugins::mesh::spiffe_identity::{SpiffeIdentity, SpiffeIdentity
 use ferrum_edge::plugins::{
     HTTP_FAMILY_AND_STREAM_PROTOCOLS, Plugin, PluginResult, RequestContext,
     StreamConnectionContext, priority,
-};
-use ferrum_edge::_test_support::{
-    request_credential_deadline_at, request_credential_deadline_remaining,
 };
 use ferrum_edge::proxy::auth_lifetime::{
     StreamAuthTermination, effective_request_auth_deadline, request_is_authenticated,

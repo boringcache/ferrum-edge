@@ -406,7 +406,10 @@ impl<'a> PresentedChain<'a> {
                 if cert.subject() != certs[child].issuer() {
                     continue;
                 }
-                if certs[child].verify_signature(Some(cert.public_key())).is_ok() {
+                if certs[child]
+                    .verify_signature(Some(cert.public_key()))
+                    .is_ok()
+                {
                     child_parents.push(parent);
                 }
             }
