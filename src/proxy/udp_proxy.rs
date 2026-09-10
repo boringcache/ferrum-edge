@@ -1454,22 +1454,24 @@ fn ensure_egress_writer(
 
 /// The production client→backend send for one queued datagram: the DTLS tunnel
 /// when the backend leg terminates DTLS, otherwise the connected UDP socket.
-/// Owned arguments keep the writer's future `'static`.
-fn session_backend_send(
+///
+/// Owned arguments keep the writer's future `'static`. `Send` is not restated
+/// on the return type: [`spawn_session_egress_writer`] requires `Fut: Send +
+/// 'static` at the call site, so an accidentally non-`Send` body still fails to
+/// compile there.
+async fn session_backend_send(
     session: Arc<UdpSession>,
     data: Bytes,
-) -> impl std::future::Future<Output = Result<usize, std::io::Error>> + Send {
-    async move {
-        if let Some(dtls) = session.dtls_conn.as_ref() {
-            dtls.send(&data)
-                .await
-                .map(|()| data.len())
-                .map_err(|e| std::io::Error::other(e.to_string()))
-        } else if let Some(socket) = session.backend_socket.as_ref() {
-            socket.send(&data).await
-        } else {
-            Err(std::io::Error::other("no backend socket available"))
-        }
+) -> Result<usize, std::io::Error> {
+    if let Some(dtls) = session.dtls_conn.as_ref() {
+        dtls.send(&data)
+            .await
+            .map(|()| data.len())
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    } else if let Some(socket) = session.backend_socket.as_ref() {
+        socket.send(&data).await
+    } else {
+        Err(std::io::Error::other("no backend socket available"))
     }
 }
 
@@ -10347,6 +10349,20 @@ impl UdpEgressWriterProbe {
             .connect(backend_addr)
             .await
             .map_err(|e| format!("probe session socket connect failed: {e}"))?;
+        // Reproduce the state the production fast path always meets. A session
+        // socket is created during setup, whose FIRST client datagram goes out
+        // through the AWAITED `forward_client_datagram_to_backend`; only later
+        // datagrams reach `forward_client_datagram_without_blocking`. That
+        // awaited send leaves tokio's cached readiness for this socket
+        // writable, and `try_send` answers `WouldBlock` WITHOUT a syscall while
+        // that cache is empty (`Registration::try_io` refuses to attempt an
+        // operation on a resource the I/O driver has not yet reported ready).
+        // A probe socket that was never driven would therefore report gateway
+        // congestion that the kernel never signalled.
+        backend_socket
+            .writable()
+            .await
+            .map_err(|e| format!("probe session socket writability failed: {e}"))?;
 
         let client_addr: SocketAddr = "127.0.0.1:34567"
             .parse()

@@ -52,6 +52,12 @@ async fn settle(what: &str, predicate: impl Fn() -> bool) {
 
 /// An uncongested plain-UDP datagram must still be written straight out of the
 /// borrowed receive buffer: no `Bytes`, no channel, no worker.
+///
+/// The probe drives its session socket to writability first, the way
+/// production's awaited first forward drives it during session setup: tokio's
+/// `try_send` answers `WouldBlock` without a syscall while the I/O driver has
+/// not yet observed a freshly registered socket, and that is a probe artefact
+/// rather than the local socket pressure the writer exists for.
 #[tokio::test]
 async fn an_uncongested_plain_udp_datagram_takes_the_borrowed_fast_path() {
     let probe = UdpEgressWriterProbe::with_amplification_factor(Some(4.0))
