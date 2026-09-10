@@ -7746,6 +7746,174 @@ async fn cohere_chat_request_shapes_are_inspected() {
 }
 
 #[tokio::test]
+async fn bedrock_converse_tool_use_input_is_inspected() {
+    // The untyped Converse spelling of a tool call. It matches neither the
+    // typed `tool_use` arm nor a `content[].text` reader, and exposes no
+    // `text`/`content` member of its own, so its arguments — replayed to the
+    // model on the next turn — used to reach it uninspected.
+    assert_request_shape_inspected(
+        "converse toolUse.input",
+        json!({
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "toolUse": {
+                        "toolUseId": "tooluse_1",
+                        "name": "lookup_account",
+                        "input": {"query": PROVIDER_SHAPE_INJECTION}
+                    }
+                }]
+            }]
+        }),
+        "$.messages[0].content[0].toolUse.input",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn bedrock_converse_tool_use_input_is_attributed_as_tool_arguments() {
+    // The block rides inside an assistant message, so without a kind override
+    // it would be scored as the assistant's own prose. Attributing it
+    // `tool_arguments` matches the Anthropic `$.content[*].input` path and is
+    // what lets a tool-scoped rule reach it.
+    let plugin = plugin(&request_shape_config());
+    let mut ctx = make_post_ctx(&json!({
+        "messages": [{
+            "role": "assistant",
+            "content": [{"toolUse": {
+                "toolUseId": "tooluse_1",
+                "input": {"query": PROVIDER_SHAPE_INJECTION}
+            }}]
+        }]
+    }));
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_reject(result, Some(403));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.segment_kinds")
+            .map(String::as_str),
+        Some("tool_arguments")
+    );
+}
+
+#[tokio::test]
+async fn bedrock_converse_tool_use_scan_is_scoped_to_the_arguments() {
+    // Only `input` is model-visible: the sibling `toolUseId` / `name` fields
+    // are call plumbing, and reading them would make an operator's tool naming
+    // an inspection surface. A block carrying only those yields no segment at
+    // all, so the body is refused as uninspectable rather than scored on
+    // plumbing.
+    let mut config = request_shape_config();
+    config["on_error"] = json!("reject");
+    let plugin = plugin(&config);
+    let mut ctx = make_post_ctx(&json!({
+        "messages": [{
+            "role": "assistant",
+            "content": [{"toolUse": {
+                "toolUseId": "tooluse_1",
+                "name": PROVIDER_SHAPE_INJECTION
+            }}]
+        }]
+    }));
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_reject(result, Some(400));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.uninspectable_body")
+            .map(String::as_str),
+        Some("no_extractable_content")
+    );
+}
+
+#[tokio::test]
+async fn cohere_document_map_members_are_inspected() {
+    // A Cohere v1 document is an arbitrary string-to-string map and the
+    // provider serializes every eligible member into the prompt, so an
+    // injection in `snippet` reaches the model exactly like one in `text`
+    // while a reader that stops at `text` never sees it.
+    assert_request_shape_inspected(
+        "cohere documents[] map member",
+        json!({"documents": [{"id": "doc-1", "snippet": PROVIDER_SHAPE_INJECTION}]}),
+        "$.documents[0].snippet",
+    )
+    .await;
+    assert_request_shape_inspected(
+        "cohere documents[].text",
+        json!({"documents": [{"id": "doc-1", "text": PROVIDER_SHAPE_INJECTION}]}),
+        "$.documents[0].text",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn cohere_document_provider_hidden_members_are_not_inspected() {
+    // `id` (the citation identifier), the `_excludes` control, and every
+    // member it names stay out of the model-visible rendering, so they are not
+    // prompt text. A document carrying only those yields no segment, which is
+    // the fail-closed `no_extractable_content` route rather than a silent
+    // allow.
+    let mut config = request_shape_config();
+    config["on_error"] = json!("reject");
+    let plugin = plugin(&config);
+    let mut ctx = make_post_ctx(&json!({
+        "documents": [{
+            "id": PROVIDER_SHAPE_INJECTION,
+            "_excludes": ["internal"],
+            "internal": PROVIDER_SHAPE_INJECTION
+        }]
+    }));
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_reject(result, Some(400));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.uninspectable_body")
+            .map(String::as_str),
+        Some("no_extractable_content")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.rule_ids")
+            .map(String::as_str),
+        Some(""),
+        "a refusal for want of content must not report a rule match"
+    );
+}
+
+#[tokio::test]
+async fn cohere_document_object_member_is_not_stringified_into_a_segment() {
+    // `documents` is an ordinary word in unrelated JSON, so an object member
+    // must not be stringified into one segment and shipped to the embedding
+    // provider. It yields nothing, and the body is refused as uninspectable
+    // instead of being embedded.
+    let mut config = request_shape_config();
+    config["on_error"] = json!("reject");
+    let plugin = plugin(&config);
+    let mut ctx = make_post_ctx(&json!({
+        "documents": [{"id": "doc-1", "meta": {"tenant": "acme", "api_key": "sk-secret"}}]
+    }));
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_reject(result, Some(400));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.uninspectable_body")
+            .map(String::as_str),
+        Some("no_extractable_content")
+    );
+}
+
+#[tokio::test]
 async fn huggingface_tgi_inputs_request_is_inspected() {
     assert_request_shape_inspected(
         "tgi inputs string",
