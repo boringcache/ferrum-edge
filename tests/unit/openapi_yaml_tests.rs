@@ -2127,6 +2127,9 @@ fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
 fn graphql_config_schema_matches_runtime_validation() {
     use ferrum_edge::plugins::create_plugin;
     use ferrum_edge::plugins::graphql::GRAPHQL_CONFIG_KEYS;
+    use ferrum_edge::plugins::utils::rate_limit::{
+        MAX_RATE_LIMIT_MAX_REQUESTS, MAX_RATE_LIMIT_WINDOW_SECONDS,
+    };
     use ferrum_edge::plugins::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
 
     let spec: serde_json::Value =
@@ -2179,6 +2182,21 @@ fn graphql_config_schema_matches_runtime_validation() {
         Some(&json!(1))
     );
 
+    // Issue #5129: the three u32 policy limits carry their runtime range, so a
+    // schema-driven authoring tool refuses exactly what the constructor refuses.
+    for field in ["max_depth", "max_complexity", "max_aliases"] {
+        assert_eq!(
+            schema["properties"][field]["minimum"],
+            json!(0),
+            "{field} must advertise the unsigned floor"
+        );
+        assert_eq!(
+            schema["properties"][field]["maximum"],
+            json!(u32::MAX),
+            "{field} must advertise the 32-bit ceiling"
+        );
+    }
+
     let schema_fields: BTreeSet<_> = schema["properties"]
         .as_object()
         .expect("GraphqlConfig properties")
@@ -2213,6 +2231,20 @@ fn graphql_config_schema_matches_runtime_validation() {
     assert!(docs.contains("valid GraphQL Names"));
     assert!(docs.contains("`2`, not `2.0`"));
     assert!(docs.contains("validated even while `sync_mode` is `local`"));
+    // Issue #5129 / #5133: the operator-facing table states the enforced ranges
+    // for the u32 policy limits and for both rate-entry fields.
+    assert!(
+        docs.contains(&format!("`0..={}`", u32::MAX)),
+        "docs/plugins.md graphql section must document the u32 policy-limit range"
+    );
+    assert!(
+        docs.contains(&format!("`1..={MAX_RATE_LIMIT_MAX_REQUESTS}`")),
+        "docs/plugins.md graphql section must document the max_requests ceiling"
+    );
+    assert!(
+        docs.contains(&format!("`1..={MAX_RATE_LIMIT_WINDOW_SECONDS}`")),
+        "docs/plugins.md graphql section must document the window_seconds ceiling"
+    );
 
     let validator_schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2227,6 +2259,13 @@ fn graphql_config_schema_matches_runtime_validation() {
         json!({"max_depth": 5}),
         json!({"max_complexity": 100}),
         json!({"max_aliases": 3}),
+        // Issue #5129 boundaries: zero and u32::MAX are admitted by both.
+        json!({"max_depth": 0}),
+        json!({"max_complexity": 0}),
+        json!({"max_aliases": 0}),
+        json!({"max_depth": 4294967295u32}),
+        json!({"max_complexity": 4294967295u32}),
+        json!({"max_aliases": 4294967295u32}),
         json!({"introspection_allowed": false}),
         json!({"type_rate_limits": {"query": {"max_requests": 1, "window_seconds": 60}}}),
         json!({"type_rate_limits": {
@@ -2288,6 +2327,13 @@ fn graphql_config_schema_matches_runtime_validation() {
         json!({"operation_rate_limits": {"": {"max_requests": 1, "window_seconds": 60}}}),
         json!({"type_rate_limits": {"query": {"max_requests": 1, "window_seconds": 60, "burst": 2}}}),
         json!({"max_depth": 5, "introspection_allowd": false}),
+        // Issue #5129 boundaries: below zero and above u32::MAX are refused by both.
+        json!({"max_depth": -1}),
+        json!({"max_complexity": -1}),
+        json!({"max_aliases": -1}),
+        json!({"max_depth": 4294967296u64}),
+        json!({"max_complexity": 4294967296u64}),
+        json!({"max_aliases": 4294967296u64}),
         json!({"max_depth": 5, "sync_mdoe": "redis", "redis_url": "redis://localhost:6379/0"}),
         json!({
             "max_depth": 5,
