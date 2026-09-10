@@ -10,6 +10,7 @@
 //!    checked-in `tests/fixtures/test_validator.bin` descriptor.
 //! 3. Assert reject / redact / pass-through behavior end to end over the real
 //!    native gRPC data path.
+//!
 //! HTTP response coverage also checks origin gzip JSON over H1, H2, and H3.
 //!
 //! Run with:
