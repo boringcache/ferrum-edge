@@ -1059,6 +1059,10 @@ impl ProxyBody {
     /// `closer` is `None` for frontends that own their own downstream writes and
     /// already bound every one of them (the native HTTP/3 relays), where a
     /// transport close would be both unnecessary and wrong.
+    ///
+    /// A body that is already at end of stream, under a bound that has not yet
+    /// elapsed, is returned untouched — see the comment in the body for why the
+    /// wrapper must not change a complete response's framing.
     pub(crate) fn with_authorization_deadline(
         mut self,
         deadline: crate::proxy::auth_lifetime::StreamAuthDeadline,
@@ -1067,6 +1071,26 @@ impl ProxyBody {
         auth_latch: Option<crate::proxy::auth_lifetime::StreamAuthTerminationLatch>,
         closer: Option<crate::proxy::auth_lifetime::AuthorizationConnectionCloser>,
     ) -> Self {
+        // A response that is ALREADY complete carries no remaining frame for
+        // this bound to protect, and wrapping it would change its FRAMING: the
+        // pump-backed `AuthorizationCancellableBody` reports
+        // `is_end_stream() == false` until it has delivered a terminal, so a
+        // transport that reads the predicate before writing the head drops
+        // `END_STREAM` from the initial HEADERS and appends an empty DATA frame
+        // instead. That turns a backend's Trailers-Only gRPC answer — HEADERS
+        // with `grpc-status` and END_STREAM, no body at all — into a two-frame
+        // response. The request-upload seam declines for exactly this reason;
+        // see `UploadSource::install_pump`.
+        //
+        // Narrowed to a bound that has NOT already elapsed: an elapsed one
+        // replaces the upstream's answer with the gateway's own terminal, so
+        // the upstream's framing is not the thing being written.
+        if http_body::Body::is_end_stream(&self) {
+            let expired = crate::proxy::auth_lifetime::expired_authorization(Some(deadline));
+            if expired.is_none() {
+                return self;
+            }
+        }
         let terminal = DeadlineTerminal {
             grpc_status_header: AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER,
             grpc_message_header: deadline.termination.grpc_message(),
