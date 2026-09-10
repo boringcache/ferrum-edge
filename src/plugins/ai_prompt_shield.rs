@@ -2633,7 +2633,10 @@ fn collect_content_block_nested_text<'a>(block: &'a Value, texts: &mut Vec<&'a s
         collect_tool_result_content_text(block.get("content"), texts);
     } else if let Some(text) = block.get("guardContent").and_then(guard_content_text) {
         texts.push(text);
-    } else if let Some(input) = block.get("toolUse").and_then(|tool_use| tool_use.get("input")) {
+    } else if let Some(input) = block
+        .get("toolUse")
+        .and_then(|tool_use| tool_use.get("input"))
+    {
         collect_tool_argument_text(input, texts, 0);
     }
 }
