@@ -610,7 +610,9 @@ fn typed_component_properties_match_serde_field_inventories() {
         rust_only = ["credentials"],
         schema_only = []
     );
-    check!(PluginConfig, "PluginConfig");
+    // Properties live on PluginConfigBase; PluginConfig/Create/Replace compose
+    // presence requirements on top of that shared bag.
+    check!(PluginConfig, "PluginConfigBase");
     check!(PluginAssociation, "PluginAssociation");
     check!(Upstream, "Upstream");
     check!(UpstreamTarget, "UpstreamTarget");
@@ -753,10 +755,10 @@ fn auth_mode_and_basic_credential_response_contracts_are_truthful() {
     assert!(!password_pattern.is_match("embedded\0null"));
     assert!(password_pattern.is_match("tabs\tand\nnewlines\rremain valid"));
 
-    let plugin_config = &spec["components"]["schemas"]["PluginConfig"];
+    let plugin_config = &spec["components"]["schemas"]["PluginConfigBase"];
     let config_description = plugin_config["properties"]["config"]["description"]
         .as_str()
-        .expect("PluginConfig config description");
+        .expect("PluginConfigBase config description");
     assert!(config_description.contains("Disabled plugin configs are stored without construction"));
     assert!(config_description.contains("Enabling performs full validation"));
 
@@ -1899,8 +1901,9 @@ fn collect_openapi_inventory(
 
 #[test]
 fn openapi_inventory_has_unique_operations_resolved_refs_and_no_orphan_schemas() {
-    let spec: serde_json::Value =
-        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let yaml: Value = serde_yaml::from_str(include_str!("../../openapi.yaml"))
+        .expect("openapi.yaml parses without duplicate mapping keys");
+    let spec = serde_json::to_value(yaml).expect("openapi.yaml is JSON-compatible");
     let mut operation_ids = Vec::new();
 
     for (path, path_item) in spec["paths"].as_object().expect("paths is an object") {
@@ -2310,6 +2313,208 @@ fn grpc_method_router_schema_matches_runtime_validation() {
             "config should be invalid: {config}"
         );
     }
+}
+
+/// Issue #5004: `RateLimitingConfig` / `RateLimitingRuleConfig` must admit
+/// exactly what the constructor admits, so schema-driven editors and clients do
+/// not disagree with file/admin admission. Table-driven both ways; the three
+/// rules JSON Schema cannot express are asserted explicitly as residuals rather
+/// than implied to be parity.
+#[test]
+fn rate_limiting_schema_and_runtime_admission_agree() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/RateLimitingConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("RateLimitingConfig schema compiles");
+
+    for config in [
+        // Baseline.
+        json!({"limits": [{"scope": "default", "window_seconds": 60, "max_requests": 2}]}),
+        // `null` is the same as omitting the dimension, and the parser
+        // normalizes ASCII case on limit_by / sync_mode / scope.
+        json!({
+            "limit_by": null,
+            "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 2}]
+        }),
+        json!({
+            "limit_by": "IP",
+            "sync_mode": "LOCAL",
+            "limits": [{"scope": "DEFAULT", "window_seconds": 60, "max_requests": 2}]
+        }),
+        json!({
+            "limit_by": "spiffe",
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+        // Consumer-scoped rules alongside the required default rule.
+        json!({
+            "limit_by": "consumer",
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {"scope": "consumers", "consumers": ["alice"], "requests_per_minute": 1000}
+            ]
+        }),
+        // The exact documented Redis example (docs/plugins.md).
+        json!({
+            "limit_by": "consumer",
+            "expose_headers": true,
+            "sync_mode": "redis",
+            "redis_url": "redis://redis-host:6379/0",
+            "redis_tls": true,
+            "redis_key_prefix": "myapp:rate_limiting",
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {
+                    "scope": "consumers",
+                    "consumers": ["premium-app", "partner-app"],
+                    "requests_per_minute": 1000
+                },
+                {
+                    "scope": "consumers",
+                    "consumers": ["batch-worker"],
+                    "window_seconds": 60,
+                    "max_requests": 250
+                }
+            ]
+        }),
+    ] {
+        assert!(
+            validator.validate(&config).is_ok(),
+            "schema should accept: {config}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("rate_limiting", &config).is_ok(),
+            "runtime should accept schema-valid config: {config}"
+        );
+    }
+
+    for config in [
+        // No `scope: default` rule at all.
+        json!({
+            "limit_by": "consumer",
+            "limits": [{"scope": "consumers", "consumers": ["alice"], "requests_per_minute": 1}]
+        }),
+        // Two default rules.
+        json!({
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {"scope": "default", "requests_per_minute": 10}
+            ]
+        }),
+        // A consumers rule without `limit_by: consumer` (explicit and implied).
+        json!({
+            "limit_by": "ip",
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {"scope": "consumers", "consumers": ["alice"], "requests_per_minute": 10}
+            ]
+        }),
+        json!({
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {"scope": "consumers", "consumers": ["alice"], "requests_per_minute": 10}
+            ]
+        }),
+        // `limit_by: null` means `ip`, so it is not a consumer dimension either.
+        json!({
+            "limit_by": null,
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {"scope": "consumers", "consumers": ["alice"], "requests_per_minute": 10}
+            ]
+        }),
+        // One identity repeated inside a single consumers rule.
+        json!({
+            "limit_by": "consumer",
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {
+                    "scope": "consumers",
+                    "consumers": ["alice", "alice"],
+                    "requests_per_minute": 10
+                }
+            ]
+        }),
+        // Centralized mode without an endpoint.
+        json!({
+            "sync_mode": "redis",
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+        // Latent/explicit Redis scalars the constructor bounds.
+        json!({
+            "redis_key_prefix": "",
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+        json!({
+            "redis_connect_timeout_seconds": 0,
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+        json!({
+            "redis_connect_timeout_seconds": -1,
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+        json!({
+            "redis_health_check_interval_seconds": 0,
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+        // Issue #5005: an unusable database selector.
+        json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:6379/banana",
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+    ] {
+        assert!(
+            validator.validate(&config).is_err(),
+            "schema should reject: {config}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("rate_limiting", &config).is_err(),
+            "runtime should reject schema-invalid config: {config}"
+        );
+    }
+
+    // Documented residuals: the constructor is stricter than any JSON Schema
+    // can be here, so these are refused at admission and accepted by the
+    // schema. Both halves are asserted so a future schema tightening (or a
+    // constructor relaxation) has to update this list deliberately.
+    for config in [
+        // One identity named in two *different* consumers rules.
+        json!({
+            "limit_by": "consumer",
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {"scope": "consumers", "consumers": ["alice"], "requests_per_minute": 10},
+                {"scope": "consumers", "consumers": ["alice"], "requests_per_minute": 20}
+            ]
+        }),
+        // An out-of-range TCP port in redis_url.
+        json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:99999/0",
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+    ] {
+        assert!(
+            validator.validate(&config).is_ok(),
+            "documented residual must still be schema-valid: {config}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("rate_limiting", &config).is_err(),
+            "documented residual must be refused at admission: {config}"
+        );
+    }
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    assert!(
+        plugin_docs.contains("Three residual rules JSON Schema cannot express"),
+        "rate_limiting docs must state which admission rules the schema cannot express"
+    );
 }
 
 #[test]
@@ -4549,9 +4754,9 @@ fn hmac_auth_plugin_config_branch_requires_a_config_object() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
     let branch = spec
-        .pointer("/components/schemas/PluginConfig/allOf")
+        .pointer("/components/schemas/PluginConfigBase/allOf/0/then/allOf")
         .and_then(serde_json::Value::as_array)
-        .expect("PluginConfig allOf")
+        .expect("enabled PluginConfigBase allOf")
         .iter()
         .find(|entry| {
             entry.pointer("/if/properties/plugin_name/const") == Some(&json!("hmac_auth"))
@@ -4997,10 +5202,35 @@ fn ai_tool_governor_schema_matches_runtime_invariants() {
 }
 
 fn plugin_config_schema_mapping(spec: &serde_json::Value) -> BTreeMap<String, String> {
-    let all_of = spec
-        .pointer("/components/schemas/PluginConfig/allOf")
+    let base_all_of = spec
+        .pointer("/components/schemas/PluginConfigBase/allOf")
         .and_then(serde_json::Value::as_array)
-        .expect("PluginConfig allOf should be an array");
+        .expect("PluginConfigBase allOf should be an array");
+    assert!(
+        base_all_of.len() >= 2,
+        "PluginConfigBase must gate construction and keep the prometheus_metrics scope guard"
+    );
+    let enabled_gate = &base_all_of[0];
+    assert_eq!(
+        enabled_gate.pointer("/if/properties/enabled/not/const"),
+        Some(&json!(false)),
+        "plugin-specific construction schemas must not apply when enabled is false"
+    );
+    assert_eq!(
+        base_all_of[1].pointer("/if/properties/plugin_name/const"),
+        Some(&json!("prometheus_metrics")),
+        "disabled prometheus_metrics must still require global scope"
+    );
+    assert_eq!(
+        base_all_of[1].pointer("/then/properties/scope/const"),
+        Some(&json!("global")),
+        "disabled prometheus_metrics must still require global scope"
+    );
+
+    let all_of = enabled_gate
+        .pointer("/then/allOf")
+        .and_then(serde_json::Value::as_array)
+        .expect("enabled PluginConfigBase conditionals should be an array");
 
     let mut mapping = BTreeMap::new();
     for entry in all_of {
@@ -5217,6 +5447,142 @@ fn plugin_config_schema_applies_plugin_specific_config() {
         validator.validate(&custom).is_ok(),
         "custom plugins should keep generic PluginConfig config shape"
     );
+}
+
+/// Issue #4996: shared PluginConfig/Create/Replace must admit the same null,
+/// disabled, and POST-default bodies as `validate_plugin_config_definition`
+/// and PUT's explicit `enabled` presence check, without loosening enabled
+/// construction or PUT replace semantics.
+#[test]
+fn plugin_config_shared_schema_matches_admin_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    assert_eq!(
+        spec["paths"]["/plugins/config"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+            ["$ref"],
+        json!("#/components/schemas/PluginConfigCreate")
+    );
+    assert_eq!(
+        spec["paths"]["/plugins/config/{id}"]["put"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        json!("#/components/schemas/PluginConfigReplace")
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["BatchCreateRequest"]["properties"]["plugin_configs"]["items"]
+            ["$ref"],
+        json!("#/components/schemas/PluginConfigCreate")
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["PluginConfigBase"]["properties"]["config"]["type"],
+        json!(["object", "null"])
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["PluginConfigCreate"]["allOf"][1]["required"],
+        json!(["plugin_name", "scope"])
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["PluginConfigReplace"]["allOf"][1]["required"],
+        json!(["plugin_name", "scope", "enabled"])
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["PluginConfig"]["allOf"][1]["required"],
+        json!(["plugin_name", "scope", "enabled"])
+    );
+
+    let stdout_null = json!({
+        "plugin_name": "stdout_logging",
+        "scope": "global",
+        "enabled": true,
+        "config": null
+    });
+    assert_component_validity(&spec, "PluginConfigCreate", &stdout_null, true);
+    assert_component_validity(&spec, "PluginConfig", &stdout_null, true);
+    assert_component_validity(&spec, "PluginConfigReplace", &stdout_null, true);
+
+    let disabled_http_logging = json!({
+        "plugin_name": "http_logging",
+        "scope": "global",
+        "enabled": false,
+        "config": {}
+    });
+    assert_component_validity(&spec, "PluginConfigCreate", &disabled_http_logging, true);
+    assert_component_validity(&spec, "PluginConfig", &disabled_http_logging, true);
+    assert_component_validity(&spec, "PluginConfigReplace", &disabled_http_logging, true);
+
+    let post_defaults = json!({
+        "plugin_name": "stdout_logging",
+        "scope": "global",
+        "config": {}
+    });
+    assert_component_validity(&spec, "PluginConfigCreate", &post_defaults, true);
+    assert_component_validity(&spec, "PluginConfig", &post_defaults, false);
+    assert_component_validity(&spec, "PluginConfigReplace", &post_defaults, false);
+
+    let enabled_http_logging_missing_endpoint = json!({
+        "plugin_name": "http_logging",
+        "scope": "global",
+        "enabled": true,
+        "config": {}
+    });
+    assert_component_validity(
+        &spec,
+        "PluginConfigCreate",
+        &enabled_http_logging_missing_endpoint,
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "PluginConfig",
+        &enabled_http_logging_missing_endpoint,
+        false,
+    );
+
+    let object_only_null = json!({
+        "plugin_name": "http_logging",
+        "scope": "global",
+        "enabled": true,
+        "config": null
+    });
+    assert_component_validity(&spec, "PluginConfigCreate", &object_only_null, false);
+    assert_component_validity(&spec, "PluginConfigReplace", &object_only_null, false);
+
+    let mut missing_config = json!({
+        "plugin_name": "http_logging",
+        "scope": "global"
+    });
+    assert_component_validity(&spec, "PluginConfigCreate", &missing_config, false);
+    missing_config["enabled"] = json!(false);
+    for component in ["PluginConfigCreate", "PluginConfig", "PluginConfigReplace"] {
+        assert_component_validity(&spec, component, &missing_config, true);
+    }
+
+    for plugin_name in ["prometheus_metrics", "mtls_auth", "compression"] {
+        let body = json!({
+            "plugin_name": plugin_name,
+            "scope": "global",
+            "enabled": true,
+            "config": null
+        });
+        assert_component_validity(&spec, "PluginConfigCreate", &body, true);
+    }
+
+    // Generic scope restrictions still apply when construction is skipped.
+    for plugin_name in ["prometheus_metrics", "transaction_log_schema"] {
+        let mut body = json!({
+            "plugin_name": plugin_name,
+            "scope": "global",
+            "enabled": false,
+            "config": {}
+        });
+        for component in ["PluginConfigCreate", "PluginConfig", "PluginConfigReplace"] {
+            assert_component_validity(&spec, component, &body, true);
+        }
+        body["scope"] = json!("proxy_group");
+        for component in ["PluginConfigCreate", "PluginConfig", "PluginConfigReplace"] {
+            assert_component_validity(&spec, component, &body, false);
+        }
+    }
 }
 
 #[test]
@@ -9588,6 +9954,7 @@ fn prometheus_metrics_config_is_closed_and_bounds_unsigned_timing_fields() {
     );
 
     for config in [
+        serde_json::Value::Null,
         json!({}),
         json!({"render_cache_ttl_seconds": 0}),
         json!({"render_cache_ttl_seconds": u64::MAX}),
@@ -12431,9 +12798,9 @@ fn ws_frame_logging_schema_matches_runtime_admission_contract() {
     }
 
     let plugin_config_desc = spec
-        .pointer("/components/schemas/PluginConfig/properties/config/description")
+        .pointer("/components/schemas/PluginConfigBase/properties/config/description")
         .and_then(|v| v.as_str())
-        .expect("PluginConfig.config description");
+        .expect("PluginConfigBase.config description");
     assert!(
         plugin_config_desc.contains("OptionalFailOpen"),
         "generic PluginConfig.config must document OptionalFailOpen omission"
@@ -13356,9 +13723,9 @@ fn request_termination_schema_matches_strict_runtime_contract() {
     assert_eq!(trigger_fields, runtime_trigger);
 
     let request_termination_branch = spec
-        .pointer("/components/schemas/PluginConfig/allOf")
+        .pointer("/components/schemas/PluginConfigBase/allOf/0/then/allOf")
         .and_then(serde_json::Value::as_array)
-        .expect("PluginConfig allOf")
+        .expect("enabled PluginConfigBase allOf")
         .iter()
         .find(|entry| {
             entry
@@ -15067,9 +15434,10 @@ fn mesh_bpf_metrics_schema_matches_constructor_admission() {
     );
     assert_eq!(MESH_BPF_METRICS_CONFIG_KEYS, ["prefix"].as_slice());
 
-    let bpf_branch = spec["components"]["schemas"]["PluginConfig"]["allOf"]
-        .as_array()
-        .expect("PluginConfig allOf")
+    let bpf_branch = spec
+        .pointer("/components/schemas/PluginConfigBase/allOf/0/then/allOf")
+        .and_then(serde_json::Value::as_array)
+        .expect("enabled PluginConfigBase allOf")
         .iter()
         .find(|entry| {
             entry
@@ -15079,11 +15447,7 @@ fn mesh_bpf_metrics_schema_matches_constructor_admission() {
         })
         .expect("__mesh_bpf_metrics PluginConfig branch");
     assert_eq!(
-        bpf_branch.pointer("/then/if/properties/enabled/const"),
-        Some(&json!(true))
-    );
-    assert_eq!(
-        bpf_branch.pointer("/then/then/properties/scope/const"),
+        bpf_branch.pointer("/then/properties/scope/const"),
         Some(&json!("global"))
     );
 
@@ -15203,12 +15567,23 @@ fn mesh_bpf_metrics_schema_matches_constructor_admission() {
                 "enabled": true,
                 "config": null
             }),
-            false,
+            true,
         ),
     ];
     for (instance, expected_valid) in wrapper_cases {
         assert_component_validity(&spec, "PluginConfig", &instance, expected_valid);
     }
+
+    // POST's omitted enabled field defaults to true, so the global-scope
+    // restriction must run through the shared construction gate as well.
+    let mut post_defaults = json!({
+        "plugin_name": "__mesh_bpf_metrics",
+        "scope": "global",
+        "config": null
+    });
+    assert_component_validity(&spec, "PluginConfigCreate", &post_defaults, true);
+    post_defaults["scope"] = json!("proxy_group");
+    assert_component_validity(&spec, "PluginConfigCreate", &post_defaults, false);
 
     let plugins_docs = include_str!("../../docs/plugins.md");
     let section = plugins_docs
@@ -16600,4 +16975,150 @@ fn serverless_function_schema_matches_runtime_admission() {
             "runtime must reject the schema-invalid config: {config}"
         );
     }
+}
+
+/// Issue #5239: the `ApiChargebackConfig` component must reject exactly what the
+/// constructor rejects — no-op pricing, blank currency, out-of-range or
+/// duplicate status codes, negative timer/budget values, simultaneous `schema`
+/// and `schema_ref`, and projection features the billing-row record family
+/// cannot express.
+#[test]
+fn api_chargeback_schema_admits_only_constructible_configs() {
+    use ferrum_edge::plugins::api_chargeback::ApiChargeback;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/ApiChargebackConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("ApiChargebackConfig schema compiles");
+
+    // The minimal effective configuration: a nonempty tier counts even at a
+    // zero price, because an explicitly zero-priced tier still meters calls.
+    let base = json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0}]});
+    let with = |patch: serde_json::Value| -> serde_json::Value {
+        let mut config = base.clone();
+        let object = config.as_object_mut().expect("base is an object");
+        for (key, value) in patch.as_object().expect("patch is an object") {
+            object.insert(key.clone(), value.clone());
+        }
+        config
+    };
+    let accept = |config: serde_json::Value| {
+        assert!(
+            validator.validate(&config).is_ok(),
+            "OpenAPI must admit {config}"
+        );
+        ApiChargeback::new(&config, "ferrum")
+            .unwrap_or_else(|err| panic!("runtime must admit {config}: {err}"));
+    };
+    let reject = |config: serde_json::Value| {
+        assert!(
+            validator.validate(&config).is_err(),
+            "OpenAPI must reject {config}"
+        );
+        assert!(
+            ApiChargeback::new(&config, "ferrum").is_err(),
+            "runtime must reject {config}"
+        );
+    };
+
+    let documented_per_call = json!({
+        "currency": "USD",
+        "pricing_tiers": [
+            {"status_codes": [200, 201, 202, 204], "price_per_call": 0.00001},
+            {"status_codes": [301, 302], "price_per_call": 0.000005}
+        ]
+    });
+    let documented_combined = json!({
+        "currency": "USD",
+        "pricing_tiers": [
+            {"status_codes": [200, 201, 202, 204], "price_per_call": 0.00001}
+        ],
+        "bandwidth_pricing": {
+            "price_per_byte_sent": 0.0000000001,
+            "price_per_byte_received": 0.0000000002
+        },
+        "stream_connection_pricing": {"price_per_connection": 0.0005}
+    });
+    let supported_derived = json!({
+        "schema": {"derived_fields": [{"name": "row_kind", "kind": "summary_kind"}]}
+    });
+
+    accept(base.clone());
+    accept(json!({"bandwidth_pricing": {"price_per_byte_sent": 0.01}}));
+    accept(json!({"bandwidth_pricing": {"price_per_byte_received": 0.02}}));
+    accept(json!({"stream_connection_pricing": {"price_per_connection": 5}}));
+    accept(json!({"pricing_tiers": [{"status_codes": [100, 599], "price_per_call": 1}]}));
+    accept(documented_per_call);
+    accept(documented_combined);
+    accept(with(json!({"schema": {"omit": ["proxy_name"]}})));
+    accept(with(
+        json!({"schema": {"rename": {"total_calls": "calls"}}}),
+    ));
+    accept(with(supported_derived));
+
+    let unrepresentable_derived = json!({
+        "schema": {"derived_fields": [{"name": "host", "kind": "backend_host"}]}
+    });
+
+    // No effective pricing: the plugin would record nothing.
+    reject(json!({}));
+    reject(json!({"bandwidth_pricing": {}}));
+    reject(json!({"bandwidth_pricing": {"price_per_byte_sent": 0}}));
+    reject(json!({"stream_connection_pricing": {"price_per_connection": 0}}));
+    reject(json!({"pricing_tiers": []}));
+    // Currency is trimmed and must not be empty.
+    reject(with(json!({"currency": ""})));
+    reject(with(json!({"currency": " \t "})));
+    // Status codes must be real HTTP statuses, distinct within a tier.
+    reject(json!({"pricing_tiers": [{"status_codes": [99], "price_per_call": 1}]}));
+    reject(json!({"pricing_tiers": [{"status_codes": [600], "price_per_call": 1}]}));
+    reject(json!({"pricing_tiers": [{"status_codes": [200, 200], "price_per_call": 1}]}));
+    // Timer / budget knobs are unsigned 64-bit integers.
+    reject(with(json!({"render_cache_ttl_seconds": -1})));
+    reject(with(json!({"stale_entry_ttl_seconds": -1})));
+    reject(with(json!({"cache_invalidation_min_age_ms": -1})));
+    reject(with(json!({"cleanup_interval_seconds": -1})));
+    reject(with(json!({"max_entries": 0})));
+    reject(with(json!({"max_retained_bytes": 0})));
+    // Projection surface: mutually exclusive, and narrowed to the billing row.
+    reject(with(json!({"schema": {}, "schema_ref": "missing"})));
+    reject(with(json!({"schema": {"order": ["proxy_id"]}})));
+    reject(with(json!({"schema": {"summary_type": "http"}})));
+    reject(with(json!({"schema": {"timestamp_format": "epoch_ms"}})));
+    reject(with(json!({"schema": {"metadata": {"mode": "omit"}}})));
+    reject(with(json!({"schema": {"omit": ["response_status_code"]}})));
+    reject(with(json!({"schema": {"rename": {"client_ip": "ip"}}})));
+    reject(with(unrepresentable_derived));
+
+    // Constraints that stay runtime-only must be documented as such rather than
+    // silently missing from the component.
+    let component = spec
+        .pointer("/components/schemas/ApiChargebackConfig")
+        .expect("ApiChargebackConfig exists");
+    let description = component["description"].as_str().expect("a description");
+    assert!(
+        description.contains("Runtime-only admission"),
+        "the component must name the constraints JSON Schema cannot express"
+    );
+
+    let guide = include_str!("../../docs/plugins.md");
+    let section = guide
+        .split("### `api_chargeback`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("api_chargeback docs section");
+    assert!(
+        section.contains("Precise admission rules"),
+        "docs/plugins.md must state the exact admission rules"
+    );
+    assert!(
+        section.contains("unsigned 64-bit integer"),
+        "docs/plugins.md must state the unsigned bound on the timer knobs"
+    );
 }
