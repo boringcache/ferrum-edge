@@ -2624,6 +2624,22 @@ pub struct RequestContext {
     /// Typed rather than `metadata`: a digest of a client query document must not
     /// enter a transaction log, and no plugin may forge one to skip the recheck.
     pub(crate) graphql_request_envelope_hashes: HashMap<u64, [u8; 32]>,
+    /// Rate-limit buckets one `graphql` instance already charged for this
+    /// request, as `(instance id, bucket key)`.
+    ///
+    /// The envelope digest above answers "is this the document already parsed?",
+    /// which is the right question for structural policy but the wrong one for
+    /// accounting: an unrelated `request_transformer` addition (an `extensions`
+    /// member, a JSON reserialization) changes the digest without changing the
+    /// operation, and re-running enforcement over it used to spend a second
+    /// token from the same budget — so `max_requests: 1` refused the very first
+    /// request. A bucket is charged at most once per request, while a transform
+    /// that actually selects a different operation type or name still reaches
+    /// its own uncharged bucket and is enforced there.
+    ///
+    /// Keyed by instance because two configured `graphql` instances build
+    /// identical key strings over separate budgets.
+    pub(crate) graphql_charged_rate_buckets: HashSet<(u64, String)>,
     /// Per-`waf`-instance digest of the response header map that instance
     /// actually scanned in `after_proxy` (priority 2930).
     ///
@@ -3483,6 +3499,7 @@ impl RequestContext {
             ai_response_guard_pending_redactions: HashMap::new(),
             ai_tool_governor_replay_redactions: HashSet::new(),
             graphql_request_envelope_hashes: HashMap::new(),
+            graphql_charged_rate_buckets: HashSet::new(),
             waf_response_header_digests: HashMap::new(),
             json_scan_memo: crate::util::json_dup_keys::JsonScanMemo::default(),
             governed_request_body_plaintext: None,
@@ -4756,6 +4773,9 @@ impl RequestContext {
             // Carried into the final-request-body stage so every plugin in that
             // stage shares one duplicate-key screen of the same body.
             graphql_request_envelope_hashes: self.graphql_request_envelope_hashes.clone(),
+            // Carried so the final-request-body re-check can see which budgets
+            // `before_proxy` already charged for this request.
+            graphql_charged_rate_buckets: self.graphql_charged_rate_buckets.clone(),
             waf_response_header_digests: self.waf_response_header_digests.clone(),
             json_scan_memo: self.json_scan_memo.clone(),
             // Deliberately NOT carried: the shared request representation gate
