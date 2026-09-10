@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ferrum_edge::modes::mesh::config::{
-    MESH_EXT_AUTHZ_PROCESS_CONCURRENT_CALLS, MeshConfig, MeshExtAuthzProvider, MeshPolicy, MeshRule,
-    PolicyAction, PolicyScope,
+    MESH_EXT_AUTHZ_PROCESS_CONCURRENT_CALLS, MeshConfig, MeshExtAuthzProvider, MeshPolicy,
+    MeshRule, PolicyAction, PolicyScope,
 };
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use ferrum_edge::plugins::PluginHttpClient;
