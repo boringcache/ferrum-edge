@@ -856,13 +856,16 @@ impl JwksAuth {
             .filter(|(_, provider)| {
                 provider.require_dpop
                     && (provider.token_locations.is_empty()
-                        || provider.token_locations.iter().any(|location| match location {
-                            TokenLocation::Header(header) => {
-                                header.name.eq_ignore_ascii_case("authorization")
-                                    && header.prefix.is_none()
-                            }
-                            TokenLocation::QueryParam(_) => false,
-                        }))
+                        || provider
+                            .token_locations
+                            .iter()
+                            .any(|location| match location {
+                                TokenLocation::Header(header) => {
+                                    header.name.eq_ignore_ascii_case("authorization")
+                                        && header.prefix.is_none()
+                                }
+                                TokenLocation::QueryParam(_) => false,
+                            }))
             })
             .map(|(idx, _)| idx)
             .collect();
