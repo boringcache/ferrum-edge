@@ -427,7 +427,10 @@ fn validate_kafka_topic_name(topic: &str) -> Result<(), String> {
             "kafka_logging: 'topic' must be at most {MAX_KAFKA_TOPIC_NAME_LENGTH} characters"
         ));
     }
-    if let Some(offending) = topic.chars().find(|character| !is_kafka_topic_char(*character)) {
+    if let Some(offending) = topic
+        .chars()
+        .find(|character| !is_kafka_topic_char(*character))
+    {
         // Escape the offending character so a control byte cannot reshape the
         // diagnostic, and name only that character rather than the whole value.
         return Err(format!(
