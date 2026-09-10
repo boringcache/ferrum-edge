@@ -3012,6 +3012,43 @@ mod projected_generation {
         );
     }
 
+    /// The other half of that classification, and the reason it cannot be read
+    /// off a link count: the pinned generation is still linked into the mount —
+    /// merely superseded — and the entry its document names was never one of
+    /// its files. That is an operator error, not a rotation race, so it stays
+    /// permanently unbound. On Darwin an open directory reports the same link
+    /// count before and after `rmdir`, so this case and the reclaimed one above
+    /// are indistinguishable by `nlink` and must be separated by identity.
+    #[test]
+    fn a_superseded_but_live_generation_missing_an_entry_stays_permanently_unbound() {
+        let mount = ProjectedMount::new();
+        // `gen-a`'s document references `tenant.secret`, which `gen-a` itself
+        // never contained.
+        mount.write_generation("gen-a", &[("bundle.json", slot_document(&mount, TENANT_A))]);
+        mount.write_generation(
+            "gen-b",
+            &[
+                ("bundle.json", slot_document(&mount, TENANT_B)),
+                ("tenant.secret", TENANT_B_SECRET.to_string()),
+            ],
+        );
+        mount.activate("gen-a");
+        mount.publish(&["bundle.json", "tenant.secret"]);
+
+        let pinned = PinnedTrustBundleSource::pin(&mount.bundle_path()).expect("document reads");
+        // Supersede the pin WITHOUT reclaiming it: `..gen-a` remains an entry of
+        // the projection mount.
+        mount.activate("gen-b");
+
+        let error = CpDpTrustBundle::from_pinned_source(pinned, None)
+            .expect_err("an unbound reference must be refused");
+        assert_eq!(
+            error.reason(),
+            TrustBundleRejectReason::MaterialIntegrityUnbound,
+            "a live generation missing an entry must not be reported as a rotation race"
+        );
+    }
+
     /// Startup (`load_from_path`) and the periodic reload worker must go
     /// through the same coherent-generation loader — a mixed candidate must be
     /// able to become neither the initial authorization root nor a live
