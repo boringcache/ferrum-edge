@@ -10943,8 +10943,7 @@ fn size_limiting_plugin_configs_are_closed_and_bounded_in_openapi() {
                 "{schema_name}.{field} must be a positive integer"
             );
             assert_eq!(
-                schema["properties"][field]["maximum"],
-                uint64_max,
+                schema["properties"][field]["maximum"], uint64_max,
                 "{schema_name}.{field} must advertise the uint64 upper bound"
             );
             assert_eq!(
@@ -11043,7 +11042,9 @@ fn size_limiting_plugin_configs_are_closed_and_bounded_in_openapi() {
         ("ws_message_size_limiting", json!({"max_frame_bytes": 1})),
     ] {
         assert!(
-            plugin_validator.validate(&plugin_config(plugin_name, minimal.clone())).is_ok(),
+            plugin_validator
+                .validate(&plugin_config(plugin_name, minimal.clone()))
+                .is_ok(),
             "{plugin_name} PluginConfig branch must accept the documented minimal config"
         );
 
@@ -11053,7 +11054,9 @@ fn size_limiting_plugin_configs_are_closed_and_bounded_in_openapi() {
             .expect("minimal config is an object")
             .insert("max_bytez".to_string(), json!(64));
         assert!(
-            plugin_validator.validate(&plugin_config(plugin_name, unknown)).is_err(),
+            plugin_validator
+                .validate(&plugin_config(plugin_name, unknown))
+                .is_err(),
             "{plugin_name} PluginConfig branch must reject an unknown key"
         );
 
@@ -11068,7 +11071,9 @@ fn size_limiting_plugin_configs_are_closed_and_bounded_in_openapi() {
             .expect("minimal config is an object")
             .insert(size_field.to_string(), json!(u64::MAX));
         assert!(
-            plugin_validator.validate(&plugin_config(plugin_name, at_max)).is_ok(),
+            plugin_validator
+                .validate(&plugin_config(plugin_name, at_max))
+                .is_ok(),
             "{plugin_name} PluginConfig branch must accept u64::MAX"
         );
 
@@ -11080,7 +11085,9 @@ fn size_limiting_plugin_configs_are_closed_and_bounded_in_openapi() {
             .expect("minimal config is an object")
             .insert(size_field.to_string(), over);
         assert!(
-            plugin_validator.validate(&plugin_config(plugin_name, over_range)).is_err(),
+            plugin_validator
+                .validate(&plugin_config(plugin_name, over_range))
+                .is_err(),
             "{plugin_name} PluginConfig branch must reject u64::MAX+1"
         );
     }
