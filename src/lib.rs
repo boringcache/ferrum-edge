@@ -9830,6 +9830,12 @@ pub mod _test_support {
     /// production datagram paths.
     pub use crate::proxy::udp_proxy::UdpAuthorizationSessionProbe;
 
+    /// A real plain-UDP session driven through the production non-blocking
+    /// client→backend admission and its bounded per-session backend-send writer
+    /// (issue #5045), with only the backend send itself injectable so a parked
+    /// send needs no sleep.
+    pub use crate::proxy::udp_proxy::{UdpEgressAdmissionForTest, UdpEgressWriterProbe};
+
     /// The fixed PRE-COMMITMENT terminal the H1/H2 dispatch funnel substitutes
     /// when a request-upload authorization expiry cancelled the backend
     /// dispatch before any response head reached the client (issue #3815).
