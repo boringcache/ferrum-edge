@@ -3169,7 +3169,10 @@ async fn test_hmac_auth_non_ascii_digest_returns_invalid_not_missing() {
     );
     ctx.set_raw_headers(raw);
     ctx.materialize_headers();
-    assert!(!ctx.headers.contains_key("digest"));
+    // Valid UTF-8 obs-text is materialized byte-for-byte (issue #5010); the
+    // digest grammar is still visible-ASCII only, so the value is malformed
+    // rather than missing.
+    assert!(ctx.headers.contains_key("digest"));
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject_body(result, r#"{"error":"Malformed digest header"}"#);
