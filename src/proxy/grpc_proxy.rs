@@ -280,7 +280,9 @@ impl Drop for GrpcBody {
         // bill zero uploaded bytes. Idempotent with the EOF/error publications
         // in `poll_frame`.
         if let GrpcBody::Streaming {
-            bytes_seen, request_bytes, ..
+            bytes_seen,
+            request_bytes,
+            ..
         } = self
             && let Some(accounting) = request_bytes.as_mut()
         {

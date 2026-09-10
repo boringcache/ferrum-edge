@@ -3687,7 +3687,10 @@ fn grpc_streaming_upload_publishes_forwarded_request_bytes() {
     let streaming_variant = src
         .split("    Streaming {")
         .nth(1)
-        .and_then(|rest| rest.split("    /// Streaming body sourced from a channel").next())
+        .and_then(|rest| {
+            rest.split("    /// Streaming body sourced from a channel")
+                .next()
+        })
         .expect("the Streaming variant must exist");
     let accounting_field = "request_bytes: Option<GrpcUploadByteAccounting>";
     assert!(

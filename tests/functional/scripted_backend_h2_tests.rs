@@ -1683,7 +1683,10 @@ async fn assert_api_chargeback_bills_grpc_upload_bytes(overrides: Value, case: &
         .spawn()
         .expect("spawn backend");
     let harness = GatewayHarness::builder()
-        .file_config(grpc_chargeback_bandwidth_file_config(backend_port, overrides))
+        .file_config(grpc_chargeback_bandwidth_file_config(
+            backend_port,
+            overrides,
+        ))
         .pool_warmup_enabled(false)
         .spawn()
         .await
@@ -1715,7 +1718,8 @@ async fn assert_api_chargeback_bills_grpc_upload_bytes(overrides: Value, case: &
         &charges["consumers"]["grpc-chargeback-user"]["proxies"]["grpc-chargeback"]["bandwidth"];
     let bytes_sent = bandwidth["bytes_sent"].as_u64();
     assert_eq!(
-        bytes_sent, Some(expected_bytes_sent),
+        bytes_sent,
+        Some(expected_bytes_sent),
         "{case}: streamed gRPC upload bytes must be billed; {charges:#?}"
     );
     let charge_sent = bandwidth["charge_sent"]

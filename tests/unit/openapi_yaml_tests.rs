@@ -11743,7 +11743,9 @@ fn api_chargeback_schema_admits_only_constructible_configs() {
     accept(documented_per_call);
     accept(documented_combined);
     accept(with(json!({"schema": {"omit": ["proxy_name"]}})));
-    accept(with(json!({"schema": {"rename": {"total_calls": "calls"}}})));
+    accept(with(
+        json!({"schema": {"rename": {"total_calls": "calls"}}}),
+    ));
     accept(with(supported_derived));
 
     let unrepresentable_derived = json!({
