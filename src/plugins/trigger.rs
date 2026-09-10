@@ -247,7 +247,10 @@ impl PluginTriggerGate {
     /// Read terminal eligibility for shared observation without counting a
     /// second hook. The actual log invocation owns skip/missing diagnostics.
     pub(crate) fn transaction_log_enabled(&self, summary: &TransactionSummary) -> bool {
-        summary.plugin_trigger_decisions.decision(self.token).unwrap_or(true)
+        summary
+            .plugin_trigger_decisions
+            .decision(self.token)
+            .unwrap_or(true)
     }
 
     /// Read the decision this instance took during the request lifecycle,

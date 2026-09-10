@@ -425,7 +425,10 @@ impl WorkloadMetrics {
             "max_retries",
             "retry_delay_ms",
         ] {
-            if config.get(key).is_some_and(|value| value.as_u64().is_none()) {
+            if config
+                .get(key)
+                .is_some_and(|value| value.as_u64().is_none())
+            {
                 return Err(format!(
                     "workload_metrics: {key} must be a non-negative integer"
                 ));

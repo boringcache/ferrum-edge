@@ -28,7 +28,12 @@ fn malformed_fields_fail_constructor_and_shared_admin_admission() {
             cases.push(json!({field: value}));
         }
     }
-    for field in ["labels", "custom_tags", "custom_header_tags", "custom_env_tags"] {
+    for field in [
+        "labels",
+        "custom_tags",
+        "custom_header_tags",
+        "custom_env_tags",
+    ] {
         for value in [json!(null), json!([]), json!("tags"), json!({"region": 17})] {
             cases.push(json!({field: value}));
         }
@@ -166,7 +171,8 @@ async fn effective_instances_record_one_graph_observation_with_final_grpc_status
         let source = format!("{unique}-{index}");
         ctx.metadata
             .insert("mesh.source.workload".into(), source.clone());
-        ctx.metadata.insert("request_protocol".into(), protocol.into());
+        ctx.metadata
+            .insert("request_protocol".into(), protocol.into());
         ctx.metadata.insert(
             "mesh.request_protocol".into(),
             if index == 3 { "grpc-web" } else { protocol }.into(),
@@ -228,10 +234,7 @@ async fn effective_instances_record_one_graph_observation_with_final_grpc_status
             .iter()
             .find(|edge| edge.source_workload == source);
         if requests == 0 {
-            assert!(
-                edge.is_none(),
-                "unexpected graph observation for {source}"
-            );
+            assert!(edge.is_none(), "unexpected graph observation for {source}");
         } else {
             let edge = edge.expect("graph edge");
             assert_eq!(edge.requests_total, requests);
@@ -255,8 +258,7 @@ fn effective_custom_tag_union_is_bounded_even_for_triggered_instances() {
         );
         if conditional {
             second.trigger = Some(
-                serde_json::from_value(json!({"when": {"match": {"method": ["POST"]}}}))
-                    .unwrap(),
+                serde_json::from_value(json!({"when": {"match": {"method": ["POST"]}}})).unwrap(),
             );
         }
         let config = GatewayConfig {
@@ -267,8 +269,7 @@ fn effective_custom_tag_union_is_bounded_even_for_triggered_instances() {
         let error = PluginCache::new(&config).err().expect("aggregate tag cap");
         assert!(error.contains("effective custom tags exceed 32"));
         let mut overlapping = config;
-        overlapping.plugin_configs[1].config =
-            json!({"custom_header_tags": {"tag_0": "x-region"}});
+        overlapping.plugin_configs[1].config = json!({"custom_header_tags": {"tag_0": "x-region"}});
         assert!(PluginCache::new(&overlapping).is_ok());
     }
 }
@@ -285,9 +286,8 @@ async fn custom_tags_compose_across_sources_hooks_and_skipped_instances() {
         json!({"custom_tags": {"skipped": "hidden"}}),
         PluginScope::Global,
     );
-    skipped.trigger = Some(
-        serde_json::from_value(json!({"when": {"match": {"method": ["POST"]}}})).unwrap(),
-    );
+    skipped.trigger =
+        Some(serde_json::from_value(json!({"when": {"match": {"method": ["POST"]}}})).unwrap());
     let cache = cache(vec![skipped]);
     let mut plugins: Vec<Arc<dyn Plugin>> = vec![
         Arc::new(WorkloadMetrics::new(&json!({"custom_tags": {"first": "first"}})).unwrap()),
@@ -331,7 +331,10 @@ fn provider_operation_and_default_schema_matches_constructor_admission() {
         (json!({"span_reporting_disabled": "true"}), false),
         (json!({"labels": {"app": 17}}), false),
         (json!({"custom_tags": {"bad name": "value"}}), false),
-        (json!({"custom_header_tags": {"region": "bad header"}}), false),
+        (
+            json!({"custom_header_tags": {"region": "bad header"}}),
+            false,
+        ),
         (json!({"direction_emit": null}), true),
         (json!({"direction_emit": {"unused": true}}), true),
         (json!({"direction_emit": {"server": null}}), false),
@@ -443,11 +446,7 @@ fn provider_operation_and_default_schema_matches_constructor_admission() {
         ));
     }
     for (config, accepted) in cases {
-        assert_eq!(
-            validator.is_valid(&config),
-            accepted,
-            "schema: {config}"
-        );
+        assert_eq!(validator.is_valid(&config), accepted, "schema: {config}");
         assert_eq!(
             WorkloadMetrics::new(&config).is_ok(),
             accepted,
