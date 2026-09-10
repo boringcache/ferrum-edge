@@ -2073,7 +2073,9 @@ paths:
         process totals include retired workers and survive reload/removal. Per-event
         pending rows are memory exposure, not a persistence guarantee. Requires a valid admin
         JWT because sink status can expose billing topology and ClickHouse
-        endpoint metadata. Credentials and URL user-info are never returned.
+        endpoint metadata. Credentials, URL user-info, and the ClickHouse URL
+        path are never returned: `instances[].clickhouse.endpoint` is the
+        structural `scheme://host:port/redacted` form.
       tags: [Metrics]
       responses:
         "200":
@@ -10790,6 +10792,8 @@ components:
           then:
             required: [config]
             properties:
+              scope:
+                const: global
               config:
                 $ref: "#/components/schemas/TransactionLogSchemaConfig"
         - if:
@@ -11559,6 +11563,15 @@ components:
             properties:
               config:
                 $ref: "#/components/schemas/MeshBpfMetricsConfig"
+            if:
+              required: [enabled]
+              properties:
+                enabled:
+                  const: true
+            then:
+              properties:
+                scope:
+                  const: global
         - if:
             required: [plugin_name]
             properties:
@@ -17431,6 +17444,16 @@ components:
         family cannot express (`summary_type`, `timestamp_format`, `metadata`,
         `order`, or a derived kind with no source field) is rejected at
         construction with a plugin- and field-specific diagnostic.
+        Constraints this document cannot express are still enforced at
+        construction and are NOT relaxations of the runtime contract: `omit` /
+        `rename` / `order` names must resolve against the record family's field
+        inventory for the selected `summary_type`; a field may not be both
+        omitted and renamed; the combined native, static, and derived output
+        keys must be unique; `order` must list every non-extension output key
+        unless it contains `"*"`; and `rename` targets, `static_fields` keys
+        (including nested keys) and `derived_fields` names may not match a
+        sensitive-data substring, while a `static_fields` string value that
+        looks like a literal HTTP auth credential is refused.
         See docs/log_schema.md.
       additionalProperties: false
       properties:
@@ -17444,26 +17467,32 @@ components:
             only customizes types it claims to handle).
         omit:
           type: array
-          items: { type: string }
+          items: { type: string, minLength: 1 }
           description: Native field names to drop from output.
         rename:
           type: object
-          additionalProperties: { type: string }
+          propertyNames: { minLength: 1 }
+          additionalProperties: { type: string, minLength: 1 }
           description: Map of native field name -> output key.
         order:
           type: array
-          items: { type: string }
+          uniqueItems: true
+          items: { type: string, minLength: 1 }
           description: >-
             Explicit output order, by output key. May contain `"*"` once
             as a wildcard for "every unlisted entry in natural order."
-            Without `"*"`, every field must be listed.
+            Without `"*"`, every field must be listed. Entries are unique —
+            a repeated output key (or a second `"*"`) is rejected.
         static_fields:
           type: object
-          additionalProperties: true
+          propertyNames: { minLength: 1 }
+          additionalProperties:
+            not: { type: "null" }
           description: >-
             Literal JSON values injected at top level. Keys / nested
             keys matching sensitive substrings are rejected at
-            compile time.
+            compile time. A `null` value is rejected — use `omit`
+            to drop a field.
         derived_fields:
           type: array
           description: Computed values; emitted alongside native fields.
@@ -17474,6 +17503,7 @@ components:
             properties:
               name:
                 type: string
+                minLength: 1
                 description: Output key for the derived value.
               kind:
                 type: string
@@ -17498,19 +17528,24 @@ components:
               default: nested
             prefix:
               type: string
+              pattern: "^[^\\x00-\\x1F\\x7F-\\x9F]*$"
               description: >-
-                Flatten mode only. Prepended to each metadata key when
-                promoted to top-level (e.g. `"meta_"`). Control
-                characters are rejected.
+                Prepended to each metadata key when promoted to top-level
+                (e.g. `"meta_"`); only `flatten` reads it. Control
+                characters are rejected. The type and the control-character
+                restriction are validated in every mode, so a `nested` or
+                `omit` schema cannot carry a value that would only start
+                failing once the mode is switched to `flatten`.
             on_collision:
               type: string
               enum: [skip, overwrite]
               default: skip
               description: >-
-                Flatten mode only. Behavior when a metadata key collides
-                with an already-emitted field. `skip` keeps the existing
-                value; `overwrite` emits a duplicate JSON key (last
-                value wins per parser convention).
+                Behavior when a metadata key collides with an
+                already-emitted field; only `flatten` reads it. `skip` keeps
+                the existing value; `overwrite` emits a duplicate JSON key
+                (last value wins per parser convention). Validated in every
+                mode, like `prefix`.
         timestamp_format:
           type: string
           enum: [rfc3339, epoch_ms, epoch_s]
@@ -18101,6 +18136,33 @@ components:
             required: [sasl_password]
           then:
             required: [sasl_username]
+        # resolve_schema refuses both together.
+        - not:
+            required: [schema, schema_ref]
+        # producer_config namespace dependencies. security_protocol defaults to
+        # plaintext, so an absent field must take the non-TLS / non-SASL branch.
+        - if:
+            required: [security_protocol]
+            properties:
+              security_protocol:
+                enum: [ssl, sasl_ssl]
+          else:
+            properties:
+              producer_config:
+                propertyNames:
+                  not:
+                    pattern: '^(ssl\.|enable\.ssl\.)'
+        - if:
+            required: [security_protocol]
+            properties:
+              security_protocol:
+                enum: [sasl_plaintext, sasl_ssl]
+          else:
+            properties:
+              producer_config:
+                propertyNames:
+                  not:
+                    pattern: '^(sasl\.|enable\.sasl\.|https\.)'
       properties:
         broker_list:
           type: string
@@ -18110,13 +18172,33 @@ components:
         topic:
           type: string
           minLength: 1
-          pattern: '\S'
-          description: Kafka topic to produce messages to
+          maxLength: 249
+          # Apache Kafka Topic.validate: ASCII letters, digits, '.', '_', '-',
+          # and never "." or "..". Matched verbatim by the constructor.
+          pattern: '^[A-Za-z0-9._-]+$'
+          not:
+            anyOf:
+              - enum: [".", ".."]
+              # Belt-and-braces for dialects (Python's re) whose `$` also
+              # matches before a trailing newline; the constructor takes the
+              # topic byte for byte.
+              - pattern: '\s'
+          description: >-
+            Kafka topic to produce messages to. Held to Kafka's own topic
+            syntax at admission: 1-249 characters drawn from ASCII letters,
+            digits, '.', '_', and '-', and never "." or "..". Whether an
+            otherwise valid topic exists (or may be auto-created) is still a
+            broker decision.
         key_field:
           type: string
           enum: [client_ip, proxy_id, none]
           default: client_ip
-          description: "Partition key field: client_ip (groups by client), proxy_id (groups by route), none (round-robin)"
+          description: >-
+            Partition key field: client_ip (groups by client), proxy_id (groups
+            by route), none (omits the record key and delegates partition
+            selection to the configured librdkafka partitioner — by default
+            consistent_random with sticky batching, NOT a Ferrum per-record
+            rotation). Matched exactly: lowercase, no surrounding whitespace.
         buffer_capacity:
           type: integer
           default: 10000
@@ -18141,9 +18223,13 @@ components:
             Aggregate Ferrum retained-content byte budget across queued records
             awaiting librdkafka admission and transient serializers. Admission
             reserves max_entry_bytes before serialization and shrinks that lease
-            to the exact retained record size. Must be at least max_entry_bytes.
-            Bytes are released when librdkafka send returns. Hard maximum
-            268435456.
+            to the exact retained record size. Must be at least max_entry_bytes
+            (a cross-field bound JSON Schema cannot express; the constructor
+            enforces it). The charge is NOT released when librdkafka send
+            returns: it is transferred into the record's delivery opaque and
+            covers librdkafka's own retained copy until terminal delivery,
+            terminal failure, purge-on-destroy, or an immediate send rejection.
+            Hard maximum 268435456.
         compression:
           type: string
           enum: [none, gzip, snappy, lz4, zstd]
@@ -18161,7 +18247,11 @@ components:
           description: "Delivery acknowledgment level: 0 (fire-and-forget local completion still observed via delivery callback), 1 (leader ack), all/-1 (full ISR ack)"
         message_timeout_ms:
           type: integer
-          description: Timeout for message delivery in milliseconds
+          minimum: 0
+          maximum: 2147483647
+          description: >-
+            Timeout for message delivery in milliseconds. librdkafka's own
+            range; 0 means no local timeout.
         security_protocol:
           type: string
           enum: [plaintext, ssl, sasl_plaintext, sasl_ssl]
@@ -18207,9 +18297,57 @@ components:
         producer_config:
           type: object
           propertyNames:
-            type: string
-            minLength: 1
-            pattern: '^\S(?:[\s\S]*\S)?$'
+            allOf:
+              - type: string
+                minLength: 1
+                pattern: '^\S(?:[\s\S]*\S)?$'
+              # Delivery reporting is plugin-owned in every property-name casing.
+              - not:
+                  pattern: '^[dD][eE][lL][iI][vV][eE][rR][yY]\.[rR][eE][pP][oO][rR][tT]\.[oO][nN][lL][yY]\.[eE][rR][rR][oO][rR]$'
+              # Properties the constructor refuses outright: bootstrap aliases,
+              # every alias of an authoritative top-level TLS/SASL control, and
+              # transactional.id (the sink owns no Kafka transaction). The
+              # constructor matches these case-insensitively, which JSON Schema
+              # cannot express without a non-portable inline flag, so a re-cased
+              # spelling is still refused at admission though it passes here.
+              - not:
+                  enum:
+                    - bootstrap.servers
+                    - metadata.broker.list
+                    - transactional.id
+                    - security.protocol
+                    - enable.ssl.certificate.verification
+                    - ssl.endpoint.identification.algorithm
+                    - ssl.ca.location
+                    - ssl.ca.pem
+                    - ssl.ca.certificate.stores
+                    - ssl.certificate.location
+                    - ssl.certificate.pem
+                    - ssl.key.location
+                    - ssl.key.pem
+                    - ssl.keystore.location
+                    - sasl.mechanism
+                    - sasl.mechanisms
+                    - sasl.username
+                    - sasl.password
+          properties:
+            # Ferrum re-derives these three budgets and caps them at its own
+            # hard maxima, so the admitted string is a bounded decimal integer.
+            # Case-insensitively matched by the constructor, as above: a
+            # re-cased spelling falls through to additionalProperties here and
+            # is still bound-checked at admission.
+            queue.buffering.max.messages:
+              type: string
+              description: "librdkafka producer queue depth, 1-100000."
+              pattern: '^([1-9][0-9]{0,4}|100000)$'
+            queue.buffering.max.kbytes:
+              type: string
+              description: "librdkafka producer queue size in KiB, 1-262144."
+              pattern: '^([1-9][0-9]{0,4}|1[0-9]{5}|2[0-5][0-9]{4}|26[01][0-9]{3}|2620[0-9]{2}|2621[0-3][0-9]|26214[0-4])$'
+            message.max.bytes:
+              type: string
+              description: "librdkafka maximum message size in bytes, 1-4194304."
+              pattern: '^([1-9][0-9]{0,5}|[1-3][0-9]{6}|40[0-9]{5}|41[0-8][0-9]{4}|419[0-3][0-9]{3}|4194[0-2][0-9]{2}|419430[0-4])$'
           additionalProperties:
             type: string
             minLength: 1
@@ -18223,10 +18361,21 @@ components:
             sasl_plaintext/sasl_ssl. Queue/message budgets cannot exceed Ferrum
             hard maxima. ssl.crl.location cannot conflict with gateway
             file-backed gateway CRL source when verification is enabled.
+            transactional.id is refused outright: the logging lifecycle never
+            calls init_transactions/begin_transaction/commit_transaction, so a
+            transactional producer would reject every record.
+            delivery.report.only.error is refused regardless of value or casing:
+            Ferrum owns delivery reporting and always enables successful delivery
+            reports. Retained-byte leases release at terminal delivery, terminal
+            failure, purge-on-destroy, or immediate send rejection. Values carrying
+            inline PEM private-key material are refused by shape, which JSON
+            Schema does not model here.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
           type: string
+          minLength: 1
+          pattern: '\S'
           description: >-
             Name of a schema registered by a `transaction_log_schema` plugin.
             Mutually exclusive with `schema`. Note: Kafka partition keys
@@ -18722,13 +18871,14 @@ components:
         schemas:
           type: object
           minProperties: 1
+          propertyNames: { minLength: 1 }
           additionalProperties:
             $ref: "#/components/schemas/SummaryLogSchema"
           description: >-
-            Map of schema name → schema definition. Names are referenced
-            by other plugins as `schema_ref: <name>`. Duplicate names
-            across multiple enabled `transaction_log_schema` plugins in the
-            same namespace are rejected before persistence or load.
+            Map of schema name → schema definition. Names are non-empty and
+            referenced by other plugins as `schema_ref: <name>`. Duplicate
+            names across multiple enabled `transaction_log_schema` plugins in
+            the same namespace are rejected before persistence or load.
 
     TransactionDebuggerConfig:
       type: object
@@ -18851,6 +19001,15 @@ components:
             trimmed before the 128-character maximum is applied. Requires
             log_request_body or log_response_body true when the array is
             nonempty. An empty array is valid without a capture switch.
+            Independently of this list, everything under an Azure "On Your
+            Data" `parameters` object inside a `data_sources` / `dataSources` /
+            `data-sources` container is replaced wholesale. Recognizing that
+            container name never short-circuits the ordinary visitor: a
+            captured body is arbitrary JSON, so a value under that name which
+            is not the provider's conventional array (an object, string,
+            number, boolean, or null) is still traversed with the same
+            member-name and credential-shaped-string rules as the rest of the
+            body.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
@@ -18892,17 +19051,26 @@ components:
 
     PrometheusMetricsConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: prometheus_metrics — Exports gateway metrics in Prometheus
         format. At most one enabled instance is permitted and it must use
         global scope because the registry and tunables are process-wide.
+        Unknown keys are rejected. `schema` and `schema_ref` are not accepted
+        properties.
       properties:
         render_cache_ttl_seconds:
           type: integer
+          format: uint64
+          minimum: 0
+          maximum: 18446744073709551615
           default: 5
           description: How long the cached /metrics response is served before rebuilding (seconds)
         stale_entry_ttl_seconds:
           type: integer
+          format: uint64
+          minimum: 0
+          maximum: 18446744073709551615
           default: 3600
           description: How long idle metric entries live before eviction (seconds). Prevents unbounded memory growth from deleted/recreated proxies
         mesh_series_budget_per_family:
@@ -18921,6 +19089,9 @@ components:
             there is no unlimited mode.
         cache_invalidation_min_age_ms:
           type: integer
+          format: uint64
+          minimum: 0
+          maximum: 18446744073709551615
           default: 500
           description: Minimum age (ms) of the render cache before record() will invalidate it. Under extreme load this prevents an allocation per request
 
@@ -19990,7 +20161,11 @@ components:
                   higher-level root. A root issuer pin can succeed when the client
                   omits that certificate from the presented chain. UDP+DTLS uses
                   the same leaf-first verified presented chain as terminated
-                  TCP+TLS.
+                  TCP+TLS. The earliest notAfter on the path that satisfied the
+                  constraint is composed into the request and stream
+                  authorization deadline, so an issuer expiring before the leaf
+                  ends the authorization at its own expiry; across alternative
+                  verified paths the longest-lived matching path wins.
           description: >-
             Per-proxy issuer pins. DN fields are descriptive filters (AND within
             an entry, OR across entries) and must match the pinned CA subject;
@@ -21588,6 +21763,23 @@ components:
         plugin id `__mesh_spiffe_identity`. Standalone usage is supported on
         non-mesh gateways that still terminate mTLS and want to surface the
         SPIFFE identity to other plugins.
+
+        The trust domain is admitted exactly as SPIFFE-ID section 2.1 defines
+        it: non-empty, at most 255 bytes, lowercase, and composed only of
+        `[a-z0-9.-_]` — including at the first and last byte. Userinfo, ports,
+        percent-encoding, and the SPIFFE ID's own 2048-byte total bound are
+        still enforced.
+
+        A certificate-derived peer identity is admitted as an authenticated
+        principal carrying the leaf certificate's `notAfter` as its
+        authorization deadline, so SPIFFE-only policy chains (this plugin plus
+        `mesh_authz`, with no `mtls_auth`) are bounded by SVID expiry on the
+        request, WebSocket, streaming-body, TCP+TLS, and UDP+DTLS paths. Every
+        request re-checks the leaf validity window, and an expired or
+        not-yet-valid SVID is refused with the same fixed `403`
+        `{"error":"invalid SPIFFE identity certificate"}` body as a malformed
+        one. A pre-stamped kernel-attested or HBONE-asserted `peer_spiffe_id`
+        carries no validity window and is not treated as certificate-bounded.
       additionalProperties: false
       properties: {}
 
@@ -23239,25 +23431,40 @@ components:
             `trusted_hbone_assertors` / `trust_domain_aliases` instead.
 
     MeshBpfMetricsConfig:
-      type: object
+      type: [object, "null", string, array, number, boolean]
       description: |
         Plugin: __mesh_bpf_metrics - reserved internal mesh NodeWaypoint
         plugin that exposes BPF SOCK_OPS counters and fixed-bucket TCP
-        latency histograms (SRTT / SYN-to-ACK) on the Prometheus scrape
-        surface. Mesh mode auto-injects it when BPF metrics are available;
-        operator-managed plugin configs should not create names prefixed
-        with `__`.
+        latency histograms (SRTT / SYN-to-ACK / accept-to-first-byte)
+        on the Prometheus scrape surface. Mesh mode auto-injects a
+        global instance on NodeWaypoint; operator-managed plugin configs
+        should not create names prefixed with `__`. Enabled instances
+        must use `scope: global` (at most one enabled instance per
+        process). Registration is OptionalFailOpen: Admin create/update
+        still returns HTTP 400 for an invalid enabled config, while
+        file-mode load/`ferrum-edge validate` and plugin-cache rebuild
+        warn and omit the instance.
+
+        Object configs are closed: the only admitted key is `prefix`.
+        A string `prefix` is trimmed before the identifier check.
+        Non-object configs (null, string, array, number, boolean) keep
+        the default prefix `ferrum_mesh_bpf`.
       additionalProperties: false
       properties:
         prefix:
           type: string
-          pattern: "^[A-Za-z_][A-Za-z0-9_]*$"
+          pattern: "^\\s*[A-Za-z_][A-Za-z0-9_]*\\s*$"
           default: ferrum_mesh_bpf
           description: |
-            Prometheus metric name prefix for emitted BPF counters and
-            latency histograms (default families include
-            `{prefix}_srtt_microseconds` and
-            `{prefix}_syn_to_ack_microseconds`).
+            Prometheus metric name prefix for every emitted BPF family
+            (`{prefix}_tcp_events_total`, `{prefix}_drops_total`,
+            `{prefix}_srtt_microseconds`, `{prefix}_syn_to_ack_microseconds`,
+            `{prefix}_accept_to_first_byte_microseconds`, and the ringbuf
+            families). Surrounding whitespace is trimmed before the
+            identifier check; the trimmed value must match
+            `[A-Za-z_][A-Za-z0-9_]*` and must not be empty. There is no
+            declared length limit beyond that grammar. Omit the key to
+            keep `ferrum_mesh_bpf`.
 
     SoapWsSecurityConfig:
       type: object
@@ -28038,7 +28245,13 @@ components:
         a 64 MiB process-wide retained-body budget. Synthetic and fan-out
         headers reuse the canonical secondary-request sanitizer shared with
         request_mirror (Connection-listed hop-by-hop, Trailer, framing, Ferrum
-        markers, proxy-owned X-Forwarded-*), preserving Host for routing.
+        markers, proxy-owned X-Forwarded-*), preserving Host for routing. That
+        snapshot is taken from the original client headers, not from the
+        already-transformed map, so an earlier request_transformer chain is
+        applied exactly once to the synthetic cohort as well. Synthetic and
+        fan-out requests are sent over HTTP/1.1 so the preserved Host is the
+        request authority; over HTTP/2 the two would disagree and ingress
+        validation would correctly reject every replay.
       required:
         - key
         - concurrent_clients
@@ -28085,12 +28298,15 @@ components:
           type: [integer, "null"]
           format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           default: 1048576
           description: >-
-            Maximum response bytes the synthetic client consumes per request.
-            Must be greater than zero. The client stops reading at the cap,
-            bounding its own work and memory without changing the backend
-            response.
+            Maximum response bytes the synthetic client consumes per request
+            (1–18446744073709551615). The runtime parses this as an unsigned
+            64-bit integer, so the finite upper bound is part of the admitted
+            contract; a larger value is rejected. The client stops reading at
+            the cap, bounding its own work and memory without changing the
+            backend response.
         gateway_port:
           type: [integer, "null"]
           format: uint16
@@ -28098,9 +28314,11 @@ components:
           maximum: 65535
           description: >-
             Local gateway port for synthetic requests (1–65535). Defaults to
-            FERRUM_PROXY_HTTP_PORT (or FERRUM_PROXY_HTTPS_PORT when gateway_tls
-            is enabled) or 8000/8443. A resolved port of 0 (disabled listener)
-            is rejected.
+            the effective FERRUM_PROXY_HTTP_PORT (or FERRUM_PROXY_HTTPS_PORT
+            when gateway_tls is enabled) resolved with the same environment >
+            ferrum.conf/--settings precedence the listener itself uses, then
+            8000/8443. A resolved port of 0 (disabled listener) is rejected
+            whichever configuration source supplied it.
         gateway_tls:
           type: [boolean, "null"]
           default: false
@@ -28116,6 +28334,14 @@ components:
           items:
             type: string
             minLength: 1
+            pattern: '^[hH][tT][tT][pP][sS]?://[^/?#@\s]+(?:/[^?#\s]*)?$'
+            description: >-
+              An http(s) URL with a non-empty authority and no URL userinfo,
+              query, or fragment. This pattern models only the intrinsic URL
+              grammar the constructor admits; the environment-dependent checks
+              below (loopback-alias equality against the selected local target,
+              normalized duplicate origins, and backend egress screening) need
+              runtime context and stay runtime-only.
           description: >-
             Remote gateway URLs for one-hop fan-out from the originating
             controller (at most 32). Peers receive X-Loadtesting-Fanout and
@@ -29177,7 +29403,11 @@ components:
         and native gRPC (HTTP/2) wire formats. Supports binary
         (application/grpc-web) and text (application/grpc-web-text) encoding,
         including message-format suffixes such as +proto, +json, +thrift, and
-        other valid +subtype values. Request-body decoding follows request
+        other valid +subtype values. The request message-format suffix is
+        preserved on the native backend Content-Type (application/grpc-web-text+json
+        dispatches as application/grpc+json); a bare type and +proto both
+        dispatch as the canonical bare application/grpc. Request-body decoding
+        follows request
         Content-Type; response encoding and Content-Type follow Accept
         negotiation (absent Accept defaults to the request Content-Type mode
         and suffix; lists, q-values, and */* / application/* wildcards are
@@ -29185,13 +29415,24 @@ components:
         different message-format suffix; malformed or fully refused Accept
         fails closed with HTTP 406;
         translated responses merge Vary: Accept so caches separate variants).
+        A media range carrying parameters other than q still matches when its
+        type, subtype, and suffix match (so application/grpc-web-text;charset=utf-8
+        is acceptable), but those parameters are ignored for precedence and
+        quality selection and cannot veto an unparameterized representation
+        (application/grpc-web+proto;q=1, application/grpc-web+proto;version=2;q=0
+        is served as application/grpc-web+proto). A range whose type or suffix
+        does not match still yields HTTP 406.
         Config must be a JSON object (not null); `{}` and objects that only set
         `expose_headers` are accepted. Unknown keys are rejected. When a backend
         or intermediary response omits a valid numeric grpc-status, the response
         trailer frame synthesizes status from the official HTTP-to-gRPC client
         mapping (400→13, 401→16, 403→7, 404→12, 429/502/503/504→14, others→2);
         a valid supplied grpc-status remains authoritative. The client-visible
-        HTTP status is not rewritten to 200 on this path. The body trailer frame
+        HTTP status is not rewritten to 200 on this path. When such a non-200
+        response carries a non-gRPC entity (for example a text/plain or
+        text/html error document), that entity is dropped rather than framed:
+        the client receives a terminal-only gRPC-Web body carrying the mapped
+        status, on both the streaming and buffered paths. The body trailer frame
         preserves backend `grpc-status` / `grpc-message`, binary `*-bin`
         metadata, and valid ASCII custom trailing metadata while excluding
         hop-by-hop, forbidden, pseudo, connection-listed, and invalid
@@ -29201,14 +29442,23 @@ components:
         only.
       properties:
         expose_headers:
-          type: array
+          type: [array, "null"]
           items:
             type: string
+            minLength: 1
+            pattern: "^[ \\t]*[!#$%&'*+\\-.^_`|~0-9A-Za-z]+[ \\t]*$"
           description: >-
             Additional response headers to include in
             Access-Control-Expose-Headers for browser CORS compatibility.
             grpc-status and grpc-message are always exposed. Multiple grpc_web
-            instances union their lists in configured order.
+            instances union their lists in configured order. Explicit null is
+            accepted at this field and means the empty list (unlike the plugin
+            config object itself, where null is rejected). Each item is trimmed
+            of surrounding spaces/tabs and must then be a non-empty HTTP field
+            name (token characters only); empty, whitespace-only, and names
+            containing an internal space or a colon are rejected. Accepted names
+            are lowercased and de-duplicated in first-seen order, so entries
+            differing only in case collapse to one.
 
     GrpcDeadlineConfig:
       type: object
@@ -29271,6 +29521,13 @@ components:
           description: Boolean shorthand. true enables the pack with Ferrum defaults; false disables it.
         - type: object
           additionalProperties: false
+          if:
+            required: [examples_mode]
+            properties:
+              examples_mode:
+                const: replace
+          then:
+            required: [examples]
           properties:
             enabled:
               type: boolean
@@ -29280,60 +29537,281 @@ components:
               type: string
               enum: [append, replace]
               default: append
-              description: Append customer examples to Ferrum defaults or replace the semantic example set for this pack.
+              description: Append customer examples to Ferrum defaults or replace the semantic example set for this pack. replace requires examples.
             examples:
               type: array
               minItems: 1
               items:
                 type: string
-              description: Customer semantic examples for this built-in pack.
-          description: Object form for tuning a built-in AI semantic firewall pack.
+                minLength: 1
+                pattern: "\\S"
+              description: Customer semantic examples for this built-in pack. Each entry must contain a non-whitespace character; surrounding whitespace is trimmed. Required when examples_mode is replace.
+          description: Object form for tuning a built-in AI semantic firewall pack. The pack keeps its built-in rule id, pack metadata, and compiled-in matching behavior either way.
       description: Built-in pack toggle or tuning object.
+
+    AiSemanticFirewallEnabledBuiltinPack:
+      description: >-
+        Matches a builtins.<pack> value that leaves the pack ACTIVE: the boolean
+        shorthand true, or the object form without enabled: false. Used only by
+        the ai_semantic_firewall active-policy conditionals.
+      anyOf:
+        - const: true
+        - type: object
+          not:
+            required: [enabled]
+            properties:
+              enabled:
+                const: false
+
+    AiSemanticFirewallActivePolicy:
+      description: >-
+        At least one ai_semantic_firewall rule source is active: any built-in
+        pack (omitting builtins enables all seven), an allow topic, a deny
+        topic, or a custom rule. An enabled instance with no active rule source
+        is rejected by the constructor.
+      anyOf:
+        - not:
+            required: [builtins]
+        - required: [builtins]
+          properties:
+            builtins:
+              anyOf:
+                - required: [prompt_injection]
+                  properties:
+                    prompt_injection:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [jailbreak]
+                  properties:
+                    jailbreak:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [system_prompt_exfiltration]
+                  properties:
+                    system_prompt_exfiltration:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [data_exfiltration]
+                  properties:
+                    data_exfiltration:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [indirect_prompt_injection]
+                  properties:
+                    indirect_prompt_injection:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [tool_abuse]
+                  properties:
+                    tool_abuse:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [response_leakage]
+                  properties:
+                    response_leakage:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+        - required: [allow_topics]
+          properties:
+            allow_topics:
+              minItems: 1
+        - required: [deny_topics]
+          properties:
+            deny_topics:
+              minItems: 1
+        - required: [custom_rules]
+          properties:
+            custom_rules:
+              minItems: 1
+
+    AiSemanticFirewallActiveRequestPolicy:
+      description: >-
+        At least one REQUEST-direction ai_semantic_firewall rule is active: any
+        built-in pack except the response-only response_leakage (omitting
+        builtins enables all of them), an allow topic (request-side only), a
+        deny topic (bidirectional), or a custom rule whose direction is not
+        response.
+      anyOf:
+        - not:
+            required: [builtins]
+        - required: [builtins]
+          properties:
+            builtins:
+              anyOf:
+                - required: [prompt_injection]
+                  properties:
+                    prompt_injection:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [jailbreak]
+                  properties:
+                    jailbreak:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [system_prompt_exfiltration]
+                  properties:
+                    system_prompt_exfiltration:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [data_exfiltration]
+                  properties:
+                    data_exfiltration:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [indirect_prompt_injection]
+                  properties:
+                    indirect_prompt_injection:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [tool_abuse]
+                  properties:
+                    tool_abuse:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+        - required: [allow_topics]
+          properties:
+            allow_topics:
+              minItems: 1
+        - required: [deny_topics]
+          properties:
+            deny_topics:
+              minItems: 1
+        - required: [custom_rules]
+          properties:
+            custom_rules:
+              contains:
+                not:
+                  required: [direction]
+                  properties:
+                    direction:
+                      const: response
+
+    AiSemanticFirewallActiveResponsePolicy:
+      description: >-
+        At least one RESPONSE-direction ai_semantic_firewall rule is active: the
+        bidirectional built-ins system_prompt_exfiltration / tool_abuse, the
+        response-direction built-in response_leakage (omitting builtins enables
+        all three), a deny topic (bidirectional), or a custom rule whose
+        direction is not request. Allow topics are request-side only and never
+        satisfy this.
+      anyOf:
+        - not:
+            required: [builtins]
+        - required: [builtins]
+          properties:
+            builtins:
+              anyOf:
+                - required: [system_prompt_exfiltration]
+                  properties:
+                    system_prompt_exfiltration:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [tool_abuse]
+                  properties:
+                    tool_abuse:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [response_leakage]
+                  properties:
+                    response_leakage:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+        - required: [deny_topics]
+          properties:
+            deny_topics:
+              minItems: 1
+        - required: [custom_rules]
+          properties:
+            custom_rules:
+              contains:
+                not:
+                  required: [direction]
+                  properties:
+                    direction:
+                      const: request
 
     AiTranscriptAuditConfig:
       type: object
       required: [sink]
       additionalProperties: false
-      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (3010); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and allow-listed cache telemetry (namespaced `ai_semantic_cache.<id>.{cache_status,cache_match,cache_similarity}`, legacy `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity`, and `request_deduplication.replayed`; never `cache_key`), then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Retention is bounded by BOTH record count (sink.buffer_capacity) and an aggregate retained-byte budget (limits.buffer_max_bytes / limits.max_entry_bytes) covering staged candidates, fail-closed pre-commit reservations, active fail-open stream capture, exact pre-serialized queue payloads, JSON-array assembly, and every sequential retry. A fail-open stream reserves the maximum retained-record charge before copying response bytes and transfers that lease at terminal enqueue; a fail-closed stream reuses its pre-commit lease. Retry clones share immutable Bytes rather than deep-cloning records; reqwest receives the already-escaped exact-capacity JSON body rather than reserializing it. In redacted_body, limits.max_redaction_scan_bytes is checked before JSON classification/model/tool extraction/redaction; oversized JSON POSTs are conservatively audited as possible streaming AI requests with explicit omission evidence rather than bypassing audit. Streamed keyed hashing is bounded by capture.stream_hash, and active-stream reservations by limits.max_stream_reservation_secs. Authenticated /health exposes effective admitted ceilings plus live retained_bytes/retained_byte_drops/stream_reservations_expired/sink_healthy gauges without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only and conservatively classified oversized capture. In-flight staging is hard-bounded at 4096 entries per plugin instance while candidate/record_id/sample markers remain shared across co-located instances: a saturated instance neither erases a peer's live candidate nor borrows it for response buffering, response hooks, stream reservations, sampling/admission, or record emission. The local staging entry is consumed by atomic removal at buffered or ordinary stream-terminal commit. Expiry first revokes capture/hash work and releases all staging/queue/byte owners; its single-fire request-owned terminal slot carries only the local sampling roll needed for a body-free best-effort fallback and cannot be created from shared peer markers. Orphan/reservation sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP by default; native gRPC capture requires an explicit descriptor-based grpc enrollment block (enrolled methods only). Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults. Redacted captures replace malformed function.arguments JSON with [UNPARSEABLE] and set arguments_redaction_failed=true on the captured function object; valid arguments retain member-name redaction. Explicit full_body raw capture is unchanged."
+      allOf:
+        # mode: full_body captures UNREDACTED payloads, so the constructor
+        # requires the explicit allow_full_body opt-in.
+        - if:
+            required: [mode]
+            properties:
+              mode: {const: full_body}
+          then:
+            required: [allow_full_body]
+            properties:
+              allow_full_body: {const: true}
+        # An explicitly emptied pattern set makes the redactor a silent
+        # pass-through while records still claim redaction. redacted_body
+        # exports body excerpts and metadata_only exports request-derived
+        # model/tool_names, so both refuse it; hash_only and full_body export no
+        # redacted request-derived strings and are exempt. An absent mode is the
+        # redacted_body default and is covered here.
+        - if:
+            required: [redaction]
+            properties:
+              mode: {enum: [redacted_body, metadata_only, null]}
+              redaction:
+                type: object
+                required: [builtins]
+                properties:
+                  builtins: {type: array, maxItems: 0}
+                  custom_patterns: {maxItems: 0}
+          then: false
+        # privacy.path_mode: redact would export the literal path unchanged
+        # under the same empty pattern set, so it is refused in every mode —
+        # including the two the body guard above exempts.
+        - if:
+            required: [privacy, redaction]
+            properties:
+              privacy:
+                type: object
+                required: [path_mode]
+                properties:
+                  path_mode: {const: redact}
+              redaction:
+                type: object
+                required: [builtins]
+                properties:
+                  builtins: {type: array, maxItems: 0}
+                  custom_patterns: {maxItems: 0}
+          then: false
+      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (3010); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and allow-listed cache telemetry (namespaced `ai_semantic_cache.<id>.{cache_status,cache_match,cache_similarity}`, legacy `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity`, and `request_deduplication.replayed`; never `cache_key`), then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Retention is bounded by BOTH record count (sink.buffer_capacity) and an aggregate retained-byte budget (limits.buffer_max_bytes / limits.max_entry_bytes) covering staged candidates, fail-closed pre-commit reservations, active fail-open stream capture, exact pre-serialized queue payloads, JSON-array assembly, and every sequential retry. A fail-open stream reserves the maximum retained-record charge before copying response bytes and transfers that lease at terminal enqueue; a fail-closed stream reuses its pre-commit lease. Retry clones share immutable Bytes rather than deep-cloning records; reqwest receives the already-escaped exact-capacity JSON body rather than reserializing it. In redacted_body, limits.max_redaction_scan_bytes is checked before JSON classification/model/tool extraction/redaction; oversized JSON POSTs are conservatively audited as possible streaming AI requests with explicit omission evidence rather than bypassing audit. Streamed keyed hashing is bounded by capture.stream_hash, and active-stream reservations by limits.max_stream_reservation_secs. Authenticated /health exposes effective admitted ceilings plus live retained_bytes/retained_byte_drops/stream_reservations_expired/sink_healthy gauges without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only and conservatively classified oversized capture. In-flight staging is hard-bounded at 4096 entries per plugin instance while candidate/record_id/sample markers remain shared across co-located instances: a saturated instance neither erases a peer's live candidate nor borrows it for response buffering, response hooks, stream reservations, sampling/admission, or record emission. The local staging entry is consumed by atomic removal at buffered or ordinary stream-terminal commit. Expiry first revokes capture/hash work and releases all staging/queue/byte owners; its single-fire request-owned terminal slot carries only the local sampling roll needed for a body-free best-effort fallback and cannot be created from shared peer markers. Orphan/reservation sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP by default; native gRPC capture requires an explicit descriptor-based grpc enrollment block (enrolled methods only). Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults. Redacted captures replace malformed function.arguments JSON with [UNPARSEABLE] and set arguments_redaction_failed=true on the captured function object; valid arguments retain member-name redaction. Explicit full_body raw capture is unchanged. Every fixed scalar whose runtime default is used when the key is omitted also accepts an explicit null; the batching keys (sink.batch_size, sink.flush_interval_ms, sink.buffer_capacity, sink.max_retries, sink.retry_delay_ms), sink.endpoint_url, sink.custom_headers, redaction.custom_patterns, grpc, grpc.descriptor_path, and grpc.methods do NOT — null is a type error for those, exactly as the schema states. RUNTIME-ONLY CHECKS this component deliberately cannot express, all of which still reject the configuration at construction: (1) arithmetic relationships between limits — limits.max_entry_bytes must be >= the worst-case serialized-JSON contract implied by the configured capture limits, limits.buffer_max_bytes must be >= both 65536 and the retained charge of limits.max_entry_bytes, and max_request_bytes + max_response_bytes + max_stream_capture_bytes must be <= 2097152; (2) Rust `regex` crate compilation of every redaction.builtins entry and every redaction.custom_patterns[].regex, and rejection of an unknown redaction.builtins name beyond the enum; (3) sink.endpoint_url authority, userinfo, and backend-egress SSRF screening, plus the rule that cleartext http:// is admitted only with sink.allow_insecure_loopback: true AND a localhost / loopback-IP host; (4) sink.custom_headers name/value validity and the ${secret:NAME} template grammar (a resolvable FERRUM_TRANSCRIPT_SINK_SECRET_<NAME> is checked later still, when the background worker activates); (5) node-local existence and decodability of grpc.descriptor_path, and resolution of each method's request_type / response_type / text_fields against that descriptor — Admin/CP admission validates shape only; (6) grpc.methods key normalization (trim plus one optional leading slash) and the rejection of two keys that normalize to the same method path; (7) grpc.methods[].text_fields segment trimming, the per-path segment-depth ceiling, and duplicate detection after normalization, which catches pairs that uniqueItems cannot (\"a.b\" versus \"a . b\"); and (8) the plugin-cache composition rule that refuses a priority override placing this instance at or after a co-located request_deduplication instance."
       properties:
         mode:
-          type: string
-          enum: [metadata_only, redacted_body, full_body, hash_only]
+          type: [string, "null"]
+          enum: [metadata_only, redacted_body, full_body, hash_only, null]
           default: redacted_body
-          description: "metadata_only: keyed body hashes + model/provider/token/guardrail metadata, no body. redacted_body: capped, PII-redacted request/response excerpts. Values beneath normalized sensitive JSON keys (password/auth/cookie/session/credential/private-key/client-secret/API-key/token variants) are replaced regardless of value shape; JSON objects/arrays encoded inside strings (including tool arguments) are recursively decoded/redacted to a depth cap of 64. Uniform OpenAI chat.completion.chunk SSE is reassembled before redaction with exact shape {sse_reassembled:true,object:'chat.completion.chunk',completion_text:{'<choice>':'…'},tool_calls:{'<choice>':[{index,id,type,function:{name,arguments}}]},finish_reason:{'<choice>':'…'}}; absent categories are omitted, and text/tool fragments are concatenated by choice/tool index under max_stream_capture_bytes. Only a provider-declared unsigned index correlates fragments across deltas; array position is intra-delta identity only (exported as 'position:<n>' choice keys and a tool-call 'position' field, never as a fabricated index). Malformed optional fields do not abort reassembly (that would drop back to per-frame redaction, which cannot see a secret split across fragments): ignorable ones (finish_reason, delta, delta.content, tool_calls, id, type, function, function.name, function.arguments) are skipped, while a malformed identity-bearing index (choices[].index, tool_calls[].index) takes a collision-free per-occurrence bucket ('unattributed:<n>' choice key, index_unattributed:true plus occurrence:<n> on a tool call) rather than collapsing onto index 0, sharing one unattributed bucket, or being dropped. Where identity is a guess, payload is withheld instead of joined or split: ambiguous completion text becomes '[REDACTED:ambiguous_choice]' with choice_identity_ambiguous:true and completion_text_withheld:true, and ambiguous tool arguments become '[REDACTED:ambiguous_tool_call]' with arguments_withheld:true. Skipped or re-routed fields are listed in a sorted malformed_fields array of compiled-in field paths (never provider values); the key is omitted for well-formed streams. Other or non-parseable SSE stays per-frame. full_body: capped unredacted excerpts (requires allow_full_body). hash_only: keyed body hashes + envelope only. Body hashes are keyed HMAC-SHA256 in every mode, never plain SHA-256."
+          description: "Null keeps the default, as for every other fixed scalar here. metadata_only: keyed body hashes + model/provider/token/guardrail metadata, no body. redacted_body: capped, PII-redacted request/response excerpts. Values beneath normalized sensitive JSON keys (password/auth/cookie/session/credential/private-key/client-secret/API-key/token variants) are replaced regardless of value shape; everything under an Azure 'On Your Data' parameters object inside a data_sources / dataSources / data-sources container is additionally replaced wholesale, and recognizing that container name never short-circuits the ordinary visitor — a value under it that is not the provider's conventional array (object, string, number, boolean, null) is still traversed with the same member-name and pattern rules; JSON objects/arrays encoded inside strings (including tool arguments) are recursively decoded/redacted to a depth cap of 64. Uniform OpenAI chat.completion.chunk SSE is reassembled before redaction with exact shape {sse_reassembled:true,object:'chat.completion.chunk',completion_text:{'<choice>':'…'},tool_calls:{'<choice>':[{index,id,type,function:{name,arguments}}]},finish_reason:{'<choice>':'…'}}; absent categories are omitted, and text/tool fragments are concatenated by choice/tool index under max_stream_capture_bytes. Only a provider-declared unsigned index correlates fragments across deltas; array position is intra-delta identity only (exported as 'position:<n>' choice keys and a tool-call 'position' field, never as a fabricated index). Malformed optional fields do not abort reassembly (that would drop back to per-frame redaction, which cannot see a secret split across fragments): ignorable ones (finish_reason, delta, delta.content, tool_calls, id, type, function, function.name, function.arguments) are skipped, while a malformed identity-bearing index (choices[].index, tool_calls[].index) takes a collision-free per-occurrence bucket ('unattributed:<n>' choice key, index_unattributed:true plus occurrence:<n> on a tool call) rather than collapsing onto index 0, sharing one unattributed bucket, or being dropped. Where identity is a guess, payload is withheld instead of joined or split: ambiguous completion text becomes '[REDACTED:ambiguous_choice]' with choice_identity_ambiguous:true and completion_text_withheld:true, and ambiguous tool arguments become '[REDACTED:ambiguous_tool_call]' with arguments_withheld:true. Skipped or re-routed fields are listed in a sorted malformed_fields array of compiled-in field paths (never provider values); the key is omitted for well-formed streams. Other or non-parseable SSE stays per-frame. full_body: capped unredacted excerpts (requires allow_full_body). hash_only: keyed body hashes + envelope only. Body hashes are keyed HMAC-SHA256 in every mode, never plain SHA-256."
         allow_full_body:
-          type: boolean
+          type: [boolean, "null"]
           default: false
           description: "Required guardrail for mode=full_body, which captures unredacted payloads. Construction fails if full_body is set without this opt-in."
         capture:
           type: [object, "null"]
           additionalProperties: false
-          description: "What to capture. Omit or null to keep defaults."
+          description: "What to capture. Omit or null to keep defaults. At least one of request, response, or streaming_response must stay enabled."
+          not:
+            type: object
+            required: [request, response]
+            properties:
+              request: {const: false}
+              response: {const: false}
+              streaming_response: {enum: [false, "false", null]}
           properties:
             request:
-              type: boolean
+              type: [boolean, "null"]
               default: true
             response:
-              type: boolean
+              type: [boolean, "null"]
               default: true
             streaming_response:
               default: false
-              description: "Capture SSE response excerpts. false | true | 'sampled'. true forces every AI-candidate request's response onto the stream-inspection path. 'sampled' tees only requests that win the sampling.rate roll (or whose request-side guardrail fired when always_capture_on_guardrail is set — the tee decision is evaluated at dispatch time, after the request-phase guardrail plugins ran); error responses and response-side guardrail hits on un-sampled streaming requests still emit records via the log fallback, but without a response body/hash — teeing every stream to cover those late triggers would defeat sampled capture."
+              description: "Capture SSE response excerpts. false | true | 'sampled', or the string spellings 'true' / 'false', or null for the default. true forces every AI-candidate request's response onto the stream-inspection path. 'sampled' tees only requests that win the sampling.rate roll (or whose request-side guardrail fired when always_capture_on_guardrail is set — the tee decision is evaluated at dispatch time, after the request-phase guardrail plugins ran); error responses and response-side guardrail hits on un-sampled streaming requests still emit records via the log fallback, but without a response body/hash — teeing every stream to cover those late triggers would defeat sampled capture."
               oneOf:
                 - type: boolean
                 - type: string
-                  enum: [sampled]
+                  enum: [sampled, "true", "false"]
+                - type: "null"
             headers:
-              type: boolean
+              type: [boolean, "null"]
               default: false
               description: "Capture response headers (redacted by key). Also gated by privacy.include_raw_headers."
             tool_calls:
-              type: boolean
+              type: [boolean, "null"]
               default: true
               description: "Extract tool/function names from the request body."
             stream_hash:
-              type: string
-              enum: [capped, full]
+              type: [string, "null"]
+              enum: [capped, full, null]
               default: capped
               description: "How much of a streamed (SSE) response the exported keyed HMAC-SHA256 response_hash covers. capped (default) stops hashing at limits.max_stream_capture_bytes, so limits.max_stream_capture_bytes bounds audit CPU as well as retained bytes and an indefinitely long high-bandwidth stream cannot keep a keyed hash running for the life of the connection; the digest is then marked response_hash_scope=partial, carries the exact response_hash_bytes it covered, and is domain-separated so it can never collide with or be presented as a full-stream digest. full is the explicit opt-in for deployments whose evidence chain genuinely re-derives the provider's complete response, and accepts unbounded per-byte keyed-hashing cost. The response_hash is a tamper-evidence/correlation token over the captured transcript, not an integrity attestation of the client's byte stream — abnormally terminated and downstream-cut streams already omit it entirely. Buffered (non-streamed) responses are complete by construction and always hash full."
         sampling:
@@ -29342,34 +29820,35 @@ components:
           description: "Sampling controls. Omit or null to keep defaults."
           properties:
             rate:
-              type: number
+              type: [number, "null"]
               minimum: 0.0
               maximum: 1.0
               default: 1.0
               description: "Fraction of eligible AI transactions emitted as full records. Guardrail/error captures override the roll."
             always_capture_on_guardrail:
-              type: boolean
+              type: [boolean, "null"]
               default: true
               description: "Override a losing sampling roll for a fired guardrail. A non-empty ai_tool_governor.decision other than allow (deny, dry_run, require_approval, or redact_args) fires this override on request, buffered-response, and terminal-stream paths; ordinary allow does not. Exported guardrails include bounded ai_tool_governor.enabled, mode, decision, tool_names, risk, policy_ids, approval_id, arguments_hashes, and redacted_tools fields."
             always_capture_on_error:
-              type: boolean
+              type: [boolean, "null"]
               default: true
             max_records_per_minute:
-              type: integer
+              type: [integer, "null"]
               minimum: 0
+              maximum: 18446744073709551615
               default: 0
-              description: "Records-per-minute cap (0 = unlimited). Over the cap, records are dropped (never reject traffic)."
+              description: "Records-per-minute cap (0 = unlimited). Over the cap, records are dropped and traffic is NEVER rejected: a record the window has already refused takes no queue permit or retained-byte reservation and cannot select a fail-closed 503, so sink.on_buffer_full/on_sink_error: reject cannot deny traffic for an audit record that could not have been written. Suppression is bounded by the window — the first record admitted after it rolls over flushes normally, which is the same background-send recovery probe that restores sink health elsewhere. The admitted maximum is the unsigned 64-bit ceiling (a larger literal is a type error, not a clamp); the effective in-window ceiling is clamped to 4294967294."
         redaction:
           type: [object, "null"]
           additionalProperties: false
           description: "PII redaction policy for captured excerpts. Omit or null to keep defaults. In mode=redacted_body and mode=metadata_only the pattern set must not be empty: builtins=[] with no custom_patterns is rejected at construction (a pass-through redactor would export unredacted data — body excerpts in redacted_body, the request-derived model/tool_names in both — without the full_body opt-in; hash_only exports no request-derived strings and is exempt). redacted_body also replaces values beneath normalized sensitive parent keys and recursively redacts JSON-encoded object/array strings before applying regex patterns."
           properties:
             builtins:
-              type: array
+              type: [array, "null"]
               items:
                 type: string
                 enum: [ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban]
-              description: "Built-in PII patterns, shared with ai_prompt_shield/ai_response_guard."
+              description: "Built-in PII patterns, shared with ai_prompt_shield/ai_response_guard. Omit or null for the default set; an explicit empty array with no custom_patterns is refused in redacted_body/metadata_only, and under privacy.path_mode: redact in every mode."
             custom_patterns:
               type: array
               items:
@@ -29382,17 +29861,17 @@ components:
                   regex:
                     type: string
             placeholder:
-              type: string
+              type: [string, "null"]
               default: "[REDACTED:{type}]"
               description: "Non-hashing replacement template; {type} is substituted with the pattern name."
             hash_redacted_values:
-              type: boolean
+              type: [boolean, "null"]
               default: true
               description: "Replace matches with [REDACTED:<type>:<hmac-prefix>] so identical values stay correlatable without storing the raw value. The digest is a keyed HMAC-SHA256 (see hash_secret), never a plain hash — most PII value spaces are small enough to brute-force offline from an unsalted digest."
             hash_secret:
-              type: string
+              type: [string, "null"]
               minLength: 16
-              description: "Optional key for the redacted-value HMAC and the exported request/response body hashes. When set (min 16 chars), hashed placeholders and body hashes are stable across gateway instances and restarts, so values correlate fleet-wide. When omitted, each process generates a random key at startup: digests still correlate within one process lifetime but never across restarts/instances, and can never be dictionary-attacked from exported records. Treat like any other secret — do not log or export it."
+              description: "Optional key for the redacted-value HMAC and the exported request/response body hashes. The minimum length is counted in CHARACTERS (Unicode code points), matching this minLength — not in UTF-8 bytes, so an 8-character multi-byte secret is refused even though it carries 16 bytes. When set (min 16 characters), hashed placeholders and body hashes are stable across gateway instances and restarts, so values correlate fleet-wide. When omitted or null, each process generates a random key at startup: digests still correlate within one process lifetime but never across restarts/instances, and can never be dictionary-attacked from exported records. Treat like any other secret — do not log or export it."
         limits:
           type: [object, "null"]
           additionalProperties: false
@@ -29406,7 +29885,7 @@ components:
             aggregate tool-name bytes <= 4096). Omit or null to keep defaults.
           properties:
             max_request_bytes:
-              type: integer
+              type: [integer, "null"]
               minimum: 1
               maximum: 1048576
               default: 65536
@@ -29415,7 +29894,7 @@ components:
                 1048576. Counts toward the cross-field aggregate with
                 max_response_bytes and max_stream_capture_bytes.
             max_response_bytes:
-              type: integer
+              type: [integer, "null"]
               minimum: 1
               maximum: 1048576
               default: 65536
@@ -29423,7 +29902,7 @@ components:
                 Maximum retained buffered response-body excerpt bytes. Hard
                 maximum 1048576. Counts toward the cross-field aggregate.
             max_stream_capture_bytes:
-              type: integer
+              type: [integer, "null"]
               minimum: 1
               maximum: 1048576
               default: 65536
@@ -29432,7 +29911,7 @@ components:
                 1048576. Counts toward the cross-field aggregate. Also bounds
                 the streamed keyed digest unless capture.stream_hash is full.
             max_redaction_scan_bytes:
-              type: integer
+              type: [integer, "null"]
               minimum: 4096
               maximum: 8388608
               default: 1048576
@@ -29460,7 +29939,7 @@ components:
                 caps on a UTF-8 boundary first and never scans past the cap, so
                 it is unaffected.
             max_entry_bytes:
-              type: integer
+              type: [integer, "null"]
               minimum: 1
               maximum: 16777216
               description: >-
@@ -29475,7 +29954,7 @@ components:
                 exceeds this ceiling is dropped/rejected, never partially
                 serialized.
             buffer_max_bytes:
-              type: integer
+              type: [integer, "null"]
               minimum: 65536
               maximum: 268435456
               default: 134217728
@@ -29498,7 +29977,7 @@ components:
                 2 * (max_entry_bytes + 1) + 128. Live retained_bytes and
                 retained_byte_drops are exposed on authenticated /health.
             max_stream_reservation_secs:
-              type: integer
+              type: [integer, "null"]
               minimum: 1
               maximum: 86400
               default: 900
@@ -29542,15 +30021,17 @@ components:
           description: "Async batched HTTPS sink. The endpoint is SSRF-screened against the backend egress policy at construction (literal IPs) and at send time (resolved hostnames). Cleartext HTTP requires allow_insecure_loopback=true and is then limited to localhost or a loopback IP. Unknown sink keys are rejected; custom_headers remains an open string map."
           properties:
             type:
-              type: string
-              enum: [http]
+              type: [string, "null"]
+              enum: [http, null]
               default: http
             endpoint_url:
               type: string
               format: uri
-              description: "Collector URL. HTTPS is required by default. HTTP is accepted only for localhost or a loopback IP when allow_insecure_loopback is explicitly true. Userinfo credentials (https://user:pass@host) are rejected — authenticate with custom_headers. A collector that requires a credential in the URL path or query is supported, and this value is never rendered in operational output: egress-denial, DNS/TLS, retry, slow-call, and batch-failure diagnostics show only a structurally redacted scheme://host:port/redacted form. The admin audit and non-admin read projections apply the schema-aware sensitivity contract instead, keeping only scheme://host[:port] with `[REDACTED_PATH]` / `[REDACTED_QUERY]` / `[REDACTED_FRAGMENT]` markers."
+              minLength: 1
+              pattern: '^[Hh][Tt][Tt][Pp][Ss]?://'
+              description: "Collector URL. Only the http and https schemes are admitted (the pattern is spelled case-insensitively because URL schemes are). HTTPS is required by default. HTTP is accepted only for localhost or a loopback IP when allow_insecure_loopback is explicitly true. Userinfo credentials (https://user:pass@host) are rejected — authenticate with custom_headers. A collector that requires a credential in the URL path or query is supported, and this value is never rendered in operational output: egress-denial, DNS/TLS, retry, slow-call, and batch-failure diagnostics show only a structurally redacted scheme://host:port/redacted form. The admin audit and non-admin read projections apply the schema-aware sensitivity contract instead, keeping only scheme://host[:port] with `[REDACTED_PATH]` / `[REDACTED_QUERY]` / `[REDACTED_FRAGMENT]` markers."
             allow_insecure_loopback:
-              type: boolean
+              type: [boolean, "null"]
               default: false
               description: "Allow an http:// collector only when endpoint_url uses localhost or a loopback IP. This never permits remote cleartext delivery."
             custom_headers:
@@ -29585,28 +30066,28 @@ components:
               default: 1000
               description: "Fixed delay between batch send retries for transient collector failures."
             on_buffer_full:
-              type: string
-              enum: [drop, reject]
+              type: [string, "null"]
+              enum: [drop, reject, null]
               default: drop
               description: "drop: silently drop when the queue or per-instance 4096-entry staging bound is full (never block). reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit when staging or a queue slot cannot be reserved. Shared candidate markers from co-located peers do not bypass this bound. Streaming admission honors sampling plus configured error/guardrail overrides."
             on_sink_error:
-              type: string
-              enum: [warn, reject]
+              type: [string, "null"]
+              enum: [warn, reject, null]
               default: warn
               description: "warn: log and drop on permanent sink failure. reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit while the sink is unhealthy. Streaming admission honors sampling plus configured error/guardrail overrides. Sink health is published from the COMPLETE delivery outcome, never from response headers alone: the acknowledgement body is drained and validated under sink.ack_max_bytes / sink.ack_timeout_ms first, and a 2xx whose acknowledgement stalls, overruns its bound, fails transport, or fails ack_policy validation is an ambiguous delivery that marks the sink unhealthy AND returns the batch for retry. Any non-2xx collector response also marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired token) whose batch is discarded rather than retried — so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Hysteresis: health drops on the first failed or ambiguous delivery with no damping, and is restored only by a 2xx whose acknowledgement fully drained and validated; each retry attempt re-publishes, so recovery happens on the attempt that actually succeeded. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe."
             ack_policy:
-              type: string
-              enum: [drain, json]
+              type: [string, "null"]
+              enum: [drain, json, null]
               default: drain
               description: "How a collector acknowledgement is validated before sink health is published. drain: read the acknowledgement to EOF under sink.ack_max_bytes and sink.ack_timeout_ms, discarding the bytes (content is not inspected). json: additionally require a JSON object that does not report rejected records — a non-object/unparseable body, a non-zero/non-empty errors|failed|rejected|error_count field, or a status string outside the unequivocal affirmative set ok|success|accepted|created fails the batch. Ambiguous partial-delivery values such as partial_ok are unhealthy even without an explicit failure count. Acknowledgement bytes are never retained beyond the bound and never logged; only compiled-in failure classes appear in diagnostics, so a hostile collector cannot echo captured transcript content back into gateway logs."
             ack_max_bytes:
-              type: integer
+              type: [integer, "null"]
               minimum: 64
               maximum: 1048576
               default: 65536
               description: "Hard bound on the acknowledgement body read from the collector. An advertised Content-Length above this, or a stream that exceeds it, fails the batch instead of buffering unbounded collector output into the flush worker."
             ack_timeout_ms:
-              type: integer
+              type: [integer, "null"]
               minimum: 1
               maximum: 30000
               default: 1000
@@ -29617,17 +30098,17 @@ components:
           description: "Identity/header/path export controls. Omit or null to keep defaults."
           properties:
             include_consumer_username:
-              type: boolean
+              type: [boolean, "null"]
               default: true
             include_client_ip:
-              type: boolean
+              type: [boolean, "null"]
               default: false
             include_raw_headers:
-              type: boolean
+              type: [boolean, "null"]
               default: false
             path_mode:
-              type: string
-              enum: [omit, template, redact, hash, raw]
+              type: [string, "null"]
+              enum: [omit, template, redact, hash, raw, null]
               description: "How the request path is exported. Applications often embed emails/account-ids/document-names/tokens in path segments, so a privacy mode never exports the literal path by default. omit: no path. template: export the matched route identifier (proxy listen_path, else proxy name; omitted when unavailable) instead of the user-controlled path. redact: literal path with the configured PII redactor applied (requires at least one redaction.builtins/custom_patterns pattern). hash: keyed HMAC-SHA256 hex digest of the literal path (shares redaction.hash_secret; not brute-forceable offline). raw: literal path verbatim. Default is template for metadata_only/redacted_body/hash_only and raw for full_body (the deliberate raw-capture opt-in)."
 
         grpc:
@@ -29695,18 +30176,25 @@ components:
                 additionalProperties: false
                 properties:
                   request_type:
-                    type: string
+                    type: [string, "null"]
                     minLength: 1
                     pattern: '\S'
-                    description: Fully-qualified protobuf request message type.
+                    description: >-
+                      Fully-qualified protobuf request message type. Null (or a
+                      blank string) is treated exactly as absent, so the other
+                      direction must then be set.
                   response_type:
-                    type: string
+                    type: [string, "null"]
                     minLength: 1
                     pattern: '\S'
-                    description: Fully-qualified protobuf response message type.
+                    description: >-
+                      Fully-qualified protobuf response message type. Null (or a
+                      blank string) is treated exactly as absent, so the other
+                      direction must then be set.
                   text_fields:
-                    type: array
+                    type: [array, "null"]
                     minItems: 1
+                    uniqueItems: true
                     items:
                       type: string
                       minLength: 1
@@ -29716,13 +30204,24 @@ components:
                       exported. Each path must end at a string field and may
                       not traverse a map field. Repeated fields retain every
                       selected value under indexed paths such as tags.0 or
-                      messages.2.text. Omit to cover every string field
-                      recursively.
+                      messages.2.text. Omit, or set null, to cover every string
+                      field recursively; an explicit empty array is refused.
+                      The runtime additionally trims each dotted segment before
+                      comparing, so it rejects duplicates uniqueItems cannot see
+                      ("a.b" versus "a . b"), rejects an empty segment, and
+                      rejects a path deeper than the message-nesting ceiling.
+                # `required` is satisfied by an explicit null, so each branch
+                # also demands a non-blank string — the runtime treats a null or
+                # blank value as absent.
                 anyOf:
                   - required: [request_type]
+                    properties:
+                      request_type: {type: string, minLength: 1, pattern: '\S'}
                   - required: [response_type]
+                    properties:
+                      response_type: {type: string, minLength: 1, pattern: '\S'}
             max_message_bytes:
-              type: integer
+              type: [integer, "null"]
               minimum: 1
               maximum: 8388608
               default: 1048576
@@ -29736,7 +30235,7 @@ components:
                 equal to the hard maximum of that aggregate scan ceiling — a
                 larger per-message value could never produce a capture.
             max_messages:
-              type: integer
+              type: [integer, "null"]
               minimum: 1
               maximum: 1024
               default: 64
@@ -29755,7 +30254,7 @@ components:
     AiSemanticFirewallConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_semantic_firewall — Semantic LLM guardrails for prompt injection, jailbreaks, system/developer prompt exfiltration, data exfiltration intent, indirect prompt injection, tool abuse, business-topic allow/deny policy, response leakage, dry-run rollout, and audit metadata."
+      description: "Plugin: ai_semantic_firewall — Semantic LLM guardrails for prompt injection, jailbreaks, system/developer prompt exfiltration, data exfiltration intent, indirect prompt injection, tool abuse, business-topic allow/deny policy, response leakage, dry-run rollout, and audit metadata. An enabled instance must carry a provider, at least one active rule source, and rules that apply to the enabled inspection directions; a disabled instance (enabled: false) is exempt from those cross-field requirements but every block it DOES carry is still validated, matching the constructor. Three relationships standard JSON Schema cannot express and ferrum-edge validate still rejects with a field-specific error: streaming.overlap_bytes must be strictly less than streaming.max_window_bytes; streaming.overlap_tokens must be strictly less than streaming.max_window_tokens; and every allow_topics/deny_topics/custom_rules id must be unique across those three lists AND against the ids of the ACTIVE built-in packs (prompt_injection, jailbreak, system_prompt_exfiltration, data_exfiltration, indirect_prompt_injection, tool_abuse, response_leakage). A rule id is an operator-facing label only — naming a custom or deny-topic rule after a disabled built-in pack does not give it that built-in's matching behavior."
       allOf:
         - if:
             required: [enabled]
@@ -29764,7 +30263,90 @@ components:
                 const: false
           then: {}
           else:
-            required: [provider]
+            allOf:
+              - required: [provider]
+              # At least one rule source is active.
+              - $ref: '#/components/schemas/AiSemanticFirewallActivePolicy'
+              # inspect.request and inspect.response cannot both be false.
+              - not:
+                  required: [inspect]
+                  properties:
+                    inspect:
+                      required: [request, response]
+                      properties:
+                        request:
+                          const: false
+                        response:
+                          const: false
+              # Rules must apply to the enabled inspection directions.
+              - if:
+                  required: [inspect]
+                  properties:
+                    inspect:
+                      required: [request]
+                      properties:
+                        request:
+                          const: false
+                then:
+                  $ref: '#/components/schemas/AiSemanticFirewallActiveResponsePolicy'
+              - if:
+                  required: [inspect]
+                  properties:
+                    inspect:
+                      required: [response]
+                      properties:
+                        response:
+                          const: false
+                then:
+                  $ref: '#/components/schemas/AiSemanticFirewallActiveRequestPolicy'
+              # An empty extraction list is only admissible when no rule in that
+              # direction is active.
+              - if:
+                  required: [extraction]
+                  properties:
+                    extraction:
+                      required: [request_json_paths]
+                      properties:
+                        request_json_paths:
+                          maxItems: 0
+                then:
+                  anyOf:
+                    - required: [inspect]
+                      properties:
+                        inspect:
+                          required: [request]
+                          properties:
+                            request:
+                              const: false
+                    - not:
+                        $ref: '#/components/schemas/AiSemanticFirewallActiveRequestPolicy'
+              - if:
+                  required: [extraction]
+                  properties:
+                    extraction:
+                      required: [response_json_paths]
+                      properties:
+                        response_json_paths:
+                          maxItems: 0
+                then:
+                  anyOf:
+                    - required: [inspect]
+                      properties:
+                        inspect:
+                          required: [response]
+                          properties:
+                            response:
+                              const: false
+                    - not:
+                        $ref: '#/components/schemas/AiSemanticFirewallActiveResponsePolicy'
+        # The streaming tuning block is only admissible for streaming_response: inspect.
+        - if:
+            required: [streaming]
+          then:
+            required: [streaming_response]
+            properties:
+              streaming_response:
+                const: inspect
       properties:
         enabled:
           type: boolean
@@ -29784,7 +30366,7 @@ components:
           type: string
           enum: [enforce, dry_run]
           default: enforce
-          description: Dry-run mode never rejects and emits would_action metadata.
+          description: "Dry-run mode never rejects or cuts traffic and emits would_action metadata. This covers every disposition on both the buffered and the windowed streaming paths: a matched rule, an uninspectable body/window, an unmapped governed provider stream, an exhausted streaming.max_inspections budget, a provider error under on_error=reject, and an expired streaming.max_hold_ms hold (including on_hold_timeout=cut) are all recorded and released."
         on_error:
           type: string
           enum: [warn, allow, reject]
@@ -29805,7 +30387,38 @@ components:
         streaming:
           type: object
           additionalProperties: false
-          description: Windowed-inspection tuning. Only valid when streaming_response is inspect.
+          description: "Windowed-inspection tuning. Only valid when streaming_response is inspect. window=tokens requires an explicit tokenizer, and tokenizer / max_window_tokens / overlap_tokens are rejected for every other window kind. on_hold_timeout requires max_hold_ms, and its cut value is rejected with enforcement=detect. Two ordering relationships are not expressible here and are enforced by the constructor: overlap_bytes < max_window_bytes and overlap_tokens < max_window_tokens."
+          allOf:
+            - if:
+                required: [window]
+                properties:
+                  window:
+                    const: tokens
+              then:
+                required: [tokenizer]
+              else:
+                allOf:
+                  - not:
+                      required: [tokenizer]
+                  - not:
+                      required: [max_window_tokens]
+                  - not:
+                      required: [overlap_tokens]
+            - if:
+                required: [on_hold_timeout]
+              then:
+                required: [max_hold_ms]
+            - if:
+                required: [enforcement]
+                properties:
+                  enforcement:
+                    const: detect
+              then:
+                not:
+                  required: [on_hold_timeout]
+                  properties:
+                    on_hold_timeout:
+                      const: cut
           properties:
             window:
               type: string
@@ -29821,10 +30434,11 @@ components:
               format: uint
               minimum: 1
               default: 4096
-              description: Hard aggregate cap for the current window's input and retained raw/frame/reassembled state. Coalesced chunks are expanded event-by-event, and an individual event that cannot fit is uninspectable (fails closed under on_error=reject, forwarded under warn/allow).
+              description: "Hard aggregate cap for the current window's input and retained raw/frame/reassembled state. Coalesced chunks are expanded event-by-event: only one complete event's bytes are taken at a time and a ready window is inspected and released before more events are absorbed, so transport batching never changes a clean completion's disposition. Only an event that cannot fit with nothing else retained is uninspectable (fails closed under on_error=reject, forwarded under warn/allow)."
             overlap_bytes:
               type: integer
               format: uint
+              minimum: 0
               default: 256
               description: Bytes of already-cleared text re-inspected with the next window so a violation phrase split across a boundary is still caught. Prose and tool-call tails split this aggregate budget with a reserved tool-state share. Must be less than max_window_bytes and is included within that aggregate retained-state cap. For window=tokens this remains the hard memory ceiling on retained overlap while overlap_tokens selects the prose token budget.
             max_window_tokens:
@@ -29832,13 +30446,12 @@ components:
               format: uint
               minimum: 1
               maximum: 65536
-              default: 256
-              description: "Only valid when window=tokens. Soft window size in complete tokens under the selected tokenizer. Omit for the default (256). Values above 65536 or 0 are rejected. The hard max_window_bytes cap still forces a window (preferring a complete-token cut) when retained state fills first."
+              description: "Only valid when window=tokens; NO static default is advertised because materializing one on any other window kind turns a valid configuration into one the gateway rejects. Soft window size in complete tokens under the selected tokenizer. Omit to inherit 256. Values above 65536 or 0 are rejected. The hard max_window_bytes cap still forces a window (preferring a complete-token cut) when retained state fills first."
             overlap_tokens:
               type: integer
               format: uint
-              default: 32
-              description: "Only valid when window=tokens. Complete tokens of already-cleared prose re-inspected with the next window; retained overlap tokens count against the next window's max_window_tokens, so a window closes once retained + new tokens reach the budget (at least one new token is always required). Must be strictly less than max_window_tokens. When omitted, defaults to min(32, max_window_tokens-1). Still subject to the overlap_bytes memory ceiling."
+              minimum: 0
+              description: "Only valid when window=tokens; NO static default is advertised because the effective default is CONDITIONAL — min(32, max_window_tokens-1) — so materializing a fixed 32 invalidates every small token window. Complete tokens of already-cleared prose re-inspected with the next window; retained overlap tokens count against the next window's max_window_tokens, so a window closes once retained + new tokens reach the budget (at least one new token is always required). Must be strictly less than max_window_tokens. Still subject to the overlap_bytes memory ceiling."
             max_inspections:
               type: integer
               format: uint
@@ -29859,8 +30472,7 @@ components:
             on_hold_timeout:
               type: string
               enum: [on_error, cut, forward]
-              default: on_error
-              description: "Policy when streaming.max_hold_ms expires before a verdict. on_error inherits the plugin's on_error policy (reject fails closed by cutting, warn/allow fail open by forwarding every byte that caused the hold uninspected — complete events and any un-terminated partial SSE event — then passing the remainder of that partial event through until the next event boundary), matching how a provider error or an exhausted inspection budget is handled. cut always fails closed (discards all held/partial bytes); forward always fails open. Requires streaming.max_hold_ms to be set. cut is rejected with enforcement=detect, whose bytes were already forwarded before the evaluation began — an expired detect hold can only abandon the evaluation and release its admission permit. A cut is client-indistinguishable from a policy cut (same terminal error event), and every expiry folds into the fixed-cardinality ai_semantic_firewall.stream_hold_timeouts count (saturating-summed across active instances) and ai_semantic_firewall.stream_hold_timeout_action (most restrictive of cut > forward > detect_abandoned) transaction metadata; a zero-expiry instance neither synthesizes nor erases those keys."
+              description: "The effective default is on_error, but NO static schema default is advertised: the field is rejected outright unless streaming.max_hold_ms is also set, so tooling that materializes defaults must leave it unset. Policy when streaming.max_hold_ms expires before a verdict. on_error inherits the plugin's on_error policy (reject fails closed by cutting, warn/allow fail open by forwarding every byte that caused the hold uninspected — complete events and any un-terminated partial SSE event — then passing the remainder of that partial event through until the next event boundary), matching how a provider error or an exhausted inspection budget is handled. cut always fails closed (discards all held/partial bytes) in mode=enforce and degrades to forward in mode=dry_run, which never cuts; forward always fails open. Requires streaming.max_hold_ms to be set. cut is rejected with enforcement=detect, whose bytes were already forwarded before the evaluation began — an expired detect hold can only abandon the evaluation and release its admission permit. A cut is client-indistinguishable from a policy cut (same terminal error event), and every expiry folds into the fixed-cardinality ai_semantic_firewall.stream_hold_timeouts count (saturating-summed across active instances) and ai_semantic_firewall.stream_hold_timeout_action (most restrictive of cut > forward > detect_abandoned) transaction metadata; a zero-expiry instance neither synthesizes nor erases those keys."
             enforcement:
               type: string
               enum: [block, detect]
@@ -29874,7 +30486,7 @@ components:
             type:
               type: string
               enum: [openai_compatible_embeddings]
-              description: OpenAI-compatible embeddings provider.
+              description: OpenAI-compatible embeddings provider. Exact spelling only — no aliases and no surrounding whitespace.
             endpoint:
               type: string
               format: uri
@@ -30038,6 +30650,9 @@ components:
             properties:
               id:
                 type: string
+                minLength: 1
+                pattern: "\\S"
+                description: Rule identifier. Must contain a non-whitespace character; surrounding whitespace is trimmed. Ids must be unique across allow_topics, deny_topics, custom_rules, and the ACTIVE built-in pack names.
               description:
                 type: string
               examples:
@@ -30045,6 +30660,8 @@ components:
                 minItems: 1
                 items:
                   type: string
+                  minLength: 1
+                  pattern: "\\S"
               threshold:
                 type: number
                 format: float
@@ -30065,6 +30682,9 @@ components:
             properties:
               id:
                 type: string
+                minLength: 1
+                pattern: "\\S"
+                description: Rule identifier. Must contain a non-whitespace character; surrounding whitespace is trimmed. Ids must be unique across allow_topics, deny_topics, custom_rules, and the ACTIVE built-in pack names.
               description:
                 type: string
               examples:
@@ -30072,6 +30692,8 @@ components:
                 minItems: 1
                 items:
                   type: string
+                  minLength: 1
+                  pattern: "\\S"
               threshold:
                 type: number
                 format: float
@@ -30081,8 +30703,8 @@ components:
               action:
                 type: string
                 enum: [reject, warn]
-                default: reject
-          description: Customer-defined request/response semantic deny topics.
+                description: "Omit to INHERIT the plugin's default_action (reject unless default_action is warn); no static default is advertised because materializing reject would turn an inherited warn into a rejection. allow is not accepted here — use allow_topics for allowlist semantics."
+          description: Customer-defined request/response semantic deny topics. Deny topics are bidirectional and apply to both inspection directions.
         custom_rules:
           type: array
           items:
@@ -30092,6 +30714,9 @@ components:
             properties:
               id:
                 type: string
+                minLength: 1
+                pattern: "\\S"
+                description: Rule identifier. Must contain a non-whitespace character; surrounding whitespace is trimmed. Ids must be unique across allow_topics, deny_topics, custom_rules, and the ACTIVE built-in pack names.
               description:
                 type: string
               direction:
@@ -30105,13 +30730,14 @@ components:
               action:
                 type: string
                 enum: [warn, reject]
-                default: reject
-                description: Custom rules can warn or reject. Use allow_topics for allowlist semantics.
+                description: "Custom rules can warn or reject; use allow_topics for allowlist semantics. Omit to INHERIT the plugin's default_action (reject unless default_action is warn); no static default is advertised because materializing reject would turn an inherited warn into a rejection."
               examples:
                 type: array
                 minItems: 1
                 items:
                   type: string
+                  minLength: 1
+                  pattern: "\\S"
               threshold:
                 type: number
                 format: float
@@ -30187,21 +30813,54 @@ components:
         order and reload generations. Unknown root, semantic-policy, and Redis
         sync keys are rejected at admission with path-qualified diagnostics
         (registration policy KeepLastKnownGood). There are no intentionally
-        open maps.
+        open maps. All numeric retention/time bounds must be positive. The
+        constructor additionally enforces max_entry_size_bytes <=
+        max_total_size_bytes (including omitted defaults), the 32 UTF-8 byte
+        redis_integrity_key minimum, platform-sized integer limits, URL parsing,
+        and the deployment backend egress policy. These residual checks are not
+        fully expressible in this schema. Provider-managed Responses conversations
+        and Gemini retained contexts bypass replay; other unmodeled root context
+        is canonically bound to exact and semantic identities. Cohere SYSTEM
+        history is retained as exact instruction state in semantic scopes.
+        Cache hits preserve finalized application bodies while current response
+        enforcement, live header rules, and negotiated compression still run.
+      allOf:
+        - if:
+            required: [semantic_similarity_enabled]
+            properties:
+              semantic_similarity_enabled:
+                const: true
+          then:
+            required: [semantic_embedding_endpoint]
+            properties:
+              semantic_embedding_endpoint:
+                pattern: '^[hH][tT][tT][pP][sS]?://[^/?#@\s]+(?:[/?#][\s\S]*)?(?![\s\S])'
+        - if:
+            required: [sync_mode]
+            properties:
+              sync_mode:
+                pattern: '^[rR][eE][dD][iI][sS](?![\s\S])'
+          then:
+            required: [redis_url, redis_integrity_key]
       properties:
         ttl_seconds:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 18446744073709551615
           default: 300
           description: Time-to-live for cached entries in seconds
         max_entries:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 18446744073709551615
           default: 10000
           description: Maximum number of cached entries (local mode). In semantic mode, HNSW snapshot memory scales with this count and is charged against max_total_size_bytes.
         max_entry_size_bytes:
           type: integer
           format: uint64
+          minimum: 1
           default: 1048576
           maximum: 16777216
           description: >-
@@ -30211,6 +30870,7 @@ components:
         max_total_size_bytes:
           type: integer
           format: uint64
+          minimum: 1
           default: 104857600
           maximum: 1073741824
           description: >-
@@ -30235,47 +30895,56 @@ components:
           default: true
           description: Additionally include the authenticated consumer's display identity in the cache key. Caller isolation no longer depends on this flag — every exact and semantic key binds a mandatory caller-authorization partition (authentication mechanism, resolved identity/consumer, peer SPIFFE identity, and SHA-256 digests of every credential header presented), so two credentials resolving to one display subject with different scopes can never share a retained completion. Setting `false` no longer lets distinct callers share entries.
         anonymous_caller_scope:
-          type: [string, "null"]
-          enum: ["caller_address", "shared", null]
+          type: string
+          pattern: '^[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*(?:[cC][aA][lL][lL][eE][rR]_[aA][dD][dD][rR][eE][sS][sS]|[cC][aA][lL][lL][eE][rR]-[aA][dD][dD][rR][eE][sS][sS]|[sS][hH][aA][rR][eE][dD])[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*(?![\s\S])'
           default: "caller_address"
           description: "How anonymous callers (no gateway identity, no credential header, no peer SPIFFE identity) are partitioned. caller_address (default) binds the gateway-resolved canonical peer address, which the origin observes through Ferrum's regenerated X-Forwarded-For; a request whose canonical address cannot be parsed is refused rather than keyed incompletely. shared is an explicit operator attestation that the origin does not vary its result by caller address on this route — only set it when that is known-safe, because it re-opens cross-caller replay for address-sensitive origins. It applies to anonymous callers only: an authenticated caller always binds its canonical peer address, because the backend receives Ferrum's regenerated forwarding identity for that caller too and may vary policy or content by it."
         cache_multimodal:
           type: string
-          enum: [reject, exact_only, exact-only, include_fingerprints, include-fingerprints]
+          pattern: '^[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*(?:[rR][eE][jJ][eE][cC][tT]|[eE][xX][aA][cC][tT]_[oO][nN][lL][yY]|[eE][xX][aA][cC][tT]-[oO][nN][lL][yY]|[iI][nN][cC][lL][uU][dD][eE]_[fF][iI][nN][gG][eE][rR][pP][rR][iI][nN][tT][sS]|[iI][nN][cC][lL][uU][dD][eE]-[fF][iI][nN][gG][eE][rR][pP][rR][iI][nN][tT][sS])[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*(?![\s\S])'
           default: exact_only
-          description: Multimodal request caching mode for non-text content parts. `reject` bypasses cache lookup/store, `exact_only` uses hashed fingerprints for exact matches and disables semantic hits, and `include_fingerprints` also includes those fingerprints in semantic scope keys. The runtime parser trims surrounding whitespace and is case-insensitive (e.g. `"Reject"`, `" exact_only "` are accepted), and `_`/`-` aliases are interchangeable; admin-API config validation runs through this lenient parser, not the schema `enum`. The `enum` lists only canonical/alias forms because JSON Schema cannot express case-insensitivity — strict schema validators may reject mixed-case or padded inputs the gateway itself accepts.
+          description: Multimodal request caching mode for non-text content parts. `reject` bypasses cache lookup/store, `exact_only` uses hashed fingerprints for exact matches and disables semantic hits, and `include_fingerprints` also includes those fingerprints in semantic scope keys. The parser and schema accept surrounding whitespace, ASCII case variants, and the listed underscore/hyphen aliases.
         semantic_similarity_enabled:
           type: boolean
           default: false
           description: Enable embedding-based semantic lookup after exact Redis/local misses. Exact matching remains active when this is disabled or enabled.
         semantic_embedding_provider:
           type: string
-          enum: [openai, openai_compatible, openai-compatible, azure, azure_openai, azure-openai, mistral, voyage, voyageai, voyage_ai, anthropic, claude, cohere, google, google_gemini, google-gemini, gemini, google_vertex, google-vertex, vertex, vertex_ai, vertex-ai, bedrock_titan, bedrock-titan, amazon_titan, amazon-titan, bedrock_cohere, bedrock-cohere, cohere_bedrock, cohere-bedrock]
+          pattern: '^[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*(?:[oO][pP][eE][nN][aA][iI]|[oO][pP][eE][nN][aA][iI]_[cC][oO][mM][pP][aA][tT][iI][bB][lL][eE]|[oO][pP][eE][nN][aA][iI]-[cC][oO][mM][pP][aA][tT][iI][bB][lL][eE]|[aA][zZ][uU][rR][eE]|[aA][zZ][uU][rR][eE]_[oO][pP][eE][nN][aA][iI]|[aA][zZ][uU][rR][eE]-[oO][pP][eE][nN][aA][iI]|[mM][iI][sS][tT][rR][aA][lL]|[vV][oO][yY][aA][gG][eE]|[vV][oO][yY][aA][gG][eE][aA][iI]|[vV][oO][yY][aA][gG][eE]_[aA][iI]|[aA][nN][tT][hH][rR][oO][pP][iI][cC]|[cC][lL][aA][uU][dD][eE]|[cC][oO][hH][eE][rR][eE]|[gG][oO][oO][gG][lL][eE]|[gG][oO][oO][gG][lL][eE]_[gG][eE][mM][iI][nN][iI]|[gG][oO][oO][gG][lL][eE]-[gG][eE][mM][iI][nN][iI]|[gG][eE][mM][iI][nN][iI]|[gG][oO][oO][gG][lL][eE]_[vV][eE][rR][tT][eE][xX]|[gG][oO][oO][gG][lL][eE]-[vV][eE][rR][tT][eE][xX]|[vV][eE][rR][tT][eE][xX]|[vV][eE][rR][tT][eE][xX]_[aA][iI]|[vV][eE][rR][tT][eE][xX]-[aA][iI]|[bB][eE][dD][rR][oO][cC][kK]_[tT][iI][tT][aA][nN]|[bB][eE][dD][rR][oO][cC][kK]-[tT][iI][tT][aA][nN]|[aA][mM][aA][zZ][oO][nN]_[tT][iI][tT][aA][nN]|[aA][mM][aA][zZ][oO][nN]-[tT][iI][tT][aA][nN]|[bB][eE][dD][rR][oO][cC][kK]_[cC][oO][hH][eE][rR][eE]|[bB][eE][dD][rR][oO][cC][kK]-[cC][oO][hH][eE][rR][eE]|[cC][oO][hH][eE][rR][eE]_[bB][eE][dD][rR][oO][cC][kK]|[cC][oO][hH][eE][rR][eE]-[bB][eE][dD][rR][oO][cC][kK])[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*(?![\s\S])'
           default: openai
-          description: Embedding provider request/response format. Compatibility aliases mirror the plugin parser; anthropic and claude are aliases for Voyage-compatible embeddings because Claude does not expose a native embedding model.
+          description: Embedding provider request/response format. Values are trimmed and ASCII case-insensitive. Aliases include openai_compatible/openai-compatible, azure/azure-openai, voyageai/voyage_ai/anthropic/claude, google/gemini/google-gemini, vertex/vertex_ai/vertex-ai/google-vertex, amazon_titan/amazon-titan/bedrock-titan, and cohere_bedrock/cohere-bedrock/bedrock-cohere; anthropic and claude are aliases for Voyage-compatible embeddings because Claude does not expose a native embedding model.
         semantic_embedding_endpoint:
           type: string
-          format: uri
-          description: Embedding endpoint URL. Required when semantic_similarity_enabled is true. Must not include URL userinfo; use semantic_embedding_api_key for credentials. Query parameters and path tokens required by signed or credential-bearing endpoints are preserved on the outbound request but stripped from logs and error diagnostics (canonical redacted form uses scheme/host/port plus /...). OpenAI-compatible endpoints use input/model JSON; other providers send native embedding JSON.
+          pattern: '[^\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]'
+          description: Nonblank embedding endpoint. Required and validated as an HTTP(S) URL when semantic_similarity_enabled is true; disabled semantic mode only checks that the supplied string is nonblank. Must not include URL userinfo; use semantic_embedding_api_key for credentials. Query parameters and path tokens required by signed or credential-bearing endpoints are preserved on the outbound request but stripped from logs and error diagnostics (canonical redacted form uses scheme/host/port plus /...). OpenAI-compatible endpoints use input/model JSON; other providers send native embedding JSON.
         semantic_embedding_model:
           type: string
+          pattern: '[^\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]'
           description: Model name sent in the embedding request body. Omit for local endpoints that do not require a model field.
         semantic_embedding_input_type:
           type: string
+          pattern: '[^\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]'
           description: Provider-specific input or task type, such as query/document for Voyage, search_query/search_document for Cohere, SEMANTIC_SIMILARITY for Gemini, or Vertex task_type.
         semantic_embedding_output_dimension:
           type: integer
           format: uint64
-          description: Provider-specific reduced embedding dimension when supported.
+          minimum: 1
+          maximum: 16384
+          description: Provider-specific reduced embedding dimension from 1 to 16384 when supported. Mistral uses output_dimension; OpenAI and Azure OpenAI use dimensions.
         semantic_embedding_api_key:
           type: string
+          pattern: '[^\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]'
           format: password
-          description: API key for the embedding endpoint. Sent in semantic_embedding_auth_header with semantic_embedding_auth_scheme when configured.
+          allOf:
+            - pattern: '^[^\u0000-\u0008\u000a-\u001f\u007f]*(?![\s\S])'
+          description: Nonblank API key; the final header value is validated at admission and retained as sensitive. Invalid header characters in the key or scheme are rejected without echoing values. Sent in semantic_embedding_auth_header with semantic_embedding_auth_scheme when configured.
         semantic_embedding_auth_header:
           type: string
+          pattern: '^[!#$%&''*+.^_`|~0-9A-Za-z-]+(?![\s\S])'
           description: HTTP header used for semantic_embedding_api_key. Defaults to Authorization, except Azure OpenAI uses api-key and Google Gemini uses x-goog-api-key.
         semantic_embedding_auth_scheme:
           type: string
+          pattern: '^[^\u0000-\u0008\u000a-\u001f\u007f]*(?![\s\S])'
           description: Prefix for the API key header value. Defaults to Bearer, except Azure OpenAI and Google Gemini send the raw key. Set to an empty string to send the raw key.
         semantic_similarity_threshold:
           type: number
@@ -30298,20 +30967,26 @@ components:
         semantic_embedding_timeout_ms:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 18446744073709551615
           default: 5000
           description: Per-request timeout for embedding calls in milliseconds. Embedding failures fall back to a normal exact-cache miss.
         sync_mode:
           type: string
-          enum: [local, redis]
+          pattern: '^(?:[lL][oO][cC][aA][lL]|[rR][eE][dD][iI][sS])(?![\s\S])'
           default: local
-          description: "Storage backend: 'local' (in-memory DashMap) or 'redis' (centralized Redis)"
+          description: "Storage backend: local or redis, ASCII case-insensitive without whitespace trimming. Redis requires redis_url and redis_integrity_key."
         redis_url:
           type: string
           minLength: 1
-          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
+          pattern: '^[rR][eE][dD][iI][sS][sS]?://[^/?#\s]+(?:/+(?:(?:\+?0*(?:[0-9]{1,9}|[0-1][0-9]{9}|20[0-9]{8}|21[0-3][0-9]{7}|214[0-6][0-9]{6}|2147[0-3][0-9]{5}|21474[0-7][0-9]{4}|214748[0-2][0-9]{3}|2147483[0-5][0-9]{2}|21474836[0-3][0-9]|214748364[0-6]|2147483647)|-0+))?/*)?(?:\?[^\s#]*)?(?![\s\S])'
           description: >-
             Redis connection URL (required when sync_mode is redis). Must not
-            carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY.
+            carry a URL fragment. The database path selects an integer from 0 to
+            2147483647; surrounding slashes, leading zeros, a leading plus, and
+            negative zero match the shared parser. URL port validity and server
+            database availability remain constructor/server checks. TLS skip-verify
+            is only FERRUM_TLS_NO_VERIFY.
             URL-embedded userinfo is accepted but never disclosed:
             connection/health-check logs and non-admin/audit projections keep
             only the scheme, host, port, and database, replace the userinfo, and
@@ -30322,6 +30997,7 @@ components:
           description: Enable TLS for Redis connection
         redis_key_prefix:
           type: string
+          minLength: 1
           description: >-
             Redis key namespace prefix. When omitted, the runtime derives
             `{FERRUM_NAMESPACE}:ai_cache` (for example `ferrum:ai_cache` when
@@ -30337,11 +31013,15 @@ components:
         redis_connect_timeout_seconds:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 18446744073709551615
           default: 5
           description: Redis connection timeout in seconds
         redis_health_check_interval_seconds:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 18446744073709551615
           default: 5
           description: Interval for background health check pings when Redis is unavailable
         redis_username:
@@ -30352,11 +31032,11 @@ components:
           description: Redis password
         redis_integrity_key:
           type: string
-          minLength: 32
           description: >-
             Narrowly scoped HMAC-SHA256 secret that authenticates Redis cache
             envelopes. Required when sync_mode is redis (fail closed if omitted).
-            Minimum 32 bytes. Bound to the full status/header/body envelope and
+            Minimum 32 UTF-8 bytes, checked by the constructor (JSON Schema string
+            length counts characters). Bound to the full status/header/body envelope and
             the Redis namespace/key context. Compared in constant time; never
             logged, and replaced by [REDACTED] in admin audit diffs and in
             viewer/operator plugin-config reads (full admin reads stay raw so
@@ -31326,7 +32006,7 @@ components:
     AiFederationConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_federation — HTTP-family OpenAI Chat Completions gateway. Dispatches from the finalized-request-egress phase after request-body transforms and the complete final request-policy hook pass, so priority_override cannot move provider I/O ahead of WAF/OpenAPI/body/size policy. Translates final request bodies to provider-native JSON with a 64 MiB serialization cap and normalizes bounded, non-streaming responses back to OpenAI format. Native gRPC is not supported or advertised. Provider and OAuth redirects are never followed. Configuration is strict: unknown root, provider, and circuit fields are rejected. Streaming Chat Completions (`stream: true`) are served by a separate non-buffering path that is OFF by default: with the root `streaming` block enabled, before_proxy commits exactly ONE provider before any downstream-visible byte and rewrites the routing decision through route_override_* so the ordinary dispatch path relays provider SSE incrementally. Provider fallback for a stream happens only during that pre-commit selection (open circuit, ineligible provider, unusable endpoint); after the commit no second provider is ever spliced into the same logical stream, and a post-commit failure truncates with one gateway-authored terminal SSE `error` event. Streaming eligibility is narrow: only providers whose native streaming wire format already is the OpenAI Chat Completions SSE contract (openai, mistral, xai, deepseek, meta_llama, hugging_face, azure_openai) with a static header credential. anthropic, google_gemini, google_vertex, aws_bedrock, and cohere, and any provider using AWS SigV4 or Google OAuth2, fail closed with a field-specific 501 — use ai_stream_router for Anthropic/Gemini streaming translation. With `streaming.enabled` the plugin declares a backend-boundary header policy plus request header/destination mutation, so it can no longer be composed with request_deduplication or response_caching on the same proxy. A claimed stream consumes one `max_concurrent_requests` permit and one real provider-circuit admission for the whole life of the response, and both are released exactly once on completion, client disconnect, downstream policy cut, backend error, or cancellation; a 2xx stream is scored a circuit success only after a valid terminal `data: [DONE]`. The provider-visible top-level `model` is rewritten to the value `model_mapping` / `default_model` resolved, and the committed provider's `connect_timeout_seconds` / `read_timeout_seconds` become the streaming route's dispatch budgets instead of the matched proxy's. Provider response headers on a claimed stream are reduced to the same bounded safe allowlist the buffered path publishes plus a gateway-authored `Content-Type: text/event-stream` — provider cookies, redirects, auth challenges, validators/digests, and unknown metadata never reach the client. Streaming is disabled by default and `stream: true` then returns 501 as before. Priority fallback is allowed for configured statuses, malformed provider success responses, and proven pre-wire transport failures. Ambiguous POST outcomes are not replayed by default. Fails closed by default when a JSON POST cannot be inspected, lacks a string `model`, or has no matching provider. Outbound calls use the shared PluginHttpClient and global TLS settings (FERRUM_TLS_CA_BUNDLE_PATH, FERRUM_TLS_NO_VERIFY); per-proxy backend TLS overrides do not apply."
+      description: "Plugin: ai_federation — HTTP-family OpenAI Chat Completions gateway. Dispatches from the finalized-request-egress phase after request-body transforms and the complete final request-policy hook pass, so priority_override cannot move provider I/O ahead of WAF/OpenAPI/body/size policy. Translates final request bodies to provider-native JSON with a 64 MiB serialization cap and normalizes bounded, non-streaming responses back to OpenAI format. Native gRPC is not supported or advertised. Provider and OAuth redirects are never followed. Configuration is strict: unknown root, provider, and circuit fields are rejected. Streaming Chat Completions (`stream: true`) are served by a separate non-buffering path that is OFF by default: with the root `streaming` block enabled, before_proxy commits exactly ONE provider before any downstream-visible byte and rewrites the routing decision through route_override_* so the ordinary dispatch path relays provider SSE incrementally. Provider fallback for a stream happens only during that pre-commit selection (open circuit, ineligible provider, unusable endpoint); after the commit no second provider is ever spliced into the same logical stream, and a post-commit failure truncates with one gateway-authored terminal SSE `error` event. Streaming eligibility is narrow: only providers whose native streaming wire format already is the OpenAI Chat Completions SSE contract (openai, mistral, xai, deepseek, meta_llama, hugging_face, azure_openai) with a static header credential. anthropic, google_gemini, google_vertex, aws_bedrock, and cohere, and any provider using AWS SigV4 or Google OAuth2, fail closed with a field-specific 501 — use ai_stream_router for Anthropic/Gemini streaming translation. With `streaming.enabled` the plugin declares a backend-boundary header policy plus request header/destination mutation, so it can no longer be composed with request_deduplication or response_caching on the same proxy. A claimed stream consumes one `max_concurrent_requests` permit and one real provider-circuit admission for the whole life of the response, and both are released exactly once on completion, client disconnect, downstream policy cut, backend error, or cancellation; a 2xx stream is scored a circuit success only after a valid terminal `data: [DONE]`. The selected provider's `multimodal_mode` is applied to a streamed request exactly as to a buffered one: a reject-mode provider declines the request during pre-commit selection and the next matching provider is considered, a text_only_with_warning provider has the non-text content parts removed from the provider-visible body, and the finalized body is re-checked before egress so a later transform cannot reintroduce content the committed provider forbids. The provider-visible top-level `model` is rewritten to the value `model_mapping` / `default_model` resolved, and the committed provider's `connect_timeout_seconds` / `read_timeout_seconds` become the streaming route's dispatch budgets instead of the matched proxy's. Provider response headers on a claimed stream are reduced to the same bounded safe allowlist the buffered path publishes plus a gateway-authored `Content-Type: text/event-stream` — provider cookies, redirects, auth challenges, validators/digests, and unknown metadata never reach the client. Streaming is disabled by default and `stream: true` then returns 501 as before. Priority fallback is allowed for configured statuses and proven pre-wire transport failures; a completed 2xx that cannot be normalized is TERMINAL and returns 502 (response_normalization_failed) without calling another provider, because that generation has already been performed. Ambiguous POST outcomes are not replayed by default. Fails closed by default when a JSON POST cannot be inspected, lacks a string `model`, or has no matching provider. Outbound calls use the shared PluginHttpClient and global TLS settings (FERRUM_TLS_CA_BUNDLE_PATH, FERRUM_TLS_NO_VERIFY); per-proxy backend TLS overrides do not apply."
       required: [providers]
       properties:
         providers:
@@ -31368,7 +32048,8 @@ components:
                 description: "Lower = tried first. Defaults to provider's index + 1."
               api_key:
                 type: string
-                description: API key for the provider. Required for all providers except aws_bedrock (uses SigV4) and google_vertex (uses service account JWT).
+                minLength: 1
+                description: API key for the provider. Required for all providers except aws_bedrock (uses SigV4) and google_vertex (uses service account JWT). An empty value is treated as absent and fails configuration admission; the resolved value must also be a valid HTTP header value (no newlines or control characters).
               model_patterns:
                 type: array
                 maxItems: 128
@@ -31446,20 +32127,23 @@ components:
                 minLength: 1
                 maxLength: 64
                 pattern: '^[A-Za-z0-9._:-]+$'
-                description: Azure OpenAI deployment name. Required for azure_openai.
+                not: { pattern: '\.\.' }
+                description: Azure OpenAI deployment name. Required for azure_openai. Interpolated into the provider endpoint path, so the traversal sequence `..` is rejected.
               azure_api_version:
                 type: string
                 minLength: 1
                 maxLength: 64
                 pattern: '^[A-Za-z0-9._:-]+$'
+                not: { pattern: '\.\.' }
                 default: "2024-06-01"
-                description: Azure OpenAI api-version query parameter.
+                description: Azure OpenAI api-version query parameter. Interpolated into the provider endpoint, so the traversal sequence `..` is rejected.
               google_project_id:
                 type: string
                 minLength: 1
                 maxLength: 128
                 pattern: '^[A-Za-z0-9._:-]+$'
-                description: Google Cloud project ID. Required for google_vertex.
+                not: { pattern: '\.\.' }
+                description: Google Cloud project ID. Required for google_vertex. Interpolated into the provider endpoint path, so the traversal sequence `..` is rejected.
               google_region:
                 type: string
                 minLength: 1
@@ -31468,7 +32152,8 @@ components:
                 description: Google Vertex AI region (e.g. us-central1). Required for google_vertex.
               google_service_account_json:
                 type: string
-                description: Google service account JSON contents (the file body, not the path). Required for google_vertex; used to mint OAuth2 access tokens via JWT bearer flow.
+                minLength: 1
+                description: Google service account JSON contents (the file body, not the path). Required for google_vertex; used to mint OAuth2 access tokens via JWT bearer flow. An empty value is treated as absent and fails configuration admission.
               aws_region:
                 type: string
                 minLength: 1
@@ -31539,6 +32224,24 @@ components:
                     allow_plaintext:
                       const: true
                   required: [allow_plaintext]
+              # google_gemini, google_vertex, and aws_bedrock interpolate the
+              # RESOLVED model into the endpoint path, so every provider-native
+              # model identifier they may resolve to is additionally restricted
+              # to a safe URL path component - no '/' or '+'. The general
+              # identifier charset stays in force for the client-facing keys,
+              # which are never interpolated into a URL.
+              - if:
+                  required: [provider_type]
+                  properties:
+                    provider_type:
+                      enum: [google_gemini, google_vertex, aws_bedrock]
+                then:
+                  properties:
+                    default_model:
+                      pattern: '^[A-Za-z0-9._:-]+$'
+                    model_mapping:
+                      additionalProperties:
+                        pattern: '^[A-Za-z0-9._:-]+$'
         fallback_enabled:
           type: boolean
           default: true
@@ -31604,27 +32307,27 @@ components:
     AiStreamRouterConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_stream_router — streaming counterpart to ai_federation. Claims ONLY OpenAI Chat Completions requests with `stream: true` and preserves true end-to-end SSE streaming. Runs at priority 2984 (before ai_semantic_cache at 4057, before ai_federation at 4060). Instead of an internal terminate-and-respond HTTP call, it rewrites the routing decision via RequestContext.route_override_* so the normal proxy dispatch streams the provider response straight back to the client. Strips client credential headers (Authorization, Proxy-Authorization, Cookie, and API-key headers) and injects the provider's credential; gateway-asserted x-consumer-* identity headers are also suppressed toward the provider. openai/openai_compatible providers pass through unchanged except optional stream_options.include_usage injection; anthropic requests are translated to the Anthropic Messages API streaming request and Anthropic SSE events are normalized to OpenAI chat.completion.chunk SSE. google_gemini requests are translated to Gemini/streamGenerateContent (Vertex-compatible) and provider SSE/JSON streams are normalized to OpenAI chat.completion.chunk SSE. When it claims a request it sets ctx.metadata ai_stream_router_claimed=true so ai_federation defers. Fails closed by default when a streaming request lacks a top-level string `model` or matches no provider. Non-streaming requests Continue to ai_federation. Provider fallback is NOT implemented and a `fallback` config block is REJECTED at admission (issue #3328): the plugin commits one provider route, credential set, backend TLS resolution, and translated request body before dispatch and never switches providers, pre- or post-first-byte, so a stored fallback policy could only be silently inert. No ai_stream_router.fallback_attempts metadata is emitted. Configuration is strict: unknown root and provider fields are rejected with path-qualified diagnostics (and spelling suggestions when useful), so typos such as `enabeld` cannot silently leave the router enabled. The same constructor contract admits file validate/startup, Admin/database writes, and CP/DP snapshot or reload publication; invalid enabled configs reject publication and retain the last-known-good instance under the plugin's FailClosed policy. NOTE: this plugin is HTTP-only and routes over the normal dispatch path, so per-proxy backend TLS/DNS egress policy applies to provider endpoints."
+      description: "Plugin: ai_stream_router — streaming counterpart to ai_federation. Claims ONLY OpenAI Chat Completions requests with `stream: true` and preserves true end-to-end SSE streaming. Runs at priority 2984 (before ai_semantic_cache at 4057, before ai_federation at 4060). Instead of an internal terminate-and-respond HTTP call, it rewrites the routing decision via RequestContext.route_override_* so the normal proxy dispatch streams the provider response straight back to the client. Strips client credential headers (Authorization, Proxy-Authorization, Cookie, and API-key headers) and injects the provider's credential; gateway-asserted x-consumer-* identity headers are also suppressed toward the provider. openai/openai_compatible providers pass through unchanged except optional stream_options.include_usage injection; anthropic requests are translated to the Anthropic Messages API streaming request and Anthropic SSE events are normalized to OpenAI chat.completion.chunk SSE. google_gemini requests are translated to Gemini/streamGenerateContent (Vertex-compatible) and provider SSE/JSON streams are normalized to OpenAI chat.completion.chunk SSE. When it claims a request it sets ctx.metadata ai_stream_router_claimed=true so ai_federation defers. Fails closed by default when a streaming request lacks a top-level string `model` or matches no provider. Non-streaming requests Continue to ai_federation. Provider fallback is NOT implemented and a `fallback` config block is REJECTED at admission (issue #3328): the plugin commits one provider route, credential set, backend TLS resolution, and translated request body before dispatch and never switches providers, pre- or post-first-byte, so a stored fallback policy could only be silently inert. No ai_stream_router.fallback_attempts metadata is emitted. Configuration is strict: unknown root and provider fields are rejected with path-qualified diagnostics (and spelling suggestions when useful), so typos such as `enabeld` cannot silently leave the router enabled. The same constructor contract admits file validate/startup, Admin/database writes, and CP/DP snapshot or reload publication; invalid enabled configs reject publication and retain the last-known-good instance under the plugin's FailClosed policy. NOTE: this plugin is HTTP-only and routes over the normal dispatch path, but the claim commits its own egress policy rather than inheriting the proxy's: an https provider endpoint is verified against the system trust store unless that provider sets inherit_backend_tls: true, and any dns_override inherited from the matched proxy is explicitly revoked so the provider host resolves through provider DNS."
       required: [providers]
       properties:
         enabled:
-          type: boolean
+          type: [boolean, "null"]
           default: true
           description: Master switch. When false the plugin never claims requests.
         fail_on_missing_model:
-          type: boolean
+          type: [boolean, "null"]
           default: true
           description: Reject a streaming request that lacks a top-level string `model`. Set to false to pass such requests through (to ai_federation / normal backend).
         fail_on_no_matching_provider:
-          type: boolean
+          type: [boolean, "null"]
           default: true
           description: Reject a streaming request whose `model` matches no configured provider. Set to false to pass such requests through.
         inject_usage_options:
-          type: boolean
+          type: [boolean, "null"]
           default: true
           description: For openai/openai_compatible providers, inject stream_options.include_usage=true so the provider emits a final usage event.
         normalize_response_stream:
-          type: boolean
+          type: [boolean, "null"]
           default: true
           description: Normalize provider-native SSE (e.g. Anthropic Messages API events) to OpenAI chat.completion.chunk SSE. Disabling forwards provider-native SSE verbatim.
         providers:
@@ -31638,7 +32341,8 @@ components:
             properties:
               name:
                 type: string
-                description: Unique provider name (surfaced in ai_stream_router.provider metadata).
+                minLength: 1
+                description: Unique provider name (surfaced in ai_stream_router.provider metadata). Must be non-empty, and unique across the instance's providers; that uniqueness check is a runtime admission rule this schema cannot express.
               provider_type:
                 type: string
                 enum:
@@ -31649,69 +32353,96 @@ components:
                 description: "Provider wire format. openai/openai_compatible pass through; anthropic and google_gemini are translated + normalized to OpenAI chat.completion.chunk SSE."
               endpoint:
                 type: string
+                minLength: 1
+                pattern: "^[Hh][Tt][Tt][Pp][Ss]?://"
                 description: "Full https (or http with allow_plaintext) provider streaming endpoint URL, e.g. https://api.openai.com/v1/chat/completions, https://api.anthropic.com/v1/messages, or https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent. May contain a literal {model} path placeholder (required for typical Gemini/Vertex model routing). An endpoint query string (e.g. an Azure-style ?api-version=...) is preserved and merged with the client's own query using '&'. IPv6 literal hosts are bracketed in the forwarded authority."
               api_key:
                 type: string
-                description: "Provider API key. Supports a ${ENV_VAR} reference resolved from the process environment. Injected as Authorization: Bearer for openai(-compatible), x-api-key for anthropic, x-goog-api-key for google_gemini."
+                minLength: 1
+                description: "Provider API key. The resolved value must be a valid HTTP header value (no CR, LF, NUL, or other control byte) or construction fails. Supports a ${ENV_VAR} reference resolved from the process environment. Injected as Authorization: Bearer for openai(-compatible), x-api-key for anthropic, x-goog-api-key for google_gemini."
               model_patterns:
                 type: array
                 minItems: 1
                 items:
                   type: string
-                description: "Non-empty glob patterns matched against the request `model` (exact or prefix, e.g. ['gpt-*', 'o*'] or ['claude-*'])."
+                  minLength: 1
+                description: "Non-empty glob patterns matched against the request `model`. `*` is the only wildcard, matches any run of characters except URL-structural separators (`/ ? # & \\`) and whitespace, and the pattern is anchored at both ends — so `*mini` matches `model-mini` and `mini-mini` alike, and never matches `mini-pro`. Example: ['gpt-*', 'o*'] or ['claude-*']."
               priority:
-                type: integer
+                type: [integer, "null"]
                 minimum: 1
-                description: "Lower = matched first. Defaults to provider index + 1."
+                maximum: 4294967295
+                description: "Lower = matched first. Defaults to provider index + 1. Stored as a u32, so a larger value is rejected; an explicit null means omission."
               allow_plaintext:
-                type: boolean
+                type: [boolean, "null"]
                 default: false
-                description: Permit an http:// endpoint (rejected by default).
+                description: "Permit an http:// endpoint. Plaintext provider egress is rejected by default, so this is the required opt-in for an internal HTTP-compatible provider. It has no effect on an https endpoint and does not relax runtime TLS/FIPS policy. An explicit null means omission."
               anthropic_version:
-                type: string
+                type: [string, "null"]
                 default: "2023-06-01"
-                description: anthropic-version header value sent to Anthropic providers.
+                description: "anthropic-version header value sent to Anthropic providers. Must be a valid HTTP header value; an explicit null means omission and keeps the default."
               inherit_backend_tls:
-                type: boolean
+                type: [boolean, "null"]
                 default: false
-                description: "By default an https provider endpoint is verified against the system trust store (default backend TLS). Set true to keep the proxy's own resolved backend TLS instead — custom CA bundle, SNI/SAN policy, and backend mTLS client certificate — for internal openai_compatible endpoints behind private PKI. No effect on http endpoints."
+                description: "By default an https provider endpoint is verified against the system trust store (default backend TLS). Set true to keep the proxy's own resolved backend TLS instead — custom CA bundle, SNI/SAN policy, and backend mTLS client certificate — for internal openai_compatible endpoints behind private PKI. No effect on http endpoints. An explicit null means omission."
+            allOf:
+              # Plaintext provider egress is opt-in: an http:// endpoint without
+              # allow_plaintext: true is refused by the constructor.
+              - if:
+                  required: [endpoint]
+                  properties:
+                    endpoint:
+                      pattern: "^[Hh][Tt][Tt][Pp]://"
+                then:
+                  required: [allow_plaintext]
+                  properties:
+                    allow_plaintext:
+                      const: true
 
     A2aGatewayConfig:
       type: object
       required: [discovery]
-      description: "Plugin: a2a_gateway — transparent Agent-to-Agent protocol gateway for HTTP JSON-RPC, HTTP+JSON/REST, and gRPC/grpcs A2A traffic. The implemented A2A protocol version is 0.3.x, whose canonical gRPC service is a2a.v1.A2AService (package a2a.v1); A2A 1.0's lf.a2a.v1.A2AService carries a renumbered AgentCard and is never decoded as 0.3. Detects standard A2A methods, optionally denies methods by gateway policy, rewrites HTTP JSON and unary gRPC Agent Card endpoint URLs to the gateway address, preserves SSE/gRPC streaming for non-card traffic, and emits a2a.* metadata for existing Ferrum logging, tracing, chargeback, WAF, and alerting plugins. It does not manage A2A task state or aggregate multiple agents in V1. Cannot be composed with request_deduplication on the same proxy while discovery.public_base_url is unset and discovery.trust_forwarded_headers is true; admission rejects that pairing with 400 because the rewritten Agent Card origin is then derived from per-request forwarded headers and the connection's TLS SNI, neither of which a replay fingerprint binds. A configured discovery.public_base_url composes normally."
+      additionalProperties: false
+      description: "Plugin: a2a_gateway — transparent Agent-to-Agent protocol gateway for HTTP JSON-RPC, HTTP+JSON/REST, and gRPC/grpcs A2A traffic. The implemented A2A protocol version is 0.3.x, whose canonical gRPC service is a2a.v1.A2AService (package a2a.v1); A2A 1.0's lf.a2a.v1.A2AService carries a renumbered AgentCard and is never decoded as 0.3. Detects standard A2A methods, optionally denies methods by gateway policy, rewrites HTTP JSON and unary gRPC Agent Card endpoint URLs to the gateway address, preserves SSE/gRPC streaming for non-card traffic, and emits a2a.* metadata for existing Ferrum logging, tracing, chargeback, WAF, and alerting plugins. It does not manage A2A task state or aggregate multiple agents in V1. Cannot be composed with request_deduplication on the same proxy while discovery.public_base_url is unset and discovery.trust_forwarded_headers is true; admission rejects that pairing with 400 because the rewritten Agent Card origin is then derived from per-request forwarded headers and the connection's TLS SNI, neither of which a replay fingerprint binds. A configured discovery.public_base_url composes normally. Null is accepted everywhere a value is optional and means the same thing as omitting the key. Unknown keys are rejected at construction, at the root and inside every nested fixed-shape object."
       properties:
         enabled:
-          type: boolean
+          type: [boolean, "null"]
           default: true
         mode:
-          type: string
-          enum: [transparent_proxy]
+          type: [string, "null"]
+          enum: [transparent_proxy, null]
           default: transparent_proxy
         endpoint:
-          type: object
+          type: [object, "null"]
+          additionalProperties: false
           properties:
             path:
-              type: string
+              type: [string, "null"]
+              minLength: 1
+              pattern: '^/'
               default: /a2a
-              description: Public JSON-RPC A2A endpoint path.
+              description: Public JSON-RPC A2A endpoint path. Must be a non-empty absolute path beginning with /.
             agent_card_path:
-              type: string
+              type: [string, "null"]
+              minLength: 1
+              pattern: '^/'
               default: /.well-known/agent-card.json
-              description: Public Agent Card discovery path suffix.
+              description: Public Agent Card discovery path suffix. Must be a non-empty absolute path beginning with /.
             protocol_versions:
-              type: array
+              type: [array, "null"]
               minItems: 1
               items:
                 type: string
+                minLength: 1
+                pattern: '\S'
               default: ["0.3.0"]
               description: Supported A2A protocol versions as EXACT version strings. There is no family, range, or wildcard syntax - listing 0.3.0 admits 0.3.0 and not 0.3.99. The first entry is the gateway's preferred version for a2a.protocol_version metadata. gRPC Agent Card rewriting additionally requires the responding gRPC service to declare the a2a-0.3 card schema (see endpoint.grpc_services) AND the matched version to belong to the implemented A2A 0.3 wire layout, so an exactly-configured 1.0.0 is still refused.
             grpc_services:
-              type: array
+              type: [array, "null"]
               minItems: 1
               items:
                 oneOf:
                   - type: string
+                    pattern: '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$'
                     description: Fully-qualified gRPC service name. A published A2A service name resolves to the Agent Card wire layout the A2A specification gives it - a2a.v1.A2AService is A2A 0.3 (card_schema a2a-0.3) and lf.a2a.v1.A2AService is A2A 1.0 (card_schema a2a-1.0). Any other name is a custom service with no published layout and resolves to card_schema none.
                   - type: object
                     required: [service]
@@ -31719,42 +32450,50 @@ components:
                     properties:
                       service:
                         type: string
-                        description: Fully-qualified gRPC service name.
+                        pattern: '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$'
+                        description: Fully-qualified gRPC service name. Required; null is not accepted here. Duplicate service names across entries are rejected.
                       card_schema:
-                        type: string
-                        enum: [a2a-0.3, a2a-1.0, none]
+                        type: [string, "null"]
+                        enum: [a2a-0.3, a2a-1.0, none, null]
                         description: Agent Card protobuf wire layout this service is declared to serve. a2a-0.3 is the only layout the gateway decodes and rewrites; a2a-1.0 and none are detected and policed but fail card rewriting closed. Omitted means the published layout for a published A2A service name and none for a custom one. Declaring a value that contradicts a published A2A service name is rejected - the layout is a property of the protocol, not of the deployment.
               default: ["a2a.v1.A2AService", "lf.a2a.v1.A2AService"]
               description: "Fully-qualified gRPC service names recognized as A2A services, each with a declared Agent Card wire layout. RPCs on these services are detected, mapped to canonical a2a.method names, and gated by method policy from request metadata alone - request protobuf payloads are never decoded. The defaults recognize both the canonical A2A 0.3 service a2a.v1.A2AService (package a2a.v1 in a2aproject/A2A at tag v0.3.0) and A2A 1.0's lf.a2a.v1.A2AService so upgrades preserve method-policy enforcement for either published identity. The 0.3 service is the identity whose card layout the default endpoint.protocol_versions 0.3.0 describes. The 1.0 service uses package lf.a2a.v1 with a renumbered AgentCard; it is detected and policed by default while card rewriting on it fails closed with agent_card_grpc_schema_unsupported rather than decoding a 1.0 card as 0.3. The one decoded payload is the unary Agent Card reply (GetAgentCard / GetExtendedAgentCard) on an a2a-0.3 service when discovery.rewrite_agent_card_urls is enabled - a proven-successful reply is decoded against the A2A 0.3.x Agent Card wire layout, rewritten, and re-encoded as a single uncompressed frame, and anything unsupported or malformed fails closed with a fixed diagnostic. A card RPC on a service whose declared layout is none fails closed with agent_card_grpc_schema_undeclared; set discovery.rewrite_agent_card_urls false or declare card_schema a2a-0.3 for such a deployment. All other gRPC responses, including streaming ones, pass through undecoded."
         detection:
-          type: object
+          type: [object, "null"]
+          additionalProperties: false
           properties:
             bindings:
-              type: array
+              type: [array, "null"]
               minItems: 1
               items:
                 type: string
-                enum: [jsonrpc, rest, grpc]
+                enum: [jsonrpc, "json-rpc", rest, http_json, "http+json", grpc]
               default: [jsonrpc, rest, grpc]
+              description: A2A bindings to detect. Each entry is one of three bindings, and two of them accept aliases that normalize to the canonical name - "json-rpc" is "jsonrpc", and "http_json" and "http+json" are "rest". The list must be non-empty; repeating a binding under two spellings is accepted and deduplicates.
             version_header:
-              type: string
+              type: [string, "null"]
+              minLength: 1
+              pattern: '^[!#$%&''*+.^_`|~0-9A-Za-z-]+$'
               default: A2A-Version
-              description: Header used to record/accept A2A protocol version hints.
+              description: Header used to record/accept A2A protocol version hints. Must be a valid non-empty HTTP field name.
             max_request_body_size:
-              type: integer
+              type: [integer, "null"]
               format: uint64
+              minimum: 0
+              maximum: 18446744073709551615
               default: 1048576
               description: Maximum JSON-RPC request body bytes parsed for A2A detection; 0 means no plugin-level detection limit. Oversized JSON-RPC candidates fail closed when default_action is deny or any per-method deny rule is configured.
             allow_unknown_methods_with_version_header:
-              type: boolean
+              type: [boolean, "null"]
               default: true
               description: Treat JSON-RPC requests carrying the version header as A2A even when the method is not in the built-in standard-method table. Metadata records method as unknown to bound cardinality.
             strip_accept_encoding:
-              type: boolean
+              type: [boolean, "null"]
               default: true
               description: Remove Accept-Encoding on non-streaming A2A HTTP requests whose responses may be parsed or rewritten by the plugin. Enabling this plugin with the default true value marks request headers mutable for all traffic on the proxy.
         discovery:
           type: object
+          additionalProperties: false
           anyOf:
             - required: [rewrite_agent_card_urls]
               properties:
@@ -31769,51 +32508,93 @@ components:
                   minItems: 1
           properties:
             rewrite_agent_card_urls:
-              type: boolean
+              type: [boolean, "null"]
               default: true
               description: Rewrite Agent Card endpoint URLs for detected HTTP JSON and unary gRPC card requests. Rewrites JSON-RPC endpoint URLs, preserves non-JSONRPC interface URLs such as GRPC and HTTP+JSON, removes stale signatures after mutation, and re-encodes A2A 0.3.x protobuf Agent Cards on the gRPC path. The gRPC path only inspects a proven-successful reply - HTTP 200 with a terminal grpc-status of exactly 0 - so a non-OK upstream response is forwarded as written rather than mistaken for a card. It rewrites the A2A 0.3.x wire layout only and requires positive proof of it TWICE - the responding gRPC service must be declared to carry the a2a-0.3 card schema (endpoint.grpc_services; a service declared a2a-1.0 or none fails closed with agent_card_grpc_schema_unsupported / agent_card_grpc_schema_undeclared before a byte is decoded) AND the card must carry an explicit protocol_version that exactly matches a configured endpoint.protocol_versions entry AND belongs to the 0.3 family. A card with an absent or empty protocol_version fails closed with a trailers-only gRPC INTERNAL under HTTP 200 and an unsupported_agent_card_protobuf_version diagnostic, and is not assumed to be 0.3.x even when endpoint.protocol_versions lists only 0.3.x. A2A renumbered AgentCard for 1.0, so guessing would corrupt the card and re-serve it under a stale signature. All seventeen known 0.3 top-level fields are schema-validated before any rewrite - each must carry the wire type the 0.3 schema declares (a canonical 0/1 varint for supports_authenticated_extended_card), each singular field may appear at most once, and every known string that is re-emitted must be valid UTF-8. url and every AgentInterface url must parse as a bounded absolute http/https URL with a real host and no embedded credentials, and an AgentInterface without a url is refused rather than counted as a usable endpoint. Faults fail closed with agent_card_protobuf_field_wire_mismatch, agent_card_protobuf_field_duplicated, agent_card_protobuf_string_invalid, agent_card_protobuf_bool_invalid, agent_card_protobuf_interface_url_missing, or agent_card_protobuf_url_layout_mismatch. The submessages the rewriter preserves rather than parses - provider, capabilities, security_schemes, security, skills, and signatures - are checked for wire type and multiplicity only; their contents are never decoded and are not claimed to be well formed. Unknown fields with any valid wire type are preserved untouched. Diagnostics are fixed strings; response bytes are never reflected into grpc-message or metadata. Set this to false when fronting a non-0.3 A2A backend; leaving it true refuses such cards rather than serving un-rewritten internal URLs.
             public_base_url:
-              type: string
+              type: [string, "null"]
               format: uri
+              maxLength: 4096
+              pattern: '^[Hh][Tt][Tt][Pp][Ss]?://(?![^/?#]*@)[^/?#\s\\][^\s?#\\]*$'
               description: Explicit public gateway base URL, for example https://agents.example.com. Rewriting defaults to enabled and requires this value or trust_forwarded_headers=true with nonempty allowed_public_origins. Empty plugin configurations fail admission. Explicit rewrite_agent_card_urls=false selects unchanged backend cards. When deriving an origin, X-Forwarded-* and Host must select an allowed normalized origin; missing, malformed, comma-separated or unlisted origins fail closed before backend dispatch with agent_card_public_origin_unavailable (HTTP 502 or gRPC INTERNAL). Configuring this value is also what makes the Agent Card rewrite a pure function of configuration, which is required to compose this plugin with request_deduplication on the same proxy.
             trust_forwarded_headers:
-              type: boolean
+              type: [boolean, "null"]
               default: false
               description: Derive the public gateway origin from X-Forwarded-Proto, X-Forwarded-Host, and Host when discovery.public_base_url is omitted. Requires nonempty allowed_public_origins when rewriting is enabled; the trusted front door must replace forwarded headers. Schemes and ports must match an allowed normalized origin. In that request-derived mode the origin also depends on whether the connection carried a TLS SNI hostname, which no replay fingerprint binds, so admission rejects the pair with request_deduplication on the same proxy with 400 (fatal in file mode, rejected update in DP) and the runtime retains and replays nothing. Setting discovery.public_base_url resolves it; a configured public base composes normally.
             allowed_public_origins:
-              type: array
+              type: [array, "null"]
               default: []
               items:
                 type: string
                 format: uri
+                maxLength: 4096
+                pattern: '^[Hh][Tt][Tt][Pp][Ss]?://(?![^/?#]*@)[^/?#\s\\]+/?$'
               description: Allowed absolute HTTP(S) origins for request-derived card URLs, without paths, credentials, queries or fragments. Required with trust_forwarded_headers when rewriting is enabled and public_base_url is absent. Compared after URL origin normalization, including scheme and non-default port. A configured public_base_url takes precedence.
         observability:
-          type: object
+          type: [object, "null"]
+          additionalProperties: false
           properties:
             emit_metadata:
-              type: boolean
+              type: [boolean, "null"]
               default: true
               description: Emit a2a.* request and response metadata for downstream logging, tracing, authz, and chargeback plugins. When true (default), detected non-streaming A2A HTTP responses are buffered so response metadata (a2a.task_id, a2a.context_id, a2a.task_state, a2a.error) can be extracted; SSE and non-card gRPC responses are never buffered for metadata. Detected unary gRPC Agent Card responses are buffered when discovery.rewrite_agent_card_urls is true so protobuf cards can be rewritten. Detected 2xx SSE streams are observed without buffering and write a2a.stream_events plus any observed a2a.task_id, a2a.context_id, and a2a.task_state into transaction metadata at stream termination, where key-based metadata redaction applies. The buffer is bounded by the global FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES limit, not max_payload_size. Set false together with discovery.rewrite_agent_card_urls=false to keep responses fully streaming; request detection and method policy still apply.
             log_payloads:
-              type: boolean
+              type: [boolean, "null"]
               default: false
               description: Copies bounded A2A response payloads into metadata. Payloads can contain secrets or PII and are copied verbatim into a2a.payload.response rather than field-redacted; enable only for protected logging paths. Request payloads are not logged. Requires emit_metadata=true, because payload capture writes the a2a.payload.response metadata key; with emit_metadata=false this option has no effect.
             max_payload_size:
-              type: integer
+              type: [integer, "null"]
               format: uint64
               default: 1048576
               minimum: 1
+              maximum: 18446744073709551615
               description: Payload logging byte limit. Task and context identifiers, textual errors and protocol-version metadata are capped at min(max_payload_size, 1024) UTF-8 bytes including a trailing ~ marker, with a companion .truncated flag. Task states are normalized to the protocol state set; unrecognized states become unknown with .unrecognized=true, and normalized states too large for this limit are omitted with .truncated=true. Applies to request hints, JSON replies and SSE completion metadata; does not cap response buffering or alter response bytes.
         policy:
-          type: object
+          type: [object, "null"]
+          additionalProperties: false
           properties:
             default_action:
-              type: string
-              enum: [allow, deny]
+              type: [string, "null"]
+              enum: [allow, deny, null]
               default: allow
               description: With deny or any per-method deny rule, unrecognized requests inside the configured endpoint, discovery or gRPC-service scope fail closed, including unsupported payloads, methods, paths and disabled bindings. Known batch members are individually policed. Unrelated sibling paths and services are outside scope.
             methods:
-              type: object
+              type: [object, "null"]
+              propertyNames:
+                enum:
+                  - message/send
+                  - message/stream
+                  - tasks/get
+                  - tasks/list
+                  - tasks/cancel
+                  - tasks/resubscribe
+                  - tasks/pushNotificationConfig/set
+                  - tasks/pushNotificationConfig/get
+                  - tasks/pushNotificationConfig/list
+                  - tasks/pushNotificationConfig/delete
+                  - agent/getCard
+                  - agent/getExtendedAgentCard
+                  - agent/getAuthenticatedExtendedCard
+                  - unknown
+                  - SendMessage
+                  - SendStreamingMessage
+                  - GetTask
+                  - ListTasks
+                  - CancelTask
+                  - SubscribeToTask
+                  - TaskSubscription
+                  - CreateTaskPushNotificationConfig
+                  - CreateTaskPushNotification
+                  - GetTaskPushNotificationConfig
+                  - GetTaskPushNotification
+                  - ListTaskPushNotificationConfigs
+                  - ListTaskPushNotificationConfig
+                  - ListTaskPushNotification
+                  - DeleteTaskPushNotificationConfig
+                  - DeleteTaskPushNotification
+                  - GetAgentCard
+                  - GetExtendedAgentCard
+                  - GetAuthenticatedExtendedCard
               description: >-
                 Per-method policy overrides. Keys must be a canonical A2A method name —
                 message/send, message/stream, tasks/get, tasks/list, tasks/cancel,
@@ -31823,14 +32604,20 @@ components:
                 agent/getExtendedAgentCard, agent/getAuthenticatedExtendedCard — or the
                 literal "unknown". PascalCase gRPC/REST aliases such as SendMessage or
                 GetTask are accepted and normalized to these canonical names.
-                Unrecognized keys are rejected at config validation.
+                Unrecognized keys are rejected at config validation. Two keys that
+                canonicalize to the same method — for example "tasks/get" and
+                "GetTask", or "SubscribeToTask" and "TaskSubscription" — are a
+                duplicate and are rejected; that cross-key restriction is not
+                expressible in this schema.
               additionalProperties:
                 type: object
                 required: [action]
+                additionalProperties: false
                 properties:
                   action:
                     type: string
                     enum: [allow, deny]
+                    description: Required; null is not accepted here.
 
     McpGatewayConfig:
       type: object
@@ -32409,6 +33196,66 @@ components:
             api_chargeback instance must resolve to the same projection because
             one render cache serves them all. See docs/log_schema.md.
 
+    ApiChargebackSinkLogField:
+      type: string
+      description: Native exported charge-event field available to omit or rename.
+      enum:
+        - event_id
+        - received_at
+        - node_id
+        - namespace
+        - consumer_id
+        - consumer_name
+        - proxy_id
+        - proxy_name
+        - route_id
+        - status_code
+        - http_status_code
+        - grpc_status
+        - protocol
+        - call_count
+        - charge_call
+        - bytes_sent
+        - bytes_received
+        - charge_bytes_sent
+        - charge_bytes_received
+        - charge_total
+        - currency
+        - pricing_version
+        - request_id
+        - trace_id
+        - snapshot_id
+
+    ApiChargebackSinkLogSchema:
+      description: >-
+        Projection of the exported charge-event record. Supports omit, rename,
+        order, static_fields, and derived_fields. The summary_type,
+        timestamp_format, and metadata keys are forbidden, even with null or
+        default values. received_at remains an epoch-nanosecond integer.
+        Derived kinds are status_class (from billable status_code), summary_kind
+        (always charge_event), and outcome (error for status_code >= 500 or a
+        nonzero grpc_status, otherwise ok). backend_host is unavailable.
+        Shared constructor checks still enforce output-key uniqueness,
+        sensitive-data restrictions, omit/rename conflicts, and order coverage
+        against the final output keys. See docs/log_schema.md.
+      allOf:
+        - $ref: "#/components/schemas/SummaryLogSchema"
+        - properties:
+            summary_type: false
+            timestamp_format: false
+            metadata: false
+            omit:
+              items:
+                $ref: "#/components/schemas/ApiChargebackSinkLogField"
+            rename:
+              propertyNames:
+                $ref: "#/components/schemas/ApiChargebackSinkLogField"
+            derived_fields:
+              items:
+                properties:
+                  kind:
+                    enum: [status_class, summary_kind, outcome]
+
     ApiChargebackSinkConfig:
       type: object
       additionalProperties: false
@@ -32442,28 +33289,40 @@ components:
 
         OpenAPI encodes material cross-field invariants that JSON Schema can
         represent accurately: `clickhouse` (with runtime-mandatory `url`) is
-        required; snapshot mode requires `spool.enabled=true`; nonempty
+        required; snapshot mode forbids `spool.enabled=false`; nonempty
         `clickhouse.password_ref` requires `https://` and forbids disabled TLS
         certificate/hostname verification; `clickhouse.url` must be http(s)
-        without user-info; batch/spool/snapshot numeric bounds match the
-        constructor.
+        without user-info; `clickhouse.tls.client_cert_file` and
+        `client_key_file` must be set together; `pricing_tiers[].status_codes`
+        entries are unique within a tier; and batch/spool/snapshot numeric,
+        length, and character bounds match the constructor. Settings the
+        constructor ignores while `spool.enabled` is false (`dir`, `max_bytes`,
+        `replay_interval_secs`, `delivery_queue_capacity`) are constrained only
+        while spooling is enabled, which is the default.
 
-        Runtime admission layer (not safely expressible as OpenAPI 3.1
-        comparisons or input-independent checks):
-        `retry.max_delay_ms >= retry.initial_delay_ms`;
+        Cold constructor validation (`validate`, Admin, file mode, and CP-DP all
+        share it) adds the checks that need no I/O but that OpenAPI 3.1 cannot
+        express safely: `retry.max_delay_ms >= retry.initial_delay_ms`;
         worst-case cumulative inter-attempt delay
         (`retry.max_attempts` / `retry.initial_delay_ms` / `retry.max_delay_ms`)
         must not exceed 600000 ms;
-        `snapshot.stale_entry_ttl_secs >= snapshot.interval_secs`;
-        nonempty `password_ref` must name a set `FERRUM_*` process environment
-        variable; spool directory privacy/permissions
-        (`ensure_private_dir`); ClickHouse URL egress IP screening;
-        `wait_for_async_insert` falsy values require
-        `clickhouse.allow_lossy_async_insert=true`; and
-        whitespace-only trimming for `currency` / `pricing_version` /
-        `password_ref`. File, Admin, and CP-DP admission all invoke the same
-        plugin constructor validation path.
+        `snapshot.stale_entry_ttl_secs >= snapshot.interval_secs`; ClickHouse
+        URL egress IP screening; whitespace-only trimming for `currency` /
+        `pricing_version` / `password_ref`; that a nonempty `password_ref` *is
+        spelled* `FERRUM_*`; and UTF-8 byte bounds where `maxLength` above
+        counts characters instead.
+
+        Activation (serving startup) adds the checks that require local files,
+        the process environment, or the filesystem, and therefore do NOT run
+        under `ferrum-edge validate`: resolving `password_ref` to a set
+        environment variable, reading/parsing the TLS CA and client
+        certificate/key files, and creating the spool tree with private
+        permissions (`ensure_private_dir`). A configuration accepted by
+        `validate` can still abort serving startup on a node missing those
+        files or variables.
       allOf:
+        - not:
+            required: [schema, schema_ref]
         - anyOf:
             - required: [pricing_tiers]
               properties:
@@ -32503,14 +33362,67 @@ components:
               mode:
                 const: snapshot
           then:
-            required: [spool]
+            not:
+              required: [spool]
+              properties:
+                spool:
+                  type: object
+                  required: [enabled]
+                  properties:
+                    enabled:
+                      const: false
+        - not:
+            required: [clickhouse]
+            properties:
+              clickhouse:
+                type: object
+                required: [tls]
+                properties:
+                  tls:
+                    type: object
+                    oneOf:
+                      - required: [client_cert_file]
+                        properties:
+                          client_cert_file:
+                            type: string
+                          client_key_file:
+                            type: "null"
+                      - required: [client_key_file]
+                        properties:
+                          client_key_file:
+                            type: string
+                          client_cert_file:
+                            type: "null"
+        - if:
+            not:
+              required: [spool]
+              properties:
+                spool:
+                  type: object
+                  required: [enabled]
+                  properties:
+                    enabled:
+                      const: false
+          then:
             properties:
               spool:
                 type: object
-                required: [enabled]
                 properties:
-                  enabled:
-                    const: true
+                  dir:
+                    type: string
+                    minLength: 1
+                    not:
+                      pattern: '[\x00]'
+                  max_bytes:
+                    type: integer
+                    minimum: 1
+                  replay_interval_secs:
+                    type: integer
+                    minimum: 1
+                  delivery_queue_capacity:
+                    type: integer
+                    minimum: 1
+                    maximum: 1000000
         - not:
             allOf:
               - required: [clickhouse]
@@ -32577,15 +33489,29 @@ components:
         currency:
           type: string
           minLength: 1
+          maxLength: 512
           pattern: '\S'
           default: "USD"
-          description: Currency label written to each charge event. Runtime also rejects whitespace-only values after trim.
+          description: >-
+            Currency label written to each charge event. Runtime also rejects
+            whitespace-only values after trim, and bounds the label at 512
+            UTF-8 bytes: it is copied verbatim into every exported row and
+            counts against the bounded charge-event budget, so a longer label
+            would make every per-event export fail admission. `maxLength`
+            counts characters, so the runtime byte bound is the stricter of the
+            two for non-ASCII labels.
         pricing_version:
           type: string
           minLength: 1
+          maxLength: 512
           pattern: '\S'
           default: default
-          description: Operator-controlled pricing/version label written to each event. Runtime also rejects whitespace-only values after trim.
+          description: >-
+            Operator-controlled pricing/version label written to each event.
+            Runtime also rejects whitespace-only values after trim, and bounds
+            the label at 512 UTF-8 bytes for the same reason as `currency`.
+            `maxLength` counts characters, so the runtime byte bound is the
+            stricter of the two for non-ASCII labels.
         include_request_id:
           type: boolean
           default: true
@@ -32605,6 +33531,7 @@ components:
               status_codes:
                 type: array
                 minItems: 1
+                uniqueItems: true
                 items:
                   type: integer
                   minimum: 100
@@ -32667,10 +33594,10 @@ components:
               default: charges_raw
               description: ClickHouse table identifier interpolated into INSERT. ASCII letters, digits, underscore, and dot only.
             username:
-              type: string
-              description: Optional ClickHouse HTTP Basic username.
+              type: [string, "null"]
+              description: Optional ClickHouse HTTP Basic username. `null` is accepted and means unset.
             password_ref:
-              type: string
+              type: [string, "null"]
               pattern: '^\s*(?:FERRUM_.*)?\s*$'
               description: |
                 FERRUM_* environment variable containing the ClickHouse password,
@@ -32690,10 +33617,16 @@ components:
                   description: PEM CA bundle for this ClickHouse endpoint.
                 client_cert_file:
                   type: [string, "null"]
-                  description: PEM client certificate for ClickHouse mTLS.
+                  description: >-
+                    PEM client certificate for ClickHouse mTLS. Must be set
+                    together with `client_key_file`; the constructor rejects an
+                    incomplete pair during file/Admin/CP-DP admission rather
+                    than only when the TLS client is built.
                 client_key_file:
                   type: [string, "null"]
-                  description: PEM client private key for ClickHouse mTLS.
+                  description: >-
+                    PEM client private key for ClickHouse mTLS. Must be set
+                    together with `client_cert_file`.
                 verify_hostname:
                   type: boolean
                   default: true
@@ -32704,8 +33637,21 @@ components:
                   description: Disable certificate verification for this ClickHouse endpoint. Logs a warning and cannot be used with password_ref. Testing only.
             insert_query_params:
               type: object
+              propertyNames:
+                minLength: 1
+                maxLength: 128
+                allOf:
+                  - not:
+                      pattern: '[\x00-\x1f\x7f-\x9f]'
+                  - not:
+                      pattern: '[Aa][Pp][Ii][Kk][Ee][Yy]|[Aa][Pp][Ii]_[Kk][Ee][Yy]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll]|[Pp][Aa][Ss][Ss][Ww][Dd]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Tt][Oo][Kk][Ee][Nn]'
+                  - not:
+                      pattern: '^[Uu][Ss][Ee][Rr]$|^[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]$|^[Ss][Ee][Ss][Ss][Ii][Oo][Nn]_[Ii][Dd]$'
               additionalProperties:
                 type: string
+                maxLength: 512
+                not:
+                  pattern: '[\x00-\x1f\x7f-\x9f]'
               default: {}
               description: |
                 Extra query parameters appended to the ClickHouse INSERT request.
@@ -32729,6 +33675,11 @@ components:
                 string in any diagnostic; failures report a structurally
                 redacted `scheme://host:port/redacted` endpoint. Admin audit
                 projections redact every value in this map.
+
+                Names are 1-128 bytes and values at most 512 bytes, and neither
+                may contain a Unicode control character. The `maxLength`
+                keywords above count characters, so for non-ASCII names or
+                values the runtime UTF-8 byte bound is the stricter of the two.
             allow_lossy_async_insert:
               type: boolean
               default: false
@@ -32825,11 +33776,15 @@ components:
               default: true
             dir:
               type: string
-              minLength: 1
               default: /var/lib/ferrum/chargeback-spool
+              description: >-
+                Spool root. Constrained only while spooling is enabled (the
+                default): the constructor requires a nonempty, NUL-free path,
+                and ignores `dir`, `max_bytes`, `replay_interval_secs`, and
+                `delivery_queue_capacity` entirely when `enabled` is false.
             max_bytes:
               type: integer
-              minimum: 1
+              minimum: 0
               default: 10737418240
               description: |
                 Hard ceiling on total encoded on-disk bytes owned by this sink under
@@ -32861,12 +33816,11 @@ components:
                 being read or expanded without bound.
             replay_interval_secs:
               type: integer
-              minimum: 1
+              minimum: 0
               default: 60
             delivery_queue_capacity:
               type: integer
-              minimum: 1
-              maximum: 1000000
+              minimum: 0
               default: 4096
               description: >-
                 Bounded async handoff queue for overflow and failed-batch spool
@@ -32920,7 +33874,7 @@ components:
                 increments the explicit cardinality-rejection counter.
             max_retained_bytes:
               type: integer
-              minimum: 1
+              minimum: 9440
               maximum: 268435456
               default: 67108864
               description: |
@@ -32932,12 +33886,19 @@ components:
                 additionally requires the value to be at least one bounded
                 charge-event size.
         schema:
-          $ref: "#/components/schemas/SummaryLogSchema"
+          $ref: "#/components/schemas/ApiChargebackSinkLogSchema"
         schema_ref:
           type: string
+          minLength: 1
           description: >-
-            Name of a schema registered by a `transaction_log_schema` plugin.
-            Mutually exclusive with `schema`. Projects the exported charge-event
+            Nonempty name of a schema registered by a `transaction_log_schema`
+            plugin. Mutually exclusive with `schema` by key presence, including
+            null values. The referenced definition must also satisfy
+            ApiChargebackSinkLogSchema; existence and compatibility are checked
+            at construction, since JSON Schema cannot resolve registry contents.
+            Named definitions must first compile against the transaction-summary
+            field inventory, so use inline schema for charge-event-only fields.
+            Projects the exported charge-event
             record (the JSONEachRow row delivered to ClickHouse and the durable
             spool artifact that replays it), not the pricing, the accumulator
             identities, or the snapshot keys. Renaming a field renames the
@@ -33371,7 +34332,14 @@ components:
           properties:
             endpoint:
               type: string
-              description: ClickHouse endpoint with user-info, query, and fragment stripped.
+              description: >-
+                Structurally redacted ClickHouse endpoint,
+                `scheme://host:port/redacted`. User-info, path, query, and
+                fragment are never rendered, so this surface cannot disclose a
+                credential embedded in the configured URL that the admin
+                plugin-config read path already withholds from non-admin roles.
+                The durable spool owner still binds the full sanitized endpoint,
+                so redaction here does not move artifact ownership.
             database:
               type: string
             table:
