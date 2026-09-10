@@ -25175,12 +25175,56 @@ components:
         prefers a rewritten UTF-8 request_body metadata view when present,
         falls back to raw buffered bytes when no text view exists, then the
         transport-proven-empty witness, and otherwise fails closed; the final
-        request-body hook validates the exact backend-visible bytes.
-        Representation-gap diagnostics are fixed strings and never echo body
-        bytes.
+        request-body hook validates the exact backend-visible bytes. A request
+        that declares a non-identity Content-Encoding is not judged early at
+        all: the shared backend-visible representation gate decodes it under
+        bounded, budget-charged limits and the final request-body hook
+        validates the resulting plaintext before any byte reaches the backend,
+        so a valid gzip JSON/XML upload succeeds while an undecodable coding is
+        still refused. Representation-gap diagnostics are fixed strings and
+        never echo body bytes. Every constraint below mirrors a runtime
+        admission rule, so a configuration this schema accepts is one
+        BodyValidator::new accepts, except for two dependencies that are
+        node-local and cannot be expressed statically: protobuf_descriptor_path
+        must name a readable FileDescriptorSet, and every configured message
+        type must resolve inside it.
+      anyOf:
+        - required: [json_schema]
+        - required: [required_fields]
+          properties:
+            required_fields:
+              minItems: 1
+        - required: [validate_xml]
+          properties:
+            validate_xml:
+              const: true
+        - required: [required_xml_elements]
+          properties:
+            required_xml_elements:
+              minItems: 1
+        - required: [response_json_schema]
+        - required: [response_required_fields]
+          properties:
+            response_required_fields:
+              minItems: 1
+        - required: [response_validate_xml]
+          properties:
+            response_validate_xml:
+              const: true
+        - required: [response_required_xml_elements]
+          properties:
+            response_required_xml_elements:
+              minItems: 1
+        - required: [protobuf_descriptor_path, protobuf_request_type]
+        - required: [protobuf_descriptor_path, protobuf_response_type]
+        - required: [protobuf_descriptor_path, protobuf_method_messages]
+          properties:
+            protobuf_method_messages:
+              minProperties: 1
       properties:
         json_schema:
           type: object
+          minProperties: 1
           description: >-
             JSON Schema for request body validation. Compiled at plugin
             construction under json_schema_draft; a malformed schema, an unknown
@@ -25211,8 +25255,12 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
           default: []
-          description: Simple required field names in request body
+          description: >-
+            Simple required field names in request body. Empty entries are
+            rejected at construction; an empty list simply configures no
+            required-field rule.
         validate_xml:
           type: boolean
           default: false
@@ -25228,15 +25276,24 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            pattern: "^(\\{[^{}]*\\})?[^\\s{}<>&/:'\"=]+$"
           default: []
           description: >-
             Required XML element names, matched against parsed element names.
             A bare name matches that local name in any namespace; Clark notation
             ("{http://example.com/ns}item") requires the expanded namespace URI
-            and local name to match, and "{}item" requires no namespace.
+            and local name to match, and "{}item" requires no namespace. An
+            entry that opens Clark notation without closing it, or whose local
+            name is empty or is not an XML NCName (no whitespace, markup,
+            braces, or "prefix:local" spelling), is rejected at construction:
+            the matcher compares against parsed local names, so such an entry
+            could never be satisfied by any well-formed document.
         xml_max_entities:
           type: integer
           format: uint64
+          minimum: 0
+          maximum: 18446744073709551615
           default: 100
           description: >-
             Max <!ENTITY declarations allowed in an XML DOCTYPE before the body
@@ -25248,11 +25305,19 @@ components:
           default: true
           description: >-
             Reject XML whose entity definitions reference other general
-            entities (the billion-laughs expansion signature).
+            entities (the billion-laughs expansion signature). Entity
+            declaration names and general/parameter entity references are read
+            with the XML Name grammar, the same production the parser uses, so
+            a non-ASCII entity name is subject to the restriction rather than
+            invisible to it. When this is enabled, an entity declaration the
+            policy cannot read a replacement text out of is refused outright
+            rather than counted as safe.
         content_types:
           type: array
           items:
             type: string
+            minLength: 1
+            pattern: "^[ \t]*[0-9A-Za-z!#$%&'*+.^_`|~-]+/[0-9A-Za-z!#$%&'*+.^_`|~-]+[ \t]*(;.*)?$"
           default: ["application/json", "application/xml", "text/xml"]
           description: >-
             Request media types to validate. Matching uses the Content-Type
@@ -25263,6 +25328,7 @@ components:
             actual headers do not match and are skipped.
         response_json_schema:
           type: object
+          minProperties: 1
           description: >-
             JSON Schema for response body validation. Compiled at plugin
             construction under json_schema_draft with the same fail-closed rules
@@ -25272,8 +25338,11 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
           default: []
-          description: Required field names in response
+          description: >-
+            Required field names in response. Empty entries are rejected at
+            construction; an empty list configures no required-field rule.
         response_validate_xml:
           type: boolean
           default: false
@@ -25285,11 +25354,19 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            pattern: "^(\\{[^{}]*\\})?[^\\s{}<>&/:'\"=]+$"
           default: []
+          description: >-
+            Required XML element names in responses, with the same parsing,
+            Clark-notation, and XML NCName admission rules as
+            required_xml_elements.
         response_content_types:
           type: array
           items:
             type: string
+            minLength: 1
+            pattern: "^[ \t]*[0-9A-Za-z!#$%&'*+.^_`|~-]+/[0-9A-Za-z!#$%&'*+.^_`|~-]+[ \t]*(;.*)?$"
           default: ["application/json", "application/xml", "text/xml"]
           description: >-
             Response media types to validate. Same exact type/subtype matching
@@ -25297,6 +25374,7 @@ components:
             parameter collisions and malformed headers do not match).
         protobuf_descriptor_path:
           type: string
+          minLength: 1
           description: >-
             Node-local path to a compiled FileDescriptorSet binary
             (protoc --descriptor_set_out --include_imports). CP admission is
@@ -25305,39 +25383,65 @@ components:
             closed.
         protobuf_request_type:
           type: string
-          description: Default fully-qualified protobuf message type for request validation
+          minLength: 1
+          description: >-
+            Default fully-qualified protobuf message type for request
+            validation. Requires protobuf_descriptor_path.
         protobuf_response_type:
           type: string
-          description: Default fully-qualified protobuf message type for response validation
+          minLength: 1
+          description: >-
+            Default fully-qualified protobuf message type for response
+            validation. Requires protobuf_descriptor_path.
         protobuf_method_messages:
           type: object
+          propertyNames:
+            pattern: "^/[^/?#\\s]+/[^/?#\\s]+$"
           additionalProperties:
             type: object
             additionalProperties: false
+            minProperties: 1
+            anyOf:
+              - required: [request]
+              - required: [response]
             properties:
               request:
                 type: string
+                minLength: 1
                 description: Fully-qualified protobuf message type for request validation
               response:
                 type: string
+                minLength: 1
                 description: Fully-qualified protobuf message type for response validation
           description: >-
-            Per-method message type overrides keyed by gRPC path. Each entry
-            accepts only 'request' and 'response'; any other key rejects the
-            configuration.
+            Per-method message type overrides keyed by gRPC path. Requires
+            protobuf_descriptor_path. Each key must be the gRPC method path the
+            hooks look up — '/package.Service/Method': one leading '/', exactly
+            two non-empty segments, and no whitespace, control character,
+            query, or fragment. A key spelled any other way could never be
+            selected by the exact method lookup, so it is rejected rather than
+            admitted as an inert rule. Each entry accepts only 'request' and
+            'response', must set at least one of them, and any other key
+            rejects the configuration.
         protobuf_reject_unknown_fields:
           type: boolean
           default: false
           description: >-
-            Reject messages containing field numbers not in the descriptor. This
-            is independent of proto2 required-field initialization, which is
-            always enforced: a decoded message that omits any proto2 required
-            field, at the top level or inside a present nested/repeated/map/
-            extension message value, is rejected regardless of this setting.
+            Reject messages containing field numbers not in the descriptor, at
+            the top level and inside every present nested, repeated, map-value,
+            oneof, and extension message value, in both directions, under the
+            same bounded 32-level / 50000-message walk as the initialization
+            check. The rejection carries a count only, never a field number or
+            payload byte. This is independent of proto2 required-field
+            initialization, which is always enforced: a decoded message that
+            omits any proto2 required field, at the top level or inside a
+            present nested/repeated/map/extension message value, is rejected
+            regardless of this setting.
         grpc_max_decompressed_size_bytes:
           type: integer
           format: uint64
           minimum: 0
+          maximum: 18446744073709551615
           description: >-
             Maximum decompressed gRPC protobuf payload size in bytes for both
             request and response validation. Nonnegative integer matching runtime

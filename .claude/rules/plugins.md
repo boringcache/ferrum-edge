@@ -519,7 +519,13 @@ on a native-gRPC request.
   `ai_prompt_shield`), falls back to `ctx.request_body_bytes` when no text view
   exists (retained via `needs_request_body_bytes()` so non-UTF-8 cannot look
   like "no body"), treats `ctx.replay_request_body_empty_proven()` as the
-  transport's own empty proof, and fails closed otherwise. The final
+  transport's own empty proof, and fails closed otherwise. A representation
+  that reached the early hook but carries a non-identity `Content-Encoding` is
+  the one case the early hook does NOT judge: it has no decoder, so the verdict
+  belongs to step 5c's staged plaintext and the final hook, which still run
+  before backend egress. That deferral is taken only when the instance's own
+  final request-body policy claims the request; a MISSING representation still
+  fails closed early. The final
   request-body hook still validates the exact backend-visible bytes. Native
   gRPC always runs `parse_grpc_frame`. The only exemptions are protocol-defined:
   empty terminal gRPC *error* replies (a single valid non-zero `grpc-status`),

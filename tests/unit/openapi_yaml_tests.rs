@@ -4966,22 +4966,25 @@ fn body_validator_grpc_max_decompressed_size_bytes_stays_in_openapi_docs_and_run
         );
     }
 
+    // Each instance carries a rule-bearing key: the schema now refuses a
+    // configuration with no validation rule at all, exactly as the constructor
+    // does (issue #5122).
     assert_component_validity(
         &spec,
         "BodyValidatorConfig",
-        &json!({"grpc_max_decompressed_size_bytes": 0}),
+        &json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": 0}),
         true,
     );
     assert_component_validity(
         &spec,
         "BodyValidatorConfig",
-        &json!({"grpc_max_decompressed_size_bytes": -1}),
+        &json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": -1}),
         false,
     );
     assert_component_validity(
         &spec,
         "BodyValidatorConfig",
-        &json!({"grpc_max_decompressed_size_bytes": "10"}),
+        &json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": "10"}),
         false,
     );
 
@@ -10820,6 +10823,109 @@ fn body_validator_schema_is_closed_and_matches_the_runtime_key_set() {
         schema["properties"]["json_schema_draft"]["enum"],
         json!(["draft2020-12", "draft7"])
     );
+}
+
+/// Issue #5122: the published `BodyValidatorConfig` schema must accept exactly
+/// the configurations the runtime constructor admits.
+///
+/// Two node-local dependencies stay runtime-only and are deliberately not
+/// represented statically: the descriptor file must exist, and every configured
+/// message type must resolve inside it. Everything else — rule presence,
+/// non-empty schemas/strings/map entries, unsigned bounds, media-type and
+/// Clark-notation shape, and gRPC method-path selectors — is asserted in both
+/// directions so a generated client cannot build a configuration the gateway
+/// then refuses.
+#[test]
+fn body_validator_schema_admits_exactly_what_the_constructor_admits() {
+    use ferrum_edge::plugins::body_validator::BodyValidator;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for config in [
+        // No validation rule at all.
+        json!({}),
+        json!({"validate_xml": false}),
+        json!({"response_validate_xml": false}),
+        json!({"required_fields": []}),
+        // Present but unusable rule values.
+        json!({"json_schema": {}}),
+        json!({"response_json_schema": {}}),
+        json!({"required_fields": [""]}),
+        json!({"response_required_fields": [""]}),
+        json!({"required_xml_elements": ["two words"]}),
+        json!({"required_xml_elements": ["{unclosed"]}),
+        json!({"response_required_xml_elements": ["two words"]}),
+        // Out-of-domain integers.
+        json!({"validate_xml": true, "xml_max_entities": -1}),
+        json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": -1}),
+        // Malformed media types.
+        json!({"validate_xml": true, "content_types": ["application"]}),
+        json!({"validate_xml": true, "content_types": [""]}),
+        json!({"validate_xml": true, "response_content_types": ["json"]}),
+        // Protobuf cross-field shape.
+        json!({"protobuf_request_type": "audit.Message"}),
+        json!({"protobuf_response_type": "audit.Message"}),
+        json!({"protobuf_descriptor_path": ""}),
+        json!({"protobuf_descriptor_path": "/srv/audit.bin"}),
+        json!({
+            "protobuf_descriptor_path": "/srv/audit.bin",
+            "protobuf_method_messages": {}
+        }),
+        json!({
+            "protobuf_descriptor_path": "/srv/audit.bin",
+            "protobuf_method_messages": {"/audit.Service/Echo": {}}
+        }),
+        json!({
+            "protobuf_descriptor_path": "/srv/audit.bin",
+            "protobuf_method_messages": {
+                "audit.Service/Echo": {"request": "audit.Message"}
+            }
+        }),
+    ] {
+        assert!(
+            BodyValidator::validate_config(&config).is_err(),
+            "runtime admission must reject {config}"
+        );
+        assert_component_validity(&spec, "BodyValidatorConfig", &config, false);
+    }
+
+    for config in [
+        json!({"validate_xml": true}),
+        json!({"response_validate_xml": true}),
+        json!({"required_fields": ["name"]}),
+        json!({"response_required_fields": ["id"]}),
+        json!({"json_schema": {"type": "object"}}),
+        json!({"response_json_schema": {"type": "object"}}),
+        json!({"required_xml_elements": ["item", "{}item"]}),
+        json!({"response_required_xml_elements": ["{urn:x}item"]}),
+        // An empty media list means "every valid media type", and an explicit
+        // zero cap disables the decompressed ceiling; both must survive.
+        json!({"validate_xml": true, "content_types": []}),
+        json!({"validate_xml": true, "xml_max_entities": 0}),
+        json!({
+            "validate_xml": true,
+            "content_types": ["application/json; charset=utf-8"]
+        }),
+        json!({
+            "protobuf_descriptor_path": "/srv/audit.bin",
+            "protobuf_request_type": "audit.Message"
+        }),
+        json!({
+            "protobuf_descriptor_path": "/srv/audit.bin",
+            "protobuf_response_type": "audit.Message"
+        }),
+        json!({
+            "protobuf_descriptor_path": "/srv/audit.bin",
+            "protobuf_method_messages": {
+                "/audit.Service/Echo": {"request": "audit.Message"}
+            }
+        }),
+    ] {
+        BodyValidator::validate_config(&config)
+            .unwrap_or_else(|error| panic!("runtime must accept {config}: {error}"));
+        assert_component_validity(&spec, "BodyValidatorConfig", &config, true);
+    }
 }
 
 /// Advisory GHSA-8594-2xhc-8g38: the observability sinks whose endpoint may
