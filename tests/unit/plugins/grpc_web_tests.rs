@@ -4573,25 +4573,40 @@ fn accept_parameterized_ranges_match_type_without_vetoing_or_changing_mode() {
     // unparameterized match so an unrelated range can win.
     let request = "application/grpc-web+proto";
     assert_eq!(
-        negotiate(request, Some("application/grpc-web;q=1, application/grpc-web-text;charset=utf-8"))
-            .expect("parameterized negotiation"),
-        negotiate(request, Some("application/grpc-web;q=1, application/grpc-web-text"))
-            .expect("unparameterized negotiation"),
+        negotiate(
+            request,
+            Some("application/grpc-web;q=1, application/grpc-web-text;charset=utf-8")
+        )
+        .expect("parameterized negotiation"),
+        negotiate(
+            request,
+            Some("application/grpc-web;q=1, application/grpc-web-text")
+        )
+        .expect("unparameterized negotiation"),
     );
     assert_eq!(
-        negotiate(request, Some("application/grpc-web;q=1, application/grpc-web-text;charset=utf-8"))
-            .expect("parameterized negotiation"),
+        negotiate(
+            request,
+            Some("application/grpc-web;q=1, application/grpc-web-text;charset=utf-8")
+        )
+        .expect("parameterized negotiation"),
         "application/grpc-web+proto"
     );
     assert_eq!(
-        negotiate(request, Some("*/*, application/grpc-web-text;charset=utf-8"))
-            .expect("parameterized exact still beats wildcard"),
+        negotiate(
+            request,
+            Some("*/*, application/grpc-web-text;charset=utf-8")
+        )
+        .expect("parameterized exact still beats wildcard"),
         negotiate(request, Some("*/*, application/grpc-web-text"))
             .expect("unparameterized exact beats wildcard"),
     );
     assert_eq!(
-        negotiate(request, Some("*/*, application/grpc-web-text;charset=utf-8"))
-            .expect("parameterized exact still beats wildcard"),
+        negotiate(
+            request,
+            Some("*/*, application/grpc-web-text;charset=utf-8")
+        )
+        .expect("parameterized exact still beats wildcard"),
         "application/grpc-web-text+proto"
     );
     assert_eq!(

@@ -983,9 +983,7 @@ async fn grpc_web_accept_negotiates_h1_h2_success_and_rejection_paths() {
             Some("application/grpc-web+proto;version=2"),
         )
         .await
-        .unwrap_or_else(|error| {
-            panic!("{version:?} parameterized-only request failed: {error}")
-        });
+        .unwrap_or_else(|error| panic!("{version:?} parameterized-only request failed: {error}"));
         assert_ne!(
             status, 406,
             "{version:?} a parameterized type match must not 406 on its own"
