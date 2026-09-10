@@ -77,12 +77,32 @@ jobs:
         env:
           RUST_LOG: error,boring_cache_cli::storage_transfer=info
           BORINGCACHE_TRANSFER_HTTP2: ${{ inputs.transfer_http2 }}
+          BORINGCACHE_OBSERVABILITY_JSONL_PATH: ${{ runner.temp }}/restore-observability.jsonl
         run: |
           boringcache --version
           df -h .
           boringcache restore boringcache/ferrum-edge \
             --entry fuzz-target-toolchain-e3b99108dfccdd33-graph-551e4f3879e93b22-branch-boringcache-validation-ubuntu-24-x86_64:fuzz/target \
             --no-git --no-platform --fail-on-cache-miss --fail-on-cache-error
+
+      - name: Record archive phase resources
+        if: always()
+        env:
+          PHASE_LOG: ${{ runner.temp }}/restore-observability.jsonl
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["PHASE_LOG"])
+          if path.exists():
+              for line in path.read_text().splitlines():
+                  event = json.loads(line)
+                  if event.get("schema") == "archive_graph_phase.v1":
+                      print(json.dumps({"duration_ms": event.get("duration_ms"),
+                                        "lifecycle": event.get("lifecycle")}))
+          PY
 
       - name: Measure target files and inspect Cargo fingerprints
         run: |
