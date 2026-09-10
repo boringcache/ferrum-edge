@@ -19457,41 +19457,86 @@ components:
       type: object
       additionalProperties: false
       description: >-
-        Plugin: otel_tracing — W3C Trace Context propagation and OTLP/Zipkin/Datadog
-        span export. Trace-context trust defaults to untrusted (fail-closed). Parent
-        sampling is honored; root sampling defaults to always_on. Server span names
-        use low-cardinality proxy/route identifiers. Every configured property is
-        non-null; omit optional properties instead of sending null.
+        Plugin: otel_tracing — W3C Trace Context propagation and OTLP/HTTP JSON
+        span export. This plugin has no exporter selector and always exports OTLP;
+        Zipkin, Datadog, and Lightstep span export is configured through mesh
+        Telemetry providers on workload_metrics. Trace-context trust defaults to
+        untrusted (fail-closed). Parent sampling is honored; root sampling defaults
+        to always_on. Server span names use low-cardinality proxy/route identifiers.
+        Every configured property is non-null; omit optional properties instead of
+        sending null. Configured strings are trimmed before use, so a whitespace-only
+        value is rejected, and the enum-valued properties are accepted
+        case-insensitively.
+      allOf:
+        # root_sampling_ratio is admitted only with root_sampling=ratio, and
+        # root_sampling=ratio requires it. Both directions are rejected at
+        # construction.
+        - if:
+            required: [root_sampling_ratio]
+          then:
+            required: [root_sampling]
+            properties:
+              root_sampling:
+                pattern: '^\s*[Rr][Aa][Tt][Ii][Oo]\s*$'
+        - if:
+            required: [root_sampling]
+            properties:
+              root_sampling:
+                pattern: '^\s*[Rr][Aa][Tt][Ii][Oo]\s*$'
+          then:
+            required: [root_sampling_ratio]
       properties:
         endpoint:
           type: string
           minLength: 1
+          pattern: '^\s*[Hh][Tt][Tt][Pp][Ss]?://[^\s/?#@]+([/?#][^\s]*)?\s*$'
           description: >-
-            OTLP/HTTP collector endpoint. Omit for propagation-only mode.
-            URL userinfo is rejected; path/query credentials are redacted in diagnostics.
+            OTLP/HTTP collector endpoint. Omit for propagation-only mode. Must be an
+            http or https URL with a non-empty host. URL userinfo is rejected;
+            path/query credentials are redacted in diagnostics.
         service_name:
           type: string
           minLength: 1
+          pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: ferrum-edge
-          description: Service name in spans and resource attributes
+          description: >-
+            Service name in spans and resource attributes. Trimmed before use and
+            rejected when blank. Retained as configured, not bounded by
+            max_attribute_bytes.
         deployment_environment:
           type: string
           minLength: 1
-          description: deployment.environment resource attribute
+          pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
+          description: >-
+            deployment.environment resource attribute. Trimmed before use and rejected
+            when blank. Retained as configured, not bounded by max_attribute_bytes.
         generate_trace_id:
           type: boolean
           default: true
           description: Generate trace IDs for requests without a usable incoming traceparent
         headers:
           type: object
+          propertyNames:
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           additionalProperties:
             type: string
+            pattern: '^[^\u0000-\u0008\u000A-\u001F\u007F]*$'
           default: {}
-          description: Custom HTTP headers sent with OTLP exports (values treated as secrets)
+          description: >-
+            Custom HTTP headers sent with OTLP exports (values treated as secrets).
+            Field names must be HTTP tokens and values must be legal HTTP header
+            values; both are rejected at construction otherwise.
         authorization:
           type: string
           minLength: 1
-          description: Authorization header value for OTLP exports (secret)
+          allOf:
+            - pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
+            - pattern: '^[^\u0000-\u0008\u000A-\u001F\u007F]*$'
+          description: >-
+            Authorization header value for OTLP exports (secret). Trimmed before use,
+            rejected when blank, and rejected when it is not a legal HTTP header value
+            — including in propagation-only mode. Diagnostics for a rejected value
+            name the field and the expected type only, never the value.
         batch_size:
           type: integer
           default: 50
@@ -19509,7 +19554,12 @@ components:
           default: 10000
           minimum: 1
           maximum: 100000
-          description: Max pending spans; new spans are dropped when the buffer is full
+          description: >-
+            Capacity of the exporter's span queue; new spans are dropped when that
+            queue is full. The flush worker holds its in-flight batch outside this
+            queue, so total pending spans can reach buffer_capacity + batch_size.
+            Aggregate retention is bounded by buffer_max_bytes and the process
+            observability byte ceiling.
         buffer_max_bytes:
           type: integer
           default: 16777216
@@ -19521,7 +19571,11 @@ components:
           default: 2048
           minimum: 64
           maximum: 16384
-          description: Max retained bytes per string span attribute
+          description: >-
+            Max retained bytes per request-derived string span attribute (consumer,
+            user agent, route, namespace, addresses, url.path, mesh attributes).
+            Configured identity — service_name and deployment_environment, in both the
+            span and resource attribute sets — is retained as configured.
         max_retries:
           type: integer
           default: 2
@@ -19533,20 +19587,30 @@ components:
           default: 1000
           minimum: 0
           maximum: 60000
-          description: Delay between retries
+          description: >-
+            Base delay before the first retry. Subsequent retries double it with
+            +/-25% jitter, capped at 60000 ms. A collector Retry-After header on a
+            retryable response (delay-seconds or HTTP-date) overrides this delay for
+            that attempt, also capped at 60000 ms. Only 429, 502, 503, and 504 are
+            retried; every other non-success status discards the batch.
         trace_context_trust:
           type: string
-          enum: [untrusted, trusted]
+          pattern: '^\s*([Uu][Nn][Tt][Rr][Uu][Ss][Tt][Ee][Dd]|[Tt][Rr][Uu][Ss][Tt][Ee][Dd])\s*$'
           default: untrusted
           description: >-
-            Whether inbound W3C parents are adopted. untrusted (default) creates a
-            fresh root and never parents under caller-chosen IDs. trusted adopts a
-            valid lowercase W3C parent for internal/mesh propagation.
+            Whether inbound W3C parents are adopted. Canonical values are untrusted
+            and trusted; the value is trimmed and matched case-insensitively.
+            untrusted (default) creates a fresh root and never parents under
+            caller-chosen IDs. trusted adopts a valid lowercase W3C parent for
+            internal/mesh propagation.
         root_sampling:
           type: string
-          enum: [always_on, always_off, ratio]
+          pattern: '^\s*([Aa][Ll][Ww][Aa][Yy][Ss]_[Oo][Nn]|[Aa][Ll][Ww][Aa][Yy][Ss]_[Oo][Ff][Ff]|[Rr][Aa][Tt][Ii][Oo])\s*$'
           default: always_on
-          description: Sampling policy for locally created root traces
+          description: >-
+            Sampling policy for locally created root traces. Canonical values are
+            always_on, always_off, and ratio; the value is trimmed and matched
+            case-insensitively.
         root_sampling_ratio:
           type: number
           minimum: 0
