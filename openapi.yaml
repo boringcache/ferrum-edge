@@ -18144,23 +18144,36 @@ components:
 
     WsLoggingConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: ws_logging — Sends transaction logs to a WebSocket endpoint in
         batches with bounded establishment/write timeouts, per-entry and
         queued-byte admission budgets, and structurally redacted endpoint
-        diagnostics.
+        diagnostics. Unknown top-level keys are rejected. `schema` and
+        `schema_ref` are mutually exclusive. `buffer_max_bytes` must be at
+        least 2 * (max_entry_bytes + 1) at runtime; this schema encodes the
+        absolute floor (2050) but cannot express that sibling-field arithmetic.
       required:
         - endpoint_url
+      allOf:
+        - not:
+            required: [schema, schema_ref]
       properties:
         endpoint_url:
           type: string
+          minLength: 1
+          format: uri
+          pattern: '^[wW][sS][sS]?://(?![^/?#]*@)(?:\[[^\]\s]+\]|[^/?#:\s]+)(?::[0-9]+)?(?:[/?#].*)?$'
           description: >-
             WebSocket URL (ws:// or wss://) to send transaction logs to. Must
             include a hostname and must not include URL user information.
             Path/query credentials are permitted for collectors that require
             them, but operational diagnostics always use a structurally
             redacted form (`scheme://host[:port]/redacted`). Malformed or
-            non-WebSocket schemes are rejected at config load time.
+            non-WebSocket schemes are rejected at config load time. The
+            constructor canonicalizes the value (lowercase scheme,
+            percent-encoded path) before the collector handshake so admitted
+            representations match the tungstenite request URI.
         reconnect_delay_ms:
           type: integer
           default: 5000
@@ -18232,11 +18245,15 @@ components:
             Aggregate serialized-content budget across queued records,
             contiguous batch assembly, and retries. Admission conservatively
             reserves two copies plus JSON-array framing, so this value must be
-            greater than or equal to 2 * (max_entry_bytes + 1).
+            greater than or equal to 2 * (max_entry_bytes + 1). Runtime
+            validation enforces that sibling-field lower bound; this schema
+            encodes only the absolute floor (2050) when max_entry_bytes is at
+            its minimum.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
           type: string
+          minLength: 1
           description: >-
             Name of a schema registered by a `transaction_log_schema` plugin.
             Mutually exclusive with `schema`. WebSocket disconnect entries are
