@@ -2064,26 +2064,82 @@ impl BoundedResponseBodyConstruction {
     }
 }
 
-/// Lifecycle of a unary gRPC Agent Card rewrite `a2a_gateway` claimed on the
-/// response path (issue #3297).
+/// One `a2a_gateway` instance's private claim over a request (`GHSA-593v-25wm-37mw`).
+///
+/// Endpoint, discovery, and gRPC-service scopes are per instance, but the
+/// detection facts a response hook needs are per request. Storing them as loose
+/// context fields made them shared: a second instance whose own scope did not
+/// match the request still saw an earlier instance's `detected` flag and applied
+/// ITS `observability` and `discovery` settings — including verbatim payload
+/// capture — to a response it never claimed.
+///
+/// So the claim carries the owning instance id and is handed out only to that
+/// owner ([`RequestContext::a2a_gateway_claim`] /
+/// [`RequestContext::a2a_gateway_claim_mut`]). Claiming is first-wins: at most
+/// one instance owns the A2A interpretation of a request, which is also the only
+/// coherent answer for Agent Card rewriting — two instances rewriting one card
+/// would fight over the published origin. Request-phase method policy is
+/// unaffected and still runs independently in every instance.
+#[derive(Debug, Clone)]
+pub(crate) struct A2aGatewayClaim {
+    /// Process-unique id of the `a2a_gateway` instance that detected this
+    /// request. Every response-phase read is gated on matching it.
+    pub(crate) owner: u64,
+    /// Detected binding (`jsonrpc`, `rest`, or `grpc`).
+    pub(crate) binding: &'static str,
+    pub(crate) is_agent_card: bool,
+    pub(crate) streaming: bool,
+    /// `AgentCard` wire layout the matched gRPC service is CONFIGURED to carry,
+    /// resolved once at detection so the response path never re-derives a
+    /// service identity from a `ctx.path` a route override may have rebased —
+    /// see [`A2aGrpcCardSchema`].
+    pub(crate) grpc_card_schema: Option<A2aGrpcCardSchema>,
+    /// Public origin admitted for this request in `before_proxy`, resolved from
+    /// the hook's own header map.
+    ///
+    /// Retaining the admitted RESULT is what makes Agent Card rewriting
+    /// independent of `detection.strip_accept_encoding`: a proxy on which no
+    /// plugin mutates request headers moves them out of the context entirely, so
+    /// a response hook that re-derived the origin from `ctx.headers` saw an empty
+    /// map and failed a request the allowlist had already admitted.
+    pub(crate) public_base: Option<String>,
+    /// Lifecycle of an Agent Card rewrite this instance admitted. Consumed by
+    /// `on_final_response_body`, which fails closed unless a completed outcome
+    /// was reported — see [`A2aGrpcCardRewriteState`].
+    pub(crate) card_rewrite: Option<A2aGrpcCardRewriteState>,
+    /// Set when the normalize phase actually installed replacement card bytes.
+    ///
+    /// That phase recomputes only `Content-Length`, so the plugin has to
+    /// invalidate the upstream validators itself in the next hook that holds a
+    /// mutable header map. The ordinary transform path needs no such flag: the
+    /// core already runs the shared invalidation for it.
+    pub(crate) card_body_replaced: bool,
+}
+
+/// Lifecycle of an Agent Card rewrite `a2a_gateway` claimed on the response path
+/// (issue #3297).
 ///
 /// The point of a typed state rather than a bare error slot is that "the
-/// transform reported success", "the transform refused", and "the transform
-/// never ran" are three different facts, and only the first may publish the
-/// backend's frame. `on_response_body` admits a card by setting `Staged`; the
-/// transform phase must replace it; `on_final_response_body` refuses anything
-/// still `Staged`.
+/// producing phase reported success", "it refused", and "it never ran" are three
+/// different facts, and only the first may publish the backend's bytes. An
+/// admission phase claims a card by setting `Staged`; the producing phase must
+/// replace it; `on_final_response_body` refuses anything still `Staged`.
+///
+/// Shared by both card representations. The unary gRPC frame and the HTTP JSON
+/// document are admitted and produced by the same two-phase contract, so a
+/// staged rewrite that silently fails to run fails closed the same way on either
+/// binding (`GHSA-r423-f5mr-83x2`).
 ///
 /// Kept private to the crate and out of metadata: a plugin-writable marker could
 /// otherwise suppress the fail-closed terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum A2aGrpcCardRewriteState {
-    /// Admitted in `on_response_body`; the transform phase has not reported.
+    /// Admitted by an earlier phase; the producing phase has not reported.
     Staged,
-    /// The transform phase completed — the frame was rewritten, or provably
+    /// The producing phase completed — the card was rewritten, or provably
     /// needed no rewrite.
     Applied,
-    /// The transform phase refused with this fixed diagnostic.
+    /// The producing phase refused with this fixed diagnostic.
     Failed(&'static str),
     /// The rewrite did not fit the per-response retained ceiling. The shared
     /// capacity terminal owns the client-visible outcome.
@@ -2889,23 +2945,15 @@ pub struct RequestContext {
     /// downstream body is dropped; terminal logging waits on this signal before
     /// draining plugin write-back state.
     response_stream_completion: Option<Arc<ResponseStreamCompletion>>,
-    /// A2A gateway detection state staged between request and response hooks.
+    /// A2A gateway detection state staged between request and response hooks,
+    /// owned by the one `a2a_gateway` instance that claimed the request.
+    ///
     /// Kept out of public metadata so Agent Card rewriting can work even when
-    /// `observability.emit_metadata` is disabled.
-    pub(crate) a2a_gateway_detected: bool,
-    pub(crate) a2a_gateway_binding: Option<&'static str>,
-    pub(crate) a2a_gateway_is_agent_card: bool,
-    pub(crate) a2a_gateway_streaming: bool,
-    /// `AgentCard` wire layout the matched gRPC service is CONFIGURED to carry,
-    /// resolved once at detection so the response path never re-derives a
-    /// service identity from a `ctx.path` a route override may have rebased —
-    /// see [`A2aGrpcCardSchema`].
-    pub(crate) a2a_gateway_grpc_card_schema: Option<A2aGrpcCardSchema>,
-    /// Lifecycle of a unary gRPC Agent Card rewrite `a2a_gateway` admitted in
-    /// `on_response_body`. Consumed by `on_final_response_body`, which fails
-    /// closed unless the transform phase reported a completed outcome — see
-    /// [`A2aGrpcCardRewriteState`].
-    pub(crate) a2a_gateway_grpc_card_rewrite: Option<A2aGrpcCardRewriteState>,
+    /// `observability.emit_metadata` is disabled, and instance-keyed so a
+    /// sibling instance with a disjoint endpoint scope cannot apply its own
+    /// payload-capture or rewrite policy to a response it never claimed
+    /// (`GHSA-593v-25wm-37mw`). Boxed because most requests never touch it.
+    pub(crate) a2a_gateway_claim: Option<Box<A2aGatewayClaim>>,
     /// Exact upstream/public resource URI pair used to route an MCP
     /// `resources/read` request. Kept out of public metadata so upstream URI
     /// details cannot enter transaction logs, while the response hook can
@@ -3559,12 +3607,7 @@ impl RequestContext {
             compression_response_encode_aborted: false,
             response_stream_id: None,
             response_stream_completion: None,
-            a2a_gateway_detected: false,
-            a2a_gateway_binding: None,
-            a2a_gateway_is_agent_card: false,
-            a2a_gateway_streaming: false,
-            a2a_gateway_grpc_card_schema: None,
-            a2a_gateway_grpc_card_rewrite: None,
+            a2a_gateway_claim: None,
             mcp_response_resource_binding: None,
             mcp_trusted_tool_name_rewrite: None,
             mcp_validate_tool_result: None,
@@ -4073,6 +4116,37 @@ impl RequestContext {
 
     pub(crate) fn has_compression_response_admission_owner(&self) -> bool {
         self.compression_response_admission_owner.is_some()
+    }
+
+    /// Record `claim` as this request's A2A detection, unless a sibling
+    /// `a2a_gateway` instance already claimed it.
+    ///
+    /// First-wins, so at most one instance owns the A2A interpretation of a
+    /// request and its response. Returns whether the caller is now the owner —
+    /// including when it already was, so a deferred `before_proxy` pass that
+    /// re-detects the same request keeps its claim (`GHSA-593v-25wm-37mw`).
+    pub(crate) fn claim_a2a_gateway(&mut self, claim: A2aGatewayClaim) -> bool {
+        match self.a2a_gateway_claim.as_ref() {
+            Some(existing) if existing.owner != claim.owner => false,
+            _ => {
+                self.a2a_gateway_claim = Some(Box::new(claim));
+                true
+            }
+        }
+    }
+
+    /// This request's A2A claim, but only for the instance that owns it.
+    pub(crate) fn a2a_gateway_claim(&self, owner: u64) -> Option<&A2aGatewayClaim> {
+        self.a2a_gateway_claim
+            .as_deref()
+            .filter(|claim| claim.owner == owner)
+    }
+
+    /// Mutable view of this request's A2A claim, but only for its owner.
+    pub(crate) fn a2a_gateway_claim_mut(&mut self, owner: u64) -> Option<&mut A2aGatewayClaim> {
+        self.a2a_gateway_claim
+            .as_deref_mut()
+            .filter(|claim| claim.owner == owner)
     }
 
     pub(crate) fn claim_compression_response_admission(&mut self, owner: u64) -> bool {
@@ -4896,12 +4970,16 @@ impl RequestContext {
             ),
             response_stream_id: self.response_stream_id,
             response_stream_completion: self.response_stream_completion.clone(),
-            a2a_gateway_detected: self.a2a_gateway_detected,
-            a2a_gateway_binding: self.a2a_gateway_binding,
-            a2a_gateway_is_agent_card: self.a2a_gateway_is_agent_card,
-            a2a_gateway_streaming: self.a2a_gateway_streaming,
-            a2a_gateway_grpc_card_schema: self.a2a_gateway_grpc_card_schema,
-            a2a_gateway_grpc_card_rewrite: None,
+            // The card-rewrite lifecycle stays on the live context: this
+            // compatibility clone runs only request-body hooks and never
+            // reports a rewrite outcome, so carrying a `Staged` marker into it
+            // would strand the fail-closed decision on a context nobody reads.
+            a2a_gateway_claim: self.a2a_gateway_claim.as_ref().map(|claim| {
+                Box::new(A2aGatewayClaim {
+                    card_rewrite: None,
+                    ..(**claim).clone()
+                })
+            }),
             mcp_response_resource_binding: self.mcp_response_resource_binding.clone(),
             mcp_trusted_tool_name_rewrite: self.mcp_trusted_tool_name_rewrite.clone(),
             mcp_validate_tool_result: self.mcp_validate_tool_result.clone(),
