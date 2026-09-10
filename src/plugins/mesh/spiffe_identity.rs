@@ -23,7 +23,7 @@ use x509_parser::prelude::*;
 
 use crate::identity::SpiffeId;
 use crate::identity::spiffe::UriSanError;
-use crate::plugins::utils::auth_flow;
+use crate::plugins::utils::auth_flow::{self, CredentialDeadline};
 use crate::plugins::utils::cert_validity::CertValidityWindow;
 use crate::plugins::{
     HTTP_FAMILY_AND_STREAM_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext,
@@ -105,19 +105,24 @@ fn derive_peer_spiffe_extraction(der: &[u8]) -> PeerSpiffeExtraction {
 /// Re-check the retained window against wall-clock now and return the immutable
 /// monotonic authorization deadline for this admission.
 ///
-/// `None` refuses the identity. Mirrors `mtls_auth::evaluation_outcome`: X.509
-/// validity is defined against wall-clock time, so the Unix window is consulted
-/// on every request, while the monotonic Instant is converted exactly once and
-/// every later cache hit admits against that captured value — a wall-clock
-/// rollback cannot recreate a later deadline, and an unrepresentable conversion
-/// fails closed without populating the slot.
+/// [`CredentialDeadline::Invalid`] refuses the identity. Mirrors
+/// `mtls_auth::evaluation_outcome`: X.509 validity is defined against
+/// wall-clock time, so the Unix window is consulted on every request, while the
+/// monotonic Instant is converted exactly once and every later cache hit admits
+/// against that captured value — a wall-clock rollback cannot recreate a later
+/// deadline, and an unusable interval fails closed without populating the slot.
+///
+/// [`CredentialDeadline::Unbounded`] is an admission, not a refusal (issue
+/// #5396): a valid SVID whose `notAfter` simply outruns the representable
+/// monotonic range carries no upper bound of its own, and the finite
+/// authenticated-stream maximum bounds the session instead.
 fn admission_deadline(
     validity: &CertValidityWindow,
     monotonic_expiry: &OnceLock<tokio::time::Instant>,
-) -> Option<tokio::time::Instant> {
+) -> CredentialDeadline {
     let now_unix = x509_parser::time::ASN1Time::now().timestamp();
     if !validity.contains(now_unix) {
-        return None;
+        return CredentialDeadline::Invalid;
     }
 
     if let Some(&deadline) = monotonic_expiry.get() {
@@ -125,17 +130,23 @@ fn admission_deadline(
         // already-elapsed bound refuses, never a fresh conversion that could
         // land later after a wall-clock rollback.
         if tokio::time::Instant::now() >= deadline {
-            return None;
+            return CredentialDeadline::Invalid;
         }
-        return Some(deadline);
+        return CredentialDeadline::Bounded(deadline);
     }
 
     let converted =
-        auth_flow::try_credential_deadline_from_unix_seconds(validity.not_after_unix, 0)?;
-    match monotonic_expiry.set(converted) {
-        Ok(()) => Some(converted),
-        Err(_) => Some(monotonic_expiry.get().copied().unwrap_or(converted)),
-    }
+        auth_flow::try_credential_deadline_from_unix_seconds(validity.not_after_unix, 0);
+    let CredentialDeadline::Bounded(deadline) = converted else {
+        // Neither an unbounded nor a refused conversion populates the slot, so a
+        // later request converts again rather than caching a bogus Instant.
+        return converted;
+    };
+    let deadline = match monotonic_expiry.set(deadline) {
+        Ok(()) => deadline,
+        Err(_) => monotonic_expiry.get().copied().unwrap_or(deadline),
+    };
+    CredentialDeadline::Bounded(deadline)
 }
 
 /// Connection-local cache of the peer-cert SPIFFE extraction outcome.
@@ -274,8 +285,12 @@ impl Plugin for SpiffeIdentity {
                 // Time-dependent, so re-decided per request even behind the
                 // connection cache: an H1 keep-alive connection and an H2/H3
                 // connection both serve new requests long after the handshake.
-                let Some(deadline) = admission_deadline(validity, monotonic_expiry) else {
-                    return invalid_svid_reject(SVID_NOT_CURRENTLY_VALID);
+                let deadline = match admission_deadline(validity, monotonic_expiry) {
+                    CredentialDeadline::Bounded(deadline) => Some(deadline),
+                    CredentialDeadline::Unbounded => None,
+                    CredentialDeadline::Invalid => {
+                        return invalid_svid_reject(SVID_NOT_CURRENTLY_VALID);
+                    }
                 };
                 debug!("spiffe_identity: peer SPIFFE ID extracted: {}", id);
                 ctx.admit_certificate_spiffe_principal(id.clone(), deadline);
@@ -321,8 +336,12 @@ impl Plugin for SpiffeIdentity {
                 // `on_stream_connect` runs exactly once, at admission, and is
                 // never repeated — without the deadline the raw TCP/TLS and
                 // DTLS relays would have no bound at all.
-                let Some(deadline) = admission_deadline(&validity, &monotonic_expiry) else {
-                    return invalid_svid_reject(SVID_NOT_CURRENTLY_VALID);
+                let deadline = match admission_deadline(&validity, &monotonic_expiry) {
+                    CredentialDeadline::Bounded(deadline) => Some(deadline),
+                    CredentialDeadline::Unbounded => None,
+                    CredentialDeadline::Invalid => {
+                        return invalid_svid_reject(SVID_NOT_CURRENTLY_VALID);
+                    }
                 };
                 debug!("spiffe_identity: stream peer SPIFFE ID: {}", id);
                 ctx.admit_certificate_spiffe_principal(&id, deadline);

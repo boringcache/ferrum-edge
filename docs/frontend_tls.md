@@ -1186,6 +1186,14 @@ continuously. Issue #3816 tracks that gap.
 - **Boundaries are inclusive.** `notBefore` and `notAfter` themselves are inside
   the window, matching RFC 5280 "valid at" semantics. One second past `notAfter`
   is outside it.
+- **A far-future expiry is not an unusable time.** A leaf carrying RFC 5280's
+  "no well-defined expiration" value `99991231235959Z`, or any `notAfter`
+  further out than the host's monotonic clock can represent, is a valid
+  certificate and authenticates. It simply carries no credential deadline of its
+  own, and the finite `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` bounds
+  the admitted stream instead. Where that boundary sits is platform dependent —
+  a nanosecond-based `Instant` saturates centuries before a `timespec`-based one
+  — so this can never be allowed to decide whether a credential is valid.
 - **The connection cache stays, but never caches a time-dependent decision.**
   HTTP/3 memoizes the expensive X.509 parse, path verification, and identity
   extraction once per plugin instance and transport connection. What is cached

@@ -15,6 +15,7 @@ use ferrum_edge::_test_support::{
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::plugins::mtls_auth::{MtlsAuth, MtlsAuthConnectionCache};
+use ferrum_edge::plugins::utils::auth_flow::CredentialDeadline;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, StreamConnectionContext};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
@@ -438,9 +439,11 @@ fn a_fresh_unix_conversion_after_wall_clock_rollback_would_extend_the_instant() 
     let now = tokio::time::Instant::now();
     let original =
         try_credential_deadline_from_unix_seconds_at_for_test(2_000_000, 0, 2_000_000 - 120, now)
+            .bounded()
             .expect("representable original conversion");
     let after_rollback =
         try_credential_deadline_from_unix_seconds_at_for_test(2_000_000, 0, 2_000_000 - 3_600, now)
+            .bounded()
             .expect("representable rolled-back conversion");
     assert!(
         after_rollback > original,
@@ -450,15 +453,150 @@ fn a_fresh_unix_conversion_after_wall_clock_rollback_would_extend_the_instant() 
 }
 
 #[test]
-fn an_unrepresentable_unix_to_monotonic_conversion_fails_closed() {
+fn an_unusable_unix_to_monotonic_conversion_fails_closed() {
     let now = tokio::time::Instant::now();
+    assert_eq!(
+        try_credential_deadline_from_unix_seconds_at_for_test(-1, 0, 100, now),
+        CredentialDeadline::Invalid,
+        "an expiry before the Unix epoch can never bound a live credential"
+    );
+    assert_eq!(
+        try_credential_deadline_from_unix_seconds_at_for_test(0, u64::MAX, 0, now),
+        CredentialDeadline::Invalid,
+        "a leeway too wide to be a signed offset is a malformed validation \
+         parameter, not a far-future expiry"
+    );
+}
+
+/// The largest monotonic instant reachable from `now` by adding whole seconds.
+///
+/// `std` exposes no `Instant::MAX`, and where the maximum sits is platform
+/// dependent — a nanosecond-based clock saturates centuries before a
+/// `timespec`-based one — so it is found by a bounded binary search instead of
+/// hard-coded. Only used to place `now_mono` where the next second is
+/// unrepresentable.
+fn largest_representable_instant(now: tokio::time::Instant) -> tokio::time::Instant {
+    let (mut lo, mut hi) = (0_u64, u64::MAX);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        let step = std::time::Duration::from_secs(mid);
+        if now.checked_add(step).is_some() {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    now.checked_add(std::time::Duration::from_secs(lo))
+        .expect("the search settles on a representable offset")
+}
+
+#[test]
+fn an_expiry_beyond_the_representable_range_admits_with_no_bound() {
+    // Issue #5396: `None` used to mean BOTH "this interval can never be valid"
+    // and "this expiry is further out than an Instant can hold". The second is
+    // a perfectly valid long-lived certificate and must not fail closed.
+    let now = tokio::time::Instant::now();
+    assert_eq!(
+        try_credential_deadline_from_unix_seconds_at_for_test(i64::MAX, 0, 0, now),
+        CredentialDeadline::Unbounded,
+        "an `i64::MAX` notAfter outruns the monotonic clock, it is not invalid"
+    );
+    assert_eq!(
+        try_credential_deadline_from_unix_seconds_at_for_test(i64::MAX, 1, 0, now),
+        CredentialDeadline::Unbounded,
+        "an overflowing expiry+leeway is far future, not an unusable interval"
+    );
+}
+
+#[test]
+fn a_now_mono_at_the_platform_maximum_admits_with_no_bound() {
+    // Anchored where no further second is representable, so the outcome does
+    // not depend on how far out this platform's monotonic clock reaches.
+    let now_mono = largest_representable_instant(tokio::time::Instant::now());
+    assert_eq!(
+        try_credential_deadline_from_unix_seconds_at_for_test(1_000, 0, 999, now_mono),
+        CredentialDeadline::Unbounded,
+        "a one-second window the clock cannot express is still a live credential"
+    );
+    // Representable deadlines keep their exact behaviour from the same anchor:
+    // an already-elapsed window converts to the anchor itself, which the
+    // callers then compare against `now` as before.
+    assert_eq!(
+        try_credential_deadline_from_unix_seconds_at_for_test(1_000, 0, 1_000, now_mono),
+        CredentialDeadline::Bounded(now_mono),
+        "a zero-remaining window is exactly the anchor, not unbounded"
+    );
+}
+
+/// ~7,900 years out: the "no well-defined expiration" shape RFC 5280 spells
+/// `99991231235959Z`, expressed as an offset the certificate helper accepts and
+/// `time::OffsetDateTime` can still represent.
+const NO_EXPIRATION_OFFSET_SECS: i64 = 250_000_000_000;
+
+#[tokio::test]
+async fn a_leaf_with_no_well_defined_expiration_still_authenticates() {
+    // A valid long-lived certificate must authenticate on every platform
+    // (issue #5396). Whether its `notAfter` is representable as a monotonic
+    // deadline is a property of the host clock, never of the credential.
+    let cert = cert_with_validity("client.example.com", -60, NO_EXPIRATION_OFFSET_SECS);
+    let index = ConsumerIndex::new(&[mtls_consumer("alice", "client.example.com")]);
+    let mut ctx = ctx_with_cert(cert);
+
+    assert_continue(default_plugin().authenticate(&mut ctx, &index).await);
+    let consumer = ctx.identified_consumer.clone().expect("mapped consumer");
+    assert_eq!(consumer.username, "alice");
+    // Where the expiry IS representable it is published unchanged; where it is
+    // not, the credential carries no bound of its own and the finite
+    // authenticated-stream maximum is what limits the session.
+    if let Some(remaining) = request_credential_deadline_remaining(&ctx) {
+        assert!(
+            remaining > std::time::Duration::from_secs(100 * 365 * 24 * 3_600),
+            "a representable no-expiration bound must stay centuries out"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_stream_connection_with_no_well_defined_expiration_is_admitted() {
+    let cert = cert_with_validity("client.example.com", -60, NO_EXPIRATION_OFFSET_SECS);
+    let index = Arc::new(ConsumerIndex::new(&[mtls_consumer(
+        "alice",
+        "client.example.com",
+    )]));
+    let mut ctx = stream_ctx_with_cert(cert, index);
+
+    assert_continue(default_plugin().on_stream_connect(&mut ctx).await);
+    assert!(ctx.is_authenticated());
+}
+
+#[test]
+fn the_evaluation_admits_an_unrepresentable_expiry_instead_of_rejecting_it() {
+    // Shape contract for the branch a Linux CI clock cannot reach: the
+    // far-future arm must publish no bound, and only the unusable-interval arm
+    // may return an invalid-certificate rejection (issue #5396).
+    let source = include_str!("../../../src/plugins/mtls_auth.rs");
+    let outcome = source
+        .split("fn evaluation_outcome(")
+        .nth(1)
+        .expect("evaluation_outcome")
+        .split("\n    fn verify_client_cert(")
+        .next()
+        .expect("bounded evaluation_outcome");
+    let unbounded_arm = outcome
+        .split("CredentialDeadline::Unbounded =>")
+        .nth(1)
+        .expect("the far-future arm must be handled explicitly")
+        .split("CredentialDeadline::Invalid =>")
+        .next()
+        .expect("bounded far-future arm");
     assert!(
-        try_credential_deadline_from_unix_seconds_at_for_test(-1, 0, 100, now).is_none(),
-        "a negative expiry is not a monotonic deadline"
+        !unbounded_arm.contains("return VerifyOutcome::"),
+        "an expiry beyond the representable monotonic range must admit the \
+         certificate, not reject it"
     );
     assert!(
-        try_credential_deadline_from_unix_seconds_at_for_test(i64::MAX, 1, 0, now).is_none(),
-        "an overflowing expiry+leeway must fail closed, not saturate into now"
+        outcome.contains("CredentialDeadline::Invalid =>"),
+        "an unusable validity interval must still fail closed"
     );
 }
 

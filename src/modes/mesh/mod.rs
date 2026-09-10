@@ -14509,10 +14509,10 @@ async fn arm_mesh_runtime_startup(
         ) {
             owner.push_mesh_background(handle);
         }
-        // Spawn the SOCK_OPS ringbuf consumer. When the kernel program
-        // is not pinned (no node-agent on this host, kernel < 5.7, or
-        // build without the ebpf feature), the spawned task logs once
-        // and exits — the plugin still emits zero counters.
+        // Spawn the SOCK_OPS ringbuf consumer. Linux `ebpf` builds retry
+        // with capped backoff until the node-agent pins appear (or
+        // shutdown); other targets skip the task. The plugin still emits
+        // zero counters until the consumer attaches.
         if let Some(state) = bpf_metrics_state.as_ref()
             && let Some(handle) = spawn_sock_ops_consumer_task(state.clone(), &shutdown_tx)
         {
