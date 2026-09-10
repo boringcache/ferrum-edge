@@ -8,6 +8,16 @@ on:
         required: false
         type: string
         default: ""
+      cli_artifact_id:
+        description: Optional immutable Linux CLI artifact to validate
+        required: false
+        type: string
+        default: ""
+      cli_artifact_workspace:
+        description: Workspace that owns the optional CLI artifact
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -24,10 +34,35 @@ jobs:
           ref: 558a3ccd412c285c20c609be3460fdbf6947040d
           persist-credentials: false
 
+      - name: Download the exact CLI artifact
+        if: inputs.cli_artifact_id != ''
+        uses: boringcache/one@404b744a2053da4cf963f13f615f7fafe94f3cf7 # v1.30.1
+        env:
+          BORINGCACHE_RESTORE_TOKEN: ${{ secrets.BORINGCACHE_RESTORE_TOKEN }}
+        with:
+          cli-version: v1.30.1
+          mode: artifact
+          artifact-command: pull
+          artifact-id: ${{ inputs.cli_artifact_id }}
+          artifact-workspace: ${{ inputs.cli_artifact_workspace }}
+          artifact-path: ${{ runner.temp }}/validation-cli
+          trust-policy: restore
+          fail-on-cache-error: true
+
+      - name: Verify and select the CLI artifact
+        if: inputs.cli_artifact_id != ''
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}/validation-cli"
+          sha256sum --check boringcache.sha256
+          chmod +x boringcache
+          echo "${RUNNER_TEMP}/validation-cli" >> "$GITHUB_PATH"
+          ./boringcache --version
+
       - name: Set up BoringCache
         uses: boringcache/one@404b744a2053da4cf963f13f615f7fafe94f3cf7 # v1.30.1
         with:
-          cli-version: ${{ inputs.cli_version }}
+          cli-version: ${{ inputs.cli_artifact_id != '' && 'skip' || inputs.cli_version }}
           setup: none
           mode: archive
           cache-profiles: dependencies
