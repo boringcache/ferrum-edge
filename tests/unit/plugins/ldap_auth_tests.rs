@@ -2874,7 +2874,11 @@ fn test_ldap_auth_advertises_the_basic_challenge() {
 #[tokio::test]
 async fn test_invalid_credential_rejection_carries_the_basic_challenge() {
     let plugin = direct_bind_plugin(json!({}));
-    let mut ctx = context_with_materialized_raw_header("Authorization", "Basic !!!not-base64");
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        "Basic !!!not-base64".to_string(),
+    );
 
     let result = plugin
         .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
