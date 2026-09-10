@@ -9099,5 +9099,5 @@ async fn test_bypassed_response_is_not_rewritten_with_a_vary_contract() {
         "public, max-age=60".to_string(),
     );
     plugin.after_proxy(&mut ctx, 200, &mut resp).await;
-    assert!(resp.get("vary").is_none());
+    assert!(!resp.contains_key("vary"));
 }
