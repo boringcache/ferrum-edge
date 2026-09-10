@@ -223,7 +223,9 @@ fn test_prometheus_plugin_rejects_unknown_render_cache_ttl_secnds_key() {
         }),
         "ferrum",
     )
-    .expect_err("typo render_cache_ttl_secnds must fail construction");
+    .err()
+
+    .unwrap_or_else(|| panic!("typo render_cache_ttl_secnds must fail construction"));
     assert!(err.contains("unknown configuration key"), "{err}");
     assert!(err.contains("render_cache_ttl_secnds"), "{err}");
     assert!(
@@ -1896,7 +1898,9 @@ async fn test_plugin_config_rejects_unbounded_mesh_series_budget() {
         &serde_json::json!({"mesh_series_budget_per_family": 0}),
         "ferrum",
     )
-    .expect_err("0 must be rejected — no unlimited mesh series mode");
+    .err()
+
+    .unwrap_or_else(|| panic!("0 must be rejected — no unlimited mesh series mode"));
     assert!(
         err.contains("mesh_series_budget_per_family"),
         "error should name the field: {err}"
@@ -3166,7 +3170,9 @@ fn test_rejected_plugin_cache_rebuild_leaves_registry_policy_untouched() {
     rejected.plugin_configs[0].updated_at = Utc::now();
     let err = cache
         .rebuild(&rejected)
-        .expect_err("FailClosed sibling must reject the generation");
+        .err()
+
+        .unwrap_or_else(|| panic!("FailClosed sibling must reject the generation"));
     assert!(
         err.contains("key_auth"),
         "rejected rebuild must name the FailClosed sibling: {err}"
@@ -3211,7 +3217,9 @@ fn test_rejected_plugin_cache_delta_leaves_registry_policy_untouched() {
             &delta.removed_proxy_ids,
             delta.global_plugin_configs_changed,
         )
-        .expect_err("incremental reload must reject the FailClosed sibling");
+        .err()
+
+        .unwrap_or_else(|| panic!("incremental reload must reject the FailClosed sibling"));
     assert!(
         err.contains("key_auth"),
         "rejected delta must name the FailClosed sibling: {err}"
