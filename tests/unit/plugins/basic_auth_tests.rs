@@ -794,7 +794,10 @@ async fn test_basic_auth_removal_is_scheme_and_name_case_insensitive() {
 
     let mut ctx = make_ctx();
     let mut backend_headers = std::collections::HashMap::new();
-    backend_headers.insert("Authorization".to_string(), "bAsIc dXNlcjpwYXNz".to_string());
+    backend_headers.insert(
+        "Authorization".to_string(),
+        "bAsIc dXNlcjpwYXNz".to_string(),
+    );
     assert_continue(plugin.before_proxy(&mut ctx, &mut backend_headers).await);
 
     assert!(
