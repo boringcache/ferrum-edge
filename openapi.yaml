@@ -18442,8 +18442,8 @@ components:
         be at least 131074 (`2 * (65536 + 1)`); a sibling comparison against an
         explicit `max_entry_bytes` is enforced only at construction. Named-schema
         existence is runtime-only. Construction also rejects a prefix/tag/schema
-        combination whose minimum ordinary HTTP, gRPC, stream, and WebSocket
-        record cannot fit `max_entry_bytes`.
+        combination whose smallest ordinary record (HTTP, gRPC, stream, or
+        WebSocket) cannot fit `max_entry_bytes`.
         UDP datagrams never exceed a 1452-byte conservative IPv4/IPv6 payload
         ceiling; indivisible oversized lines are dropped rather than fragmented.
         Hot-path admission reserves a queue slot and a provisional max_entry_bytes
@@ -18489,8 +18489,8 @@ components:
             trailing whitespace is trimmed before sanitization; empty after
             trim is rejected. Runtime admission enforces at most 256 UTF-8
             bytes after sanitization, so a longer raw string may still be
-            refused. Construction also requires max_entry_bytes to fit a
-            minimum ordinary record under this prefix.
+            refused. Construction also requires max_entry_bytes to fit the
+            smallest ordinary record under this prefix.
         global_tags:
           type: object
           propertyNames:
@@ -18537,8 +18537,8 @@ components:
           maximum: 1048576
           description: >-
             Maximum rendered StatsD line-protocol bytes for one admitted
-            transaction. Configuration is rejected unless a minimum ordinary
-            HTTP, gRPC, stream, and WebSocket record with the resolved prefix,
+            transaction. Configuration is rejected unless the smallest ordinary
+            record (HTTP, gRPC, stream, or WebSocket) with the resolved prefix,
             global tags, and schema fits this budget. Request-shaped fields
             can still make an individual render exceed the budget; those
             oversized entries are dropped before enqueue.

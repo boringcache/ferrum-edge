@@ -639,7 +639,7 @@ Sends transaction metrics to a StatsD-compatible server (StatsD, Datadog DogStat
 | `flush_interval_ms` | Integer | `500` | Max milliseconds before flushing buffered metrics (50–600000) |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full (1–1000000) |
 | `max_batch_lines` | Integer | `50` | Max metric entries to batch before flushing (1–10000) |
-| `max_entry_bytes` | Integer | `65536` | Maximum rendered StatsD line-protocol size of one admitted transaction (1024–1048576). Construction rejects a prefix / global-tags / schema combination that cannot hold a minimum ordinary HTTP, gRPC, stream, and WebSocket record. Request-shaped fields can still overflow at runtime and are dropped before enqueue. |
+| `max_entry_bytes` | Integer | `65536` | Maximum rendered StatsD line-protocol size of one admitted transaction (1024–1048576). Construction rejects a prefix / global-tags / schema combination that cannot hold even the smallest ordinary record (HTTP, gRPC, stream, or WebSocket). Request-shaped fields can still overflow at runtime and are dropped before enqueue. |
 | `buffer_max_bytes` | Integer | `16777216` | Aggregate retained rendered-content budget across queued entries, one MTU-bounded datagram buffer, and retries (must be ≥ `2 * (max_entry_bytes + 1)`; hard max 268435456). Admission reserves before rendering. |
 | `max_retries` | Integer | `0` | Retry attempts after the initial UDP send fails (0–10; shared batching logger) |
 | `retry_delay_ms` | Integer | `0` | Delay in milliseconds between retry attempts (0–60000) |

@@ -1173,7 +1173,7 @@ fn validate_minimum_record_budget(
     let required = minimum_ordinary_record_bytes(prefix, global_tags, schema);
     if required > max_entry_bytes {
         return Err(format!(
-            "statsd_logging: 'max_entry_bytes' must fit a minimum ordinary HTTP, gRPC, stream, and WebSocket record with the resolved prefix, tags, and schema (requires at least {required} bytes, configured {max_entry_bytes})"
+            "statsd_logging: 'max_entry_bytes' must fit at least the smallest ordinary record (HTTP, gRPC, stream, or WebSocket) with the resolved prefix, tags, and schema (requires at least {required} bytes, configured {max_entry_bytes})"
         ));
     }
     Ok(())
@@ -1279,7 +1279,7 @@ fn minimum_ordinary_record_bytes(
     let ws = render_metrics_len(|buf| {
         format_ws_metrics(&minimum_ws_context(), prefix, global_tags, schema, buf);
     });
-    http.max(grpc).max(stream).max(ws)
+    http.min(grpc).min(stream).min(ws)
 }
 
 /// Pack newline-delimited StatsD lines into UDP datagrams that each stay at
