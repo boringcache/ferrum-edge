@@ -38831,28 +38831,6 @@ async fn handle_proxy_request_inner(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
-    // `mcp_gateway` may have replaced the governed JSON-RPC body with an empty
-    // POST-side 202 while privately reserving the event. The ordinary buffered
-    // header policy ran before that legacy final-body hook, over the original
-    // 200 response. Close the newly selected acknowledgement here so the
-    // committed hook never publishes an event whose actual POST response did
-    // not pass final header policy. Synthetic rejects reach the equivalent
-    // boundary inside `apply_reject_after_proxy_and_synthetic_body_hooks`.
-    if ctx.mcp_sse_publication.is_some()
-        && let ResponseBody::Buffered(ref mut data) = response_body
-    {
-        let phase_start = Instant::now();
-        let _ = enforce_buffered_final_client_visible_response_header_policy(
-            &plugins,
-            &mut ctx,
-            &mut response_status,
-            &mut response_headers,
-            data,
-        )
-        .await;
-        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-    }
-
     // Inject the sticky-session cookie before committed exporters observe the
     // final header view. This remains after every rejection/body replacement so
     // the cookie lands on the same response that will be sent downstream.
