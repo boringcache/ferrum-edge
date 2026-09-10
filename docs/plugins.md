@@ -2444,7 +2444,7 @@ Active in `on_request_received` (callback and logout paths), `authenticate` (ses
 | `session.ttl_secs` | u64 | Absolute session lifetime (default: `3600`; `1`–`31536000`) |
 | `session.idle_ttl_secs` | u64 | Idle timeout (default: `1800`; `1`–`31536000`) |
 | `session.max_cookie_bytes` | u64 | Maximum sealed session and pending-flow cookie size (default: `8000`; `1024`–`8000`) |
-| `session.domain` | String (optional) | Bare DNS name (optional leading dot); durable session Domain only; correlation cookies are host-only and scoped to `callback_path` |
+| `session.domain` | String (optional) | Bare DNS name (optional leading dot); durable session Domain only. Correlation cookies never inherit it, and secure correlation cookies use browser-enforced `__Host-` scope (`Path=/`) |
 | `session.secure` | Boolean | Default `true`; when false, generated cookie names carry no `__Host-`/`__Secure-` prefix because a prefixed cookie without `Secure` is rejected by browsers |
 | `session.hide_session_cookie` | Boolean | Default `true`; strip this plugin's session and correlation cookies from the `Cookie` header forwarded upstream, leaving unrelated cookies intact |
 | `session.http_only` | Boolean | `HttpOnly` on the session cookie (default: `true`) |
