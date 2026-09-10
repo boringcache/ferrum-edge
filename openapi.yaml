@@ -31860,7 +31860,7 @@ components:
     AiFederationConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_federation — HTTP-family OpenAI Chat Completions gateway. Dispatches from the finalized-request-egress phase after request-body transforms and the complete final request-policy hook pass, so priority_override cannot move provider I/O ahead of WAF/OpenAPI/body/size policy. Translates final request bodies to provider-native JSON with a 64 MiB serialization cap and normalizes bounded, non-streaming responses back to OpenAI format. Native gRPC is not supported or advertised. Provider and OAuth redirects are never followed. Configuration is strict: unknown root, provider, and circuit fields are rejected. Streaming Chat Completions (`stream: true`) are served by a separate non-buffering path that is OFF by default: with the root `streaming` block enabled, before_proxy commits exactly ONE provider before any downstream-visible byte and rewrites the routing decision through route_override_* so the ordinary dispatch path relays provider SSE incrementally. Provider fallback for a stream happens only during that pre-commit selection (open circuit, ineligible provider, unusable endpoint); after the commit no second provider is ever spliced into the same logical stream, and a post-commit failure truncates with one gateway-authored terminal SSE `error` event. Streaming eligibility is narrow: only providers whose native streaming wire format already is the OpenAI Chat Completions SSE contract (openai, mistral, xai, deepseek, meta_llama, hugging_face, azure_openai) with a static header credential. anthropic, google_gemini, google_vertex, aws_bedrock, and cohere, and any provider using AWS SigV4 or Google OAuth2, fail closed with a field-specific 501 — use ai_stream_router for Anthropic/Gemini streaming translation. With `streaming.enabled` the plugin declares a backend-boundary header policy plus request header/destination mutation, so it can no longer be composed with request_deduplication or response_caching on the same proxy. A claimed stream consumes one `max_concurrent_requests` permit and one real provider-circuit admission for the whole life of the response, and both are released exactly once on completion, client disconnect, downstream policy cut, backend error, or cancellation; a 2xx stream is scored a circuit success only after a valid terminal `data: [DONE]`. The provider-visible top-level `model` is rewritten to the value `model_mapping` / `default_model` resolved, and the committed provider's `connect_timeout_seconds` / `read_timeout_seconds` become the streaming route's dispatch budgets instead of the matched proxy's. Provider response headers on a claimed stream are reduced to the same bounded safe allowlist the buffered path publishes plus a gateway-authored `Content-Type: text/event-stream` — provider cookies, redirects, auth challenges, validators/digests, and unknown metadata never reach the client. Streaming is disabled by default and `stream: true` then returns 501 as before. Priority fallback is allowed for configured statuses, malformed provider success responses, and proven pre-wire transport failures. Ambiguous POST outcomes are not replayed by default. Fails closed by default when a JSON POST cannot be inspected, lacks a string `model`, or has no matching provider. Outbound calls use the shared PluginHttpClient and global TLS settings (FERRUM_TLS_CA_BUNDLE_PATH, FERRUM_TLS_NO_VERIFY); per-proxy backend TLS overrides do not apply."
+      description: "Plugin: ai_federation — HTTP-family OpenAI Chat Completions gateway. Dispatches from the finalized-request-egress phase after request-body transforms and the complete final request-policy hook pass, so priority_override cannot move provider I/O ahead of WAF/OpenAPI/body/size policy. Translates final request bodies to provider-native JSON with a 64 MiB serialization cap and normalizes bounded, non-streaming responses back to OpenAI format. Native gRPC is not supported or advertised. Provider and OAuth redirects are never followed. Configuration is strict: unknown root, provider, and circuit fields are rejected. Streaming Chat Completions (`stream: true`) are served by a separate non-buffering path that is OFF by default: with the root `streaming` block enabled, before_proxy commits exactly ONE provider before any downstream-visible byte and rewrites the routing decision through route_override_* so the ordinary dispatch path relays provider SSE incrementally. Provider fallback for a stream happens only during that pre-commit selection (open circuit, ineligible provider, unusable endpoint); after the commit no second provider is ever spliced into the same logical stream, and a post-commit failure truncates with one gateway-authored terminal SSE `error` event. Streaming eligibility is narrow: only providers whose native streaming wire format already is the OpenAI Chat Completions SSE contract (openai, mistral, xai, deepseek, meta_llama, hugging_face, azure_openai) with a static header credential. anthropic, google_gemini, google_vertex, aws_bedrock, and cohere, and any provider using AWS SigV4 or Google OAuth2, fail closed with a field-specific 501 — use ai_stream_router for Anthropic/Gemini streaming translation. With `streaming.enabled` the plugin declares a backend-boundary header policy plus request header/destination mutation, so it can no longer be composed with request_deduplication or response_caching on the same proxy. A claimed stream consumes one `max_concurrent_requests` permit and one real provider-circuit admission for the whole life of the response, and both are released exactly once on completion, client disconnect, downstream policy cut, backend error, or cancellation; a 2xx stream is scored a circuit success only after a valid terminal `data: [DONE]`. The selected provider's `multimodal_mode` is applied to a streamed request exactly as to a buffered one: a reject-mode provider declines the request during pre-commit selection and the next matching provider is considered, a text_only_with_warning provider has the non-text content parts removed from the provider-visible body, and the finalized body is re-checked before egress so a later transform cannot reintroduce content the committed provider forbids. The provider-visible top-level `model` is rewritten to the value `model_mapping` / `default_model` resolved, and the committed provider's `connect_timeout_seconds` / `read_timeout_seconds` become the streaming route's dispatch budgets instead of the matched proxy's. Provider response headers on a claimed stream are reduced to the same bounded safe allowlist the buffered path publishes plus a gateway-authored `Content-Type: text/event-stream` — provider cookies, redirects, auth challenges, validators/digests, and unknown metadata never reach the client. Streaming is disabled by default and `stream: true` then returns 501 as before. Priority fallback is allowed for configured statuses and proven pre-wire transport failures; a completed 2xx that cannot be normalized is TERMINAL and returns 502 (response_normalization_failed) without calling another provider, because that generation has already been performed. Ambiguous POST outcomes are not replayed by default. Fails closed by default when a JSON POST cannot be inspected, lacks a string `model`, or has no matching provider. Outbound calls use the shared PluginHttpClient and global TLS settings (FERRUM_TLS_CA_BUNDLE_PATH, FERRUM_TLS_NO_VERIFY); per-proxy backend TLS overrides do not apply."
       required: [providers]
       properties:
         providers:
@@ -31902,7 +31902,8 @@ components:
                 description: "Lower = tried first. Defaults to provider's index + 1."
               api_key:
                 type: string
-                description: API key for the provider. Required for all providers except aws_bedrock (uses SigV4) and google_vertex (uses service account JWT).
+                minLength: 1
+                description: API key for the provider. Required for all providers except aws_bedrock (uses SigV4) and google_vertex (uses service account JWT). An empty value is treated as absent and fails configuration admission; the resolved value must also be a valid HTTP header value (no newlines or control characters).
               model_patterns:
                 type: array
                 maxItems: 128
@@ -31980,20 +31981,23 @@ components:
                 minLength: 1
                 maxLength: 64
                 pattern: '^[A-Za-z0-9._:-]+$'
-                description: Azure OpenAI deployment name. Required for azure_openai.
+                not: { pattern: '\.\.' }
+                description: Azure OpenAI deployment name. Required for azure_openai. Interpolated into the provider endpoint path, so the traversal sequence `..` is rejected.
               azure_api_version:
                 type: string
                 minLength: 1
                 maxLength: 64
                 pattern: '^[A-Za-z0-9._:-]+$'
+                not: { pattern: '\.\.' }
                 default: "2024-06-01"
-                description: Azure OpenAI api-version query parameter.
+                description: Azure OpenAI api-version query parameter. Interpolated into the provider endpoint, so the traversal sequence `..` is rejected.
               google_project_id:
                 type: string
                 minLength: 1
                 maxLength: 128
                 pattern: '^[A-Za-z0-9._:-]+$'
-                description: Google Cloud project ID. Required for google_vertex.
+                not: { pattern: '\.\.' }
+                description: Google Cloud project ID. Required for google_vertex. Interpolated into the provider endpoint path, so the traversal sequence `..` is rejected.
               google_region:
                 type: string
                 minLength: 1
@@ -32002,7 +32006,8 @@ components:
                 description: Google Vertex AI region (e.g. us-central1). Required for google_vertex.
               google_service_account_json:
                 type: string
-                description: Google service account JSON contents (the file body, not the path). Required for google_vertex; used to mint OAuth2 access tokens via JWT bearer flow.
+                minLength: 1
+                description: Google service account JSON contents (the file body, not the path). Required for google_vertex; used to mint OAuth2 access tokens via JWT bearer flow. An empty value is treated as absent and fails configuration admission.
               aws_region:
                 type: string
                 minLength: 1
@@ -32073,6 +32078,24 @@ components:
                     allow_plaintext:
                       const: true
                   required: [allow_plaintext]
+              # google_gemini, google_vertex, and aws_bedrock interpolate the
+              # RESOLVED model into the endpoint path, so every provider-native
+              # model identifier they may resolve to is additionally restricted
+              # to a safe URL path component - no '/' or '+'. The general
+              # identifier charset stays in force for the client-facing keys,
+              # which are never interpolated into a URL.
+              - if:
+                  required: [provider_type]
+                  properties:
+                    provider_type:
+                      enum: [google_gemini, google_vertex, aws_bedrock]
+                then:
+                  properties:
+                    default_model:
+                      pattern: '^[A-Za-z0-9._:-]+$'
+                    model_mapping:
+                      additionalProperties:
+                        pattern: '^[A-Za-z0-9._:-]+$'
         fallback_enabled:
           type: boolean
           default: true
