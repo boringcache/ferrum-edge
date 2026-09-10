@@ -4848,8 +4848,22 @@ rules match those percent-decoded parameter values plus the same bounded
 layered decode variants used for bodies, not raw whole-URI text.
 
 **Priority:** 2930
-**Phase:** `authorize`, `on_final_request_body`, `after_proxy`, `on_final_response_body`
-**Protocol:** HTTP, gRPC, WebSocket
+**Phase:** `authorize`, `on_final_request_body`, `after_proxy`,
+`finalize_client_visible_response_body`, `finalize_client_visible_response_headers`,
+`on_ws_frame`, `on_stream_connect`, `on_udp_datagram`
+**Protocol:** HTTP, gRPC, WebSocket always; TCP and UDP/DTLS when a `stream`
+block is configured
+
+The two `finalize_client_visible_*` phases are the authoritative response
+surfaces: the body scan runs after every semantic transform and before gateway
+transport encoding, and the header re-assertion is the last rejecting phase of
+the response lifecycle. `on_final_response_body` remains only as a compatibility
+alias for direct callers — the proxy skips it once the authoritative phase has
+run, so production scans once. `on_ws_frame` inspects complete WebSocket
+application messages, and `on_stream_connect` / `on_udp_datagram` are the raw
+TCP first-bytes and UDP/DTLS datagram surfaces contributed by `stream`. See
+[plugin_execution_order.md](plugin_execution_order.md) for the complete ordering
+contract.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -4872,7 +4886,7 @@ layered decode variants used for bodies, not raw whole-URI text.
 | `inspect_multipart` | bool | `false` | Inspect `multipart/*` bodies. |
 | `inspect_binary_body` | bool | `false` | Inspect bodies whose content type is not in `body_content_types`. |
 | `max_scan_bytes` | usize | `1048576` | Maximum bytes scanned from each body. Must be greater than zero. |
-| `on_body_too_large` | string | `fail_closed` | `fail_closed` rejects an oversize governed body when that direction has an enforcing body rule or anomaly scoring, and otherwise scans the first `max_scan_bytes` and records truncation; `scan_truncated` is the explicit compatibility opt-out that always scans only the prefix and forwards the complete body; `skip` skips known-oversized bodies; `block` rejects every oversize governed body in enforce mode and, when a body inspection surface can run, satisfies `mode: enforce` admission on its own. |
+| `on_body_too_large` | string | `fail_closed` | `fail_closed` rejects an oversize governed body when that direction has an enforcing body rule or anomaly scoring, and otherwise scans the first `max_scan_bytes` and records truncation; `scan_truncated` is the explicit compatibility opt-out that always scans only the prefix and forwards the complete body; `skip` skips known-oversized bodies; `block` rejects every oversize governed body in enforce mode and, when a body inspection surface can run, satisfies `mode: enforce` admission on its own; it is also a blocking disposition for the buffered-representation claim on both directions, so an origin-encoded body is decoded before the cap is measured. |
 | `scan_budget_ms` | u64 | `50` | Post-hoc deadline for metadata/header and body scans. `0` disables the timeout wrapper. The synchronous scan cannot be cancelled mid-regex; over-budget scans are reported after the scan returns. |
 | `on_scan_timeout` | string | `log_and_allow` | Action when a body scan times out: `allow`, `block`, or `log_and_allow`. |
 | `disallowed_methods` | string[] | `[]` | Methods that should trigger the built-in `FE-METHOD-001` rule when that rule is active. |
@@ -4881,6 +4895,7 @@ layered decode variants used for bodies, not raw whole-URI text.
 | `reject_status_code` | u16 | `403` | HTTP status for enforced rejects. Must be 400-599. |
 | `reject_content_type` | string | `application/json` | Content-Type header for enforced rejects. |
 | `reject_body` | string | `{"error":"Forbidden"}` | Body returned for enforced rejects. |
+| `stream` | object | _(none)_ | Optional raw TCP/UDP inspection: `tcp_require_tls`, `inspect_tcp`, `inspect_udp`, `inspect_response`, and byte-regex `signatures`. Present and actionable, it attaches this WAF to TCP and UDP/DTLS proxies as well; absent, the instance stays HTTP-family only. See [Stream (TCP/UDP) inspection](waf.md#stream-tcpudp-inspection). |
 
 **Multi-instance scoring:** Multiple scoped `waf` instances on one proxy keep
 independent anomaly accumulators keyed by the configured `plugin_configs[].id`
@@ -4910,6 +4925,14 @@ and a request-wide
 well as rule hits. The request and response paths use the same decision, so H1,
 H2, and H3 behave identically. A body whose length is *exactly*
 `max_scan_bytes` is fully scanned and never treated as oversize.
+
+The cap is measured against the **plaintext** representation in both
+directions. A globally enforcing `on_body_too_large: block` is itself a blocking
+disposition, so a request or response whose origin declared a `Content-Encoding`
+is decoded by the shared representation gate before the cap is applied — even
+when every applicable body rule is monitor-only. Without that, a compressed body
+could slip under a cap its plaintext exceeds. `monitor` mode never claims: an
+undecodable origin coding there costs an observation, not the response.
 
 Monitor-only operation is unchanged: with `mode: monitor`, or with every body
 rule left at the built-in monitor default, an oversize body is prefix-scanned and
@@ -4966,7 +4989,7 @@ representations explicitly outside the configured response-body scan scope.
 | `pattern` | string | `""` | Pattern text. Required except for `luhn` rules. CIDR rules accept an IP or CIDR range. |
 | `action` | string | global default | `enforce`, `monitor`, or `disabled`. |
 | `score` | integer | severity weight | Anomaly-score contribution when `scoring` is enabled. |
-| `fp_filters` | string[] | `[]` | Unanchored regex filters evaluated against the complete inspected target value after a rule match; if any filter matches anywhere in that value, the hit is suppressed. For `body_json_path`, this is the selected JSON scalar's string form, not only the matched substring. |
+| `fp_filters` | string[] | `[]` | Unanchored regex filters evaluated against the complete inspected target value after a rule match; if any filter matches anywhere in that value, the hit is suppressed. For `body_json_path`, this is the selected JSON scalar's string form, not only the matched substring. A body containing non-UTF-8 bytes is filtered against its lossy text view (invalid bytes become `U+FFFD`), so binary content is filtered on the same terms as text. |
 | `paranoia_min` | u8 | `1` | Minimum paranoia level required for this rule. |
 | `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers`. Path entries share exact-match and trailing-`*` prefix forms with `global_exemptions.paths`, but `~regex` anchoring differs: rule `conditions.paths` compile the text after `~` as an operator-authored, unanchored regex evaluated with Rust regex `is_match`, so they may match anywhere in the path unless the pattern itself is anchored (for example `~^/admin(?:/|$)`). A floating match such as `~api` therefore matches both `/api/users` and `/v1/api-keys`. Exact and prefix forms are unchanged and are not regex-anchored. |
 
