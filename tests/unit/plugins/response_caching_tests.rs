@@ -8990,7 +8990,10 @@ async fn test_miss_publishes_the_same_downstream_vary_contract_as_the_hit() {
     let plugin = plugin_with_config(json!({"vary_by_headers": ["accept-language"]}));
 
     let mut origin = HashMap::new();
-    origin.insert("cache-control".to_string(), "public, max-age=60".to_string());
+    origin.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
     let expected = vec![
         "accept-language".to_string(),
         "authorization".to_string(),
@@ -9024,7 +9027,10 @@ async fn test_default_config_miss_publishes_mandatory_vary_dimensions() {
     let wire = HttpWireTransport::Http1;
 
     let mut origin = HashMap::new();
-    origin.insert("cache-control".to_string(), "public, max-age=60".to_string());
+    origin.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
     let expected = vec![
         "authorization".to_string(),
         "cookie".to_string(),
@@ -9044,7 +9050,10 @@ async fn test_miss_vary_contract_preserves_origin_dimensions_and_wildcard() {
 
     // An origin dimension survives alongside the mandatory ones.
     let mut origin = HashMap::new();
-    origin.insert("cache-control".to_string(), "public, max-age=60".to_string());
+    origin.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
     origin.insert("vary".to_string(), "Accept-Encoding".to_string());
     let expected = vec![
         "accept-encoding".to_string(),
@@ -9060,7 +9069,10 @@ async fn test_miss_vary_contract_preserves_origin_dimensions_and_wildcard() {
     // `Vary: *` is a stronger downstream refusal than any name list, and this
     // cache refuses to store such a response at all, so it is left untouched.
     let mut wildcard = HashMap::new();
-    wildcard.insert("cache-control".to_string(), "public, max-age=60".to_string());
+    wildcard.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
     wildcard.insert("vary".to_string(), "*".to_string());
     let mut ctx = make_ctx("GET", "/wildcard-vary");
     let mut headers = HashMap::new();
@@ -9082,7 +9094,10 @@ async fn test_bypassed_response_is_not_rewritten_with_a_vary_contract() {
     assert_status(&plugin, &ctx, "BYPASS");
 
     let mut resp = HashMap::new();
-    resp.insert("cache-control".to_string(), "public, max-age=60".to_string());
+    resp.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
     plugin.after_proxy(&mut ctx, 200, &mut resp).await;
     assert!(resp.get("vary").is_none());
 }

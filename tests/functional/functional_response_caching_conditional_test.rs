@@ -247,8 +247,7 @@ async fn functional_response_caching_conditional_eligibility_h1_h2_h3() {
                 // the mandatory caller dimensions rather than waiting for the
                 // first hit.
                 assert_eq!(
-                    stored.headers["vary"],
-                    "authorization, cookie, proxy-authorization",
+                    stored.headers["vary"], "authorization, cookie, proxy-authorization",
                     "{url}: MISS must publish the downstream Vary contract"
                 );
                 assert_eq!(hits.load(Ordering::SeqCst), before + 1, "{url}: seed");
