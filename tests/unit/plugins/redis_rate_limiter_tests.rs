@@ -387,7 +387,7 @@ fn an_unusable_database_selector_is_diagnosed_without_echoing_the_url() {
         "redis_url": format!("redis://acl:{secret}@cache.internal:6379/banana"),
     });
     let err = RedisConfig::from_plugin_config(&config, "ferrum:test")
-        .expect_err("an unusable database selector must be rejected at construction");
+        .err().unwrap_or_else(|| panic!("an unusable database selector must be rejected at construction"));
     assert!(
         err.contains("redis_url") && err.contains("database number"),
         "diagnostic must name the field and the accepted shape: {err}"
@@ -414,7 +414,7 @@ async fn every_redis_backed_plugin_refuses_an_unusable_database_selector() {
         }),
         Some("rl-1"),
     )
-    .expect_err("rate_limiting must refuse an unusable database selector");
+    .err().unwrap_or_else(|| panic!("rate_limiting must refuse an unusable database selector"));
     assert!(err.contains("database number"), "got: {err}");
 
     let err = ferrum_edge::plugins::create_plugin(
@@ -425,7 +425,7 @@ async fn every_redis_backed_plugin_refuses_an_unusable_database_selector() {
             "redis_url": unusable,
         }),
     )
-    .expect_err("hmac_auth must refuse an unusable database selector");
+    .err().unwrap_or_else(|| panic!("hmac_auth must refuse an unusable database selector"));
     assert!(err.contains("database number"), "got: {err}");
 }
 
@@ -439,7 +439,7 @@ fn redis_tls_fails_closed_when_configured_ca_cannot_be_loaded() {
     let config = make_config("rediss://cache.internal:6380/0", true);
 
     let err = RedisRateLimitClient::new(config, None, false, Some(missing_path))
-        .expect_err("unloadable exclusive CA must refuse construction");
+        .err().unwrap_or_else(|| panic!("unloadable exclusive CA must refuse construction"));
     assert!(
         err.contains("exclusive CA bundle") && err.contains("refusing to fall back"),
         "diagnostic must name the fail-closed exclusive-CA decision: {err}"
@@ -533,7 +533,7 @@ fn test_from_plugin_config_rejects_insecure_fragment_without_echoing_the_url() {
         "redis_tls": true,
     });
     let err = RedisConfig::from_plugin_config(&config, "ferrum:test")
-        .expect_err("fragment-bearing redis_url must be rejected at construction");
+        .err().unwrap_or_else(|| panic!("fragment-bearing redis_url must be rejected at construction"));
     assert!(
         err.contains("fragment"),
         "diagnostic must name the rejected shape: {err}"
@@ -604,7 +604,7 @@ fn test_rate_limiting_plugin_rejects_insecure_redis_url_fragment() {
         "redis_tls": true,
     });
     let err = create_rate_limit_plugin_with_config_id("rate_limiting", &config, Some("rl-1"))
-        .expect_err("rate_limiting must fail construction on a fragment-bearing redis_url");
+        .err().unwrap_or_else(|| panic!("rate_limiting must fail construction on a fragment-bearing redis_url"));
     assert!(err.contains("fragment"), "got: {err}");
     assert!(
         !err.contains("cache.internal") && !err.contains("#insecure"),
@@ -1785,7 +1785,7 @@ fn redis_config_validation_diagnostics_are_value_redacted() {
         "redis://{USER}:{PASSWORD}@cache.internal:6379/0?auth={TOKEN}"
     ));
     let err = RedisConfig::from_plugin_config(&leaked_shape, "ferrum:test")
-        .expect_err("non-object config must be rejected");
+        .err().unwrap_or_else(|| panic!("non-object config must be rejected"));
     assert!(
         err.contains("must be a JSON object"),
         "unexpected non-object diagnostic: {err}"
@@ -1804,7 +1804,7 @@ fn redis_config_validation_diagnostics_are_value_redacted() {
         }),
         "ferrum:test",
     )
-    .expect_err("invalid sync_mode must be rejected");
+    .err().unwrap_or_else(|| panic!("invalid sync_mode must be rejected"));
     assert!(
         sync_err.contains("'sync_mode'") && sync_err.contains("'local' or 'redis'"),
         "unexpected sync_mode diagnostic: {sync_err}"
@@ -1825,7 +1825,7 @@ fn redis_config_validation_diagnostics_are_value_redacted() {
         }),
         "ferrum:test",
     )
-    .expect_err("non-redis scheme must be rejected");
+    .err().unwrap_or_else(|| panic!("non-redis scheme must be rejected"));
     assert!(
         url_err.contains("'redis_url'") && url_err.contains("scheme"),
         "unexpected url diagnostic: {url_err}"
@@ -1844,7 +1844,7 @@ fn redis_config_validation_diagnostics_are_value_redacted() {
         }),
         "ferrum:test",
     )
-    .expect_err("unparseable redis_url must be rejected");
+    .err().unwrap_or_else(|| panic!("unparseable redis_url must be rejected"));
     assert!(
         parse_err.contains("'redis_url'") && parse_err.contains("valid URL"),
         "unexpected parse diagnostic: {parse_err}"
