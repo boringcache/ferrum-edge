@@ -19622,7 +19622,11 @@ components:
                   higher-level root. A root issuer pin can succeed when the client
                   omits that certificate from the presented chain. UDP+DTLS uses
                   the same leaf-first verified presented chain as terminated
-                  TCP+TLS.
+                  TCP+TLS. The earliest notAfter on the path that satisfied the
+                  constraint is composed into the request and stream
+                  authorization deadline, so an issuer expiring before the leaf
+                  ends the authorization at its own expiry; across alternative
+                  verified paths the longest-lived matching path wins.
           description: >-
             Per-proxy issuer pins. DN fields are descriptive filters (AND within
             an entry, OR across entries) and must match the pinned CA subject;
@@ -20898,6 +20902,23 @@ components:
         plugin id `__mesh_spiffe_identity`. Standalone usage is supported on
         non-mesh gateways that still terminate mTLS and want to surface the
         SPIFFE identity to other plugins.
+
+        The trust domain is admitted exactly as SPIFFE-ID section 2.1 defines
+        it: non-empty, at most 255 bytes, lowercase, and composed only of
+        `[a-z0-9.-_]` — including at the first and last byte. Userinfo, ports,
+        percent-encoding, and the SPIFFE ID's own 2048-byte total bound are
+        still enforced.
+
+        A certificate-derived peer identity is admitted as an authenticated
+        principal carrying the leaf certificate's `notAfter` as its
+        authorization deadline, so SPIFFE-only policy chains (this plugin plus
+        `mesh_authz`, with no `mtls_auth`) are bounded by SVID expiry on the
+        request, WebSocket, streaming-body, TCP+TLS, and UDP+DTLS paths. Every
+        request re-checks the leaf validity window, and an expired or
+        not-yet-valid SVID is refused with the same fixed `403`
+        `{"error":"invalid SPIFFE identity certificate"}` body as a malformed
+        one. A pre-stamped kernel-attested or HBONE-asserted `peer_spiffe_id`
+        carries no validity window and is not treated as certificate-bounded.
       additionalProperties: false
       properties: {}
 

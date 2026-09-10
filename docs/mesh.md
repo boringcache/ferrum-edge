@@ -2052,11 +2052,27 @@ A bare `source.serviceAccount` is namespace-relative, so the same policy text me
 
 ### SPIFFE Identity
 
-The [`spiffe_identity`](plugins.md#spiffe_identity) plugin (priority 940) extracts the peer SPIFFE ID from TLS/DTLS client certificates on every inbound request. Configuration, admission, hooks, outputs, and invalid-SVID behavior are documented in that plugin reference. This identity feeds into:
+The [`spiffe_identity`](plugins.md#spiffe_identity) plugin (priority 940) extracts the peer SPIFFE ID from TLS/DTLS client certificates on every inbound request. Configuration, admission, hooks, outputs, trust-domain grammar, and invalid-SVID behavior are documented in that plugin reference. This identity feeds into:
 
 - `mesh_authz` principal matching
 - Workload metrics labels (`source.principal`, `destination.principal`)
 - Transaction summary `auth_method` tracking
+
+**SPIFFE-only chains are lifetime-bounded.** The mesh injection installs
+`spiffe_identity` plus `mesh_authz` and does not require `mtls_auth`, so on those
+chains the SVID alone authorizes the request. `spiffe_identity` therefore admits
+a certificate-derived peer identity as an authenticated principal carrying the
+leaf's `notAfter` as its authorization deadline, on the same protocol-neutral
+contract `mtls_auth` uses for Consumer-mapped certificates. Requests and streams
+authorized only by a peer SVID are re-checked against the leaf's validity window
+on every request and are terminated at SVID expiry (or the finite
+`FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` fallback, whichever is
+earlier) instead of running for the life of the transport connection. A
+pre-stamped kernel-attested (node-waypoint eBPF) or HBONE-asserted
+`peer_spiffe_id` carries no certificate validity window and is deliberately not
+treated as certificate-bounded; explicit trust withdrawal remains the separate
+mechanism described under
+[frontend_tls.md — Expiry is not revocation](frontend_tls.md#expiry-is-not-revocation).
 
 For production deployments, Ferrum delegates SVID issuance and trust-bundle
 distribution to a separately operated [SPIRE](https://spiffe.io/docs/latest/spire-about/)
