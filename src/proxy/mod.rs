@@ -16081,9 +16081,10 @@ fn proxy_header_entry_case_insensitive<'a>(
 }
 
 fn is_websocket_backend_strip_header(name: &str) -> bool {
-    matches!(
-        name,
-        "host"
+    headers_mod::is_consumer_assertion_header(name)
+        || matches!(
+            name,
+            "host"
             | "proxy-authenticate"
             | "sec-websocket-key"
             | "sec-websocket-version"
@@ -16095,10 +16096,8 @@ fn is_websocket_backend_strip_header(name: &str) -> bool {
             // down with a protocol error. Strip the offer so no extension is
             // ever negotiated end to end.
             | "sec-websocket-extensions"
-            | "x-consumer-username"
-            | "x-consumer-custom-id"
             | "x-geo-country"
-    )
+        )
 }
 
 fn push_forwardable_header_override(
@@ -55085,6 +55084,7 @@ mod tests {
             failure_status_codes: vec![500],
             half_open_max_requests: 1,
             trip_on_connection_errors: true,
+            half_open_probe_dwell_seconds: None,
         });
         cb.record_failure(500, false, false);
         assert!(
@@ -55937,6 +55937,7 @@ mod tests {
                 failure_status_codes: vec![500],
                 half_open_max_requests: 1,
                 trip_on_connection_errors: true,
+                half_open_probe_dwell_seconds: None,
             }
         }
 
@@ -59830,6 +59831,7 @@ mod tests {
         headers.insert("connection".to_string(), "upgrade".to_string());
         headers.insert("x-request-id".to_string(), "req-1".to_string());
         headers.insert("x-added-by-plugin".to_string(), "kept".to_string());
+        headers.insert("X-Consumer-Role".to_string(), "admin".to_string());
 
         let forwarded = collect_forwardable_proxy_headers(&headers);
 
@@ -59839,6 +59841,12 @@ mod tests {
         assert!(forwarded.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("x-added-by-plugin") && value == "kept"
         }));
+        assert!(
+            !forwarded
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-consumer-role")),
+            "the complete consumer assertion namespace must be stripped"
+        );
         assert!(
             !forwarded
                 .iter()
