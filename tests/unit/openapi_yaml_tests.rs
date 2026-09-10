@@ -4719,7 +4719,7 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
     let runtime_overlay = spec
         .pointer("/components/schemas/RequestTransformerConfig/properties/runtime_overlay_scope")
         .expect("runtime_overlay_scope remains published");
-    assert_eq!(runtime_overlay["type"], json!("string"));
+    assert_eq!(runtime_overlay["type"], json!(["string", "null"]));
     assert_eq!(runtime_overlay["minLength"], json!(1));
     assert_eq!(runtime_overlay["pattern"], json!("\\S"));
     assert_eq!(
@@ -4727,6 +4727,52 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
             .expect("default_enabled remains published")["default"],
         json!(true)
     );
+
+    // Every optional field whose constructor treats explicit `null` as absent
+    // must admit `null` in the schema too.
+    for field in [
+        "apply_route_overrides",
+        "default_enabled",
+        "runtime_overlay_resolved_enabled",
+    ] {
+        let property = spec
+            .pointer(&format!(
+                "/components/schemas/RequestTransformerConfig/properties/{field}"
+            ))
+            .unwrap_or_else(|| panic!("{field} remains published"));
+        assert_eq!(
+            property["type"],
+            json!(["boolean", "null"]),
+            "{field} must admit the explicit null the constructor accepts"
+        );
+    }
+
+    // The no-effect config is rejected by the schema, not only by the
+    // constructor: either a non-empty `rules` array or the route-only opt-in.
+    assert!(
+        spec.pointer("/components/schemas/RequestTransformerConfig/anyOf")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|branches| branches.len() == 2),
+        "RequestTransformerConfig must model non-empty rules vs route-only opt-in"
+    );
+
+    // Per-operation field sets ARE expressible in Draft 2020-12, and every rule
+    // variant composes the one shared contract.
+    let contract = json!("#/components/schemas/TransformerOperationFieldExactness");
+    for variant in [
+        "RequestTransformerHeaderRule",
+        "RequestTransformerQueryRule",
+        "RequestTransformerBodyRule",
+    ] {
+        let composed = spec
+            .pointer(&format!("/components/schemas/{variant}/allOf"))
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| panic!("{variant} must compose the operation contract"));
+        assert!(
+            composed.iter().any(|branch| branch["$ref"] == contract),
+            "{variant} must reference the shared operation-field contract"
+        );
+    }
 
     for config in [
         json!({
@@ -4810,6 +4856,47 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
                 "value": "tab\there"
             }]
         }),
+        // Route-only opt-in: the translator-owned consumer carries no static
+        // rules at all.
+        json!({"apply_route_overrides": true}),
+        json!({"rules": [], "apply_route_overrides": true}),
+        // Explicit `null` on a field the constructor treats as absent.
+        json!({
+            "rules": [{"operation": "remove", "target": "header", "key": "x-audit"}],
+            "default_enabled": null
+        }),
+        json!({
+            "rules": [{"operation": "remove", "target": "header", "key": "x-audit"}],
+            "apply_route_overrides": null,
+            "runtime_overlay_scope": null,
+            "runtime_overlay_resolved_enabled": null
+        }),
+        // A numeric segment is an ordinary array index for add/update/remove.
+        json!({
+            "rules": [{
+                "operation": "update",
+                "target": "body",
+                "key": "items.0.name",
+                "value": "first"
+            }]
+        }),
+        // An ESCAPED numeric segment is a literal key, so rename still accepts it.
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "body",
+                "key": "counts\\.0",
+                "new_key": "counts_first"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "body",
+                "key": "user.old",
+                "new_key": "user.new"
+            }]
+        }),
     ] {
         assert_component_validity(&spec, "RequestTransformerConfig", &config, true);
         assert!(
@@ -4868,6 +4955,113 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
                 "vaule": "green"
             }]
         }),
+        // A config with no effect.
+        json!({}),
+        json!({"rules": []}),
+        json!({"apply_route_overrides": false}),
+        json!({"apply_route_overrides": null}),
+        // Per-operation required / forbidden properties, for every target.
+        json!({"rules": [{"operation": "update", "target": "header", "key": "x-audit"}]}),
+        json!({"rules": [{"operation": "add", "target": "query", "key": "audit"}]}),
+        json!({"rules": [{"operation": "add", "target": "body", "key": "audit"}]}),
+        json!({"rules": [{"operation": "rename", "target": "header", "key": "x-old"}]}),
+        json!({
+            "rules": [{
+                "operation": "remove",
+                "target": "header",
+                "key": "x-audit",
+                "value": "unused"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "remove",
+                "target": "query",
+                "key": "audit",
+                "new_key": "moved"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "header",
+                "key": "X-Old",
+                "new_key": "X-New",
+                "value": "blue"
+            }]
+        }),
+        // Operation-incompatible extras are rejected by PRESENCE, so an explicit
+        // `null` fails exactly as a string would — body rules included.
+        json!({
+            "rules": [{
+                "operation": "update",
+                "target": "header",
+                "key": "X-Color",
+                "value": "blue",
+                "new_key": null
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "remove",
+                "target": "body",
+                "key": "secret",
+                "new_key": null
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "update",
+                "target": "body",
+                "key": "state",
+                "value": "public",
+                "new_key": null
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "remove",
+                "target": "body",
+                "key": "secret",
+                "value": null
+            }]
+        }),
+        // Header field-name grammar.
+        json!({"rules": [{"operation": "remove", "target": "header", "key": "bad name"}]}),
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "header",
+                "key": "X-Old",
+                "new_key": "bad name"
+            }]
+        }),
+        // CR / LF in query strings is request-target injection.
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "query",
+                "key": "audit",
+                "value": "yes\r\nx: 1"
+            }]
+        }),
+        // Array indices are not renameable.
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "body",
+                "key": "items.0",
+                "new_key": "first"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "body",
+                "key": "first",
+                "new_key": "items.0"
+            }]
+        }),
     ] {
         assert_component_validity(&spec, "RequestTransformerConfig", &config, false);
         assert!(
@@ -4875,23 +5069,6 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
             "runtime accepted OpenAPI-invalid request_transformer config: {config}"
         );
     }
-
-    // Operation-incompatible extras are known OpenAPI properties but still fail
-    // runtime construction (schema cannot encode per-operation field sets).
-    let incompatible = json!({
-        "rules": [{
-            "operation": "update",
-            "target": "header",
-            "key": "X-Color",
-            "value": "blue",
-            "new_key": "X-Ignored"
-        }]
-    });
-    assert_component_validity(&spec, "RequestTransformerConfig", &incompatible, true);
-    assert!(
-        RequestTransformer::new(&incompatible).is_err(),
-        "runtime must reject operation-incompatible header fields: {incompatible}"
-    );
 }
 
 #[test]
@@ -4965,7 +5142,7 @@ fn response_transformer_schema_matches_runtime_target_and_value_contract() {
     let runtime_overlay = spec
         .pointer("/components/schemas/ResponseTransformerConfig/properties/runtime_overlay_scope")
         .expect("runtime_overlay_scope remains published");
-    assert_eq!(runtime_overlay["type"], json!("string"));
+    assert_eq!(runtime_overlay["type"], json!(["string", "null"]));
     assert_eq!(runtime_overlay["minLength"], json!(1));
     assert_eq!(runtime_overlay["pattern"], json!("\\S"));
     assert_eq!(
@@ -4973,6 +5150,45 @@ fn response_transformer_schema_matches_runtime_target_and_value_contract() {
             .expect("default_enabled remains published")["default"],
         json!(true)
     );
+
+    for field in [
+        "apply_route_overrides",
+        "default_enabled",
+        "runtime_overlay_resolved_enabled",
+    ] {
+        let property = spec
+            .pointer(&format!(
+                "/components/schemas/ResponseTransformerConfig/properties/{field}"
+            ))
+            .unwrap_or_else(|| panic!("{field} remains published"));
+        assert_eq!(
+            property["type"],
+            json!(["boolean", "null"]),
+            "{field} must admit the explicit null the constructor accepts"
+        );
+    }
+
+    assert!(
+        spec.pointer("/components/schemas/ResponseTransformerConfig/anyOf")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|branches| branches.len() == 2),
+        "ResponseTransformerConfig must model non-empty rules vs route-only opt-in"
+    );
+
+    let contract = json!("#/components/schemas/TransformerOperationFieldExactness");
+    for variant in [
+        "ResponseTransformerHeaderRule",
+        "ResponseTransformerBodyRule",
+    ] {
+        let composed = spec
+            .pointer(&format!("/components/schemas/{variant}/allOf"))
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| panic!("{variant} must compose the operation contract"));
+        assert!(
+            composed.iter().any(|branch| branch["$ref"] == contract),
+            "{variant} must reference the shared operation-field contract"
+        );
+    }
 
     for config in [
         json!({
@@ -5000,6 +5216,32 @@ fn response_transformer_schema_matches_runtime_target_and_value_contract() {
         json!({
             "rules": [{
                 "operation": "add", "target": "header", "key": "X-Edge", "value": "tab\there"
+            }]
+        }),
+        json!({"apply_route_overrides": true}),
+        json!({"rules": [], "apply_route_overrides": true}),
+        json!({
+            "rules": [{"operation": "remove", "target": "header", "key": "X-Internal"}],
+            "apply_route_overrides": null,
+            "runtime_overlay_scope": null,
+            "default_enabled": null,
+            "runtime_overlay_resolved_enabled": null
+        }),
+        // Set-Cookie is renameable neither way, but every other operation on it
+        // stays available.
+        json!({"rules": [{"operation": "remove", "target": "header", "key": "Set-Cookie"}]}),
+        json!({
+            "rules": [{
+                "operation": "add", "target": "header", "key": "Set-Cookie", "value": "a=1"
+            }]
+        }),
+        json!({"rules": [{"operation": "remove", "target": "body", "key": "items.0"}]}),
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "body",
+                "key": "counts\\.0",
+                "new_key": "counts_first"
             }]
         }),
     ] {
@@ -5040,6 +5282,72 @@ fn response_transformer_schema_matches_runtime_target_and_value_contract() {
                 "vaule": "green"
             }]
         }),
+        json!({}),
+        json!({"rules": []}),
+        json!({"apply_route_overrides": false}),
+        json!({"rules": [{"operation": "update", "target": "header", "key": "x-audit"}]}),
+        json!({"rules": [{"operation": "add", "target": "body", "key": "audit"}]}),
+        json!({"rules": [{"operation": "rename", "target": "header", "key": "x-old"}]}),
+        json!({
+            "rules": [{
+                "operation": "remove",
+                "target": "header",
+                "key": "x-audit",
+                "value": "unused"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "update",
+                "target": "header",
+                "key": "X-Color",
+                "value": "blue",
+                "new_key": null
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "remove",
+                "target": "body",
+                "key": "secret",
+                "new_key": null
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "update",
+                "target": "body",
+                "key": "state",
+                "value": "public",
+                "new_key": null
+            }]
+        }),
+        json!({"rules": [{"operation": "remove", "target": "header", "key": "bad name"}]}),
+        // Set-Cookie's newline-joined multi-value encoding is name-bound.
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "header",
+                "key": "Set-Cookie",
+                "new_key": "X-Cookies"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "header",
+                "key": "X-Cookies",
+                "new_key": "SET-COOKIE"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "body",
+                "key": "items.0",
+                "new_key": "first"
+            }]
+        }),
     ] {
         assert_component_validity(&spec, "ResponseTransformerConfig", &config, false);
         assert!(
@@ -5047,23 +5355,6 @@ fn response_transformer_schema_matches_runtime_target_and_value_contract() {
             "runtime accepted OpenAPI-invalid response_transformer config: {config}"
         );
     }
-
-    // Operation-incompatible extras are known OpenAPI properties but still fail
-    // runtime construction (schema cannot encode per-operation field sets).
-    let incompatible = json!({
-        "rules": [{
-            "operation": "update",
-            "target": "header",
-            "key": "X-Color",
-            "value": "blue",
-            "new_key": "X-Ignored"
-        }]
-    });
-    assert_component_validity(&spec, "ResponseTransformerConfig", &incompatible, true);
-    assert!(
-        ResponseTransformer::new(&incompatible).is_err(),
-        "runtime must reject operation-incompatible header fields: {incompatible}"
-    );
 }
 
 #[test]
@@ -6068,6 +6359,146 @@ fn request_mirror_schema_matches_strict_runtime_config_contract() {
     assert!(err.contains("mirror_protcol"), "got: {err}");
     assert!(err.contains("allowed keys"), "got: {err}");
     validate_plugin_config("request_mirror", &typo).expect_err("shared admission must reject typo");
+
+    // Issue #5152: the component schema is compared against ACTUAL constructor
+    // admission, not just against the key inventory. Every case below must be
+    // accepted (or rejected) by both, so a schema-backed editor cannot reject a
+    // valid nullable/defaulted config or approve a malformed host, an
+    // incomplete credential-forwarding opt-in, or an invalid policy list.
+    let shared_client = PluginHttpClient::default();
+    let mut accepted: Vec<serde_json::Value> = vec![
+        // Minimal, plus both documented examples.
+        json!({"mirror_host": "127.0.0.1"}),
+        json!({
+            "mirror_host": "shadow.internal",
+            "mirror_port": 8443,
+            "mirror_protocol": "https",
+            "percentage": 50.0,
+            "mirror_request_body": true,
+            "max_in_flight": 64,
+            "max_retained_request_body_bytes": 33554432,
+            "max_mirrored_request_body_bytes": 4194304
+        }),
+        json!({
+            "mirror_host": "mirror.example.com",
+            "mirror_port": 8080,
+            "mirror_protocol": "https",
+            "mirror_path": "/shadow",
+            "percentage": 100.0,
+            "mirror_request_body": true,
+            "max_response_body_bytes": 1048576
+        }),
+        // The runtime lowercases the protocol, so uppercase is the same setting.
+        json!({"mirror_host": "127.0.0.1", "mirror_protocol": "HTTPS"}),
+        json!({"mirror_host": "[2001:db8::10]"}),
+        // Paired, fail-closed credential-forwarding opt-ins.
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_headers": true,
+            "forward_sensitive_header_allowlist": ["authorization"]
+        }),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["access_token"]
+        }),
+        json!({"mirror_host": "127.0.0.1", "sensitive_header_patterns": ["x-vault-"]}),
+        json!({"mirror_host": "127.0.0.1", "percentage": 0}),
+        json!({"mirror_host": "127.0.0.1", "mirror_path": ""}),
+    ];
+    // Every optional scalar and list accepts an explicit JSON null (the runtime
+    // treats null as omitted), so the schema must not reject it by type.
+    for key in REQUEST_MIRROR_CONFIG_KEYS
+        .iter()
+        .filter(|key| **key != "mirror_host")
+    {
+        let mut config = json!({"mirror_host": "127.0.0.1"});
+        config
+            .as_object_mut()
+            .expect("config object")
+            .insert((*key).to_string(), serde_json::Value::Null);
+        accepted.push(config);
+    }
+
+    let rejected: Vec<serde_json::Value> = vec![
+        json!({"mirror_host": "127.0.0.1", "mirror_protocol": "ftp"}),
+        // Host admission: a bare host only.
+        json!({"mirror_host": ""}),
+        json!({"mirror_host": " "}),
+        json!({"mirror_host": "https://example.test"}),
+        json!({"mirror_host": "example.test:80"}),
+        json!({"mirror_host": null}),
+        // Half an opt-in is a configuration error, never a partial grant.
+        json!({"mirror_host": "127.0.0.1", "forward_sensitive_headers": true}),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_headers": true,
+            "forward_sensitive_header_allowlist": []
+        }),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_header_allowlist": ["authorization"]
+        }),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_headers": true,
+            "forward_sensitive_header_allowlist": ["auth token"]
+        }),
+        json!({"mirror_host": "127.0.0.1", "forward_sensitive_query": true}),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query_allowlist": ["access_token"]
+        }),
+        // Operator pattern lists reject blank entries.
+        json!({"mirror_host": "127.0.0.1", "sensitive_header_patterns": [" "]}),
+        json!({"mirror_host": "127.0.0.1", "sensitive_query_patterns": [""]}),
+        // Numeric bounds.
+        json!({"mirror_host": "127.0.0.1", "max_in_flight": 0}),
+        json!({"mirror_host": "127.0.0.1", "max_response_body_bytes": 0}),
+        json!({"mirror_host": "127.0.0.1", "mirror_timeout_ms": 0}),
+        json!({"mirror_host": "127.0.0.1", "mirror_timeout_ms": 300001}),
+        json!({"mirror_host": "127.0.0.1", "mirror_path": "/a?b"}),
+    ];
+
+    for config in &accepted {
+        assert_component_validity(&spec, "RequestMirrorConfig", config, true);
+        assert!(
+            RequestMirror::new(config, shared_client.clone()).is_ok(),
+            "runtime must accept the schema-valid config {config}"
+        );
+    }
+    for config in &rejected {
+        assert_component_validity(&spec, "RequestMirrorConfig", config, false);
+        assert!(
+            RequestMirror::new(config, shared_client.clone()).is_err(),
+            "runtime must reject the schema-invalid config {config}"
+        );
+    }
+
+    // Documented, deliberate schema limitations: these runtime rules compare
+    // sibling values or inspect a JSON number's lexical form, which Draft
+    // 2020-12 cannot express. The component description names each one.
+    for runtime_only_rejection in [
+        // The allowlist entry is a valid header name but is not a header the
+        // deny-by-default policy strips.
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_headers": true,
+            "forward_sensitive_header_allowlist": ["x-page"]
+        }),
+        // An explicit per-body ceiling above the (defaulted) aggregate budget.
+        json!({
+            "mirror_host": "127.0.0.1",
+            "max_mirrored_request_body_bytes": 67108865
+        }),
+        // A whole-valued float is not an integer literal.
+        json!({"mirror_host": "127.0.0.1", "max_response_body_bytes": 1.0}),
+    ] {
+        assert!(
+            RequestMirror::new(&runtime_only_rejection, shared_client.clone()).is_err(),
+            "runtime must still reject {runtime_only_rejection}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -7958,6 +8389,403 @@ fn proxy_alerts_schema_rejects_unknown_keys_and_keeps_open_maps() {
         }),
         false,
     );
+}
+
+fn proxy_alerts_channel_config(channel: serde_json::Value) -> serde_json::Value {
+    json!({
+        "channels": { "ops": channel },
+        "rules": [{
+            "name": "r",
+            "type": "status_code_count",
+            "status_codes": [500],
+            "threshold_count": 1,
+            "channels": ["ops"]
+        }]
+    })
+}
+
+fn proxy_alerts_rule_config(rule: serde_json::Value) -> serde_json::Value {
+    json!({
+        "channels": {
+            "ops": {
+                "type": "webhook",
+                "url": "http://127.0.0.1:54321/",
+                "body_template": "{}"
+            }
+        },
+        "rules": [rule]
+    })
+}
+
+fn assert_proxy_alerts_schema_and_constructor(
+    validator: &jsonschema::Validator,
+    name: &str,
+    config: &serde_json::Value,
+    schema_valid: bool,
+    constructor_valid: bool,
+) {
+    assert_eq!(
+        validator.validate(config).is_ok(),
+        schema_valid,
+        "{name}: unexpected schema result for {config}"
+    );
+    let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(config);
+    match (parsed, constructor_valid) {
+        (Ok(_), true) | (Err(_), false) => {}
+        (Ok(_), false) => panic!("{name}: constructor accepted {config}"),
+        (Err(err), true) => panic!("{name}: constructor rejected {config}: {err}"),
+    }
+}
+
+#[test]
+fn proxy_alerts_schema_matches_constructor_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let description = spec["components"]["schemas"]["ProxyAlertsConfig"]["description"]
+        .as_str()
+        .expect("ProxyAlertsConfig description");
+    for contract in [
+        "OptionalFailOpen",
+        "HTTP 400",
+        "delivery_retry_max_ms >= delivery_retry_base_ms",
+        "UTF-8 byte",
+        "case-insensitive",
+        "ferrum-edge validate",
+    ] {
+        assert!(
+            description.contains(contract),
+            "ProxyAlertsConfig description missing `{contract}`"
+        );
+    }
+
+    let docs = include_str!("../../docs/proxy_alerts.md");
+    let plugins_docs = include_str!("../../docs/plugins.md");
+    let notifications_docs = include_str!("../../docs/notifications.md");
+    for (path, text, needle) in [
+        ("docs/proxy_alerts.md", docs, "OptionalFailOpen"),
+        ("docs/proxy_alerts.md", docs, "ferrum-edge validate"),
+        ("docs/proxy_alerts.md", docs, "constructor-only"),
+        ("docs/plugins.md", plugins_docs, "OptionalFailOpen"),
+        (
+            "docs/notifications.md",
+            notifications_docs,
+            "case-insensitive",
+        ),
+        (
+            "docs/notifications.md",
+            notifications_docs,
+            "character ceiling",
+        ),
+    ] {
+        assert!(text.contains(needle), "{path} missing `{needle}`");
+    }
+
+    assert_eq!(
+        spec.pointer(
+            "/components/schemas/ProxyAlertsConfig/properties/max_concurrent_dispatches/maximum",
+        )
+        .and_then(serde_json::Value::as_u64),
+        Some(4_294_967_295)
+    );
+    let method_schema = spec
+        .pointer("/components/schemas/ProxyAlertsWebhookChannel/properties/method")
+        .expect("webhook method schema");
+    assert!(
+        method_schema.get("enum").is_none(),
+        "webhook method must not be an uppercase-only enum"
+    );
+    assert_eq!(
+        method_schema["pattern"],
+        json!("^[Pp][Oo][Ss][Tt]$|^[Pp][Uu][Tt]$|^[Pp][Aa][Tt][Cc][Hh]$")
+    );
+    assert_eq!(
+        spec.pointer("/components/schemas/ProxyAlertsEmailChannel/allOf")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(2),
+        "email channel must encode username/password pairing"
+    );
+
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/ProxyAlertsConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .unwrap_or_else(|error| panic!("ProxyAlertsConfig schema compiles: {error}"));
+
+    let webhook = json!({
+        "type": "webhook",
+        "url": "http://127.0.0.1:54321/",
+        "body_template": "{}"
+    });
+    let mut method_post = webhook.clone();
+    method_post["method"] = json!("post");
+    let mut method_patch = webhook.clone();
+    method_patch["method"] = json!("pAtCh");
+    let mut empty_url = webhook.clone();
+    empty_url["url"] = json!("");
+    let mut ftp_url = webhook.clone();
+    ftp_url["url"] = json!("ftp://example.test/");
+    let mut empty_url_env = webhook.clone();
+    empty_url_env
+        .as_object_mut()
+        .expect("webhook object")
+        .remove("url");
+    empty_url_env["url_env"] = json!("");
+    let mut unbalanced = webhook.clone();
+    unbalanced["body_template"] = json!("${");
+
+    let email = json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com"]
+    });
+    let mut email_username_only = email.clone();
+    email_username_only["username"] = json!("alerts");
+    let mut email_empty_subject = email.clone();
+    email_empty_subject["subject_template"] = json!("");
+    let mut email_empty_host = email.clone();
+    email_empty_host["smtp_host"] = json!("");
+    let mut email_dots = email.clone();
+    email_dots["from"] = json!("a..b@example.test");
+    let mut email_long_subject = email.clone();
+    email_long_subject["subject_template"] = json!("é".repeat(600));
+
+    let mut too_many_dispatches = proxy_alerts_channel_config(webhook.clone());
+    too_many_dispatches["max_concurrent_dispatches"] = json!(4_294_967_296_u64);
+    let mut retry_inversion = proxy_alerts_channel_config(webhook.clone());
+    retry_inversion["delivery_retry_base_ms"] = json!(2000);
+    retry_inversion["delivery_retry_max_ms"] = json!(100);
+
+    let cases: [(&str, serde_json::Value, bool, bool); 25] = [
+        (
+            "minimal webhook",
+            proxy_alerts_channel_config(webhook.clone()),
+            true,
+            true,
+        ),
+        (
+            "method post",
+            proxy_alerts_channel_config(method_post),
+            true,
+            true,
+        ),
+        (
+            "method pAtCh",
+            proxy_alerts_channel_config(method_patch),
+            true,
+            true,
+        ),
+        (
+            "slack",
+            proxy_alerts_channel_config(json!({
+                "type": "slack",
+                "webhook_url": "https://hooks.slack.com/services/x/y/z"
+            })),
+            true,
+            true,
+        ),
+        (
+            "teams",
+            proxy_alerts_channel_config(json!({
+                "type": "teams",
+                "webhook_url": "https://outlook.office.com/webhook/x"
+            })),
+            true,
+            true,
+        ),
+        (
+            "discord",
+            proxy_alerts_channel_config(json!({
+                "type": "discord",
+                "webhook_url": "https://discord.com/api/webhooks/x"
+            })),
+            true,
+            true,
+        ),
+        (
+            "email",
+            proxy_alerts_channel_config(email.clone()),
+            true,
+            true,
+        ),
+        (
+            "error_rate",
+            proxy_alerts_rule_config(json!({
+                "name": "r",
+                "type": "error_rate",
+                "status_codes": [500],
+                "threshold_percent": 5.0,
+                "channels": ["ops"]
+            })),
+            true,
+            true,
+        ),
+        (
+            "latency_percentile",
+            proxy_alerts_rule_config(json!({
+                "name": "r",
+                "type": "latency_percentile",
+                "metric": "backend_total_ms",
+                "percentile": 95,
+                "threshold_ms": 1500,
+                "channels": ["ops"]
+            })),
+            true,
+            true,
+        ),
+        (
+            "error_class",
+            proxy_alerts_rule_config(json!({
+                "name": "r",
+                "type": "error_class",
+                "classes": ["connection_refused"],
+                "threshold_count": 1,
+                "channels": ["ops"]
+            })),
+            true,
+            true,
+        ),
+        (
+            "stream_disconnect_cause",
+            proxy_alerts_rule_config(json!({
+                "name": "r",
+                "type": "stream_disconnect_cause",
+                "causes": ["backend_error"],
+                "threshold_count": 1,
+                "channels": ["ops"]
+            })),
+            true,
+            true,
+        ),
+        (
+            "grpc_status_count",
+            proxy_alerts_rule_config(json!({
+                "name": "r",
+                "type": "grpc_status_count",
+                "grpc_statuses": [14, "OTHER"],
+                "threshold_count": 1,
+                "channels": ["ops"]
+            })),
+            true,
+            true,
+        ),
+        (
+            "grpc_status_rate",
+            proxy_alerts_rule_config(json!({
+                "name": "r",
+                "type": "grpc_status_rate",
+                "grpc_statuses": [14],
+                "threshold_percent": 5.0,
+                "channels": ["ops"]
+            })),
+            true,
+            true,
+        ),
+        (
+            "disabled draft",
+            json!({
+                "channels": {
+                    "ops": {
+                        "type": "webhook",
+                        "url": "http://127.0.0.1:54321/",
+                        "body_template": "{}"
+                    }
+                },
+                "rules": [
+                    { "enabled": false, "unknown_draft_field": true },
+                    {
+                        "name": "r",
+                        "type": "status_code_count",
+                        "status_codes": [500],
+                        "threshold_count": 1,
+                        "channels": ["ops"]
+                    }
+                ]
+            }),
+            true,
+            true,
+        ),
+        (
+            "empty url",
+            proxy_alerts_channel_config(empty_url),
+            false,
+            false,
+        ),
+        (
+            "ftp url",
+            proxy_alerts_channel_config(ftp_url),
+            false,
+            false,
+        ),
+        (
+            "empty url_env",
+            proxy_alerts_channel_config(empty_url_env),
+            false,
+            false,
+        ),
+        (
+            "email username without password",
+            proxy_alerts_channel_config(email_username_only),
+            false,
+            false,
+        ),
+        (
+            "empty subject_template",
+            proxy_alerts_channel_config(email_empty_subject),
+            false,
+            false,
+        ),
+        (
+            "empty smtp_host",
+            proxy_alerts_channel_config(email_empty_host),
+            false,
+            false,
+        ),
+        (
+            "repeated local-part dots",
+            proxy_alerts_channel_config(email_dots),
+            false,
+            false,
+        ),
+        (
+            "max_concurrent_dispatches exceeds u32",
+            too_many_dispatches,
+            false,
+            false,
+        ),
+        (
+            "unbalanced webhook placeholder",
+            proxy_alerts_channel_config(unbalanced),
+            true,
+            false,
+        ),
+        (
+            "email subject byte bound",
+            proxy_alerts_channel_config(email_long_subject),
+            true,
+            false,
+        ),
+        (
+            "delivery retry sibling comparison",
+            retry_inversion,
+            true,
+            false,
+        ),
+    ];
+
+    for (name, config, schema_ok, constructor_ok) in cases {
+        assert_proxy_alerts_schema_and_constructor(
+            &validator,
+            name,
+            &config,
+            schema_ok,
+            constructor_ok,
+        );
+    }
 }
 
 #[test]

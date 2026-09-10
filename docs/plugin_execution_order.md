@@ -1589,7 +1589,7 @@ Given all built-in plugins enabled, the execution order is:
 
 | # | Plugin | Priority | Active Phases |
 |---|--------|----------|---------------|
-| 1 | `otel_tracing` | 25 | on_request_received, on_stream_connect, before_proxy, after_proxy, log, on_stream_disconnect |
+| 1 | `otel_tracing` | 25 | on_request_received, on_stream_connect, before_proxy, after_proxy, log, on_stream_disconnect, on_ws_disconnect |
 | 2 | `correlation_id` | 50 | on_request_received, before_proxy, after_proxy, apply_websocket_handshake_response_headers, on_stream_connect |
 | 3 | `cors` | 100 | on_request_received, after_proxy |
 | 4 | `request_termination` | 125 | on_request_received |
@@ -2104,6 +2104,8 @@ An **absent** `Content-Type` is treated as JSON, and the representation gate's c
 - Body rules are parsed once at config load time, not per-request.
 - When `response_transformer` has body rules, it automatically enables conservative response body buffering for the proxy. Backend-declared `text/event-stream` responses are released after headers; request-side SSE intent alone never releases a JSON response. Without body rules, responses stream through with zero overhead.
 - `request_transformer` body transformation runs after the request body is collected and before it is sent to the backend (HTTP/1.1 and HTTPS paths).
+- `request_transformer` body rules collect only the uploads they can rewrite. The config-time capability is the upper bound; per request, an upload whose declared `Content-Type` is non-JSON streams straight through instead of being collected and then declined, so an ordinary binary or form POST pays no extra upstream time-to-first-byte and no full-body buffer. An **absent** `Content-Type` stays buffered, because the transform still parses it as JSON. A `before_proxy` header rewrite cannot bypass the rules: both the H1/H2 and the native H3 dispatch ladders re-evaluate the request-body requirements against the effective outbound headers before the body is read, so a `text/plain` → `application/json` rewrite still selects buffering.
+- An unrelated header rule never changes either buffering answer. Request header rules run in `before_proxy` and need no body; response header rules run in `after_proxy`. The one response exception is request-qualified: a TRANSLATED gRPC-Web response keeps the buffered compatibility view so terminal-metadata policy can be enforced over it, and that exception applies only to requests `grpc_web` actually translated — never to an ordinary HTTP SSE or binary response.
 - Header, query, and body rules can be mixed in a single plugin configuration.
 
 ## gRPC Compatibility
