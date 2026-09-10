@@ -423,7 +423,8 @@ async fn mesh_outbound_registry_metrics_classify_only_applicable_entries() {
             PluginResult::Continue
         ));
 
-        let rendered = ferrum_edge::plugins::prometheus_metrics::global_registry().render_uncached();
+        let rendered =
+            ferrum_edge::plugins::prometheus_metrics::global_registry().render_uncached();
         let prefix = format!(
             "ferrum_mesh_outbound_registry_decisions_total{{mesh_namespace=\"{namespace}\","
         );
@@ -437,9 +438,7 @@ async fn mesh_outbound_registry_metrics_classify_only_applicable_entries() {
         } else {
             "<admit_wildcard>"
         };
-        assert!(
-            series[0].starts_with(&format!("{prefix}host=\"{bucket}\",decision=\"admit\""))
-        );
+        assert!(series[0].starts_with(&format!("{prefix}host=\"{bucket}\",decision=\"admit\"")));
         assert!(series[0].ends_with("} 1"));
     }
 }
@@ -8564,7 +8563,9 @@ async fn mesh_outbound_registry_empty_effective_registry_denies_destinations() {
         json!({"registry": []}),
         json!({"registry": ["", " \t"]}),
     ] {
-        let plugin = create_plugin("mesh_outbound_registry", &config).unwrap().unwrap();
+        let plugin = create_plugin("mesh_outbound_registry", &config)
+            .unwrap()
+            .unwrap();
         for host in ["known.test", "known.test:443", "[::1]:443"] {
             let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
             ctx.headers.insert("host".into(), host.into());
