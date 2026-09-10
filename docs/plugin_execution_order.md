@@ -613,7 +613,12 @@ Why the split matters:
   residual scan here is what binds redaction metadata to a rewrite that actually
   happened *and* to the representation actually delivered; a `redact`
   disposition with nothing left to discharge it becomes a rejection, while
-  `warn` still passes through.
+  `warn` still passes through. For origin-encoded HTTP responses, early
+  inspection defers to the charged representation decoder and this final
+  plaintext check. A private per-instance digest recognizes the exact HTTP
+  output already verified by the redactor, including generated placeholders
+  and deliberately preserved structural scalars. Changed bytes or media types
+  require fresh detection; size, structure, and length checks still run.
 
 The phase also runs when the transform phase is skipped (an unclaimed `206`/`226`
 representation), because it is non-rewriting and must still decide.

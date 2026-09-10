@@ -2662,6 +2662,10 @@ pub struct RequestContext {
     /// whether a redaction actually happened, so neither response content nor a
     /// custom plugin may clear it.
     pub(crate) ai_response_guard_pending_redactions: HashMap<u64, String>,
+    /// Per-instance digest of residual-verified HTTP redaction output, including
+    /// its media type. Only byte-identical output may reuse the verification;
+    /// later semantic changes still require a fresh detection pass. Never logged.
+    pub(crate) ai_response_guard_verified_redactions: HashMap<u64, [u8; 32]>,
     /// `ai_tool_governor` equivalent of
     /// `ai_response_guard_replay_redactions`. Instance scoping prevents one
     /// governor from consuming another instance's transform requirement.
@@ -3602,6 +3606,7 @@ impl RequestContext {
             ai_tool_governor_response_hashes: HashMap::new(),
             ai_response_guard_replay_redactions: HashSet::new(),
             ai_response_guard_pending_redactions: HashMap::new(),
+            ai_response_guard_verified_redactions: HashMap::new(),
             ai_tool_governor_replay_redactions: HashSet::new(),
             graphql_request_envelope_hashes: HashMap::new(),
             graphql_charged_rate_buckets: HashSet::new(),
@@ -4932,6 +4937,9 @@ impl RequestContext {
             ai_tool_governor_response_hashes: self.ai_tool_governor_response_hashes.clone(),
             ai_response_guard_replay_redactions: self.ai_response_guard_replay_redactions.clone(),
             ai_response_guard_pending_redactions: self.ai_response_guard_pending_redactions.clone(),
+            ai_response_guard_verified_redactions: self
+                .ai_response_guard_verified_redactions
+                .clone(),
             ai_tool_governor_replay_redactions: self.ai_tool_governor_replay_redactions.clone(),
             // Carried into the final-request-body stage so every plugin in that
             // stage shares one duplicate-key screen of the same body.
