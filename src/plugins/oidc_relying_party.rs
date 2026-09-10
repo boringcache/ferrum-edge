@@ -3515,6 +3515,14 @@ fn validate_redirect_uri(uri: &str) -> Result<(), String> {
             ));
         }
     }
+    // RFC 6749 §3.1.2 forbids a fragment on a redirection endpoint. A
+    // conforming provider refuses the registration outright; a lenient one
+    // appends the authorization response query AFTER the fragment, so the
+    // browser never transmits `state`/`code` and every callback fails
+    // (issue #5031).
+    if parsed.fragment().is_some() {
+        return Err("oidc_relying_party: redirect_uri must not contain a fragment".to_string());
+    }
     Ok(())
 }
 

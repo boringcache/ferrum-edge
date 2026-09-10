@@ -3777,3 +3777,28 @@ async fn accepted_logout_paths_reach_local_cookie_deletion() {
         "logout must expire the session cookie: {headers:?}"
     );
 }
+
+/// RFC 6749 §3.1.2 forbids a fragment on the redirection endpoint: a lenient
+/// provider appends the authorization response query after it, so the browser
+/// never transmits `state`/`code` and every callback fails (issue #5031).
+#[test]
+fn new_rejects_redirect_uris_carrying_a_fragment() {
+    for redirect_uri in [
+        "https://app.example.com/oauth/callback#fragment",
+        "https://app.example.com/oauth/callback#",
+    ] {
+        let mut config = base_config();
+        config["providers"][0]["redirect_uri"] = json!(redirect_uri);
+        let error = validate_plugin_config("oidc_relying_party", &config)
+            .err()
+            .unwrap_or_else(|| panic!("{redirect_uri} must be rejected"));
+        assert!(error.contains("redirect_uri"), "unexpected error: {error}");
+    }
+
+    // A fixed query component stays supported: it is not a fragment, and the
+    // provider appends the response parameters after it.
+    let mut config = base_config();
+    config["providers"][0]["redirect_uri"] =
+        json!("https://app.example.com/oauth/callback?rp=edge");
+    assert!(validate_plugin_config("oidc_relying_party", &config).is_ok());
+}
