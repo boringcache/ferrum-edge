@@ -288,7 +288,7 @@ impl OutboundRegistry {
             buf.clear();
             buf.reserve(host.len());
             normalise_request_host_into(host, &mut buf);
-            if buf.is_empty() || self.hosts.contains(buf.as_str()) {
+            if buf.is_empty() || (port.is_none() && self.hosts.contains(buf.as_str())) {
                 return EXPLICIT_HOST_BUCKET;
             }
             if let Some(port) = port {

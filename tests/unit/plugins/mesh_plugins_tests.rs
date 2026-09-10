@@ -388,6 +388,62 @@ fn mesh_outbound_registry_metric_contract_matches_docs_and_help() {
     );
 }
 
+#[tokio::test]
+async fn mesh_outbound_registry_metrics_classify_only_applicable_entries() {
+    let cases = [
+        (["api.example.com", "*.example.com:443"], true, false),
+        (["api.example.com", "*.example.com:*"], true, false),
+        (["api.example.com:8443", "*.example.com:443"], true, false),
+        (["api.example.com:8443", "*.example.com:*"], true, false),
+        (["api.example.com:443", "*.example.com:443"], true, true),
+        (["api.example.com:443", "*.example.com:*"], true, true),
+        (["api.example.com:*", "*.example.com:443"], true, true),
+        (["api.example.com:*", "*.example.com:*"], true, true),
+        (["api.example.com", "*.example.com"], false, true),
+        (["api.example.com:443", "*.example.com"], false, false),
+        (["api.example.com:*", "*.example.com"], false, false),
+    ];
+    for (index, (entries, explicit_port, exact_match)) in cases.into_iter().enumerate() {
+        let namespace = format!("outbound-registry-overlap-{index}");
+        let plugin = create_plugin(
+            "mesh_outbound_registry",
+            &json!({"registry": entries, "namespace": namespace}),
+        )
+        .unwrap()
+        .unwrap();
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+        let authority = if explicit_port {
+            "API.Example.Com.:443"
+        } else {
+            "API.Example.Com."
+        };
+        ctx.headers.insert("host".into(), authority.into());
+        assert!(matches!(
+            plugin.on_request_received(&mut ctx).await,
+            PluginResult::Continue
+        ));
+
+        let rendered = ferrum_edge::plugins::prometheus_metrics::global_registry().render_uncached();
+        let prefix = format!(
+            "ferrum_mesh_outbound_registry_decisions_total{{mesh_namespace=\"{namespace}\","
+        );
+        let series: Vec<_> = rendered
+            .lines()
+            .filter(|line| line.starts_with(&prefix))
+            .collect();
+        assert_eq!(series.len(), 1, "{namespace}: {series:?}");
+        let bucket = if exact_match {
+            "<admit_explicit>"
+        } else {
+            "<admit_wildcard>"
+        };
+        assert_eq!(
+            series[0],
+            format!("{prefix}host=\"{bucket}\",decision=\"admit\"}} 1")
+        );
+    }
+}
+
 #[test]
 fn mesh_authz_rejects_namespace_scoped_direct_policy_without_namespace() {
     let err = match MeshAuthz::new(&json!({
