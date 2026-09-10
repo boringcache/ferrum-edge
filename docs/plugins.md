@@ -3113,6 +3113,7 @@ As a runtime backstop for every other transform (including custom plugins), an i
 | `username_token.created_clock_skew_seconds` | u64 | `300` | Clock skew tolerance for the UsernameToken `Created` window (`0`–`3600`) |
 | `username_token.created_max_timestamp_divergence_seconds` | u64 | `60` | Maximum permitted `\|UsernameToken.Created − Timestamp.Created\|` (`0`–`3600`) |
 | `username_token.require_timestamp_binding` | bool | `true` | Require an outer `wsu:Timestamp` with a valid `Created` for PasswordDigest, so the binding cannot be dropped by omitting the element |
+| `username_token.remove_credential` | bool | `false` | Delete the verified `wsse:UsernameToken` (or the whole `wsse:Security` header when it holds only the credential) from the **backend-visible** message. Requires `enabled: true` and an explicit `password_type: PasswordText`; refused alongside an enabled `x509_signature` / `saml` or an explicit `content_type.allow_mtom: true` — see [Removing the credential before the backend](#removing-the-credential-before-the-backend) |
 | `x509_signature.enabled` | bool | `false` | Enable X.509 signature verification |
 | `x509_signature.trusted_certs` | String[] | `[]` | PEM file paths of trusted signing certificates |
 | `x509_signature.allowed_algorithms` | String[] | `["rsa-sha256"]` | Allowed signature algorithms (`rsa-sha256`, `rsa-sha1`) |
@@ -3157,7 +3158,7 @@ On top of that ordering:
 
 - Duplicate Reference URIs are rejected. The X.509 Reference ceiling is **8**; SAML accepts exactly one Reference, targeting the enclosing assertion's own id.
 - One bounded id index is built per message after the structure is settled, replacing a full-envelope scan per Reference. The independent raw start-tag scan is likewise a single pass covering every referenced id at once.
-- Every canonicalization is charged against an aggregate per-message byte budget of `2 × decoded body length` (floor 64 KiB), counting both the source subtree walked and the canonical bytes emitted. An over-budget message is refused before the work is done.
+- Every canonicalization is charged against an aggregate per-message byte budget of `2 × decoded body length` (floor 64 KiB), counting both the source subtree walked and the canonical bytes emitted. The source subtree is charged before it is walked, and the canonical writer charges **before each run it appends** — namespace declarations and `&amp;`-style escaping expand the output independently of the input's byte count, so charging the finished string would have bounded what the gateway *accepted* while the complete over-budget representation was already built and paid for. An over-budget message stops at the first append that would cross the ceiling, and the writer never reserves more capacity than the budget still admits.
 - Element nesting is bounded to **256 levels**, screened over the raw envelope bytes before the document reaches `roxmltree`, whose tokenizer recurses once per open element: the 65 536-node parser budget bounds a *wide* document but cannot stop a deeply nested one from exhausting the worker stack inside the parser itself. An over-depth envelope is refused as malformed XML with a fixed diagnostic that echoes no envelope bytes. The separate 256-level canonicalization budget still bounds the post-parse walk.
 
 #### X.509 must protect the backend-visible Body
@@ -3210,12 +3211,100 @@ reading of an element in this plugin:
   value element are rejected the same way.
 - Whatever text does survive is read by concatenating **every** text child in
   document order — the same order and content canonicalization emits.
+- The concatenated value is used **unchanged**. Surrounding whitespace decides
+  only whether an otherwise-required element is blank; it is never stripped from
+  the value the gateway acts on. Returning a trimmed copy was the same
+  verify-here/act-on-that split in a smaller form — the signature covers the
+  character data exactly as it appears — and it also meant a configured
+  PasswordText credential with significant leading or trailing spaces could
+  never authenticate, because configuration preserved the spaces and the reader
+  removed them. Only a field whose XML Schema datatype carries
+  `whiteSpace = "collapse"` is normalized: `xsd:dateTime` instants (`wsu:Created`,
+  `wsu:Expires`) and `xsd:base64Binary` payloads (`wsse:Nonce`,
+  `ds:SignatureValue`, `ds:DigestValue`, `wsse:BinarySecurityToken`,
+  `ds:X509Certificate`). `NameID`, `Issuer`, `Audience`, `Username`, and a
+  PasswordText `Password` are opaque strings and are matched byte for byte.
 
 This applies to `NameID`, `Issuer`, `Audience`, `Username`, `Password`, `Nonce`,
 `Created`, `Expires`, `SignatureValue`, `DigestValue`, `BinarySecurityToken`, and
 `X509Certificate`. Comments **between** elements are ordinary markup and are
 still accepted — only comments *inside* a value are refused. The rejection body
 names the reason and never echoes the element's content.
+
+#### Removing the credential before the backend
+
+A verified PasswordText credential is a reusable secret, and validating it does
+not stop the envelope that carries it from reaching the backend — so every
+system behind the gateway ends up trusted with a password it usually has no use
+for. `username_token.remove_credential: true` deletes the verified
+`wsse:UsernameToken` from the message the backend receives, or the whole
+`wsse:Security` header when the credential is the only thing that header
+carries. The authenticated identity is published exactly as before
+(`authenticated_identity`, a namespace-correct `identified_consumer`, and
+`ctx.metadata["soap_ws_username"]`), so authorization, consumer rate limiting,
+logging, and chargeback are unaffected; only the reusable secret is gone.
+
+It is **off by default**. A backend may legitimately read the token, and a
+gateway must not silently change a message a deployment already relies on.
+
+**Every composition it could not sanitize honestly is refused, not degraded.**
+At admission:
+
+- `username_token.enabled` must be `true` and `password_type` must be explicitly
+  `PasswordText`. A PasswordDigest token carries no reusable plaintext secret,
+  and deleting it would also remove the `Nonce` and `Created` a backend may
+  still read.
+- An enabled `x509_signature` or `saml` is refused. Rewriting the envelope would
+  invalidate content a signature covers, so the composition fails admission
+  instead of breaking a signature at runtime.
+- An explicit `content_type.allow_mtom: true` is refused, the same way it is
+  alongside an enabled `x509_signature`: an MTOM package cannot be re-framed
+  around a shortened root part.
+
+At request time, on a governed message:
+
+| Shape | Outcome |
+|---|---|
+| Plain UTF-8 XML envelope (BOM optional), no `ds:Signature` | Credential removed; backend receives the application body and the authenticated identity |
+| Envelope carrying an XMLDSIG `Signature` anywhere | `400` — the gateway did not verify that signature and will not silently invalidate it |
+| UTF-16 body, or MTOM `multipart/related` | `415` — the bytes cannot be spliced without transcoding or re-framing |
+
+Neither refusal forwards the credential. An operator who turned this on asked
+for a security property, and quietly declining to apply it is the defect, not
+the remedy.
+
+**The integrity proof binds the sanitized message.** The identity-establishing
+final-body guard normally refuses to dispatch a body whose bytes changed after
+validation. Under credential removal it records the SHA-256 of the *sanitized*
+representation instead, and the removal itself is re-derived from a recorded
+byte range and applied only when the result reproduces that digest. So the
+plugin's own rewrite is admitted, and every other post-validation mutation —
+including one that lands before the removal and makes it inapplicable — still
+fails closed with `500`.
+
+Because this instance now declares a request-body transform, the shared
+composition rules that refuse a body transformer apply to it: combining it with
+`request_deduplication` or `response_caching` on the same proxy is rejected at
+admission, and pairing it with another request-body transformer will make the
+final-body guard refuse the dispatch. Gateway-internal views of the request
+(access logs that capture bodies, `request_mirror`) may still observe the
+original buffered body; the option governs what the **backend** receives.
+
+```yaml
+plugin_name: soap_ws_security
+config:
+  timestamp:
+    require: true
+  content_type:
+    allow_mtom: false
+  username_token:
+    enabled: true
+    password_type: PasswordText
+    remove_credential: true
+    credentials:
+      - username: partner-a
+        password: "${PARTNER_A_PASSWORD}"
+```
 
 #### UsernameToken — PasswordDigest
 
@@ -3422,7 +3511,11 @@ config:
     require: true
 ```
 
-`trusted_issuers`, `trusted_signing_certs`, `audience`, `recipient`, and `nonce.replay_scope` are all required when `saml.enabled: true`. A missing or unreadable signing cert is a fatal startup error. Rotating an IdP signing cert requires updating `trusted_signing_certs` and restarting the gateway (no live reload). `allowed_signature_algorithms` and `allowed_digest_algorithms` are independent — the defaults reject SHA-1 in either position; add `rsa-sha1` / `sha1` only to interoperate with legacy IdPs.
+`trusted_issuers`, `trusted_signing_certs`, `audience`, `recipient`, and `nonce.replay_scope` are all required when `saml.enabled: true`. A missing or unreadable signing cert is a fatal startup error. `allowed_signature_algorithms` and `allowed_digest_algorithms` are independent — the defaults reject SHA-1 in either position; add `rsa-sha1` / `sha1` only to interoperate with legacy IdPs.
+
+**Rotating an IdP signing cert does not require a restart.** The trust list is read when the plugin *generation* is constructed, and every configuration reload builds a new generation: change `trusted_signing_certs` and apply a reload — file-mode `SIGHUP`, a database or CP configuration change, a DP push — and the new signer is admitted while the retired one is refused, from the first request the new generation serves. The process, its listeners, and its in-flight connections are untouched.
+
+What is *not* detected is replacing a PEM's **contents** at an unchanged path: nothing watches the file, and an unchanged configuration produces no new material to read. Rotate by publishing the new certificate at a new path and changing the list (add the new path, reload, then remove the retired path and reload again for an overlap window), not by overwriting the file in place. A path that cannot be read, decoded, or parsed fails the reload, and the last known good generation keeps serving.
 
 #### Combined Configuration
 
