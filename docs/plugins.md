@@ -2572,7 +2572,13 @@ Authenticates using HTTP Basic credentials. Every HTTP 401 response advertises `
 
 **Priority:** 1300
 
-**Config**: The plugin object is empty. `FERRUM_BASIC_AUTH_HMAC_SECRET` is mandatory whenever the plugin is enabled and must contain at least 32 bytes of unique random material. There is no default. Rotating the secret invalidates all existing hashes, so replace the hashes in the same rollout.
+**Config**: The property set is closed — `null`, an empty object, and an object carrying only `hide_credentials` are the accepted forms. `FERRUM_BASIC_AUTH_HMAC_SECRET` is mandatory whenever the plugin is enabled and must contain at least 32 bytes of unique random material. There is no default. Rotating the secret invalidates all existing hashes, so replace the hashes in the same rollout.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `hide_credentials` | Boolean | `true` | Remove the `Authorization` field carrying the `Basic` scheme before proxying an authenticated request, including when another mechanism wins a multi-auth chain. Set to `false` only for a legacy backend that explicitly requires the reusable password. |
+
+Basic encodes a **reusable** username and password in reversible Base64: an upstream that receives the field recovers the password and can replay it on any other gateway route that consumer can reach. The credential is therefore removed by default on every HTTP/1.1, HTTP/2, HTTP/3, gRPC, gRPC-Web, and WebSocket handshake path, and it is removed even when a different mechanism authenticated the request — a mixed chain must not forward Alice's password to a backend the gateway is telling `x-consumer-username: bob`. Only the `Basic` scheme is removed; a `Bearer` or other `Authorization` scheme another policy needs is left in place. Consumer identity injection and the `401` challenge are unchanged.
 
 Admin API writes may supply exactly one of `password` or `password_hash`; plaintext passwords are hashed and removed before persistence. File-mode configuration must supply only `password_hash` so plaintext credentials never enter observable runtime configuration.
 
@@ -2587,6 +2593,14 @@ credentials:
     - password_hash: "hmac_sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     - password_hash: "hmac_sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 ```
+
+A consumer that carries `basicauth` credentials must not have a `:` in its
+`username`. RFC 7617 §2 splits the decoded `user-id ":" password` at the FIRST
+colon, so no `Authorization: Basic` value can represent such a user-id and the
+consumer could never authenticate. Admission rejects the combination (admin
+API, file, database, and CP alike) instead of accepting a login that always
+returns 401. Colons inside the **password** stay valid, and a consumer with only
+other credential types is unaffected.
 
 ### `hmac_auth`
 

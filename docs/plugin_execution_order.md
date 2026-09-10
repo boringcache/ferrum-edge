@@ -1609,7 +1609,7 @@ Given all built-in plugins enabled, the execution order is:
 | 18 | `jwt_auth` | 1100 | authenticate |
 | 19 | `key_auth` | 1200 | authenticate, before_proxy |
 | 20 | `ldap_auth` | 1250 | authenticate |
-| 21 | `basic_auth` | 1300 | authenticate |
+| 21 | `basic_auth` | 1300 | authenticate, before_proxy |
 | 22 | `hmac_auth` | 1400 | authenticate |
 | 23 | `soap_ws_security` | 1500 | authenticate, before_proxy, on_final_request_body |
 | 24 | `access_control` | 2000 | authorize, on_stream_connect |

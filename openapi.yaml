@@ -20413,9 +20413,28 @@ components:
             legacy backend explicitly requires the reusable credential.
 
     BasicAuthConfig:
-      type: object
-      description: "Plugin: basic_auth — HTTP Basic credentials verified against HMAC-SHA256 password hashes."
-      properties: {}
+      type: [object, "null"]
+      additionalProperties: false
+      description: >-
+        Plugin: basic_auth — HTTP Basic credentials verified against
+        HMAC-SHA256 password hashes. The property set is CLOSED: `null` and an
+        empty object both select the defaults, and no other key is accepted.
+        (The enclosing PluginConfig `config` property is independently
+        restricted to objects, so `null` is only reachable when this component
+        is validated on its own.)
+      properties:
+        hide_credentials:
+          type: boolean
+          default: true
+          description: >-
+            Remove the `Authorization` field carrying the RFC 7617 `Basic`
+            scheme before forwarding an authenticated request upstream,
+            including when another mechanism wins a multi-auth chain and this
+            credential merely rode along. Basic encodes a reusable password in
+            reversible Base64, so it is removed by default. Only the `Basic`
+            scheme is removed; a `Bearer` or other scheme another policy needs
+            is left in place. Disable only when a legacy backend explicitly
+            requires the reusable credential.
 
     LdapAuthConfig:
       type: object

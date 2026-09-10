@@ -252,7 +252,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "basic_auth",
         classification: BuiltinPluginClassification::Public,
         priority: 1300,
-        active_phases: "authenticate",
+        active_phases: "authenticate, before_proxy",
         matrix_protocols: HTTP_FAMILY_PROTOCOLS,
         protocol_rationale: "Requires HTTP headers",
     },
