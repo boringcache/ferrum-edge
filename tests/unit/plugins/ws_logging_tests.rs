@@ -1829,7 +1829,7 @@ async fn ws_logging_exhausted_connection_failure_counts_batch_discard() {
     plugin.log(&create_test_transaction_summary()).await;
 
     let after = wait_for_ws_sink_loss(SinkLossReason::BatchDiscard, discarded_before + 1).await;
-    assert!(accepted_total("ws_logging") >= accepted_before + 1);
+    assert!(accepted_total("ws_logging") > accepted_before);
     assert_ws_batch_discard_projections();
 
     drop(plugin);
