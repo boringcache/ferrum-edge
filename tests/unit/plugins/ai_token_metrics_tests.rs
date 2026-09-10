@@ -118,9 +118,7 @@ fn assert_usage_and_metrics(
         ),
         ("ai_total_tokens", "ferrum_ai_tokens_total", total),
     ] {
-        let series = format!(
-            "{metric}{{proxy_id=\"test-proxy\",provider=\"{provider}\"}}"
-        );
+        let series = format!("{metric}{{proxy_id=\"test-proxy\",provider=\"{provider}\"}}");
         if let Some(value) = value {
             assert_eq!(ctx.metadata[metadata_key], value.to_string());
             assert!(output.contains(&format!("{series} {value}\n")));
@@ -268,7 +266,12 @@ async fn every_admitted_provider_exports_usage_to_prometheus() {
         let mut headers = json_headers();
         assert_continue(
             plugin
-                .on_response_body(&mut ctx, 200, &mut headers, &serde_json::to_vec(&body).unwrap())
+                .on_response_body(
+                    &mut ctx,
+                    200,
+                    &mut headers,
+                    &serde_json::to_vec(&body).unwrap(),
+                )
                 .await,
         );
         assert_usage_and_metrics(&ctx, name, Some(11), 7, Some(18), "0.000025");
@@ -391,8 +394,7 @@ fn test_streaming_response_buffering_requires_explicit_opt_in() {
 #[test]
 fn retry_release_requires_origin_sse_and_no_buffering_opt_in() {
     for opt_in in [false, true] {
-        let plugin =
-            AiTokenMetrics::new(&json!({"buffer_streaming_responses": opt_in})).unwrap();
+        let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": opt_in})).unwrap();
         let ctx = ctx_with_content_type("POST", "application/json");
         assert!(plugin.should_buffer_response_body(&ctx));
         assert_eq!(
@@ -406,19 +408,14 @@ fn retry_release_requires_origin_sse_and_no_buffering_opt_in() {
             ("application/event-stream+json", false),
             ("text/plain", false),
         ] {
-            let headers =
-                HashMap::from([("Content-Type".to_string(), content_type.to_string())]);
+            let headers = HashMap::from([("Content-Type".to_string(), content_type.to_string())]);
             assert_eq!(
                 plugin.should_release_response_body_under_retries(&ctx, 200, &headers),
                 !opt_in && is_sse,
                 "{content_type}, opt_in={opt_in}"
             );
         }
-        assert!(!plugin.should_release_response_body_under_retries(
-            &ctx,
-            200,
-            &HashMap::new()
-        ));
+        assert!(!plugin.should_release_response_body_under_retries(&ctx, 200, &HashMap::new()));
         assert!(plugin.should_buffer_response_body_for_content_type(
             &ctx,
             Some("application/json"),
