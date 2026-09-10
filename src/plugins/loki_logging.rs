@@ -1397,6 +1397,7 @@ async fn send_batch(cfg: &LokiFlushConfig, batch: &[LokiEntry]) -> Result<(), St
         match send_batch_once(cfg, payload.bytes(), content_encoding).await {
             LokiAttemptOutcome::Delivered => return Ok(()),
             LokiAttemptOutcome::Terminal(error) => {
+                record_loki_batch_discard(entry_count);
                 warn!(
                     plugin = "loki_logging",
                     "Loki logging: batch discarded after terminal delivery failure ({} entries lost): {}",
@@ -1416,6 +1417,7 @@ async fn send_batch(cfg: &LokiFlushConfig, batch: &[LokiEntry]) -> Result<(), St
                 tokio::time::sleep(cfg.retry.backoff_delay(attempt)).await;
             }
             LokiAttemptOutcome::Retryable(error) => {
+                record_loki_batch_discard(entry_count);
                 warn!(
                     plugin = "loki_logging",
                     "Loki logging: batch discarded after {} attempts ({} entries lost): {}",
@@ -1483,6 +1485,18 @@ enum LokiAttemptOutcome {
     Delivered,
     Retryable(String),
     Terminal(String),
+}
+
+/// Loki owns status classification and retries inside [`send_batch`] and
+/// returns `Ok(())` on both terminal and exhausted-retry loss so the shared
+/// batching logger does not start a second retry loop. Count every lost
+/// record here; `Ok(())` is otherwise treated as a successful flush.
+fn record_loki_batch_discard(entry_count: usize) {
+    sink_loss::record_dropped(
+        LOKI_PLUGIN_NAME,
+        SinkLossReason::BatchDiscard,
+        entry_count as u64,
+    );
 }
 
 fn loki_drain_diagnostic(drain: HttpBatchDrainOutcome) -> String {

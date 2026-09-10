@@ -4654,6 +4654,10 @@ pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<Strin
     // transaction logs and retain only safe present/length correlation hints.
     crate::plugins::sse::redact_sse_log_metadata(metadata);
     crate::plugins::mcp_gateway::redact_internal_log_metadata(metadata);
+    // gRPC-Web stages the client's COMPLETE request trailer block for dispatch.
+    // It is transport state, not observability metadata, and the application
+    // trailing metadata inside it may carry credentials (GHSA-9f6g-hqpq-v8h7).
+    crate::plugins::grpc_web::redact_internal_log_metadata(metadata);
     // Fail-closed shared contract: request-deduplication lifecycle keys under
     // `_dedup_*` never enter any transaction-log projection. Ownership lives in
     // typed request state; this strips any residual public-metadata copies.
@@ -15808,11 +15812,6 @@ async fn handle_websocket_request_authenticated(
                             ws_write_buf,
                             ws_tunnel,
                             ws_tunnel_idle_disabled_safety_cap,
-                            // H1/H2: RFC 6455 / RFC 8441 mandate masked
-                            // client-to-server frames. The H3 caller in
-                            // `src/http3/websocket.rs` passes `true` for
-                            // RFC 9220 §5 compliance.
-                            false,
                             ws_idle_tracker,
                             ws_session_deadline,
                             ws_shutdown_rx,
@@ -15839,7 +15838,6 @@ async fn handle_websocket_request_authenticated(
                             ws_write_buf,
                             ws_tunnel,
                             ws_tunnel_idle_disabled_safety_cap,
-                            false,
                             ws_idle_tracker,
                             ws_session_deadline,
                             ws_shutdown_rx,
@@ -15878,7 +15876,6 @@ async fn handle_websocket_request_authenticated(
                             ws_write_buf,
                             ws_tunnel,
                             ws_tunnel_idle_disabled_safety_cap,
-                            false,
                             ws_idle_tracker,
                             ws_session_deadline,
                             ws_shutdown_rx,
@@ -18862,14 +18859,12 @@ where
 /// false` because RFC 9220 is already bridged as WebSocket frames over QUIC, not
 /// a raw TCP socket.
 ///
-/// `accept_unmasked_client_frames` controls whether the WebSocket framer
-/// accepts client-to-server frames without the RFC 6455 mask bit set.
-/// HTTP/1.1 and HTTP/2 callers pass `false` (RFC 6455 / RFC 8441 mandate
-/// masked client frames). HTTP/3 callers pass `true` — RFC 9220 §5
-/// REVERSES the masking requirement: client-to-server frames MUST NOT
-/// be masked when the WebSocket runs over HTTP/3. The H3 bridge validates
-/// that rule before bytes reach this shared tungstenite framer, then passes
-/// `true` here so compliant unmasked client frames are accepted.
+/// Client-to-server frame masking is RFC 6455 §5.1 on every frontend. RFC 8441
+/// §5 and RFC 9220 §3 only bootstrap the session — they hand the CONNECT stream
+/// to RFC 6455 "as if it were the TCP connection" and say nothing about masking
+/// — so H1, H2, and H3 all run this framer with `accept_unmasked_frames` off:
+/// masked client frames are unmasked here, and an unmasked one is a protocol
+/// error that closes the client with 1002 (issue #5011).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_websocket_proxy<C, B>(
     client_io: C,
@@ -18885,7 +18880,6 @@ pub(crate) async fn run_websocket_proxy<C, B>(
     websocket_write_buffer_size: usize,
     websocket_tunnel_mode: bool,
     websocket_tunnel_idle_disabled_safety_cap: Duration,
-    accept_unmasked_client_frames: bool,
     ws_idle_tracker: Option<Arc<WsIdleTracker>>,
     session_deadline: WsSessionDeadline,
     shutdown_rx: Option<watch::Receiver<bool>>,
@@ -18908,20 +18902,6 @@ where
     // return below stays generic.
     B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    // Invariant: the tunnel-mode raw-copy fast path is only reachable from H1
-    // frontends. RFC 6455 (H1.1) and RFC 8441 (H2 Extended CONNECT) mandate
-    // masked client frames, so H1/H2 always pass `accept_unmasked_client_frames
-    // = false`. RFC 9220 (H3 Extended CONNECT) reverses the rule and the H3
-    // caller passes `true` — but H3 cannot tunnel raw bytes (there is no TCP
-    // underneath QUIC) so the caller also passes `websocket_tunnel_mode =
-    // false`. If both are ever `true` simultaneously, a refactor has wired a
-    // non-TCP transport into the tunnel branch and `copy_bidirectional` would
-    // silently elide frame parsing on traffic that needs it.
-    debug_assert!(
-        !(websocket_tunnel_mode && accept_unmasked_client_frames),
-        "run_websocket_proxy: tunnel mode is incompatible with unmasked client \
-         frames (H3 caller must pass websocket_tunnel_mode=false)"
-    );
     // Issue #3857: the HTTP connection guard is dropped when
     // `serve_connection_with_upgrades` returns, which for an H1 upgrade is
     // before this relay ends. The cloned session handle still lives here; wrap
@@ -19163,10 +19143,11 @@ where
     ws_config.max_frame_size = Some(effective_size_limits.max_frame_bytes);
     ws_config.max_message_size = Some(effective_size_limits.max_message_bytes);
     ws_config.write_buffer_size = websocket_write_buffer_size;
-    // RFC 9220 §5: frames over HTTP/3 are NOT masked. H1/H2 callers
-    // pass `false` (RFC 6455 / RFC 8441 mandate masked client frames);
-    // H3 callers pass `true`.
-    ws_config.accept_unmasked_frames = accept_unmasked_client_frames;
+    // RFC 6455 §5.1: a server MUST close the connection on an unmasked
+    // client frame. RFC 8441 / RFC 9220 Extended CONNECT bootstrap the
+    // session without changing framing, so H1, H2, and H3 are identical
+    // here — there is no HTTP/3 masking exemption (issue #5011).
+    ws_config.accept_unmasked_frames = false;
     // Transparent relay shared by H1/H2/H3: forward Ping without a local
     // auto-Pong so end-to-end keepalive reflects the far side (issue #2963).
     ws_config.auto_pong = false;
@@ -23729,6 +23710,13 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     response_headers: &mut HashMap<String, String>,
     response_body: &mut Bytes,
 ) -> Option<FinalSyntheticBodyPolicyWitness> {
+    // Semantic-cache entries retain the finalized application body with only
+    // transport encoding removed. Body inspection must see replay provenance
+    // so mandatory policy rewrites still run, while ordinary rewrites do not.
+    // Restore it before live header rules and the late compression phase.
+    let previous_finalized_response_replay = ctx.finalized_response_replay;
+    ctx.finalized_response_replay |= ctx.semantic_cache_response_replay;
+
     // Mark the context for the duration of this body-hook phase so that storing
     // plugins (e.g. `request_deduplication`) can tell this body is a synthetic
     // plugin short-circuit and skip caching/replaying it. Saved/restored so a
@@ -24062,6 +24050,8 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     } else {
         ctx.metadata.remove(SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
     }
+
+    ctx.finalized_response_replay = previous_finalized_response_replay;
 
     // A gateway-authored terminal — a capacity refusal, a body rejection, a
     // failed mandatory replay redaction — is already the answer, and must never
@@ -35897,6 +35887,7 @@ async fn handle_proxy_request_inner(
                         content_type,
                         grpc_streaming.status,
                         grpc_web_streaming_initial_metadata,
+                        crate::plugins::grpc_web::response_entity_is_unframed_backend_error(&ctx),
                     );
                 }
                 if let Some(logger) = deferred_grpc_logger {
@@ -39985,6 +39976,7 @@ async fn handle_proxy_request_inner(
             &content_type,
             response_status,
             Some(initial_terminal_metadata),
+            crate::plugins::grpc_web::response_entity_is_unframed_backend_error(&ctx),
         )
     } else {
         body

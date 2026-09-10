@@ -953,7 +953,7 @@ Captured Sidecar/Ambient raw-TCP and UDP **egress** bypasses the generic stream 
 | `loki_logging` | | ✓ | Sends stream connection logs to Grafana Loki |
 | `udp_logging` | | ✓ | Sends stream connection logs to UDP/DTLS endpoint |
 | `ws_logging` | | ✓ | Sends stream connection logs to WebSocket endpoint |
-| `prometheus_metrics` | | ✓ | Records `ferrum_stream_connections_total` counter and `ferrum_stream_duration_ms` histogram |
+| `prometheus_metrics` | ✓ | ✓ | Marks mesh TCP observation eligibility on connect; records `ferrum_stream_connections_total` and `ferrum_stream_duration_ms` on disconnect |
 | `api_chargeback_sink` | | ✓ | Exports durable stream charge events or snapshot deltas to ClickHouse |
 | `workload_metrics` | ✓ | ✓ | Adds direction-aware mesh source/destination labels to stream metadata and emits mesh spans when Telemetry providers are configured |
 | `transaction_debugger` | | ✓ | Prints typed terminal diagnostics for stream connections |
@@ -1559,13 +1559,15 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
 | **Logging** | 9000–9999 | Observability and frame logging | `stdout_logging` (9000), `ws_frame_logging` (9050), `statsd_logging` (9075), `http_logging` (9100), `tcp_logging` (9125), `kafka_logging` (9150), `loki_logging` (9155), `udp_logging` (9160), `ws_logging` (9175), `transaction_debugger` (9200), `proxy_alerts` (9250), `prometheus_metrics` (9300), `api_chargeback` (9350), `api_chargeback_sink` (9351), `workload_metrics` (9360), `__mesh_bpf_metrics` (9365), `transaction_log_schema` (9999, config-only) |
 
-`soap_ws_security` keeps AuthN-band priority 1500. A configuration that establishes a principal (`username_token`, `x509_signature`, or `saml`) is an auth plugin: it opts into `requires_request_body_before_authenticate` and validates the SOAP message in the `authenticate` phase, publishing `authenticated_identity` and a namespace-correct `identified_consumer` so `access_control` (2000) and consumer-scoped `rate_limiting` (2900) evaluate the SOAP principal rather than the source IP. A timestamp-only configuration establishes no principal, is not an auth plugin, and keeps validating in `before_proxy` after request-body buffering — the two phases are selected by configuration and never both run. The identity-establishing form additionally runs `on_final_request_body` before backend dispatch to refuse a message whose bytes changed after validation; the timestamp-only form authenticates nobody and claims no integrity over the Body, so it does not bind the representation and stays composable with request-body transformers. Composition admission requires an identity-establishing instance to be the proxy's sole authentication mechanism in both auth modes (each mode stops after the first successful identity, while their rejection behavior also cannot preserve multiple mandatory message gates) and rejects it alongside `compression` with `decompress_request` (authentication precedes body normalization).
+`soap_ws_security` keeps AuthN-band priority 1500. A configuration that establishes a principal (`username_token`, `x509_signature`, or `saml`) is an auth plugin: it opts into `requires_request_body_before_authenticate` and validates the SOAP message in the `authenticate` phase, publishing `authenticated_identity` and a namespace-correct `identified_consumer` so `access_control` (2000) and consumer-scoped `rate_limiting` (2900) evaluate the SOAP principal rather than the source IP. A timestamp-only configuration establishes no principal, is not an auth plugin, and keeps validating in `before_proxy` after request-body buffering — the two phases are selected by configuration and never both run. The identity-establishing form additionally runs `on_final_request_body` before backend dispatch to refuse a message whose bytes changed after validation; the timestamp-only form authenticates nobody and claims no integrity over the Body, so it does not bind the representation and stays composable with request-body transformers. The opt-in `username_token.remove_credential` policy is the one configuration that also declares `modifies_request_body`: it deletes the verified `wsse:UsernameToken` in `transform_request_body`, and the representation it binds is the sanitized message, so its own removal is admitted while every other post-validation mutation still fails closed. Composition admission requires an identity-establishing instance to be the proxy's sole authentication mechanism in both auth modes (each mode stops after the first successful identity, while their rejection behavior also cannot preserve multiple mandatory message gates) and rejects it alongside `compression` with `decompress_request` (authentication precedes body normalization).
 
 `serverless_function` runs in the finalized-request-egress phase, not `before_proxy` (advisory `GHSA-4vr5-4wm3-x5xv`). With `forward_body: true` it receives the exact lossless **backend-visible** representation: request-body transforms have run and every final request-policy hook has accepted those bytes. It may therefore share a protocol chain with a body transformer, which the previous `before_proxy` ordering had to refuse outright; the capability-based refusal is retained, and widened to cover final request-body policy plugins, for registered custom plugins that still declare `egresses_request_body_before_finalization()`. Candidate admission derives the built-in serverless protocol, effective priority, `mode`, and `forward_body` capabilities without constructing its environment-bound HTTP/AWS client, and derives static protocol/`enforces_finalized_request_policy()` metadata for expensive final validators (`waf`, `openapi_validator`, `body_validator`, `request_size_limiting`, `ai_tool_governor`, `ai_semantic_firewall`) without compiling their rule sets, so a CP can validate composition without requiring credentials or schema packs that intentionally exist only on DPs. Runtime cache construction still resolves and validates those node-local values as a fail-closed backstop. Ferrum does not allow an external decision to govern bytes different from those ultimately dispatched. Non-identity encoded bodies fail closed before function egress. When a terminate-mode instance shares a protocol chain with `request_deduplication`, every deduplication instance must have a strictly lower effective priority so retry ownership exists before the function can execute; candidate admission and cache construction reject equal or reversed ordering. Deduplication runs after request-transformer header/query rules and built-in route dispatch so its fingerprint observes their effective output. Every same-protocol header/query/destination mutator must run before deduplication, including under priority overrides; a deferred request-body rewrite is likewise rejected when it cannot be fully observed during the earlier normalization phase.
 
 `mcp_gateway` sits at priority 2992: generic admission/auth/body validation runs first, then MCP JSON-RPC metadata is extracted and aggregate-router calls can set `RequestContext.route_override_*` before final route-dispatch plugins and request transformers. It is HTTP-only and does not implement generic auth, rate limiting, retry, timeout, tracing, WAF, DLP, or semantic safety behavior; those remain separate Ferrum plugins that can consume emitted `mcp.*` metadata.
 
 `a2a_gateway` sits at priority 2993: it runs after MCP handling and before final mesh route dispatch. It observes HTTP JSON-RPC, HTTP+JSON/REST, and gRPC A2A methods, applies optional method policy, rewrites HTTP and unary gRPC Agent Card responses, and emits `a2a.*` metadata. It preserves SSE and non-card gRPC streaming and does not own A2A task state.
+
+JSON-RPC method policy is re-decided in `on_final_request_body`, over the exact representation the backend will receive, so a later body transformer cannot rewrite the `method` member after the arrival-time decision admitted the request. Agent Card production is a declared bounded response producer on both bindings. It normally runs in the semantic transform stage; when `grpc_web` is also configured, the unary gRPC card is instead rewritten in the earlier `normalize_response_body` phase, because the translator re-frames the body in that same transform stage at a lower priority and the card would otherwise be handed to the rewriter already carrying a gRPC-Web trailer frame.
 
 `mesh_route_dispatch` intentionally sits at priority 2995: authentication, `mesh_authz`, and rate limiting evaluate the original public proxy identity, then route overrides apply before request transformers, mirror/serverless/caching plugins, and backend dispatch. For node-waypoint Service egress with scoped mesh policies, `mesh_authz` stamps the authorized Service upstream and `mesh_route_dispatch` rejects any matching rule that would rewrite that request to a different upstream or direct backend. When multiple instances are attached to the same proxy, each matching instance replaces the complete override destination and route-local timeout/retry policy from earlier instances; a non-matching later instance leaves any earlier match in place. Per-rule `backend_tls` is only valid for direct `backend_host`/`backend_port` destinations; `upstream_id` destinations use TLS from the referenced `Upstream`. For WebSockets, the override selects only the upgrade handshake backend; the upgraded connection is pinned to that backend and frame hooks do not re-route individual frames. HBONE CONNECT traffic flows through the standard `before_proxy` chain before the HBONE relay consumes route overrides; inner H2 frames are not re-classified per stream.
 
@@ -1589,7 +1591,7 @@ Given all built-in plugins enabled, the execution order is:
 
 | # | Plugin | Priority | Active Phases |
 |---|--------|----------|---------------|
-| 1 | `otel_tracing` | 25 | on_request_received, on_stream_connect, before_proxy, after_proxy, log, on_stream_disconnect |
+| 1 | `otel_tracing` | 25 | on_request_received, on_stream_connect, before_proxy, after_proxy, log, on_stream_disconnect, on_ws_disconnect |
 | 2 | `correlation_id` | 50 | on_request_received, before_proxy, after_proxy, apply_websocket_handshake_response_headers, on_stream_connect |
 | 3 | `cors` | 100 | on_request_received, after_proxy |
 | 4 | `request_termination` | 125 | on_request_received |
@@ -1597,7 +1599,7 @@ Given all built-in plugins enabled, the execution order is:
 | 6 | `ip_restriction` | 150 | on_request_received, on_stream_connect |
 | 7 | `geo_restriction` | 175 | on_request_received, on_stream_connect |
 | 8 | `bot_detection` | 200 | on_request_received |
-| 9 | `spec_expose` | 210 | on_request_received |
+| 9 | `spec_expose` | 210 | on_request_received, after_proxy |
 | 10 | `sse` | 250 | on_request_received, before_proxy, after_proxy, transform_response_body |
 | 11 | `grpc_web` | 260 | on_request_received, before_proxy, transform_request_body, on_final_request_body, after_proxy, transform_response_body |
 | 12 | `grpc_method_router` | 275 | on_request_received, on_backend_path_resolved |
@@ -1605,19 +1607,19 @@ Given all built-in plugins enabled, the execution order is:
 | 14 | `mtls_auth` | 950 | authenticate, on_stream_connect |
 | 15 | `jwks_auth` | 1000 | authenticate |
 | 16 | `oauth2_introspection` | 1050 | authenticate, before_proxy |
-| 17 | `oidc_relying_party` | 1075 | authenticate, before_proxy |
+| 17 | `oidc_relying_party` | 1075 | on_request_received, authenticate, before_proxy, after_proxy |
 | 18 | `jwt_auth` | 1100 | authenticate |
 | 19 | `key_auth` | 1200 | authenticate, before_proxy |
-| 20 | `ldap_auth` | 1250 | authenticate |
+| 20 | `ldap_auth` | 1250 | authenticate, before_proxy |
 | 21 | `basic_auth` | 1300 | authenticate, before_proxy |
 | 22 | `hmac_auth` | 1400 | authenticate |
-| 23 | `soap_ws_security` | 1500 | authenticate, before_proxy, on_final_request_body |
+| 23 | `soap_ws_security` | 1500 | authenticate, before_proxy, transform_request_body, on_final_request_body |
 | 24 | `access_control` | 2000 | authorize, on_stream_connect |
 | 25 | `tcp_connection_throttle` | 2050 | on_stream_connect (opaque connection permit releases on rejection/teardown) |
 | 26 | `mesh_authz` | 2075 | authorize, on_stream_connect |
 | 27 | `opa` | 2080 | authorize |
 | 28 | `adaptive_concurrency` | 2090 | backend_admission |
-| 29 | `ai_transcript_audit` | 2740 | before_proxy, on_final_request_body, on_final_response_body, on_response_committed, response_stream_inspector, on_response_stream_terminated, log |
+| 29 | `ai_transcript_audit` | 2740 | before_proxy, on_final_request_body, after_proxy, on_final_response_body, on_response_committed, response_stream_inspector, on_response_stream_terminated, log |
 | 30 | `request_size_limiting` | 2800 | on_request_received, before_proxy, on_final_request_body |
 | 31 | `ws_message_size_limiting` | 2810 | parser-level frame/message limits |
 | 32 | `graphql` | 2850 | before_proxy, on_final_request_body |
@@ -1634,7 +1636,7 @@ Given all built-in plugins enabled, the execution order is:
 | 43 | `ai_tool_governor` | 2978 | before_proxy, on_final_request_body, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated |
 | 44 | `ai_stream_router` | 2984 | before_proxy, transform_request_body, enforce_final_backend_header_policy, on_final_request_body, normalize_response_body, response_stream_inspector |
 | 45 | `mcp_gateway` | 2992 | before_proxy, transform_request_body, transform_response_body |
-| 46 | `a2a_gateway` | 2993 | before_proxy, after_proxy, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector |
+| 46 | `a2a_gateway` | 2993 | before_proxy, on_final_request_body, after_proxy, normalize_response_body, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector |
 | 47 | `mesh_route_dispatch` | 2995 | before_proxy |
 | 48 | `request_transformer` | 3000 | before_proxy, transform_request_body |
 | 49 | `request_deduplication` | 3010 | before_proxy, on_final_response_body, on_response_stream_terminated, on_response_committed |
@@ -1646,7 +1648,7 @@ Given all built-in plugins enabled, the execution order is:
 | 55 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
 | 56 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_headers, on_final_response_body |
 | 57 | `response_transformer` | 4000 | after_proxy, transform_response_body |
-| 58 | `compression` | 4050 | normalize_buffered_request_body_before_before_proxy, before_proxy, after_proxy, transform_request_body, transform_response_body |
+| 58 | `compression` | 4050 | normalize_buffered_request_body_before_before_proxy, before_proxy, after_proxy, transform_request_body_with_context, transform_response_body_with_context |
 | 59 | `ai_prompt_compressor` | 4055 | before_proxy, transform_request_body_with_context, on_final_request_body_with_context |
 | 60 | `ai_semantic_cache` | 4057 | on_final_request_body_with_context, after_proxy, on_final_response_body |
 | 61 | `ai_federation` | 4060 | before_proxy, transform_request_body_with_context, finalized request egress, enforce_final_backend_header_policy, on_final_request_body_with_context, origin response-header boundary, after_proxy, response_stream_inspector, on_response_stream_terminated (HTTP only) |
@@ -1655,17 +1657,17 @@ Given all built-in plugins enabled, the execution order is:
 | 64 | `ai_token_metrics` | 4100 | on_response_body |
 | 65 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body, response_stream_inspector, on_response_stream_terminated |
 | 66 | `stdout_logging` | 9000 | log, on_stream_disconnect, on_ws_disconnect |
-| 67 | `ws_frame_logging` | 9050 | on_ws_frame |
+| 67 | `ws_frame_logging` | 9050 | on_ws_frame, on_ws_disconnect |
 | 68 | `statsd_logging` | 9075 | log, on_stream_disconnect, on_ws_disconnect |
 | 69 | `http_logging` | 9100 | log, on_stream_disconnect |
 | 70 | `tcp_logging` | 9125 | log, on_stream_disconnect |
 | 71 | `kafka_logging` | 9150 | log, on_stream_disconnect |
 | 72 | `loki_logging` | 9155 | log, on_stream_disconnect |
 | 73 | `udp_logging` | 9160 | log, on_stream_disconnect |
-| 74 | `ws_logging` | 9175 | log, on_stream_disconnect |
+| 74 | `ws_logging` | 9175 | log, on_stream_disconnect, on_ws_disconnect |
 | 75 | `transaction_debugger` | 9200 | on_request_received, before_proxy, on_final_request_body, after_proxy, on_final_response_body, log, on_stream_disconnect, on_ws_disconnect |
 | 76 | `proxy_alerts` | 9250 | log, on_stream_disconnect, on_ws_disconnect |
-| 77 | `prometheus_metrics` | 9300 | log, on_stream_disconnect, on_ws_disconnect |
+| 77 | `prometheus_metrics` | 9300 | on_request_received, on_stream_connect, log, on_stream_disconnect, on_ws_disconnect |
 | 78 | `api_chargeback` | 9350 | log, on_stream_disconnect, on_ws_disconnect |
 | 79 | `api_chargeback_sink` | 9351 | log, on_stream_disconnect, on_ws_disconnect |
 | 80 | `workload_metrics` | 9360 | on_request_received, before_proxy, after_proxy, log, on_stream_connect, on_stream_disconnect |
@@ -1728,7 +1730,7 @@ chain.
 
 ### Spec expose runs after IP restriction and bot detection (priority 210)
 
-`spec_expose` intercepts `GET` and `HEAD` at the canonical `{listen_path}/specz` resource and returns the API specification without proxying. `HEAD` retains the GET representation until response-body transforms and guards establish the final status and headers, then suppresses the wire body. It runs at priority 210 — after IP restriction (150) and bot detection (200) so blocked IPs and bots cannot access spec endpoints, but before all authentication plugins (950+). This makes the `/specz` endpoint unauthenticated by design, allowing legitimate API consumers to discover contracts without credentials while still enforcing network-level security policies. Route-level `allowed_methods` admission still runs before the plugin.
+`spec_expose` intercepts `GET` and `HEAD` at the canonical `{listen_path}/specz` resource and returns the API specification without proxying. `HEAD` retains the GET representation until response-body transforms and guards establish the final status and headers, then the reject-path `after_proxy` hook suppresses the wire body after synthetic body policy. It runs at priority 210 — after IP restriction (150) and bot detection (200) so blocked IPs and bots cannot access spec endpoints, but before all authentication plugins (950+). This makes the `/specz` endpoint unauthenticated by design, allowing legitimate API consumers to discover contracts without credentials while still enforcing network-level security policies. Route-level `allowed_methods` admission still runs before the plugin.
 
 ### Authentication before authorization (1000s before 2000s)
 
@@ -1755,9 +1757,9 @@ Rate limiting sits at the end of the AuthZ band (priority 2900) so it can enforc
 
 **Redis mode** (`sync_mode: "redis"`): rate-limit counter plugins support only `local` and `redis` storage; database-backed counters are intentionally unsupported. `rate_limiting`, `ai_rate_limiter`, `graphql`, `grpc_method_router`, and `udp_rate_limiting` use Redis for coordinated counters across multiple gateway instances. `ws_rate_limiting` also supports Redis, but only to externalize its per-connection counters; because WebSocket connection IDs are process-local, it namespaces keys per gateway instance to avoid cross-instance collisions rather than sharing a portable connection budget across reconnects. When Redis is unavailable, behavior is governed by `redis_failure_policy`, which defaults to `fail_closed`: the plugin refuses with `503` rather than silently degrading to a per-process enforcement domain. `redis_failure_policy: "local_fallback"` is the explicit opt-in that falls back to local in-memory state and switches back when connectivity is restored. `request_deduplication` expresses the same choice through its own `on_redis_unavailable` field (also fail-closed by default) and does not accept `redis_failure_policy`; `ai_semantic_cache` keeps automatic local fallback because a cache miss carries no enforcement consequence. The shared client reconnects in the background under either policy. Redis Cluster is not supported and is screened rather than assumed: the client runs `INFO CLUSTER` on every newly established connection and reacts to `MOVED`/`ASK`/`CROSSSLOT`/`CLUSTERDOWN`/`TRYAGAIN`; a proven Cluster endpoint is refused terminally for the life of the client. The Redis backend uses native RESP protocol commands (no Lua scripts), so it works with Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
 
-### OpenAPI validation runs after body validation (priority 2960)
+### OpenAPI client validation precedes before_proxy (priority 2960)
 
-`openapi_validator` runs after the generic `body_validator` so explicit per-proxy body checks can fail first, then the generated OpenAPI contract can enforce operation-specific schemas. It runs before AI request policy and request transformation, which means contract mismatches are caught before the request body is reshaped or sent to an upstream.
+`openapi_validator` decides a matched client request contract before `body_validator` runs its `before_proxy` request checks. Priorities 2950 and 2960 order hooks within a lifecycle phase; they do not reorder distinct phases. OpenAPI response validation runs in `on_final_response_body`, while unknown-operation admission and backend-request fallback retain the phases described below.
 
 That ordering is enforced by a dedicated lifecycle phase, not by priority alone. The imported OpenAPI **request** contract is decided in `validate_client_request_body_contract`, which the proxy runs on the prebuffered original client body after gateway-owned normalization (bounded `Content-Encoding` decoding) and **before any `before_proxy` hook or `transform_request_body` transformer**. A configured transform can therefore no longer add a schema-required property, coerce an invalid type, rename a field, or delete an `additionalProperties: false` violation and have the result accepted as if the client had sent it (`GHSA-896v-jx23-9g6p`). The phase is read-only: it admits or rejects, it never rewrites the body or headers.
 
@@ -1771,9 +1773,9 @@ Buffering for that phase is selected from the matched operation alone — not fr
 
 The AI plugins are ordered to compose correctly:
 
-1. **`ai_transcript_audit` (2740)** runs after authentication/authorization and before `request_deduplication` (3010), so local and Redis replays cannot terminate the chain before audit staging. It also stages before reject-capable AI guardrails so blocked prompts can still be captured when `always_capture_on_guardrail` is enabled. Its final request-body hook reclassifies and refreshes the captured request after downstream redaction/transforms when traffic continues; priority overrides that reverse audit/dedup order are rejected.
+1. **`ai_transcript_audit` (2740)** runs after authentication/authorization and before `request_deduplication` (3010), so local and Redis replays cannot terminate the chain before audit staging. It also stages before reject-capable AI guardrails so blocked prompts can still be captured when `always_capture_on_guardrail` is enabled. Its final request-body hook reclassifies and refreshes the captured request after downstream redaction/transforms when traffic continues; priority overrides that reverse audit/dedup order are rejected. Its `after_proxy` hook is an active admission point, not an observer: on a `before_proxy` short circuit (reject or synthetic response) no final request-body hook ran, so this is where the staged request is captured from the final `request_body` — and where a refuted gRPC enrollment discards staging. On the explicitly replaceable rejection pass it also performs fail-closed stream and buffered-commit admission, so `sink.on_buffer_full: reject` / `sink.on_sink_error: reject` can select a `503` here in place of the response another plugin chose. On the non-replaceable pass it cannot re-reject, so a provisional `rejected` sink status is downgraded to `deferred` rather than reported as a rejection that never happened.
 2. **`ai_prompt_shield` (2925)** runs next in the pre-proxy body flow — PII must be detected/redacted before the request reaches the backend or later body validators. It sits right after audit staging and rate limiting so brute-force protection applies first. For encoded JSON bodies it defers inspection to `on_final_request_body`, after request decompression; enforcing actions fail closed if the body remains encoded, and compressed redaction rejects detected PII because that final hook cannot rewrite wire bytes. `waf` request metadata checks have already run in `authorize`; WAF request-body checks run on the final backend-visible body after request body transforms.
-3. **`ai_semantic_firewall` (2968)** runs after body/OpenAPI validation and before request guard, semantic cache, and federation — semantically dangerous prompts, RAG content, tool calls, and responses are evaluated before they can reach semantic cache or a federated provider. Because request/response body transformers run after the initial semantic pass, the firewall uses instance-scoped body hashes and re-evaluates changed final backend-visible requests and client-visible responses; unchanged bodies avoid duplicate embedding calls. Encoded requests are deferred until the final request hook after optional decompression, while encoded governed responses fail closed unless a final gateway-compressed body can be decoded within the inspection bound.
+3. **`ai_semantic_firewall` (2968)** runs after body/OpenAPI validation and before request guard, semantic cache, and federation — semantically dangerous prompts, RAG content, tool calls, and responses are evaluated before they can reach semantic cache or a federated provider. Because request/response body transformers run after the initial semantic pass, the firewall uses instance-scoped body hashes and re-evaluates changed final backend-visible requests and client-visible responses; unchanged bodies avoid duplicate embedding calls. Encoded requests are deferred until the final request hook after optional decompression. Encoded governed responses are decided at the final response hook the same way, and the decode is NOT limited to bodies the gateway compressed: a `gzip`/`x-gzip`/`br` response is inflated within the bounded inspection limit and classified from the decoded representation whether the origin sent that coding or a `compression` instance produced it. Only an unsupported coding, a malformed or truncated payload, or one exceeding the decode bound is uninspectable, and that follows `on_error` (fail-closed by default). The one deliberate release is a response that was never in the firewall's scope as plaintext and is encoded only because the gateway compressed it — proven by the compression plugin's private ownership marker, never by `Content-Type` or public metadata — which is not inflated again merely to repeat a decision already made.
 4. **`ai_request_guard` (2975)** runs after semantic firewall — it validates model names, max_tokens, message counts, prompt size, and provider-native temperature fields. It revalidates the final backend-visible JSON after later request-body transforms, so a transformer cannot replace a protected field after admission; clamp/default caps that are undone after transformation fail closed.
 5. **`ai_tool_governor` (2978)** runs after the request guard and before semantic cache and federation — it applies deterministic allow/deny/approval policy to concrete tool/function calls by name, arguments, JSON Schema, regex, identity, and an optional approval webhook. A disallowed tool schema in the request `tools[]`, a dangerous tool call in `choices[].message.tool_calls[]`, or a streamed SSE tool-call delta is screened before it reaches the client, semantic cache, or a federated provider. It complements `ai_semantic_firewall` (which catches intent); this plugin is purely deterministic (names, args, schema, regex, identity, approval). Because `request_transformer` (3000) and `response_transformer` (4000) run after the initial `before_proxy`/`on_response_body` inspection, the governor re-runs its deterministic request policy on the final backend-visible body (`on_final_request_body`) and its response policy on the final client-visible body (`on_final_response_body`), so a transform that rewrites an allowed body into a denied `tools/call` or injects a denied `choices[].message.tool_calls[]` is still fail-closed before dispatch or delivery.
 6. **`ai_stream_router` (2984)** claims streaming OpenAI Chat Completions requests (`"stream": true`) before non-streaming federation. It rewrites the route for provider-native streaming and normalizes Anthropic and Google Gemini / Vertex-compatible provider streams to OpenAI SSE where needed without full-response buffering.
@@ -1811,7 +1813,10 @@ Request transformers run after authentication and authorization, so they only mo
 
 ### Compression runs after response transformation (4050)
 
-Decoded `ai_semantic_cache` hits defer the compression `after_proxy` hook and
+Decoded `ai_semantic_cache` hits preserve the finalized application body, skipping
+ordinary body rewrites already reflected in the entry. Body inspection and
+mandatory policy rewrites still run under private replay provenance; live header
+rules remain active. Hits defer the compression `after_proxy` hook and
 transport transform until after the synthetic reject-path header chain and
 its final plaintext body-policy recheck. The hook is invoked once in this late
 phase, so live header rules (including `no-transform` and strong `ETag`) govern
@@ -2104,6 +2109,8 @@ An **absent** `Content-Type` is treated as JSON, and the representation gate's c
 - Body rules are parsed once at config load time, not per-request.
 - When `response_transformer` has body rules, it automatically enables conservative response body buffering for the proxy. Backend-declared `text/event-stream` responses are released after headers; request-side SSE intent alone never releases a JSON response. Without body rules, responses stream through with zero overhead.
 - `request_transformer` body transformation runs after the request body is collected and before it is sent to the backend (HTTP/1.1 and HTTPS paths).
+- `request_transformer` body rules collect only the uploads they can rewrite. The config-time capability is the upper bound; per request, an upload whose declared `Content-Type` is non-JSON streams straight through instead of being collected and then declined, so an ordinary binary or form POST pays no extra upstream time-to-first-byte and no full-body buffer. An **absent** `Content-Type` stays buffered, because the transform still parses it as JSON. A `before_proxy` header rewrite cannot bypass the rules: both the H1/H2 and the native H3 dispatch ladders re-evaluate the request-body requirements against the effective outbound headers before the body is read, so a `text/plain` → `application/json` rewrite still selects buffering.
+- An unrelated header rule never changes either buffering answer. Request header rules run in `before_proxy` and need no body; response header rules run in `after_proxy`. The one response exception is request-qualified: a TRANSLATED gRPC-Web response keeps the buffered compatibility view so terminal-metadata policy can be enforced over it, and that exception applies only to requests `grpc_web` actually translated — never to an ordinary HTTP SSE or binary response.
 - Header, query, and body rules can be mixed in a single plugin configuration.
 
 ## gRPC Compatibility

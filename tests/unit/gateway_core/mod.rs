@@ -14,6 +14,7 @@ mod build_profile_panic_strategy_tests;
 mod cached_synthetic_bytes_share_tests;
 #[cfg(unix)]
 mod cgroup_tree_walk_tests;
+mod charged_content_coding_chain_tests;
 mod chart_image_tag_helm_tests;
 mod cidr_tests;
 mod circuit_breaker_tests;
@@ -61,6 +62,7 @@ mod gatewayclass_helm_tests;
 mod grpc_capability_probe_log_tests;
 mod grpc_proxy_tests;
 mod gso_batch_buf_tests;
+mod h3_cross_protocol_backend_header_tests;
 mod h3_cross_protocol_bytes_share_tests;
 mod h3_native_reject_bytes_share_tests;
 mod h3_retry_eligibility_tests;
