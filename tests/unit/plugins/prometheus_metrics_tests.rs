@@ -224,7 +224,6 @@ fn test_prometheus_plugin_rejects_unknown_render_cache_ttl_secnds_key() {
         "ferrum",
     )
     .err()
-
     .unwrap_or_else(|| panic!("typo render_cache_ttl_secnds must fail construction"));
     assert!(err.contains("unknown configuration key"), "{err}");
     assert!(err.contains("render_cache_ttl_secnds"), "{err}");
@@ -1899,7 +1898,6 @@ async fn test_plugin_config_rejects_unbounded_mesh_series_budget() {
         "ferrum",
     )
     .err()
-
     .unwrap_or_else(|| panic!("0 must be rejected — no unlimited mesh series mode"));
     assert!(
         err.contains("mesh_series_budget_per_family"),
@@ -3171,7 +3169,6 @@ fn test_rejected_plugin_cache_rebuild_leaves_registry_policy_untouched() {
     let err = cache
         .rebuild(&rejected)
         .err()
-
         .unwrap_or_else(|| panic!("FailClosed sibling must reject the generation"));
     assert!(
         err.contains("key_auth"),
@@ -3218,7 +3215,6 @@ fn test_rejected_plugin_cache_delta_leaves_registry_policy_untouched() {
             delta.global_plugin_configs_changed,
         )
         .err()
-
         .unwrap_or_else(|| panic!("incremental reload must reject the FailClosed sibling"));
     assert!(
         err.contains("key_auth"),
