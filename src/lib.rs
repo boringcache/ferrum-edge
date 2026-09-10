@@ -3021,6 +3021,31 @@ pub mod _test_support {
         crate::plugins::kafka_logging::validate_producer_admission(config, http_client)
     }
 
+    /// Deterministic probe: terminal broker failures and immediate librdkafka
+    /// rejections must reach the process-cumulative per-plugin loss family.
+    ///
+    /// Returns `(sink_error_delta, queue_full_delta, delivery_failed,
+    /// queue_rejected)`. The two deltas read process-wide counters a concurrent
+    /// test can only increase, so assert on them as lower bounds.
+    pub fn kafka_logging_probe_terminal_loss_accounting_for_test(
+        record_count: usize,
+        queue_max_messages: Option<u32>,
+    ) -> Result<(u64, u64, u64, u64), String> {
+        crate::plugins::kafka_logging::probe_terminal_loss_accounting_for_test(
+            record_count,
+            queue_max_messages,
+        )
+    }
+
+    /// The exact SASL credential bytes the constructor would hand librdkafka,
+    /// so the verbatim-credential contract can be asserted directly.
+    pub fn kafka_logging_parsed_sasl_credentials_for_test(
+        config: &serde_json::Value,
+        http_client: &crate::plugins::PluginHttpClient,
+    ) -> Result<(Option<String>, Option<String>), String> {
+        crate::plugins::kafka_logging::parsed_sasl_credentials_for_test(config, http_client)
+    }
+
     pub fn kafka_logging_serialize_http_with_config_for_test(
         config: &serde_json::Value,
         summary: &crate::plugins::TransactionSummary,
@@ -3236,6 +3261,22 @@ pub mod _test_support {
     // ── plugins/soap_ws_security ────────────────────────────────────────────
     pub fn soap_count_wsu_id_occurrences_for_test(xml: &str, id: &str) -> Result<usize, String> {
         crate::plugins::soap_ws_security::count_wsu_id_occurrences(xml, id)
+    }
+
+    pub fn soap_exclusive_canonicalize_with_budget_for_test(
+        xml: &str,
+        local_name: &str,
+        budget_bytes: usize,
+    ) -> (Result<String, String>, usize) {
+        crate::plugins::soap_ws_security::exclusive_canonicalize_with_budget_for_test(
+            xml,
+            local_name,
+            budget_bytes,
+        )
+    }
+
+    pub fn soap_canonicalization_source_len_for_test(xml: &str, local_name: &str) -> Option<usize> {
+        crate::plugins::soap_ws_security::canonicalization_source_len_for_test(xml, local_name)
     }
 
     pub fn soap_exclusive_canonicalize_element_for_test(
@@ -11129,7 +11170,19 @@ pub mod _test_support {
         http_status: u16,
         initial_terminal_metadata: Option<HashMap<String, String>>,
     ) -> crate::proxy::ProxyBody {
-        body.into_grpc_web_streaming(content_type, http_status, initial_terminal_metadata)
+        body.into_grpc_web_streaming(content_type, http_status, initial_terminal_metadata, false)
+    }
+
+    /// Same as [`proxy_body_into_grpc_web_streaming_for_test`], with the
+    /// non-gRPC HTTP error entity suppression the translation owner records for
+    /// an unframed backend error document.
+    pub fn proxy_body_into_grpc_web_streaming_suppressed_for_test(
+        body: crate::proxy::ProxyBody,
+        content_type: &str,
+        http_status: u16,
+        initial_terminal_metadata: Option<HashMap<String, String>>,
+    ) -> crate::proxy::ProxyBody {
+        body.into_grpc_web_streaming(content_type, http_status, initial_terminal_metadata, true)
     }
 
     pub fn take_streaming_initial_terminal_metadata_for_test(
@@ -12138,6 +12191,66 @@ pub mod _test_support {
                 .try_reserve_request_permit(bytes)
                 .map(RequestBufferPermitProbe)
         }
+    }
+
+    /// What the shared charged content-coding chain decoder — the one
+    /// `compression`'s opt-in `decompress_request` normalizer now runs
+    /// (`GHSA-q76p-952x-7c3v`) — decided for one coding list, projected so
+    /// external tests can assert on it without reaching into the crate-private
+    /// error type.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum ChargedCodingChainOutcome {
+        /// Decoded under every bound, with the working-set charge released.
+        Decoded(Vec<u8>),
+        /// A coding token the strict decoder does not implement.
+        Unsupported,
+        /// Malformed, truncated, Large-Window Brotli, or trailing data.
+        Malformed,
+        /// Over a per-layer, cumulative, or amplification bound.
+        TooLarge,
+        /// The aggregate budget could not admit the decode's working set. The
+        /// GATEWAY-local capacity terminal, deliberately not a byte fault.
+        CapacityRefused,
+    }
+
+    /// Decode one canonical coding list through the PRODUCTION charged decoder,
+    /// charged against an ISOLATED budget so a parallel test binary can observe
+    /// admission and release deterministically.
+    ///
+    /// `codings` are lowercase tokens in APPLICATION order, exactly as
+    /// `compression` hands them over after classification.
+    pub fn decode_charged_coding_chain_in(
+        probe: &ResponseBufferBudgetProbe,
+        codings: &[String],
+        body: &[u8],
+        max_decoded_bytes: usize,
+        max_cumulative_bytes: usize,
+        max_amplification_ratio: u32,
+    ) -> ChargedCodingChainOutcome {
+        use crate::plugins::charged_decode::{
+            ChargedDecodeError, decode_charged_content_coding_chain,
+        };
+        let limits = crate::plugins::utils::content_encoding::DecodeLimits {
+            max_decoded_bytes,
+            max_cumulative_bytes,
+            // The caller bounds the layer COUNT before classification; this
+            // decoder is handed an already-bounded list.
+            max_codings: codings.len().max(1),
+            max_amplification_ratio,
+        };
+        match decode_charged_content_coding_chain(codings, body, limits, probe.0.handle()) {
+            Ok(plaintext) => ChargedCodingChainOutcome::Decoded(plaintext),
+            Err(ChargedDecodeError::Unsupported) => ChargedCodingChainOutcome::Unsupported,
+            Err(ChargedDecodeError::Malformed) => ChargedCodingChainOutcome::Malformed,
+            Err(ChargedDecodeError::TooLarge) => ChargedCodingChainOutcome::TooLarge,
+            Err(ChargedDecodeError::CapacityRefused) => ChargedCodingChainOutcome::CapacityRefused,
+        }
+    }
+
+    /// The exact backend-request header filter the H3 cross-protocol bridge
+    /// applies to both its plain and gRPC builders (issue #5110).
+    pub fn cross_protocol_backend_header_is_stripped_for_test(name: &str) -> bool {
+        crate::http3::cross_protocol::should_skip_cross_protocol_backend_header(name)
     }
 
     /// Whether an error class is neutral to circuit-breaker, passive-health, and

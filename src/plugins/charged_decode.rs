@@ -427,3 +427,108 @@ pub(crate) fn decode_one_coding(
         ),
     }
 }
+
+/// Whether `decoded_len` is within `ratio`:1 of `raw_len`.
+///
+/// Mirrors [`crate::plugins::utils::content_encoding`]'s amplification rule
+/// exactly, including its two deliberate exemptions: a zero ratio disables the
+/// check, and a zero-length input has no meaningful ratio (the absolute
+/// ceilings still apply to both). An overflowing product means the absolute
+/// ceiling is the binding bound, so the ratio abstains rather than wrapping
+/// into a smaller one.
+fn amplification_is_within_bounds(raw_len: usize, decoded_len: usize, ratio: u32) -> bool {
+    if ratio == 0 || raw_len == 0 {
+        return true;
+    }
+    match raw_len.checked_mul(ratio as usize) {
+        Some(limit) => decoded_len <= limit,
+        None => true,
+    }
+}
+
+/// Decode an ordered `#content-coding` list into one plaintext buffer with the
+/// strict codecs and the aggregate charge this module owns.
+///
+/// This is the charged counterpart of
+/// [`crate::plugins::utils::content_encoding::decode_content_encoding`], for the
+/// one caller that REWRITES the request rather than merely inspecting it:
+/// `compression`'s opt-in `decompress_request` normalizer
+/// (`GHSA-q76p-952x-7c3v`). That normalizer decodes unauthenticated upload bytes
+/// on the request path, so it needs exactly what the representation gates need —
+/// Large-Window-refusing `br`, and every byte of the decode's working set
+/// reserved against `FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES` BEFORE it is
+/// allocated:
+///
+/// * the ACTIVE decoder's own heap ceiling, charged before the decoder is
+///   constructed (a `br` decoder sizes its ring buffer from the stream header
+///   before it emits one output byte);
+/// * every growth of the output buffer, topped up to the capacity the allocator
+///   actually returned;
+/// * on a stacked list, the previous pass's still-resident buffer concurrently
+///   with the next pass's output.
+///
+/// `codings` are canonical lowercase tokens in APPLICATION order (the order the
+/// field lists them); they are undone in reverse. The caller has already parsed
+/// the field, bounded the layer COUNT, and resolved `identity`, so an
+/// `identity` member here is an unsupported coding rather than a no-op.
+///
+/// The charge is released when this returns: the reservation is local and the
+/// plaintext is handed back as a plain `Vec`. That is the DECODE working set
+/// bound the advisory names — the surviving plaintext is separately bounded per
+/// request by `max_decompressed_request_size` and the wire body limit, and the
+/// buffered-request budget charges the body the caller publishes.
+pub(crate) fn decode_charged_content_coding_chain(
+    codings: &[String],
+    body: &[u8],
+    limits: crate::plugins::utils::content_encoding::DecodeLimits,
+    budget: BudgetRef<'_>,
+) -> Result<Vec<u8>, ChargedDecodeError> {
+    if codings.is_empty() {
+        // The caller resolved `identity`-only lists before reaching here, so an
+        // empty list means the parse and this decode disagreed. Fail closed.
+        return Err(ChargedDecodeError::Malformed);
+    }
+
+    let ratio = limits.max_amplification_ratio;
+    let mut reservation = ResponseBufferReservation::new();
+    let mut current: Option<Vec<u8>> = None;
+    let mut cumulative = 0usize;
+    for coding in codings.iter().rev() {
+        // The previous pass's buffer is this pass's input and stays resident for
+        // the whole of it, so it is charged concurrently with this pass's
+        // output. The FIRST pass reads straight out of the caller's wire bytes,
+        // which this decode does not own.
+        let (input, concurrent) = match current.as_ref() {
+            Some(previous) => (previous.as_slice(), previous.capacity()),
+            None => (body, 0),
+        };
+        let input_len = input.len();
+        let decoded = decode_one_coding(
+            coding,
+            input,
+            limits.max_decoded_bytes,
+            concurrent,
+            &mut reservation,
+            budget,
+        )?;
+        if !amplification_is_within_bounds(input_len, decoded.len(), ratio) {
+            return Err(ChargedDecodeError::TooLarge);
+        }
+        cumulative = prospective_retained_len(cumulative, decoded.len());
+        if cumulative > limits.max_cumulative_bytes {
+            return Err(ChargedDecodeError::TooLarge);
+        }
+        current = Some(decoded);
+    }
+
+    let Some(plaintext) = current else {
+        // Unreachable: the list is non-empty and every pass assigns.
+        return Err(ChargedDecodeError::Malformed);
+    };
+    // End-to-end amplification against the ORIGINAL coded body, which a
+    // per-layer check alone does not bound for a stacked chain.
+    if !amplification_is_within_bounds(body.len(), plaintext.len(), ratio) {
+        return Err(ChargedDecodeError::TooLarge);
+    }
+    Ok(plaintext)
+}
