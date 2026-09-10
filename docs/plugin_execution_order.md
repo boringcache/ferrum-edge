@@ -1589,7 +1589,7 @@ Given all built-in plugins enabled, the execution order is:
 
 | # | Plugin | Priority | Active Phases |
 |---|--------|----------|---------------|
-| 1 | `otel_tracing` | 25 | on_request_received, on_stream_connect, before_proxy, after_proxy, log, on_stream_disconnect |
+| 1 | `otel_tracing` | 25 | on_request_received, on_stream_connect, before_proxy, after_proxy, log, on_stream_disconnect, on_ws_disconnect |
 | 2 | `correlation_id` | 50 | on_request_received, before_proxy, after_proxy, apply_websocket_handshake_response_headers, on_stream_connect |
 | 3 | `cors` | 100 | on_request_received, after_proxy |
 | 4 | `request_termination` | 125 | on_request_received |

@@ -3182,6 +3182,34 @@ pub mod _test_support {
         })
     }
 
+    /// Whether the trace exporter retries `status` for the named payload kind
+    /// (`"otlp"`, `"zipkin"`, `"datadog"`). `None` for an unknown kind.
+    pub fn otel_tracing_status_is_retryable_for_test(provider: &str, status: u16) -> Option<bool> {
+        crate::plugins::otel_tracing::trace_status_is_retryable_for_test(provider, status)
+    }
+
+    /// Parse a collector `Retry-After` value against a fixed clock, in
+    /// milliseconds. `None` when the value is absent or unparseable.
+    pub fn otel_tracing_parse_retry_after_for_test(value: &str, now_unix_secs: u64) -> Option<u64> {
+        crate::plugins::otel_tracing::parse_retry_after_for_test(value, now_unix_secs)
+    }
+
+    /// The exporter's delay in milliseconds before the retry following
+    /// `attempt` (`1` = the first retry), for fixed jitter entropy.
+    pub fn otel_tracing_retry_delay_ms_for_test(
+        base_ms: u64,
+        attempt: u32,
+        retry_after_ms: Option<u64>,
+        entropy: u64,
+    ) -> u64 {
+        crate::plugins::otel_tracing::trace_retry_delay_ms_for_test(
+            base_ms,
+            attempt,
+            retry_after_ms,
+            entropy,
+        )
+    }
+
     // ── plugins/soap_ws_security ────────────────────────────────────────────
     pub fn soap_count_wsu_id_occurrences_for_test(xml: &str, id: &str) -> Result<usize, String> {
         crate::plugins::soap_ws_security::count_wsu_id_occurrences(xml, id)
