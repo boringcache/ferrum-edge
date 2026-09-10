@@ -4937,7 +4937,9 @@ impl RequestContext {
             ai_tool_governor_response_hashes: self.ai_tool_governor_response_hashes.clone(),
             ai_response_guard_replay_redactions: self.ai_response_guard_replay_redactions.clone(),
             ai_response_guard_pending_redactions: self.ai_response_guard_pending_redactions.clone(),
-            ai_response_guard_verified_redactions: self.ai_response_guard_verified_redactions.clone(),
+            ai_response_guard_verified_redactions: self
+                .ai_response_guard_verified_redactions
+                .clone(),
             ai_tool_governor_replay_redactions: self.ai_tool_governor_replay_redactions.clone(),
             // Carried into the final-request-body stage so every plugin in that
             // stage shares one duplicate-key screen of the same body.

@@ -64,19 +64,23 @@ fn gzip_response(body: &[u8]) -> Vec<u8> {
 fn grpc_admission_matches_component_and_plugin_wrapper_schemas() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../../openapi.yaml")).unwrap();
-    let validators: Vec<_> = ["AiResponseGuardConfig", "PluginConfig", "PluginConfigCreate"]
-        .into_iter()
-        .map(|name| {
-            let schema = json!({
-                "$ref": format!("#/components/schemas/{name}"),
-                "components": spec["components"].clone()
-            });
-            (
-                name,
-                jsonschema::draft202012::options().build(&schema).unwrap(),
-            )
-        })
-        .collect();
+    let validators: Vec<_> = [
+        "AiResponseGuardConfig",
+        "PluginConfig",
+        "PluginConfigCreate",
+    ]
+    .into_iter()
+    .map(|name| {
+        let schema = json!({
+            "$ref": format!("#/components/schemas/{name}"),
+            "components": spec["components"].clone()
+        });
+        (
+            name,
+            jsonschema::draft202012::options().build(&schema).unwrap(),
+        )
+    })
+    .collect();
     let base = json!({
         "pii_patterns": ["email"],
         "grpc": {
