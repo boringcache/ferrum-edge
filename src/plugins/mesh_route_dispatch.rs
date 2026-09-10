@@ -1576,8 +1576,12 @@ impl MeshRouteDispatch {
         })
     }
 
-    /// Public for tests.
-    #[cfg(test)]
+    /// The compiled rule list, in evaluation order.
+    ///
+    /// External test crates (`tests/unit/plugins/mesh_route_dispatch_tests.rs`)
+    /// read this to assert what admission normalized — header-match keys, for
+    /// one — so it must stay unconditionally public rather than `#[cfg(test)]`,
+    /// which is invisible outside this crate's own test build.
     pub fn rules(&self) -> &[RouteRule] {
         &self.config.rules
     }
@@ -2190,9 +2194,21 @@ fn is_false(value: &bool) -> bool {
 /// Prefix replacement is literal: the unmatched suffix is appended verbatim,
 /// so a prefix that ends inside a path segment keeps that segment intact
 /// (`/prefix/old` → `/new` forwards `/prefix/oldtail` as `/newtail`, not
-/// `/new/tail`). The one adjustment is a doubled separator when BOTH sides
-/// carry a `/` — Envoy's documented `prefix: /prefix` + `prefix_rewrite: /`
-/// case, where `/prefix/etc` must forward as `/etc` rather than `//etc`.
+/// `/new/tail`). Two boundary adjustments survive that:
+///
+/// - a doubled separator collapses when BOTH sides carry a `/` — Envoy's
+///   documented `prefix: /prefix` + `prefix_rewrite: /` case, where
+///   `/prefix/etc` must forward as `/etc` rather than `//etc`;
+/// - a suffix that opens with a `.` keeps its own segment boundary. Fusing it
+///   into the replacement's last segment would relabel the traversal operand
+///   the client wrote immediately after the matched prefix as ordinary segment
+///   text (`/api../admin` → `/v2../admin`), so the `canonicalize_policy_path`
+///   check the caller runs before publishing the override would no longer see
+///   the `..` and would forward what it must refuse. Synthesizing the
+///   separator keeps that composition `/v2/../admin`, which is rejected with
+///   400 exactly as it was before literal substitution. A dot-leading suffix
+///   that is not itself a dot segment (`..hidden`) still forwards — as its
+///   own segment, which is where the client wrote it.
 ///
 /// When `match_prefix` is `None` (exact / regex match, or no `match.uri`)
 /// the whole path is replaced.
@@ -2219,15 +2235,24 @@ fn rewrite_request_path(
             _ => return replacement.to_string(),
         },
     };
-    // Join `replacement` + `tail` without doubling a `/` and — critically —
-    // without synthesizing one at a boundary that had none. Inserting a
-    // separator would move the request into a different path segment than
-    // literal prefix substitution produces, which is what Istio `HTTPRewrite`
-    // and Envoy `prefix_rewrite` specify.
-    let mut out = String::with_capacity(replacement.len() + tail.len());
+    // Join `replacement` + `tail` without doubling a `/` and — outside the
+    // dot-leading case above — without synthesizing one at a boundary that had
+    // none: inserting a separator would move the request into a different path
+    // segment than the literal prefix substitution Istio `HTTPRewrite` and
+    // Envoy `prefix_rewrite` specify.
+    let mut out = String::with_capacity(replacement.len() + tail.len() + 1);
     out.push_str(replacement);
+    let replacement_slash = replacement.ends_with('/');
     match tail.strip_prefix('/') {
-        Some(rest) if replacement.ends_with('/') => out.push_str(rest),
+        // Both sides carry the separator — drop the duplicate.
+        Some(rest) if replacement_slash => out.push_str(rest),
+        // Neither side carries it and the suffix opens a dot-leading segment:
+        // preserve the boundary so the caller's canonical check still sees a
+        // whole `.` / `..` segment instead of a fused ordinary one.
+        None if !replacement_slash && tail.starts_with('.') => {
+            out.push('/');
+            out.push_str(tail);
+        }
         _ => out.push_str(tail),
     }
     out
@@ -5687,6 +5712,27 @@ mod tests {
         assert_eq!(
             rewrite_request_path("/apiusers", "/v2", Some("/Api")),
             "/v2users"
+        );
+        // A dot-leading suffix is the exception: fusing it would relabel the
+        // client's `..` as ordinary segment text, so the boundary is kept and
+        // the caller's canonical check still refuses the composition.
+        assert_eq!(
+            rewrite_request_path("/api../admin", "/v2", Some("/api")),
+            "/v2/../admin"
+        );
+        assert_eq!(
+            rewrite_request_path("/api./users", "/v2", Some("/api")),
+            "/v2/./users"
+        );
+        assert_eq!(
+            rewrite_request_path("/api..hidden/users", "/v2", Some("/api")),
+            "/v2/..hidden/users"
+        );
+        // A trailing separator on the replacement already supplies the
+        // boundary, so nothing is synthesized on top of it.
+        assert_eq!(
+            rewrite_request_path("/api../admin", "/v2/", Some("/api")),
+            "/v2/../admin"
         );
         // Empty tail keeps the replacement verbatim.
         assert_eq!(rewrite_request_path("/api", "/v2", Some("/api")), "/v2");

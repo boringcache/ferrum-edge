@@ -2234,43 +2234,27 @@ fn rewrite_paths_require_canonical_config_admission() {
 
 #[tokio::test]
 async fn rewrite_composition_refuses_new_dot_segments_before_publication() {
-    // `/v2` joins the unmatched suffix literally, so none of these compose a
-    // dot SEGMENT (`v2..` and `v2.` are ordinary segments). `/v2/` closes its
-    // own segment, so the same suffixes do compose one and are refused before
-    // the override is published. Both replacements share the `/other` control,
-    // whose prefix simply does not match.
-    let cases: [(&str, [(&str, Option<&str>); 6]); 2] = [
-        (
-            "/v2",
-            [
-                ("/api../admin", Some("/v2../admin")),
-                ("/api..", Some("/v2..")),
-                ("/api./users", Some("/v2./users")),
-                ("/api/users", Some("/v2/users")),
-                ("/api..hidden/users", Some("/v2..hidden/users")),
-                ("/other/users", None),
-            ],
-        ),
-        (
-            "/v2/",
-            [
-                ("/api../admin", None),
-                ("/api..", None),
-                ("/api./users", None),
-                ("/api/users", Some("/v2/users")),
-                ("/api..hidden/users", Some("/v2/..hidden/users")),
-                ("/other/users", None),
-            ],
-        ),
-    ];
-    for (replacement, paths) in cases {
+    // A suffix that opens with a `.` keeps its own segment boundary, so the
+    // composition the canonical check sees is the same whether or not the
+    // replacement already ends in `/`. Both replacements therefore share one
+    // table: `..` / `.` compose a dot segment and are refused before the
+    // override is published, `..hidden` is an ordinary segment and forwards as
+    // one, and `/other` is the control whose prefix simply does not match.
+    for replacement in ["/v2", "/v2/"] {
         let plugin = MeshRouteDispatch::new(&json!({"rules": [{
             "match": {"uri": {"prefix": "/api"}},
             "destination": {"backend_host": "127.0.0.1", "backend_port": 8080},
             "rewrite": {"uri": replacement, "match_prefix": "/api"}
         }]}))
         .unwrap();
-        for (path, expected) in paths {
+        for (path, expected) in [
+            ("/api../admin", None),
+            ("/api..", None),
+            ("/api./users", None),
+            ("/api/users", Some("/v2/users")),
+            ("/api..hidden/users", Some("/v2/..hidden/users")),
+            ("/other/users", None),
+        ] {
             let mut ctx =
                 RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), path.to_string());
             let result = plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
@@ -2447,6 +2431,56 @@ async fn prefix_rewrite_preserves_a_suffix_that_starts_inside_a_segment() {
             Some("/newtail"),
             "ignore_uri_case={ignore_case}"
         );
+    }
+}
+
+#[tokio::test]
+async fn prefix_rewrite_refuses_a_dot_segment_that_opens_the_suffix() {
+    // Literal substitution must not launder the traversal operand a client
+    // wrote immediately after the matched prefix. Fusing it would compose
+    // `/new../admin` — an ordinary segment `canonicalize_policy_path` accepts —
+    // so the request would reach the backend instead of being refused. The
+    // suffix keeps its own segment boundary, the composition stays
+    // `/new/../admin`, and it is rejected with 400 before any override is
+    // published, exactly as it was before the mid-segment join changed.
+    // `..hidden` is not a dot segment and still forwards, in its own segment,
+    // and an ordinary mid-segment tail still substitutes literally.
+    for (ignore_case, match_prefix) in [(false, "/prefix/old"), (true, "/Prefix/Old")] {
+        let config = json!({"rules": [{
+            "match": {"uri": {"prefix": match_prefix}, "ignore_uri_case": ignore_case},
+            "destination": {"backend_host": "127.0.0.1", "backend_port": 8080},
+            "rewrite": {"uri": "/new", "match_prefix": match_prefix}
+        }]});
+        let plugin = MeshRouteDispatch::new(&config).expect("prefix rewrite is admitted");
+        for (path, expected) in [
+            ("/prefix/old../admin", None),
+            ("/prefix/old..", None),
+            ("/prefix/old./users", None),
+            ("/prefix/old..hidden", Some("/new/..hidden")),
+            ("/prefix/oldtail", Some("/newtail")),
+        ] {
+            let mut ctx =
+                RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), path.to_string());
+            let result = plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
+            let label = format!("{path} ignore_uri_case={ignore_case}");
+            if expected.is_some() {
+                assert!(
+                    matches!(result, PluginResult::Continue),
+                    "{label}: {result:?}"
+                );
+                assert_eq!(ctx.route_override_path.as_deref(), expected, "{label}");
+            } else {
+                assert!(matches!(
+                    result,
+                    PluginResult::Reject {
+                        status_code: 400,
+                        ..
+                    }
+                ));
+                assert!(ctx.route_override_path.is_none(), "{label}");
+            }
+            assert_eq!(ctx.path, path, "{label}: client path provenance");
+        }
     }
 }
 
