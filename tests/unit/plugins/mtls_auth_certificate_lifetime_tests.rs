@@ -617,13 +617,14 @@ async fn a_validity_rejection_never_echoes_certificate_or_time_material() {
 /// principal without overriding it would be relayed by `splice(2)` with no
 /// enforceable authorization deadline, so the built-in inventory of such
 /// plugins is pinned here: any new `on_stream_connect` hook that populates
-/// `identified_consumer`, `authenticated_identity`, or a credential deadline
-/// must both override the declaration and be listed below.
+/// `identified_consumer`, `authenticated_identity`, a certificate-derived
+/// SPIFFE principal, or a credential deadline must both override the
+/// declaration and be listed below.
 #[test]
 fn the_stream_principal_admitting_plugin_inventory_is_pinned() {
     use std::path::Path;
 
-    const DECLARED: &[&str] = &["mtls_auth"];
+    const DECLARED: &[&str] = &["mtls_auth", "spiffe_identity"];
 
     fn scan(dir: &Path, found: &mut Vec<String>) {
         for entry in std::fs::read_dir(dir).expect("readable plugin directory") {
@@ -656,7 +657,8 @@ fn the_stream_principal_admitting_plugin_inventory_is_pinned() {
                 .join("\n");
             let assigns_identity = body.contains("ctx.identified_consumer = Some")
                 || body.contains("ctx.authenticated_identity = Some")
-                || body.contains("observe_credential_deadline");
+                || body.contains("observe_credential_deadline")
+                || body.contains("admit_certificate_spiffe_principal");
             if assigns_identity {
                 found.push(
                     path.file_stem()
@@ -695,4 +697,260 @@ fn mtls_auth_keeps_a_tcp_tls_listener_on_the_deadline_aware_userspace_relay() {
         false,
         &[plugin]
     ));
+}
+
+// --- Issuer-path lifetime (GHSA-jw5x-439c-78v3) ----------------------------
+//
+// The connection cache retains the issuer/fingerprint decision, but the
+// configured pin and the presented issuing CAs are themselves valid only for a
+// finite time. An issuer that expires before the leaf must end the cached
+// decision — and the stream-admission deadline derived from it — at its own
+// `notAfter`, not the leaf's.
+
+/// Certificate parameters carrying an explicit validity window, in seconds
+/// relative to now. `not_before` is always in the recent past.
+fn params_with_validity(cn: &str, not_after_secs: i64) -> rcgen::CertificateParams {
+    let mut params = rcgen::CertificateParams::default();
+    let mut dn = rcgen::DistinguishedName::new();
+    dn.push(rcgen::DnType::CommonName, cn);
+    params.distinguished_name = dn;
+
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now - time::Duration::seconds(60);
+    params.not_after = now + time::Duration::seconds(not_after_secs);
+    params
+}
+
+fn ca_params_with_validity(cn: &str, not_after_secs: i64) -> rcgen::CertificateParams {
+    let mut params = params_with_validity(cn, not_after_secs);
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+    params
+}
+
+/// Root CA plus a client certificate it signed directly.
+/// Returns `(ca_pem, client_der)`.
+fn ca_signed_cert(
+    ca_cn: &str,
+    ca_secs: i64,
+    client_cn: &str,
+    client_secs: i64,
+) -> (String, Vec<u8>) {
+    let ca_params = ca_params_with_validity(ca_cn, ca_secs);
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let ca_pem = ca_params.self_signed(&ca_key).unwrap().pem();
+    let ca_issuer = rcgen::Issuer::new(ca_params, ca_key);
+
+    let client_params = params_with_validity(client_cn, client_secs);
+    let client_key = rcgen::KeyPair::generate().unwrap();
+    let client_der = client_params
+        .signed_by(&client_key, &ca_issuer)
+        .unwrap()
+        .der()
+        .to_vec();
+
+    (ca_pem, client_der)
+}
+
+/// Root CA -> intermediate -> client, each with its own validity window.
+/// Returns `(root_pem, intermediate_der, client_der)`.
+fn intermediate_signed_cert(
+    root_secs: i64,
+    intermediate_secs: i64,
+    client_secs: i64,
+) -> (String, Vec<u8>, Vec<u8>) {
+    let root_params = ca_params_with_validity("Bounded Root CA", root_secs);
+    let root_key = rcgen::KeyPair::generate().unwrap();
+    let root_pem = root_params.self_signed(&root_key).unwrap().pem();
+    let root_issuer = rcgen::Issuer::new(root_params, root_key);
+
+    let intermediate_params = ca_params_with_validity("Bounded Intermediate CA", intermediate_secs);
+    let intermediate_key = rcgen::KeyPair::generate().unwrap();
+    let intermediate_der = intermediate_params
+        .signed_by(&intermediate_key, &root_issuer)
+        .unwrap()
+        .der()
+        .to_vec();
+    let intermediate_issuer = rcgen::Issuer::new(intermediate_params, intermediate_key);
+
+    let client_params = params_with_validity("client.example.com", client_secs);
+    let client_key = rcgen::KeyPair::generate().unwrap();
+    let client_der = client_params
+        .signed_by(&client_key, &intermediate_issuer)
+        .unwrap()
+        .der()
+        .to_vec();
+
+    (root_pem, intermediate_der, client_der)
+}
+
+/// One intermediate key cross-signed by two roots with different lifetimes, so
+/// the leaf has two independently valid paths.
+/// Returns `(short_root_pem, long_root_pem, chain_ders, client_der)`.
+fn cross_signed_chain(short_secs: i64, long_secs: i64) -> (String, String, Vec<Vec<u8>>, Vec<u8>) {
+    let short_params = ca_params_with_validity("Short Root CA", short_secs);
+    let short_key = rcgen::KeyPair::generate().unwrap();
+    let short_pem = short_params.self_signed(&short_key).unwrap().pem();
+    let short_issuer = rcgen::Issuer::new(short_params, short_key);
+
+    let long_params = ca_params_with_validity("Long Root CA", long_secs);
+    let long_key = rcgen::KeyPair::generate().unwrap();
+    let long_pem = long_params.self_signed(&long_key).unwrap().pem();
+    let long_issuer = rcgen::Issuer::new(long_params, long_key);
+
+    let intermediate_params = ca_params_with_validity("Cross-Signed Intermediate CA", 7_200);
+    let intermediate_key = rcgen::KeyPair::generate().unwrap();
+    let via_short = intermediate_params
+        .signed_by(&intermediate_key, &short_issuer)
+        .unwrap()
+        .der()
+        .to_vec();
+    let via_long = intermediate_params
+        .signed_by(&intermediate_key, &long_issuer)
+        .unwrap()
+        .der()
+        .to_vec();
+    let intermediate_issuer = rcgen::Issuer::new(intermediate_params, intermediate_key);
+
+    let client_params = params_with_validity("client.example.com", 7_200);
+    let client_key = rcgen::KeyPair::generate().unwrap();
+    let client_der = client_params
+        .signed_by(&client_key, &intermediate_issuer)
+        .unwrap()
+        .der()
+        .to_vec();
+
+    (short_pem, long_pem, vec![via_short, via_long], client_der)
+}
+
+fn pinned_plugin(filters: Vec<Value>) -> MtlsAuth {
+    MtlsAuth::new(&json!({
+        "cert_field": "subject_cn",
+        "allowed_issuers": filters,
+    }))
+    .unwrap()
+}
+
+fn issuer_filter(cn: &str, pem: &str) -> Value {
+    json!({ "cn": cn, "ca_certificate_pem": pem })
+}
+
+fn ctx_with_chain(cert_der: Vec<u8>, chain: Vec<Vec<u8>>) -> RequestContext {
+    let mut ctx = ctx_with_cert(cert_der);
+    ctx.tls_client_cert_chain_der = Some(Arc::new(chain));
+    ctx
+}
+
+fn assert_remaining_near(ctx: &RequestContext, expected_secs: u64) {
+    let remaining = request_credential_deadline_remaining(ctx)
+        .expect("a successful verification must publish a credential deadline");
+    let low = std::time::Duration::from_secs(expected_secs.saturating_sub(10));
+    let high = std::time::Duration::from_secs(expected_secs + 2);
+    assert!(
+        remaining >= low && remaining <= high,
+        "expected roughly {expected_secs}s of authorized lifetime, got {remaining:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_pinned_issuer_expiring_before_the_leaf_bounds_the_credential_deadline() {
+    let (ca_pem, client) = ca_signed_cert("Bounded Issuer CA", 300, "client.example.com", 7_200);
+    let index = ConsumerIndex::new(&[mtls_consumer("alice", "client.example.com")]);
+    let plugin = pinned_plugin(vec![issuer_filter("Bounded Issuer CA", &ca_pem)]);
+    let mut ctx = ctx_with_cert(client);
+
+    assert_continue(plugin.authenticate(&mut ctx, &index).await);
+    assert_remaining_near(&ctx, 300);
+}
+
+#[tokio::test]
+async fn a_longer_lived_pinned_issuer_never_lengthens_the_leaf_bound() {
+    let (ca_pem, client) = ca_signed_cert("Bounded Issuer CA", 7_200, "client.example.com", 300);
+    let index = ConsumerIndex::new(&[mtls_consumer("alice", "client.example.com")]);
+    let plugin = pinned_plugin(vec![issuer_filter("Bounded Issuer CA", &ca_pem)]);
+    let mut ctx = ctx_with_cert(client);
+
+    assert_continue(plugin.authenticate(&mut ctx, &index).await);
+    assert_remaining_near(&ctx, 300);
+}
+
+#[tokio::test]
+async fn the_earliest_notafter_on_the_accepted_path_wins_not_just_the_pinned_ca() {
+    // Pinned root outlives the leaf; the presented intermediate does not.
+    let (root_pem, intermediate, client) = intermediate_signed_cert(7_200, 300, 7_200);
+    let index = ConsumerIndex::new(&[mtls_consumer("alice", "client.example.com")]);
+    let plugin = pinned_plugin(vec![issuer_filter("Bounded Root CA", &root_pem)]);
+    let mut ctx = ctx_with_chain(client, vec![intermediate]);
+
+    assert_continue(plugin.authenticate(&mut ctx, &index).await);
+    assert_remaining_near(&ctx, 300);
+}
+
+#[tokio::test]
+async fn an_alternative_longer_lived_verified_path_keeps_the_longer_bound() {
+    // Two cryptographically valid paths exist. Filters are alternatives, so the
+    // longer-lived one is the operator's authorization; tightening to the other
+    // would shorten a session the configuration allows.
+    let (short_pem, long_pem, chain, client) = cross_signed_chain(300, 3_600);
+    let index = ConsumerIndex::new(&[mtls_consumer("alice", "client.example.com")]);
+    let filters = vec![
+        issuer_filter("Short Root CA", &short_pem),
+        issuer_filter("Long Root CA", &long_pem),
+    ];
+    let plugin = pinned_plugin(filters);
+    let mut ctx = ctx_with_chain(client, chain);
+
+    assert_continue(plugin.authenticate(&mut ctx, &index).await);
+    assert_remaining_near(&ctx, 3_600);
+}
+
+#[tokio::test]
+async fn an_expired_presented_intermediate_leaves_no_verified_path() {
+    let (root_pem, intermediate, client) = intermediate_signed_cert(7_200, -60, 7_200);
+    let index = ConsumerIndex::new(&[mtls_consumer("alice", "client.example.com")]);
+    let plugin = pinned_plugin(vec![issuer_filter("Bounded Root CA", &root_pem)]);
+    let mut ctx = ctx_with_chain(client, vec![intermediate]);
+
+    match plugin.authenticate(&mut ctx, &index).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("expected the constraint to refuse the certificate, got {other:?}"),
+    }
+    assert!(request_credential_deadline_at(&ctx).is_none());
+}
+
+#[tokio::test]
+async fn a_cached_evaluation_keeps_returning_the_issuer_bounded_deadline() {
+    let (ca_pem, client) = ca_signed_cert("Bounded Issuer CA", 300, "client.example.com", 7_200);
+    let index = ConsumerIndex::new(&[mtls_consumer("alice", "client.example.com")]);
+    let plugin = pinned_plugin(vec![issuer_filter("Bounded Issuer CA", &ca_pem)]);
+    let cache = Arc::new(MtlsAuthConnectionCache::new());
+
+    let mut first = ctx_with_cert(client.clone());
+    first.mtls_auth_connection_cache = Some(Arc::clone(&cache));
+    assert_continue(plugin.authenticate(&mut first, &index).await);
+    let captured = request_credential_deadline_at(&first).expect("deadline");
+
+    let mut second = ctx_with_cert(client);
+    second.mtls_auth_connection_cache = Some(Arc::clone(&cache));
+    assert_continue(plugin.authenticate(&mut second, &index).await);
+    assert_eq!(request_credential_deadline_at(&second), Some(captured));
+    assert_eq!(cache.evaluation_count(), 1);
+    assert_remaining_near(&second, 300);
+}
+
+#[tokio::test]
+async fn a_stream_connection_carries_the_issuer_bounded_deadline() {
+    let (ca_pem, client) = ca_signed_cert("Bounded Issuer CA", 300, "client.example.com", 7_200);
+    let index = Arc::new(ConsumerIndex::new(&[mtls_consumer(
+        "alice",
+        "client.example.com",
+    )]));
+    let plugin = pinned_plugin(vec![issuer_filter("Bounded Issuer CA", &ca_pem)]);
+    let mut ctx = stream_ctx_with_cert(client, index);
+
+    assert_continue(plugin.on_stream_connect(&mut ctx).await);
+    let deadline = ctx.credential_deadline_at().expect("stream deadline");
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    assert!(remaining <= std::time::Duration::from_secs(302));
+    assert!(remaining >= std::time::Duration::from_secs(290));
 }

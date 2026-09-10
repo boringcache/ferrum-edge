@@ -258,7 +258,8 @@ Sensitive keys (`authorization`, `cookie`, credential tokens, API keys, etc.)
 are **always** redacted, on every path — `nested`, `flatten`, even when the
 operator renames the outer `metadata` field via `rename:`. There is no
 way to bypass redaction through the schema. Request-private lifecycle keys
-under the `_dedup_` prefix are **omitted entirely** (not redacted) from every
+under the `_dedup_` prefix, and the gRPC-Web request-trailer staging container
+`grpc_web.request_trailers`, are **omitted entirely** (not redacted) from every
 summary projection.
 
 ### Sensitive substrings
@@ -335,6 +336,17 @@ producer still writes the legacy names (`_dedup_key`, `_dedup_fingerprint`,
 `_dedup_local_inflight_token`, `_dedup_redis_lock_token`). Schema
 `static_fields` / rename targets that match this namespace are rejected at
 compile time.
+
+The gRPC-Web request-trailer staging container `grpc_web.request_trailers` is
+internal-only under the same contract. It holds the client's complete validated
+end-of-stream metadata block as a base64 JSON array — transport state the gRPC
+dispatch paths consume, not observability metadata — and the trailer names live
+*inside* the encoded value, so outer-key sensitive matching cannot reach them
+and base64 is an encoding rather than confidentiality. `clone_log_metadata`
+strips it, every native / schema serializer omits it, and `static_fields` /
+rename targets naming it are rejected at compile time. The response-side
+counterpart `grpc_web_shadowed_trailers` remains in the sensitive-substring
+list and serializes as `[REDACTED]`.
 
 ## Per-Plugin Notes
 

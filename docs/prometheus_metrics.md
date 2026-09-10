@@ -21,7 +21,7 @@ Dynamic families (AI token counters, mesh BPF prefix overrides, request_mirror l
 
 Scrape rendering stays allocation-light: the inventory is a documentation/CI contract only and is **not** scanned on the `/metrics` hot path.
 
-Ferrum accepts exactly one enabled, process-global `prometheus_metrics` plugin. Mesh mode auto-injects `workload_metrics` only to supply identity labels and Telemetry policy; mesh RED/lifecycle registry updates and gRPC message scanners activate only after the Prometheus plugin's request/stream hook observes the transaction. Without that exporter, the mesh metric families remain silent. The raw TCP lifecycle families cover stream-plugin paths; Ambient destination HBONE CONNECT relays use the HTTP request/response families and `ferrum_mesh_hbone_relay_failures_total` instead.
+Ferrum accepts exactly one enabled, process-global `prometheus_metrics` plugin. Mesh mode auto-injects `workload_metrics` only to supply identity labels and Telemetry policy; mesh RED/lifecycle registry updates and gRPC message scanners activate only after the Prometheus plugin's `on_request_received` / `on_stream_connect` hooks observe the transaction (counters complete later in `log` / `on_stream_disconnect`). Without that exporter, the mesh metric families remain silent. The raw TCP lifecycle families cover stream-plugin paths; Ambient destination HBONE CONNECT relays use the HTTP request/response families and `ferrum_mesh_hbone_relay_failures_total` instead.
 
 ## Operator runbooks for newly documented families
 
@@ -297,7 +297,9 @@ endpoint, topic, namespace, policy id, or record content:
   took ownership.
 - `batch_discard` — a whole batch was discarded after its retry budget was
   exhausted, or a non-retryable HTTP 4xx permanently rejected it, with no
-  durable fallback. Counts records, not batches.
+  durable fallback. Counts records, not batches. `ai_transcript_audit` counts a
+  permanently rejected batch at its classification point rather than letting
+  the shared retry loop see the discard as a delivery.
 - `shutdown` — the flush worker was closed, or had not started yet.
 - `sink_error` — a per-record delivery or serialization failure that retrying
   could not fix.
@@ -532,7 +534,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_kafka_logging_healthy` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Whether the Kafka logging generation recovered from its latest failure. |
 | `ferrum_kafka_logging_in_flight` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Records waiting in librdkafka for terminal delivery. |
 | `ferrum_kafka_logging_records_total` | counter | `generation`, `outcome` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Kafka logging record outcomes. |
-| `ferrum_kafka_logging_retained_bytes` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Ferrum userspace retained payload+key bytes awaiting librdkafka admission. |
+| `ferrum_kafka_logging_retained_bytes` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Ferrum-charged retained payload+key bytes, held from admission through librdkafka's own copy of the record until terminal delivery, terminal failure, purge, or immediate rejection. |
 | `ferrum_log_sink_accepted_records_total` | counter | `sink` | `logging` | `documented_only` | `when_process_initialized` | Records accepted by the bounded process log sink. |
 | `ferrum_log_sink_dropped_records_total` | counter | `sink`, `reason` | `logging` | `documented_only` | `when_process_initialized` | Log records dropped by bounded admission. |
 | `ferrum_log_sink_healthy` | gauge | `sink` | `logging` | `documented_only` | `when_process_initialized` | Whether the process log sink has recovered from its latest I/O or drain failure. |

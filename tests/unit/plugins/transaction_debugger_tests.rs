@@ -1193,6 +1193,93 @@ fn test_json_body_redacts_exact_sensitive_field_names_and_data_source_parameters
     );
 }
 
+/// The recognized data-source container name must never bypass the ordinary
+/// visitor, whatever JSON shape it holds.
+///
+/// The provider's conventional payload puts an array under this name, but the
+/// debugger captures arbitrary JSON, so the name proves no type invariant. An
+/// object, string, number, boolean, or null under it must receive the same
+/// member-name and credential-string redaction as anything else, and the
+/// wholesale `parameters` rule must keep applying beneath it.
+#[test]
+fn test_json_body_redacts_every_non_array_data_source_container_shape() {
+    let plugin = capture_plugin();
+    const AZURE_SEARCH_KEY: &str = "AbCdEfGhIjKlMnOpQrStUvWxYz123456";
+
+    // An object directly under the container name, in every recognized
+    // spelling: nested credential member names and the wholesale `parameters`
+    // rule both still apply, and benign siblings survive.
+    for container in ["data_sources", "dataSources", "data-sources"] {
+        let body = format!(
+            r#"{{"{container}":{{
+                "parameters":{{
+                    "key":"{AZURE_SEARCH_KEY}",
+                    "endpoint":"https://search.example.com"
+                }},
+                "api_key":"nested-object-secret-value",
+                "note":"benign-object-note"
+            }}}}"#
+        );
+        let sample = plugin.render_captured_body(body.as_bytes(), BodyKind::Json, 8_192);
+        assert_eq!(sample.state, "captured", "{}", sample.rendered);
+        for secret in [
+            AZURE_SEARCH_KEY,
+            "https://search.example.com",
+            "nested-object-secret-value",
+        ] {
+            assert!(
+                !sample.rendered.contains(secret),
+                "{container}: {}",
+                sample.rendered
+            );
+        }
+        assert!(
+            sample.rendered.contains("benign-object-note"),
+            "{container}: {}",
+            sample.rendered
+        );
+    }
+
+    // A credential-shaped string directly under the container name.
+    let body = format!(r#"{{"data_sources":"Bearer {AZURE_SEARCH_KEY}"}}"#);
+    let sample = plugin.render_captured_body(body.as_bytes(), BodyKind::Json, 8_192);
+    assert!(
+        !sample.rendered.contains(AZURE_SEARCH_KEY),
+        "{}",
+        sample.rendered
+    );
+    assert!(
+        sample.rendered.contains("***REDACTED***"),
+        "{}",
+        sample.rendered
+    );
+
+    // An array nested one level below the container object still reaches the
+    // data-source item rules.
+    let body = format!(
+        r#"{{"data_sources":{{"sources":[{{"parameters":{{"key":"{AZURE_SEARCH_KEY}"}}}}]}}}}"#
+    );
+    let sample = plugin.render_captured_body(body.as_bytes(), BodyKind::Json, 8_192);
+    assert!(
+        !sample.rendered.contains(AZURE_SEARCH_KEY),
+        "{}",
+        sample.rendered
+    );
+
+    // Scalars carry no credential to redact, but they must still capture
+    // cleanly and leave benign siblings intact.
+    for scalar in ["7", "true", "null", r#""benign-scalar-value""#] {
+        let body = format!(r#"{{"data_sources":{scalar},"note":"benign-scalar-note"}}"#);
+        let sample = plugin.render_captured_body(body.as_bytes(), BodyKind::Json, 8_192);
+        assert_eq!(sample.state, "captured", "{scalar}: {}", sample.rendered);
+        assert!(
+            sample.rendered.contains("benign-scalar-note"),
+            "{scalar}: {}",
+            sample.rendered
+        );
+    }
+}
+
 #[test]
 fn test_capture_decision_exact_cap_and_cap_plus_one() {
     let plugin = TransactionDebugger::new(&json!({
