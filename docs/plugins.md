@@ -2607,7 +2607,13 @@ Authenticates using HTTP Basic credentials. Every HTTP 401 response advertises `
 
 **Priority:** 1300
 
-**Config**: The plugin object is empty. `FERRUM_BASIC_AUTH_HMAC_SECRET` is mandatory whenever the plugin is enabled and must contain at least 32 bytes of unique random material. There is no default. Rotating the secret invalidates all existing hashes, so replace the hashes in the same rollout.
+**Config**: The property set is closed — `null`, an empty object, and an object carrying only `hide_credentials` are the accepted forms. `FERRUM_BASIC_AUTH_HMAC_SECRET` is mandatory whenever the plugin is enabled and must contain at least 32 bytes of unique random material. There is no default. Rotating the secret invalidates all existing hashes, so replace the hashes in the same rollout.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `hide_credentials` | Boolean | `true` | Remove the `Authorization` field carrying the `Basic` scheme before proxying an authenticated request, including when another mechanism wins a multi-auth chain. Set to `false` only for a legacy backend that explicitly requires the reusable password. |
+
+Basic encodes a **reusable** username and password in reversible Base64: an upstream that receives the field recovers the password and can replay it on any other gateway route that consumer can reach. The credential is therefore removed by default on every HTTP/1.1, HTTP/2, HTTP/3, gRPC, gRPC-Web, and WebSocket handshake path, and it is removed even when a different mechanism authenticated the request — a mixed chain must not forward Alice's password to a backend the gateway is telling `x-consumer-username: bob`. Only the `Basic` scheme is removed; a `Bearer` or other `Authorization` scheme another policy needs is left in place. Consumer identity injection and the `401` challenge are unchanged.
 
 Admin API writes may supply exactly one of `password` or `password_hash`; plaintext passwords are hashed and removed before persistence. File-mode configuration must supply only `password_hash` so plaintext credentials never enter observable runtime configuration.
 
@@ -2622,6 +2628,14 @@ credentials:
     - password_hash: "hmac_sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     - password_hash: "hmac_sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 ```
+
+A consumer that carries `basicauth` credentials must not have a `:` in its
+`username`. RFC 7617 §2 splits the decoded `user-id ":" password` at the FIRST
+colon, so no `Authorization: Basic` value can represent such a user-id and the
+consumer could never authenticate. Admission rejects the combination (admin
+API, file, database, and CP alike) instead of accepting a login that always
+returns 401. Colons inside the **password** stay valid, and a consumer with only
+other credential types is unaffected.
 
 ### `hmac_auth`
 
@@ -2639,7 +2653,7 @@ Authenticates requests using Ferrum's versioned HMAC authorization scheme with m
 | `sync_mode` | String | `local` | `redis` is required by, and only valid with, `replay_scope: shared` |
 | `redis_url`, `redis_tls`, `redis_key_prefix`, `redis_pool_size`, `redis_connect_timeout_seconds`, `redis_health_check_interval_seconds`, `redis_username`, `redis_password` | — | — | Shared Redis connectivity for the replay authority. Same semantics as every other Redis-backed plugin. The default key prefix is `{FERRUM_NAMESPACE}:hmac_auth:{plugin-config-id}` |
 
-The root key set is closed: a misspelled `replay_scope` or `signing_profile` fails admission rather than leaving the policy on a weaker posture than the operator wrote.
+The root key set is closed: a misspelled `replay_scope` or `signing_profile` fails admission rather than leaving the policy on a weaker posture than the operator wrote. The enumerated values are matched **exactly** — `signing_profile`, `replay_scope`, and `sync_mode` accept only the canonical lowercase spellings listed above, with no surrounding whitespace — so the published OpenAPI schema and the gateway admit exactly the same configurations. `replay_scope` is required with `ferrum-hmac-v2` and rejected with `ferrum-hmac-v1`; `allow_unsafe_replayable_v1: true` is required with v1 and rejected with v2; `sync_mode: redis` is required by, and only valid with, `replay_scope: shared`, and needs a `redis_url`.
 
 Expected `Authorization` header format (`ferrum-hmac-v2`):
 
@@ -2671,6 +2685,8 @@ Send **exactly one** body-integrity field:
 - or legacy RFC 3230 `Digest`, for example `sha-256=<standard-base64-of-sha256-of-body>` with no colon wrapping
 
 Do not send both headers. Mixed RFC 9530 / legacy spellings on one field, duplicate algorithm keys, empty members, unsupported algorithms (`md5`, `sha-1`), and non-standard Base64 fail closed. When both `sha-256` and `sha-512` are present, **both** must match. Ferrum hashes the exact client bytes from the single forwarding buffer after a valid signature admits collection; it never invents an empty-body digest when the body was not collected. `{DIGEST_HEADER_VALUE}` is that field's literal header value, not a canonicalized rewrite.
+
+**WebSocket handshakes.** A WebSocket upgrade (HTTP/1.1 `Upgrade`, HTTP/2 and HTTP/3 Extended CONNECT) is signed like any other request, over the **empty** body: sign `sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:` and send it as `Content-Digest` (or the legacy `Digest` spelling) with the usual `Date` and `Authorization: hmac` fields. The gateway never drains WebSocket DATA as a request body — after the upgrade those bytes are the tunnel — so the empty representation here is the transport's own proof from the handshake's wire framing, not a substitution for an uncollected body. A handshake that actually declares a body (`Content-Length` other than a parseable zero, or any `Transfer-Encoding`) keeps the absent snapshots and is rejected. Once the handshake authenticates, frames stream normally; the plugin does not inspect them.
 
 #### Example — RFC 9530 `Content-Digest` + `ferrum-hmac-v2`
 
@@ -4748,10 +4764,23 @@ Server-Sent Events stream handler. Validates inbound SSE client criteria, shapes
 
 1. **`on_request_received`** — Validates SSE client conformance: rejects non-GET with 405 + `Allow: GET`, rejects missing/wrong `Accept` with 406, bounds `Last-Event-ID` (max 1024 bytes) and stashes it for backend forwarding. The raw ID is omitted from transaction logs (`sse:leid_present` / `sse:leid_bytes` correlation only) and never interpolated into diagnostics.
 2. **`before_proxy`** — Strips `Accept-Encoding` to prevent compressed responses from breaking SSE line-delimited framing. Forwards `Last-Event-ID` header to the backend.
-3. **`after_proxy`** — Conservatively merges `Cache-Control` with `no-cache` without removing origin `private` / `no-store` / `no-transform` / extensions. Adds `X-Accel-Buffering: no`. Strips `Content-Length`. Does **not** emit `Connection: keep-alive` (illegal on HTTP/2 and HTTP/3; unnecessary on HTTP/1.1). Relabels non-SSE responses as `text/event-stream` when `force_sse_content_type` is set and/or when `wrap_non_sse_responses` will convert the body.
+3. **`after_proxy`** — Conservatively merges `Cache-Control` with `no-cache` without removing origin `private` / `no-store` / `no-transform` / extensions. Adds `X-Accel-Buffering: no`. Strips `Content-Length`. Does **not** emit `Connection: keep-alive` (illegal on HTTP/2 and HTTP/3; unnecessary on HTTP/1.1). Relabels non-SSE responses as `text/event-stream` when `force_sse_content_type` is set and/or when `wrap_non_sse_responses` will convert the body — and declines both for the representations listed under [Representations wrapping declines](#representations-wrapping-declines).
 4. **`transform_response_body`** — Optionally wraps non-SSE response bodies in `data: ...\n\n` SSE event framing (buffered responses only), preserving terminal line-break semantics for EventSource `MessageEvent.data`. Wrapping uses the request-scoped wrap decision from `after_proxy`, so it composes with content-type forcing instead of canceling it.
 
-**Config admission:** Config must be a JSON object. Unknown keys are rejected. Explicit `null` members are rejected; omitted keys keep defaults. `retry_ms` must be an integer ≥ 1 when set.
+**Config admission:** Config must be a JSON object. Unknown keys are rejected. Explicit `null` members are rejected; omitted keys keep defaults. `retry_ms` must be an unsigned 64-bit integer ≥ 1 when set. Admission is over the JSON numeric **value**, matching the published `SseConfig` schema (JSON Schema `type: integer` admits `2500.0` exactly as it admits `2500`), so an exact integer-valued number is accepted while fractional values and magnitudes outside the `minimum`/`maximum` pair are rejected on both sides.
+
+#### Representations wrapping declines
+
+`wrap_non_sse_responses` rewrites both the body and its media type, so it is refused outright — relabel included — for a representation it cannot convert. The decision happens in `after_proxy`, before any header is touched, so the client receives the origin's own representation instead of reframed bytes under an event-stream label:
+
+| Origin response | Outcome |
+|---|---|
+| `206 Partial Content` / `226 IM Used` | Forwarded unchanged; a fragment is not a complete event |
+| `Cache-Control: no-transform` | Forwarded unchanged (RFC 9110 §7.7). This also suppresses `force_sse_content_type`, which §7.7 lists among the fields a `no-transform` response forbids changing. The directive is read from the pristine pre-`after_proxy` snapshot, so a later header rule that strips it cannot unlock wrapping. A `no-transform` token inside a quoted extension value is not the directive |
+| Non-identity `Content-Encoding` | Forwarded unchanged; compressed octets are not the UTF-8 text `data:` framing describes. `strip_accept_encoding` (default on) is what normally prevents this |
+| Genuine `text/event-stream` | Streamed, never double-wrapped — including when retries are configured |
+
+A framed event that would exceed the effective response-body ceiling is a different outcome: the rewrite was claimed and could not be produced, so the shared gateway capacity refusal owns the response rather than the unconverted body being published under the `text/event-stream` label already selected.
 
 **Request validation:**
 
@@ -4772,11 +4801,11 @@ Server-Sent Events stream handler. Validates inbound SSE client criteria, shapes
 |---|---|---|---|
 | `add_no_buffering_header` | bool | `true` | Add `X-Accel-Buffering: no` to disable nginx/ALB buffering |
 | `strip_content_length` | bool | `true` | Remove `Content-Length` from the initial response map (SSE streams are indefinite). `false` no longer leaves one on the wire: [final response framing](#final-response-framing) removes `Content-Length` from every ordinary streamed response. The flag still governs whether `content-length` joins this instance's response-trailer policy names and whether the gateway's own declared-length accounting sees the backend value. |
-| `retry_ms` | u64 | _(none)_ | EventSource reconnection hint (ms), prepended as `retry:` when wrapping; must be ≥ 1 |
+| `retry_ms` | u64 | _(none)_ | EventSource reconnection hint (ms), prepended as `retry:` when wrapping; must be ≥ 1 and within the unsigned 64-bit range |
 | `force_sse_content_type` | bool | `false` | Force `Content-Type: text/event-stream` even if backend returns something else |
-| `wrap_non_sse_responses` | bool | `false` | Wrap non-SSE response bodies in `data: ...\n\n` SSE event framing; implies client-visible `text/event-stream` for wrapped responses |
+| `wrap_non_sse_responses` | bool | `false` | Wrap non-SSE response bodies in `data: ...\n\n` SSE event framing; implies client-visible `text/event-stream` for wrapped responses. See [Representations wrapping declines](#representations-wrapping-declines) |
 
-**Note:** When `wrap_non_sse_responses` is enabled, the plugin requires response body buffering and delivers a correctly framed `text/event-stream` response (composing with `force_sse_content_type`). When disabled (default), the response streams through with zero overhead — ideal for backends that already emit `text/event-stream`. Genuine upstream `text/event-stream` bodies are never double-wrapped. Wrapping normalizes CR/CRLF to LF and preserves terminal newlines in `MessageEvent.data` (lossy UTF-8 replacement of invalid bytes is separate from newline fidelity).
+**Note:** When `wrap_non_sse_responses` is enabled, the plugin requires response body buffering and delivers a correctly framed `text/event-stream` response (composing with `force_sse_content_type`). When disabled (default), the response streams through with zero overhead — ideal for backends that already emit `text/event-stream`. Genuine upstream `text/event-stream` bodies are never double-wrapped: buffering is released as soon as the backend response headers prove the origin selected an event stream, including on a retry-enabled proxy and on the HTTP/3 → HTTP bridge. Wrapping normalizes CR/CRLF to LF and preserves terminal newlines in `MessageEvent.data` (lossy UTF-8 replacement of invalid bytes is separate from newline fidelity).
 
 ```yaml
 config:
@@ -5101,6 +5130,8 @@ Request-side validation buffers by **configured representation, never by request
 
 Media types outside `content_types` / `response_content_types`, and allowlisted media types no configured rule can inspect, still pass through untouched — the advisory closes fail-open holes without widening applicability. Early request-side `before_proxy` inspection prefers a downstream-rewritten UTF-8 `request_body` metadata view when one exists (so composition with `ai_prompt_shield` redact evaluates the shielded representation), falls back to the raw buffered bytes when no text view is present (so a non-UTF-8 body the proxy stripped from metadata cannot look like "no body at all"), then uses the transport-proven-empty witness, and otherwise fails closed. The final request-body hook continues to validate the exact backend-visible bytes.
 
+**Encoded request bodies are decoded, not rejected.** A request that declares a non-identity `Content-Encoding` (`gzip`, `x-gzip`, `br`, or a stacked list) carries a *compressed* representation of the document the configured rules are about, and `before_proxy` has no decoder. Such a request is therefore not judged early: the shared backend-visible request representation gate (`GHSA-3973-47g5-4mcx`) decodes it under bounded, budget-charged limits and the final request-body hook validates the resulting plaintext — still before any byte reaches the backend. Deferral is taken only when that gate has claimed the request, so nothing escapes inspection: an unsupported, malformed, truncated, over-limit, or over-amplified coding is a `400`, a gateway capacity refusal is a `503`, and a decoded document that violates the configured rules is the ordinary `400`. A valid gzip JSON or XML upload now succeeds on H1, H2, and H3 instead of failing the early UTF-8 conversion. When the `compression` plugin is configured with `decompress_request: true` it has already rewritten the body and stripped `Content-Encoding` before `before_proxy`, so the early hook validates directly as it always did.
+
 **Duplicate JSON object members are rejected (`GHSA-c78j-5w9p-cpq6`).** Before any required-field or JSON Schema evaluation, a governed JSON body is screened for duplicate object member names at any nesting depth, including inside arrays. `serde_json` collapses duplicates to the *last* value while many backends and clients keep the *first*, and this plugin forwards the original bytes — so a body that passes validation on the collapsed view could still deliver a forbidden earlier value downstream. Request-side ambiguity is a `400`, response-side ambiguity a `502`. Member names are compared after JSON escapes are decoded, so a literal name and a `\uXXXX`-escaped spelling of the same code point are one member. The screen is non-recursive and bounded by explicit depth, token, member-count, member-name, and body-size budgets; exhausting any budget fails closed without an unbounded confirmation pass. Malformed bodies keep their existing `Invalid JSON` handling, and the rejection detail is a fixed reason that never echoes body bytes. Sibling objects and different nesting levels may of course reuse a name; only duplicates *within one object* are rejected.
 
 **Validation diagnostics never echo body content (`GHSA-5p2h-fq6q-gwh9`).** The `details` field of the generated 400 / 502 body — which is also what internal tracing emits — carries only a compiled-in failure category, the failing allowlisted JSON Schema keyword, and, on the request side, a bounded instance location. Numeric segments in that location render as the fixed `#` marker, because a JSON Pointer alone does not prove the container was an array — an object member literally named `0` is indistinguishable from a true index. An object member name survives only when the configured schema declares it, and any other member name renders as `~`. Segment count, segment length, and total diagnostic length are capped. The rejected value, the `enum` / `const` constants the schema expects, the `roxmltree` parse token, and the `prost` decode rendering are never formatted in. Response-side details stay coarser than request-side ones — they omit the instance location entirely — because describing an upstream body's shape back to the client is itself a disclosure.
@@ -5141,7 +5172,7 @@ Media types outside `content_types` / `response_content_types`, and allowlisted 
 | `protobuf_descriptor_path` | String | — | Path to compiled `FileDescriptorSet` binary (`protoc --descriptor_set_out --include_imports`) |
 | `protobuf_request_type` | String | — | Default fully-qualified protobuf message type for request validation |
 | `protobuf_response_type` | String | — | Default fully-qualified protobuf message type for response validation |
-| `protobuf_method_messages` | Object | `{}` | Per-method message type overrides keyed by gRPC path (e.g., `/pkg.Svc/Method`). Each value has `request` and/or `response` string fields |
+| `protobuf_method_messages` | Object | `{}` | Per-method message type overrides keyed by gRPC path (e.g., `/pkg.Svc/Method`). Each value has `request` and/or `response` string fields; at least one is required |
 | `protobuf_reject_unknown_fields` | bool | `false` | Reject messages containing field numbers not in the descriptor (independent of required-field initialization, which is always enforced) |
 | `grpc_max_decompressed_size_bytes` | usize | env / 10 MiB | Maximum decompressed gRPC protobuf payload size for both request and response validation. `0` disables the decompressed cap. When omitted, inherits `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` when that value parses as an unsigned integer; otherwise falls back to 10 MiB (10485760). |
 
@@ -5195,9 +5226,15 @@ Client-visible schema failures never echo the rejected value. A request failure 
 
 Two policy guards run before parsing: the configured `<!ENTITY` declaration cap (`xml_max_entities`) with nested-entity rejection (`xml_reject_nested_entities`), and unconditional rejection of external `SYSTEM` / `PUBLIC` identifiers on either the DOCTYPE external subset or an entity declaration. Ferrum accepts no external identifier and never resolves one. The guard is quote/comment/CDATA-aware, so keyword-looking literal text is not misclassified. Internal DTD subsets remain permitted so the entity knobs stay authoritative; the parser still applies its own billion-laughs limits (expansion depth 10, 255 references per reference).
 
-`required_xml_elements` / `response_required_xml_elements` match **parsed** element names, not source bytes, so a name inside a comment, CDATA section, or processing instruction never satisfies a requirement. A bare entry (`item`) matches that local name in any namespace. Clark notation (`{http://example.com/ns}item`) requires the expanded namespace URI **and** the local name to match. `{}item` requires the element to be in no namespace. An entry that opens `{` without closing `}`, or that has an empty local name, is a configuration error.
+The entity-policy scanners read entity declaration names, general entity references (`&name;`), and parameter entity references (`%name;`) with the **XML `Name` grammar**, the same production the parser uses, so an entity declared or referenced under a non-ASCII name is seen by the nesting restriction rather than slipping past an ASCII-only scan. With `xml_reject_nested_entities` enabled, an `<!ENTITY ...>` declaration the policy cannot read a replacement text out of is refused outright: failing to extract a value is not evidence that the declaration is harmless, since the parser downstream still sees a declared, referenceable entity. Comments, CDATA sections, processing instructions, and quoted markup-declaration values remain excluded from the scan, and the parser's own expansion depth and reference limits remain the independent second line of defence.
 
-**Protobuf initialization**: after decoding, every proto2 `required` field must be present — at the top level and recursively inside present singular, repeated, map, and extension message values. Presence, not value, is what is checked: a required scalar carrying its type's default value is present, because proto2 tracks it with a hasbit. proto3 descriptors have no `required` cardinality and are unaffected, and a proto3-only descriptor pool skips the walk entirely. The walk is bounded to 32 levels of message nesting and 50000 messages, and fails closed if either budget is exhausted. This is independent of `protobuf_reject_unknown_fields`, applies to compressed frames and per-method request/response descriptors alike, and the error names the descriptor field path only — never a payload value.
+`required_xml_elements` / `response_required_xml_elements` match **parsed** element names, not source bytes, so a name inside a comment, CDATA section, or processing instruction never satisfies a requirement. A bare entry (`item`) matches that local name in any namespace. Clark notation (`{http://example.com/ns}item`) requires the expanded namespace URI **and** the local name to match. `{}item` requires the element to be in no namespace.
+
+The local name is admitted against the XML `NCName` grammar — the XML `Name` production without `:` — because that is exactly what the parser reports as a local name. An entry that opens `{` without closing `}`, has an empty local name, or whose local name is not an `NCName` (`two words`, `2item`, `ns:item`, embedded markup, stray braces) is a configuration error on both the request and response fields. Such an entry used to be admitted and then made every governed request fail with `400` and every governed response with `502` forever, because no well-formed document can produce a local name of that shape. Valid Unicode names such as `süd` or `名前` are unaffected — the grammar is the XML one, not ASCII.
+
+**Protobuf initialization**: after decoding, every proto2 `required` field must be present — at the top level and recursively inside present singular, repeated, map, and extension message values. Presence, not value, is what is checked: a required scalar carrying its type's default value is present, because proto2 tracks it with a hasbit. proto3 descriptors have no `required` cardinality and are unaffected, and a proto3-only descriptor pool skips the initialization work; it walks messages only when `protobuf_reject_unknown_fields` is enabled, which shares the same walk. The walk is bounded to 32 levels of message nesting and 50000 messages, and fails closed if either budget is exhausted. This is independent of `protobuf_reject_unknown_fields`, applies to compressed frames and per-method request/response descriptors alike, and the error names the descriptor field path only — never a payload value.
+
+**Unknown protobuf fields are rejected at every nesting level.** When `protobuf_reject_unknown_fields` is enabled, the strict-schema policy is applied to the decoded outer message *and* to every present nested, repeated, map-value, oneof, and extension message value, sharing the same bounded 32-level / 50000-message walk as the initialization check. The reflection API reports only the fields the decoder could not place in one specific message, so an outer-message-only check left a nested message's unknown fields unexamined while a backend that interprets them acted on data the configured policy was supposed to refuse. The rejection carries a count only — never a field number, wire type, or payload byte. The default (`false`) is unchanged: unknown fields are permitted at every level, exactly as before. Both directions — gRPC request bodies and gRPC responses — run the same walk.
 
 **Supported JSON Schema `format` values**: the `jsonschema` crate's format vocabulary for the configured draft, which includes `email`, `ipv4`, `ipv6`, `uri`, `uri-reference`, `date-time`, `date`, `time`, `hostname`, `json-pointer`, `regex`, and `uuid`.
 
@@ -5435,9 +5472,9 @@ Request buffering is only enabled when at least one GraphQL policy is configured
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_depth` | u32 (optional) | — | Maximum allowed query nesting depth |
-| `max_complexity` | u32 (optional) | — | Maximum allowed field count |
-| `max_aliases` | u32 (optional) | — | Maximum allowed alias count |
+| `max_depth` | u32 (optional) | — | Maximum allowed query nesting depth. Inclusive range `0..=4294967295`; negative values and values above `4294967295` are rejected at plugin load time |
+| `max_complexity` | u32 (optional) | — | Maximum allowed field count. Inclusive range `0..=4294967295`; negative values and values above `4294967295` are rejected at plugin load time |
+| `max_aliases` | u32 (optional) | — | Maximum allowed alias count. Inclusive range `0..=4294967295`; negative values and values above `4294967295` are rejected at plugin load time |
 | `introspection_allowed` | bool | `true` | Whether introspection queries are permitted. Only `false` counts as an effective protection rule; the default `true` does not. |
 | `limit_by` | String | `ip` | Rate limit key: exact lowercase `ip` or `consumer`. Other values are rejected at plugin load time. |
 | `type_rate_limits` | Object | `{}` | Rate limits by operation type. Only exact lowercase `query`, `mutation`, and `subscription` keys are accepted; unknown keys are rejected. |
@@ -5453,7 +5490,7 @@ Request buffering is only enabled when at least one GraphQL policy is configured
 | `redis_password` | String (optional) | — | Redis password |
 | `redis_failure_policy` | String | `fail_closed` | Behavior when the centralized store cannot be consulted (outage, egress/DNS screen failure, or an endpoint rejected as Redis Cluster). `fail_closed` refuses with `503`; `local_fallback` explicitly opts into per-process budgets for availability. Only meaningful when `sync_mode: "redis"`, but validated in either mode |
 
-Each rate limit entry: `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive integer JSON values (`2`, not `2.0`) — missing, zero, or unknown keys are rejected at plugin load time so a typo cannot silently disable a rate limit. The same integer-encoding rule applies to the top-level numeric limits and Redis pool/timeout settings.
+Each rate limit entry: `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive integer JSON values (`2`, not `2.0`) — missing, zero, or unknown keys are rejected at plugin load time so a typo cannot silently disable a rate limit. Both fields are also bounded above by the shared rate-limit maxima, and both bounds apply identically to `type_rate_limits` and `operation_rate_limits` entries: `max_requests` accepts the inclusive range `1..=1000000` (an operational budget ceiling) and `window_seconds` the inclusive range `1..=2678400` (31 days, so the window stays representable as a monotonic duration and a signed Redis TTL). The same integer-encoding rule applies to the top-level numeric limits and Redis pool/timeout settings.
 
 The plugin requires at least one effective rule (`max_depth`, `max_complexity`, `max_aliases`, `introspection_allowed: false`, a non-empty `type_rate_limits`, or a non-empty `operation_rate_limits`) — an empty or no-op config is rejected. Unknown top-level keys are rejected so misspelled introspection, identity, rate-map, or Redis synchronization fields cannot silently fall back to defaults.
 

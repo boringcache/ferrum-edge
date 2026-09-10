@@ -2127,6 +2127,9 @@ fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
 fn graphql_config_schema_matches_runtime_validation() {
     use ferrum_edge::plugins::create_plugin;
     use ferrum_edge::plugins::graphql::GRAPHQL_CONFIG_KEYS;
+    use ferrum_edge::plugins::utils::rate_limit::{
+        MAX_RATE_LIMIT_MAX_REQUESTS, MAX_RATE_LIMIT_WINDOW_SECONDS,
+    };
     use ferrum_edge::plugins::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
 
     let spec: serde_json::Value =
@@ -2179,6 +2182,21 @@ fn graphql_config_schema_matches_runtime_validation() {
         Some(&json!(1))
     );
 
+    // Issue #5129: the three u32 policy limits carry their runtime range, so a
+    // schema-driven authoring tool refuses exactly what the constructor refuses.
+    for field in ["max_depth", "max_complexity", "max_aliases"] {
+        assert_eq!(
+            schema["properties"][field]["minimum"],
+            json!(0),
+            "{field} must advertise the unsigned floor"
+        );
+        assert_eq!(
+            schema["properties"][field]["maximum"],
+            json!(u32::MAX),
+            "{field} must advertise the 32-bit ceiling"
+        );
+    }
+
     let schema_fields: BTreeSet<_> = schema["properties"]
         .as_object()
         .expect("GraphqlConfig properties")
@@ -2213,6 +2231,20 @@ fn graphql_config_schema_matches_runtime_validation() {
     assert!(docs.contains("valid GraphQL Names"));
     assert!(docs.contains("`2`, not `2.0`"));
     assert!(docs.contains("validated even while `sync_mode` is `local`"));
+    // Issue #5129 / #5133: the operator-facing table states the enforced ranges
+    // for the u32 policy limits and for both rate-entry fields.
+    assert!(
+        docs.contains(&format!("`0..={}`", u32::MAX)),
+        "docs/plugins.md graphql section must document the u32 policy-limit range"
+    );
+    assert!(
+        docs.contains(&format!("`1..={MAX_RATE_LIMIT_MAX_REQUESTS}`")),
+        "docs/plugins.md graphql section must document the max_requests ceiling"
+    );
+    assert!(
+        docs.contains(&format!("`1..={MAX_RATE_LIMIT_WINDOW_SECONDS}`")),
+        "docs/plugins.md graphql section must document the window_seconds ceiling"
+    );
 
     let validator_schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2227,6 +2259,13 @@ fn graphql_config_schema_matches_runtime_validation() {
         json!({"max_depth": 5}),
         json!({"max_complexity": 100}),
         json!({"max_aliases": 3}),
+        // Issue #5129 boundaries: zero and u32::MAX are admitted by both.
+        json!({"max_depth": 0}),
+        json!({"max_complexity": 0}),
+        json!({"max_aliases": 0}),
+        json!({"max_depth": 4294967295u32}),
+        json!({"max_complexity": 4294967295u32}),
+        json!({"max_aliases": 4294967295u32}),
         json!({"introspection_allowed": false}),
         json!({"type_rate_limits": {"query": {"max_requests": 1, "window_seconds": 60}}}),
         json!({"type_rate_limits": {
@@ -2288,6 +2327,13 @@ fn graphql_config_schema_matches_runtime_validation() {
         json!({"operation_rate_limits": {"": {"max_requests": 1, "window_seconds": 60}}}),
         json!({"type_rate_limits": {"query": {"max_requests": 1, "window_seconds": 60, "burst": 2}}}),
         json!({"max_depth": 5, "introspection_allowd": false}),
+        // Issue #5129 boundaries: below zero and above u32::MAX are refused by both.
+        json!({"max_depth": -1}),
+        json!({"max_complexity": -1}),
+        json!({"max_aliases": -1}),
+        json!({"max_depth": 4294967296u64}),
+        json!({"max_complexity": 4294967296u64}),
+        json!({"max_aliases": 4294967296u64}),
         json!({"max_depth": 5, "sync_mdoe": "redis", "redis_url": "redis://localhost:6379/0"}),
         json!({
             "max_depth": 5,
@@ -3325,6 +3371,127 @@ fn hmac_auth_config_root_is_closed_and_matches_openapi() {
         schema["properties"]["replay_max_entries"]["default"],
         json!(ferrum_edge::plugins::hmac_auth::DEFAULT_HMAC_REPLAY_MAX_ENTRIES)
     );
+}
+
+/// Issue #5001: key-set parity is not acceptance parity. `HmacAuthConfig` had
+/// no conditional constraints at all, so schema-based tooling approved
+/// deployments the gateway refuses to start with — an empty configuration,
+/// unsafe v1 without its acknowledgement, v2 without a replay scope, and every
+/// impossible Redis/scope pairing. This is the real schema-vs-runtime
+/// acceptance matrix.
+#[test]
+fn hmac_auth_schema_acceptance_matches_runtime_admission() {
+    use ferrum_edge::plugins::create_plugin;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let validator_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/HmacAuthConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&validator_schema)
+        .expect("HmacAuthConfig schema compiles");
+
+    let redis_url = "redis://127.0.0.1:6379/0";
+    let accepted = [
+        json!({"replay_scope": "process"}),
+        json!({"replay_scope": "process", "clock_skew_seconds": 60}),
+        json!({"replay_scope": "process", "replay_max_entries": 1}),
+        json!({"replay_scope": "process", "sync_mode": "local"}),
+        json!({"signing_profile": "ferrum-hmac-v2", "replay_scope": "process"}),
+        json!({
+            "signing_profile": "ferrum-hmac-v2",
+            "replay_scope": "process",
+            "allow_unsafe_replayable_v1": false
+        }),
+        json!({"signing_profile": "ferrum-hmac-v1", "allow_unsafe_replayable_v1": true}),
+        json!({
+            "replay_scope": "shared",
+            "sync_mode": "redis",
+            "redis_url": redis_url
+        }),
+    ];
+    for config in &accepted {
+        assert!(
+            validator.validate(config).is_ok(),
+            "config should be schema-valid: {config}"
+        );
+        assert!(
+            create_plugin("hmac_auth", config).is_ok(),
+            "config should be runtime-valid: {config}"
+        );
+    }
+
+    let rejected = [
+        // Profile / acknowledgement / scope admission (the #5001 matrix).
+        json!({}),
+        json!({"clock_skew_seconds": 60}),
+        json!({"signing_profile": "ferrum-hmac-v1"}),
+        json!({"signing_profile": "ferrum-hmac-v1", "allow_unsafe_replayable_v1": false}),
+        json!({
+            "signing_profile": "ferrum-hmac-v1",
+            "allow_unsafe_replayable_v1": true,
+            "replay_scope": "process"
+        }),
+        json!({"replay_scope": "process", "allow_unsafe_replayable_v1": true}),
+        json!({"replay_scope": "shared"}),
+        json!({"replay_scope": "shared", "sync_mode": "redis"}),
+        json!({"replay_scope": "process", "sync_mode": "redis", "redis_url": redis_url}),
+        json!({
+            "signing_profile": "ferrum-hmac-v1",
+            "allow_unsafe_replayable_v1": true,
+            "sync_mode": "redis",
+            "redis_url": redis_url
+        }),
+        // Scalar spellings: the enums are exact on both surfaces.
+        json!({"replay_scope": " PROCESS "}),
+        json!({"replay_scope": "Process"}),
+        json!({"replay_scope": "process", "signing_profile": " ferrum-hmac-v2 "}),
+        json!({"replay_scope": "process", "signing_profile": "FERRUM-HMAC-V2"}),
+        json!({
+            "replay_scope": "shared",
+            "sync_mode": "REDIS",
+            "redis_url": redis_url
+        }),
+        // Types, bounds, and the closed key set.
+        json!({"replay_scope": "process", "replay_max_entries": 0}),
+        json!({"replay_scope": "process", "clock_skew_seconds": 0}),
+        json!({"replay_scope": "process", "clock_skew_seconds": 301}),
+        json!({"replay_scope": true}),
+        json!({"replay_scope": "process", "replay_scop": "shared"}),
+        json!({"replay_scope": "process", "require_digest": true}),
+    ];
+    for config in &rejected {
+        assert!(
+            validator.validate(config).is_err(),
+            "config should be schema-invalid: {config}"
+        );
+        assert!(
+            create_plugin("hmac_auth", config).is_err(),
+            "config should be runtime-invalid: {config}"
+        );
+    }
+}
+
+/// The enclosing `PluginConfig` branch must demand `config` too: an omitted
+/// `config` defaults to null and `HmacAuth::build` refuses a non-object.
+#[test]
+fn hmac_auth_plugin_config_branch_requires_a_config_object() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let branch = spec
+        .pointer("/components/schemas/PluginConfig/allOf")
+        .and_then(serde_json::Value::as_array)
+        .expect("PluginConfig allOf")
+        .iter()
+        .find(|entry| {
+            entry.pointer("/if/properties/plugin_name/const") == Some(&json!("hmac_auth"))
+        })
+        .expect("hmac_auth PluginConfig branch");
+
+    assert_eq!(branch.pointer("/then/required"), Some(&json!(["config"])));
 }
 
 #[test]
@@ -4920,22 +5087,25 @@ fn body_validator_grpc_max_decompressed_size_bytes_stays_in_openapi_docs_and_run
         );
     }
 
+    // Each instance carries a rule-bearing key: the schema now refuses a
+    // configuration with no validation rule at all, exactly as the constructor
+    // does (issue #5122).
     assert_component_validity(
         &spec,
         "BodyValidatorConfig",
-        &json!({"grpc_max_decompressed_size_bytes": 0}),
+        &json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": 0}),
         true,
     );
     assert_component_validity(
         &spec,
         "BodyValidatorConfig",
-        &json!({"grpc_max_decompressed_size_bytes": -1}),
+        &json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": -1}),
         false,
     );
     assert_component_validity(
         &spec,
         "BodyValidatorConfig",
-        &json!({"grpc_max_decompressed_size_bytes": "10"}),
+        &json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": "10"}),
         false,
     );
 
@@ -10774,6 +10944,109 @@ fn body_validator_schema_is_closed_and_matches_the_runtime_key_set() {
         schema["properties"]["json_schema_draft"]["enum"],
         json!(["draft2020-12", "draft7"])
     );
+}
+
+/// Issue #5122: the published `BodyValidatorConfig` schema must accept exactly
+/// the configurations the runtime constructor admits.
+///
+/// Two node-local dependencies stay runtime-only and are deliberately not
+/// represented statically: the descriptor file must exist, and every configured
+/// message type must resolve inside it. Everything else — rule presence,
+/// non-empty schemas/strings/map entries, unsigned bounds, media-type and
+/// Clark-notation shape, and gRPC method-path selectors — is asserted in both
+/// directions so a generated client cannot build a configuration the gateway
+/// then refuses.
+#[test]
+fn body_validator_schema_admits_exactly_what_the_constructor_admits() {
+    use ferrum_edge::plugins::body_validator::BodyValidator;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for config in [
+        // No validation rule at all.
+        json!({}),
+        json!({"validate_xml": false}),
+        json!({"response_validate_xml": false}),
+        json!({"required_fields": []}),
+        // Present but unusable rule values.
+        json!({"json_schema": {}}),
+        json!({"response_json_schema": {}}),
+        json!({"required_fields": [""]}),
+        json!({"response_required_fields": [""]}),
+        json!({"required_xml_elements": ["two words"]}),
+        json!({"required_xml_elements": ["{unclosed"]}),
+        json!({"response_required_xml_elements": ["two words"]}),
+        // Out-of-domain integers.
+        json!({"validate_xml": true, "xml_max_entities": -1}),
+        json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": -1}),
+        // Malformed media types.
+        json!({"validate_xml": true, "content_types": ["application"]}),
+        json!({"validate_xml": true, "content_types": [""]}),
+        json!({"validate_xml": true, "response_content_types": ["json"]}),
+        // Protobuf cross-field shape.
+        json!({"protobuf_request_type": "audit.Message"}),
+        json!({"protobuf_response_type": "audit.Message"}),
+        json!({"protobuf_descriptor_path": ""}),
+        json!({"protobuf_descriptor_path": "/srv/audit.bin"}),
+        json!({
+            "protobuf_descriptor_path": "/srv/audit.bin",
+            "protobuf_method_messages": {}
+        }),
+        json!({
+            "protobuf_descriptor_path": "/srv/audit.bin",
+            "protobuf_method_messages": {"/audit.Service/Echo": {}}
+        }),
+        json!({
+            "protobuf_descriptor_path": "/srv/audit.bin",
+            "protobuf_method_messages": {
+                "audit.Service/Echo": {"request": "audit.Message"}
+            }
+        }),
+    ] {
+        assert!(
+            BodyValidator::validate_config(&config).is_err(),
+            "runtime admission must reject {config}"
+        );
+        assert_component_validity(&spec, "BodyValidatorConfig", &config, false);
+    }
+
+    for config in [
+        json!({"validate_xml": true}),
+        json!({"response_validate_xml": true}),
+        json!({"required_fields": ["name"]}),
+        json!({"response_required_fields": ["id"]}),
+        json!({"json_schema": {"type": "object"}}),
+        json!({"response_json_schema": {"type": "object"}}),
+        json!({"required_xml_elements": ["item", "{}item"]}),
+        json!({"response_required_xml_elements": ["{urn:x}item"]}),
+        // An empty media list means "every valid media type", and an explicit
+        // zero cap disables the decompressed ceiling; both must survive.
+        json!({"validate_xml": true, "content_types": []}),
+        json!({"validate_xml": true, "xml_max_entities": 0}),
+        json!({
+            "validate_xml": true,
+            "content_types": ["application/json; charset=utf-8"]
+        }),
+        json!({
+            "protobuf_descriptor_path": "/srv/audit.bin",
+            "protobuf_request_type": "audit.Message"
+        }),
+        json!({
+            "protobuf_descriptor_path": "/srv/audit.bin",
+            "protobuf_response_type": "audit.Message"
+        }),
+        json!({
+            "protobuf_descriptor_path": "/srv/audit.bin",
+            "protobuf_method_messages": {
+                "/audit.Service/Echo": {"request": "audit.Message"}
+            }
+        }),
+    ] {
+        BodyValidator::validate_config(&config)
+            .unwrap_or_else(|error| panic!("runtime must accept {config}: {error}"));
+        assert_component_validity(&spec, "BodyValidatorConfig", &config, true);
+    }
 }
 
 /// Advisory GHSA-8594-2xhc-8g38: the observability sinks whose endpoint may

@@ -5344,6 +5344,161 @@ async fn h3_progressing_sse_survives_idle_read_timeout() {
     );
 }
 
+/// Config for the H3→HTTP bridge carrying one `sse` instance.
+fn h3_sse_plugin_yaml(
+    port: u16,
+    read_timeout_ms: u64,
+    plugin: Value,
+    retry: Option<Value>,
+) -> String {
+    let mut proxy = json!({
+        "id": "scripted-h3",
+        "listen_path": "/api",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": port,
+        "strip_listen_path": true,
+        "backend_connect_timeout_ms": 2000,
+        "backend_read_timeout_ms": read_timeout_ms,
+        "backend_write_timeout_ms": 5_000,
+        "plugins": [{"plugin_config_id": "sse"}],
+    });
+    if let Some(retry) = retry {
+        proxy["retry"] = retry;
+    }
+    to_file_mode_yaml(&json!({
+        "version": "1",
+        "proxies": [proxy],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "sse",
+            "plugin_name": "sse",
+            "proxy_id": "scripted-h3",
+            "scope": "proxy",
+            "enabled": true,
+            "config": plugin,
+        }],
+    }))
+}
+
+/// #5097 — an H3 client must receive the SAME framed event an H1/H2 client
+/// receives for the same wrapped non-SSE origin response.
+///
+/// The bridge used to run `after_proxy` first, so the `sse` instance relabelled
+/// the response to `text/event-stream` and the buffer/stream refinement that
+/// followed then released the body — there is nothing left for a wrapper to do
+/// in an already-SSE response. The origin's plain text went out verbatim under
+/// the event-stream label the wrap was supposed to fill.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_bridge_frames_a_wrapped_non_sse_response() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Type".into(),
+            value: "text/plain".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: "12".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(b"hello\r\nworld".to_vec()))
+        .step(HttpStep::RespondBodyEnd)
+        .spawn()
+        .expect("spawn");
+
+    let yaml = h3_sse_plugin_yaml(
+        backend_port,
+        5_000,
+        json!({"wrap_non_sse_responses": true, "retry_ms": 2500}),
+        None,
+    );
+    let (_harness, _ca, https_port) =
+        spawn_h3_harness_with_explicit_https_port_and_config(yaml, false, None).await;
+    let client = Http3Client::insecure().expect("h3 client");
+    let resp = client
+        .get_with_options(
+            &format!("https://127.0.0.1:{https_port}/api/text"),
+            GetOptions::default().header("accept", "text/event-stream"),
+        )
+        .await
+        .expect("H3 wrapped response");
+
+    assert_eq!(resp.status.as_u16(), 200, "body={:?}", resp.body_text());
+    let content_type = resp.headers.get("content-type");
+    let content_type = content_type.and_then(|value| value.to_str().ok());
+    assert_eq!(content_type, Some("text/event-stream"));
+    assert_eq!(
+        resp.body_text(),
+        "retry: 2500\ndata: hello\ndata: world\n\n",
+        "the H3 bridge must frame a wrapped non-SSE body exactly as H1/H2 does"
+    );
+}
+
+/// #5099 — a default (non-wrapping) `sse` proxy streams to an H3 client even
+/// with retries configured.
+///
+/// The backend commits SSE headers plus one event and then stalls past the read
+/// watermark, so a streamed response delivers that event before the body
+/// aborts, while a buffered one collects until the timeout and delivers nothing.
+/// The bridge used to force buffering whenever `retry` was configured at all,
+/// even though every retry decision it makes is taken from the response status
+/// before a single body byte is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_bridge_streams_default_sse_with_retries_configured() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Type".into(),
+            value: "text/event-stream".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(H3_SSE_FIRST_EVENT.to_vec()))
+        .step(HttpStep::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn");
+
+    let read_timeout_ms: u64 = 800;
+    let yaml = h3_sse_plugin_yaml(
+        backend_port,
+        read_timeout_ms,
+        json!({}),
+        Some(json!({"max_retries": 1})),
+    );
+    let (_harness, _ca, https_port) =
+        spawn_h3_harness_with_explicit_https_port_and_config(yaml, false, None).await;
+    let client = Http3Client::insecure().expect("h3 client");
+    let resp = client
+        .get_with_options(
+            &format!("https://127.0.0.1:{https_port}/api/ssestall"),
+            GetOptions::default().header("accept", "text/event-stream"),
+        )
+        .await
+        .expect("H3 SSE headers");
+
+    assert_eq!(resp.status.as_u16(), 200, "body={:?}", resp.body_text());
+    assert!(
+        resp.body_text().contains("data: hello"),
+        "configuring retries must not buffer a default SSE response on the H3 \
+         bridge; body={:?} body_error={:?}",
+        resp.body_text(),
+        resp.body_error
+    );
+}
+
 /// Ordinary responses report the backend hop, including a retained earlier
 /// Via value, on both buffered and streaming H3 frontend paths.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
