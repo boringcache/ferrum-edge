@@ -47,8 +47,8 @@ use crate::plugins::chargeback::pricing::{
 };
 use crate::plugins::chargeback::{bounded_billing_identity, bounded_display};
 use crate::plugins::utils::log_schema::{
-    DerivedKind, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView, SummarySchema,
-    TimestampFormat, resolve_schema,
+    DerivedKind, EmittedKeys, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView,
+    SummarySchema, TimestampFormat, resolve_schema,
 };
 use crate::util::unknown_keys::reject_unknown_keys;
 
@@ -2679,7 +2679,7 @@ impl<'a> SchemaSerializable for ChargebackProxyRow<'a> {
     fn serialize_metadata<S>(
         &self,
         _policy: &MetadataPolicy,
-        _emitted: &mut std::collections::HashSet<String>,
+        _emitted: &EmittedKeys<'_>,
         _map: &mut S,
     ) -> Result<(), S::Error>
     where

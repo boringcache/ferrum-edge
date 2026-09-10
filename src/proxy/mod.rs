@@ -4654,6 +4654,10 @@ pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<Strin
     // transaction logs and retain only safe present/length correlation hints.
     crate::plugins::sse::redact_sse_log_metadata(metadata);
     crate::plugins::mcp_gateway::redact_internal_log_metadata(metadata);
+    // gRPC-Web stages the client's COMPLETE request trailer block for dispatch.
+    // It is transport state, not observability metadata, and the application
+    // trailing metadata inside it may carry credentials (GHSA-9f6g-hqpq-v8h7).
+    crate::plugins::grpc_web::redact_internal_log_metadata(metadata);
     // Fail-closed shared contract: request-deduplication lifecycle keys under
     // `_dedup_*` never enter any transaction-log projection. Ownership lives in
     // typed request state; this strips any residual public-metadata copies.
@@ -35904,6 +35908,7 @@ async fn handle_proxy_request_inner(
                         content_type,
                         grpc_streaming.status,
                         grpc_web_streaming_initial_metadata,
+                        crate::plugins::grpc_web::response_entity_is_unframed_backend_error(&ctx),
                     );
                 }
                 if let Some(logger) = deferred_grpc_logger {
@@ -39992,6 +39997,7 @@ async fn handle_proxy_request_inner(
             &content_type,
             response_status,
             Some(initial_terminal_metadata),
+            crate::plugins::grpc_web::response_entity_is_unframed_backend_error(&ctx),
         )
     } else {
         body

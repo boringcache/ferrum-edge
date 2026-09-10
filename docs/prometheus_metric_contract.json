@@ -2433,7 +2433,7 @@
   {
     "name": "ferrum_kafka_logging_retained_bytes",
     "type": "gauge",
-    "help": "Ferrum userspace retained payload+key bytes awaiting librdkafka admission.",
+    "help": "Ferrum-charged retained payload+key bytes, held from admission through librdkafka's own copy of the record until terminal delivery, terminal failure, purge, or immediate rejection.",
     "labels": [
       "generation"
     ],

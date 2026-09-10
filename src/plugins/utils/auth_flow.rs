@@ -471,7 +471,11 @@ pub fn commit_authentication_attempt(
         if ctx.auth_method.is_none() {
             ctx.auth_method = Some(auth_method);
         }
-        ctx.credential_deadline_at = credential_deadline;
+        // Earliest wins rather than assign: an identity mechanism that ran
+        // earlier on this request (`spiffe_identity`, priority 940, publishing
+        // the peer SVID's `notAfter`) may already have established a shorter
+        // bound, and a second, longer-lived credential must not widen it.
+        ctx.observe_credential_deadline(credential_deadline);
         attempt.commit_principal_state(ctx);
     }
 

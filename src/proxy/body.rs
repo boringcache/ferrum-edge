@@ -477,6 +477,16 @@ struct GrpcWebStreamingBody {
     terminal_status: Arc<AtomicU64>,
     terminal_emitted: bool,
     failed: bool,
+    /// The backend/intermediary answered with an HTTP error whose entity is not
+    /// a gRPC message stream (a `text/plain` or `text/html` error document).
+    ///
+    /// gRPC-Web bodies are a frame sequence, so those bytes cannot be forwarded:
+    /// prepended to the synthesized terminal frame they make the WHOLE response
+    /// unparseable, and a client then cannot read the mapped status it is being
+    /// told about. The entity is drained and dropped; the terminal frame alone
+    /// is emitted. Decided once from the pristine backend response by
+    /// `grpc_web::unframed_backend_error_entity` — never from these bytes.
+    suppress_backend_entity: bool,
 }
 
 impl GrpcWebStreamingBody {
@@ -509,78 +519,86 @@ impl http_body::Body for GrpcWebStreamingBody {
             return Poll::Ready(None);
         }
 
-        match Pin::new(&mut this.inner).poll_frame(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Some(Err(error))) => {
-                this.failed = true;
-                Poll::Ready(Some(Err(error)))
-            }
-            Poll::Ready(Some(Ok(frame))) if frame.is_data() => {
-                let data = match frame.into_data() {
-                    Ok(data) => data,
-                    Err(_) => {
-                        this.failed = true;
-                        return Poll::Ready(Some(Err(Box::new(std::io::Error::other(
-                            "gRPC-Web streaming adapter received an invalid DATA frame",
-                        )))));
-                    }
-                };
-                // An inner client-deadline or authorization-lifetime wrapper may
-                // already have produced a body-framed gRPC-Web terminal status.
-                // Preserve it verbatim (especially text mode, which is already
-                // base64-encoded) and expose its status to the outer deferred
-                // logger. The authorization deadline is checked first so an
-                // expired credential is reported as `UNAUTHENTICATED` rather
-                // than a client-chosen `DEADLINE_EXCEEDED`.
-                let inner_auth_deadline_fired = this
-                    .inner
-                    .stream_auth_deadline
-                    .as_ref()
-                    .is_some_and(|state| state.fired.load(Ordering::Acquire));
-                let inner_deadline_fired = inner_auth_deadline_fired
-                    || this
-                        .inner
-                        .client_grpc_deadline_fired
-                        .as_ref()
-                        .is_some_and(|flag| flag.load(Ordering::Acquire));
-                if inner_deadline_fired {
-                    let terminal_status = if inner_auth_deadline_fired {
-                        crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED
-                    } else {
-                        crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED
-                    };
-                    this.terminal_status
-                        .store(u64::from(terminal_status), Ordering::Release);
-                    this.terminal_emitted = true;
-                    return Poll::Ready(Some(Ok(Frame::data(data))));
+        loop {
+            match Pin::new(&mut this.inner).poll_frame(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Err(error))) => {
+                    this.failed = true;
+                    return Poll::Ready(Some(Err(error)));
                 }
-                Poll::Ready(Some(Ok(Frame::data(
-                    crate::plugins::grpc_web::encode_streaming_data(data, this.text_mode),
-                ))))
-            }
-            Poll::Ready(Some(Ok(frame))) if frame.is_trailers() => {
-                let trailers = match frame.into_trailers() {
-                    Ok(trailers) => trailers,
-                    Err(_) => {
-                        this.failed = true;
-                        return Poll::Ready(Some(Err(Box::new(std::io::Error::other(
-                            "gRPC-Web streaming adapter received an invalid trailer frame",
-                        )))));
+                Poll::Ready(Some(Ok(frame))) if frame.is_data() => {
+                    let data = match frame.into_data() {
+                        Ok(data) => data,
+                        Err(_) => {
+                            this.failed = true;
+                            return Poll::Ready(Some(Err(Box::new(std::io::Error::other(
+                                "gRPC-Web streaming adapter received an invalid DATA frame",
+                            )))));
+                        }
+                    };
+                    // An inner client-deadline or authorization-lifetime wrapper may
+                    // already have produced a body-framed gRPC-Web terminal status.
+                    // Preserve it verbatim (especially text mode, which is already
+                    // base64-encoded) and expose its status to the outer deferred
+                    // logger. The authorization deadline is checked first so an
+                    // expired credential is reported as `UNAUTHENTICATED` rather
+                    // than a client-chosen `DEADLINE_EXCEEDED`.
+                    let inner_auth_deadline_fired = this
+                        .inner
+                        .stream_auth_deadline
+                        .as_ref()
+                        .is_some_and(|state| state.fired.load(Ordering::Acquire));
+                    let inner_deadline_fired = inner_auth_deadline_fired
+                        || this
+                            .inner
+                            .client_grpc_deadline_fired
+                            .as_ref()
+                            .is_some_and(|flag| flag.load(Ordering::Acquire));
+                    if inner_deadline_fired {
+                        let terminal_status = if inner_auth_deadline_fired {
+                            crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED
+                        } else {
+                            crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED
+                        };
+                        this.terminal_status
+                            .store(u64::from(terminal_status), Ordering::Release);
+                        this.terminal_emitted = true;
+                        return Poll::Ready(Some(Ok(Frame::data(data))));
                     }
-                };
-                let mut collected = std::collections::HashMap::new();
-                super::grpc_proxy::collect_buffered_grpc_trailers(&trailers, &mut collected);
-                Poll::Ready(Some(Ok(this.terminal_data(collected))))
-            }
-            Poll::Ready(Some(Ok(_))) => {
-                this.failed = true;
-                Poll::Ready(Some(Err(Box::new(std::io::Error::other(
-                    "gRPC-Web streaming adapter received an unsupported frame",
-                )))))
-            }
-            Poll::Ready(None) => {
-                let trailers = this.initial_terminal_metadata.take().unwrap_or_default();
-                Poll::Ready(Some(Ok(this.terminal_data(trailers))))
+                    // A non-gRPC HTTP error entity is drained, never forwarded:
+                    // see `suppress_backend_entity`. Keep polling so the
+                    // terminal frame is still emitted from EOF or trailers.
+                    if this.suppress_backend_entity {
+                        continue;
+                    }
+                    return Poll::Ready(Some(Ok(Frame::data(
+                        crate::plugins::grpc_web::encode_streaming_data(data, this.text_mode),
+                    ))));
+                }
+                Poll::Ready(Some(Ok(frame))) if frame.is_trailers() => {
+                    let trailers = match frame.into_trailers() {
+                        Ok(trailers) => trailers,
+                        Err(_) => {
+                            this.failed = true;
+                            return Poll::Ready(Some(Err(Box::new(std::io::Error::other(
+                                "gRPC-Web streaming adapter received an invalid trailer frame",
+                            )))));
+                        }
+                    };
+                    let mut collected = std::collections::HashMap::new();
+                    super::grpc_proxy::collect_buffered_grpc_trailers(&trailers, &mut collected);
+                    return Poll::Ready(Some(Ok(this.terminal_data(collected))));
+                }
+                Poll::Ready(Some(Ok(_))) => {
+                    this.failed = true;
+                    return Poll::Ready(Some(Err(Box::new(std::io::Error::other(
+                        "gRPC-Web streaming adapter received an unsupported frame",
+                    )))));
+                }
+                Poll::Ready(None) => {
+                    let trailers = this.initial_terminal_metadata.take().unwrap_or_default();
+                    return Poll::Ready(Some(Ok(this.terminal_data(trailers))));
+                }
             }
         }
     }
@@ -712,11 +730,14 @@ impl ProxyBody {
     /// to the returned outer body, where the body-framed terminal status can
     /// classify synthesized missing-trailer errors and encoded deadlines while
     /// text expansion and terminal DATA bytes are counted exactly once.
+    /// `suppress_backend_entity` drops a non-gRPC HTTP error entity instead of
+    /// framing it; see [`GrpcWebStreamingBody::suppress_backend_entity`].
     pub(crate) fn into_grpc_web_streaming(
         self,
         content_type: &str,
         http_status: u16,
         initial_terminal_metadata: Option<std::collections::HashMap<String, String>>,
+        suppress_backend_entity: bool,
     ) -> Self {
         let mut inner = self;
         let client_grpc_deadline_fired = inner.client_grpc_deadline_fired.clone();
@@ -734,6 +755,7 @@ impl ProxyBody {
             terminal_status: Arc::clone(&terminal_status),
             terminal_emitted: false,
             failed: false,
+            suppress_backend_entity,
         };
         let mut body = Self::streaming(Box::pin(adapter));
         body._backend_admission_permits = backend_admission_permits;
@@ -1059,6 +1081,10 @@ impl ProxyBody {
     /// `closer` is `None` for frontends that own their own downstream writes and
     /// already bound every one of them (the native HTTP/3 relays), where a
     /// transport close would be both unnecessary and wrong.
+    ///
+    /// A body that is already at end of stream, under a bound that has not yet
+    /// elapsed, is returned untouched — see the comment in the body for why the
+    /// wrapper must not change a complete response's framing.
     pub(crate) fn with_authorization_deadline(
         mut self,
         deadline: crate::proxy::auth_lifetime::StreamAuthDeadline,
@@ -1067,6 +1093,26 @@ impl ProxyBody {
         auth_latch: Option<crate::proxy::auth_lifetime::StreamAuthTerminationLatch>,
         closer: Option<crate::proxy::auth_lifetime::AuthorizationConnectionCloser>,
     ) -> Self {
+        // A response that is ALREADY complete carries no remaining frame for
+        // this bound to protect, and wrapping it would change its FRAMING: the
+        // pump-backed `AuthorizationCancellableBody` reports
+        // `is_end_stream() == false` until it has delivered a terminal, so a
+        // transport that reads the predicate before writing the head drops
+        // `END_STREAM` from the initial HEADERS and appends an empty DATA frame
+        // instead. That turns a backend's Trailers-Only gRPC answer — HEADERS
+        // with `grpc-status` and END_STREAM, no body at all — into a two-frame
+        // response. The request-upload seam declines for exactly this reason;
+        // see `UploadSource::install_pump`.
+        //
+        // Narrowed to a bound that has NOT already elapsed: an elapsed one
+        // replaces the upstream's answer with the gateway's own terminal, so
+        // the upstream's framing is not the thing being written.
+        if http_body::Body::is_end_stream(&self) {
+            let expired = crate::proxy::auth_lifetime::expired_authorization(Some(deadline));
+            if expired.is_none() {
+                return self;
+            }
+        }
         let terminal = DeadlineTerminal {
             grpc_status_header: AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER,
             grpc_message_header: deadline.termination.grpc_message(),
