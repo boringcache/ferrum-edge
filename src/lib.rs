@@ -801,6 +801,19 @@ pub mod _test_support {
         ctx.set_request_headers_to_redact(Arc::new(headers));
     }
 
+    /// Model proxy core's typed backend-dispatch provenance for direct plugin
+    /// lifecycle tests that never enter an HTTP dispatch path. `error_class:
+    /// None` records an authoritative backend response; a class with
+    /// `request_on_wire: false` records a pre-wire refusal, and with `true` an
+    /// ambiguous post-wire failure.
+    pub fn record_backend_dispatch_outcome_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        error_class: Option<crate::retry::ErrorClass>,
+        request_on_wire: bool,
+    ) {
+        ctx.record_backend_dispatch_outcome(error_class, request_on_wire);
+    }
+
     /// Model the transport-owned empty-body proof for direct plugin lifecycle
     /// tests that do not enter through an HTTP proxy body-drain path.
     pub fn set_replay_request_body_empty_proven_for_test(
