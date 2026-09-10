@@ -624,6 +624,53 @@ fn validate_redis_url(raw_url: &str) -> Result<(), String> {
                 .to_string(),
         );
     }
+    validate_redis_database_selector(&parsed)?;
+    Ok(())
+}
+
+/// Largest database index any Redis-family server can name.
+///
+/// The server's `databases` setting is a C `int` and `SELECT` refuses
+/// `id >= server.dbnum`, so nothing above this bound can ever address a
+/// database. A selector inside the bound may still exceed a particular
+/// server's configured `databases` count; only the server can decide that, and
+/// it does so on the `SELECT` issued during the connection handshake.
+const MAX_REDIS_DATABASE_INDEX: i64 = i32::MAX as i64;
+
+/// Validate the URL path as a Redis database selector at plugin admission.
+///
+/// redis-rs derives the database from `url.path().trim_matches('/')` and fails
+/// with `Invalid database number` when it is not an integer — but only at
+/// *client construction*, which every Redis-backed plugin defers to first use.
+/// An unconstructible selector therefore passed `validate`, left the gateway
+/// unready, and turned every otherwise-correct request into a fail-closed
+/// refusal with no diagnostic naming the field. Every consumer of
+/// [`RedisConfig::from_plugin_config`] reaches this check, so the
+/// misconfiguration is now an admission error instead.
+///
+/// Never echoes the value: `redis_url` may carry userinfo credentials.
+fn validate_redis_database_selector(url: &Url) -> Result<(), String> {
+    let selector = url.path().trim_matches('/');
+    if selector.is_empty() {
+        return Ok(());
+    }
+    if selector.contains('/') {
+        return Err(
+            "redis rate limiter: 'redis_url' path must be a single database number \
+             (for example '/0')"
+                .to_string(),
+        );
+    }
+    let database = selector.parse::<i64>().map_err(|_| {
+        "redis rate limiter: 'redis_url' path must be a database number (for example '/0')"
+            .to_string()
+    })?;
+    if !(0..=MAX_REDIS_DATABASE_INDEX).contains(&database) {
+        return Err(format!(
+            "redis rate limiter: 'redis_url' database number must be between 0 and \
+             {MAX_REDIS_DATABASE_INDEX}"
+        ));
+    }
     Ok(())
 }
 
@@ -1031,18 +1078,30 @@ async fn ping_connection(
     }
 }
 
-/// Recovery-probe connection config: Ferrum's connect timeout, without
-/// redis-rs' default 500ms command response timeout.
+/// Screening connection config: Ferrum's connect timeout, without redis-rs'
+/// default 500ms command response timeout.
 ///
 /// `PING` / `INFO` replies are bounded by the caller's `tokio::time::timeout`
 /// so a silent backend is classified against the admitted connect-timeout
-/// bound rather than the crate's shorter command cap. Pooled command paths
-/// keep `async_connection_config`.
-fn recovery_async_connection_config(connect_timeout: Duration) -> redis::AsyncConnectionConfig {
+/// bound rather than the crate's shorter command cap. Used by the recovery
+/// checker *and* by the pooled/dedicated connect paths, whose `INFO` screens
+/// carry the same admitted deadline; those paths arm the ordinary per-command
+/// response bound afterwards through [`RedisRateLimitClient::screen_and_arm`].
+fn screened_async_connection_config(connect_timeout: Duration) -> redis::AsyncConnectionConfig {
     redis::AsyncConnectionConfig::new()
         .set_connection_timeout(Some(connect_timeout))
         .set_response_timeout(None)
 }
+
+/// Per-command response deadline installed on pooled and dedicated connections
+/// once they are screened.
+///
+/// This is redis-rs' own default (`DEFAULT_RESPONSE_TIMEOUT`), retained
+/// explicitly rather than inherited: the connection is established with the
+/// inner cap disabled so the `INFO CLUSTER` / memory screens are bounded by the
+/// configured `redis_connect_timeout_seconds`, and ordinary command execution
+/// must still be bounded afterwards.
+const SCREENED_COMMAND_RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Ask a freshly established connection whether it belongs to a Cluster-mode
 /// server, under a hard `probe_timeout` deadline.
@@ -2590,7 +2649,7 @@ impl RedisRateLimitClient {
             Err(_) => return false,
         };
         let connect_timeout = self.connect_timeout();
-        let async_config = recovery_async_connection_config(connect_timeout);
+        let async_config = screened_async_connection_config(connect_timeout);
         let mut conn = match tokio::time::timeout(
             connect_timeout,
             client.get_multiplexed_async_connection_with_config(&async_config),
@@ -2653,15 +2712,22 @@ impl RedisRateLimitClient {
         Duration::from_secs(self.config.connect_timeout_seconds)
     }
 
-    /// redis-rs async connection config carrying Ferrum's connection-attempt timeout.
+    /// redis-rs async connection config carrying Ferrum's connection-attempt
+    /// timeout, with the crate's 500ms command response cap disabled.
     ///
-    /// The crate default is one second; without this, outer `tokio::time::timeout`
-    /// wrappers cannot extend attempts past that inner cap. Used by pooled and
-    /// dedicated connect paths. Recovery probes use
-    /// [`recovery_async_connection_config`] so redis-rs' 500ms command response
-    /// timeout cannot preempt the admitted PING/INFO bound.
+    /// The crate connect default is one second; without this, outer
+    /// `tokio::time::timeout` wrappers cannot extend attempts past that inner
+    /// cap. The response cap is disabled for the same reason the recovery probe
+    /// disables it: the very first commands on a new pooled or dedicated
+    /// connection are the `INFO CLUSTER` / memory screens, which the operator
+    /// bounded with `redis_connect_timeout_seconds`. A healthy server that
+    /// answers `INFO` in 750ms must fit a configured 2s screen instead of being
+    /// refused after 500ms and re-refused on every subsequent connection.
+    /// [`Self::screen_and_arm`] installs
+    /// [`SCREENED_COMMAND_RESPONSE_TIMEOUT`] before the connection can carry a
+    /// policy command, so ordinary execution stays bounded.
     fn async_connection_config(&self) -> redis::AsyncConnectionConfig {
-        redis::AsyncConnectionConfig::new().set_connection_timeout(Some(self.connect_timeout()))
+        screened_async_connection_config(self.connect_timeout())
     }
 
     /// Establish a non-reconnecting multiplexed connection with Ferrum's timeout
@@ -2771,7 +2837,7 @@ impl RedisRateLimitClient {
                 // no-eviction memory policy) before the connection is published
                 // to the hot path: a Cluster endpoint or an evicting Redis must
                 // never serve a policy operation.
-                if !self.screen_established_connection(&mut conn).await {
+                if !self.screen_and_arm(&mut conn).await {
                     return None;
                 }
                 // Re-check at the publication boundary: another task may have
@@ -2876,7 +2942,7 @@ impl RedisRateLimitClient {
             Ok(mut conn) => {
                 // Screen topology (and replay no-eviction policy) before any
                 // WATCH/MULTI sequence runs on it.
-                if !self.screen_established_connection(&mut conn).await {
+                if !self.screen_and_arm(&mut conn).await {
                     return None;
                 }
                 // Same publication boundary as the pooled path: a concurrent
@@ -3116,6 +3182,24 @@ impl RedisRateLimitClient {
         self.screen_topology(conn).await && self.screen_memory_policy(conn).await
     }
 
+    /// Screen a freshly established connection and, when it is usable, install
+    /// the ordinary per-command response deadline.
+    ///
+    /// The connection was dialled with redis-rs' inner response cap disabled so
+    /// the screens above are bounded by the admitted
+    /// `redis_connect_timeout_seconds` (see [`Self::async_connection_config`]).
+    /// Arming here — before the socket is published to a pool slot or handed to
+    /// a `WATCH`/`MULTI` sequence, and before it is cloned — restores a bounded
+    /// command deadline for every policy operation that follows. A connection
+    /// that fails the screen is dropped, so it is never armed.
+    async fn screen_and_arm(&self, conn: &mut redis::aio::MultiplexedConnection) -> bool {
+        if !self.screen_established_connection(conn).await {
+            return false;
+        }
+        conn.set_response_timeout(SCREENED_COMMAND_RESPONSE_TIMEOUT);
+        true
+    }
+
     /// Start a background task that periodically probes Redis to detect recovery.
     ///
     /// The task is aborted when this client is dropped so retired plugin
@@ -3220,7 +3304,7 @@ impl RedisRateLimitClient {
                         config.username.as_deref(),
                         config.password.as_deref(),
                     )?;
-                    let async_config = recovery_async_connection_config(connect_timeout);
+                    let async_config = screened_async_connection_config(connect_timeout);
                     let mut conn = match tokio::time::timeout(
                         connect_timeout,
                         client.get_multiplexed_async_connection_with_config(&async_config),
