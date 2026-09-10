@@ -257,7 +257,7 @@ async fn monitor_mode_never_closes_a_session() {
 
 #[tokio::test]
 async fn log_to_stdout_monitor_mode_logs_monitored_effective_action() {
-    let (logs, guard) = crate::unit::plugins::plugin_utils::capture_logs();
+    let (logs, guard) = crate::unit::plugins::plugin_utils::capture_debug_logs();
     let mut config = enforcing_request_rule();
     config["mode"] = json!("monitor");
     config["log_to_stdout"] = json!(true);
@@ -270,20 +270,22 @@ async fn log_to_stdout_monitor_mode_logs_monitored_effective_action() {
 
     assert_eq!(outgoing, original);
     let captured = logs.contents();
+    let hit = captured
+        .lines()
+        .find(|line| {
+            line.contains("DEBUG") && line.contains("WAF rule matched on a WebSocket message")
+        })
+        .expect("each WebSocket rule hit retains its debug diagnostic");
     assert!(
-        captured.contains("WAF rule matched on a WebSocket message"),
-        "expected per-message warning: {captured}"
-    );
-    assert!(
-        captured.contains("action=monitored"),
+        hit.contains("action=monitored"),
         "monitor-mode hit must log monitored effective action: {captured}"
     );
     assert!(
-        captured.contains("rule_action=enforce"),
+        hit.contains("rule_action=enforce"),
         "configured enforce action must remain visible: {captured}"
     );
     assert!(
-        !captured
+        !hit
             .split_whitespace()
             .any(|field| field.trim_end_matches(',') == "action=block"),
         "must not log the legacy exact action=block field: {captured}"
@@ -292,7 +294,7 @@ async fn log_to_stdout_monitor_mode_logs_monitored_effective_action() {
 
 #[tokio::test]
 async fn log_to_stdout_enforce_mode_logs_blocked_effective_action() {
-    let (logs, guard) = crate::unit::plugins::plugin_utils::capture_logs();
+    let (logs, guard) = crate::unit::plugins::plugin_utils::capture_debug_logs();
     let mut config = enforcing_request_rule();
     config["log_to_stdout"] = json!(true);
     let plugins = vec![waf(config)];
@@ -304,16 +306,18 @@ async fn log_to_stdout_enforce_mode_logs_blocked_effective_action() {
 
     assert_policy_close(&outgoing);
     let captured = logs.contents();
+    let hit = captured
+        .lines()
+        .find(|line| {
+            line.contains("DEBUG") && line.contains("WAF rule matched on a WebSocket message")
+        })
+        .expect("each WebSocket rule hit retains its debug diagnostic");
     assert!(
-        captured.contains("WAF rule matched on a WebSocket message"),
-        "expected per-message warning: {captured}"
-    );
-    assert!(
-        captured.contains("action=blocked"),
+        hit.contains("action=blocked"),
         "enforce-mode hit must log blocked effective action: {captured}"
     );
     assert!(
-        captured.contains("rule_action=enforce"),
+        hit.contains("rule_action=enforce"),
         "configured enforce action must remain visible: {captured}"
     );
 }

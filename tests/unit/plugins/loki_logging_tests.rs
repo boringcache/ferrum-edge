@@ -15,11 +15,10 @@ use ferrum_edge::plugins::{
     },
 };
 use serde_json::json;
-use std::io::{self, Read};
+use std::io::Read;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tracing_subscriber::fmt::MakeWriter;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -30,42 +29,6 @@ use super::plugin_utils::{
 
 fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
-}
-
-#[derive(Clone, Default)]
-struct SharedWriter {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
-
-impl SharedWriter {
-    fn contents(&self) -> String {
-        String::from_utf8(self.buffer.lock().unwrap().clone()).unwrap_or_default()
-    }
-}
-
-struct SharedGuard {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
-
-impl io::Write for SharedGuard {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buffer.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for SharedWriter {
-    type Writer = SharedGuard;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        SharedGuard {
-            buffer: Arc::clone(&self.buffer),
-        }
-    }
 }
 
 fn delivery_config(endpoint_url: String) -> serde_json::Value {
@@ -604,14 +567,7 @@ async fn test_loki_stream_disconnects_keep_source_time_in_line_and_emit_in_queue
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_loki_status_260_is_terminal_and_diagnostics_are_redacted() {
-    let writer = SharedWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_target(false)
-        .without_time()
-        .with_writer(writer.clone())
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
+    let (writer, guard) = super::plugin_utils::capture_debug_logs();
 
     let server = MockServer::start().await;
     let response_secret = "blocked-body-secret-canary";
@@ -661,7 +617,14 @@ async fn test_loki_status_260_is_terminal_and_diagnostics_are_redacted() {
     drop(guard);
 
     let logs = writer.contents();
-    assert!(logs.contains("status 260"));
+    let terminal = logs
+        .lines()
+        .find(|line| {
+            line.contains("DEBUG")
+                && line.contains("Loki logging: batch discarded after terminal delivery failure")
+        })
+        .expect("each terminal failure retains its debug diagnostic");
+    assert!(terminal.contains("status 260"), "{logs}");
     for secret in [
         response_secret,
         "private-path-secret",
@@ -708,14 +671,7 @@ async fn test_loki_retries_408_429_and_5xx() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_loki_accepts_empty_200_but_rejects_nonempty_200_without_retry() {
-    let writer = SharedWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_target(false)
-        .without_time()
-        .with_writer(writer.clone())
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
+    let (writer, guard) = super::plugin_utils::capture_debug_logs();
 
     let server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -758,12 +714,16 @@ async fn test_loki_accepts_empty_200_but_rejects_nonempty_200_without_retry() {
     drop(guard);
 
     let logs = writer.contents();
-    assert!(logs.contains("unexpected non-empty response"));
+    let terminals: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("DEBUG") && line.contains("returned status 200"))
+        .collect();
     assert_eq!(
-        logs.matches("returned status 200").count(),
+        terminals.len(),
         1,
         "the empty 200 must be delivered while the non-empty 200 is terminal: {logs}"
     );
+    assert!(terminals[0].contains("unexpected non-empty response"));
 }
 
 #[tokio::test]

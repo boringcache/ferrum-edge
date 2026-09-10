@@ -5803,13 +5803,7 @@ async fn excessive_embedding_dimensions_and_response_bytes_fail_closed() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn detect_mode_logs_sanitized_provider_failure_once_per_response() {
-    let writer = SharedWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .without_time()
-        .with_writer(writer.clone())
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
+    let (writer, guard) = super::plugin_utils::capture_debug_logs();
 
     let config = json!({
         "inspect": {"request": false, "response": true},
@@ -5856,14 +5850,23 @@ async fn detect_mode_logs_sanitized_provider_failure_once_per_response() {
     drop(guard);
 
     let logs = writer.contents();
+    // Count per-event DEBUG records; WARN is shared and sampled across responses.
+    let failures: Vec<_> = logs
+        .lines()
+        .filter(|line| {
+            line.contains("DEBUG")
+                && line.contains("streaming detect: embedding provider evaluation failed")
+        })
+        .collect();
     assert_eq!(
-        logs.matches("streaming detect: embedding provider evaluation failed")
-            .count(),
+        failures.len(),
         1,
         "provider failures must be bounded once per response: {logs}"
     );
-    assert!(logs.contains("enforcement=\"detect\""));
-    assert!(logs.contains("provider_error=\"embedding request failed\""));
+    assert!(failures[0].contains("enforcement=\"detect\""));
+    assert!(
+        failures[0].contains("provider_error=\"embedding request failed\"")
+    );
     assert!(!logs.contains("/private/secret/embeddings"));
 }
 
@@ -5876,13 +5879,7 @@ async fn detect_mode_sanitizes_malformed_provider_response() {
         .mount(&server)
         .await;
 
-    let writer = SharedWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .without_time()
-        .with_writer(writer.clone())
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
+    let (writer, guard) = super::plugin_utils::capture_debug_logs();
     let config = json!({
         "inspect": {"request": false, "response": true},
         "streaming_response": "inspect",
@@ -5917,7 +5914,16 @@ async fn detect_mode_sanitizes_malformed_provider_response() {
     }
     drop(guard);
     let logs = writer.contents();
-    assert!(logs.contains("provider_error=\"embedding response parse failed\""));
+    let failure = logs
+        .lines()
+        .find(|line| {
+            line.contains("DEBUG")
+                && line.contains("streaming detect: embedding provider evaluation failed")
+        })
+        .expect("each provider failure retains its debug diagnostic");
+    assert!(
+        failure.contains("provider_error=\"embedding response parse failed\"")
+    );
     assert!(!logs.contains("provider raw secret payload"));
 }
 

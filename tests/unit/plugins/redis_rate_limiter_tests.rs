@@ -3525,12 +3525,13 @@ fn mask_source(source: &str) -> MaskedSource {
     }
 }
 
-/// Macro names whose arguments become log records.
-const TRACING_MACROS: [&str; 12] = [
+/// Macro names whose arguments become log records, including sampled wrappers.
+const TRACING_MACROS: [&str; 13] = [
     "trace",
     "debug",
     "info",
     "warn",
+    "warn_sampled",
     "error",
     "event",
     "span",
@@ -3873,6 +3874,10 @@ fn identity_log_guard_catches_arbitrary_field_names_and_render_forms() {
         r#"fn f() { debug!("window for {key} tripped"); }"#,
         // Path-qualified macro.
         r#"fn f() { tracing::warn!(field = %total_key, "x"); }"#,
+        // Sampling wrappers retain the same recorded-value boundary.
+        r#"fn f() { warn_sampled!(anything_at_all = %key, "denied"); }"#,
+        r#"fn f() { warn_sampled!(?redis_key, "denied"); }"#,
+        r#"fn f() { crate::warn_sampled!("window for {key} tripped"); }"#,
         // Identity values that do not spell "key".
         r#"fn f() { warn!(who = %authenticated_identity, "x"); }"#,
     ];
@@ -3886,6 +3891,7 @@ fn identity_log_guard_catches_arbitrary_field_names_and_render_forms() {
     let allowed = [
         // Documented non-identity operator config.
         r#"fn f() { warn!(key_prefix = %self.config.key_prefix, "x"); }"#,
+        r#"fn f() { warn_sampled!(key_prefix = %self.config.key_prefix, "x"); }"#,
         // Ordinary bindings and non-tracing macros are not log records.
         r#"fn f() { let previous_key = b(); assert!(!previous_key.is_empty()); }"#,
         r#"fn f() { panic!("{previous_key}"); }"#,
