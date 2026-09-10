@@ -2906,6 +2906,37 @@ pub struct RequestContext {
     /// under the public name only when the final wire name exactly matches
     /// this trusted upstream alias.
     pub(crate) mcp_trusted_tool_name_rewrite: Option<(String, String)>,
+    /// Identity of the `mcp_gateway` instance that admitted this request in
+    /// `before_proxy`, and therefore the only instance whose response-phase
+    /// policies may act on it.
+    ///
+    /// Admission deliberately permits several `mcp_gateway` instances on one
+    /// proxy with disjoint `endpoint.path` scopes, but every configured
+    /// instance is invoked on EVERY response phase of every request. Without a
+    /// positive owner the private claims below read as "some mcp_gateway set
+    /// this", and a sibling — including one whose inner `config.enabled` is
+    /// `false` — would consume another instance's validator and apply its own
+    /// `validation.max_upstream_response_bytes` to traffic it never routed.
+    ///
+    /// The owner is recorded rather than re-derived from `ctx.path` because a
+    /// route rewrite can rebase that path before the response phases run;
+    /// re-deriving would silently DISABLE the owner's own fail-closed result
+    /// enforcement. Private for the same reason as the claims it guards: a
+    /// forgeable `mcp.*` metadata key must not be able to transfer ownership.
+    pub(crate) mcp_owner_instance: Option<u64>,
+    /// The exact JSON-RPC `id` wire token of the singleton MCP request this
+    /// context admitted, retained so a gateway-authored terminal answer can
+    /// name the call the client is still waiting on.
+    ///
+    /// Response-phase refusals (result validation, an unusable upstream
+    /// representation) are authored after the request body is gone, and an
+    /// error carrying `id: null` never resolves a pending call. Bounded at
+    /// admission by the same reflected-id byte limit the request path uses, so
+    /// retaining it cannot become an unbounded per-request allocation. Batch
+    /// bodies and genuinely unidentified requests leave this `None` and stay
+    /// eligible for `id: null`. Private so no forged key can redirect a
+    /// refusal onto another request's id.
+    pub(crate) mcp_request_json_rpc_id: Option<String>,
     /// When set, `mcp_gateway` must validate the buffered `tools/call` result
     /// against this exact compiled `outputSchema` validator before any
     /// caller-visible response or audit publication. The `Arc` is pinned from
@@ -3540,6 +3571,8 @@ impl RequestContext {
             a2a_gateway_grpc_card_rewrite: None,
             mcp_response_resource_binding: None,
             mcp_trusted_tool_name_rewrite: None,
+            mcp_owner_instance: None,
+            mcp_request_json_rpc_id: None,
             mcp_validate_tool_result: None,
             mcp_batch_forbids_upstream: false,
             mcp_aggregate_sse: None,
@@ -4844,6 +4877,8 @@ impl RequestContext {
             a2a_gateway_grpc_card_rewrite: None,
             mcp_response_resource_binding: self.mcp_response_resource_binding.clone(),
             mcp_trusted_tool_name_rewrite: self.mcp_trusted_tool_name_rewrite.clone(),
+            mcp_owner_instance: self.mcp_owner_instance,
+            mcp_request_json_rpc_id: self.mcp_request_json_rpc_id.clone(),
             mcp_validate_tool_result: self.mcp_validate_tool_result.clone(),
             mcp_batch_forbids_upstream: self.mcp_batch_forbids_upstream,
             // A hook-context copy is never a transport, so it has no business
