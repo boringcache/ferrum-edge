@@ -273,6 +273,96 @@ fn transaction_log_schema_closed_object_keys_match_openapi() {
 }
 
 #[test]
+fn transaction_log_schema_openapi_matches_constructor_admission() {
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    // Issue #5168: the document admitted schema shapes the constructor
+    // rejects — empty names, empty list entries / rename targets / derived
+    // names / static keys, null static values, duplicate `order` entries, and
+    // control characters in a metadata prefix — so schema-driven tooling
+    // approved configurations that fail at load. Both surfaces must agree.
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/TransactionLogSchemaConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("TransactionLogSchemaConfig schema compiles");
+
+    for config in [
+        json!({ "schemas": {} }),
+        json!({ "schemas": { "": {} } }),
+        json!({ "schemas": { "basic": { "omit": [""] } } }),
+        json!({ "schemas": { "basic": { "rename": { "proxy_id": "" } } } }),
+        json!({ "schemas": { "basic": { "rename": { "": "route_id" } } } }),
+        json!({ "schemas": { "basic": { "order": ["*", "*"] } } }),
+        json!({ "schemas": { "basic": { "static_fields": { "stamp": null } } } }),
+        json!({ "schemas": { "basic": { "static_fields": { "": "v1" } } } }),
+        json!({
+            "schemas": { "basic": { "derived_fields": [{ "name": "", "kind": "outcome" }] } }
+        }),
+        json!({
+            "schemas": { "basic": { "metadata": { "mode": "flatten", "prefix": "bad\u{1}" } } }
+        }),
+        json!({ "schemas": { "basic": { "metadata": { "mode": "nested", "prefix": 3 } } } }),
+        json!({
+            "schemas": { "basic": { "metadata": { "mode": "omit", "on_collision": "bad" } } }
+        }),
+    ] {
+        let documented = validator.validate(&config);
+        let runtime = validate_plugin_config("transaction_log_schema", &config);
+        assert!(documented.is_err(), "schema should reject: {config}");
+        assert!(runtime.is_err(), "runtime should reject: {config}");
+    }
+
+    for config in [
+        json!({ "schemas": { "basic": {} } }),
+        json!({
+            "schemas": {
+                "basic": {
+                    "summary_type": "http",
+                    "omit": ["request_user_agent"],
+                    "rename": { "proxy_id": "route_id" },
+                    "order": ["route_id", "*"],
+                    "static_fields": { "env": "production" },
+                    "derived_fields": [{ "name": "outcome", "kind": "outcome" }],
+                    "metadata": { "mode": "flatten", "prefix": "meta_" },
+                    "timestamp_format": "epoch_ms"
+                }
+            }
+        }),
+    ] {
+        let documented = validator.validate(&config);
+        let runtime = validate_plugin_config("transaction_log_schema", &config);
+        assert!(documented.is_ok(), "schema should accept: {config}");
+        assert!(runtime.is_ok(), "runtime should accept: {config}");
+    }
+
+    // Non-global scope is rejected by the admin write path, so the
+    // `PluginConfig` branch must not admit it either.
+    let plugin_branch = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/PluginConfig",
+        "components": spec["components"].clone()
+    });
+    let plugin_validator = jsonschema::draft202012::options()
+        .build(&plugin_branch)
+        .expect("PluginConfig schema compiles");
+    let mut plugin = json!({
+        "plugin_name": "transaction_log_schema",
+        "scope": "global",
+        "enabled": true,
+        "config": { "schemas": { "basic": {} } }
+    });
+    assert!(plugin_validator.validate(&plugin).is_ok());
+    plugin["scope"] = json!("proxy_group");
+    assert!(plugin_validator.validate(&plugin).is_err());
+}
+
+#[test]
 fn typed_component_properties_match_serde_field_inventories() {
     use ferrum_edge::config::types::{
         ActiveHealthCheck, BackendTlsConfig, CircuitBreakerConfig, ConsulConfig, Consumer,

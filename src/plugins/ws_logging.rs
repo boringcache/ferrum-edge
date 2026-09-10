@@ -33,7 +33,7 @@
 use async_trait::async_trait;
 use futures_util::SinkExt;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -48,8 +48,8 @@ use super::utils::log_schema::view::{
     MetadataNested, emit_timestamp, extract_host_from_url, serialize_schema_metadata,
 };
 use super::utils::log_schema::{
-    DerivedKind, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView, SummarySchema,
-    TimestampFormat, resolve_schema,
+    DerivedKind, EmittedKeys, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView,
+    SummarySchema, TimestampFormat, resolve_schema,
 };
 use super::utils::sink_loss::{self, SinkLossReason};
 use super::utils::{
@@ -261,7 +261,7 @@ impl SchemaSerializable for WsDisconnectLogEntry<'_> {
     fn serialize_metadata<S>(
         &self,
         policy: &MetadataPolicy,
-        emitted: &mut HashSet<String>,
+        emitted: &EmittedKeys<'_>,
         map: &mut S,
     ) -> Result<(), S::Error>
     where

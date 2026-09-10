@@ -363,6 +363,61 @@ framing.
 > `transaction_debugger` accept the same contract against their own
 > record families.
 
+### `transaction_log_schema`
+
+Config-only plugin that registers **named** output schemas in a process-global
+registry so any number of logging plugins can share one definition through
+`schema_ref: <name>` instead of repeating an inline `schema:` block. It has no
+lifecycle hooks and never touches a request: the plugin cache compiles and
+stages its definitions, then discards the instance rather than adding it to any
+runtime hook or protocol list, so a schema-only configuration leaves the
+no-plugin transaction-summary fast path intact.
+
+**Priority:** 9999
+**Scope:** `global` only — schemas are process-global. `scope: proxy` and
+`scope: proxy_group` are rejected by the admin write path with a `400` and by
+the runtime rejecting contract, so an admitted write can never be refused by a
+later full-config load.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `schemas` | Object | *(required)* | Map of schema name → schema definition. Must contain at least one entry; names must be non-empty and unique across every enabled `transaction_log_schema` in the namespace. Each value is the same schema object accepted by a logging plugin's inline `schema:` — see **[docs/log_schema.md](log_schema.md)** for the field reference (`summary_type`, `omit`, `rename`, `order`, `static_fields`, `derived_fields`, `metadata`, `timestamp_format`). |
+
+Unknown outer config keys and unknown nested fixed-shape keys (schema,
+`derived_fields` entry, `metadata` policy) are rejected with their full path.
+Named definitions compile under the base field family, so WebSocket-disconnect
+field names stay rejected in a portable definition; `ws_logging` recompiles a
+referenced schema under its own capability at resolve time.
+
+Loaders sort `transaction_log_schema` ahead of every other plugin, so a
+`schema_ref` always resolves regardless of declaration order. The registry is
+replaced wholesale on each config reload — renamed or removed schemas do not
+leak — and admin create/update/delete, batch, and restore validate the complete
+prospective namespace graph (definitions staged before referrers) without
+touching the live registry. A `schema_ref` naming a schema absent from the
+prospective namespace is rejected.
+
+```yaml
+plugin_name: transaction_log_schema
+scope: global
+config:
+  schemas:
+    splunk_cim:
+      summary_type: both
+      rename: { proxy_id: route_id }
+      metadata: { mode: flatten, prefix: "fields." }
+    datadog:
+      summary_type: http
+      static_fields: { source: ferrum-edge }
+```
+
+```yaml
+plugin_name: stdout_logging
+scope: global
+config:
+  schema_ref: splunk_cim
+```
+
 ### `stdout_logging`
 
 Writes one JSON transaction (or stream) summary per line to stdout for each request. Output goes through the same bounded non-blocking writer as runtime stdout events, so logging never waits for stdout on request-processing threads. Capacity is reserved before JSON serialization; saturation and oversize records are dropped with monotonic telemetry. It is emitted independent of `FERRUM_LOG_LEVEL` — enabling the plugin is the on/off switch.
@@ -1071,6 +1126,8 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 | `body_completed` | bool | `true` when the final body frame flushed to the client; `false` if streaming aborted before completion. Always `true` for buffered responses |
 | `bytes_sent` | u64 | Bytes the gateway **relayed from the client to the backend** (request body size). Same JSON key as `StreamTransactionSummary.bytes_sent`. Omitted from JSON when zero (empty / `GET` / `HEAD`) |
 | `bytes_received` | u64 | Bytes the gateway **relayed from the backend to the client** (response body size, unified buffered + streaming counter). Same JSON key as `StreamTransactionSummary.bytes_received`. May be less than the backend's advertised `Content-Length` when streaming was interrupted. Omitted from JSON when zero |
+| `grpc_request_messages` | u64 | Complete length-prefixed gRPC request messages observed for this transaction. Omitted from JSON when zero (non-gRPC traffic) |
+| `grpc_response_messages` | u64 | Complete length-prefixed gRPC response messages observed for this transaction. Omitted from JSON when zero (non-gRPC traffic) |
 | `mirror` | bool | Present and `true` when this entry is a mirror (shadow) request rather than the client-facing transaction. Shadow summaries remain available to logging/observability plugins; `api_chargeback` and `api_chargeback_sink` never treat them as consumer-billable |
 | `metadata` | Object | Plugin-injected key-value pairs (correlation ID, trace ID, etc.) |
 
@@ -1079,7 +1136,7 @@ and any `metadata.mirror_error`; their standard `backend_target` field contains
 the query-stripped mirror URL. Several shadow destinations therefore remain
 independently attributable without logging request credentials.
 
-**Notes on conditional fields:** `auth_method`, `grpc_status`, `response_streamed`, `client_disconnected`, `backend_resolved_ip`, `error_class`, and `body_error_class` are omitted from the JSON output when not applicable/false/null to keep log entries compact.
+**Notes on conditional fields:** `auth_method`, `grpc_status`, `grpc_request_messages`, `grpc_response_messages`, `response_streamed`, `client_disconnected`, `backend_resolved_ip`, `error_class`, and `body_error_class` are omitted from the JSON output when not applicable/false/null/zero to keep log entries compact. A configured `schema:` / `schema_ref:` preserves each of those guards, so a projected line matches the native one field for field.
 
 **`error_class` vs `body_error_class`:** `error_class` covers failures before or during the response header exchange (connect, TLS, DNS, pool, pre-header timeouts). `body_error_class` covers failures observed while streaming the response body after headers were sent. A transaction can have one, the other, both, or neither. For streamed responses, `DeferredTransactionLogger` moves the `log` phase to body-completion so `body_error_class`, `body_completed`, `bytes_received`, and `latency_total_ms` reflect the full client-visible outcome. Gateway processing/overhead stay at the `-1.0` unknown sentinel when `latency_backend_total_ms` is unknown.
 

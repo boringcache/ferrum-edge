@@ -10790,6 +10790,8 @@ components:
           then:
             required: [config]
             properties:
+              scope:
+                const: global
               config:
                 $ref: "#/components/schemas/TransactionLogSchemaConfig"
         - if:
@@ -17431,6 +17433,16 @@ components:
         family cannot express (`summary_type`, `timestamp_format`, `metadata`,
         `order`, or a derived kind with no source field) is rejected at
         construction with a plugin- and field-specific diagnostic.
+        Constraints this document cannot express are still enforced at
+        construction and are NOT relaxations of the runtime contract: `omit` /
+        `rename` / `order` names must resolve against the record family's field
+        inventory for the selected `summary_type`; a field may not be both
+        omitted and renamed; the combined native, static, and derived output
+        keys must be unique; `order` must list every non-extension output key
+        unless it contains `"*"`; and `rename` targets, `static_fields` keys
+        (including nested keys) and `derived_fields` names may not match a
+        sensitive-data substring, while a `static_fields` string value that
+        looks like a literal HTTP auth credential is refused.
         See docs/log_schema.md.
       additionalProperties: false
       properties:
@@ -17444,26 +17456,32 @@ components:
             only customizes types it claims to handle).
         omit:
           type: array
-          items: { type: string }
+          items: { type: string, minLength: 1 }
           description: Native field names to drop from output.
         rename:
           type: object
-          additionalProperties: { type: string }
+          propertyNames: { minLength: 1 }
+          additionalProperties: { type: string, minLength: 1 }
           description: Map of native field name -> output key.
         order:
           type: array
-          items: { type: string }
+          uniqueItems: true
+          items: { type: string, minLength: 1 }
           description: >-
             Explicit output order, by output key. May contain `"*"` once
             as a wildcard for "every unlisted entry in natural order."
-            Without `"*"`, every field must be listed.
+            Without `"*"`, every field must be listed. Entries are unique —
+            a repeated output key (or a second `"*"`) is rejected.
         static_fields:
           type: object
-          additionalProperties: true
+          propertyNames: { minLength: 1 }
+          additionalProperties:
+            not: { type: "null" }
           description: >-
             Literal JSON values injected at top level. Keys / nested
             keys matching sensitive substrings are rejected at
-            compile time.
+            compile time. A `null` value is rejected — use `omit`
+            to drop a field.
         derived_fields:
           type: array
           description: Computed values; emitted alongside native fields.
@@ -17474,6 +17492,7 @@ components:
             properties:
               name:
                 type: string
+                minLength: 1
                 description: Output key for the derived value.
               kind:
                 type: string
@@ -17498,19 +17517,24 @@ components:
               default: nested
             prefix:
               type: string
+              pattern: "^[^\\x00-\\x1F\\x7F-\\x9F]*$"
               description: >-
-                Flatten mode only. Prepended to each metadata key when
-                promoted to top-level (e.g. `"meta_"`). Control
-                characters are rejected.
+                Prepended to each metadata key when promoted to top-level
+                (e.g. `"meta_"`); only `flatten` reads it. Control
+                characters are rejected. The type and the control-character
+                restriction are validated in every mode, so a `nested` or
+                `omit` schema cannot carry a value that would only start
+                failing once the mode is switched to `flatten`.
             on_collision:
               type: string
               enum: [skip, overwrite]
               default: skip
               description: >-
-                Flatten mode only. Behavior when a metadata key collides
-                with an already-emitted field. `skip` keeps the existing
-                value; `overwrite` emits a duplicate JSON key (last
-                value wins per parser convention).
+                Behavior when a metadata key collides with an
+                already-emitted field; only `flatten` reads it. `skip` keeps
+                the existing value; `overwrite` emits a duplicate JSON key
+                (last value wins per parser convention). Validated in every
+                mode, like `prefix`.
         timestamp_format:
           type: string
           enum: [rfc3339, epoch_ms, epoch_s]
@@ -18619,13 +18643,14 @@ components:
         schemas:
           type: object
           minProperties: 1
+          propertyNames: { minLength: 1 }
           additionalProperties:
             $ref: "#/components/schemas/SummaryLogSchema"
           description: >-
-            Map of schema name → schema definition. Names are referenced
-            by other plugins as `schema_ref: <name>`. Duplicate names
-            across multiple enabled `transaction_log_schema` plugins in the
-            same namespace are rejected before persistence or load.
+            Map of schema name → schema definition. Names are non-empty and
+            referenced by other plugins as `schema_ref: <name>`. Duplicate
+            names across multiple enabled `transaction_log_schema` plugins in
+            the same namespace are rejected before persistence or load.
 
     TransactionDebuggerConfig:
       type: object

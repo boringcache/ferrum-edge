@@ -64,8 +64,8 @@ use crate::dns::DnsCacheResolver;
 use crate::observability_delivery::DeliveryWorkerControl;
 use crate::plugins::utils::log_schema::view::status_class;
 use crate::plugins::utils::log_schema::{
-    DerivedKind, FieldSpec, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView,
-    SummarySchema, TimestampFormat, resolve_schema,
+    DerivedKind, EmittedKeys, FieldSpec, MetadataPolicy, SchemaCapabilities, SchemaSerializable,
+    SchemaView, SummarySchema, TimestampFormat, resolve_schema,
 };
 use tokio::sync::mpsc;
 
@@ -1576,7 +1576,7 @@ impl SchemaSerializable for ChargeEvent {
     fn serialize_metadata<S>(
         &self,
         _policy: &MetadataPolicy,
-        _emitted: &mut std::collections::HashSet<String>,
+        _emitted: &EmittedKeys<'_>,
         _map: &mut S,
     ) -> Result<(), S::Error>
     where
