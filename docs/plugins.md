@@ -8481,6 +8481,292 @@ An `upstream_id` destination resolves in the matched proxy's namespace. Scoped p
 
 **Query predicates are fail-closed (advisories GHSA-j2j6-f9c7-hh85, GHSA-gr4p-3qw3-87r5).** `match.query_params` compares against the canonical decoding of the backend-bound query representation available at the dispatch hook, after authentication-owned credential strips and any priority-overridden query transformer that already ran. Selecting a route is a security decision, so a request whose query cannot be decoded to one value is rejected with `400` **before any rule is evaluated**, using the same [classifications](#query-canonicalization-advisories-ghsa-j2j6-f9c7-hh85-ghsa-gr4p-3qw3-87r5) OPA applies: a repeated or percent-encoded duplicate name (`?tenant=victim&tenant=admin`, `?a=1&%61=2`, `?flag&flag=1`), a literal `+`, malformed percent-encoding, or a non-UTF-8 decoding. `%20` and `%2B` are unambiguous. Behavior is identical on HTTP/1.1, HTTP/2, and HTTP/3, because predicates no longer read the protocol-dependent `ctx.query_params` map. A later route/request transform remains an intentional, separately ordered operation. A dispatch config that declares no `query_params` predicate is completely unaffected — no query is decoded and no request is rejected on this path.
 
+#### Standalone configuration
+
+`mesh_route_dispatch` is auto-emitted by the mesh/Istio translators, but it is an
+ordinary operator-configurable plugin: the table below is the complete accepted
+shape, and the constructor is the source of truth for it (`openapi.yaml` →
+`MeshRouteDispatchConfig` mirrors it, with the two runtime-only checks called out
+below). Omitted keys take the listed default; `null` is accepted only where the
+type column says so. Unknown keys are rejected at every level.
+
+**Root**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `rules` | Object[] | — | Required, at least one entry. Ordered; **first match wins** and evaluation stops there |
+| `reject_unmatched` | bool | `false` | `true` answers `404` when no rule matched instead of falling through to the proxy's own backend. The translator sets this; a hand-written soft override normally leaves it `false` |
+
+**`rules[]`**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `match` | Object | `{}` | Predicates, all-of across the fields below. An empty match is rejected **unless** the rule carries a route action (`request_transform`, `response_transform`, `fault`, `rewrite`, `redirect`), which makes it the deliberate action-only catch-all; otherwise it would silently shadow every later rule |
+| `destination` | Object | `{}` | Route override applied on match. At least one field must be set unless the rule carries a `redirect` |
+| `timeout_ms` | u64 \| null | omitted | Route-local backend response/read timeout. `0` means "no timeout". Cannot be combined with `timeout_disabled: true` |
+| `timeout_disabled` | bool | `false` | Clear the selected proxy's inherited backend read timeout for this route (resolves to `0`). Cannot be combined with `timeout_ms` |
+| `retry` | Object \| null | omitted | Route-local retry policy (below). Cannot be combined with `retry_disabled: true` |
+| `retry_disabled` | bool | `false` | Clear the selected proxy's inherited retry policy for this route. Cannot be combined with `retry` |
+| `request_transform` | Object[] | `[]` | Route-level request header transforms (below). Requires an eligible consumer — see [Route transforms need a consumer](#route-transforms-need-a-consumer) |
+| `response_transform` | Object[] | `[]` | Route-level response header transforms. Same shape and same consumer requirement, plus the closed protocol-managed destination set described above |
+| `fault` | Object \| null | omitted | Per-rule delay / abort, applied before any route override |
+| `rewrite` | Object \| null | omitted | Per-rule URI / authority rewrite applied to the backend request |
+| `redirect` | Object \| null | omitted | Per-rule 3xx answer. Highest precedence: the request never reaches a backend, so the rule needs no `destination` |
+
+**`rules[].match`**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `methods` | (String \| Object)[] | `[]` | Any-of. A bare string is an `exact` match; the object form is an Istio `StringMatch` with **exactly one** of `exact` / `prefix` / `regex`. `exact` and `prefix` operands must be non-empty RFC 9110 method tokens — an empty value or one containing a space (`"GET POST"`) is rejected at load, because it could never match. `exact` preserves operator casing (`"get"` matches only `get`); `prefix` is ASCII-uppercased at load; `regex` is compiled verbatim between full-input anchors. Empty array = no method restriction |
+| `headers` | Object | `{}` | All-of, keyed by header name. Names must be RFC 9110 tokens and are ASCII-lowercased at load; duplicates after normalization are rejected. Values take the same bare-string / `StringMatch` shapes as `methods`. An `exact: ""` predicate legitimately means "present and empty"; empty `prefix` / `regex` operands are rejected |
+| `query_params` | Object | `{}` | All-of equality on the canonical decoded query — see the fail-closed contract above |
+| `authority` | String \| Object \| null | omitted | `Host` / `:authority` predicate, bare string or `StringMatch`. Case-sensitive for `exact` / `prefix`, including an explicit request port; write `(?i)` for a case-insensitive `regex`. All operands must be non-empty |
+| `source_namespace` | String \| null | omitted | Source workload namespace, read from the peer SPIFFE ID. Exact and case-sensitive; empty or whitespace-bearing values are rejected. Fails closed (no match) when there is no resolved peer identity |
+| `uri` | Object \| null | omitted | `StringMatch` on the request path. Normally omitted because the proxy's `listen_path` already gates URI selection; the translator emits it for `ignoreUriCase` routes and collapsed route-order fallbacks. `regex` must match the full path |
+| `ignore_uri_case` | bool | `false` | Fold ASCII case for `uri.exact` / `uri.prefix` only. Rejected without a `uri` predicate, and it never affects `uri.regex`, headers, methods, or authority |
+
+**`rules[].destination`**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `upstream_id` | String \| null | omitted | Override the proxy's upstream. Resolved in the matched proxy's namespace. Mutually exclusive with every direct-backend field |
+| `backend_host` | String \| null | omitted | Direct-backend host. A **bare host**: a DNS name, an IPv4 literal, or an IPv6 literal in either `::1` or `[::1]` form. The port belongs in `backend_port`; an embedded authority port, scheme, path, query, fragment, or userinfo is rejected at load rather than failing DNS resolution with a 502 on every matching request. Trimmed and ASCII-lowercased at load; max 255 characters |
+| `backend_port` | 1–65535 \| null | omitted | Direct-backend port. Must be set together with `backend_host` |
+| `backend_tls` | Object \| null | omitted | Route-local backend TLS (below). **Direct backends only** — an `upstream_id` destination inherits TLS from the referenced `Upstream` (including mesh `DestinationRule` projection), so per-canary TLS for an upstream override is modeled as a separate upstream resource |
+| `requires_node_waypoint_authz` | bool | `false` | Trusted mesh-translator marker. Under scoped NodeWaypoint authorization, a matching destination carrying it fails closed without an authorized destination stamp. Not for hand-authored config |
+
+**`rules[].fault`** — at least one of `delay` / `abort` is required.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `delay.duration_ms` | u64 | — | Required. `1`–`60000` |
+| `delay.percentage` | f64 | — | Required. `(0.0, 100.0]`; `0.0` is rejected (omit the action instead). A positive value below one 64-bit sampler bucket rounds up so every accepted value can fire |
+| `abort.status_code` | u16 | — | Required. `200`–`599` |
+| `abort.percentage` | f64 | — | Required. Same `(0.0, 100.0]` range as the delay |
+| `abort.grpc_status` | u32 \| null | omitted | `0`–`16`, emitted only when the immutable pre-plugin request flavor is native gRPC |
+| `abort.body` | String \| null | omitted | Response body; empty when unset |
+
+**`rules[].rewrite`** — at least one of `uri` / `authority` is required.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `uri` | String \| null | omitted | Replacement path. Must be a canonical absolute path with no query or fragment; percent escapes, dot segments, backslashes, and CRLF are rejected at load, and the composed path is re-checked before publication |
+| `authority` | String \| null | omitted | Replacement `Host` / `:authority`. Non-empty, CRLF-free, no whitespace |
+| `match_prefix` | String \| null | omitted | The literal prefix to replace with `uri`. Replacement is literal: the unmatched suffix is appended **verbatim**, so `match_prefix: /prefix/old` + `uri: /new` forwards `/prefix/oldtail` as `/newtail`, never `/new/tail`. A doubled separator is collapsed when both sides carry a `/` (`match_prefix: /prefix` + `uri: /` forwards `/prefix/etc` as `/etc`). An empty string means "no prefix" — `uri` replaces the whole path |
+
+**`rules[].redirect`** — every field is optional; a status-only redirect preserves the request URL.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `uri` | String \| null | omitted | Replacement `Location` path; the request path is preserved when unset |
+| `match_prefix` | String \| null | omitted | Prefix replaced by `uri`, with the same literal-substitution contract as `rewrite.match_prefix` |
+| `authority` | String \| null | omitted | Replacement `Location` authority; the request authority is preserved when unset |
+| `port` | 1–65535 \| null | omitted | Replacement authority port. Mutually exclusive with `derive_port` |
+| `derive_port` | String \| null | omitted | `FROM_PROTOCOL_DEFAULT` (80/http, 443/https) or `FROM_REQUEST_PORT` (original-destination port under capture, otherwise the frontend listener port — never `X-Forwarded-Port` / `Forwarded`). Mutually exclusive with `port` |
+| `scheme` | String \| null | omitted | `http` or `https`, ASCII-lowercased before validation (so `HTTPS` is accepted). The request's frontend scheme is preserved when unset |
+| `redirect_code` | u16 | `301` | `300`–`399` |
+
+Scheme-default ports are omitted from the rendered authority, and the original query string is preserved unless the redirect `uri` supplies its own.
+
+**`rules[].retry`** — a strict route-local wire shape that converts to the gateway `RetryConfig`.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `max_retries` | u32 | `3` | `0`–`100` |
+| `retryable_status_codes` | u16[] | `[]` | Each `100`–`599`; at most 500 entries |
+| `retryable_methods` | String[] | `["GET", "HEAD", "OPTIONS", "PUT", "DELETE"]` | One of GET / POST / PUT / PATCH / DELETE / HEAD / OPTIONS / TRACE / CONNECT, ASCII-uppercased before comparison (so `get` is accepted). At most 9 entries |
+| `backoff` | Object | `{"fixed": {"delay_ms": 100}}` | Either `{"fixed": {"delay_ms": N}}` or `{"exponential": {"base_ms": N, "max_ms": M}}`. Each delay is `0`–`300000` ms and `base_ms` must not exceed `max_ms` |
+| `retry_on_connect_failure` | bool | `true` | Retry connection failures |
+
+**`rules[].destination.backend_tls`** — a strict route-local wire shape that converts to the gateway `BackendTlsConfig`.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `client_cert_path` | String \| null | omitted | Client certificate PEM path. Non-empty, and must be set together with `client_key_path` |
+| `client_key_path` | String \| null | omitted | Client key PEM path. Non-empty, and must be set together with `client_cert_path` |
+| `server_ca_cert_path` | String \| null | omitted | Backend CA PEM path, or `system://` for the platform roots. Non-empty |
+| `verify_server_cert` | bool | `true` | Verify the backend certificate. Cannot be `false` alongside a `system://` `server_ca_cert_path` |
+| `sni` | String \| null | omitted | SNI override, max 253 characters, ASCII-lowercased at load |
+| `san_allow_list` | String[] | `[]` | Accepted backend SAN entries, at most 256 |
+
+**`rules[].{request,response}_transform[]`**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `operation` | String | — | Required. `add` (append with a comma separator, or insert), `update` (insert or replace), or `remove` |
+| `target` | String | `header` | Only `header` is accepted for route-level transforms |
+| `key` | String | — | Required. A valid HTTP header name |
+| `value` | String \| null | omitted | Required and non-null for `add` / `update`; omitted or null for `remove`. Must parse as an HTTP `HeaderValue`; CRLF is rejected |
+
+**Two admission rules the JSON Schema cannot express** and that only the constructor
+enforces: `backoff.base_ms <= backoff.max_ms` (a comparison between two sibling
+properties), and the `system://` CA versus `verify_server_cert: false`
+contradiction (a value-prefix test combined with a sibling boolean). The
+`backend_host` schema `pattern` is likewise a conservative approximation — a
+colon-bearing value that is not a valid IPv6 literal passes the schema and is
+still rejected at admission.
+
+##### Matching and dispatch semantics
+
+- **Soft fallback is the default.** With `reject_unmatched: false`, a request that
+  matches no rule is simply proxied to the matched proxy's own backend. That makes
+  a broken predicate look like healthy traffic, so verify a new canary rule
+  actually fires before relying on it.
+- **Aggregate unmatched handling.** `reject_unmatched` is finalized across every
+  attached instance: a local miss never short-circuits a later instance, and the
+  `404` is returned only after all instances have run with no match and no earlier
+  route override. All attached instances must stay a contiguous priority block.
+- **Whole-destination replacement.** A matching instance replaces all four
+  override fields (`upstream_id`, `backend_host`, `backend_port`, `backend_tls`);
+  a non-matching instance leaves an earlier instance's override intact.
+- **Protocol scope.** The plugin runs on HTTP, gRPC, and WebSocket at priority
+  2995. A WebSocket override selects the upgrade backend only — frames are not
+  re-routed after the upgrade — and an HBONE `CONNECT` is matched on the outer
+  request before the relay branch, after which the tunnel is a transparent relay.
+- **Clearing inherited policy.** `timeout_disabled` / `retry_disabled` are the only
+  way to clear a timeout or retry policy the selected proxy carries; leaving the
+  field unset inherits it, which is the opposite of the operator's intent for a
+  collapsed route.
+
+##### Route transforms need a consumer
+
+Route header transforms are published onto the request context and applied by
+proxy core after the last **eligible** (enabled) `request_transformer` /
+`response_transformer` in the chain. A proxy with no such instance forwards the
+request normally and applies neither transform. The VirtualService translator
+auto-emits an `apply_route_overrides: true` consumer; when configuring the plugin
+directly, add one yourself (see the third example below).
+
+##### Examples
+
+A minimal direct override — a `POST` carrying `x-canary: v2` goes to the canary
+backend, everything else keeps the proxy's own backend:
+
+```yaml
+version: "1"
+plugin_configs:
+  - id: reviews-canary
+    plugin_name: mesh_route_dispatch
+    scope: proxy
+    proxy_id: reviews
+    enabled: true
+    config:
+      rules:
+        - match:
+            methods: ["POST"]
+            headers:
+              x-canary: v2
+          destination:
+            backend_host: reviews-v2.default.svc.cluster.local
+            backend_port: 9080
+          timeout_ms: 1500
+proxies:
+  - id: reviews
+    listen_path: /reviews
+    backend_scheme: http
+    backend_host: reviews-v1.default.svc.cluster.local
+    backend_port: 9080
+    plugins:
+      - plugin_config_id: reviews-canary
+```
+
+A redirect-only rule needs no `destination`. `/reviews/legacyitem` is answered
+`301` with a `Location` path of `/reviews/v2item` — literal prefix substitution,
+with no separator synthesized at the segment boundary:
+
+```yaml
+version: "1"
+plugin_configs:
+  - id: reviews-redirect
+    plugin_name: mesh_route_dispatch
+    scope: proxy
+    proxy_id: reviews
+    enabled: true
+    config:
+      rules:
+        - match:
+            uri:
+              prefix: /reviews/legacy
+          redirect:
+            uri: /reviews/v2
+            match_prefix: /reviews/legacy
+            redirect_code: 301
+proxies:
+  - id: reviews
+    listen_path: /reviews
+    backend_scheme: http
+    backend_host: reviews-v1.default.svc.cluster.local
+    backend_port: 9080
+    plugins:
+      - plugin_config_id: reviews-redirect
+```
+
+Route header transforms with the eligible consumers they require. Without the two
+transformer instances the rule still forwards to the backend, but neither header
+change is applied:
+
+```yaml
+version: "1"
+plugin_configs:
+  - id: reviews-routing
+    plugin_name: mesh_route_dispatch
+    scope: proxy
+    proxy_id: reviews
+    enabled: true
+    config:
+      reject_unmatched: true
+      rules:
+        - match:
+            uri:
+              prefix: /reviews/api
+          destination:
+            backend_host: reviews-v2.default.svc.cluster.local
+            backend_port: 9080
+          rewrite:
+            uri: /v2
+            match_prefix: /reviews/api
+          request_transform:
+            - operation: update
+              key: x-route
+              value: reviews-v2
+            - operation: remove
+              key: x-internal-debug
+          response_transform:
+            - operation: add
+              key: x-served-by
+              value: edge
+  - id: reviews-route-request-consumer
+    plugin_name: request_transformer
+    scope: proxy
+    proxy_id: reviews
+    enabled: true
+    config:
+      apply_route_overrides: true
+      rules: []
+  - id: reviews-route-response-consumer
+    plugin_name: response_transformer
+    scope: proxy
+    proxy_id: reviews
+    enabled: true
+    config:
+      apply_route_overrides: true
+      rules: []
+proxies:
+  - id: reviews
+    listen_path: /reviews
+    backend_scheme: http
+    backend_host: reviews-v1.default.svc.cluster.local
+    backend_port: 9080
+    plugins:
+      - plugin_config_id: reviews-routing
+      - plugin_config_id: reviews-route-request-consumer
+      - plugin_config_id: reviews-route-response-consumer
+```
+
+With `reject_unmatched: true` in that last example, a request under `/reviews`
+that does not start with `/reviews/api` is answered `404` rather than reaching
+`reviews-v1`.
+
 See [Mesh VirtualService translation](mesh.md#virtualservice-translation) and [plugin execution order](plugin_execution_order.md#why-this-order-matters) for route-collapse, fault, rewrite, redirect, and HBONE behavior.
 
 ### `proxy_alerts`
