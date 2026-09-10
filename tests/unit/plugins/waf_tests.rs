@@ -8223,7 +8223,11 @@ fn waf_main_reference_summary_matches_the_parity_registry() {
             .flatten()
             .min()
             .unwrap_or(rest.len());
-        rest[..end].replace('\n', " ").replace('`', "").trim().to_string()
+        rest[..end]
+            .replace('\n', " ")
+            .replace('`', "")
+            .trim()
+            .to_string()
     };
 
     assert_eq!(field("**Priority:**"), meta.priority.to_string());
@@ -8411,7 +8415,8 @@ fn waf_config_schema_and_constructor_admission_agree() {
         let runtime = Waf::new(&case);
         let runtime_ok = runtime.is_ok();
         assert_eq!(
-            schema_ok, runtime_ok,
+            schema_ok,
+            runtime_ok,
             "schema valid={schema_ok}, constructor={:?}, config={case}",
             runtime.err()
         );
