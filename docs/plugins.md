@@ -2456,7 +2456,7 @@ config:
 
 Runs a browser-oriented OpenID Connect relying party flow with authorization code + PKCE, encrypted gateway sessions with a sliding idle window and proactive refresh-token rotation, ID token validation through provider JWKS, optional UserInfo merge, scope/role checks, claim header fan-out, and RP-initiated logout. Concurrent refresh-due requests carrying the same refresh token share one token-endpoint call per instance, and a refresh token the provider reports as `invalid_grant` is never re-sealed into a `Set-Cookie`; see [OIDC Relying Party](oidc_relying_party.md#concurrent-refreshes-and-spent-refresh-tokens) for the multi-replica caveat.
 
-Logout expires the browser cookie and, with an authentic session cookie, sends `id_token_hint` to the provider and attempts discovered refresh-token revocation. No cookie or an invalid cookie returns the local logged-out page. Stateless cookie copies remain usable within the claims and absolute/idle lifetime limits even after logout; see [Logout](oidc_relying_party.md#logout) for residual validity and best-effort revocation behavior.
+Active in `on_request_received` (callback and logout paths), `authenticate` (session validation, refresh, and browser challenge), `before_proxy` (claim headers and session-cookie hiding), and `after_proxy` (rolling `Set-Cookie` emission). Logout expires the browser cookie and, with an authentic session cookie, sends `id_token_hint` to the provider and attempts discovered refresh-token revocation. No cookie or an invalid cookie returns the local logged-out page. Stateless cookie copies remain usable within the claims and absolute/idle lifetime limits even after logout; see [Logout](oidc_relying_party.md#logout) for residual validity and best-effort revocation behavior.
 
 **Priority:** 1075
 
@@ -2468,27 +2468,48 @@ Logout expires the browser cookie and, with an authentic session cookie, sends `
 | `providers[].authorization_endpoint` | String | Explicit authorization endpoint when discovery is not used |
 | `providers[].token_endpoint` | String | Explicit token endpoint when discovery is not used |
 | `providers[].jwks_uri` | String | Explicit JWKS URI when discovery is not used |
-| `providers[].userinfo_endpoint` | String (optional) | UserInfo endpoint used to enrich session claims |
+| `providers[].userinfo_endpoint` | String (optional) | UserInfo endpoint used to enrich session claims; explicit values win over discovery |
+| `providers[].end_session_endpoint` | String (optional) | RP-initiated logout endpoint; explicit values win over discovery |
+| `providers[].post_logout_redirect_uri` | String (optional) | Absolute URI sent to the provider after RP-initiated logout |
 | `providers[].client_id` | String | OIDC client ID |
-| `providers[].client_auth.method` | String | `client_secret_basic`, `client_secret_post`, `private_key_jwt`, or `none` |
-| `providers[].redirect_uri` | String | Absolute callback URI registered with the provider; its host must match the browser request host before Ferrum issues a challenge (ports are ignored) |
+| `providers[].client_auth.method` | String | `client_secret_basic` (default), `client_secret_post`, `private_key_jwt`, or `none` |
+| `providers[].client_auth.client_secret` | String | Required for `client_secret_basic` and `client_secret_post` |
+| `providers[].client_auth.private_key_pem` | String | Required for `private_key_jwt`; must support the selected algorithm |
+| `providers[].client_auth.private_key_jwt_alg` | String | `RS256` (default), `RS384`, `RS512`, `ES256`, `ES384`, or `EdDSA` |
+| `providers[].client_auth.private_key_jwt_kid` | String (optional) | `kid` header placed on the signed client assertion |
+| `providers[].redirect_uri` | String | Absolute callback URI registered with the provider, with no fragment; its host must match the browser request host before Ferrum issues a challenge (ports are ignored) |
 | `providers[].callback_path` | String | Callback path Ferrum handles (default: `/oauth/callback`); must equal the path in `redirect_uri` |
-| `providers[].logout_path` | String | Local logout path (default: `/oauth/logout`) |
+| `providers[].logout_path` | String | Local logout path (default: `/oauth/logout`); must not resolve to the same path as `callback_path` |
 | `providers[].scopes` | String[] | OIDC scopes; must include `openid` |
 | `providers[].audiences` | String[] | Accepted ID token audiences |
 | `providers[].required_scopes` | String[] (optional) | Scopes that must all be present in session claims |
 | `providers[].required_roles` | String[] (optional) | Roles where any one must be present |
 | `providers[].claim_headers` | Object (optional) | Session claim-to-header mappings |
+| `providers[].scope_claim` | String | Claim holding granted scopes (default: `scope`) |
+| `providers[].role_claim` | String | Claim holding roles (default: `roles`) |
+| `providers[].consumer_identity_claim` | String | Claim resolved against the consumer index (default: `sub`) |
+| `providers[].consumer_header_claim` | String | Claim emitted as the consumer username header (default: `sub`) |
+| `providers[].id_token_clock_skew_secs` | u64 | ID token expiry leeway (default: `60`; `0`–`3600`) |
 | `session.encryption_secret` | String | At least 32 bytes; encrypts and authenticates session cookies and sealed pending-flow correlation cookies |
 | `session.encryption_secret_previous` | String (optional) | Previous secret accepted for session and pending-flow cookie rotation |
 | `session.store` | String | Session backend; only `cookie` is implemented |
-| `session.cookie_name` | String (optional) | Explicit name opts out of automatic naming; default is context-derived and prefixed `__Host-` (secure, no domain, root path), `__Secure-` (secure, otherwise), or unprefixed when `session.secure` is false |
-| `session.ttl_secs` | u64 | Absolute session lifetime (default: `3600`) |
-| `session.idle_ttl_secs` | u64 | Idle timeout (default: `1800`) |
-| `session.max_cookie_bytes` | u64 | Maximum sealed session and pending-flow cookie size (default: `8000`) |
-| `session.domain` | String (optional) | Durable session Domain only; correlation cookies never inherit it and secure correlation cookies use browser-enforced `__Host-` scope (`Path=/`) |
+| `session.cookie_name` | String (optional) | Explicit name opts out of automatic naming and must be an RFC 6265 `cookie-name` token; an explicit `__Host-`/`__Secure-` name must satisfy that prefix's attribute rules. Default is context-derived and prefixed `__Host-` (secure, no domain, root path), `__Secure-` (secure, otherwise), or unprefixed when `session.secure` is false |
+| `session.ttl_secs` | u64 | Absolute session lifetime (default: `3600`; `1`–`31536000`) |
+| `session.idle_ttl_secs` | u64 | Idle timeout (default: `1800`; `1`–`31536000`) |
+| `session.max_cookie_bytes` | u64 | Maximum sealed session and pending-flow cookie size (default: `8000`; `1024`–`8000`) |
+| `session.domain` | String (optional) | Bare DNS name (optional leading dot); durable session Domain only. Correlation cookies never inherit it, and secure correlation cookies use browser-enforced `__Host-` scope (`Path=/`) |
 | `session.secure` | Boolean | Default `true`; when false, generated cookie names carry no `__Host-`/`__Secure-` prefix because a prefixed cookie without `Secure` is rejected by browsers |
+| `session.hide_session_cookie` | Boolean | Default `true`; strip this plugin's session and correlation cookies from the `Cookie` header forwarded upstream, leaving unrelated cookies intact |
+| `session.http_only` | Boolean | `HttpOnly` on the session cookie (default: `true`) |
+| `session.same_site` | String | `lax` (default), `strict`, or `none`; case-insensitive. `none` requires `session.secure: true` |
+| `session.path` | String | Session cookie `Path` (default: `/`) |
 | `behavior.rp_initiated_logout` | Boolean | Default `true`; send the sealed session ID token as a logout hint and attempt discovered refresh-token revocation (five-second bound) |
+| `behavior.state_ttl_secs` | u64 | Pending authorization-flow lifetime (default: `600`; `1`–`3600`) |
+| `behavior.refresh_skew_secs` | u64 | Refresh lead time before token expiry (default: `30`; must be `<= session.ttl_secs / 2`) |
+| `behavior.challenge_html_status` | u64 | Browser challenge status: `302` (default), `303`, or `307` |
+| `behavior.challenge_api_status` | u64 | Non-browser challenge status: `401` (default) or `403` |
+| `behavior.html_accept_substrings` | String[] | `Accept` substrings that mark a browser request (default: `["text/html"]`) |
+| `behavior.post_login_redirect_param` | String (optional) | Query parameter carrying the post-login target; requires `behavior.trusted_redirect_hosts` |
 | `behavior.state_cache_max_entries` | u64 | Per-instance maximum pending login starts (default: `10000`); does not block cross-replica callbacks |
 | `behavior.state_cache_max_entries_per_source` | u64 | Per-instance per-client-IP pending login start cap (default: `32`) |
 | `behavior.post_login_default_path` | String | Redirect target when no trusted original URL exists |
@@ -2501,7 +2522,9 @@ config:
     - issuer: "https://idp.example.com/"
       discovery_url: "https://idp.example.com/.well-known/openid-configuration"
       client_id: ferrum-edge
+      scopes: ["openid", "profile", "email"]
       redirect_uri: "https://edge.example.com/oidc/callback"
+      callback_path: "/oidc/callback"
       client_auth:
         method: client_secret_basic
         client_secret: "${OIDC_CLIENT_SECRET}"

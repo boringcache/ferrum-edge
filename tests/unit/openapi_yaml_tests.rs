@@ -10025,6 +10025,7 @@ fn oidc_relying_party_schema_matches_strict_runtime_surface() {
             "domain",
             "encryption_secret",
             "encryption_secret_previous",
+            "hide_session_cookie",
             "http_only",
             "idle_ttl_secs",
             "max_cookie_bytes",
