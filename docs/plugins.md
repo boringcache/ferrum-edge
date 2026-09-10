@@ -391,7 +391,7 @@ Sends transaction summaries as JSON to an external HTTP endpoint. Entries are bu
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `endpoint_url` | String | `""` | URL to POST transaction logs to |
+| `endpoint_url` | String | *(required)* | URL to POST transaction logs to. Must be `http://` or `https://` with a hostname or IP; empty strings are rejected. |
 | `custom_headers` | Object | *(none)* | Key-value pairs of custom HTTP headers to include on every batch request |
 | `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch (1–10000) |
 | `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (100–600000) |
@@ -405,7 +405,7 @@ Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elap
 
 Unknown top-level keys are rejected at construction (for example a misspelled `endpont_url` cannot silently leave logs undelivered). Registration is `OptionalFailOpen`: Admin create/update still returns HTTP 400 for an invalid enabled config, while file-mode `validate`/load and plugin-cache rebuild warn, naming the unknown key, and omit this instance rather than failing the gateway.
 
-Retries fire on transport errors and 5xx responses. A **4xx response other than 408 or 429 aborts the batch immediately** (retrying a malformed or unauthorized payload just delays the drop) — fix the endpoint URL, authorization header, or field schema rather than waiting through `max_retries × retry_delay_ms`. 408 (Request Timeout) and 429 (Too Many Requests) are transient throttling signals and are retried within the configured budget.
+Retries fire on transport errors and 5xx responses. A **4xx response other than 408 or 429 aborts the batch immediately** (retrying a malformed or unauthorized payload just delays the drop) — fix the endpoint URL, authorization header, or field schema rather than waiting through `max_retries × retry_delay_ms`. 408 (Request Timeout) and 429 (Too Many Requests) are transient throttling signals and are retried within the configured budget. Permanent 4xx discards increment `ferrum_plugin_log_sink_records_dropped_total{plugin="http_logging",reason="batch_discard"}` once per lost record; the counter is process-cumulative and is not reset by a plugin-cache reload.
 
 Response bodies are never logged or retained. After reading the status, each batch response is asynchronously drained and discarded under a 1 MiB hard cap and a one-second drain timeout so HTTP/1.1 keep-alive connections can be reused. Oversized, stalled, or malformed acknowledgement bodies abort the drain without changing the status classification (2xx remains success; non-retryable 4xx remains a discard).
 
@@ -437,15 +437,15 @@ The table below summarizes how to configure `http_logging` for popular log inges
 | **Sumo Logic** | `https://<endpoint>.sumologic.com/receiver/v1/http/<token>` | `X-Sumo-Category`, `X-Sumo-Name`, `X-Sumo-Host` (optional metadata) | Token embedded in URL | Yes | 1MB default | No auth header needed — token is in the URL path |
 | **Elastic / OpenSearch** | Requires intermediary (Logstash/Fluent Bit NDJSON transform) | `Authorization: "Basic <b64>"` or `Authorization: "Bearer <token>"` (at the intermediary) | Standard Authorization header | **No** — `_bulk` requires NDJSON action/source lines and `_doc` accepts one document object | N/A | Cannot POST the plugin's JSON array directly; see the Elastic / OpenSearch section below |
 | **Azure Monitor** | `https://<dce>.ingest.monitor.azure.com/dataCollectionRules/<dcr-id>/streams/<stream>?api-version=2023-01-01` | `Authorization: "Bearer <aad-token>"` | Azure AD OAuth2 bearer token | Yes (custom tables) | 1MB per call | Requires Data Collection Endpoint + Rule; fields map to custom table columns |
-| **AWS CloudWatch** | Requires intermediary (Fluent Bit/Firehose HTTP endpoint) | `Authorization: "Bearer <token>"` or custom | Varies by intermediary | **No** — needs `PutLogEvents` API format | N/A | Cannot POST directly; use a Firehose HTTP endpoint or Fluent Bit as intermediary |
+| **AWS CloudWatch** | Requires intermediary (Fluent Bit HTTP input) | Varies by intermediary | Varies by intermediary | **No** — needs `PutLogEvents` API format | N/A | Cannot POST directly; Fluent Bit (or another HTTP ingest bridge) must transform records and call CloudWatch |
 | **Google Cloud Logging** | Requires intermediary (Fluent Bit/custom) | `Authorization: "Bearer <token>"` | OAuth2 bearer token | **No** — needs `entries.write` format | N/A | Cannot POST directly; use Fluent Bit or a custom HTTP bridge |
 | **Logtail / Better Stack** | `https://in.logs.betterstack.com` | `Authorization: "Bearer <source-token>"` | Standard Authorization header | Yes | 10MB | Fields auto-parsed from JSON |
 | **Axiom** | `https://api.axiom.co/v1/datasets/<dataset>/ingest` | `Authorization: "Bearer <api-token>"` | Standard Authorization header | Yes | 10MB | Fields auto-parsed; supports `Content-Type: application/json` |
-| **Mezmo (LogDNA)** | `https://logs.mezmo.com/logs/ingest?hostname=<host>&apikey=<key>` | *(none — key in query string)* | API key in URL query parameter | Yes (lines API) | 10MB | Hostname is a required query parameter |
+| **Mezmo (LogDNA)** | Requires intermediary (Fluent Bit/custom HTTP bridge) | `apikey: "<ingestion-key>"` at the intermediary | Ingestion-key header (`apikey`) or query parameter at the intermediary | **No** — ingest API requires `{"lines":[...]}` | N/A | Cannot POST the plugin's JSON array directly; see the Mezmo section below |
 
 > **TLS verification:** If any service uses an internal CA, set `FERRUM_TLS_CA_BUNDLE_PATH` to your CA bundle so the plugin's HTTP client can verify the endpoint's certificate.
 
-> **Credentials in `endpoint_url`:** Prefer `custom_headers` — it is the supported authentication channel for every service that offers one, and header values are never logged. Some collectors have no header option (Sumo Logic puts its token in the URL path; Mezmo puts its API key in the query string), so `endpoint_url` may legitimately carry a reusable credential. Ferrum therefore never renders a configured `endpoint_url` in operational output. Diagnostics — egress-policy denial, DNS/TLS/connect failure, retry, slow-call warnings, and batch-failure error strings — show only a structurally redacted form (`https://host:port/redacted`) with the entire path, query, and fragment replaced. The admin API's audit and non-admin read projections apply the schema-aware sensitivity contract instead, keeping only `scheme://host[:port]` with `[REDACTED_PATH]`/`[REDACTED_QUERY]`/`[REDACTED_FRAGMENT]` markers (see `docs/admin_api.md`). The complete URL is used only to build the outbound request.
+> **Credentials in `endpoint_url`:** Prefer `custom_headers` — it is the supported authentication channel for every service that offers one, and header values are never logged. Some collectors have no header option (Sumo Logic puts its token in the URL path), so `endpoint_url` may legitimately carry a reusable credential. Mezmo ingestion keys can be sent as an `apikey` header at an HTTP bridge; do not put them in `endpoint_url` unless the collector itself requires a query credential. Ferrum therefore never renders a configured `endpoint_url` in operational output. Diagnostics — egress-policy denial, DNS/TLS/connect failure, retry, slow-call warnings, and batch-failure error strings — show only a structurally redacted form (`https://host:port/redacted`) with the entire path, query, and fragment replaced. The admin API's audit and non-admin read projections apply the schema-aware sensitivity contract instead, keeping only `scheme://host[:port]` with `[REDACTED_PATH]`/`[REDACTED_QUERY]`/`[REDACTED_FRAGMENT]` markers (see `docs/admin_api.md`). The complete URL is used only to build the outbound request.
 >
 > Userinfo credentials (`https://user:password@host/...`) are **rejected at configuration time** for `http_logging`, `loki_logging`, and `ai_transcript_audit`. Use `custom_headers` (for example `Authorization: "Basic <base64>"`) instead.
 
@@ -464,7 +464,7 @@ The `http_logging` plugin works with [Splunk HTTP Event Collector (HEC)](https:/
 3. **Configure the HEC token** — edit the token's settings:
    - **Source type**: set to `_json` (built-in) or your custom `ferrum_edge_logs`
    - **Index**: choose your target index
-   - **Enable indexer acknowledgement**: optional, for guaranteed delivery
+   - **Enable indexer acknowledgement**: leave this **disabled**. `http_logging` treats HTTP 2xx as delivery success and does not send `X-Splunk-Request-Channel` or poll `/services/collector/ack`. Tokens with indexer acknowledgment enabled reject requests that lack a channel, and a channel header alone cannot provide confirmed indexing. Ordinary HTTP acceptance is not the same as confirmed indexing; use a Splunk-aware intermediary if you need acknowledgment.
 
 4. **Configure the plugin** — point `endpoint_url` at the raw HEC endpoint and set the Splunk auth token via `custom_headers`:
 
@@ -564,6 +564,24 @@ config:
   flush_interval_ms: 2000
 ```
 
+#### Mezmo (LogDNA) Integration
+
+Mezmo's ingest API expects a JSON **object** with a `lines` array of log-line entries, not a top-level JSON array of `TransactionSummary` objects. Posting this plugin's payload directly to `https://logs.mezmo.com/logs/ingest` is a contract mismatch (typically a 4xx, which the plugin treats as a terminal discard). Mezmo does support header authentication via the `apikey` header; it is not limited to a query-string key.
+
+Use an HTTP bridge that accepts the plugin's JSON array and re-wraps each summary into Mezmo's log-line envelope (`{"lines":[{"line":"<json>","app":"ferrum-edge",...}]}`):
+
+```yaml
+plugin_name: http_logging
+config:
+  # Fluent Bit HTTP input (or a custom bridge) that transforms the JSON
+  # array into Mezmo's {"lines":[...]} envelope and authenticates with Mezmo.
+  endpoint_url: "http://fluent-bit.internal:8888/ferrum"
+  batch_size: 100
+  flush_interval_ms: 2000
+```
+
+> **Note:** Configure the intermediary with the Mezmo ingestion key (`apikey` header or the documented query parameter) and a `hostname`. Do not point `endpoint_url` at Mezmo's ingest URL directly — the plugin does not emit the `lines` envelope.
+
 #### Elastic / OpenSearch Integration
 
 Elasticsearch and OpenSearch cannot ingest this plugin's payload directly. The plugin always POSTs a JSON **array** of log-entry objects, while the index-document API (`/<index>/_doc`) accepts a **single** JSON document and the bulk API (`/<index>/_bulk`) requires newline-delimited action/source records (NDJSON), not a JSON array. Posting the array to either endpoint returns an ordinary 4xx, which the plugin treats as a terminal discard — the batch is dropped, not retried — so a direct configuration silently loses logs.
@@ -600,7 +618,9 @@ config:
 
 #### AWS CloudWatch Logs Integration
 
-CloudWatch Logs does not have an HTTP JSON intake API. Use [Fluent Bit](https://docs.fluentbit.io/manual/pipeline/outputs/cloudwatch) or an [Amazon Kinesis Data Firehose HTTP endpoint](https://docs.aws.amazon.com/firehose/latest/dev/create-destination.html#create-destination-http) as an intermediary:
+CloudWatch Logs does not have an HTTP JSON intake API. Use [Fluent Bit](https://docs.fluentbit.io/manual/pipeline/outputs/cloudwatch) (or another HTTP ingest bridge that you operate) as an intermediary that receives this plugin's JSON arrays, transforms records, and authenticates to the CloudWatch `PutLogEvents` API.
+
+Amazon Data Firehose HTTP endpoints are **outbound destinations**: Firehose sends records *to* an URL you configure. They are not an inbound HTTP-to-CloudWatch bridge, and pointing `endpoint_url` at a Firehose destination URL cannot produce a CloudWatch pipeline.
 
 ```yaml
 plugin_name: http_logging
