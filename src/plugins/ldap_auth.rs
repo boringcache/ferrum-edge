@@ -1642,8 +1642,7 @@ pub fn escape_dn_value(input: &str) -> String {
 /// no escaping, so a template that parses with them substituted also parses
 /// with the escaped runtime value in their place.
 const LDAP_FILTER_VALIDATION_USERNAME: &str = "ferrumfiltervalidation";
-const LDAP_FILTER_VALIDATION_USER_DN: &str =
-    "cn=ferrumfiltervalidation,ou=users,dc=example,dc=com";
+const LDAP_FILTER_VALIDATION_USER_DN: &str = "cn=ferrumfiltervalidation,ou=users,dc=example,dc=com";
 
 /// Reject a configured filter template that is not a well-formed RFC 4515
 /// search filter.

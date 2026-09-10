@@ -3203,22 +3203,14 @@ async fn test_escaped_comma_rdn_cannot_impersonate_a_required_group() {
 
 #[tokio::test]
 async fn test_escaped_comma_inside_a_legitimate_group_rdn_still_matches() {
-    assert_dn_fallback_group_result(
-        "cn=ad\\,mins,ou=groups,dc=example,dc=com",
-        "ad,mins",
-        true,
-    )
-    .await;
+    assert_dn_fallback_group_result("cn=ad\\,mins,ou=groups,dc=example,dc=com", "ad,mins", true)
+        .await;
 }
 
 #[tokio::test]
 async fn test_hex_escaped_rdn_value_is_decoded_before_matching() {
-    assert_dn_fallback_group_result(
-        "cn=ad\\2Cmins,ou=groups,dc=example,dc=com",
-        "ad,mins",
-        true,
-    )
-    .await;
+    assert_dn_fallback_group_result("cn=ad\\2Cmins,ou=groups,dc=example,dc=com", "ad,mins", true)
+        .await;
 }
 
 #[tokio::test]
