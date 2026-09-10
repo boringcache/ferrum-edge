@@ -141,7 +141,12 @@ pub fn create_test_context() -> RequestContext {
 }
 
 /// Build a request context whose raw header map contains `value`, then run
-/// `materialize_headers()` so non-visible-ASCII values stay out of `ctx.headers`.
+/// `materialize_headers()`.
+///
+/// `value` is always valid UTF-8, so materialization keeps it byte-exact (issue
+/// #5010). The divergence these repros exercise is the RFC-bound visible-ASCII
+/// credential policy in `header_extract`, which reads the retained RAW map and
+/// still reports a non-ASCII field line as present-but-malformed.
 pub fn context_with_materialized_raw_header(name: &str, value: &str) -> RequestContext {
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
@@ -159,23 +164,29 @@ pub fn context_with_materialized_raw_header(name: &str, value: &str) -> RequestC
     );
     ctx.set_raw_headers(raw);
     ctx.materialize_headers();
-    assert!(
-        !ctx.headers.contains_key(name.to_ascii_lowercase().as_str())
-            && !ctx.headers.contains_key(name),
-        "non-ASCII header values must stay out of the materialized map in this repro"
+    assert_eq!(
+        ctx.headers
+            .get(name.to_ascii_lowercase().as_str())
+            .map(String::as_str),
+        Some(value),
+        "valid UTF-8 header values must be materialized byte-exact in this repro"
     );
     ctx
 }
 
-/// Build a request context from raw header bytes that `materialize_headers()`
-/// omits, then materialize the rest of the map.
+/// Build a request context from raw header bytes, then materialize the map.
+///
+/// Bytes that are not valid UTF-8 cannot be represented in the materialized map
+/// and stay out of it; valid UTF-8 is materialized byte-exact.
 pub fn context_with_materialized_raw_header_bytes(name: &str, value: &[u8]) -> RequestContext {
     let ctx = context_with_materialized_raw_header_lines(name, &[value]);
-    assert!(
-        !ctx.headers.contains_key(name.to_ascii_lowercase().as_str())
-            && !ctx.headers.contains_key(name),
-        "non-materializable header values must stay out of the materialized map in this repro"
-    );
+    if std::str::from_utf8(value).is_err() {
+        assert!(
+            !ctx.headers.contains_key(name.to_ascii_lowercase().as_str())
+                && !ctx.headers.contains_key(name),
+            "non-UTF-8 header values must stay out of the materialized map in this repro"
+        );
+    }
     ctx
 }
 

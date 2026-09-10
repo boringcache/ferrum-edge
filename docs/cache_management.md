@@ -222,7 +222,7 @@ When the cache reaches the max entry count, new circuit breaker entries for prev
 
 **Default limit:** 10,000 entries. Caching is disabled by default.
 
-**Config field:** `cache_ttl_seconds` (default `0`, disabled; maximum `86,400` seconds / 24 hours) and `max_cache_entries` (default `10,000`).
+**Config field:** `cache_ttl_seconds` (default `0`, disabled; maximum `86,400` seconds / 24 hours) and `max_cache_entries` (default `10,000`; maximum `1,000,000`).
 
 **Cleanup mechanism:** TTL-based expiration is checked on lookup. Admission uses atomic entry accounting to preserve the hard cap during concurrent authentication. At capacity, one existing entry is replaced for each new admission; the request path never performs a full-cache scan.
 
@@ -309,7 +309,7 @@ When the cache reaches the max entry count, new circuit breaker entries for prev
 | `soap_ws_security` | *(fixed, not configurable)* | `93601`s | Nonce claim retention — `max created_max_age_seconds + 2 x max created_clock_skew_seconds + 1`, the widest window the schema admits, so a later reload cannot outlive a claim |
 | `soap_ws_security` | `nonce.max_encoded_length` | `512` | Maximum encoded `wsse:Nonce` length |
 | `soap_ws_security` | `nonce.max_total_cache_bytes` | `67108864` | Maximum retained nonce-key UTF-8 payload bytes (one count per shared key allocation) |
-| `ldap_auth` | `max_cache_entries` | `10000` | Maximum cached LDAP bind results |
+| `ldap_auth` | `max_cache_entries` | `10000` | Maximum cached LDAP bind results (1–1,000,000) |
 | `ldap_auth` | `cache_ttl_seconds` | `0` | LDAP cache entry TTL (`0` = disabled; maximum `86400`) |
 | `oauth2_introspection` | `providers[].max_cache_entries` | `10000` | Per-provider hard entry ceiling, split 75/25 between active and negative results |
 | `oauth2_introspection` | `providers[].max_cache_entry_bytes` | `16384` | Maximum normalized active authorization-result bytes retained per token |

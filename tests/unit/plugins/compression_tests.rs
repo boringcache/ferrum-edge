@@ -1063,9 +1063,14 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
         !store_resp.contains_key("content-encoding"),
         "default/identity store must remain uncoded"
     );
-    assert_eq!(
-        store_resp.get("vary").map(String::as_str),
-        Some("Accept-Encoding"),
+    // `response_caching` publishes its own downstream Vary contract on the miss,
+    // so the negotiation dimension is merged into that list rather than
+    // replacing it.
+    assert!(
+        store_resp.get("vary").is_some_and(|vary| {
+            vary.split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("Accept-Encoding"))
+        }),
         "identity-first store must nominate Vary before response_caching inserts"
     );
     cache
@@ -1174,9 +1179,12 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
         gzip_resp.get("content-encoding").map(String::as_str),
         Some("gzip")
     );
-    assert_eq!(
-        gzip_resp.get("vary").map(String::as_str),
-        Some("Accept-Encoding")
+    assert!(
+        gzip_resp.get("vary").is_some_and(|vary| {
+            vary.split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("Accept-Encoding"))
+        }),
+        "the gzip store must keep the negotiation dimension in the merged Vary"
     );
     // Body bytes after transform_response_body would be compressed; the cache
     // stores whatever final body the gateway supplies. Use distinct bytes so

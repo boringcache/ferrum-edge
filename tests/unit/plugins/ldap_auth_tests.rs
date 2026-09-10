@@ -743,7 +743,9 @@ fn test_ldap_auth_plugin_contract() {
 
     assert_eq!(plugin.supported_protocols(), HTTP_FAMILY_PROTOCOLS);
     assert!(plugin.is_auth_plugin());
-    assert!(!plugin.modifies_request_headers());
+    // `hide_credentials` defaults to true, so the Basic credential is removed
+    // from the backend request in `before_proxy`.
+    assert!(plugin.modifies_request_headers());
     assert!(!plugin.modifies_request_body());
     assert!(!plugin.requires_request_body_before_before_proxy());
     assert!(!plugin.requires_request_body_before_authenticate());
@@ -2770,4 +2772,452 @@ async fn test_ldap_auth_non_ascii_authorization_returns_invalid_not_missing() {
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject_body(result, r#"{"error":"Invalid Authorization header"}"#);
     assert!(ctx.identified_consumer.is_none());
+}
+
+// ─── Shared fixtures for the sections below ──────────────────────────────
+
+fn direct_bind_config_with(extra: serde_json::Value) -> serde_json::Value {
+    let mut config = json!({
+        "ldap_url": "ldaps://ldap.example.com:636",
+        "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+        "canonical_identity_attribute": "uid"
+    });
+    let object = config.as_object_mut().expect("config object");
+    for (key, value) in extra.as_object().expect("extra object") {
+        object.insert(key.clone(), value.clone());
+    }
+    config
+}
+
+fn direct_bind_plugin(extra: serde_json::Value) -> LdapAuth {
+    let config = direct_bind_config_with(extra);
+    LdapAuth::new(&config, http_client()).expect("valid direct-bind config")
+}
+
+fn search_bind_config_with(search_filter: &str) -> serde_json::Value {
+    json!({
+        "ldap_url": "ldaps://ldap.example.com:636",
+        "search_base_dn": "ou=users,dc=example,dc=com",
+        "search_filter": search_filter,
+        "canonical_identity_attribute": "uid",
+        "service_account_dn": "cn=admin,dc=example,dc=com",
+        "service_account_password": "service-secret"
+    })
+}
+
+// ─── Filter syntax admission (issue #5036) ───────────────────────────────
+
+#[test]
+fn test_unbalanced_search_filter_rejected_at_admission() {
+    let config = search_bind_config_with("(uid={username}");
+    let Err(error) = LdapAuth::new(&config, http_client()) else {
+        panic!("unbalanced search_filter must be rejected");
+    };
+    assert!(
+        error.contains("'search_filter'") && error.contains("RFC 4515"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn test_empty_filter_branch_in_search_filter_rejected_at_admission() {
+    let config = search_bind_config_with("(&(uid={username})())");
+    let Err(error) = LdapAuth::new(&config, http_client()) else {
+        panic!("an empty filter branch must be rejected");
+    };
+    assert!(error.contains("'search_filter'"), "unexpected: {error}");
+}
+
+#[test]
+fn test_valid_search_filter_accepted_at_admission() {
+    let config = search_bind_config_with("(&(objectClass=person)(uid={username}))");
+    LdapAuth::new(&config, http_client()).expect("well-formed search_filter is admitted");
+}
+
+#[test]
+fn test_unbalanced_group_filter_rejected_at_admission() {
+    let config = direct_bind_config_with(json!({
+        "group_base_dn": "ou=groups,dc=example,dc=com",
+        "group_filter": "(member={user_dn}",
+        "required_groups": ["admins"]
+    }));
+    let Err(error) = LdapAuth::new(&config, http_client()) else {
+        panic!("unbalanced group_filter must be rejected");
+    };
+    assert!(
+        error.contains("'group_filter'") && error.contains("RFC 4515"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn test_valid_group_filter_accepted_at_admission() {
+    let config = direct_bind_config_with(json!({
+        "group_base_dn": "ou=groups,dc=example,dc=com",
+        "group_filter": "(&(objectClass=group)(member={user_dn}))",
+        "required_groups": ["admins"]
+    }));
+    LdapAuth::new(&config, http_client()).expect("well-formed group_filter is admitted");
+}
+
+// ─── Basic authentication challenge (issue #5037) ────────────────────────
+
+#[test]
+fn test_ldap_auth_advertises_the_basic_challenge() {
+    let plugin = direct_bind_plugin(json!({}));
+    assert_eq!(
+        plugin.authentication_challenge(),
+        Some(r#"Basic realm="ferrum-edge", charset="UTF-8""#)
+    );
+}
+
+#[tokio::test]
+async fn test_invalid_credential_rejection_carries_the_basic_challenge() {
+    let plugin = direct_bind_plugin(json!({}));
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        "Basic !!!not-base64".to_string(),
+    );
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    let PluginResult::Reject {
+        status_code,
+        headers,
+        ..
+    } = result
+    else {
+        panic!("expected a rejection");
+    };
+    assert_eq!(status_code, 401);
+    assert_eq!(
+        headers.get("WWW-Authenticate").map(String::as_str),
+        Some(r#"Basic realm="ferrum-edge", charset="UTF-8""#)
+    );
+}
+
+// ─── max_cache_entries upper bound ───────────────────────────────────────
+
+#[test]
+fn test_max_cache_entries_upper_bound_enforced() {
+    direct_bind_plugin(json!({"max_cache_entries": 1_000_000}));
+    let config = direct_bind_config_with(json!({"max_cache_entries": 1_000_001}));
+    let Err(error) = LdapAuth::new(&config, http_client()) else {
+        panic!("above the documented maximum must be rejected");
+    };
+    assert!(error.contains("'max_cache_entries'"), "unexpected: {error}");
+}
+
+// ─── hide_credentials (advisory GHSA-wprm-pc37-r867) ─────────────────────
+
+async fn backend_headers_after_before_proxy(
+    extra: serde_json::Value,
+    authorization: &str,
+) -> std::collections::HashMap<String, String> {
+    let plugin = direct_bind_plugin(extra);
+    let mut ctx = make_ctx();
+    let mut headers = std::collections::HashMap::new();
+    headers.insert("authorization".to_string(), authorization.to_string());
+    headers.insert("x-trace".to_string(), "keep-me".to_string());
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    headers
+}
+
+#[tokio::test]
+async fn test_basic_credentials_are_hidden_from_the_backend_by_default() {
+    let authorization = basic_header("alice", "user-secret");
+    let headers = backend_headers_after_before_proxy(json!({}), &authorization).await;
+    assert!(
+        !headers.contains_key("authorization"),
+        "the Basic credential must not reach the backend: {headers:?}"
+    );
+    assert_eq!(headers.get("x-trace").map(String::as_str), Some("keep-me"));
+}
+
+#[tokio::test]
+async fn test_mixed_case_authorization_field_name_is_also_hidden() {
+    let plugin = direct_bind_plugin(json!({}));
+    let mut ctx = make_ctx();
+    let mut headers = std::collections::HashMap::new();
+    headers.insert(
+        "Authorization".to_string(),
+        basic_header("alice", "user-secret"),
+    );
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(headers.is_empty(), "unexpected headers: {headers:?}");
+}
+
+#[tokio::test]
+async fn test_hide_credentials_leaves_other_authorization_schemes_intact() {
+    let headers = backend_headers_after_before_proxy(json!({}), "Bearer some.jwt.token").await;
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer some.jwt.token"),
+        "another mechanism's credential must reach the backend unchanged"
+    );
+}
+
+#[tokio::test]
+async fn test_hide_credentials_can_be_disabled() {
+    let authorization = basic_header("alice", "user-secret");
+    let extra = json!({"hide_credentials": false});
+    let headers = backend_headers_after_before_proxy(extra, &authorization).await;
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some(authorization.as_str())
+    );
+}
+
+#[test]
+fn test_authorization_is_always_redacted_from_diagnostics() {
+    for hide_credentials in [true, false] {
+        let plugin = direct_bind_plugin(json!({"hide_credentials": hide_credentials}));
+        let redacted: Vec<&str> = plugin
+            .request_headers_to_redact()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(redacted, ["authorization"]);
+        assert_eq!(plugin.modifies_request_headers(), hide_credentials);
+    }
+}
+
+#[test]
+fn test_hide_credentials_must_be_a_boolean() {
+    let config = direct_bind_config_with(json!({"hide_credentials": "yes"}));
+    let Err(error) = LdapAuth::new(&config, http_client()) else {
+        panic!("non-boolean hide_credentials must be rejected");
+    };
+    assert!(error.contains("'hide_credentials'"), "unexpected: {error}");
+}
+
+// ─── Service-account password is never trimmed (issue #5039) ─────────────
+
+/// Mock directory that records every request message it receives and then
+/// rejects the bind, so a test can assert exactly what reached the wire.
+async fn spawn_bind_recording_ldap_server(
+    recorded: Arc<RwLock<Vec<Vec<u8>>>>,
+) -> (u16, tokio::task::JoinHandle<()>) {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind recording LDAP server");
+    let port = listener
+        .local_addr()
+        .expect("recording LDAP local addr")
+        .port();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept service bind");
+        let bind = read_ldap_message_bytes(&mut stream).await;
+        recorded.write().expect("record bind message").push(bind);
+        let _ = stream.write_all(&bind_response(1, 49)).await;
+    });
+    (port, task)
+}
+
+#[test]
+fn test_service_account_password_keeps_surrounding_whitespace() {
+    let config = json!({
+        "ldap_url": "ldaps://ldap.example.com:636",
+        "search_base_dn": "ou=users,dc=example,dc=com",
+        "search_filter": "(uid={username})",
+        "canonical_identity_attribute": "uid",
+        "service_account_dn": "cn=admin,dc=example,dc=com",
+        "service_account_password": "  padded-secret  "
+    });
+    LdapAuth::new(&config, http_client()).expect("a padded password is a valid secret");
+}
+
+#[test]
+fn test_empty_service_account_password_still_rejected() {
+    let config = json!({
+        "ldap_url": "ldaps://ldap.example.com:636",
+        "search_base_dn": "ou=users,dc=example,dc=com",
+        "search_filter": "(uid={username})",
+        "canonical_identity_attribute": "uid",
+        "service_account_dn": "cn=admin,dc=example,dc=com",
+        "service_account_password": ""
+    });
+    let Err(error) = LdapAuth::new(&config, http_client()) else {
+        panic!("an empty password must be rejected");
+    };
+    assert!(
+        error.contains("'service_account_password'"),
+        "unexpected: {error}"
+    );
+}
+
+#[tokio::test]
+async fn test_service_account_bind_carries_the_configured_password_verbatim() {
+    let recorded = Arc::new(RwLock::new(Vec::new()));
+    let (port, task) = spawn_bind_recording_ldap_server(Arc::clone(&recorded)).await;
+    let config = json!({
+        "ldap_url": format!("ldap://127.0.0.1:{port}"),
+        "search_base_dn": "ou=users,dc=example,dc=com",
+        "search_filter": "(uid={username})",
+        "canonical_identity_attribute": "uid",
+        "service_account_dn": "cn=admin,dc=example,dc=com",
+        "service_account_password": "  padded-secret  ",
+        "consumer_mapping": false
+    });
+    let plugin = LdapAuth::new(&config, http_client()).expect("valid search-bind config");
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("alice", "user-secret"),
+    );
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    // A rejected service-account bind is an operator problem, not the client's.
+    assert_reject(result, Some(500));
+
+    let recorded = recorded.read().expect("read recorded messages");
+    let bind = recorded.first().expect("service bind was recorded");
+    assert!(
+        ldap_message_contains(bind, "  padded-secret  "),
+        "the service bind must carry the configured password verbatim"
+    );
+    task.abort();
+}
+
+// ─── Required-group DN matching (advisory GHSA-96v4-fqx6-rm3f) ───────────
+
+/// Direct-bind authentication whose group search returns exactly one entry
+/// carrying a NON-matching `sAMAccountName`, so only the entry's own DN can
+/// decide the required-group gate. No custom `group_filter` is configured, so
+/// the built-in membership filter is itself the membership proof.
+async fn assert_dn_fallback_group_result(
+    entry_dn: &'static str,
+    required_group: &'static str,
+    expect_authorized: bool,
+) {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind group LDAP server");
+    let port = listener.local_addr().expect("group LDAP local addr").port();
+    let task = tokio::spawn(async move {
+        let (mut user_stream, _) = listener.accept().await.expect("accept direct bind");
+        read_ldap_message(&mut user_stream).await;
+        user_stream
+            .write_all(&bind_response(1, 0))
+            .await
+            .expect("write direct bind success");
+        answer_canonical_identity_search(&mut user_stream).await;
+        drop(user_stream);
+
+        let (mut group_stream, _) = listener.accept().await.expect("accept group search");
+        read_ldap_message(&mut group_stream).await;
+        group_stream
+            .write_all(&search_result_entry(
+                1,
+                entry_dn,
+                &[("samaccountname", &["unrelated-group"])],
+            ))
+            .await
+            .expect("write group search entry");
+        group_stream
+            .write_all(&search_result_done(1, 0))
+            .await
+            .expect("write group search done");
+    });
+
+    let plugin = LdapAuth::new(
+        &json!({
+            "ldap_url": format!("ldap://127.0.0.1:{port}"),
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
+            "group_base_dn": "ou=groups,dc=example,dc=com",
+            "group_attribute": "sAMAccountName",
+            "required_groups": [required_group],
+            "consumer_mapping": false
+        }),
+        http_client(),
+    )
+    .expect("valid direct-bind group config");
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("alice", "user-secret"),
+    );
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    if expect_authorized {
+        assert_continue(result);
+    } else {
+        assert_reject(result, Some(403));
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn test_group_dn_fallback_matches_the_entry_own_cn_rdn() {
+    assert_dn_fallback_group_result("cn=admins,ou=groups,dc=example,dc=com", "admins", true).await;
+}
+
+#[tokio::test]
+async fn test_group_dn_fallback_matches_the_configured_group_attribute_rdn() {
+    assert_dn_fallback_group_result(
+        "sAMAccountName=admins,ou=groups,dc=example,dc=com",
+        "admins",
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_group_dn_fallback_matches_a_multi_valued_rdn_component() {
+    assert_dn_fallback_group_result(
+        "cn=admins+ou=engineering,ou=groups,dc=example,dc=com",
+        "admins",
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_entry_nested_under_a_required_group_is_not_that_group() {
+    assert_dn_fallback_group_result(
+        "uid=visitors,cn=admins,ou=groups,dc=example,dc=com",
+        "admins",
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_escaped_comma_rdn_cannot_impersonate_a_required_group() {
+    assert_dn_fallback_group_result(
+        "ou=visitors\\,cn=admins,ou=groups,dc=example,dc=com",
+        "admins",
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_escaped_comma_inside_a_legitimate_group_rdn_still_matches() {
+    assert_dn_fallback_group_result("cn=ad\\,mins,ou=groups,dc=example,dc=com", "ad,mins", true)
+        .await;
+}
+
+#[tokio::test]
+async fn test_hex_escaped_rdn_value_is_decoded_before_matching() {
+    assert_dn_fallback_group_result("cn=ad\\2Cmins,ou=groups,dc=example,dc=com", "ad,mins", true)
+        .await;
+}
+
+#[tokio::test]
+async fn test_unparsable_group_dn_fails_closed() {
+    assert_dn_fallback_group_result("not-a-distinguished-name", "admins", false).await;
 }
