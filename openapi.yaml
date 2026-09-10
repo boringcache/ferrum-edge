@@ -31632,7 +31632,7 @@ components:
     AiPromptShieldConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_prompt_shield — HTTP-only PII detection and redaction in bare JSON AI prompts. Native gRPC is unsupported (not registered for the Grpc protocol view). Framed gRPC-Web bodies remain outside the JSON inspection scope and are skipped without decoding."
+      description: "Plugin: ai_prompt_shield — HTTP-only PII detection and redaction in bare JSON AI prompts. Native gRPC is unsupported (not registered for the Grpc protocol view). Framed gRPC-Web bodies remain outside the JSON inspection scope and are skipped without decoding. Inspection is scoped to POST requests on every hook, including the request-body transform, so a co-located body plugin that forces buffering cannot extend redaction to another method. Every in-scope request is re-decided in on_final_request_body over the exact backend-visible body after all request-body transforms; reject and warn re-decide there and redact fails closed, because that hook cannot rewrite wire bytes."
       anyOf:
         - not:
             required: [patterns]
@@ -31661,14 +31661,16 @@ components:
           type: array
           items:
             type: object
+            additionalProperties: false
             required: [name, regex]
             properties:
               name:
                 type: string
+                maxLength: 128
               regex:
                 type: string
           default: []
-          description: "Custom {name, regex} patterns"
+          description: "Custom {name, regex} patterns. Each entry accepts exactly these two members; an unknown member is fatal at construction, like an unknown top-level field. `regex` must not match the empty string — a zero-width rule would insert the redaction placeholder at every position — and `name` is bounded (maxLength, in characters) because it is substituted into redaction_placeholder."
         scan_fields:
           type: string
           enum: [content, all]
@@ -31679,16 +31681,17 @@ components:
           items:
             type: string
           default: []
-          description: "Message roles to skip scanning. Filters messages[].role, Gemini contents[].role, and Cohere chat_history[].role (matched case-insensitively, since Cohere spells roles USER/CHATBOT/SYSTEM/TOOL); the value 'system' additionally suppresses the top-level system field, the Cohere preamble, and the Gemini system instruction"
+          description: "Message roles to skip scanning. Applies to scan_fields: content ONLY — scan_fields: all deliberately scans every value in the body regardless of role, so a role exemption does not preserve a message there. In content mode it filters messages[].role, Gemini contents[].role, and Cohere chat_history[].role (matched case-insensitively, since Cohere spells roles USER/CHATBOT/SYSTEM/TOOL); the value 'system' additionally suppresses the top-level system field, the Cohere preamble, and the Gemini system instruction. Provider inputs that carry no role, such as an OpenAI Responses function_call_output item, are never suppressed."
         redaction_placeholder:
           type: string
           default: "[REDACTED:{type}]"
-          description: Template for redacted text
+          description: "Template for redacted text. `{type}` is substituted with the matched pattern name; the RENDERED result must be at most 512 UTF-8 bytes, since every match re-emits it. Redaction output is additionally charged against a per-request growth allowance of four times the request body size (minimum 65536, maximum 67108864 bytes); an expanding policy that exhausts it fails the request closed with 413 rather than forwarding a partially redacted body."
         max_scan_bytes:
           type: integer
           minimum: 1
+          maximum: 9007199254740991
           default: 1048576
-          description: Maximum body size to scan; enforcing actions reject larger bodies instead of bypassing inspection
+          description: "Maximum body size to scan; enforcing actions reject larger bodies instead of bypassing inspection. The supported domain is 1 to 9007199254740991 (2^53-1), the largest integer every JSON number representation holds exactly, so this component and the constructor reach the same verdict for every input. A mathematically integral value is accepted however it is spelled (1024 and 1024.0 alike); a fractional, negative, zero, or out-of-range value is rejected at construction rather than truncated."
 
     AiPromptCompressorConfig:
       type: object

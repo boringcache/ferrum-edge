@@ -9350,11 +9350,44 @@ fn ai_prompt_shield_schema_matches_runtime_validation() {
         json!({"patterns": []}),
         json!({"max_scan_bytes": 0}),
         json!({"patterns": ["email"], "scan_field": "all"}),
+        // A `custom_patterns` entry is as closed as the top level: an
+        // unsupported nested member is refused by both surfaces, not read as
+        // name/regex and dropped.
+        json!({
+            "patterns": [],
+            "custom_patterns": [{"name": "account", "regex": "ACCT-[0-9]+", "note": "x"}]
+        }),
+        // The published `name` bound and the constructor's agree.
+        json!({
+            "patterns": [],
+            "custom_patterns": [{"name": "n".repeat(200), "regex": "ACCT-[0-9]+"}]
+        }),
     ] {
         assert_component_validity(&spec, "AiPromptShieldConfig", &config, false);
         assert!(
             AiPromptShield::new(&config).is_err(),
             "runtime should reject schema-invalid config: {config}"
+        );
+    }
+
+    // `max_scan_bytes` publishes an explicit numeric domain whose bound every
+    // JSON number representation holds exactly, so the component and the
+    // constructor reach the same verdict at, just above, and far above it.
+    // Written through `from_str` because `json!` would need the literals to fit
+    // a Rust integer type.
+    for (raw, expected_valid) in [
+        (r#"{"max_scan_bytes":9007199254740991}"#, true),
+        (r#"{"max_scan_bytes":1024.0}"#, true),
+        (r#"{"max_scan_bytes":9007199254740992}"#, false),
+        (r#"{"max_scan_bytes":18446744073709551616}"#, false),
+        (r#"{"max_scan_bytes":1024.5}"#, false),
+    ] {
+        let config: serde_json::Value = serde_json::from_str(raw).expect("fixture parses");
+        assert_component_validity(&spec, "AiPromptShieldConfig", &config, expected_valid);
+        assert_eq!(
+            AiPromptShield::new(&config).is_ok(),
+            expected_valid,
+            "component and constructor must agree on {raw}"
         );
     }
 }
