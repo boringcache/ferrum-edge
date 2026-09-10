@@ -8507,6 +8507,7 @@ fn mesh_authz_keeps_omitted_optional_matchers_and_empty_scaffolds() {
     .expect("a rule carrying only its action is valid");
 
     MeshAuthz::new(&json!({
+        "namespace": "default",
         "mesh_policies": [{
             "name": "scaffold",
             "namespace": "default",
