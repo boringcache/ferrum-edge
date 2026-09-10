@@ -2312,6 +2312,208 @@ fn grpc_method_router_schema_matches_runtime_validation() {
     }
 }
 
+/// Issue #5004: `RateLimitingConfig` / `RateLimitingRuleConfig` must admit
+/// exactly what the constructor admits, so schema-driven editors and clients do
+/// not disagree with file/admin admission. Table-driven both ways; the three
+/// rules JSON Schema cannot express are asserted explicitly as residuals rather
+/// than implied to be parity.
+#[test]
+fn rate_limiting_schema_and_runtime_admission_agree() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/RateLimitingConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("RateLimitingConfig schema compiles");
+
+    for config in [
+        // Baseline.
+        json!({"limits": [{"scope": "default", "window_seconds": 60, "max_requests": 2}]}),
+        // `null` is the same as omitting the dimension, and the parser
+        // normalizes ASCII case on limit_by / sync_mode / scope.
+        json!({
+            "limit_by": null,
+            "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 2}]
+        }),
+        json!({
+            "limit_by": "IP",
+            "sync_mode": "LOCAL",
+            "limits": [{"scope": "DEFAULT", "window_seconds": 60, "max_requests": 2}]
+        }),
+        json!({
+            "limit_by": "spiffe",
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+        // Consumer-scoped rules alongside the required default rule.
+        json!({
+            "limit_by": "consumer",
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {"scope": "consumers", "consumers": ["alice"], "requests_per_minute": 1000}
+            ]
+        }),
+        // The exact documented Redis example (docs/plugins.md).
+        json!({
+            "limit_by": "consumer",
+            "expose_headers": true,
+            "sync_mode": "redis",
+            "redis_url": "redis://redis-host:6379/0",
+            "redis_tls": true,
+            "redis_key_prefix": "myapp:rate_limiting",
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {
+                    "scope": "consumers",
+                    "consumers": ["premium-app", "partner-app"],
+                    "requests_per_minute": 1000
+                },
+                {
+                    "scope": "consumers",
+                    "consumers": ["batch-worker"],
+                    "window_seconds": 60,
+                    "max_requests": 250
+                }
+            ]
+        }),
+    ] {
+        assert!(
+            validator.validate(&config).is_ok(),
+            "schema should accept: {config}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("rate_limiting", &config).is_ok(),
+            "runtime should accept schema-valid config: {config}"
+        );
+    }
+
+    for config in [
+        // No `scope: default` rule at all.
+        json!({
+            "limit_by": "consumer",
+            "limits": [{"scope": "consumers", "consumers": ["alice"], "requests_per_minute": 1}]
+        }),
+        // Two default rules.
+        json!({
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {"scope": "default", "requests_per_minute": 10}
+            ]
+        }),
+        // A consumers rule without `limit_by: consumer` (explicit and implied).
+        json!({
+            "limit_by": "ip",
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {"scope": "consumers", "consumers": ["alice"], "requests_per_minute": 10}
+            ]
+        }),
+        json!({
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {"scope": "consumers", "consumers": ["alice"], "requests_per_minute": 10}
+            ]
+        }),
+        // `limit_by: null` means `ip`, so it is not a consumer dimension either.
+        json!({
+            "limit_by": null,
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {"scope": "consumers", "consumers": ["alice"], "requests_per_minute": 10}
+            ]
+        }),
+        // One identity repeated inside a single consumers rule.
+        json!({
+            "limit_by": "consumer",
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {
+                    "scope": "consumers",
+                    "consumers": ["alice", "alice"],
+                    "requests_per_minute": 10
+                }
+            ]
+        }),
+        // Centralized mode without an endpoint.
+        json!({
+            "sync_mode": "redis",
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+        // Latent/explicit Redis scalars the constructor bounds.
+        json!({
+            "redis_key_prefix": "",
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+        json!({
+            "redis_connect_timeout_seconds": 0,
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+        json!({
+            "redis_connect_timeout_seconds": -1,
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+        json!({
+            "redis_health_check_interval_seconds": 0,
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+        // Issue #5005: an unusable database selector.
+        json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:6379/banana",
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+    ] {
+        assert!(
+            validator.validate(&config).is_err(),
+            "schema should reject: {config}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("rate_limiting", &config).is_err(),
+            "runtime should reject schema-invalid config: {config}"
+        );
+    }
+
+    // Documented residuals: the constructor is stricter than any JSON Schema
+    // can be here, so these are refused at admission and accepted by the
+    // schema. Both halves are asserted so a future schema tightening (or a
+    // constructor relaxation) has to update this list deliberately.
+    for config in [
+        // One identity named in two *different* consumers rules.
+        json!({
+            "limit_by": "consumer",
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {"scope": "consumers", "consumers": ["alice"], "requests_per_minute": 10},
+                {"scope": "consumers", "consumers": ["alice"], "requests_per_minute": 20}
+            ]
+        }),
+        // An out-of-range TCP port in redis_url.
+        json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:99999/0",
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+    ] {
+        assert!(
+            validator.validate(&config).is_ok(),
+            "documented residual must still be schema-valid: {config}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("rate_limiting", &config).is_err(),
+            "documented residual must be refused at admission: {config}"
+        );
+    }
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    assert!(
+        plugin_docs.contains("Three residual rules JSON Schema cannot express"),
+        "rate_limiting docs must state which admission rules the schema cannot express"
+    );
+}
+
 #[test]
 fn rate_limiting_config_schema_requires_redis_pool_size_minimum() {
     // Issue #2304: redis_pool_size remains operator-facing and must advertise
