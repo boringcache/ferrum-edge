@@ -2618,7 +2618,7 @@ Authenticates requests using Ferrum's versioned HMAC authorization scheme with m
 | `sync_mode` | String | `local` | `redis` is required by, and only valid with, `replay_scope: shared` |
 | `redis_url`, `redis_tls`, `redis_key_prefix`, `redis_pool_size`, `redis_connect_timeout_seconds`, `redis_health_check_interval_seconds`, `redis_username`, `redis_password` | — | — | Shared Redis connectivity for the replay authority. Same semantics as every other Redis-backed plugin. The default key prefix is `{FERRUM_NAMESPACE}:hmac_auth:{plugin-config-id}` |
 
-The root key set is closed: a misspelled `replay_scope` or `signing_profile` fails admission rather than leaving the policy on a weaker posture than the operator wrote.
+The root key set is closed: a misspelled `replay_scope` or `signing_profile` fails admission rather than leaving the policy on a weaker posture than the operator wrote. The enumerated values are matched **exactly** — `signing_profile`, `replay_scope`, and `sync_mode` accept only the canonical lowercase spellings listed above, with no surrounding whitespace — so the published OpenAPI schema and the gateway admit exactly the same configurations. `replay_scope` is required with `ferrum-hmac-v2` and rejected with `ferrum-hmac-v1`; `allow_unsafe_replayable_v1: true` is required with v1 and rejected with v2; `sync_mode: redis` is required by, and only valid with, `replay_scope: shared`, and needs a `redis_url`.
 
 Expected `Authorization` header format (`ferrum-hmac-v2`):
 

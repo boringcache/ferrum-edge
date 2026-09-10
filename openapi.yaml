@@ -10923,6 +10923,7 @@ components:
               plugin_name:
                 const: hmac_auth
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/HmacAuthConfig"
@@ -20699,7 +20700,9 @@ components:
             request instead of falling back to freshness-only acceptance.
         replay_max_entries:
           type: integer
+          format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           default: 100000
           description: >-
             Capacity this process-scoped authority enforces against the shared
@@ -20758,6 +20761,59 @@ components:
         redis_password:
           type: string
           description: Redis password
+      allOf:
+        # The constructor's profile/scope/backend admission, expressed exactly.
+        # An omitted `signing_profile` means `ferrum-hmac-v2`, so the v2 rules
+        # live in the `else` branch rather than in a second `if`.
+        - if:
+            required: [signing_profile]
+            properties:
+              signing_profile:
+                const: ferrum-hmac-v1
+          then:
+            # v1 has no replay state at all: it demands the unsafe
+            # acknowledgement and refuses every replay knob.
+            required: [allow_unsafe_replayable_v1]
+            properties:
+              allow_unsafe_replayable_v1:
+                const: true
+              sync_mode:
+                const: local
+            not:
+              required: [replay_scope]
+          else:
+            # ferrum-hmac-v2 (the default) has no default replay scope, and the
+            # unsafe acknowledgement is only meaningful with v1.
+            required: [replay_scope]
+            properties:
+              allow_unsafe_replayable_v1:
+                const: false
+        - if:
+            required: [replay_scope]
+            properties:
+              replay_scope:
+                const: shared
+          then:
+            required: [sync_mode, redis_url]
+            properties:
+              sync_mode:
+                const: redis
+        - if:
+            required: [replay_scope]
+            properties:
+              replay_scope:
+                const: process
+          then:
+            properties:
+              sync_mode:
+                const: local
+        - if:
+            required: [sync_mode]
+            properties:
+              sync_mode:
+                const: redis
+          then:
+            required: [redis_url]
 
     # ── Mesh / Service-Mesh Plugins ─────────────────────────────────
     # These plugins are primarily auto-injected by mesh mode (sidecar / ambient /
