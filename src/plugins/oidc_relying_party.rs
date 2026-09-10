@@ -37,6 +37,7 @@ use super::utils::jwks_cache::{
 };
 use super::utils::jwks_store::{DEFAULT_JWKS_MAX_STALE_SECONDS, JwksKeyStore};
 use super::utils::jwt_verifier::{JwtVerifyParams, verify_jwt_with_jwks};
+use super::utils::log_helpers::redacted_endpoint_url_str;
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
 use super::{PluginResult, RequestContext};
@@ -1497,7 +1498,11 @@ impl OidcRelyingParty {
         }
         self.provider
             .http_client
-            .execute(with_form_body(request, &params), "oidc_rp_token")
+            .execute_redacted(
+                with_form_body(request, &params),
+                "oidc_rp_token",
+                &redacted_endpoint_url_str(token_endpoint),
+            )
             .await
             .map_err(|_| r#"{"error":"Token endpoint request failed"}"#.to_string())
     }
@@ -1592,7 +1597,7 @@ impl OidcRelyingParty {
         let response = self
             .provider
             .http_client
-            .execute(
+            .execute_redacted(
                 self.provider
                     .http_client
                     .get()
@@ -1600,6 +1605,7 @@ impl OidcRelyingParty {
                     .get(endpoint)
                     .bearer_auth(access_token),
                 "oidc_rp_userinfo",
+                &redacted_endpoint_url_str(endpoint),
             )
             .await
             .map_err(|error| format!("userinfo request failed: {error}"))?;
@@ -4321,7 +4327,11 @@ async fn fetch_discovery(
         .get()
         .map_err(|e| format!("discovery request failed: {e}"))?;
     let response = http_client
-        .execute(client.get(discovery_url), "oidc_rp_discovery")
+        .execute_redacted(
+            client.get(discovery_url),
+            "oidc_rp_discovery",
+            &redacted_endpoint_url_str(discovery_url),
+        )
         .await
         .map_err(|e| format!("discovery request failed: {e}"))?;
     if !response.status().is_success() {

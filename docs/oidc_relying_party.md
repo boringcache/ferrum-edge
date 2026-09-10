@@ -58,6 +58,13 @@ The plugin is active in four phases (priority `1075`):
 - Claim header mappings reject reserved headers, including `Authorization`, `Host`, hop-by-hop headers, and Ferrum consumer identity headers.
 - The gateway session cookie and the sealed pending-flow correlation cookies are removed from the `Cookie` header forwarded to the selected backend, on every protocol this plugin serves (HTTP/1.1, HTTP/2, the HTTP/3 cross-protocol bridge, gRPC, and the WebSocket handshake). Unrelated application cookies are preserved exactly, and the strip runs after authentication so it never changes an authentication decision. Encryption keeps a backend from *reading* the session, but not from replaying it: the sealed value is a complete gateway credential that any other route under the same OIDC policy would accept. The upstream already receives the verified identity and `claim_headers` values, so it does not need the credential itself. Set `session.hide_session_cookie: false` to opt back into passthrough when a backend genuinely requires the raw cookie.
 
+## Provider diagnostics
+
+Provider-call diagnostics for discovery, UserInfo, token grants, and revocation
+use a structurally redacted endpoint (`scheme://host:port/redacted`) and a safe
+transport error class. URL userinfo, paths, queries, and fragments are omitted
+from error strings as well as shared HTTP-client logs.
+
 ## Multi-replica deployments
 
 Fresh logins work behind non-sticky load balancers when every Ferrum replica shares the same `oidc_relying_party` configuration and `session.encryption_secret` (plus `encryption_secret_previous` during rotation). The durable session cookie was already replica-safe; pending authorization-code state is now likewise carried in the sealed correlation cookie, so an `/oidc`/`/oauth` callback may land on a different replica than the one that issued the challenge. Sticky sessions are not required for login completion. Keep encryption secrets identical across the fleet; a replica with the wrong secret or a different provider/session context rejects sealed pending-flow cookies and fails closed.

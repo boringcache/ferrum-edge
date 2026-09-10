@@ -588,7 +588,8 @@ so disabling metadata/hash observability cannot be bypassed by lifecycle state.
 > Thus a dry-run denied/approval-required call remains forwarded but appears in
 > transaction logs with `decision`, `tool_names`, and (when
 > `hash_arguments: true`) `arguments_hashes`. Streaming **enforce** decisions
-> still cut the stream and are also logged at `warn`.
+> still cut the stream and emit sampled warnings (one per source site per
+> 10 seconds with suppressed-event counts); every detail remains at `debug`.
 
 ## Composition
 

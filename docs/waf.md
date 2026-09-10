@@ -647,10 +647,12 @@ and later instances are not invoked for it.
 **Observability.** A closed WebSocket session has no per-message
 transaction-summary surface, so message findings are emitted as
 fixed-cardinality `waf`-target log events instead of `waf.*` transaction
-metadata: one event for every block (always, since the close is the only other
+metadata: a diagnostic for every block (always, since the close is the only other
 signal), plus one per matched rule and one per non-blocking
 oversize/uninspectable/scan-timeout signal when `log_to_stdout` is enabled. No
-message bytes are logged. Monitor-mode WebSocket findings are non-blocking and
+message bytes are logged. Warnings are sampled once per source site per 10 seconds
+across all sessions, with suppressed-event counts; every diagnostic is available
+at debug level. Monitor-mode WebSocket findings are non-blocking and
 there is no per-message transaction metadata surface, so enable
 `log_to_stdout` when staging WebSocket policy in `mode: monitor`; otherwise
 those findings intentionally produce no operator-visible signal.
@@ -812,8 +814,10 @@ so enforce-mode impact stays directly countable before you switch modes — in
 particular the server-first `first_bytes_unavailable` false-positive risk noted
 above, whose would-blocks carry no `waf.rule_hits` to infer from.
 
-`log_to_stdout` additionally emits a dedicated structured `warn!`
-(`target: "waf"`) per matched rule, independent of any logging plugin. Each
+`log_to_stdout` additionally emits dedicated structured diagnostics
+(`target: "waf"`), independent of any logging plugin. Per-rule details are
+available at debug level; warnings sample one event per source site per 10 seconds
+and report `suppressed_events` (shared across rules and instances). Each
 event carries `action` as that rule's **effective direct outcome** after applying
 the global mode (`blocked`, `monitored`, or `disabled`) and `rule_action` as the
 configured rule action (`enforce`, `monitor`, or `disabled`). Aggregate anomaly
@@ -856,7 +860,7 @@ fire, then switch to `enforce`.
 | `reject_content_type` | string | `application/json` | blocked-response content type |
 | `reject_body` | string | `{"error":"Forbidden"}` | blocked-response body |
 | `log_to_metadata` | bool | `true` | write `waf.*` metadata |
-| `log_to_stdout` | bool | `false` | structured per-hit warning |
+| `log_to_stdout` | bool | `false` | structured hit diagnostics: sampled warnings and per-hit debug detail |
 | `stream` | object | _(off)_ | raw TCP/UDP inspection (see [Stream inspection](#stream-tcpudp-inspection)) |
 
 ### `stream` block

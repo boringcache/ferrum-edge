@@ -4370,7 +4370,7 @@ fn assert_waf_stdout_hit_action(logs: &str, effective: &str, configured: &str) {
 
 #[tokio::test]
 async fn log_to_stdout_monitor_mode_logs_monitored_effective_action() {
-    let (logs, guard) = super::plugin_utils::capture_logs();
+    let (logs, guard) = super::plugin_utils::capture_debug_logs();
     let plugin = Waf::new(&json!({
         "mode": "monitor",
         "default_rule_action": "enforce",
@@ -4391,14 +4391,14 @@ async fn log_to_stdout_monitor_mode_logs_monitored_effective_action() {
     let captured = logs.contents();
     assert!(
         captured.contains("WAF rule matched"),
-        "expected per-hit warning: {captured}"
+        "expected per-hit diagnostic: {captured}"
     );
     assert_waf_stdout_hit_action(&captured, "monitored", "enforce");
 }
 
 #[tokio::test]
 async fn log_to_stdout_enforce_mode_logs_blocked_effective_action() {
-    let (logs, guard) = super::plugin_utils::capture_logs();
+    let (logs, guard) = super::plugin_utils::capture_debug_logs();
     let plugin = Waf::new(&json!({
         "rule_modes": { "FE-SQLI-002": "enforce" },
         "log_to_stdout": true
@@ -4418,14 +4418,14 @@ async fn log_to_stdout_enforce_mode_logs_blocked_effective_action() {
     let captured = logs.contents();
     assert!(
         captured.contains("WAF rule matched"),
-        "expected per-hit warning: {captured}"
+        "expected per-hit diagnostic: {captured}"
     );
     assert_waf_stdout_hit_action(&captured, "blocked", "enforce");
 }
 
 #[tokio::test]
 async fn log_to_stdout_stream_monitor_mode_logs_monitored_effective_action() {
-    let (logs, guard) = super::plugin_utils::capture_logs();
+    let (logs, guard) = super::plugin_utils::capture_debug_logs();
     let plugin = Waf::new(&json!({
         "mode": "monitor",
         "include_default_rules": false,
@@ -4451,7 +4451,7 @@ async fn log_to_stdout_stream_monitor_mode_logs_monitored_effective_action() {
     let captured = logs.contents();
     assert!(
         captured.contains("WAF stream signature matched"),
-        "expected per-hit stream warning: {captured}"
+        "expected per-hit stream diagnostic: {captured}"
     );
     assert_waf_stdout_hit_action(&captured, "monitored", "enforce");
 }

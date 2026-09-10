@@ -325,6 +325,8 @@
 //! `xsd:dateTime` instants and `xsd:base64Binary` payloads — is normalized, by
 //! `element_text_collapsed`.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use crate::fips::backend::digest;
 use crate::fips::backend::signature as ring_sig;
 use async_trait::async_trait;
@@ -336,7 +338,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
-use tracing::{debug, warn};
+use tracing::debug;
 use x509_parser::prelude::*;
 
 use crate::tls::source::{CertSource, MaterialKind, SecretString, load_material_blocking};
@@ -2727,7 +2729,7 @@ impl SoapWsSecurity {
     /// process-local" knob: a per-replica fallback would silently reinstate the
     /// bypass the shared backend exists to close.
     fn shared_backend_unavailable() -> String {
-        warn!(
+        warn_sampled!(
             failure_class = Self::NONCE_SHARED_BACKEND_UNAVAILABLE_CLASS,
             "soap_ws_security: shared replay backend is unavailable"
         );
@@ -2735,7 +2737,7 @@ impl SoapWsSecurity {
     }
 
     fn nonce_too_long() -> String {
-        warn!(
+        warn_sampled!(
             failure_class = Self::NONCE_TOO_LONG_CLASS,
             "soap_ws_security: Nonce exceeds the maximum permitted length"
         );
@@ -2870,7 +2872,7 @@ impl SoapWsSecurity {
     }
 
     fn nonce_state_saturated() -> String {
-        warn!(
+        warn_sampled!(
             failure_class = Self::NONCE_STATE_SATURATED_CLASS,
             "soap_ws_security: replay protection state is at capacity"
         );
@@ -4762,7 +4764,7 @@ impl SoapWsSecurity {
         // PasswordDigest binding compares against this same element, and binding
         // against an unvalidated instant would be no binding at all.
         if let Err(error) = self.validate_timestamp(security, now) {
-            warn!(
+            warn_sampled!(
                 failure_class = "timestamp",
                 "soap_ws_security: timestamp validation failed"
             );
@@ -4780,7 +4782,7 @@ impl SoapWsSecurity {
                 Err(UsernameTokenError::InvalidCredentials) => {
                     // Generic response + stable failure class: do not log the
                     // candidate username or password/digest verification detail.
-                    warn!(
+                    warn_sampled!(
                         failure_class = UsernameTokenError::INVALID_CREDENTIALS_CLASS,
                         "soap_ws_security: UsernameToken authentication failed"
                     );
@@ -4791,7 +4793,7 @@ impl SoapWsSecurity {
                     });
                 }
                 Err(UsernameTokenError::Structural(detail)) => {
-                    warn!(
+                    warn_sampled!(
                         failure_class = UsernameTokenError::STRUCTURAL_CLASS,
                         "soap_ws_security: UsernameToken structural validation failed"
                     );
@@ -4822,7 +4824,7 @@ impl SoapWsSecurity {
                         .get_or_insert_with(|| cert_principal.to_string());
                 }
                 Err(error) => {
-                    warn!(
+                    warn_sampled!(
                         failure_class = "x509_signature",
                         "soap_ws_security: X.509 signature validation failed"
                     );
@@ -4843,7 +4845,7 @@ impl SoapWsSecurity {
                     principal.saml_subject = Some(name_id);
                 }
                 Err(error) => {
-                    warn!(
+                    warn_sampled!(
                         failure_class = "saml",
                         "soap_ws_security: SAML validation failed"
                     );
@@ -4950,7 +4952,7 @@ impl SoapWsSecurity {
             SoapRequestDisposition::Governed(class) => class,
             SoapRequestDisposition::PassThrough => return PluginResult::Continue,
             SoapRequestDisposition::Reject(rejection) => {
-                warn!(
+                warn_sampled!(
                     failure_class = rejection.class(),
                     "soap_ws_security: request representation rejected on a SOAP-protected route"
                 );
@@ -5470,7 +5472,7 @@ impl Plugin for SoapWsSecurity {
         if sha256_array(body) == expected {
             return PluginResult::Continue;
         }
-        warn!(
+        warn_sampled!(
             failure_class = "authenticated_body_mutated",
             "soap_ws_security: refusing to dispatch a SOAP message whose body changed after \
              WS-Security validation"

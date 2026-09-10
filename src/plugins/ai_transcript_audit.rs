@@ -57,6 +57,8 @@
 //! `ai_semantic_firewall`, `ai_response_guard`, and the tool governance in
 //! `ai_semantic_firewall` for enforcement.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Write};
@@ -1294,7 +1296,7 @@ fn expire_stream_reservation(
     let total = stream_reservations_expired
         .fetch_add(1, Ordering::Relaxed)
         .saturating_add(1);
-    tracing::warn!(
+    warn_sampled!(
         plugin = "ai_transcript_audit",
         expired = 1_u64,
         total_expired = total,
@@ -5818,7 +5820,7 @@ fn classify_batch_delivery(
                 SinkLossReason::BatchDiscard,
                 entry_count as u64,
             );
-            tracing::warn!(
+            warn_sampled!(
                 "ai_transcript_audit batch discarded due to {} response ({} entries lost){}",
                 status,
                 entry_count,

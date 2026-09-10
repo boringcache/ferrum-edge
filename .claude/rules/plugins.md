@@ -247,11 +247,15 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     request representation phase, run once by
     `run_final_request_body_hooks_with_provenance` immediately before step 6 on
     every dispatch ladder (`GHSA-3973-47g5-4mcx`). A plugin claims a request with
-    `enforces_final_request_body_policy` (`waf`, `body_validator`, `graphql`)
+    `enforces_final_request_body_policy` (`waf`, `body_validator`, `graphql`,
+    and deny-policy `a2a_gateway` configurations)
     only when its configured policy would BOTH inspect this representation and
     be able to REFUSE it — a `monitor`-mode WAF, a body rule set that only logs,
     and an `on_body_too_large: skip` body outside the scan window all lose an
-    observation rather than fail closed, and must not claim;
+    observation rather than fail closed, and must not claim. The broader
+    `enforces_finalized_request_policy` composition capability also includes
+    `ai_prompt_shield`: it rejects a final representation it cannot inspect,
+    but does not currently claim the staged plaintext inspection view;
     for a claimed request whose finalized `Content-Encoding` names a transforming
     coding, the ordered `#content-coding` list is parsed and decoded in reverse
     application order into a staged PLAINTEXT INSPECTION VIEW, and anything
@@ -267,9 +271,11 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     body. This phase is independent of `compression`: an enforcing
     policy may not silently depend on a separately configured decompressor.
     Codec strictness and charge ordering come from `plugins::charged_decode`,
-    shared with the response gate — the permissive
-    `utils::content_encoding` decoder (`BrotliState::new`, `large_window = true`)
-    is deliberately unreachable from this security gate. The complete decode
+    shared with the response gate. The generic `utils::content_encoding`
+    inspection decoder also uses its strict `StrictBrotliReader` primitive
+    (`BrotliState::new_strict`, Large Window refused), but does not reserve the
+    aggregate working-set budget; this security gate uses the charged decoder.
+    The complete decode
     working set (output capacity, stacked-pass concurrency window, and the ACTIVE
     decoder's own heap, reserved before the decoder is CONSTRUCTED) is charged to
     a process-wide `FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES` budget before

@@ -24,13 +24,14 @@ mod scan;
 mod stream;
 mod websocket;
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tracing::warn;
 
 use self::defaults::default_rules;
 use self::exemptions::CompiledExemptions;
@@ -750,7 +751,7 @@ impl Waf {
         }
         let globally_enforcing = self.config.mode == GlobalMode::Enforce;
         for hit in hits {
-            warn!(
+            warn_sampled!(
                 target: "waf",
                 proxy = %proxy_id,
                 rule = %hit.id,
@@ -814,7 +815,7 @@ impl Waf {
                 ctx.set_waf_metadata_if_absent("waf.block_reason", "body_too_large");
             }
             if self.config.log_to_stdout {
-                warn!(
+                warn_sampled!(
                     target: "waf",
                     proxy = %proxy_id(ctx),
                     client_ip = %ctx.client_ip,
@@ -959,7 +960,7 @@ impl Waf {
             }
         }
         if !matches!(self.config.on_scan_timeout, TimeoutAction::Allow) {
-            warn!(
+            warn_sampled!(
                 target: "waf",
                 proxy = %proxy_id(ctx),
                 client_ip = %ctx.client_ip,
@@ -981,7 +982,7 @@ impl Waf {
         }
         let rule = &self.compiled.rules[hit.rule_index];
         let globally_enforcing = self.config.mode == GlobalMode::Enforce;
-        warn!(
+        warn_sampled!(
             target: "waf",
             proxy = %proxy_id(ctx),
             rule = %rule.id,
@@ -1262,7 +1263,7 @@ impl Plugin for Waf {
                     "tcp_require_tls",
                 );
                 if self.config.log_to_stdout {
-                    warn!(
+                    warn_sampled!(
                         target: "waf",
                         proxy = %ctx.proxy_id,
                         client_ip = %ctx.client_ip,
@@ -1322,7 +1323,7 @@ impl Plugin for Waf {
                         "first_bytes_unavailable",
                     );
                     if self.config.log_to_stdout {
-                        warn!(
+                        warn_sampled!(
                             target: "waf",
                             proxy = %ctx.proxy_id,
                             client_ip = %ctx.client_ip,
@@ -1472,7 +1473,7 @@ impl Plugin for Waf {
         if is_control || !self.requires_ws_frame_hooks() {
             return None;
         }
-        warn!(
+        warn_sampled!(
             target: "waf",
             plugin = "waf",
             proxy = %proxy_id,

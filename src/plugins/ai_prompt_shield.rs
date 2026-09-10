@@ -70,7 +70,9 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{debug, warn};
+use tracing::debug;
+
+use crate::plugins::utils::log_sampling::warn_sampled;
 
 use super::utils::body_transform::is_json_content_type;
 use super::{Plugin, PluginResult, RequestContext};
@@ -1401,7 +1403,7 @@ impl AiPromptShield {
     fn handle_oversize_body(&self, ctx: &mut RequestContext, body_size: usize) -> PluginResult {
         match self.action {
             ShieldAction::Warn => {
-                warn!(
+                warn_sampled!(
                     body_size,
                     max_scan_bytes = self.max_scan_bytes,
                     "ai_prompt_shield: request body exceeds scan ceiling (warn mode)"
@@ -1413,7 +1415,7 @@ impl AiPromptShield {
                 PluginResult::Continue
             }
             ShieldAction::Reject | ShieldAction::Redact => {
-                warn!(
+                warn_sampled!(
                     body_size,
                     max_scan_bytes = self.max_scan_bytes,
                     "ai_prompt_shield: rejecting request body above scan ceiling"
@@ -1470,7 +1472,7 @@ impl AiPromptShield {
                 }
             }
             ShieldAction::Warn => {
-                warn!(
+                warn_sampled!(
                     "ai_prompt_shield: PII detected in the final request body (types: {:?}), passing through (warn mode)",
                     detected
                 );
@@ -1483,7 +1485,7 @@ impl AiPromptShield {
                 // Forwarding would leak the plaintext body, so redaction policy
                 // fails closed on any PII still present in the dispatched
                 // representation.
-                warn!(
+                warn_sampled!(
                     "ai_prompt_shield: PII detected in the final request body (types: {:?}) but that body cannot be rewritten, rejecting request",
                     detected
                 );
@@ -1513,7 +1515,7 @@ impl AiPromptShield {
     ) -> PluginResult {
         match self.action {
             ShieldAction::Warn => {
-                warn!(
+                warn_sampled!(
                     reason,
                     "ai_prompt_shield: deferred request body could not be inspected (warn mode)"
                 );
@@ -1522,7 +1524,7 @@ impl AiPromptShield {
                 PluginResult::Continue
             }
             ShieldAction::Reject | ShieldAction::Redact => {
-                warn!(
+                warn_sampled!(
                     reason,
                     "ai_prompt_shield: rejecting uninspectable deferred request body"
                 );
@@ -1697,7 +1699,7 @@ impl Plugin for AiPromptShield {
                 }
             }
             ShieldAction::Warn => {
-                warn!(
+                warn_sampled!(
                     "ai_prompt_shield: PII detected (types: {:?}), passing through (warn mode)",
                     detected
                 );
@@ -1758,7 +1760,7 @@ impl Plugin for AiPromptShield {
                         // only a cross-token custom pattern). Fail closed
                         // rather than forward the value while reporting it
                         // redacted.
-                        warn!(
+                        warn_sampled!(
                             "ai_prompt_shield: PII detected (types: {:?}) could not be fully redacted, rejecting request",
                             detected
                         );
@@ -1781,7 +1783,7 @@ impl Plugin for AiPromptShield {
                         // zero-width match). Nothing partially rewritten is
                         // forwarded; the request is refused as un-redactable at
                         // this size, matching the scan-ceiling disposition.
-                        warn!(
+                        warn_sampled!(
                             body_size = original_body.len(),
                             "ai_prompt_shield: redaction exceeded the request output budget, rejecting request"
                         );
@@ -1804,7 +1806,7 @@ impl Plugin for AiPromptShield {
                         // found nothing to change. This should not happen for a
                         // parseable in-range body, but if it does, do not claim
                         // redaction and do not forward unredacted PII.
-                        warn!(
+                        warn_sampled!(
                             "ai_prompt_shield: PII detected (types: {:?}) but redaction produced no change, rejecting request",
                             detected
                         );

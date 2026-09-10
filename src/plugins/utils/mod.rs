@@ -30,6 +30,7 @@ pub mod jwks_cache;
 pub mod jwks_store;
 pub mod jwt_verifier;
 pub mod log_helpers;
+pub mod log_sampling;
 pub mod log_schema;
 pub mod metadata_redaction;
 pub mod openai_error;

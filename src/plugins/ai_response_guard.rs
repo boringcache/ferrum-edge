@@ -35,7 +35,9 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read as _, Write as _};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{debug, warn};
+use tracing::debug;
+
+use crate::plugins::utils::log_sampling::warn_sampled;
 
 use super::utils::body_transform::is_json_content_type;
 use super::utils::json_escape::escape_json_string;
@@ -1438,7 +1440,7 @@ impl AiResponseGuard {
                 }
             }
             GuardAction::Warn => {
-                warn!(
+                warn_sampled!(
                     "ai_response_guard: content detected (types: {:?}), passing through (warn mode)",
                     detected
                 );
@@ -3300,7 +3302,7 @@ fn load_grpc_inspection(
     let pool = match load_grpc_descriptor_pool_inner(&shape.descriptor_path) {
         Ok(pool) => pool,
         Err((true, _)) => {
-            warn!(
+            warn_sampled!(
                 plugin = "ai_response_guard",
                 "Protobuf descriptor dependency is unavailable; enrolled gRPC methods fail closed"
             );
@@ -4024,7 +4026,7 @@ impl Plugin for AiResponseGuard {
             .ai_response_guard_pending_redactions
             .remove(&self.instance_id)
         {
-            warn!(
+            warn_sampled!(
                 "ai_response_guard: detected content was not redacted before delivery (types: {}), rejecting response",
                 detected
             );
@@ -4050,7 +4052,7 @@ impl Plugin for AiResponseGuard {
         else {
             return PluginResult::Continue;
         };
-        warn!(
+        warn_sampled!(
             "ai_response_guard: detected content is still present in the final client-visible response (types: {}), rejecting response",
             detected
         );

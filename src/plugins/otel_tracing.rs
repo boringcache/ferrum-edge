@@ -23,6 +23,8 @@
 //!   for extensions); `http.request.method` retains the observed token.
 //! - Exporter queues are count- and byte-bounded; diagnostics use redacted URLs.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
@@ -2114,9 +2116,10 @@ async fn deliver_trace_payload(
         // Collector-supplied throttling instruction for THIS attempt only.
         let mut throttle: Option<Duration> = None;
         let Some(http) = cfg.http_client.get().ok() else {
-            warn!(
+            warn_sampled!(
                 "{} export batch discarded: plugin HTTP client unavailable ({} spans lost)",
-                cfg.provider_name, entry_count,
+                cfg.provider_name,
+                entry_count,
             );
             return;
         };
@@ -2151,23 +2154,32 @@ async fn deliver_trace_payload(
             }
             Ok(response) => {
                 let status = response.status();
-                warn!(
+                warn_sampled!(
                     "{} export failed with status {} for {} (attempt {}/{})",
-                    cfg.provider_name, status, cfg.endpoint_for_logs, attempt, total_attempts,
+                    cfg.provider_name,
+                    status,
+                    cfg.endpoint_for_logs,
+                    attempt,
+                    total_attempts,
                 );
                 if !trace_status_is_retryable(cfg.payload_kind, status) {
-                    warn!(
+                    warn_sampled!(
                         "{} export batch discarded due to {} response ({} spans lost)",
-                        cfg.provider_name, status, entry_count,
+                        cfg.provider_name,
+                        status,
+                        entry_count,
                     );
                     return;
                 }
                 throttle = retry_after_from_headers(response.headers());
             }
             Err(e) => {
-                warn!(
+                warn_sampled!(
                     "{} export failed: {} (attempt {}/{})",
-                    cfg.provider_name, e, attempt, total_attempts,
+                    cfg.provider_name,
+                    e,
+                    attempt,
+                    total_attempts,
                 );
             }
         }
@@ -2178,9 +2190,11 @@ async fn deliver_trace_payload(
         }
     }
 
-    warn!(
+    warn_sampled!(
         "{} export batch discarded after {} attempts ({} spans lost)",
-        cfg.provider_name, total_attempts, entry_count,
+        cfg.provider_name,
+        total_attempts,
+        entry_count,
     );
 }
 
@@ -2200,7 +2214,7 @@ async fn handle_otlp_partial_success(
             Ok(Some(chunk)) => chunk,
             Ok(None) => break,
             Err(error) => {
-                warn!(
+                warn_sampled!(
                     provider = cfg.provider_name,
                     endpoint = %cfg.endpoint_for_logs,
                     %error,
@@ -2210,7 +2224,7 @@ async fn handle_otlp_partial_success(
             }
         };
         if body.len().saturating_add(chunk.len()) > MAX_OTLP_SUCCESS_BODY_BYTES {
-            warn!(
+            warn_sampled!(
                 provider = cfg.provider_name,
                 endpoint = %cfg.endpoint_for_logs,
                 limit_bytes = MAX_OTLP_SUCCESS_BODY_BYTES,
@@ -2228,7 +2242,7 @@ async fn handle_otlp_partial_success(
         .map(otlp_json_content_type)
         .unwrap_or(true)
     {
-        warn!(
+        warn_sampled!(
             provider = cfg.provider_name,
             endpoint = %cfg.endpoint_for_logs,
             body_bytes = body.len(),
@@ -2237,7 +2251,7 @@ async fn handle_otlp_partial_success(
         return;
     }
     let Ok(value) = serde_json::from_slice::<Value>(&body) else {
-        warn!(
+        warn_sampled!(
             provider = cfg.provider_name,
             endpoint = %cfg.endpoint_for_logs,
             body_bytes = body.len(),
@@ -2255,7 +2269,7 @@ async fn handle_otlp_partial_success(
         return;
     }
     let Some(partial) = partial_value.as_object() else {
-        warn!(
+        warn_sampled!(
             provider = cfg.provider_name,
             endpoint = %cfg.endpoint_for_logs,
             body_bytes = body.len(),
@@ -2275,7 +2289,7 @@ async fn handle_otlp_partial_success(
         {
             Some(rejected) => rejected,
             None => {
-                warn!(
+                warn_sampled!(
                     provider = cfg.provider_name,
                     endpoint = %cfg.endpoint_for_logs,
                     body_bytes = body.len(),
@@ -2292,7 +2306,7 @@ async fn handle_otlp_partial_success(
         None | Some(Value::Null) => "",
         Some(Value::String(message)) => message.as_str(),
         Some(_) => {
-            warn!(
+            warn_sampled!(
                 provider = cfg.provider_name,
                 endpoint = %cfg.endpoint_for_logs,
                 body_bytes = body.len(),
@@ -2303,7 +2317,7 @@ async fn handle_otlp_partial_success(
     };
     let message = bounded_log_value(message, MAX_PARTIAL_SUCCESS_MESSAGE_BYTES);
     if rejected > 0 || !message.is_empty() {
-        warn!(
+        warn_sampled!(
             provider = cfg.provider_name,
             endpoint = %cfg.endpoint_for_logs,
             rejected_spans = rejected,

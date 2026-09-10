@@ -1,3 +1,5 @@
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
@@ -657,9 +659,10 @@ impl Oauth2Introspection {
 
         let guard = provider.introspection_endpoint.load();
         let Some(resolved) = guard.as_ref().as_ref() else {
-            warn!(
+            warn_sampled!(
                 plugin = "oauth2_introspection",
-                provider_idx, "introspection endpoint unresolved"
+                provider_idx,
+                "introspection endpoint unresolved"
             );
             return Err(IntrospectionDecision::Unavailable);
         };
@@ -671,9 +674,10 @@ impl Oauth2Introspection {
             .clone()
             .try_acquire_owned()
             .map_err(|_| {
-                warn!(
+                warn_sampled!(
                     plugin = "oauth2_introspection",
-                    provider_idx, "provider introspection concurrency limit reached"
+                    provider_idx,
+                    "provider introspection concurrency limit reached"
                 );
                 IntrospectionDecision::Unavailable
             })?;
@@ -682,9 +686,10 @@ impl Oauth2Introspection {
             .clone()
             .try_acquire_owned()
             .map_err(|_| {
-                warn!(
+                warn_sampled!(
                     plugin = "oauth2_introspection",
-                    provider_idx, "global introspection concurrency limit reached"
+                    provider_idx,
+                    "global introspection concurrency limit reached"
                 );
                 IntrospectionDecision::Unavailable
             })?;
@@ -756,7 +761,7 @@ impl Oauth2Introspection {
             .execute_with_redacted_url(request, "oauth2_introspection", &redacted_endpoint)
             .await
             .map_err(|e| {
-                warn!(
+                warn_sampled!(
                     plugin = "oauth2_introspection",
                     provider_idx,
                     error_class = %crate::retry::classify_reqwest_error(&e),
@@ -765,7 +770,7 @@ impl Oauth2Introspection {
                 IntrospectionDecision::Unavailable
             })?;
         if !response.status().is_success() {
-            warn!(
+            warn_sampled!(
                 plugin = "oauth2_introspection",
                 provider_idx,
                 status = response.status().as_u16(),
@@ -776,7 +781,7 @@ impl Oauth2Introspection {
         let body = read_response_body_bounded(response, MAX_INTROSPECTION_RESPONSE_BYTES)
             .await
             .map_err(|e| {
-                warn!(
+                warn_sampled!(
                     plugin = "oauth2_introspection",
                     provider_idx,
                     error = %e,
@@ -785,7 +790,7 @@ impl Oauth2Introspection {
                 IntrospectionDecision::Unavailable
             })?;
         let claims: Value = serde_json::from_slice(&body).map_err(|e| {
-            warn!(
+            warn_sampled!(
                 plugin = "oauth2_introspection",
                 provider_idx,
                 error = %e,
@@ -800,7 +805,7 @@ impl Oauth2Introspection {
                 return Err(IntrospectionDecision::Inactive);
             }
             None => {
-                warn!(
+                warn_sampled!(
                     plugin = "oauth2_introspection",
                     provider_idx,
                     "token introspection response has a missing or non-boolean active member"
@@ -822,9 +827,10 @@ impl Oauth2Introspection {
                 ));
             }
             Some(_) => {
-                warn!(
+                warn_sampled!(
                     plugin = "oauth2_introspection",
-                    provider_idx, "token introspection response has a non-string token_type member"
+                    provider_idx,
+                    "token introspection response has a non-string token_type member"
                 );
                 return Err(IntrospectionDecision::Unavailable);
             }

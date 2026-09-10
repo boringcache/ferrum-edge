@@ -1,5 +1,7 @@
 //! Shared rate-limit algorithms plus local/Redis/failover storage adapters.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde_json::Value;
@@ -2747,7 +2749,7 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                     {
                         // `curr_key` embeds the caller-supplied identity
                         // dimension, so it is not logged.
-                        warn!(
+                        warn_sampled!(
                             "ai_rate_limiter: failed to roll back denied Redis token reservation; \
                              estimate stays charged until the window TTL expires"
                         );

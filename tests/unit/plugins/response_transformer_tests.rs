@@ -2550,14 +2550,15 @@ async fn claimed_body_rewrite_marks_capacity_refusal_distinct_from_noop() {
         )
     );
     let warnings: Vec<_> = logs.lines().filter(|line| line.contains("WARN")).collect();
-    assert_eq!(warnings.len(), 1, "{logs}");
-    assert!(warnings[0].contains("response_transformer"), "{logs}");
-    assert!(warnings[0].contains("proxy_id="), "{logs}");
-    assert!(
-        warnings[0].contains("produced_bytes_at_least=210"),
-        "{logs}"
-    );
-    assert!(warnings[0].contains("ceiling=40"), "{logs}");
+    assert!(warnings.len() <= 1, "{logs}");
+    let rejection = logs
+        .lines()
+        .find(|line| line.contains("DEBUG") && line.contains("produced_bytes_at_least="))
+        .expect("each refusal retains its debug diagnostic");
+    assert!(rejection.contains("response_transformer"), "{logs}");
+    assert!(rejection.contains("proxy_id="), "{logs}");
+    assert!(rejection.contains("produced_bytes_at_least=210"), "{logs}");
+    assert!(rejection.contains("ceiling=40"), "{logs}");
     assert!(
         !logs.contains(&"x".repeat(200)),
         "payload must not be logged"

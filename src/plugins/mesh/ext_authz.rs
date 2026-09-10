@@ -94,6 +94,8 @@
 //! reason token only. Metrics are labelled by that reason and by nothing else —
 //! never by provider, namespace, route, host, principal, or a status string.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -456,7 +458,7 @@ impl PreparedProvider {
     /// disposition.
     fn body_too_large_refusal(&self) -> MeshExtAuthzOutcome {
         record(MeshExtAuthzReason::BodyTooLarge, false);
-        tracing::warn!(
+        warn_sampled!(
             plugin = "mesh_authz",
             reason = MeshExtAuthzReason::BodyTooLarge.as_str(),
             "Mesh external authorization request body exceeds the selected provider's maxRequestBytes; refusing without dispatching a check"
@@ -471,7 +473,7 @@ impl PreparedProvider {
     fn failure(&self, reason: MeshExtAuthzReason) -> MeshExtAuthzOutcome {
         record(reason, self.fail_open);
         if self.fail_open {
-            tracing::warn!(
+            warn_sampled!(
                 plugin = "mesh_authz",
                 reason = reason.as_str(),
                 "Mesh external authorization check failed; provider is configured failOpen so the request continues"
@@ -676,7 +678,7 @@ impl MeshExtAuthzExecutor {
     ) -> MeshExtAuthzOutcome {
         let Some(provider) = self.providers.get(provider_name) else {
             record(MeshExtAuthzReason::ProviderUnbound, false);
-            tracing::warn!(
+            warn_sampled!(
                 plugin = "mesh_authz",
                 reason = MeshExtAuthzReason::ProviderUnbound.as_str(),
                 "Mesh CUSTOM authorization policy names a provider this configuration generation does not carry; denying"

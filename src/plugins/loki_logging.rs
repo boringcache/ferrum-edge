@@ -18,6 +18,8 @@
 //!   arbitrary extra headers.
 //! - **Authentication**: `Authorization` header for Bearer/Basic auth.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use crate::fips::backend::rand::{SecureRandom, SystemRandom};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -1398,7 +1400,7 @@ async fn send_batch(cfg: &LokiFlushConfig, batch: &[LokiEntry]) -> Result<(), St
             LokiAttemptOutcome::Delivered => return Ok(()),
             LokiAttemptOutcome::Terminal(error) => {
                 record_loki_batch_discard(entry_count);
-                warn!(
+                warn_sampled!(
                     plugin = "loki_logging",
                     "Loki logging: batch discarded after terminal delivery failure ({} entries lost): {}",
                     entry_count,
@@ -1407,7 +1409,7 @@ async fn send_batch(cfg: &LokiFlushConfig, batch: &[LokiEntry]) -> Result<(), St
                 return Ok(());
             }
             LokiAttemptOutcome::Retryable(error) if attempt < attempts => {
-                warn!(
+                warn_sampled!(
                     plugin = "loki_logging",
                     "Loki logging: batch flush failed (attempt {}/{}): {}",
                     attempt,
@@ -1418,7 +1420,7 @@ async fn send_batch(cfg: &LokiFlushConfig, batch: &[LokiEntry]) -> Result<(), St
             }
             LokiAttemptOutcome::Retryable(error) => {
                 record_loki_batch_discard(entry_count);
-                warn!(
+                warn_sampled!(
                     plugin = "loki_logging",
                     "Loki logging: batch discarded after {} attempts ({} entries lost): {}",
                     attempts,

@@ -21,6 +21,8 @@
 //! generation for every stable plugin-config ID — never a process-wide
 //! last-constructor-wins singleton.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use chrono::{SecondsFormat, TimeZone, Utc};
@@ -2110,7 +2112,7 @@ fn start_spool_delivery_with_clone_ceiling(
                                     invalidate_status_cache();
                                 }
                                 Ok(Err(error)) => {
-                                    warn!(
+                                    warn_sampled!(
                                         plugin = PLUGIN_NAME,
                                         error = %error,
                                         "Chargeback sink async spool write failed"
@@ -2121,7 +2123,7 @@ fn start_spool_delivery_with_clone_ceiling(
                                     );
                                 }
                                 Err(error) => {
-                                    warn!(
+                                    warn_sampled!(
                                         plugin = PLUGIN_NAME,
                                         error = %error,
                                         "Chargeback sink async spool write task failed"
@@ -2168,7 +2170,7 @@ fn start_spool_delivery_with_clone_ceiling(
                                 }
                                 Ok(Err(error)) => {
                                     metrics.spool_available.store(false, Ordering::Release);
-                                    warn!(
+                                    warn_sampled!(
                                         plugin = PLUGIN_NAME,
                                         generation,
                                         error = %error,
@@ -2177,7 +2179,7 @@ fn start_spool_delivery_with_clone_ceiling(
                                     job.restage();
                                 }
                                 Err(error) => {
-                                    warn!(
+                                    warn_sampled!(
                                         plugin = PLUGIN_NAME,
                                         generation,
                                         error = %error,
@@ -3163,7 +3165,7 @@ impl ApiChargebackSink {
                         // ChargeEvent records.
                         enqueue.try_enqueue(batch, "export failure")
                     } else {
-                        warn!(
+                        warn_sampled!(
                             plugin = PLUGIN_NAME,
                             error = %error,
                             "Chargeback sink export failed and spool is disabled; batch was lost"

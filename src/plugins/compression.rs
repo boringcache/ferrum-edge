@@ -51,6 +51,8 @@
 //! content length, ETag awareness, no double-compression, and `Vary` header
 //! injection.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -61,7 +63,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 use crate::util::http_headers::{headers_have_cache_control_directive, headers_have_strong_etag};
 use crate::util::unknown_keys::reject_unknown_keys;
@@ -350,7 +352,7 @@ pub(crate) fn reconcile_aborted_gateway_response_encoding(
             "content-length".to_string(),
             response_body.len().to_string(),
         );
-        warn!(
+        warn_sampled!(
             "compression: replaced failed gateway content coding with 406 because identity is unacceptable"
         );
         return true;
@@ -360,7 +362,7 @@ pub(crate) fn reconcile_aborted_gateway_response_encoding(
         "content-length".to_string(),
         response_body.len().to_string(),
     );
-    warn!(
+    warn_sampled!(
         "compression: restored identity response after failed gateway content coding \
          (body_len={})",
         response_body.len()
@@ -657,7 +659,7 @@ impl CompressionPlugin {
         limits: DecodeLimits,
     ) -> Result<Vec<u8>, RequestDecodeRefusal> {
         let Ok(permit) = try_acquire_codec_permit() else {
-            warn!("compression: codec admission saturated while decoding request body");
+            warn_sampled!("compression: codec admission saturated while decoding request body");
             return Err(RequestDecodeRefusal::CodecUnavailable);
         };
         let decoded = tokio::task::spawn_blocking(move || {
@@ -677,19 +679,19 @@ impl CompressionPlugin {
                 // aggregate budget simply had no room for this decode's working
                 // set. Counting it as a codec fault would misreport capacity
                 // pressure as corruption.
-                warn!("compression: request-decode budget refused the decode working set");
+                warn_sampled!("compression: request-decode budget refused the decode working set");
                 Err(RequestDecodeRefusal::DecodeCapacity)
             }
             Ok(Err(_)) => {
                 CODEC_WORKER_FAILURES.fetch_add(1, Ordering::Relaxed);
                 // Fixed-cardinality: never interpolate the coding token or any
                 // decoder detail derived from client bytes.
-                warn!("compression: rejecting request with undecodable Content-Encoding");
+                warn_sampled!("compression: rejecting request with undecodable Content-Encoding");
                 Err(RequestDecodeRefusal::Representation)
             }
             Err(_) => {
                 CODEC_JOIN_FAILURES.fetch_add(1, Ordering::Relaxed);
-                warn!("compression: request decode worker join failed");
+                warn_sampled!("compression: request decode worker join failed");
                 Err(RequestDecodeRefusal::CodecUnavailable)
             }
         }
@@ -729,7 +731,9 @@ impl CompressionPlugin {
         let plan = match self.classify_request_content_encoding(&ce) {
             Ok(plan) => plan,
             Err(e) => {
-                warn!("compression: rejecting request with invalid Content-Encoding '{ce}': {e}");
+                warn_sampled!(
+                    "compression: rejecting request with invalid Content-Encoding '{ce}': {e}"
+                );
                 return PluginResult::Reject {
                     status_code: 400,
                     body: r#"{"error":"Malformed or unsupported Content-Encoding"}"#.to_string(),
@@ -771,7 +775,9 @@ impl CompressionPlugin {
                 };
 
                 if decode_source.is_empty() {
-                    warn!("compression: rejecting request with empty compressed body ({marker})");
+                    warn_sampled!(
+                        "compression: rejecting request with empty compressed body ({marker})"
+                    );
                     return PluginResult::Reject {
                         status_code: 400,
                         body: r#"{"error":"Malformed compressed request body"}"#.to_string(),
@@ -983,7 +989,7 @@ impl CompressionPlugin {
             }
             Err(()) => {
                 ctx.mark_compression_response_admission_declined();
-                warn!(
+                warn_sampled!(
                     "compression: response buffer admission saturated at reservation; \
                      response will stream identity (or 406 when identity is unacceptable) \
                      instead of buffering for compression"
@@ -2409,7 +2415,7 @@ impl Plugin for CompressionPlugin {
         // header or against `identity;q=0`.
         let Ok(permit) = try_acquire_codec_permit() else {
             drop(buffer_permit);
-            warn!("compression: codec admission saturated while encoding response body");
+            warn_sampled!("compression: codec admission saturated while encoding response body");
             ctx.mark_compression_response_encode_aborted();
             return None;
         };

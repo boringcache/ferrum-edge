@@ -1,3 +1,5 @@
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -1127,7 +1129,7 @@ async fn flush_with_retry<T, F, Fut>(
                 return;
             }
             Err(error) if attempt < attempts => {
-                warn!(
+                warn_sampled!(
                     plugin = cfg.plugin_name,
                     "{}: batch flush failed (attempt {}/{}): {}",
                     cfg.plugin_name,
@@ -1142,7 +1144,7 @@ async fn flush_with_retry<T, F, Fut>(
             }
             Err(error) => {
                 let fallback_accepted = if let Some(on_failed_batch) = on_failed_batch {
-                    warn!(
+                    warn_sampled!(
                         plugin = cfg.plugin_name,
                         "{}: handing failed batch to fallback after {} attempts ({} entries): {}",
                         cfg.plugin_name,
@@ -1165,7 +1167,7 @@ async fn flush_with_retry<T, F, Fut>(
                         SinkLossReason::BatchDiscard,
                         entry_count as u64,
                     );
-                    warn!(
+                    warn_sampled!(
                         plugin = cfg.plugin_name,
                         "{}: batch discarded after {} attempts ({} entries lost): {}",
                         cfg.plugin_name,

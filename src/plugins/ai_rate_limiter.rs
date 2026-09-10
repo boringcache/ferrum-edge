@@ -31,6 +31,8 @@
 //! response side. They are classified as non-AI traffic and left untouched
 //! rather than being charged zero tokens against a budget.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -1229,7 +1231,7 @@ impl AiRateLimiter {
                     OnUnmeteredResponse::ChargeEstimate.as_str().to_string(),
                 );
                 if reserved_tokens == 0 && self.request_was_compressed_ai_candidate(ctx) {
-                    warn!(
+                    warn_sampled!(
                         provider = %self.provider,
                         count_mode = %self.count_mode,
                         detail = %unmetered_detail,
@@ -1237,7 +1239,7 @@ impl AiRateLimiter {
                     );
                     return self.reject_unmetered();
                 }
-                warn!(
+                warn_sampled!(
                     provider = %self.provider,
                     count_mode = %self.count_mode,
                     reserved_tokens,
@@ -1264,7 +1266,7 @@ impl AiRateLimiter {
                 {
                     self.store_metadata(ctx, &outcome);
                 }
-                warn!(
+                warn_sampled!(
                     provider = %self.provider,
                     count_mode = %self.count_mode,
                     reserved_tokens,
@@ -1278,7 +1280,7 @@ impl AiRateLimiter {
                     self.keys.unmetered_action.clone(),
                     OnUnmeteredResponse::Reject.as_str().to_string(),
                 );
-                warn!(
+                warn_sampled!(
                     provider = %self.provider,
                     count_mode = %self.count_mode,
                     reserved_tokens,
@@ -1472,7 +1474,7 @@ impl AiRateLimiter {
                 self.keys.unmetered_action.clone(),
                 self.on_unmetered_response.as_str().to_string(),
             );
-            warn!(
+            warn_sampled!(
                 limiter_instance = self.instance_id,
                 provider = %self.provider,
                 count_mode = %self.count_mode,
@@ -2540,7 +2542,7 @@ impl Plugin for AiRateLimiter {
             // The rate-limit key embeds the identity dimension (consumer,
             // authenticated identity, SPIFFE ID, or client IP) and is never
             // logged; the bounded counters below stay.
-            warn!(
+            warn_sampled!(
                 current_tokens = usage,
                 limit = self.token_limit,
                 plugin = "ai_rate_limiter",
@@ -2828,7 +2830,7 @@ impl Plugin for AiRateLimiter {
                 self.keys.unmetered_action.clone(),
                 self.on_unmetered_response.as_str().to_string(),
             );
-            warn!(
+            warn_sampled!(
                 limiter_instance = self.instance_id,
                 provider = %self.provider,
                 count_mode = %self.count_mode,

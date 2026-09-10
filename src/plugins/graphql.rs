@@ -28,13 +28,15 @@
 //! heuristic (e.g. it does not type-check or validate against a schema) and is
 //! intended as an edge filter layered in front of the backend GraphQL server.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::utils::body_transform::is_json_content_type;
 use super::utils::rate_limit::{
@@ -1917,7 +1919,7 @@ impl GraphqlPlugin {
                             headers: json_content_type_header(),
                         };
                     }
-                    warn!(
+                    warn_sampled!(
                         op_type = %op.op_type,
                         plugin = "graphql",
                         "GraphQL operation type rate limit exceeded"
@@ -1970,7 +1972,7 @@ impl GraphqlPlugin {
                             headers: json_content_type_header(),
                         };
                     }
-                    warn!(
+                    warn_sampled!(
                         operation = %op_name,
                         plugin = "graphql",
                         "GraphQL named operation rate limit exceeded"

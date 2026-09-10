@@ -105,6 +105,8 @@
 //! trusted upstream alias; final arguments are still re-evaluated, and any
 //! unrelated name change fails closed.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -116,7 +118,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::debug;
 use url::Url;
 
 use crate::fips::approved::Sha256;
@@ -1294,7 +1296,7 @@ impl GovernorEngine {
                     cd.reason = Some(format!("approval endpoint error: {err}"));
                 }
                 FailOnError::Warn => {
-                    warn!(
+                    warn_sampled!(
                         target: "ai_tool_governor",
                         tool = %call.name,
                         "approval endpoint error, failing open (warn): {err}"
@@ -5036,7 +5038,7 @@ impl ToolCallStreamInspector {
         self.record_metadata(&batch);
 
         if batch.enforce_blocks {
-            warn!(
+            warn_sampled!(
                 target: "ai_tool_governor",
                 decision = batch.overall_label,
                 risk = batch.max_risk.as_str(),
@@ -5076,7 +5078,7 @@ impl ToolCallStreamInspector {
     /// bounded by the same hold cap as the SSE path.
     fn hold_entire_body(&mut self) -> ResponseStreamAction {
         if self.carry.len() > MAX_STREAM_HOLD_BYTES {
-            warn!(
+            warn_sampled!(
                 target: "ai_tool_governor",
                 held_bytes = self.carry.len(),
                 mode = self.engine.mode.as_str(),
@@ -5098,7 +5100,7 @@ impl ToolCallStreamInspector {
     /// all retained bytes are forwarded unchanged and later chunks bypass
     /// inspection so observation never disrupts traffic.
     fn handle_hold_overflow(&mut self, mut out: Vec<u8>) -> ResponseStreamAction {
-        warn!(
+        warn_sampled!(
             target: "ai_tool_governor",
             held_bytes = self.held.len(),
             carry_bytes = self.carry.len(),
@@ -5136,7 +5138,7 @@ impl ToolCallStreamInspector {
         if json_dup_keys::slice_ambiguity(strip_json_bom(&body)).is_some() {
             if self.engine.mode == Mode::Enforce {
                 self.record_uninspectable_metadata();
-                warn!(
+                warn_sampled!(
                     target: "ai_tool_governor",
                     "JSON-shaped stream contains duplicate JSON object member names; cutting stream"
                 );
@@ -5152,7 +5154,7 @@ impl ToolCallStreamInspector {
         if extract.ungovernable {
             if self.engine.mode == Mode::Enforce {
                 self.record_uninspectable_metadata();
-                warn!(
+                warn_sampled!(
                     target: "ai_tool_governor",
                     "JSON-shaped stream contains an ungovernable tool call; cutting stream"
                 );
@@ -5174,7 +5176,7 @@ impl ToolCallStreamInspector {
                 && self.engine.mode == Mode::Enforce
             {
                 self.record_uninspectable_metadata();
-                warn!(
+                warn_sampled!(
                     target: "ai_tool_governor",
                     "JSON-shaped stream carries a tool-call shape this plugin cannot read; cutting stream"
                 );
@@ -5203,7 +5205,7 @@ impl ToolCallStreamInspector {
             .await;
         self.record_metadata(&batch);
         if batch.enforce_blocks {
-            warn!(
+            warn_sampled!(
                 target: "ai_tool_governor",
                 decision = batch.overall_label,
                 "JSON-shaped stream tool call blocked; cutting stream: {}",
@@ -5279,7 +5281,7 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                             && self.engine.mode == Mode::Enforce
                         {
                             self.record_uninspectable_metadata();
-                            warn!(
+                            warn_sampled!(
                                 target: "ai_tool_governor",
                                 "SSE frame carries a tool-call shape this plugin cannot read; cutting stream"
                             );
@@ -5331,7 +5333,7 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                     // to preserve arrival order behind a pending batch.
                     if self.engine.mode == Mode::Enforce {
                         self.record_uninspectable_metadata();
-                        warn!(
+                        warn_sampled!(
                             target: "ai_tool_governor",
                             "SSE data payload contains duplicate JSON object member names; cutting stream"
                         );
@@ -5384,7 +5386,7 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                 // unchanged.
                 if self.engine.mode == Mode::Enforce {
                     self.record_uninspectable_metadata();
-                    warn!(
+                    warn_sampled!(
                         target: "ai_tool_governor",
                         held_bytes = self.carry.len(),
                         "opaque stream under governance cannot be inspected; cutting stream"
@@ -5410,7 +5412,7 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                 if std::str::from_utf8(&self.carry).is_err() {
                     if self.engine.mode == Mode::Enforce {
                         self.record_uninspectable_metadata();
-                        warn!(
+                        warn_sampled!(
                             target: "ai_tool_governor",
                             held_bytes = self.carry.len(),
                             "unclassifiable non-UTF-8 stream under governance cannot be inspected; cutting stream"
@@ -5448,7 +5450,7 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                 {
                     self.record_unrecognized_shape_observation();
                     self.record_uninspectable_metadata();
-                    warn!(
+                    warn_sampled!(
                         target: "ai_tool_governor",
                         "trailing SSE frame carries a tool-call shape this plugin cannot read; cutting stream"
                     );
@@ -5465,7 +5467,7 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                 // records the observation and still forwards the trailing bytes.
                 SseEvent::Ambiguous if self.engine.mode == Mode::Enforce => {
                     self.record_uninspectable_metadata();
-                    warn!(
+                    warn_sampled!(
                         target: "ai_tool_governor",
                         "trailing SSE data payload contains duplicate JSON object member names; cutting stream"
                     );

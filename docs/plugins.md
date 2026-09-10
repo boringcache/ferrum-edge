@@ -351,6 +351,26 @@ framing.
 
 ## Logging Plugins
 
+### Rejection and delivery diagnostics
+
+Selected rejection and delivery-failure diagnostics use a process-wide warning
+sampler: the first event at each source site is emitted immediately, then at
+most one warning every **10 seconds**. Each warning includes the sampled event,
+`suppressed_events` (the events withheld since the previous emission), and
+`sample_interval_seconds: 10`. The next event after the interval emits the
+summary; there is no periodic message when traffic stops. Concurrent events at
+the boundary may be included in either adjacent summary.
+
+The allowance is shared across clients, routes, plugin instances, and config
+reloads. It covers admission/authentication/authorization refusals, body and
+WebSocket size policies, AI inspection outcomes, and the delivery-failure paths
+of batching loggers, tracing exporters, chargeback, mirrors, and notifications.
+Every event remains available at **debug** level under its existing tracing
+target. Transaction logs, rejection metadata, metrics, delivery accounting, and
+policy decisions retain their existing behavior. Sampled warnings are examples
+with aggregate counts, not a complete per-request audit trail; use transaction
+logs and metrics for accounting. Explicit debug logging retains per-event volume.
+
 > **Customizing transaction log output**: every logging plugin below
 > accepts an optional `schema:` block (or
 > `schema_ref:` against a named `transaction_log_schema` plugin) to
@@ -5339,7 +5359,7 @@ contract.
 | `on_scan_timeout` | string | `log_and_allow` | Action when a body scan times out: `allow`, `block`, or `log_and_allow`. |
 | `disallowed_methods` | string[] | `[]` | Methods that should trigger the built-in `FE-METHOD-001` rule when that rule is active. |
 | `log_to_metadata` | bool | `true` | Write WAF metadata such as `waf.rule_hits`, `waf.action`, and `waf.severity` into transaction logs. |
-| `log_to_stdout` | bool | `false` | Emit `tracing::warn!` events for rule matches. Each event's `action` is that rule's effective direct outcome after applying the global mode (`blocked`, `monitored`, `disabled`); `rule_action` carries the configured rule action (`enforce`, `monitor`, `disabled`). Aggregate anomaly scoring can still make the final transaction `waf.action=blocked` after individual per-rule events. |
+| `log_to_stdout` | bool | `false` | Emit sampled warnings for rule matches (one per source site per 10 seconds across instances, with `suppressed_events` counts) and per-hit debug detail. Each event's `action` is that rule's effective direct outcome after applying the global mode (`blocked`, `monitored`, `disabled`); `rule_action` carries the configured rule action (`enforce`, `monitor`, `disabled`). Aggregate anomaly scoring can still make the final transaction `waf.action=blocked` after individual per-rule events. |
 | `reject_status_code` | u16 | `403` | HTTP status for enforced rejects. Must be 400-599. |
 | `reject_content_type` | string | `application/json` | Content-Type header for enforced rejects. |
 | `reject_body` | string | `{"error":"Forbidden"}` | Body returned for enforced rejects. |

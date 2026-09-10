@@ -5,6 +5,8 @@
 //! discovery catalogs in aggregate-router mode, and routes namespaced MCP tool,
 //! resource, and prompt calls to configured upstream MCP servers.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use crate::fips::approved::Sha256;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -5453,7 +5455,7 @@ impl McpGateway {
                 .insert("mcp.route_decision".to_string(), "deny".to_string());
         }
         // Reason is a gateway-controlled category string — never a result body.
-        warn!(
+        warn_sampled!(
             reason,
             "MCP gateway rejecting tools/call result that failed outputSchema validation"
         );
@@ -7121,7 +7123,7 @@ fn json_rpc_error(
 ) -> PluginResult {
     let mut metadata = Map::new();
     if let Some(detail) = internal_detail.as_deref() {
-        warn!(
+        warn_sampled!(
             code,
             message,
             internal_detail = %detail,

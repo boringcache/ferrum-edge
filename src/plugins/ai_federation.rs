@@ -93,6 +93,8 @@
 //! federation token accounting works even though normal backend dispatch is
 //! skipped.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -6434,7 +6436,7 @@ impl AiFederation {
             if let Err(message) =
                 validate_multimodal_policy(provider, openai_body, &multimodal_usage)
             {
-                warn!(
+                warn_sampled!(
                     provider = %provider.name,
                     provider_type = %provider.provider_type.as_str(),
                     multimodal_mode = %provider.multimodal_mode.as_str(),
@@ -6611,7 +6613,7 @@ impl AiFederation {
             if provider.multimodal_mode == MultimodalMode::TextOnlyWithWarning
                 && !multimodal_usage.is_empty()
             {
-                warn!(
+                warn_sampled!(
                     provider = %provider.name,
                     provider_type = %provider.provider_type.as_str(),
                     non_text_parts = multimodal_usage.non_text_parts,
@@ -7733,7 +7735,7 @@ impl Plugin for AiFederation {
                 if let Some(guard) = half_open_probe_guard.as_mut() {
                     guard.release();
                 }
-                warn!(
+                warn_sampled!(
                     provider = %provider.name,
                     provider_type = %provider.provider_type.as_str(),
                     "ai_federation: rejected request — resolved model contains characters not permitted in URL path"
@@ -7750,7 +7752,7 @@ impl Plugin for AiFederation {
             if let Err(message) =
                 validate_multimodal_policy(provider, &openai_body, &multimodal_usage)
             {
-                warn!(
+                warn_sampled!(
                     provider = %provider.name,
                     provider_type = %provider.provider_type.as_str(),
                     multimodal_mode = %provider.multimodal_mode.as_str(),
@@ -7776,7 +7778,7 @@ impl Plugin for AiFederation {
                 // request) — not here. If this provider later fails over to a
                 // `translate`-mode provider that preserves the image, writing the
                 // "dropped" metadata now would misreport the serving provider.
-                warn!(
+                warn_sampled!(
                     provider = %provider.name,
                     provider_type = %provider.provider_type.as_str(),
                     non_text_parts = multimodal_usage.non_text_parts,
@@ -7787,7 +7789,7 @@ impl Plugin for AiFederation {
             let translated = match translate_request(provider, &openai_body, &resolved_model) {
                 Ok(t) => t,
                 Err(e) => {
-                    warn!(
+                    warn_sampled!(
                         provider = %provider.name,
                         "ai_federation: request translation failed"
                     );
@@ -7860,7 +7862,7 @@ impl Plugin for AiFederation {
                             guard.release();
                         }
                     }
-                    warn!(
+                    warn_sampled!(
                         provider = %provider.name,
                         error_class = failure.error_class.as_str(),
                         failure_kind = ?failure.kind,
@@ -7946,7 +7948,7 @@ impl Plugin for AiFederation {
                     }
                 }
                 if self.fallback_enabled && has_later_provider {
-                    warn!(
+                    warn_sampled!(
                         provider = %provider.name,
                         status,
                         "ai_federation: provider returned fallback-eligible status"
@@ -8035,7 +8037,7 @@ impl Plugin for AiFederation {
                     ) {
                         Ok(b) => b,
                         Err(BoundedJsonSerializationError::LimitExceeded) => {
-                            warn!(
+                            warn_sampled!(
                                 provider = %provider.name,
                                 "ai_federation: normalized provider response exceeded configured size limit"
                             );
@@ -8049,7 +8051,7 @@ impl Plugin for AiFederation {
                             );
                         }
                         Err(BoundedJsonSerializationError::Serialization) => {
-                            warn!(
+                            warn_sampled!(
                                 provider = %provider.name,
                                 error_class = "serialization_error",
                                 "ai_federation: failed to serialize normalized response"
@@ -8080,7 +8082,7 @@ impl Plugin for AiFederation {
                             guard.resolve();
                         }
                     }
-                    warn!(
+                    warn_sampled!(
                         provider = %provider.name,
                         error = %e,
                         "ai_federation: response normalization failed"

@@ -81,10 +81,12 @@
 //! implies a client-visible `text/event-stream` media type for responses that
 //! are wrapped.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use serde_json::{Map, Number, Value};
 use std::collections::HashMap;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::utils::policy_digest;
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
@@ -699,7 +701,7 @@ impl super::Plugin for SsePlugin {
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         // SSE is a read-only protocol — only GET is valid.
         if self.require_get_method && ctx.method != "GET" {
-            warn!(
+            warn_sampled!(
                 plugin = "sse",
                 method = %ctx.method,
                 "SSE request rejected: method must be GET"
@@ -719,7 +721,7 @@ impl super::Plugin for SsePlugin {
                 .is_some_and(|v| Self::accepts_event_stream(v));
 
             if !accepts_sse {
-                warn!(
+                warn_sampled!(
                     plugin = "sse",
                     accept = ?ctx.headers.get("accept"),
                     "SSE request rejected: Accept header must include text/event-stream"
@@ -738,7 +740,7 @@ impl super::Plugin for SsePlugin {
         // logs (see `redact_sse_log_metadata` + metadata redaction defaults).
         if let Some(last_id) = ctx.headers.get("last-event-id") {
             if last_id.len() > MAX_LAST_EVENT_ID_BYTES {
-                warn!(
+                warn_sampled!(
                     plugin = "sse",
                     last_event_id_len = last_id.len(),
                     max_bytes = MAX_LAST_EVENT_ID_BYTES,
