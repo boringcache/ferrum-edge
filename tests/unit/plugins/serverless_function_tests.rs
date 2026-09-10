@@ -5914,3 +5914,710 @@ async fn test_forward_body_fails_closed_when_no_body_was_collected() {
         "no function may be contacted when the governed representation is unavailable"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #5173 — the SigV4 canonical Host is the authority sent on the wire
+// ---------------------------------------------------------------------------
+
+fn sigv4_authorization_for(url: &str) -> String {
+    let now = chrono::DateTime::parse_from_rfc3339("2024-01-15T12:00:00Z")
+        .expect("fixed timestamp parses")
+        .with_timezone(&chrono::Utc);
+    ferrum_edge::plugins::serverless_function::test_helpers::sign_aws_request_test(
+        &create_test_aws_config(),
+        url,
+        b"{}",
+        &now,
+    )
+    .expect("SigV4 signing should succeed")
+    .into_iter()
+    .find(|(name, _)| name == "authorization")
+    .map(|(_, value)| value)
+    .expect("authorization header should be present")
+}
+
+/// A custom `aws_endpoint_url` with a nondefault port sends `host:port` in the
+/// `Host` field, so that is what a verifying endpoint recomputes the signature
+/// over. The canonical request is rebuilt here independently — from the Host
+/// field the request actually carries — and only the crypto primitives are
+/// shared with the signer.
+#[test]
+fn test_aws_sigv4_canonical_host_includes_a_nondefault_port() {
+    use ferrum_edge::plugins::utils::aws_sigv4;
+
+    let authorization = sigv4_authorization_for(
+        "http://127.0.0.1:59816/2015-03-31/functions/strict/invocations?Qualifier=%24LATEST",
+    );
+
+    let payload_hash = aws_sigv4::sha256_hex(b"{}");
+    let canonical_headers = format!(
+        "content-type:application/json\nhost:127.0.0.1:59816\nx-amz-content-sha256:{payload_hash}\nx-amz-date:20240115T120000Z\n"
+    );
+    let canonical_request = format!(
+        "POST\n/2015-03-31/functions/strict/invocations\nQualifier=%24LATEST\n{canonical_headers}\ncontent-type;host;x-amz-content-sha256;x-amz-date\n{payload_hash}"
+    );
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n20240115T120000Z\n20240115/us-east-1/lambda/aws4_request\n{}",
+        aws_sigv4::sha256_hex(canonical_request.as_bytes())
+    );
+    let signing_key = aws_sigv4::derive_signing_key(
+        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "20240115",
+        "us-east-1",
+        "lambda",
+    )
+    .expect("signing key derives");
+    let expected: String = aws_sigv4::hmac_sha256(&signing_key, string_to_sign.as_bytes())
+        .expect("signature computes")
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+
+    assert!(
+        authorization.ends_with(&format!("Signature={expected}")),
+        "canonical Host must carry the nondefault port; got {authorization}"
+    );
+}
+
+/// A scheme's default port never appears in the authority that goes on the
+/// wire, so it must not change the signature either. A nondefault port must.
+#[test]
+fn test_aws_sigv4_canonical_host_omits_scheme_default_ports() {
+    let https_implicit = sigv4_authorization_for("https://lambda.example/invocations");
+    let https_explicit = sigv4_authorization_for("https://lambda.example:443/invocations");
+    assert_eq!(https_implicit, https_explicit);
+
+    let http_implicit = sigv4_authorization_for("http://127.0.0.1/invocations");
+    let http_explicit = sigv4_authorization_for("http://127.0.0.1:80/invocations");
+    assert_eq!(http_implicit, http_explicit);
+
+    let http_custom = sigv4_authorization_for("http://127.0.0.1:4566/invocations");
+    assert_ne!(http_implicit, http_custom);
+
+    let https_custom = sigv4_authorization_for("https://lambda.example:8443/invocations");
+    assert_ne!(https_implicit, https_custom);
+}
+
+/// IPv6 endpoints keep their brackets in the signed Host, matching the wire.
+#[test]
+fn test_aws_sigv4_canonical_host_brackets_ipv6_literals() {
+    use ferrum_edge::plugins::utils::aws_sigv4;
+
+    let authorization =
+        sigv4_authorization_for("http://[2001:db8::30]:4566/2015-03-31/f/invocations");
+    let payload_hash = aws_sigv4::sha256_hex(b"{}");
+    let canonical_headers = format!(
+        "content-type:application/json\nhost:[2001:db8::30]:4566\nx-amz-content-sha256:{payload_hash}\nx-amz-date:20240115T120000Z\n"
+    );
+    let canonical_request = format!(
+        "POST\n/2015-03-31/f/invocations\n\n{canonical_headers}\ncontent-type;host;x-amz-content-sha256;x-amz-date\n{payload_hash}"
+    );
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n20240115T120000Z\n20240115/us-east-1/lambda/aws4_request\n{}",
+        aws_sigv4::sha256_hex(canonical_request.as_bytes())
+    );
+    let signing_key = aws_sigv4::derive_signing_key(
+        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "20240115",
+        "us-east-1",
+        "lambda",
+    )
+    .expect("signing key derives");
+    let expected: String = aws_sigv4::hmac_sha256(&signing_key, string_to_sign.as_bytes())
+        .expect("signature computes")
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+
+    assert!(
+        authorization.ends_with(&format!("Signature={expected}")),
+        "IPv6 canonical Host must stay bracketed; got {authorization}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #5175 — supplied-field validation is provider-independent
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_inactive_provider_fields_still_reject_wrong_json_types() {
+    for (provider, field) in [
+        ("azure_functions", "aws_region"),
+        ("azure_functions", "aws_access_key_id"),
+        ("azure_functions", "aws_secret_access_key"),
+        ("azure_functions", "aws_function_name"),
+        ("azure_functions", "aws_session_token"),
+        ("azure_functions", "aws_qualifier"),
+        ("azure_functions", "aws_endpoint_url"),
+        ("azure_functions", "gcp_bearer_token"),
+        ("gcp_cloud_functions", "azure_function_key"),
+        ("aws_lambda", "azure_function_key"),
+        ("aws_lambda", "gcp_bearer_token"),
+    ] {
+        let mut config = json!({
+            "provider": provider,
+            "function_url": "http://127.0.0.1:45678/pre"
+        });
+        config[field] = json!(123);
+        let err = expect_err(ServerlessFunction::new(&config, default_client()));
+        assert!(
+            err.contains(&format!("'{field}' must be a string")),
+            "provider={provider} field={field}, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_well_typed_inactive_provider_fields_remain_accepted() {
+    ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "aws_region": "us-east-1",
+            "aws_function_name": "other-function",
+            "aws_qualifier": "prod",
+            "aws_endpoint_url": "http://127.0.0.1:4566",
+            "gcp_bearer_token": "ya29.example-token"
+        }),
+        default_client(),
+    )
+    .expect("well-typed inactive provider fields stay accepted");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #5176 — forward_headers entries are HTTP field-name tokens
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_forward_headers_rejects_empty_and_separator_bearing_names() {
+    for (entry, fragment) in [
+        (json!(""), "non-empty string"),
+        (json!("bad header"), "not a valid HTTP header name"),
+        (json!("bad:header"), "not a valid HTTP header name"),
+        (json!("bad\theader"), "not a valid HTTP header name"),
+    ] {
+        let err = expect_err(ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": "https://example.com/func",
+                "forward_headers": [entry]
+            }),
+            default_client(),
+        ));
+        assert!(err.contains(fragment), "got: {err}");
+    }
+}
+
+#[test]
+fn test_forward_headers_accepts_legal_token_punctuation() {
+    ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "forward_headers": ["X-Request-ID", "x_custom.name", "a!#$%&'*+^`|~1"]
+        }),
+        default_client(),
+    )
+    .expect("legal field-name tokens are accepted");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #5178 — one lexical URL contract for runtime and schema
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_function_url_lexical_contract_rejects_the_published_grammar_failures() {
+    for url in [
+        "https://:1234",
+        "https://127.0.0.1:65536/pre",
+        "http://127.0.0.1/a b",
+        "http://127.0.0.1/a\tb",
+        "http://127.0.0.1\n/a",
+        "http://127.0.0.1/\u{7f}",
+    ] {
+        let err = expect_err(ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": url
+            }),
+            default_client(),
+        ));
+        assert!(err.contains("function_url"), "url={url:?}, got: {err}");
+    }
+}
+
+#[test]
+fn test_function_url_lexical_contract_accepts_hostname_ipv4_and_ipv6_origins() {
+    for url in [
+        "http://127.0.0.1/a%20b",
+        "https://functions.example/api/transform",
+        "https://functions.example:65535/api/transform",
+        "https://[2001:db8::1]:8443/api/transform",
+        "http://127.0.0.1:0/pre",
+    ] {
+        ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": url
+            }),
+            default_client(),
+        )
+        .unwrap_or_else(|error| panic!("url={url} should be accepted: {error}"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #5179 — CP/admin admission defers node-local credentials
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_shape_only_admission_defers_node_local_aws_credentials() {
+    let _lock = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // SAFETY: serialized by ENV_MUTEX — no concurrent env var access
+    unsafe {
+        remove_all_aws_env_vars();
+    }
+
+    let config = json!({
+        "provider": "aws_lambda",
+        "aws_region": "us-east-1",
+        "aws_function_name": "audit"
+    });
+
+    ferrum_edge::plugins::validate_plugin_config("serverless_function", &config)
+        .expect("CP/admin admission must not require DP-only AWS credentials");
+
+    let err = expect_err(ServerlessFunction::new(&config, default_client()));
+    assert!(
+        err.contains("'aws_access_key_id' is required for aws_lambda"),
+        "runtime construction must still fail closed, got: {err}"
+    );
+}
+
+#[test]
+fn test_shape_only_admission_still_rejects_supplied_field_errors() {
+    let _lock = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // SAFETY: serialized by ENV_MUTEX — no concurrent env var access
+    unsafe {
+        remove_all_aws_env_vars();
+    }
+
+    for (config, fragment) in [
+        (
+            json!({"provider": "aws_lambda", "aws_region": 123}),
+            "'aws_region' must be a string",
+        ),
+        (
+            json!({"provider": "aws_lambda", "aws_function_name": "bad name"}),
+            "'aws_function_name' is not a valid Lambda function name",
+        ),
+        (
+            json!({"provider": "aws_lambda", "aws_endpoint_url": "tcp://localhost:4566"}),
+            "aws_endpoint_url must use http:// or https://",
+        ),
+        (
+            json!({"provider": "aws_lambda", "mode": "terminat"}),
+            "unknown mode",
+        ),
+        (
+            json!({"provider": "azure_functions"}),
+            "'function_url' is required for azure_functions",
+        ),
+        (json!({"provider": "nope"}), "unknown provider"),
+    ] {
+        let err = ferrum_edge::plugins::validate_plugin_config("serverless_function", &config)
+            .expect_err("shape-only admission must still reject supplied-field errors");
+        assert!(err.contains(fragment), "config={config}, got: {err}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #5180 — partition-aware default Lambda endpoint
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_default_lambda_endpoint_is_partition_aware() {
+    let _lock = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // SAFETY: serialized by ENV_MUTEX — no concurrent env var access
+    unsafe {
+        remove_all_aws_env_vars();
+        std::env::remove_var("AWS_LAMBDA_ENDPOINT_URL");
+    }
+
+    for (region, expected_host) in [
+        ("cn-north-1", "lambda.cn-north-1.amazonaws.com.cn"),
+        ("cn-northwest-1", "lambda.cn-northwest-1.amazonaws.com.cn"),
+        ("us-east-1", "lambda.us-east-1.amazonaws.com"),
+        ("us-gov-west-1", "lambda.us-gov-west-1.amazonaws.com"),
+    ] {
+        let plugin = ServerlessFunction::new(
+            &json!({
+                "provider": "aws_lambda",
+                "aws_region": region,
+                "aws_access_key_id": "AKIAIOSFODNN7EXAMPLE",
+                "aws_secret_access_key": "secret",
+                "aws_function_name": "audit"
+            }),
+            default_client(),
+        )
+        .unwrap_or_else(|error| panic!("region={region} should be accepted: {error}"));
+
+        assert_eq!(
+            plugin.warmup_hostnames(),
+            vec![expected_host.to_string()],
+            "region={region}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #5181 — Lambda identifier grammars
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_invalid_lambda_identifiers_are_rejected_at_admission() {
+    for (field, value, fragment) in [
+        ("aws_function_name", " ", "not a valid Lambda function name"),
+        (
+            "aws_function_name",
+            "my function",
+            "not a valid Lambda function name",
+        ),
+        (
+            "aws_function_name",
+            "my/function",
+            "not a valid Lambda function name",
+        ),
+        (
+            "aws_function_name",
+            "my-function:bad alias",
+            "not a valid Lambda function name",
+        ),
+        (
+            "aws_qualifier",
+            "not a qualifier",
+            "not a valid Lambda version or alias qualifier",
+        ),
+        (
+            "aws_qualifier",
+            "bad/alias",
+            "not a valid Lambda version or alias qualifier",
+        ),
+    ] {
+        let mut config = json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func"
+        });
+        config[field] = json!(value);
+        let err = expect_err(ServerlessFunction::new(&config, default_client()));
+        assert!(
+            err.contains(fragment),
+            "field={field} value={value:?}, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_over_length_lambda_identifiers_are_rejected() {
+    let long_name = "a".repeat(171);
+    let long_qualifier = "b".repeat(129);
+    for (field, value, fragment) in [
+        (
+            "aws_function_name",
+            long_name.as_str(),
+            "'aws_function_name' must be at most 170 characters",
+        ),
+        (
+            "aws_qualifier",
+            long_qualifier.as_str(),
+            "'aws_qualifier' must be at most 128 characters",
+        ),
+    ] {
+        let mut config = json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func"
+        });
+        config[field] = json!(value);
+        let err = expect_err(ServerlessFunction::new(&config, default_client()));
+        assert!(err.contains(fragment), "field={field}: {err}");
+    }
+}
+
+#[test]
+fn test_supported_lambda_identifier_forms_are_accepted() {
+    let _lock = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // SAFETY: serialized by ENV_MUTEX — no concurrent env var access
+    unsafe {
+        remove_all_aws_env_vars();
+        std::env::remove_var("AWS_LAMBDA_ENDPOINT_URL");
+    }
+
+    for function_name in [
+        "my-function",
+        "my_function.v2",
+        "my-function:prod",
+        "my-function:$LATEST",
+        "123456789012:function:my-function",
+        "us-east-1:123456789012:function:my-function",
+        "arn:aws:lambda:us-east-1:123456789012:function:my-function",
+        "arn:aws-cn:lambda:cn-north-1:123456789012:function:my-function:prod",
+        "arn:aws-us-gov:lambda:us-gov-west-1:123456789012:function:my-function",
+    ] {
+        for qualifier in ["$LATEST", "prod", "1", "blue-green_2"] {
+            ServerlessFunction::new(
+                &json!({
+                    "provider": "aws_lambda",
+                    "aws_region": "us-east-1",
+                    "aws_access_key_id": "AKIAIOSFODNN7EXAMPLE",
+                    "aws_secret_access_key": "secret",
+                    "aws_function_name": function_name,
+                    "aws_qualifier": qualifier
+                }),
+                default_client(),
+            )
+            .unwrap_or_else(|error| {
+                panic!("name={function_name} qualifier={qualifier} should be accepted: {error}")
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #5189 — provider credentials must be representable as header values
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_unrepresentable_credential_headers_fail_admission() {
+    for (provider, field, value) in [
+        ("azure_functions", "azure_function_key", "audit\ncredential"),
+        ("azure_functions", "azure_function_key", "audit\rcredential"),
+        ("azure_functions", "azure_function_key", "audit\u{0}cred"),
+        (
+            "gcp_cloud_functions",
+            "gcp_bearer_token",
+            "audit\ncredential",
+        ),
+        ("gcp_cloud_functions", "gcp_bearer_token", "audit\u{7f}cred"),
+    ] {
+        let mut config = json!({
+            "provider": provider,
+            "function_url": "http://127.0.0.1:45678/pre"
+        });
+        config[field] = json!(value);
+        let err = expect_err(ServerlessFunction::new(&config, default_client()));
+        assert!(
+            err.contains(&format!("'{field}' is not a valid HTTP header value")),
+            "provider={provider} field={field}: {err}"
+        );
+        assert!(
+            !err.contains("audit"),
+            "the diagnostic must not reflect the credential: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_ordinary_credential_headers_are_accepted() {
+    ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "azure_function_key": "my-secret-key=="
+        }),
+        default_client(),
+    )
+    .expect("ordinary Azure function key is accepted");
+    ServerlessFunction::new(
+        &json!({
+            "provider": "gcp_cloud_functions",
+            "function_url": "https://example.com/func",
+            "gcp_bearer_token": "ya29.example-token"
+        }),
+        default_client(),
+    )
+    .expect("ordinary GCP bearer token is accepted");
+}
+
+#[test]
+fn test_environment_resolved_credentials_are_validated_too() {
+    let _lock = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // SAFETY: serialized by ENV_MUTEX — no concurrent env var access
+    unsafe {
+        std::env::set_var("AZURE_FUNCTIONS_KEY", "audit\ncredential");
+    }
+    let azure_result = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func"
+        }),
+        default_client(),
+    );
+    // SAFETY: serialized by ENV_MUTEX — no concurrent env var access
+    unsafe {
+        std::env::remove_var("AZURE_FUNCTIONS_KEY");
+    }
+    let err = expect_err(azure_result);
+    assert!(
+        err.contains("'azure_function_key' is not a valid HTTP header value"),
+        "got: {err}"
+    );
+
+    // SAFETY: serialized by ENV_MUTEX — no concurrent env var access
+    unsafe {
+        std::env::set_var("GCP_CLOUD_FUNCTIONS_BEARER_TOKEN", "audit\ncredential");
+    }
+    let gcp_result = ServerlessFunction::new(
+        &json!({
+            "provider": "gcp_cloud_functions",
+            "function_url": "https://example.com/func"
+        }),
+        default_client(),
+    );
+    // SAFETY: serialized by ENV_MUTEX — no concurrent env var access
+    unsafe {
+        std::env::remove_var("GCP_CLOUD_FUNCTIONS_BEARER_TOKEN");
+    }
+    let err = expect_err(gcp_result);
+    assert!(
+        err.contains("'gcp_bearer_token' is not a valid HTTP header value"),
+        "got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GHSA-4xpr-23qf-v649 — an over-limit native gRPC terminate output must reject
+// ---------------------------------------------------------------------------
+
+async fn oversized_terminate_server() -> wiremock::MockServer {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(4096)))
+        .mount(&server)
+        .await;
+    server
+}
+
+#[tokio::test]
+async fn test_oversized_native_grpc_terminate_output_never_continues_to_the_backend() {
+    let server = oversized_terminate_server().await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "terminate",
+            "on_error": "continue",
+            "max_response_body_bytes": 64,
+            "timeout_ms": 5000
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ferrum_edge::_test_support::set_request_http_flavor_for_test(
+        &mut ctx,
+        ferrum_edge::config::types::HttpFlavor::Grpc,
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+
+    match plugin.finalized_egress(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502);
+            assert!(body.contains("response_body_too_large"), "got: {body}");
+            assert!(
+                !body.contains("xxxxxxxx"),
+                "the untrusted function body must never be reflected: {body}"
+            );
+        }
+        other => panic!(
+            "oversized native gRPC terminate output must fail closed, got {:?}",
+            other
+        ),
+    }
+    assert_eq!(
+        ctx.metadata
+            .get("serverless_function.standalone.error_class")
+            .map(String::as_str),
+        Some("response_body_too_large")
+    );
+}
+
+#[tokio::test]
+async fn test_oversized_native_grpc_terminate_output_rejects_under_on_error_reject() {
+    let server = oversized_terminate_server().await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "terminate",
+            "on_error": "reject",
+            "max_response_body_bytes": 64,
+            "timeout_ms": 5000
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ferrum_edge::_test_support::set_request_http_flavor_for_test(
+        &mut ctx,
+        ferrum_edge::config::types::HttpFlavor::Grpc,
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+
+    assert!(matches!(
+        plugin.finalized_egress(&mut ctx, &mut headers).await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+/// The promotion is scoped to the native gRPC terminate output contract:
+/// ordinary HTTP terminate keeps the documented `on_error: continue` behavior.
+#[tokio::test]
+async fn test_oversized_http_terminate_output_still_honors_on_error_continue() {
+    let server = oversized_terminate_server().await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "terminate",
+            "on_error": "continue",
+            "max_response_body_bytes": 64,
+            "timeout_ms": 5000
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    assert!(matches!(
+        plugin.finalized_egress(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("serverless_function.standalone.error_class")
+            .map(String::as_str),
+        Some("response_body_too_large")
+    );
+}
