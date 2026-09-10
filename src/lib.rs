@@ -100,6 +100,16 @@ pub mod _test_support {
         (path, cloned_offset)
     }
 
+    /// Exercise the WebSocket-handshake body-digest proof (issue #5000) without
+    /// standing up a transport. `plugins` decides whether any configured policy
+    /// asked for digests; `ctx` supplies the handshake's framing headers.
+    pub fn publish_websocket_handshake_body_digests_for_test(
+        plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+    ) {
+        crate::proxy::publish_websocket_handshake_body_digests(plugins, ctx);
+    }
+
     pub fn websocket_backend_path_for_test(
         proxy: &crate::config::types::Proxy,
         path: &str,
@@ -11307,6 +11317,35 @@ pub mod _test_support {
     /// Process-wide count of records rejected alone by the datagram gate.
     pub fn udp_logging_local_record_drops_for_test() -> u64 {
         crate::plugins::udp_logging::local_record_drops_for_test()
+    }
+
+    /// Lost-record total for injected split-batch retry sequences.
+    ///
+    /// Each inner slice is one attempt. Labels: `"reject"` (deterministic
+    /// local size rejection), `"ok"` (delivered), `"transport"` (transport
+    /// error). Matches production: local rejects count only on a completed
+    /// attempt; exhausting retries counts the original batch once.
+    pub fn udp_logging_split_retry_lost_record_count_for_test(attempts: &[&[&str]]) -> u64 {
+        use crate::plugins::udp_logging::SplitEntryOutcome;
+        let parsed: Vec<Vec<SplitEntryOutcome>> = attempts
+            .iter()
+            .map(|attempt| {
+                attempt
+                    .iter()
+                    .map(|label| match *label {
+                        "reject" => SplitEntryOutcome::LocalReject,
+                        "ok" => SplitEntryOutcome::Delivered,
+                        "transport" => SplitEntryOutcome::TransportError,
+                        other => panic!(
+                            "udp_logging split-retry fixture label must be \
+                             reject/ok/transport, got {other}"
+                        ),
+                    })
+                    .collect()
+            })
+            .collect();
+        let refs: Vec<&[SplitEntryOutcome]> = parsed.iter().map(Vec::as_slice).collect();
+        crate::plugins::udp_logging::split_retry_lost_record_count(&refs)
     }
 
     pub fn udp_logging_classify_serialized_summaries_for_test(

@@ -10941,6 +10941,7 @@ components:
                     plugin_name:
                       const: hmac_auth
                 then:
+                  required: [config]
                   properties:
                     config:
                       $ref: "#/components/schemas/HmacAuthConfig"
@@ -11014,6 +11015,7 @@ components:
                     plugin_name:
                       const: security_headers
                 then:
+                  required: [config]
                   properties:
                     config:
                       $ref: "#/components/schemas/SecurityHeadersConfig"
@@ -11584,8 +11586,7 @@ components:
                   required: [config]
                   properties:
                     config:
-                      $ref: "#/components/schemas/FaultInjectionConfig"
-        - if:
+                      $ref: "#/components/schemas/FaultInjectionConfig"        - if:
             required: [plugin_name]
             properties:
               plugin_name:
@@ -17784,11 +17785,39 @@ components:
             properties:
               tls:
                 const: true
+        - not:
+            required: [schema, schema_ref]
+        - if:
+            not:
+              required: [max_entry_bytes]
+          then:
+            properties:
+              buffer_max_bytes:
+                minimum: 131074
       properties:
         host:
           type: string
           minLength: 1
-          description: Hostname or IP of the TCP log receiver
+          # Runtime trims surrounding whitespace, then parse_socket_host:
+          # hostname or IP without scheme, path, query, fragment, credentials,
+          # or a single-colon host:port. Brackets are valid only around an IPv6
+          # literal.
+          not:
+            anyOf:
+              - pattern: "://"
+              - pattern: "[/?#@]"
+              - pattern: "^\\s+$"
+              - pattern: "\\S\\s+\\S"
+              - pattern: "^\\s*[^\\[\\]:\\s]+:[^:\\s]+\\s*$"
+              - allOf:
+                  - pattern: "[\\[\\]]"
+                  - not:
+                      pattern: "^\\s*\\[[0-9A-Fa-f:.]+\\]\\s*$"
+          description: >-
+            Hostname or IP of the TCP log receiver. Surrounding whitespace is
+            trimmed. Must be a bare hostname or IP without scheme, path, query,
+            fragment, credentials, or port (bracketed and unbracketed IPv6
+            literals are allowed).
         port:
           type: integer
           minimum: 1
@@ -17801,13 +17830,14 @@ components:
         tls_server_name:
           type: string
           minLength: 1
-          pattern: '^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?|[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*)$'
+          pattern: '^(?:[A-Za-z0-9_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?\.?|[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*)$'
           description: >-
             DNS or IP identity for TLS SNI/certificate verification (defaults to
-            `host`). Allowed only when `tls` is true. The schema rejects URL
-            schemes, paths, queries, fragments, credentials, whitespace, and
-            host:port values; full rustls DNS/IP identity validation is enforced
-            during plugin admission.
+            `host`). Allowed only when `tls` is true. Accepts rustls DNS/IP
+            identities, including absolute names (trailing dot) and underscore
+            labels. The schema rejects URL schemes, paths, queries, fragments,
+            credentials, whitespace, and host:port values; full rustls DNS/IP
+            identity validation is enforced during plugin admission.
         batch_size:
           type: integer
           default: 50
@@ -17854,7 +17884,9 @@ components:
           description: >-
             Aggregate retained serialized-content budget across queued,
             assembled, and retrying records. Must be at least
-            2 * (max_entry_bytes + 1).
+            2 * (max_entry_bytes + 1) and at most 268435456 (256 MiB). When
+            `max_entry_bytes` is omitted, the default entry size requires at
+            least 131074.
         connect_timeout_ms:
           type: integer
           default: 5000
@@ -17912,22 +17944,39 @@ components:
                 - required: [dtls_key_path]
                 - required: [dtls_ca_cert_path]
                 - required: [dtls_no_verify]
+        - not:
+            required: [schema, schema_ref]
+        - if:
+            not:
+              required: [max_entry_bytes]
+          then:
+            properties:
+              buffer_max_bytes:
+                minimum: 131074
       properties:
         host:
           type: string
           minLength: 1
-          # Match runtime parse_socket_host: hostname or IP without scheme,
-          # path, query, fragment, credentials, or a single-colon host:port.
-          # Valid IPv6 literals necessarily contain at least two colons.
+          # Runtime trims surrounding whitespace, then parse_socket_host:
+          # hostname or IP without scheme, path, query, fragment, credentials,
+          # or a single-colon host:port. Brackets are valid only around an IPv6
+          # literal.
           not:
             anyOf:
               - pattern: "://"
-              - pattern: "[/?#@\\s]"
-              - pattern: "^[^\\[\\]:]+:[^:]+$"
+              - pattern: "[/?#@]"
+              - pattern: "^\\s+$"
+              - pattern: "\\S\\s+\\S"
+              - pattern: "^\\s*[^\\[\\]:\\s]+:[^:\\s]+\\s*$"
+              - allOf:
+                  - pattern: "[\\[\\]]"
+                  - not:
+                      pattern: "^\\s*\\[[0-9A-Fa-f:.]+\\]\\s*$"
           description: >-
-            UDP endpoint hostname or IP address. Must be a bare hostname or IP
-            without scheme, path, query, fragment, credentials, or port
-            (bracketed and unbracketed IPv6 literals are allowed).
+            UDP endpoint hostname or IP address. Surrounding whitespace is
+            trimmed. Must be a bare hostname or IP without scheme, path, query,
+            fragment, credentials, or port (bracketed and unbracketed IPv6
+            literals are allowed).
         port:
           type: integer
           minimum: 1
@@ -17945,24 +17994,30 @@ components:
         dtls_cert_path:
           type: string
           minLength: 1
+          pattern: "\\S"
           description: >-
             PEM client certificate for DTLS mutual TLS. Materialized during the
             consuming node's dependency/construction phase when dtls is true; must
             be paired with dtls_key_path. Rejected unless dtls is true.
+            Whitespace-only values are rejected.
         dtls_key_path:
           type: string
           minLength: 1
+          pattern: "\\S"
           description: >-
             PEM private key for DTLS mutual TLS (ECDSA P-256 or P-384). Must be
             paired with dtls_cert_path. Rejected unless dtls is true.
+            Whitespace-only values are rejected.
         dtls_ca_cert_path:
           type: string
           minLength: 1
+          pattern: "\\S"
           description: >-
             PEM CA certificate for verifying the DTLS server. Materialized on the
             consuming node whenever set with dtls true, including when dtls_no_verify
             is true (the source must still be valid even though verification is
-            disabled). Rejected unless dtls is true.
+            disabled). Rejected unless dtls is true. Whitespace-only values are
+            rejected.
         dtls_no_verify:
           type: boolean
           default: false
@@ -18015,11 +18070,14 @@ components:
           description: >-
             Aggregate retained serialized-content budget across queued,
             assembled, and retrying records. Must be at least
-            2 * (max_entry_bytes + 1).
+            2 * (max_entry_bytes + 1) and at most 268435456 (256 MiB). When
+            `max_entry_bytes` is omitted, the default entry size requires at
+            least 131074.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
           type: string
+          minLength: 1
           description: >-
             Name of a schema registered by a `transaction_log_schema` plugin.
             Mutually exclusive with `schema`. See docs/log_schema.md.
@@ -18660,12 +18718,50 @@ components:
         omitted. When the transaction_debug DEBUG target is disabled no body is
         buffered for capture. Captured bytes go only to the transaction_debug
         tracing target and are never written into transaction-log metadata.
+      allOf:
+        - if:
+            required: [max_request_body_bytes]
+          then:
+            required: [log_request_body]
+            properties:
+              log_request_body:
+                const: true
+        - if:
+            required: [max_response_body_bytes]
+          then:
+            required: [log_response_body]
+            properties:
+              log_response_body:
+                const: true
+        - if:
+            required: [redacted_body_fields]
+            properties:
+              redacted_body_fields:
+                type: array
+                minItems: 1
+          then:
+            anyOf:
+              - required: [log_request_body]
+                properties:
+                  log_request_body:
+                    const: true
+              - required: [log_response_body]
+                properties:
+                  log_response_body:
+                    const: true
+        - not:
+            required: [schema, schema_ref]
       properties:
         redacted_headers:
           type: array
           items:
             type: string
-          description: Additional header names to redact beyond the built-in sensitive list
+            minLength: 1
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+          description: >-
+            Additional header names to redact beyond the built-in sensitive
+            list. Each entry must be a nonempty HTTP header token (RFC 9110
+            tchar). Empty strings and names with spaces are rejected.
         log_request_body:
           type: boolean
           default: false
@@ -18699,12 +18795,13 @@ components:
           items:
             type: string
             minLength: 1
-            maxLength: 128
-            pattern: '\S'
+            pattern: '^\s*\S(?:[\s\S]{0,126}\S)?\s*$'
           description: >-
             Additional body field names (compared case-insensitively) to redact
-            beyond the built-in credential markers. Requires log_request_body or
-            log_response_body true.
+            beyond the built-in credential markers. Surrounding whitespace is
+            trimmed before the 128-character maximum is applied. Requires
+            log_request_body or log_response_body true when the array is
+            nonempty. An empty array is valid without a capture switch.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
@@ -18729,15 +18826,16 @@ components:
           type: [string, "null"]
           default: x-request-id
           minLength: 1
-          pattern: "^\\s*[!#$%&'*+.^_`|~0-9A-Za-z-]+\\s*$"
+          maxLength: 65535
+          pattern: "^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*[!#$%&'*+.^_`|~0-9A-Za-z-]+[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$"
           not:
             type: string
-            pattern: "^\\s*(?:[Ee][Aa][Rr][Ll][Yy]-[Dd][Aa][Tt][Aa]|[Xx]-[Ff][Ee][Rr][Rr][Uu][Mm]-[Oo][Rr][Ii][Gg][Ii][Nn][Aa][Ll]-[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Xx]-[Gg][Rr][Pp][Cc]-[Ww][Ee][Bb]-[Mm][Oo][Dd][Ee]|[Aa][Pp][Ii]-[Kk][Ee][Yy]|[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ii][Oo][Nn]-[Ii][Nn][Ff][Oo]|[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]|[Cc][Oo][Oo][Kk][Ii][Ee]|[Ee][Xx][Pp][Ee][Cc][Tt]|[Gg][Rr][Pp][Cc]-[Mm][Ee][Ss][Ss][Aa][Gg][Ee]|[Gg][Rr][Pp][Cc]-[Ss][Tt][Aa][Tt][Uu][Ss]|[Gg][Rr][Pp][Cc]-[Ss][Tt][Aa][Tt][Uu][Ss]-[Dd][Ee][Tt][Aa][Ii][Ll][Ss]-[Bb][Ii][Nn]|[Hh][Oo][Ss][Tt]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ii][Oo][Nn]-[Ii][Nn][Ff][Oo]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Pp][Rr][Oo][Xx][Yy]-[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Ss][Ee][Cc]-[Ww][Ee][Bb][Ss][Oo][Cc][Kk][Ee][Tt]-[Aa][Cc][Cc][Ee][Pp][Tt]|[Ss][Ee][Cc]-[Ww][Ee][Bb][Ss][Oo][Cc][Kk][Ee][Tt]-[Ee][Xx][Tt][Ee][Nn][Ss][Ii][Oo][Nn][Ss]|[Ss][Ee][Cc]-[Ww][Ee][Bb][Ss][Oo][Cc][Kk][Ee][Tt]-[Kk][Ee][Yy]|[Ss][Ee][Cc]-[Ww][Ee][Bb][Ss][Oo][Cc][Kk][Ee][Tt]-[Pp][Rr][Oo][Tt][Oo][Cc][Oo][Ll]|[Ss][Ee][Cc]-[Ww][Ee][Bb][Ss][Oo][Cc][Kk][Ee][Tt]-[Vv][Ee][Rr][Ss][Ii][Oo][Nn]|[Ss][Ee][Tt]-[Cc][Oo][Oo][Kk][Ii][Ee]|[Tt][Ee]|[Tt][Rr][Aa][Cc][Ee][Pp][Aa][Rr][Ee][Nn][Tt]|[Tt][Rr][Aa][Cc][Ee][Ss][Tt][Aa][Tt][Ee]|[Tt][Rr][Aa][Ii][Ll][Ee][Rr]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee]|[Ww][Ww][Ww]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Xx]-[Aa][Pp][Ii]-[Kk][Ee][Yy]|[Xx]-[Aa][Uu][Tt][Hh]-[Tt][Oo][Kk][Ee][Nn]|[Xx]-[Cc][Ss][Rr][Ff]-[Tt][Oo][Kk][Ee][Nn]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Ff][Oo][Rr]|[Xx]-[Gg][Oo][Oo][Gg]-[Aa][Pp][Ii]-[Kk][Ee][Yy]|[Xx]-[Xx][Ss][Rr][Ff]-[Tt][Oo][Kk][Ee][Nn])\\s*$"
+            pattern: "^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*(?:[Ee][Aa][Rr][Ll][Yy]-[Dd][Aa][Tt][Aa]|[Xx]-[Ff][Ee][Rr][Rr][Uu][Mm]-[Oo][Rr][Ii][Gg][Ii][Nn][Aa][Ll]-[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Xx]-[Gg][Rr][Pp][Cc]-[Ww][Ee][Bb]-[Mm][Oo][Dd][Ee]|[Aa][Pp][Ii]-[Kk][Ee][Yy]|[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ii][Oo][Nn]-[Ii][Nn][Ff][Oo]|[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]|[Cc][Oo][Oo][Kk][Ii][Ee]|[Ee][Xx][Pp][Ee][Cc][Tt]|[Gg][Rr][Pp][Cc]-[Mm][Ee][Ss][Ss][Aa][Gg][Ee]|[Gg][Rr][Pp][Cc]-[Ss][Tt][Aa][Tt][Uu][Ss]|[Gg][Rr][Pp][Cc]-[Ss][Tt][Aa][Tt][Uu][Ss]-[Dd][Ee][Tt][Aa][Ii][Ll][Ss]-[Bb][Ii][Nn]|[Hh][Oo][Ss][Tt]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ii][Oo][Nn]-[Ii][Nn][Ff][Oo]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Pp][Rr][Oo][Xx][Yy]-[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Ss][Ee][Cc]-[Ww][Ee][Bb][Ss][Oo][Cc][Kk][Ee][Tt]-[Aa][Cc][Cc][Ee][Pp][Tt]|[Ss][Ee][Cc]-[Ww][Ee][Bb][Ss][Oo][Cc][Kk][Ee][Tt]-[Ee][Xx][Tt][Ee][Nn][Ss][Ii][Oo][Nn][Ss]|[Ss][Ee][Cc]-[Ww][Ee][Bb][Ss][Oo][Cc][Kk][Ee][Tt]-[Kk][Ee][Yy]|[Ss][Ee][Cc]-[Ww][Ee][Bb][Ss][Oo][Cc][Kk][Ee][Tt]-[Pp][Rr][Oo][Tt][Oo][Cc][Oo][Ll]|[Ss][Ee][Cc]-[Ww][Ee][Bb][Ss][Oo][Cc][Kk][Ee][Tt]-[Vv][Ee][Rr][Ss][Ii][Oo][Nn]|[Ss][Ee][Tt]-[Cc][Oo][Oo][Kk][Ii][Ee]|[Tt][Ee]|[Tt][Rr][Aa][Cc][Ee][Pp][Aa][Rr][Ee][Nn][Tt]|[Tt][Rr][Aa][Cc][Ee][Ss][Tt][Aa][Tt][Ee]|[Tt][Rr][Aa][Ii][Ll][Ee][Rr]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee]|[Ww][Ww][Ww]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Xx]-[Aa][Pp][Ii]-[Kk][Ee][Yy]|[Xx]-[Aa][Uu][Tt][Hh]-[Tt][Oo][Kk][Ee][Nn]|[Xx]-[Cc][Ss][Rr][Ff]-[Tt][Oo][Kk][Ee][Nn]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Ff][Oo][Rr]|[Xx]-[Gg][Oo][Oo][Gg]-[Aa][Pp][Ii]-[Kk][Ee][Yy]|[Xx]-[Xx][Ss][Rr][Ff]-[Tt][Oo][Kk][Ee][Nn])[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$"
           allOf:
             - not:
                 type: string
-                pattern: "^\\s*(?:[Ee][Aa][Rr][Ll][Yy]-[Dd][Aa][Tt][Aa]|[Xx]-[Ff][Ee][Rr][Rr][Uu][Mm]-[Oo][Rr][Ii][Gg][Ii][Nn][Aa][Ll]-[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Xx]-[Gg][Rr][Pp][Cc]-[Ww][Ee][Bb]-[Mm][Oo][Dd][Ee]|[Tt][Rr][Aa][Cc][Ee][Pp][Aa][Rr][Ee][Nn][Tt]|[Tt][Rr][Aa][Cc][Ee][Ss][Tt][Aa][Tt][Ee]|[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]|[Vv][Ii][Aa]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Hh][Oo][Ss][Tt]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Pp][Rr][Oo][Tt][Oo])\\s*$"
-          description: "Header name (surrounding whitespace trimmed and lowercased internally). Used for the inbound preserved value and this instance's outbound/echoed value. Protocol-managed request, forwarding, framing, connection, content-coding, W3C tracing context (traceparent and tracestate), gRPC status, WebSocket handshake, and internal marker names (including early-data, x-grpc-web-mode, and x-ferrum-original-content-encoding), plus security-sensitive credential/authentication names, are rejected case-insensitively. Runtime also rejects the effective deployment-specific FERRUM_REAL_IP_HEADER value case-insensitively; CP/DP config sync enforces one matching value across the cluster before distribution. Null selects x-request-id."
+                pattern: "^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*(?:[Ee][Aa][Rr][Ll][Yy]-[Dd][Aa][Tt][Aa]|[Xx]-[Ff][Ee][Rr][Rr][Uu][Mm]-[Oo][Rr][Ii][Gg][Ii][Nn][Aa][Ll]-[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Xx]-[Gg][Rr][Pp][Cc]-[Ww][Ee][Bb]-[Mm][Oo][Dd][Ee]|[Tt][Rr][Aa][Cc][Ee][Pp][Aa][Rr][Ee][Nn][Tt]|[Tt][Rr][Aa][Cc][Ee][Ss][Tt][Aa][Tt][Ee]|[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]|[Vv][Ii][Aa]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Hh][Oo][Ss][Tt]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Pp][Rr][Oo][Tt][Oo])[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$"
+          description: "Header name (surrounding Rust `str::trim` Unicode White_Space is trimmed and the name is lowercased internally). After trimming, the token must be a valid `http::HeaderName` of at most 65,535 ASCII bytes. Used for the inbound preserved value and this instance's outbound/echoed value. Protocol-managed request, forwarding, framing, connection, content-coding, W3C tracing context (traceparent and tracestate), gRPC status, WebSocket handshake, and internal marker names (including early-data, x-grpc-web-mode, and x-ferrum-original-content-encoding), plus security-sensitive credential/authentication names, are rejected case-insensitively. Runtime also rejects the effective deployment-specific FERRUM_REAL_IP_HEADER value case-insensitively; CP/DP config sync enforces one matching value across the cluster before distribution. Null selects x-request-id."
         echo_downstream:
           type: [boolean, "null"]
           default: true
@@ -20614,9 +20712,28 @@ components:
             legacy backend explicitly requires the reusable credential.
 
     BasicAuthConfig:
-      type: object
-      description: "Plugin: basic_auth — HTTP Basic credentials verified against HMAC-SHA256 password hashes."
-      properties: {}
+      type: [object, "null"]
+      additionalProperties: false
+      description: >-
+        Plugin: basic_auth — HTTP Basic credentials verified against
+        HMAC-SHA256 password hashes. The property set is CLOSED: `null` and an
+        empty object both select the defaults, and no other key is accepted.
+        (The enclosing PluginConfig `config` property is independently
+        restricted to objects, so `null` is only reachable when this component
+        is validated on its own.)
+      properties:
+        hide_credentials:
+          type: boolean
+          default: true
+          description: >-
+            Remove the `Authorization` field carrying the RFC 7617 `Basic`
+            scheme before forwarding an authenticated request upstream,
+            including when another mechanism wins a multi-auth chain and this
+            credential merely rode along. Basic encodes a reusable password in
+            reversible Base64, so it is removed by default. Only the `Basic`
+            scheme is removed; a `Bearer` or other scheme another policy needs
+            is left in place. Disable only when a legacy backend explicitly
+            requires the reusable credential.
 
     LdapAuthConfig:
       type: object
@@ -20825,7 +20942,11 @@ components:
         retry is therefore a replay and is rejected; safe retries send a fresh
         nonce with a recomputed signature. HBONE CONNECT and
         request-body-transformer compositions fail closed. The
-        pre-authentication body path has a 10 MiB hard ceiling.
+        pre-authentication body path has a 10 MiB hard ceiling. A WebSocket
+        handshake (HTTP/1.1 Upgrade, HTTP/2 and HTTP/3 Extended CONNECT) is
+        signed over the EMPTY body: tunnel DATA is never drained as a request
+        body, so the transport proves the handshake's empty representation from
+        its own wire framing, and a handshake that declares a body is rejected.
       properties:
         clock_skew_seconds:
           type: integer
@@ -20877,7 +20998,9 @@ components:
             request instead of falling back to freshness-only acceptance.
         replay_max_entries:
           type: integer
+          format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           default: 100000
           description: >-
             Capacity this process-scoped authority enforces against the shared
@@ -20936,6 +21059,59 @@ components:
         redis_password:
           type: string
           description: Redis password
+      allOf:
+        # The constructor's profile/scope/backend admission, expressed exactly.
+        # An omitted `signing_profile` means `ferrum-hmac-v2`, so the v2 rules
+        # live in the `else` branch rather than in a second `if`.
+        - if:
+            required: [signing_profile]
+            properties:
+              signing_profile:
+                const: ferrum-hmac-v1
+          then:
+            # v1 has no replay state at all: it demands the unsafe
+            # acknowledgement and refuses every replay knob.
+            required: [allow_unsafe_replayable_v1]
+            properties:
+              allow_unsafe_replayable_v1:
+                const: true
+              sync_mode:
+                const: local
+            not:
+              required: [replay_scope]
+          else:
+            # ferrum-hmac-v2 (the default) has no default replay scope, and the
+            # unsafe acknowledgement is only meaningful with v1.
+            required: [replay_scope]
+            properties:
+              allow_unsafe_replayable_v1:
+                const: false
+        - if:
+            required: [replay_scope]
+            properties:
+              replay_scope:
+                const: shared
+          then:
+            required: [sync_mode, redis_url]
+            properties:
+              sync_mode:
+                const: redis
+        - if:
+            required: [replay_scope]
+            properties:
+              replay_scope:
+                const: process
+          then:
+            properties:
+              sync_mode:
+                const: local
+        - if:
+            required: [sync_mode]
+            properties:
+              sync_mode:
+                const: redis
+          then:
+            required: [redis_url]
 
     # ── Mesh / Service-Mesh Plugins ─────────────────────────────────
     # These plugins are primarily auto-injected by mesh mode (sidecar / ambient /
@@ -23337,7 +23513,8 @@ components:
           default: []
           description: >-
             Consumer usernames that are explicitly allowed. Empty list disables
-            the username allow check (other allow rules still apply).
+            the username allow check (other allow rules still apply). Each
+            entry is at most 255 Unicode characters.
         disallowed_consumers:
           type: array
           items:
@@ -23363,7 +23540,8 @@ components:
           default: []
           description: >-
             ACL group names that are explicitly allowed. The check matches if
-            any of the consumer's `acl_groups` appears in this list.
+            any of the consumer's `acl_groups` appears in this list. Each
+            entry is at most 255 Unicode characters.
         disallowed_groups:
           type: array
           items:
@@ -23375,7 +23553,8 @@ components:
           description: >-
             ACL group names that are explicitly denied. If any of the consumer's
             `acl_groups` appears in this list the request is rejected, even when
-            the username is in `allowed_consumers`.
+            the username is in `allowed_consumers`. Each entry is at most 255
+            Unicode characters.
         allow_authenticated_identity:
           type: boolean
           default: false
@@ -23408,6 +23587,7 @@ components:
           type: integer
           format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           description: >-
             Maximum active TCP connections allowed for one Consumer/IP key in
             this ferrum-edge process. Each replica enforces this limit
@@ -23451,30 +23631,35 @@ components:
           format: uint64
           default: 10000
           minimum: 1
+          maximum: 18446744073709551615
           description: Maximum number of distinct target keys this stable plugin policy will track, bounding limiter memory for high-cardinality wildcard upstreams. State is retained across compatible config reloads. Lowering this value or changing the policy's effective subset-filtered backend targets, route-override destinations, or route execution order publishes an independent tracking space; retired permits finish against detached state, while retired cache and load-balancer views cannot admit, repopulate, or train the replacement. Service-discovery changes outside the policy's selected subset remain compatible. When the cap is reached, new target keys fail open — they are admitted without adaptive limiting (never rejected with a 503) until the policy is removed/recreated, its route key space changes, or the process restarts. Existing keys continue to be admitted subject to their adaptive limit.
         min_limit:
           type: integer
           format: uint64
           default: 1
           minimum: 1
+          maximum: 18446744073709551615
           description: Lower bound for the adaptive in-flight request limit.
         initial_limit:
           type: integer
           format: uint64
           default: 32
           minimum: 1
+          maximum: 18446744073709551615
           description: Starting in-flight request limit for a new target key. Must be between `min_limit` and `max_limit`.
         max_limit:
           type: integer
           format: uint64
           default: 1024
           minimum: 1
+          maximum: 18446744073709551615
           description: Upper bound for the adaptive in-flight request limit. Must be greater than or equal to `min_limit`.
         min_samples:
           type: integer
           format: uint64
           default: 20
           minimum: 1
+          maximum: 18446744073709551615
           description: Successful backend samples required before latency-based limit changes are applied.
         target_latency_multiplier:
           type: number
@@ -23494,6 +23679,7 @@ components:
           format: uint64
           default: 1
           minimum: 1
+          maximum: 18446744073709551615
           description: Additive increase applied when the target is saturated and latency remains within the target.
         shadow_mode:
           type: boolean
@@ -23503,6 +23689,23 @@ components:
           type: boolean
           default: false
           description: Include `x-adaptive-concurrency-limit` and `x-adaptive-concurrency-inflight` on genuine per-target limit rejections. Generation-handoff rejections omit them because no truthful per-target limit or in-flight value exists.
+
+    IpRestrictionRule:
+      type: string
+      minLength: 1
+      description: >-
+        One IP or CIDR rule admitted by `ip_restriction`. Surrounding whitespace
+        follows Rust `str::trim` Unicode `White_Space` semantics. IPv4 octets
+        must be canonical unsigned decimal (no leading zeros, no `+`). Native
+        IPv6 may be bracketed and may carry a zone identifier; CIDR prefixes
+        sit outside the brackets. IPv4 CIDR prefixes are `/0`–`/32`; native
+        IPv6 prefixes are `/0`–`/128`. IPv4-mapped IPv6 (`::ffff:a.b.c.d` and
+        the uncompressed `0:0:0:0:0:ffff:…` form) accept exact addresses or
+        CIDR `/96`–`/128` only.
+      allOf:
+        - pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)){3}(?:/(?:3[0-2]|[12]?[0-9]))?|(?:(?:(?:(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,7}:|(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,5}(?::[0-9A-Fa-f]{1,4}){1,2}|(?:[0-9A-Fa-f]{1,4}:){1,4}(?::[0-9A-Fa-f]{1,4}){1,3}|(?:[0-9A-Fa-f]{1,4}:){1,3}(?::[0-9A-Fa-f]{1,4}){1,4}|(?:[0-9A-Fa-f]{1,4}:){1,2}(?::[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:(?:(?::[0-9A-Fa-f]{1,4}){1,6})|:(?:(?::[0-9A-Fa-f]{1,4}){1,7}|:))|(?:(?:[0-9A-Fa-f]{1,4}:){6}|(?:[0-9A-Fa-f]{1,4}:){1,5}:|::(?:[Ff]{4}:)?)(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)){3})(?:%[^/\]]+)?|\[(?:(?:(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,7}:|(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,5}(?::[0-9A-Fa-f]{1,4}){1,2}|(?:[0-9A-Fa-f]{1,4}:){1,4}(?::[0-9A-Fa-f]{1,4}){1,3}|(?:[0-9A-Fa-f]{1,4}:){1,3}(?::[0-9A-Fa-f]{1,4}){1,4}|(?:[0-9A-Fa-f]{1,4}:){1,2}(?::[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:(?:(?::[0-9A-Fa-f]{1,4}){1,6})|:(?:(?::[0-9A-Fa-f]{1,4}){1,7}|:))|(?:(?:[0-9A-Fa-f]{1,4}:){6}|(?:[0-9A-Fa-f]{1,4}:){1,5}:|::(?:[Ff]{4}:)?)(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)){3})(?:%[^/\]]+)?\])(?:/(?:12[0-8]|1[01][0-9]|[1-9]?[0-9]))?)[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$'
+        - not:
+            pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*\[?(?:::[Ff]{4}:|(?:0{1,4}:){5}[Ff]{4}:)(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)){3}|[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4})(?:%[^/\]]+)?\]?/(?:[0-8]?[0-9]|9[0-5])[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$'
 
     IpRestrictionConfig:
       type: object
@@ -23537,23 +23740,21 @@ components:
         allow:
           type: array
           items:
-            type: string
-            minLength: 1
-            pattern: '.*\S.*'
+            $ref: "#/components/schemas/IpRestrictionRule"
           default: []
           description: >-
             Allowed IP addresses or CIDR ranges (IPv4 or IPv6). Empty list
-            disables allow-list enforcement.
+            disables allow-list enforcement. Each entry must match
+            `IpRestrictionRule`.
         deny:
           type: array
           items:
-            type: string
-            minLength: 1
-            pattern: '.*\S.*'
+            $ref: "#/components/schemas/IpRestrictionRule"
           default: []
           description: >-
             Denied IP addresses or CIDR ranges (IPv4 or IPv6). Always takes
-            precedence over an `allow` match.
+            precedence over an `allow` match. Each entry must match
+            `IpRestrictionRule`.
         mode:
           type: string
           enum: [allow_first, deny_first]
@@ -24037,7 +24238,57 @@ components:
     SecurityHeadersConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: security_headers — Injects validated response security headers (secure defaults) and strips fingerprinting headers at the client-visible initial-header boundary, including buffered gRPC/gRPC-Web and WebSocket handshakes. Unknown configuration keys are rejected, and `set` rejects protocol-managed hop-by-hop / framing destinations (`remove` of those names remains allowed)."
+      description: "Plugin: security_headers — Injects validated response security headers (secure defaults) and strips fingerprinting headers at the client-visible initial-header boundary, including buffered gRPC/gRPC-Web and WebSocket handshakes. Unknown configuration keys are rejected, `config` must be an object, and `set` rejects protocol-managed hop-by-hop / framing destinations (`remove` of those names remains allowed). An effective policy that sets and removes nothing is rejected."
+      not:
+        allOf:
+          - required: [content_type_options]
+            properties:
+              content_type_options:
+                oneOf:
+                  - const: false
+                  - const: ""
+                  - type: "null"
+          - required: [frame_options]
+            properties:
+              frame_options:
+                oneOf:
+                  - const: false
+                  - const: ""
+                  - type: "null"
+          - required: [referrer_policy]
+            properties:
+              referrer_policy:
+                oneOf:
+                  - const: false
+                  - const: ""
+                  - type: "null"
+          - required: [remove]
+            properties:
+              remove:
+                oneOf:
+                  - type: array
+                    maxItems: 0
+                  - type: "null"
+          - properties:
+              hsts:
+                oneOf:
+                  - const: false
+                  - const: ""
+                  - type: "null"
+              content_security_policy:
+                oneOf:
+                  - const: ""
+                  - type: "null"
+              permissions_policy:
+                oneOf:
+                  - const: ""
+                  - type: "null"
+              set:
+                oneOf:
+                  - type: object
+                    additionalProperties: false
+                    maxProperties: 0
+                  - type: "null"
       properties:
         content_type_options:
           oneOf:
@@ -24064,7 +24315,7 @@ components:
           default: strict-origin-when-cross-origin
           description: "Referrer-Policy. Default strict-origin-when-cross-origin; string overrides; false disables."
         hsts:
-          description: "Strict-Transport-Security (opt-in). true = max-age=31536000; includeSubDomains; a string is used verbatim; an object {max_age, include_subdomains, preload} builds the value."
+          description: "Strict-Transport-Security (opt-in). true = max-age=31536000; includeSubDomains; a string is used verbatim; false/null/\"\" disables; an object {max_age, include_subdomains, preload} builds the value. Object members accept JSON null as the documented default: max_age 31536000 (unsigned 64-bit integer), include_subdomains true, preload false."
           oneOf:
             - type: boolean
             - type: string
@@ -24074,14 +24325,16 @@ components:
               additionalProperties: false
               properties:
                 max_age:
-                  type: integer
+                  type: [integer, "null"]
+                  format: uint64
                   minimum: 0
+                  maximum: 18446744073709551615
                   default: 31536000
                 include_subdomains:
-                  type: boolean
+                  type: [boolean, "null"]
                   default: true
                 preload:
-                  type: boolean
+                  type: [boolean, "null"]
                   default: false
         content_security_policy:
           type: [string, "null"]
@@ -24098,6 +24351,8 @@ components:
             minLength: 1
             maxLength: 65535
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+            not:
+              pattern: "^(?:[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Ee]|[Tt][Rr][Aa][Ii][Ll][Ee][Rr]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee])$"
           additionalProperties:
             type: string
             pattern: '^[\u0009\u0020-\u007E]*$'
@@ -24112,9 +24367,9 @@ components:
           default: [server, x-powered-by]
           description: "Valid HTTP field names (maximum 65,535 ASCII bytes) to strip case-insensitively. Names are canonicalized to lowercase. Defaults to Server and X-Powered-By; set [] to strip nothing."
         override_existing:
-          type: boolean
+          type: [boolean, "null"]
           default: true
-          description: "When false, only add a header the backend did not already set."
+          description: "When false, only add a header the backend did not already set. Null selects true."
 
     CompressionConfig:
       type: [object, "null"]
@@ -24195,15 +24450,16 @@ components:
           type: integer
           format: uint64
           minimum: 1
-          description: "EventSource reconnection hint in milliseconds (must be >= 1 when set)"
+          maximum: 18446744073709551615
+          description: "EventSource reconnection hint in milliseconds, prepended as a retry: field when wrapping. Admitted over the JSON numeric VALUE, so an exact integer-valued number (2500.0) is accepted exactly as 2500 is; fractional values and magnitudes outside the unsigned 64-bit range above are rejected."
         force_sse_content_type:
           type: boolean
           default: false
-          description: "Force Content-Type: text/event-stream even if backend returns something else"
+          description: "Force Content-Type: text/event-stream even if backend returns something else. Not applied to a response carrying Cache-Control: no-transform (RFC 9110 section 7.7 forbids an intermediary changing Content-Type on one)."
         wrap_non_sse_responses:
           type: boolean
           default: false
-          description: "Wrap non-SSE response bodies in data: ...\\n\\n SSE event framing (enables response buffering). Implies client-visible text/event-stream for wrapped responses and composes with force_sse_content_type."
+          description: "Wrap non-SSE response bodies in data: ...\\n\\n SSE event framing (enables response buffering). Implies client-visible text/event-stream for wrapped responses and composes with force_sse_content_type. Wrapping and its relabel are declined together — the origin representation is forwarded unchanged — for 206/226 responses, responses carrying Cache-Control: no-transform (RFC 9110 section 7.7, which also blocks force_sse_content_type), and bodies under a non-identity Content-Encoding. A framed event that exceeds the effective response-body ceiling returns the gateway capacity refusal instead of the unframed body."
 
     RateLimitingRuleConfig:
       type: object
@@ -25231,12 +25487,56 @@ components:
         prefers a rewritten UTF-8 request_body metadata view when present,
         falls back to raw buffered bytes when no text view exists, then the
         transport-proven-empty witness, and otherwise fails closed; the final
-        request-body hook validates the exact backend-visible bytes.
-        Representation-gap diagnostics are fixed strings and never echo body
-        bytes.
+        request-body hook validates the exact backend-visible bytes. A request
+        that declares a non-identity Content-Encoding is not judged early at
+        all: the shared backend-visible representation gate decodes it under
+        bounded, budget-charged limits and the final request-body hook
+        validates the resulting plaintext before any byte reaches the backend,
+        so a valid gzip JSON/XML upload succeeds while an undecodable coding is
+        still refused. Representation-gap diagnostics are fixed strings and
+        never echo body bytes. Every constraint below mirrors a runtime
+        admission rule, so a configuration this schema accepts is one
+        BodyValidator::new accepts, except for two dependencies that are
+        node-local and cannot be expressed statically: protobuf_descriptor_path
+        must name a readable FileDescriptorSet, and every configured message
+        type must resolve inside it.
+      anyOf:
+        - required: [json_schema]
+        - required: [required_fields]
+          properties:
+            required_fields:
+              minItems: 1
+        - required: [validate_xml]
+          properties:
+            validate_xml:
+              const: true
+        - required: [required_xml_elements]
+          properties:
+            required_xml_elements:
+              minItems: 1
+        - required: [response_json_schema]
+        - required: [response_required_fields]
+          properties:
+            response_required_fields:
+              minItems: 1
+        - required: [response_validate_xml]
+          properties:
+            response_validate_xml:
+              const: true
+        - required: [response_required_xml_elements]
+          properties:
+            response_required_xml_elements:
+              minItems: 1
+        - required: [protobuf_descriptor_path, protobuf_request_type]
+        - required: [protobuf_descriptor_path, protobuf_response_type]
+        - required: [protobuf_descriptor_path, protobuf_method_messages]
+          properties:
+            protobuf_method_messages:
+              minProperties: 1
       properties:
         json_schema:
           type: object
+          minProperties: 1
           description: >-
             JSON Schema for request body validation. Compiled at plugin
             construction under json_schema_draft; a malformed schema, an unknown
@@ -25267,8 +25567,12 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
           default: []
-          description: Simple required field names in request body
+          description: >-
+            Simple required field names in request body. Empty entries are
+            rejected at construction; an empty list simply configures no
+            required-field rule.
         validate_xml:
           type: boolean
           default: false
@@ -25284,15 +25588,24 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            pattern: "^(\\{[^{}]*\\})?[^\\s{}<>&/:'\"=]+$"
           default: []
           description: >-
             Required XML element names, matched against parsed element names.
             A bare name matches that local name in any namespace; Clark notation
             ("{http://example.com/ns}item") requires the expanded namespace URI
-            and local name to match, and "{}item" requires no namespace.
+            and local name to match, and "{}item" requires no namespace. An
+            entry that opens Clark notation without closing it, or whose local
+            name is empty or is not an XML NCName (no whitespace, markup,
+            braces, or "prefix:local" spelling), is rejected at construction:
+            the matcher compares against parsed local names, so such an entry
+            could never be satisfied by any well-formed document.
         xml_max_entities:
           type: integer
           format: uint64
+          minimum: 0
+          maximum: 18446744073709551615
           default: 100
           description: >-
             Max <!ENTITY declarations allowed in an XML DOCTYPE before the body
@@ -25304,11 +25617,19 @@ components:
           default: true
           description: >-
             Reject XML whose entity definitions reference other general
-            entities (the billion-laughs expansion signature).
+            entities (the billion-laughs expansion signature). Entity
+            declaration names and general/parameter entity references are read
+            with the XML Name grammar, the same production the parser uses, so
+            a non-ASCII entity name is subject to the restriction rather than
+            invisible to it. When this is enabled, an entity declaration the
+            policy cannot read a replacement text out of is refused outright
+            rather than counted as safe.
         content_types:
           type: array
           items:
             type: string
+            minLength: 1
+            pattern: "^[ \t]*[0-9A-Za-z!#$%&'*+.^_`|~-]+/[0-9A-Za-z!#$%&'*+.^_`|~-]+[ \t]*(;.*)?$"
           default: ["application/json", "application/xml", "text/xml"]
           description: >-
             Request media types to validate. Matching uses the Content-Type
@@ -25319,6 +25640,7 @@ components:
             actual headers do not match and are skipped.
         response_json_schema:
           type: object
+          minProperties: 1
           description: >-
             JSON Schema for response body validation. Compiled at plugin
             construction under json_schema_draft with the same fail-closed rules
@@ -25328,8 +25650,11 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
           default: []
-          description: Required field names in response
+          description: >-
+            Required field names in response. Empty entries are rejected at
+            construction; an empty list configures no required-field rule.
         response_validate_xml:
           type: boolean
           default: false
@@ -25341,11 +25666,19 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            pattern: "^(\\{[^{}]*\\})?[^\\s{}<>&/:'\"=]+$"
           default: []
+          description: >-
+            Required XML element names in responses, with the same parsing,
+            Clark-notation, and XML NCName admission rules as
+            required_xml_elements.
         response_content_types:
           type: array
           items:
             type: string
+            minLength: 1
+            pattern: "^[ \t]*[0-9A-Za-z!#$%&'*+.^_`|~-]+/[0-9A-Za-z!#$%&'*+.^_`|~-]+[ \t]*(;.*)?$"
           default: ["application/json", "application/xml", "text/xml"]
           description: >-
             Response media types to validate. Same exact type/subtype matching
@@ -25353,6 +25686,7 @@ components:
             parameter collisions and malformed headers do not match).
         protobuf_descriptor_path:
           type: string
+          minLength: 1
           description: >-
             Node-local path to a compiled FileDescriptorSet binary
             (protoc --descriptor_set_out --include_imports). CP admission is
@@ -25361,39 +25695,65 @@ components:
             closed.
         protobuf_request_type:
           type: string
-          description: Default fully-qualified protobuf message type for request validation
+          minLength: 1
+          description: >-
+            Default fully-qualified protobuf message type for request
+            validation. Requires protobuf_descriptor_path.
         protobuf_response_type:
           type: string
-          description: Default fully-qualified protobuf message type for response validation
+          minLength: 1
+          description: >-
+            Default fully-qualified protobuf message type for response
+            validation. Requires protobuf_descriptor_path.
         protobuf_method_messages:
           type: object
+          propertyNames:
+            pattern: "^/[^/?#\\s]+/[^/?#\\s]+$"
           additionalProperties:
             type: object
             additionalProperties: false
+            minProperties: 1
+            anyOf:
+              - required: [request]
+              - required: [response]
             properties:
               request:
                 type: string
+                minLength: 1
                 description: Fully-qualified protobuf message type for request validation
               response:
                 type: string
+                minLength: 1
                 description: Fully-qualified protobuf message type for response validation
           description: >-
-            Per-method message type overrides keyed by gRPC path. Each entry
-            accepts only 'request' and 'response'; any other key rejects the
-            configuration.
+            Per-method message type overrides keyed by gRPC path. Requires
+            protobuf_descriptor_path. Each key must be the gRPC method path the
+            hooks look up — '/package.Service/Method': one leading '/', exactly
+            two non-empty segments, and no whitespace, control character,
+            query, or fragment. A key spelled any other way could never be
+            selected by the exact method lookup, so it is rejected rather than
+            admitted as an inert rule. Each entry accepts only 'request' and
+            'response', must set at least one of them, and any other key
+            rejects the configuration.
         protobuf_reject_unknown_fields:
           type: boolean
           default: false
           description: >-
-            Reject messages containing field numbers not in the descriptor. This
-            is independent of proto2 required-field initialization, which is
-            always enforced: a decoded message that omits any proto2 required
-            field, at the top level or inside a present nested/repeated/map/
-            extension message value, is rejected regardless of this setting.
+            Reject messages containing field numbers not in the descriptor, at
+            the top level and inside every present nested, repeated, map-value,
+            oneof, and extension message value, in both directions, under the
+            same bounded 32-level / 50000-message walk as the initialization
+            check. The rejection carries a count only, never a field number or
+            payload byte. This is independent of proto2 required-field
+            initialization, which is always enforced: a decoded message that
+            omits any proto2 required field, at the top level or inside a
+            present nested/repeated/map/extension message value, is rejected
+            regardless of this setting.
         grpc_max_decompressed_size_bytes:
           type: integer
           format: uint64
           minimum: 0
+          maximum: 18446744073709551615
           description: >-
             Maximum decompressed gRPC protobuf payload size in bytes for both
             request and response validation. Nonnegative integer matching runtime
@@ -26959,15 +27319,27 @@ components:
         max_depth:
           type: integer
           format: uint32
-          description: Maximum allowed query nesting depth
+          minimum: 0
+          maximum: 4294967295
+          description: >-
+            Maximum allowed query nesting depth. Admission requires an unsigned
+            integer that fits in 32 bits, so the inclusive range is 0-4294967295.
         max_complexity:
           type: integer
           format: uint32
-          description: Maximum allowed field count
+          minimum: 0
+          maximum: 4294967295
+          description: >-
+            Maximum allowed field count. Admission requires an unsigned integer
+            that fits in 32 bits, so the inclusive range is 0-4294967295.
         max_aliases:
           type: integer
           format: uint32
-          description: Maximum allowed alias count
+          minimum: 0
+          maximum: 4294967295
+          description: >-
+            Maximum allowed alias count. Admission requires an unsigned integer
+            that fits in 32 bits, so the inclusive range is 0-4294967295.
         introspection_allowed:
           type: boolean
           default: true

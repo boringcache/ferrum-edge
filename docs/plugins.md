@@ -821,17 +821,17 @@ Sends transaction summaries as newline-delimited JSON (NDJSON) over a persistent
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `host` | String | *(required)* | Hostname or IP of the TCP log receiver |
+| `host` | String | *(required)* | Hostname or IP of the TCP log receiver. Surrounding whitespace is trimmed. Must be a bare hostname or IP (no scheme, path, query, fragment, credentials, or host:port; brackets only around IPv6). |
 | `port` | Integer | *(required)* | Port of the TCP log receiver (1–65535) |
 | `tls` | Boolean | `false` | Enable TLS encryption for the connection |
-| `tls_server_name` | String | *(none)* | DNS or IP identity for TLS SNI/cert verification (defaults to `host`). Allowed only when `tls: true`. Must be a rustls-acceptable server name (no URL scheme, path, query, fragment, credentials, whitespace, or host:port); invalid values fail admission. |
+| `tls_server_name` | String | *(none)* | DNS or IP identity for TLS SNI/cert verification (defaults to `host`). Allowed only when `tls: true`. Must be a rustls-acceptable server name, including absolute DNS names (trailing dot) and underscore labels; no URL scheme, path, query, fragment, credentials, whitespace, or host:port. Invalid values fail admission. |
 | `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch (1–10000) |
 | `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (100–600000) |
 | `max_retries` | Integer | `3` | Retry attempts on failed batch delivery (0–10) |
 | `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts (0–60000) |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full (1–1000000) |
 | `max_entry_bytes` | Integer | `65536` | Maximum serialized size of one admitted NDJSON record (1024–1048576). Oversized records are dropped before enqueue. |
-| `buffer_max_bytes` | Integer | `16777216` | Aggregate retained serialized-content budget across queued, assembled, and retrying records (must be ≥ `2 * (max_entry_bytes + 1)`). |
+| `buffer_max_bytes` | Integer | `16777216` | Aggregate retained serialized-content budget across queued, assembled, and retrying records (must be ≥ `2 * (max_entry_bytes + 1)` and ≤ 268435456 / 256 MiB). |
 | `connect_timeout_ms` | Integer | `5000` | Connection establishment timeout in milliseconds (100–60000). Covers DNS resolution, TCP connect, and the TLS handshake when `tls: true`. |
 | `write_timeout_ms` | Integer | `5000` | Per-batch socket `write_all` + `flush` timeout in milliseconds (100–60000). On timeout the persistent writer is discarded and the shared retry/reconnect path runs. |
 | `schema` | Object | *(none)* | Inline log schema (see [docs/log_schema.md](log_schema.md)); mutually exclusive with `schema_ref` |
@@ -867,7 +867,19 @@ input {
 }
 ```
 
-For TLS, add `ssl_enable => true` with your certificate configuration to the Logstash TCP input.
+For TLS, Logstash TCP input 7.0.0+ uses `ssl_enabled` (the older `ssl_enable` option was removed and now fails startup):
+
+```
+input {
+  tcp {
+    port => 5140
+    codec => json_lines
+    ssl_enabled => true
+    ssl_certificate => "/etc/logstash/certs/server.crt"
+    ssl_key => "/etc/logstash/certs/server.key"
+  }
+}
+```
 
 ### `udp_logging`
 
@@ -879,12 +891,12 @@ Unknown top-level keys are rejected at construction / Admin validation (OpenAPI 
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `host` | String | *(required)* | UDP endpoint hostname or IP address |
+| `host` | String | *(required)* | UDP endpoint hostname or IP address. Surrounding whitespace is trimmed. Must be a bare hostname or IP (no scheme, path, query, fragment, credentials, or host:port; brackets only around IPv6). |
 | `port` | Integer | *(required)* | UDP endpoint port (1–65535) |
 | `dtls` | Boolean | `false` | Enable DTLS encryption for log datagrams |
-| `dtls_cert_path` | String | *(none)* | PEM client certificate for DTLS mutual TLS (requires `dtls: true`; materialized on the consuming node) |
-| `dtls_key_path` | String | *(none)* | PEM private key for DTLS mutual TLS (requires `dtls: true`; must be paired with `dtls_cert_path`; ECDSA P-256/P-384 only) |
-| `dtls_ca_cert_path` | String | *(none)* | PEM CA certificate for verifying the DTLS server (requires `dtls: true`; materialized on the consuming node when set, even if `dtls_no_verify` disables use of the resulting verifier) |
+| `dtls_cert_path` | String | *(none)* | PEM client certificate for DTLS mutual TLS (requires `dtls: true`; materialized on the consuming node; whitespace-only values are rejected) |
+| `dtls_key_path` | String | *(none)* | PEM private key for DTLS mutual TLS (requires `dtls: true`; must be paired with `dtls_cert_path`; ECDSA P-256/P-384 only; whitespace-only values are rejected) |
+| `dtls_ca_cert_path` | String | *(none)* | PEM CA certificate for verifying the DTLS server (requires `dtls: true`; materialized on the consuming node when set, even if `dtls_no_verify` disables use of the resulting verifier; whitespace-only values are rejected) |
 | `dtls_no_verify` | Boolean | `false` | Skip DTLS server certificate verification (testing only; requires `dtls: true`) |
 | `batch_size` | Integer | `10` | Number of entries to buffer before sending a batch (1–10000) |
 | `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (100–600000) |
@@ -892,7 +904,9 @@ Unknown top-level keys are rejected at construction / Admin validation (OpenAPI 
 | `retry_delay_ms` | Integer | `500` | Delay in milliseconds between retry attempts (0–60000) |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full (1–1000000) |
 | `max_entry_bytes` | Integer | `65536` | Maximum serialized size of one admitted JSON record (1024–1048576). Oversized records are dropped before enqueue. |
-| `buffer_max_bytes` | Integer | `16777216` | Aggregate retained serialized-content budget across queued, assembled, and retrying records (must be ≥ `2 * (max_entry_bytes + 1)`). |
+| `buffer_max_bytes` | Integer | `16777216` | Aggregate retained serialized-content budget across queued, assembled, and retrying records (must be ≥ `2 * (max_entry_bytes + 1)` and ≤ 268435456 / 256 MiB). |
+| `schema` | Object | *(none)* | Inline log schema (see [docs/log_schema.md](log_schema.md)); mutually exclusive with `schema_ref` |
+| `schema_ref` | String | *(none)* | Named schema from `transaction_log_schema`; mutually exclusive with `schema` |
 
 Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Each batch is serialized as a JSON array and sent as a single UDP datagram.
 
@@ -900,7 +914,7 @@ Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elap
 
 **Datagram size:** Every batch is gated by the per-datagram ceiling of the transport actually in use, not only under DTLS. For DTLS the ceiling is the plaintext limit `FERRUM_DTLS_MAX_PLAINTEXT_BYTES` (default **16,384**). For plain UDP the ceiling is the datagram maximum for the resolved collector's address family — **65,507** payload bytes over IPv4 (65,535 minus the 20-byte IP header and the 8-byte UDP header) and **65,527** over IPv6. The plain-UDP bound is fixed by the transport and is not configurable; a destination that has not resolved yet is gated on the smaller IPv4 bound so the gate can never be skipped.
 
-Ferrum bounds the assembled datagram by construction: the serialized length of a batch is computed before the batch is assembled, so a payload the transport cannot carry is never materialized. A single-entry batch that exceeds the ceiling fails closed into retry/final-loss. A multi-entry batch that exceeds the ceiling is split per entry so one oversized record cannot erase co-batched siblings; each oversized single is discarded with explicit, rate-limited loss accounting. A record dropped this way is published on `ferrum_plugin_log_sink_records_dropped_total{plugin="udp_logging",reason="sink_error"}`: it was already admitted and counted as accepted, and `record_too_large` is reserved for admission-time refusals so the accepted-plus-admission-loss identity stays exact. Split delivery is at-least-once: if an earlier entry succeeds and a later entry fails, retrying the original batch can duplicate the earlier entry, so collectors must tolerate duplicates.
+Ferrum bounds the assembled datagram by construction: the serialized length of a batch is computed before the batch is assembled, so a payload the transport cannot carry is never materialized. A single-entry batch that exceeds the ceiling fails closed into retry/final-loss. A multi-entry batch that exceeds the ceiling is split per entry so one oversized record cannot erase co-batched siblings; each oversized single is discarded with explicit, rate-limited loss accounting. A record dropped this way is published on `ferrum_plugin_log_sink_records_dropped_total{plugin="udp_logging",reason="sink_error"}`: it was already admitted and counted as accepted, and `record_too_large` is reserved for admission-time refusals so the accepted-plus-admission-loss identity stays exact. A locally rejected record is counted once; if a later sibling then hits a transport error, retry of the original batch does not increment the same loss again, and terminal `batch_discard` accounts for the original batch as a whole. Split delivery is at-least-once: if an earlier entry succeeds and a later entry fails, retrying the original batch can duplicate the earlier entry, so collectors must tolerate duplicates.
 
 The per-entry split — not admission validation — is what keeps every admitted configuration deliverable. `batch_size` x `max_entry_bytes` reaches roughly 640 KB at the defaults, an order of magnitude past any UDP datagram, so refusing such a configuration at admission would refuse the defaults themselves; instead an over-ceiling batch is re-sent one record per datagram and no record is lost because of a neighbour's size. A record whose *own* datagram still exceeds the ceiling cannot be carried by that transport at all and is dropped alone: keep `max_entry_bytes` at or below **65,505** (the plain-UDP IPv4 bound minus the two bytes of JSON array framing), or below `FERRUM_DTLS_MAX_PLAINTEXT_BYTES - 2` under DTLS, if every admitted record must be deliverable. Operators should still size `batch_size` so serialized payloads stay under the network MTU (typically ~1400 bytes for DTLS, ~1472 bytes for plain UDP over Ethernet); an in-ceiling but over-MTU datagram may still be fragmented or dropped by the network.
 
@@ -1675,24 +1689,24 @@ Capturable media types are `application/json`, `text/json`, any `+json` structur
 
 When both switches are false — the default — the plugin reports no body buffering requirement, allocates nothing on the body path, and emits no capture records.
 
-WebSocket upgrades produce the ordinary HTTP handshake transaction diagnostic and exactly one additional terminal session diagnostic when the upgraded session ends. When `correlation_id` or `otel_tracing` supplied `request_id` or `trace_id` metadata, the terminal records include the same selected value; all selected metadata passes through the central sensitivity classifier. The plugin never dumps the complete metadata map.
+WebSocket upgrades produce the ordinary HTTP handshake transaction diagnostic and exactly one additional terminal session diagnostic when the upgraded session ends. When `correlation_id` or `otel_tracing` supplied `request_id` or `trace_id` metadata, the **default unprojected** terminal records include the same selected value; all selected metadata passes through the central sensitivity classifier. Those default records never dump the complete metadata map. Configuring `schema` or `schema_ref` — including an empty `schema: {}` — projects diagnostics through the shared log-schema compiler, which includes the redacted, `_dedup_*`-stripped metadata map by default (`metadata.mode: nested`). Operators who want selected fields only can drop the map with `metadata: {mode: omit}` (flatten remains available; see [docs/log_schema.md](log_schema.md)).
 
 **Priority:** 9200
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `redacted_headers` | String[] | `[]` | Additional header names to redact beyond the built-in sensitive list |
+| `redacted_headers` | String[] | `[]` | Additional header names to redact beyond the built-in sensitive list. Each name must be a nonempty HTTP header token (RFC 9110 tchar); empty strings and names with spaces are rejected |
 | `log_request_body` | bool | `false` | Enable bounded, redacted capture of the backend-visible request body |
 | `log_response_body` | bool | `false` | Enable bounded, redacted capture of the client-visible response body |
 | `max_request_body_bytes` | Integer | `1024` | Request capture budget in bytes (1–8192). Requires `log_request_body: true` |
 | `max_response_body_bytes` | Integer | `1024` | Response capture budget in bytes (1–8192). Requires `log_response_body: true` |
-| `redacted_body_fields` | String[] | `[]` | Additional body field names (case-insensitive, ≤128 chars) to redact. Requires one of the capture switches |
+| `redacted_body_fields` | String[] | `[]` | Additional body field names (case-insensitive) to redact. Surrounding whitespace is trimmed before the 128-character maximum. A nonempty list requires one of the capture switches; `[]` is valid without a switch |
 | `schema` | Object | *(none)* | Inline projection for the terminal diagnostic records (see [docs/log_schema.md](log_schema.md)); mutually exclusive with `schema_ref` |
 | `schema_ref` | String | *(none)* | Named schema from `transaction_log_schema`; mutually exclusive with `schema` |
 
 **Built-in redacted headers**: `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `api-key`, `x-api-key`, `x-goog-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, `www-authenticate`, `x-forwarded-authorization`
 
-The configuration object is closed: any key outside the table above is rejected. Capture budgets outside `1..=8192` are rejected rather than clamped, `null` is rejected for every field, and a budget or `redacted_body_fields` without its capture switch is rejected as inert configuration.
+The configuration object is closed: any key outside the table above is rejected. Capture budgets outside `1..=8192` are rejected rather than clamped, `null` is rejected for every field, and a budget or nonempty `redacted_body_fields` without its capture switch is rejected as inert configuration. `schema` and `schema_ref` cannot both be set.
 
 `schema` / `schema_ref` project the terminal diagnostic records emitted on the `transaction_debug` target. The field inventory is this plugin's own — `outcome`, `method`, `path`, `status`, `rejection_phase`, `latency_plugin_ms`, `latency_gw_overhead_ms`, `metadata`, and the rest of the names in the default records — not the transaction-summary names, so a summary-only name such as `request_user_agent` is rejected with a field-specific diagnostic. With a schema configured the plugin emits one `record` field carrying the projected JSON document instead of the individual `tracing` fields; with none configured the default records are byte-for-byte unchanged. Body capture samples are never part of the projection. See [docs/log_schema.md](log_schema.md).
 
@@ -1712,7 +1726,7 @@ When this plugin generates a header because the client omitted a valid inbound v
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `header_name` | String or null | `x-request-id` | Header name used for inbound, outbound, and echoed IDs. Surrounding whitespace is trimmed and the name is lowercased internally. Must be a non-empty valid HTTP header token (RFC 7230 §3.2.6). Protocol-managed request, forwarding, framing, connection, content-coding, W3C tracing-context, gRPC status, WebSocket handshake, and internal marker names (`host`, `forwarded`, `via`, `x-forwarded-for`, `x-forwarded-host`, `x-forwarded-proto`, `connection`, `content-encoding`, `content-length`, `early-data`, `expect`, `traceparent`, `tracestate`, `transfer-encoding`, `upgrade`, `grpc-status`, `x-grpc-web-mode`, `x-ferrum-original-content-encoding`, `sec-websocket-*`, and the other names listed in the OpenAPI schema) are rejected. The effective deployment-specific `FERRUM_REAL_IP_HEADER` value is also rejected case-insensitively so correlation cannot overwrite backend-visible client attribution; CP/DP deployments enforce one matching value across the config-sync handshake before distributing config. Security-sensitive request and response names (`authorization`, `cookie`, `set-cookie`, `www-authenticate`, `api-key`, `x-api-key`, `x-goog-api-key`, API/auth/CSRF/XSRF token aliases, forwarded authorization, and proxy equivalents) are also rejected so correlation processing cannot replace, copy, or echo credentials or authentication state. Null selects the default. |
+| `header_name` | String or null | `x-request-id` | Header name used for inbound, outbound, and echoed IDs. Surrounding whitespace is trimmed with Rust `str::trim` Unicode `White_Space` semantics (U+0085 is trimmed; U+FEFF is not) and the name is lowercased internally. After trimming, the name must be a valid HTTP field-name token (RFC 7230 §3.2.6) that `http::HeaderName` can represent — at most 65,535 ASCII bytes. Protocol-managed request, forwarding, framing, connection, content-coding, W3C tracing-context, gRPC status, WebSocket handshake, and internal marker names (`host`, `forwarded`, `via`, `x-forwarded-for`, `x-forwarded-host`, `x-forwarded-proto`, `connection`, `content-encoding`, `content-length`, `early-data`, `expect`, `traceparent`, `tracestate`, `transfer-encoding`, `upgrade`, `grpc-status`, `x-grpc-web-mode`, `x-ferrum-original-content-encoding`, `sec-websocket-*`, and the other names listed in the OpenAPI schema) are rejected. The effective deployment-specific `FERRUM_REAL_IP_HEADER` value is also rejected case-insensitively so correlation cannot overwrite backend-visible client attribution; CP/DP deployments enforce one matching value across the config-sync handshake before distributing config. Security-sensitive request and response names (`authorization`, `cookie`, `set-cookie`, `www-authenticate`, `api-key`, `x-api-key`, `x-goog-api-key`, API/auth/CSRF/XSRF token aliases, forwarded authorization, and proxy equivalents) are also rejected so correlation processing cannot replace, copy, or echo credentials or authentication state. Null selects the default. |
 | `echo_downstream` | bool or null | `true` | Include the resolved ID in ordinary responses, plugin rejection responses, and successful H1 Upgrade/H2-H3 Extended CONNECT WebSocket handshakes. Null selects the default. |
 
 The config itself must be a JSON object; top-level null and every other non-object value are rejected. The object is closed: keys other than `header_name` and `echo_downstream` are rejected deterministically rather than silently enabling defaults.
@@ -2607,7 +2621,13 @@ Authenticates using HTTP Basic credentials. Every HTTP 401 response advertises `
 
 **Priority:** 1300
 
-**Config**: The plugin object is empty. `FERRUM_BASIC_AUTH_HMAC_SECRET` is mandatory whenever the plugin is enabled and must contain at least 32 bytes of unique random material. There is no default. Rotating the secret invalidates all existing hashes, so replace the hashes in the same rollout.
+**Config**: The property set is closed — `null`, an empty object, and an object carrying only `hide_credentials` are the accepted forms. `FERRUM_BASIC_AUTH_HMAC_SECRET` is mandatory whenever the plugin is enabled and must contain at least 32 bytes of unique random material. There is no default. Rotating the secret invalidates all existing hashes, so replace the hashes in the same rollout.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `hide_credentials` | Boolean | `true` | Remove the `Authorization` field carrying the `Basic` scheme before proxying an authenticated request, including when another mechanism wins a multi-auth chain. Set to `false` only for a legacy backend that explicitly requires the reusable password. |
+
+Basic encodes a **reusable** username and password in reversible Base64: an upstream that receives the field recovers the password and can replay it on any other gateway route that consumer can reach. The credential is therefore removed by default on every HTTP/1.1, HTTP/2, HTTP/3, gRPC, gRPC-Web, and WebSocket handshake path, and it is removed even when a different mechanism authenticated the request — a mixed chain must not forward Alice's password to a backend the gateway is telling `x-consumer-username: bob`. Only the `Basic` scheme is removed; a `Bearer` or other `Authorization` scheme another policy needs is left in place. Consumer identity injection and the `401` challenge are unchanged.
 
 Admin API writes may supply exactly one of `password` or `password_hash`; plaintext passwords are hashed and removed before persistence. File-mode configuration must supply only `password_hash` so plaintext credentials never enter observable runtime configuration.
 
@@ -2622,6 +2642,14 @@ credentials:
     - password_hash: "hmac_sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     - password_hash: "hmac_sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 ```
+
+A consumer that carries `basicauth` credentials must not have a `:` in its
+`username`. RFC 7617 §2 splits the decoded `user-id ":" password` at the FIRST
+colon, so no `Authorization: Basic` value can represent such a user-id and the
+consumer could never authenticate. Admission rejects the combination (admin
+API, file, database, and CP alike) instead of accepting a login that always
+returns 401. Colons inside the **password** stay valid, and a consumer with only
+other credential types is unaffected.
 
 ### `hmac_auth`
 
@@ -2639,7 +2667,7 @@ Authenticates requests using Ferrum's versioned HMAC authorization scheme with m
 | `sync_mode` | String | `local` | `redis` is required by, and only valid with, `replay_scope: shared` |
 | `redis_url`, `redis_tls`, `redis_key_prefix`, `redis_pool_size`, `redis_connect_timeout_seconds`, `redis_health_check_interval_seconds`, `redis_username`, `redis_password` | — | — | Shared Redis connectivity for the replay authority. Same semantics as every other Redis-backed plugin. The default key prefix is `{FERRUM_NAMESPACE}:hmac_auth:{plugin-config-id}` |
 
-The root key set is closed: a misspelled `replay_scope` or `signing_profile` fails admission rather than leaving the policy on a weaker posture than the operator wrote.
+The root key set is closed: a misspelled `replay_scope` or `signing_profile` fails admission rather than leaving the policy on a weaker posture than the operator wrote. The enumerated values are matched **exactly** — `signing_profile`, `replay_scope`, and `sync_mode` accept only the canonical lowercase spellings listed above, with no surrounding whitespace — so the published OpenAPI schema and the gateway admit exactly the same configurations. `replay_scope` is required with `ferrum-hmac-v2` and rejected with `ferrum-hmac-v1`; `allow_unsafe_replayable_v1: true` is required with v1 and rejected with v2; `sync_mode: redis` is required by, and only valid with, `replay_scope: shared`, and needs a `redis_url`.
 
 Expected `Authorization` header format (`ferrum-hmac-v2`):
 
@@ -2671,6 +2699,8 @@ Send **exactly one** body-integrity field:
 - or legacy RFC 3230 `Digest`, for example `sha-256=<standard-base64-of-sha256-of-body>` with no colon wrapping
 
 Do not send both headers. Mixed RFC 9530 / legacy spellings on one field, duplicate algorithm keys, empty members, unsupported algorithms (`md5`, `sha-1`), and non-standard Base64 fail closed. When both `sha-256` and `sha-512` are present, **both** must match. Ferrum hashes the exact client bytes from the single forwarding buffer after a valid signature admits collection; it never invents an empty-body digest when the body was not collected. `{DIGEST_HEADER_VALUE}` is that field's literal header value, not a canonicalized rewrite.
+
+**WebSocket handshakes.** A WebSocket upgrade (HTTP/1.1 `Upgrade`, HTTP/2 and HTTP/3 Extended CONNECT) is signed like any other request, over the **empty** body: sign `sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:` and send it as `Content-Digest` (or the legacy `Digest` spelling) with the usual `Date` and `Authorization: hmac` fields. The gateway never drains WebSocket DATA as a request body — after the upgrade those bytes are the tunnel — so the empty representation here is the transport's own proof from the handshake's wire framing, not a substitution for an uncollected body. A handshake that actually declares a body (`Content-Length` other than a parseable zero, or any `Transfer-Encoding`) keeps the absent snapshots and is rejected. Once the handshake authenticates, frames stream normally; the plugin does not inspect them.
 
 #### Example — RFC 9530 `Content-Digest` + `ferrum-hmac-v2`
 
@@ -3383,10 +3413,10 @@ UDP+DTLS streams via certificate-based consumer mapping.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `allowed_consumers` | String[] | `[]` | Consumer usernames explicitly allowed. Empty disables the username allow check. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
+| `allowed_consumers` | String[] | `[]` | Consumer usernames explicitly allowed. Empty disables the username allow check. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and are at most 255 Unicode characters (`chars().count()`, matching JSON Schema `maxLength`). |
 | `disallowed_consumers` | String[] | `[]` | Consumer usernames or, with `allow_authenticated_identity`, external principals explicitly denied. Takes precedence over every allow rule. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and may be up to 4096 characters so JWT/OIDC/SPIFFE-style principals are not constrained by the 255-character gateway Consumer username ceiling. An external principal above the 512-byte authenticated-principal limit is rejected during authentication, so entries longer than that can never match. |
-| `allowed_groups` | String[] | `[]` | ACL group names explicitly allowed. Matches if any of the consumer's `acl_groups` appears in this list. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
-| `disallowed_groups` | String[] | `[]` | ACL group names explicitly denied. Rejects even when the username is in `allowed_consumers`. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
+| `allowed_groups` | String[] | `[]` | ACL group names explicitly allowed. Matches if any of the consumer's `acl_groups` appears in this list. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and are at most 255 Unicode characters (`chars().count()`, matching JSON Schema `maxLength`). |
+| `disallowed_groups` | String[] | `[]` | ACL group names explicitly denied. Rejects even when the username is in `allowed_consumers`. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and are at most 255 Unicode characters (`chars().count()`, matching JSON Schema `maxLength`). |
 | `allow_authenticated_identity` | bool | `false` | Allows requests with a meaningful, non-whitespace `ctx.authenticated_identity` even when no Consumer was mapped. Cannot be combined with an allow-list (see below). |
 
 At least one of the above must be configured (non-empty list or `allow_authenticated_identity: true`). Unknown/misspelled config keys are rejected so a typo cannot silently weaken the policy. All checks use `HashSet<String>` for O(1) membership.
@@ -4636,12 +4666,14 @@ strip; use it when the intent is to drop the field rather than author one.
 | `content_type_options` | bool/string/null | `true` | Sets `X-Content-Type-Options`; `true` uses `nosniff`, a string customizes it, `false`/`null` disables it. |
 | `frame_options` | bool/string/null | `true` | Sets `X-Frame-Options`; `true` uses `SAMEORIGIN`, a string customizes it, `false`/`null` disables it. |
 | `referrer_policy` | bool/string/null | `true` | Sets `Referrer-Policy`; `true` uses `strict-origin-when-cross-origin`, a string customizes it, `false`/`null` disables it. |
-| `hsts` | bool/string/object/null | `false` | Sets `Strict-Transport-Security`; `true` uses `max-age=31536000; includeSubDomains`, a string is used verbatim, or an object may set `max_age`, `include_subdomains`, and `preload`. |
+| `hsts` | bool/string/object/null | `false` | Sets `Strict-Transport-Security`; `true` uses `max-age=31536000; includeSubDomains`, a string is used verbatim, `false`/`null`/`""` disables, or an object may set `max_age` (non-negative unsigned 64-bit integer, default `31536000`; `null` selects the default), `include_subdomains` (bool, default `true`; `null` selects the default), and `preload` (bool, default `false`; `null` selects the default). |
 | `content_security_policy` | string/null | _(unset)_ | Optional `Content-Security-Policy` value. |
 | `permissions_policy` | string/null | _(unset)_ | Optional `Permissions-Policy` value. |
 | `set` | object/null | `{}` | Additional headers to set. Names accept the complete HTTP field-name grammar except protocol-managed hop-by-hop / framing destinations (`Connection`, `Content-Length`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, case-insensitive), which are rejected at construction. Values must pass downstream HTTP header-value validation. |
 | `remove` | string[]/null | `["server","x-powered-by"]` | Valid HTTP field names to remove case-insensitively; `null` disables built-in removals. |
-| `override_existing` | bool | `true` | Replace existing response headers with configured values. When `false`, only missing headers are added. |
+| `override_existing` | bool or null | `true` | Replace existing response headers with configured values. When `false`, only missing headers are added. `null` selects `true`. |
+
+`config` must be an object. Disabling the three built-in headers (`false`/`null`/`""`) while leaving HSTS/CSP/Permissions-Policy unset, `set` empty, and `remove` `[]` or `null` is rejected — the plugin would set and remove nothing.
 
 ```yaml
 config:
@@ -4746,10 +4778,23 @@ Server-Sent Events stream handler. Validates inbound SSE client criteria, shapes
 
 1. **`on_request_received`** — Validates SSE client conformance: rejects non-GET with 405 + `Allow: GET`, rejects missing/wrong `Accept` with 406, bounds `Last-Event-ID` (max 1024 bytes) and stashes it for backend forwarding. The raw ID is omitted from transaction logs (`sse:leid_present` / `sse:leid_bytes` correlation only) and never interpolated into diagnostics.
 2. **`before_proxy`** — Strips `Accept-Encoding` to prevent compressed responses from breaking SSE line-delimited framing. Forwards `Last-Event-ID` header to the backend.
-3. **`after_proxy`** — Conservatively merges `Cache-Control` with `no-cache` without removing origin `private` / `no-store` / `no-transform` / extensions. Adds `X-Accel-Buffering: no`. Strips `Content-Length`. Does **not** emit `Connection: keep-alive` (illegal on HTTP/2 and HTTP/3; unnecessary on HTTP/1.1). Relabels non-SSE responses as `text/event-stream` when `force_sse_content_type` is set and/or when `wrap_non_sse_responses` will convert the body.
+3. **`after_proxy`** — Conservatively merges `Cache-Control` with `no-cache` without removing origin `private` / `no-store` / `no-transform` / extensions. Adds `X-Accel-Buffering: no`. Strips `Content-Length`. Does **not** emit `Connection: keep-alive` (illegal on HTTP/2 and HTTP/3; unnecessary on HTTP/1.1). Relabels non-SSE responses as `text/event-stream` when `force_sse_content_type` is set and/or when `wrap_non_sse_responses` will convert the body — and declines both for the representations listed under [Representations wrapping declines](#representations-wrapping-declines).
 4. **`transform_response_body`** — Optionally wraps non-SSE response bodies in `data: ...\n\n` SSE event framing (buffered responses only), preserving terminal line-break semantics for EventSource `MessageEvent.data`. Wrapping uses the request-scoped wrap decision from `after_proxy`, so it composes with content-type forcing instead of canceling it.
 
-**Config admission:** Config must be a JSON object. Unknown keys are rejected. Explicit `null` members are rejected; omitted keys keep defaults. `retry_ms` must be an integer ≥ 1 when set.
+**Config admission:** Config must be a JSON object. Unknown keys are rejected. Explicit `null` members are rejected; omitted keys keep defaults. `retry_ms` must be an unsigned 64-bit integer ≥ 1 when set. Admission is over the JSON numeric **value**, matching the published `SseConfig` schema (JSON Schema `type: integer` admits `2500.0` exactly as it admits `2500`), so an exact integer-valued number is accepted while fractional values and magnitudes outside the `minimum`/`maximum` pair are rejected on both sides.
+
+#### Representations wrapping declines
+
+`wrap_non_sse_responses` rewrites both the body and its media type, so it is refused outright — relabel included — for a representation it cannot convert. The decision happens in `after_proxy`, before any header is touched, so the client receives the origin's own representation instead of reframed bytes under an event-stream label:
+
+| Origin response | Outcome |
+|---|---|
+| `206 Partial Content` / `226 IM Used` | Forwarded unchanged; a fragment is not a complete event |
+| `Cache-Control: no-transform` | Forwarded unchanged (RFC 9110 §7.7). This also suppresses `force_sse_content_type`, which §7.7 lists among the fields a `no-transform` response forbids changing. The directive is read from the pristine pre-`after_proxy` snapshot, so a later header rule that strips it cannot unlock wrapping. A `no-transform` token inside a quoted extension value is not the directive |
+| Non-identity `Content-Encoding` | Forwarded unchanged; compressed octets are not the UTF-8 text `data:` framing describes. `strip_accept_encoding` (default on) is what normally prevents this |
+| Genuine `text/event-stream` | Streamed, never double-wrapped — including when retries are configured |
+
+A framed event that would exceed the effective response-body ceiling is a different outcome: the rewrite was claimed and could not be produced, so the shared gateway capacity refusal owns the response rather than the unconverted body being published under the `text/event-stream` label already selected.
 
 **Request validation:**
 
@@ -4770,11 +4815,11 @@ Server-Sent Events stream handler. Validates inbound SSE client criteria, shapes
 |---|---|---|---|
 | `add_no_buffering_header` | bool | `true` | Add `X-Accel-Buffering: no` to disable nginx/ALB buffering |
 | `strip_content_length` | bool | `true` | Remove `Content-Length` from the initial response map (SSE streams are indefinite). `false` no longer leaves one on the wire: [final response framing](#final-response-framing) removes `Content-Length` from every ordinary streamed response. The flag still governs whether `content-length` joins this instance's response-trailer policy names and whether the gateway's own declared-length accounting sees the backend value. |
-| `retry_ms` | u64 | _(none)_ | EventSource reconnection hint (ms), prepended as `retry:` when wrapping; must be ≥ 1 |
+| `retry_ms` | u64 | _(none)_ | EventSource reconnection hint (ms), prepended as `retry:` when wrapping; must be ≥ 1 and within the unsigned 64-bit range |
 | `force_sse_content_type` | bool | `false` | Force `Content-Type: text/event-stream` even if backend returns something else |
-| `wrap_non_sse_responses` | bool | `false` | Wrap non-SSE response bodies in `data: ...\n\n` SSE event framing; implies client-visible `text/event-stream` for wrapped responses |
+| `wrap_non_sse_responses` | bool | `false` | Wrap non-SSE response bodies in `data: ...\n\n` SSE event framing; implies client-visible `text/event-stream` for wrapped responses. See [Representations wrapping declines](#representations-wrapping-declines) |
 
-**Note:** When `wrap_non_sse_responses` is enabled, the plugin requires response body buffering and delivers a correctly framed `text/event-stream` response (composing with `force_sse_content_type`). When disabled (default), the response streams through with zero overhead — ideal for backends that already emit `text/event-stream`. Genuine upstream `text/event-stream` bodies are never double-wrapped. Wrapping normalizes CR/CRLF to LF and preserves terminal newlines in `MessageEvent.data` (lossy UTF-8 replacement of invalid bytes is separate from newline fidelity).
+**Note:** When `wrap_non_sse_responses` is enabled, the plugin requires response body buffering and delivers a correctly framed `text/event-stream` response (composing with `force_sse_content_type`). When disabled (default), the response streams through with zero overhead — ideal for backends that already emit `text/event-stream`. Genuine upstream `text/event-stream` bodies are never double-wrapped: buffering is released as soon as the backend response headers prove the origin selected an event stream, including on a retry-enabled proxy and on the HTTP/3 → HTTP bridge. Wrapping normalizes CR/CRLF to LF and preserves terminal newlines in `MessageEvent.data` (lossy UTF-8 replacement of invalid bytes is separate from newline fidelity).
 
 ```yaml
 config:
@@ -5099,6 +5144,8 @@ Request-side validation buffers by **configured representation, never by request
 
 Media types outside `content_types` / `response_content_types`, and allowlisted media types no configured rule can inspect, still pass through untouched — the advisory closes fail-open holes without widening applicability. Early request-side `before_proxy` inspection prefers a downstream-rewritten UTF-8 `request_body` metadata view when one exists (so composition with `ai_prompt_shield` redact evaluates the shielded representation), falls back to the raw buffered bytes when no text view is present (so a non-UTF-8 body the proxy stripped from metadata cannot look like "no body at all"), then uses the transport-proven-empty witness, and otherwise fails closed. The final request-body hook continues to validate the exact backend-visible bytes.
 
+**Encoded request bodies are decoded, not rejected.** A request that declares a non-identity `Content-Encoding` (`gzip`, `x-gzip`, `br`, or a stacked list) carries a *compressed* representation of the document the configured rules are about, and `before_proxy` has no decoder. Such a request is therefore not judged early: the shared backend-visible request representation gate (`GHSA-3973-47g5-4mcx`) decodes it under bounded, budget-charged limits and the final request-body hook validates the resulting plaintext — still before any byte reaches the backend. Deferral is taken only when that gate has claimed the request, so nothing escapes inspection: an unsupported, malformed, truncated, over-limit, or over-amplified coding is a `400`, a gateway capacity refusal is a `503`, and a decoded document that violates the configured rules is the ordinary `400`. A valid gzip JSON or XML upload now succeeds on H1, H2, and H3 instead of failing the early UTF-8 conversion. When the `compression` plugin is configured with `decompress_request: true` it has already rewritten the body and stripped `Content-Encoding` before `before_proxy`, so the early hook validates directly as it always did.
+
 **Duplicate JSON object members are rejected (`GHSA-c78j-5w9p-cpq6`).** Before any required-field or JSON Schema evaluation, a governed JSON body is screened for duplicate object member names at any nesting depth, including inside arrays. `serde_json` collapses duplicates to the *last* value while many backends and clients keep the *first*, and this plugin forwards the original bytes — so a body that passes validation on the collapsed view could still deliver a forbidden earlier value downstream. Request-side ambiguity is a `400`, response-side ambiguity a `502`. Member names are compared after JSON escapes are decoded, so a literal name and a `\uXXXX`-escaped spelling of the same code point are one member. The screen is non-recursive and bounded by explicit depth, token, member-count, member-name, and body-size budgets; exhausting any budget fails closed without an unbounded confirmation pass. Malformed bodies keep their existing `Invalid JSON` handling, and the rejection detail is a fixed reason that never echoes body bytes. Sibling objects and different nesting levels may of course reuse a name; only duplicates *within one object* are rejected.
 
 **Validation diagnostics never echo body content (`GHSA-5p2h-fq6q-gwh9`).** The `details` field of the generated 400 / 502 body — which is also what internal tracing emits — carries only a compiled-in failure category, the failing allowlisted JSON Schema keyword, and, on the request side, a bounded instance location. Numeric segments in that location render as the fixed `#` marker, because a JSON Pointer alone does not prove the container was an array — an object member literally named `0` is indistinguishable from a true index. An object member name survives only when the configured schema declares it, and any other member name renders as `~`. Segment count, segment length, and total diagnostic length are capped. The rejected value, the `enum` / `const` constants the schema expects, the `roxmltree` parse token, and the `prost` decode rendering are never formatted in. Response-side details stay coarser than request-side ones — they omit the instance location entirely — because describing an upstream body's shape back to the client is itself a disclosure.
@@ -5139,7 +5186,7 @@ Media types outside `content_types` / `response_content_types`, and allowlisted 
 | `protobuf_descriptor_path` | String | — | Path to compiled `FileDescriptorSet` binary (`protoc --descriptor_set_out --include_imports`) |
 | `protobuf_request_type` | String | — | Default fully-qualified protobuf message type for request validation |
 | `protobuf_response_type` | String | — | Default fully-qualified protobuf message type for response validation |
-| `protobuf_method_messages` | Object | `{}` | Per-method message type overrides keyed by gRPC path (e.g., `/pkg.Svc/Method`). Each value has `request` and/or `response` string fields |
+| `protobuf_method_messages` | Object | `{}` | Per-method message type overrides keyed by gRPC path (e.g., `/pkg.Svc/Method`). Each value has `request` and/or `response` string fields; at least one is required |
 | `protobuf_reject_unknown_fields` | bool | `false` | Reject messages containing field numbers not in the descriptor (independent of required-field initialization, which is always enforced) |
 | `grpc_max_decompressed_size_bytes` | usize | env / 10 MiB | Maximum decompressed gRPC protobuf payload size for both request and response validation. `0` disables the decompressed cap. When omitted, inherits `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` when that value parses as an unsigned integer; otherwise falls back to 10 MiB (10485760). |
 
@@ -5193,9 +5240,15 @@ Client-visible schema failures never echo the rejected value. A request failure 
 
 Two policy guards run before parsing: the configured `<!ENTITY` declaration cap (`xml_max_entities`) with nested-entity rejection (`xml_reject_nested_entities`), and unconditional rejection of external `SYSTEM` / `PUBLIC` identifiers on either the DOCTYPE external subset or an entity declaration. Ferrum accepts no external identifier and never resolves one. The guard is quote/comment/CDATA-aware, so keyword-looking literal text is not misclassified. Internal DTD subsets remain permitted so the entity knobs stay authoritative; the parser still applies its own billion-laughs limits (expansion depth 10, 255 references per reference).
 
-`required_xml_elements` / `response_required_xml_elements` match **parsed** element names, not source bytes, so a name inside a comment, CDATA section, or processing instruction never satisfies a requirement. A bare entry (`item`) matches that local name in any namespace. Clark notation (`{http://example.com/ns}item`) requires the expanded namespace URI **and** the local name to match. `{}item` requires the element to be in no namespace. An entry that opens `{` without closing `}`, or that has an empty local name, is a configuration error.
+The entity-policy scanners read entity declaration names, general entity references (`&name;`), and parameter entity references (`%name;`) with the **XML `Name` grammar**, the same production the parser uses, so an entity declared or referenced under a non-ASCII name is seen by the nesting restriction rather than slipping past an ASCII-only scan. With `xml_reject_nested_entities` enabled, an `<!ENTITY ...>` declaration the policy cannot read a replacement text out of is refused outright: failing to extract a value is not evidence that the declaration is harmless, since the parser downstream still sees a declared, referenceable entity. Comments, CDATA sections, processing instructions, and quoted markup-declaration values remain excluded from the scan, and the parser's own expansion depth and reference limits remain the independent second line of defence.
 
-**Protobuf initialization**: after decoding, every proto2 `required` field must be present — at the top level and recursively inside present singular, repeated, map, and extension message values. Presence, not value, is what is checked: a required scalar carrying its type's default value is present, because proto2 tracks it with a hasbit. proto3 descriptors have no `required` cardinality and are unaffected, and a proto3-only descriptor pool skips the walk entirely. The walk is bounded to 32 levels of message nesting and 50000 messages, and fails closed if either budget is exhausted. This is independent of `protobuf_reject_unknown_fields`, applies to compressed frames and per-method request/response descriptors alike, and the error names the descriptor field path only — never a payload value.
+`required_xml_elements` / `response_required_xml_elements` match **parsed** element names, not source bytes, so a name inside a comment, CDATA section, or processing instruction never satisfies a requirement. A bare entry (`item`) matches that local name in any namespace. Clark notation (`{http://example.com/ns}item`) requires the expanded namespace URI **and** the local name to match. `{}item` requires the element to be in no namespace.
+
+The local name is admitted against the XML `NCName` grammar — the XML `Name` production without `:` — because that is exactly what the parser reports as a local name. An entry that opens `{` without closing `}`, has an empty local name, or whose local name is not an `NCName` (`two words`, `2item`, `ns:item`, embedded markup, stray braces) is a configuration error on both the request and response fields. Such an entry used to be admitted and then made every governed request fail with `400` and every governed response with `502` forever, because no well-formed document can produce a local name of that shape. Valid Unicode names such as `süd` or `名前` are unaffected — the grammar is the XML one, not ASCII.
+
+**Protobuf initialization**: after decoding, every proto2 `required` field must be present — at the top level and recursively inside present singular, repeated, map, and extension message values. Presence, not value, is what is checked: a required scalar carrying its type's default value is present, because proto2 tracks it with a hasbit. proto3 descriptors have no `required` cardinality and are unaffected, and a proto3-only descriptor pool skips the initialization work; it walks messages only when `protobuf_reject_unknown_fields` is enabled, which shares the same walk. The walk is bounded to 32 levels of message nesting and 50000 messages, and fails closed if either budget is exhausted. This is independent of `protobuf_reject_unknown_fields`, applies to compressed frames and per-method request/response descriptors alike, and the error names the descriptor field path only — never a payload value.
+
+**Unknown protobuf fields are rejected at every nesting level.** When `protobuf_reject_unknown_fields` is enabled, the strict-schema policy is applied to the decoded outer message *and* to every present nested, repeated, map-value, oneof, and extension message value, sharing the same bounded 32-level / 50000-message walk as the initialization check. The reflection API reports only the fields the decoder could not place in one specific message, so an outer-message-only check left a nested message's unknown fields unexamined while a backend that interprets them acted on data the configured policy was supposed to refuse. The rejection carries a count only — never a field number, wire type, or payload byte. The default (`false`) is unchanged: unknown fields are permitted at every level, exactly as before. Both directions — gRPC request bodies and gRPC responses — run the same walk.
 
 **Supported JSON Schema `format` values**: the `jsonschema` crate's format vocabulary for the configured draft, which includes `email`, `ipv4`, `ipv6`, `uri`, `uri-reference`, `date-time`, `date`, `time`, `hostname`, `json-pointer`, `regex`, and `uuid`.
 
@@ -5433,9 +5486,9 @@ Request buffering is only enabled when at least one GraphQL policy is configured
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_depth` | u32 (optional) | — | Maximum allowed query nesting depth |
-| `max_complexity` | u32 (optional) | — | Maximum allowed field count |
-| `max_aliases` | u32 (optional) | — | Maximum allowed alias count |
+| `max_depth` | u32 (optional) | — | Maximum allowed query nesting depth. Inclusive range `0..=4294967295`; negative values and values above `4294967295` are rejected at plugin load time |
+| `max_complexity` | u32 (optional) | — | Maximum allowed field count. Inclusive range `0..=4294967295`; negative values and values above `4294967295` are rejected at plugin load time |
+| `max_aliases` | u32 (optional) | — | Maximum allowed alias count. Inclusive range `0..=4294967295`; negative values and values above `4294967295` are rejected at plugin load time |
 | `introspection_allowed` | bool | `true` | Whether introspection queries are permitted. Only `false` counts as an effective protection rule; the default `true` does not. |
 | `limit_by` | String | `ip` | Rate limit key: exact lowercase `ip` or `consumer`. Other values are rejected at plugin load time. |
 | `type_rate_limits` | Object | `{}` | Rate limits by operation type. Only exact lowercase `query`, `mutation`, and `subscription` keys are accepted; unknown keys are rejected. |
@@ -5451,7 +5504,7 @@ Request buffering is only enabled when at least one GraphQL policy is configured
 | `redis_password` | String (optional) | — | Redis password |
 | `redis_failure_policy` | String | `fail_closed` | Behavior when the centralized store cannot be consulted (outage, egress/DNS screen failure, or an endpoint rejected as Redis Cluster). `fail_closed` refuses with `503`; `local_fallback` explicitly opts into per-process budgets for availability. Only meaningful when `sync_mode: "redis"`, but validated in either mode |
 
-Each rate limit entry: `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive integer JSON values (`2`, not `2.0`) — missing, zero, or unknown keys are rejected at plugin load time so a typo cannot silently disable a rate limit. The same integer-encoding rule applies to the top-level numeric limits and Redis pool/timeout settings.
+Each rate limit entry: `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive integer JSON values (`2`, not `2.0`) — missing, zero, or unknown keys are rejected at plugin load time so a typo cannot silently disable a rate limit. Both fields are also bounded above by the shared rate-limit maxima, and both bounds apply identically to `type_rate_limits` and `operation_rate_limits` entries: `max_requests` accepts the inclusive range `1..=1000000` (an operational budget ceiling) and `window_seconds` the inclusive range `1..=2678400` (31 days, so the window stays representable as a monotonic duration and a signed Redis TTL). The same integer-encoding rule applies to the top-level numeric limits and Redis pool/timeout settings.
 
 The plugin requires at least one effective rule (`max_depth`, `max_complexity`, `max_aliases`, `introspection_allowed: false`, a non-empty `type_rate_limits`, or a non-empty `operation_rate_limits`) — an empty or no-op config is rejected. Unknown top-level keys are rejected so misspelled introspection, identity, rate-map, or Redis synchronization fields cannot silently fall back to defaults.
 
