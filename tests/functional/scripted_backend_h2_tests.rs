@@ -2904,8 +2904,10 @@ async fn grpc_protocol_nack_goaway_zero_replays_buffered_post() {
     assert_eq!(response.messages, vec![Bytes::from_static(b"ok")]);
     // One HEADERS frame was asserted by the raw rejection above; the scripted
     // backend must see exactly one replay, for two backend requests total.
-    assert_eq!(1 + backend.received_stream_count(), 2);
+    // Read through the awaited recorder so the count cannot race the
+    // backend's bookkeeping relative to the client-visible response.
     let streams = backend.received_streams().await;
+    assert_eq!(1 + streams.len(), 2);
     assert_eq!(streams[0].body, [0, 0, 0, 0, 2, b'o', b'k']);
     backend.assert_no_matcher_mismatches().await;
     backend.assert_no_step_errors().await;
@@ -2968,11 +2970,14 @@ async fn grpc_protocol_nack_refused_stream_replay_and_controls() {
             Some(if ok { 0 } else { 14 }),
             "{case}: {response:?}"
         );
-        assert_eq!(backend.received_stream_count(), expected_requests, "{case}");
+        // Await the recorder before counting so a loaded runner cannot sample
+        // `received_stream_count()` one scheduling tick before the replay is
+        // booked (issue #5434).
+        let streams = backend.received_streams().await;
+        assert_eq!(streams.len(), expected_requests, "{case}");
         if expected_requests > 1 {
             assert!(started.elapsed() >= Duration::from_millis(25), "{case}");
         }
-        let streams = backend.received_streams().await;
         if ok || drain {
             let processed = if ok { 1 } else { 0 };
             assert_eq!(
@@ -4525,7 +4530,7 @@ async fn direct_h2_early_response_survives_an_unlimited_unauthenticated_upload()
          dispatcher cancelled the still-live upload on return"
     );
     assert_eq!(
-        backend.received_stream_count(),
+        backend.received_streams().await.len(),
         1,
         "the exchange must complete on a single backend stream, not a retry"
     );
