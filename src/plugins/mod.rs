@@ -6151,14 +6151,20 @@ impl RequestContext {
     /// so a SPIFFE-only policy chain can never hold an identity the lifetime
     /// machinery does not bound. Crate-private: only the certificate-derived
     /// extraction path may mark this provenance.
+    ///
+    /// `deadline` is `None` only when the leaf's own `notAfter` is further out
+    /// than a monotonic `Instant` can represent (issue #5396). That is not an
+    /// unbounded admission: the principal still marks the request
+    /// authenticated, so `proxy::auth_lifetime` bounds it by the finite
+    /// `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` fallback.
     pub(crate) fn admit_certificate_spiffe_principal(
         &mut self,
         id: crate::identity::SpiffeId,
-        deadline: tokio::time::Instant,
+        deadline: Option<tokio::time::Instant>,
     ) {
         self.peer_spiffe_id = Some(id);
         self.peer_spiffe_certificate_principal = true;
-        self.observe_credential_deadline(Some(deadline));
+        self.observe_credential_deadline(deadline);
     }
 
     /// Return the identity value to forward to the backend in
@@ -8551,14 +8557,18 @@ impl StreamConnectionContext {
     /// only together, so a SPIFFE-only stream policy chain can never hold an
     /// identity the lifetime machinery does not bound. Crate-private: only the
     /// certificate-derived extraction path may mark this provenance.
+    ///
+    /// `deadline` is `None` only for a leaf whose `notAfter` outruns the
+    /// representable monotonic range (issue #5396); the session is then bounded
+    /// by the finite authenticated-stream maximum instead.
     pub(crate) fn admit_certificate_spiffe_principal(
         &mut self,
         id: &crate::identity::SpiffeId,
-        deadline: tokio::time::Instant,
+        deadline: Option<tokio::time::Instant>,
     ) {
         self.insert_metadata("peer_spiffe_id".to_string(), id.to_string());
         self.peer_spiffe_certificate_principal = true;
-        self.observe_credential_deadline(Some(deadline));
+        self.observe_credential_deadline(deadline);
     }
 
     /// Insert a metadata value, lazily allocating the map on first write.
@@ -11972,6 +11982,14 @@ pub(crate) fn validate_plugin_config_with_http_client(
         // process-wide reload map. Graph validation and cache reloads construct
         // explicitly inside an open reload bracket.
         return transaction_log_schema::TransactionLogSchema::validate_config(config);
+    }
+    if name == "serverless_function" {
+        // Shape-only: CP/admin admission must not require the AWS / Azure / GCP
+        // credentials that intentionally resolve only from a data plane's
+        // environment or external secret backend. Every supplied field is still
+        // validated here; runtime cache construction on the serving node
+        // resolves and validates the credentials fail closed (issue #5179).
+        return serverless_function::ServerlessFunction::validate_config(config, http_client);
     }
     match create_plugin_with_http_client(name, config, http_client)? {
         Some(_) => Ok(()),
