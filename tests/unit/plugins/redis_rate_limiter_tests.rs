@@ -3166,7 +3166,8 @@ fn cached_pool_pins_multiplexed_connection_not_connection_manager() {
     );
 
     // Both connect helpers dial multiplexed connections directly, and the
-    // pooled path screens topology before publishing into the ArcSwap slot.
+    // pooled path screens topology (and arms the per-command response
+    // deadline) before publishing into the ArcSwap slot.
     let publish = source
         .find("slot.connection.store(Arc::new(Some(conn.clone())))")
         .expect("pooled publication site");
@@ -3174,7 +3175,7 @@ fn cached_pool_pins_multiplexed_connection_not_connection_manager() {
         .find("match self.connect_multiplexed(client).await {")
         .expect("pooled establishment site");
     let screen = source[establish..publish]
-        .find("self.screen_established_connection(&mut conn)")
+        .find("self.screen_and_arm(&mut conn)")
         .expect("pooled path must screen topology before publishing");
     assert!(
         screen > 0,
