@@ -11706,9 +11706,12 @@ async fn sibling_instances_do_not_apply_response_policy_to_another_endpoint() {
     let upstream = format!("{}/mcp", server.uri());
 
     // The serving instance: endpoint `/mcp`, result validation on, 4 KiB cap.
-    let serving = create_plugin("mcp_gateway", &aggregate_output_validation_config(&upstream))
-        .unwrap()
-        .unwrap();
+    let serving = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&upstream),
+    )
+    .unwrap()
+    .unwrap();
     let session_id = initialize(&serving).await;
 
     let upstream_response = serde_json::to_vec(&json!({
@@ -11735,7 +11738,9 @@ async fn sibling_instances_do_not_apply_response_policy_to_another_endpoint() {
             "validate_tool_arguments": true,
             "max_upstream_response_bytes": 100
         });
-        let sibling = create_plugin("mcp_gateway", &sibling_config).unwrap().unwrap();
+        let sibling = create_plugin("mcp_gateway", &sibling_config)
+            .unwrap()
+            .unwrap();
 
         let mut ctx = route_validated_tool_call(&serving, &session_id, 940).await;
         assert!(
@@ -11749,7 +11754,9 @@ async fn sibling_instances_do_not_apply_response_policy_to_another_endpoint() {
         let mut sibling_headers = response_headers.clone();
         assert!(
             matches!(
-                sibling.after_proxy(&mut ctx, 200, &mut sibling_headers).await,
+                sibling
+                    .after_proxy(&mut ctx, 200, &mut sibling_headers)
+                    .await,
                 PluginResult::Continue
             ),
             "enabled={sibling_enabled}: a sibling must not refuse another endpoint's response"
@@ -12003,7 +12010,9 @@ async fn mcp_gateway_openapi_component_matches_runtime_admission() {
     });
     let transparent_with = |overrides: Value| {
         let mut config = transparent.clone();
-        let object = config.as_object_mut().expect("transparent base is an object");
+        let object = config
+            .as_object_mut()
+            .expect("transparent base is an object");
         for (key, value) in overrides.as_object().expect("overrides are an object") {
             object.insert(key.clone(), value.clone());
         }
@@ -12064,14 +12073,20 @@ async fn mcp_gateway_openapi_component_matches_runtime_admission() {
         ),
         // Explicit nulls the constructor treats exactly as omission.
         ("null enabled", schema_fixture(json!({ "enabled": null }))),
-        ("null discovery", schema_fixture(json!({ "discovery": null }))),
+        (
+            "null discovery",
+            schema_fixture(json!({ "discovery": null })),
+        ),
         ("null sessions", schema_fixture(json!({ "sessions": null }))),
         (
             "null capabilities",
             schema_fixture(json!({ "capabilities": null })),
         ),
         ("null policy", schema_fixture(json!({ "policy": null }))),
-        ("null validation", schema_fixture(json!({ "validation": null }))),
+        (
+            "null validation",
+            schema_fixture(json!({ "validation": null })),
+        ),
         (
             "null observability",
             schema_fixture(json!({ "observability": null })),
@@ -12173,7 +12188,10 @@ async fn mcp_gateway_openapi_component_matches_runtime_admission() {
             schema_fixture(json!({ "observability": { "log_result_hash": true } })),
         ),
         // Expressible scalar constraints.
-        ("root endpoint", schema_fixture(json!({ "endpoint": { "path": "/" } }))),
+        (
+            "root endpoint",
+            schema_fixture(json!({ "endpoint": { "path": "/" } })),
+        ),
         (
             "dot-segment endpoint",
             schema_fixture(json!({ "endpoint": { "path": "/mcp/../admin" } })),

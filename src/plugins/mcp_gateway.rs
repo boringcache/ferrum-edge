@@ -7931,8 +7931,7 @@ fn parse_sessions(object: &Map<String, Value>) -> Result<McpSessionConfig, Strin
         initialize_upstreams,
         session_ttl: Duration::from_secs(session_ttl_seconds),
         max_sessions,
-        sse_multiplexing: optional_bool_from_object(sessions, "sse_multiplexing")?
-            .unwrap_or(false),
+        sse_multiplexing: optional_bool_from_object(sessions, "sse_multiplexing")?.unwrap_or(false),
         sse_bounds: parse_sse_bounds(sessions)?,
     })
 }
