@@ -20504,10 +20504,10 @@ components:
         ldap_url:
           type: string
           minLength: 1
-          pattern: "^ldaps?://"
+          pattern: '^ldaps?://(?:[^/?#@]*@)?(?:\[[0-9A-Fa-f:.]+\]|[^\s/?#:@\[\]]+)(?::(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[0-9]{1,4})?)?(?:[\s/?#]|$)'
           not:
-            pattern: "^ldaps?://[^/?#]*@"
-          description: "LDAP server URL. Use ldaps:// or ldap:// with starttls=true; non-loopback plaintext ldap:// requires the explicit development-only allow_plaintext override. Embedded URL credentials are rejected. Each connection freshly resolves and policy-screens all A/AAAA candidates while retaining this hostname for TLS/SNI verification."
+            pattern: '^ldaps?://[^/?#]*[^/?#@]@'
+          description: "LDAP server URL. Use ldaps:// or ldap:// with starttls=true; non-loopback plaintext ldap:// requires the explicit development-only allow_plaintext override. The scheme is matched case-sensitively and the value must carry no leading or trailing whitespace. A hostname is required and an explicit port must be 0-65535. Embedded URL credentials are rejected; a bare '@' with empty userinfo carries none and is accepted. Each connection freshly resolves and policy-screens all A/AAAA candidates while retaining this hostname for TLS/SNI verification."
           example: "ldaps://ldap.example.com:636"
         bind_dn_template:
           type: string
@@ -20518,44 +20518,51 @@ components:
         search_base_dn:
           type: string
           minLength: 1
-          description: "Base DN for search-then-bind user search"
+          pattern: '\S'
+          description: "Base DN for search-then-bind user search. Surrounding whitespace is trimmed; a whitespace-only value is rejected"
         search_filter:
           type: string
           minLength: 1
           pattern: '\{username\}'
-          description: "LDAP search filter with {username} placeholder"
+          description: "LDAP search filter with {username} placeholder. The value must also parse as an RFC 4515 search filter; a malformed filter is rejected at load rather than failing every request with 500"
           example: "(&(objectClass=user)(sAMAccountName={username}))"
         canonical_identity_attribute:
           type: string
           minLength: 1
+          pattern: '\S'
           description: "Required in both bind modes. Exactly one value from the authenticated entry (the uniquely selected search entry, or a base-scope read of the directly bound DN) becomes the authenticated identity, Consumer mapping key, custom group-filter {username}, and default memberUid value (for example uid or sAMAccountName). Choose the authoritative attribute whose value username-based groups store; mismatches fail closed and never fall back to the presented login. Attribute-name matching is LDAP case-insensitive."
         service_account_dn:
           type: string
           minLength: 1
-          description: "DN for the service account used in search-then-bind"
+          pattern: '\S'
+          description: "DN for the service account used in search-then-bind. Surrounding whitespace is trimmed; a whitespace-only value is rejected"
         service_account_password:
           type: string
           minLength: 1
           writeOnly: true
           format: password
-          description: "Password for the service account"
+          description: "Password for the service account. Taken verbatim: it is never trimmed, so a secret with leading or trailing whitespace binds as configured. Only an empty string is rejected"
         group_base_dn:
           type: string
           minLength: 1
-          description: "Base DN for group membership search"
+          pattern: '\S'
+          description: "Base DN for group membership search. Surrounding whitespace is trimmed; a whitespace-only value is rejected"
         group_filter:
           type: string
           minLength: 1
-          description: "Group search filter. When required_groups is non-empty, a custom filter must contain {user_dn} or {username}. {username} is the authenticated canonical identity read from canonical_identity_attribute in both bind modes, never the presented login. Before authorization, every custom-filter match is rechecked against the exact returned group DN using member, uniqueMember, and memberUid so a static branch cannot fabricate membership."
+          pattern: '\S'
+          description: "Group search filter. The value must parse as an RFC 4515 search filter; a malformed filter is rejected at load. When required_groups is non-empty, a custom filter must contain {user_dn} or {username}. {username} is the authenticated canonical identity read from canonical_identity_attribute in both bind modes, never the presented login. Before authorization, every custom-filter match is rechecked against the exact returned group DN using member, uniqueMember, and memberUid so a static branch cannot fabricate membership."
         required_groups:
           type: array
           items:
             type: string
             minLength: 1
-          description: "LDAP/AD group names the user must belong to (OR logic)"
+            pattern: '\S'
+          description: "LDAP/AD group names the user must belong to (OR logic). A returned group entry matches when its group_attribute value matches, or when the entry's OWN first RDN is typed cn or group_attribute and its RFC 4514-decoded value matches; an entry merely nested under a required group never matches"
         group_attribute:
           type: string
           minLength: 1
+          pattern: '\S'
           default: "cn"
           description: "Attribute containing the group name; returned LDAP attribute names are matched case-insensitively"
         starttls:
@@ -20598,11 +20605,16 @@ components:
           format: uint64
           default: 10000
           minimum: 1
-          description: "Strict maximum entries in the auth result cache. At capacity, one existing entry is replaced without a full-cache scan."
+          maximum: 1000000
+          description: "Strict maximum entries in the auth result cache (1-1,000,000). At capacity, one existing entry is replaced without a full-cache scan."
         consumer_mapping:
           type: boolean
           default: true
           description: "Whether to map LDAP user to a gateway Consumer"
+        hide_credentials:
+          type: boolean
+          default: true
+          description: "Remove the verified Authorization: Basic credential from the backend request, including when another mechanism wins a multi-auth chain. Only the Basic scheme this plugin consumes is removed; an Authorization header carrying another scheme reaches the backend unchanged. Set to false only for a legacy backend that explicitly requires the directory password."
 
     HmacAuthConfig:
       type: object
