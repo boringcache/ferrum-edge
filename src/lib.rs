@@ -11301,6 +11301,35 @@ pub mod _test_support {
         crate::plugins::udp_logging::local_record_drops_for_test()
     }
 
+    /// Lost-record total for injected split-batch retry sequences.
+    ///
+    /// Each inner slice is one attempt. Labels: `"reject"` (deterministic
+    /// local size rejection), `"ok"` (delivered), `"transport"` (transport
+    /// error). Matches production: local rejects count only on a completed
+    /// attempt; exhausting retries counts the original batch once.
+    pub fn udp_logging_split_retry_lost_record_count_for_test(attempts: &[&[&str]]) -> u64 {
+        use crate::plugins::udp_logging::SplitEntryOutcome;
+        let parsed: Vec<Vec<SplitEntryOutcome>> = attempts
+            .iter()
+            .map(|attempt| {
+                attempt
+                    .iter()
+                    .map(|label| match *label {
+                        "reject" => SplitEntryOutcome::LocalReject,
+                        "ok" => SplitEntryOutcome::Delivered,
+                        "transport" => SplitEntryOutcome::TransportError,
+                        other => panic!(
+                            "udp_logging split-retry fixture label must be \
+                             reject/ok/transport, got {other}"
+                        ),
+                    })
+                    .collect()
+            })
+            .collect();
+        let refs: Vec<&[SplitEntryOutcome]> = parsed.iter().map(Vec::as_slice).collect();
+        crate::plugins::udp_logging::split_retry_lost_record_count(&refs)
+    }
+
     pub fn udp_logging_classify_serialized_summaries_for_test(
         summaries: &[crate::plugins::TransactionSummary],
         max_datagram_bytes: usize,

@@ -5424,7 +5424,7 @@ async fn tcp_logging_schema_matches_strict_runtime_config_contract() {
     assert_eq!(schema["properties"]["write_timeout_ms"]["default"], 5000);
     assert_eq!(
         schema["properties"]["tls_server_name"]["pattern"],
-        r"^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?|[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*)$",
+        r"^(?:[A-Za-z0-9_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?\.?|[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*)$",
     );
     let connect_desc = schema["properties"]["connect_timeout_ms"]["description"]
         .as_str()
@@ -5460,6 +5460,18 @@ async fn tcp_logging_schema_matches_strict_runtime_config_contract() {
     }
     assert!(tcp_docs.contains("KeepLastKnownGood"));
     assert!(tcp_docs.contains("at-least-once"));
+    assert!(
+        tcp_docs.contains("268435456") || tcp_docs.contains("256 MiB"),
+        "tcp_logging docs must name the 256 MiB buffer_max_bytes ceiling"
+    );
+    assert!(
+        tcp_docs.contains("ssl_enabled"),
+        "Logstash TLS instructions must use ssl_enabled"
+    );
+    assert!(
+        !tcp_docs.contains("ssl_enable =>"),
+        "removed Logstash ssl_enable option must not remain in tcp_logging docs"
+    );
 
     let valid = json!({
         "host": "logs.example.com",
@@ -5490,6 +5502,27 @@ async fn tcp_logging_schema_matches_strict_runtime_config_contract() {
     assert_component_validity(&spec, "TcpLoggingConfig", &valid_minima, true);
     assert!(TcpLogging::new(&valid_minima, PluginHttpClient::default()).is_ok());
 
+    let padded_host = json!({"host": " 127.0.0.1 ", "port": 5140});
+    assert_component_validity(&spec, "TcpLoggingConfig", &padded_host, true);
+    assert!(
+        TcpLogging::new(&padded_host, PluginHttpClient::default()).is_ok(),
+        "runtime trims surrounding host whitespace"
+    );
+
+    for tls_server_name in ["localhost.", "log_sink.local"] {
+        let config = json!({
+            "host": "127.0.0.1",
+            "port": 6514,
+            "tls": true,
+            "tls_server_name": tls_server_name
+        });
+        assert_component_validity(&spec, "TcpLoggingConfig", &config, true);
+        assert!(
+            TcpLogging::new(&config, PluginHttpClient::default()).is_ok(),
+            "rustls-accepted TLS identity {tls_server_name} must admit"
+        );
+    }
+
     let runtime_and_schema_invalid = [
         json!({"host": "logs.example.com", "port": 6514, "tlls": true}),
         json!({"host": "logs.example.com", "port": 6514, "write_timeot_ms": 1000}),
@@ -5516,6 +5549,16 @@ async fn tcp_logging_schema_matches_strict_runtime_config_contract() {
         }),
         json!({"host": "logs.example.com", "port": 6514, "tls": true, "tls_server_name": " logs.example.com"}),
         json!({"host": "logs.example.com", "port": 6514, "tls": true, "tls_server_name": "logs.example.com "}),
+        json!({"host": "http://localhost", "port": 5140}),
+        json!({"host": "localhost:9000", "port": 5140}),
+        json!({
+            "host": "127.0.0.1",
+            "port": 45123,
+            "schema": {"static_fields": {"audit": "ok"}},
+            "schema_ref": "audit"
+        }),
+        json!({"host": "127.0.0.1", "port": 45123, "buffer_max_bytes": 2050}),
+        json!({"host": "[localhost]", "port": 5140}),
     ];
     for config in runtime_and_schema_invalid {
         assert_component_validity(&spec, "TcpLoggingConfig", &config, false);
@@ -5556,6 +5599,121 @@ async fn tcp_logging_schema_matches_strict_runtime_config_contract() {
             .insert((*key).to_string(), serde_json::Value::Null);
         assert_component_validity(&spec, "TcpLoggingConfig", &config, false);
     }
+}
+
+#[test]
+fn udp_logging_schema_matches_runtime_admission() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::udp_logging::{UDP_LOGGING_CONFIG_KEYS, UdpLogging};
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/UdpLoggingConfig")
+        .expect("UdpLoggingConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    let documented = schema["properties"]
+        .as_object()
+        .expect("UdpLogging properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime = UDP_LOGGING_CONFIG_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(documented, runtime, "udp_logging runtime/OpenAPI key drift");
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let udp_docs = plugin_docs
+        .split("### `udp_logging`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("udp_logging docs section");
+    for key in UDP_LOGGING_CONFIG_KEYS {
+        assert!(
+            udp_docs.contains(&format!("`{key}`")),
+            "docs/plugins.md udp_logging section missing `{key}`"
+        );
+    }
+    assert!(
+        udp_docs.contains("268435456") || udp_docs.contains("256 MiB"),
+        "udp_logging docs must name the 256 MiB buffer_max_bytes ceiling"
+    );
+
+    let valid = json!({"host": "127.0.0.1", "port": 45123});
+    assert_component_validity(&spec, "UdpLoggingConfig", &valid, true);
+    assert!(UdpLogging::new(&valid, PluginHttpClient::default()).is_ok());
+    validate_plugin_config("udp_logging", &valid).expect("shared validation accepts minima");
+
+    let padded_host = json!({"host": " 127.0.0.1 ", "port": 45123});
+    assert_component_validity(&spec, "UdpLoggingConfig", &padded_host, true);
+    validate_plugin_config("udp_logging", &padded_host)
+        .expect("shared validation trims host whitespace");
+    assert!(
+        UdpLogging::new(&padded_host, PluginHttpClient::default()).is_ok(),
+        "constructor trims host whitespace"
+    );
+
+    let runtime_and_schema_invalid = [
+        json!({"host": "http://localhost", "port": 45123}),
+        json!({"host": "localhost:9000", "port": 45123}),
+        json!({"host": "[localhost]", "port": 45123}),
+        json!({
+            "host": "127.0.0.1",
+            "port": 45123,
+            "schema": {"static_fields": {"audit": "ok"}},
+            "schema_ref": "audit"
+        }),
+        json!({
+            "host": "127.0.0.1",
+            "port": 45123,
+            "dtls": true,
+            "dtls_ca_cert_path": " "
+        }),
+        json!({"host": "127.0.0.1", "port": 45123, "buffer_max_bytes": 2050}),
+        json!({"host": "127.0.0.1", "port": 45123, "max_entry_bytes": 0}),
+        json!({"host": "127.0.0.1", "port": 45123, "max_entry_bytes": null}),
+        json!({"host": "127.0.0.1", "port": 45123, "max_entry_bytes": "65536"}),
+        json!({"host": "127.0.0.1", "port": 45123, "buffer_max_bytes": 268435457}),
+    ];
+    for config in runtime_and_schema_invalid {
+        assert_component_validity(&spec, "UdpLoggingConfig", &config, false);
+        assert!(
+            UdpLogging::new(&config, PluginHttpClient::default()).is_err(),
+            "runtime accepted OpenAPI-invalid udp_logging config: {config}"
+        );
+        assert!(
+            validate_plugin_config("udp_logging", &config).is_err(),
+            "shared validation accepted OpenAPI-invalid udp_logging config: {config}"
+        );
+    }
+
+    let valid_explicit_min_pair = json!({
+        "host": "127.0.0.1",
+        "port": 45123,
+        "max_entry_bytes": 1024,
+        "buffer_max_bytes": 2050
+    });
+    assert_component_validity(&spec, "UdpLoggingConfig", &valid_explicit_min_pair, true);
+    validate_plugin_config("udp_logging", &valid_explicit_min_pair)
+        .expect("explicit minimum byte pair must validate");
+    assert!(
+        UdpLogging::new(&valid_explicit_min_pair, PluginHttpClient::default()).is_ok(),
+        "explicit minimum byte pair must construct"
+    );
+
+    let valid_max_pair = json!({
+        "host": "127.0.0.1",
+        "port": 45123,
+        "max_entry_bytes": 1048576,
+        "buffer_max_bytes": 268435456
+    });
+    assert_component_validity(&spec, "UdpLoggingConfig", &valid_max_pair, true);
+    validate_plugin_config("udp_logging", &valid_max_pair)
+        .expect("maximum byte pair must validate");
 }
 
 #[test]
