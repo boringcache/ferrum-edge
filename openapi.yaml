@@ -30584,48 +30584,6 @@ components:
             type: object
             additionalProperties: false
             required: [name, provider_type]
-            allOf:
-              # A static api_key is read for every provider type except
-              # aws_bedrock (SigV4 credentials, which also resolve from the
-              # standard AWS environment variables) and google_vertex (service
-              # account JWT). For those types the constructor treats an absent
-              # or empty api_key as a configuration error and there is no
-              # environment fallback, so the requirement is expressible here.
-              - if:
-                  required: [provider_type]
-                  properties:
-                    provider_type:
-                      enum:
-                        - openai
-                        - anthropic
-                        - azure_openai
-                        - google_gemini
-                        - mistral
-                        - cohere
-                        - xai
-                        - deepseek
-                        - meta_llama
-                        - hugging_face
-                then:
-                  required: [api_key]
-              # google_gemini, google_vertex, and aws_bedrock interpolate the
-              # RESOLVED model into the endpoint path, so every provider-native
-              # model identifier they may resolve to is additionally restricted
-              # to a safe URL path component - no '/' or '+'. The general
-              # identifier charset stays in force for the client-facing keys,
-              # which are never interpolated into a URL.
-              - if:
-                  required: [provider_type]
-                  properties:
-                    provider_type:
-                      enum: [google_gemini, google_vertex, aws_bedrock]
-                then:
-                  properties:
-                    default_model:
-                      pattern: '^[A-Za-z0-9._:-]+$'
-                    model_mapping:
-                      additionalProperties:
-                        pattern: '^[A-Za-z0-9._:-]+$'
             properties:
               name:
                 type: string
@@ -30832,6 +30790,24 @@ components:
                     allow_plaintext:
                       const: true
                   required: [allow_plaintext]
+              # google_gemini, google_vertex, and aws_bedrock interpolate the
+              # RESOLVED model into the endpoint path, so every provider-native
+              # model identifier they may resolve to is additionally restricted
+              # to a safe URL path component - no '/' or '+'. The general
+              # identifier charset stays in force for the client-facing keys,
+              # which are never interpolated into a URL.
+              - if:
+                  required: [provider_type]
+                  properties:
+                    provider_type:
+                      enum: [google_gemini, google_vertex, aws_bedrock]
+                then:
+                  properties:
+                    default_model:
+                      pattern: '^[A-Za-z0-9._:-]+$'
+                    model_mapping:
+                      additionalProperties:
+                        pattern: '^[A-Za-z0-9._:-]+$'
         fallback_enabled:
           type: boolean
           default: true
