@@ -1319,7 +1319,8 @@ fn h3_aggregate_sse_writer_streams_under_a_hard_listener_bound() {
             .matches("await_post_deadline_terminal_response_write(")
             .count(),
         2,
-        "pre-commit authorization terminal and listener-lifetime FIN must both use the bounded grace"
+        "exactly two bounded-grace writes: the pre-commit authorization terminal, and the \
+         single post-pump FIN every pump exit settles at"
     );
 
     // Dropping the body is what returns the session's single-listener slot, so

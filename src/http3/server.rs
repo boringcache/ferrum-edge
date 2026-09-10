@@ -16883,10 +16883,11 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
 ///
 /// A PROTOCOL-only bound never resets on its own expiry. Reaching the listener
 /// lifetime is ordinary rotation — the client is expected to reattach with
-/// `Last-Event-ID` — so both terminal paths (the pump timing out, and the body
-/// reaching EOF because the broker ended it at that same lifetime) give `finish`
-/// the bounded post-deadline grace instead of racing it against a deadline that
-/// has already elapsed. Only an actual stalled write past that grace, or an
+/// `Last-Event-ID` — so every way out of the pump (the composed bound firing, a
+/// blocked DATA write losing to it, a client disconnect, and the broker's own
+/// EOF at that same lifetime) settles at ONE terminal, which gives `finish` the
+/// bounded post-deadline grace instead of racing it against a deadline that has
+/// normally just elapsed. Only a write still blocked past that grace, or an
 /// expired authorization, resets.
 async fn send_h3_aggregate_sse_response(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
@@ -17004,59 +17005,38 @@ async fn send_h3_aggregate_sse_response(
                 // A failed write on a long-lived stream is an ordinary client
                 // disconnect, not a gateway fault: stop and let the body drop.
                 Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => break,
-                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                    return true;
-                }
+                // A write that lost to the composed bound IS that bound firing,
+                // so it leaves the pump the same way a disconnect does: the one
+                // terminal below owns the FIN-versus-reset decision.
+                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => break,
             }
         }
-        false
     };
-    let composed_deadline_fired = tokio::time::timeout_at(deadline, pump)
-        .await
-        .unwrap_or(true);
+    let _ = tokio::time::timeout_at(deadline, pump).await;
     // Release the listener slot before the QUIC stream teardown so a client
     // that reconnects immediately is never refused by its own stale lease.
     drop(body);
-    if composed_deadline_fired {
-        if let Some(termination) = aggregate_sse_bound.expired_authorization() {
-            ctx.record_authorization_termination_once(termination, auth_family);
-            crate::http3::stream_util::abort_response_stream(stream);
-        } else {
-            match crate::http3::stream_util::await_post_deadline_terminal_response_write(
-                stream.finish(),
-            )
-            .await
-            {
-                Ok(()) | Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {}
-                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                    crate::http3::stream_util::abort_response_stream(stream);
-                }
-            }
-        }
+    // ONE terminal for every pump exit: the composed bound firing, a blocked
+    // DATA write losing to it, a client disconnect, and the broker's own EOF at
+    // the configured listener lifetime. An expired AUTHORIZATION after the
+    // protected head committed resets and is recorded exactly once (issues
+    // #4112 / #4363). A PROTOCOL-only bound is ordinary listener rotation: the
+    // broker ends the body AT that lifetime, so the composed deadline has
+    // normally just elapsed, and racing the FIN against it would turn every
+    // quiet expiry into a stream RESET that reads as a transport fault. The FIN
+    // therefore gets the bounded post-deadline grace, and only a write still
+    // blocked past that grace resets.
+    if let Some(termination) = aggregate_sse_bound.expired_authorization() {
+        ctx.record_authorization_termination_once(termination, auth_family);
+        crate::http3::stream_util::abort_response_stream(stream);
     } else {
-        // The body reached its own EOF, which is what an ordinary listener
-        // rotation looks like: the broker ends the stream AT the configured
-        // lifetime, so the composed deadline has normally just elapsed. Racing
-        // the FIN against that already-expired deadline would turn every quiet
-        // expiry into a stream RESET and make routine rotation read as a
-        // transport fault, so a protocol-only bound gets the same bounded
-        // post-deadline opportunity the timeout branch above already grants it.
-        // An expired AUTHORIZATION keeps the strict deadline-bounded write and
-        // its mandatory reset (issues #4112 / #4363).
-        let expired_authorization = aggregate_sse_bound.expired_authorization();
-        let finish = stream.finish();
-        let finished = if expired_authorization.is_some() {
-            crate::http3::stream_util::await_response_write_before_deadline(Some(deadline), finish)
-                .await
-        } else {
-            crate::http3::stream_util::await_post_deadline_terminal_response_write(finish).await
-        };
-        match finished {
+        match crate::http3::stream_util::await_post_deadline_terminal_response_write(
+            stream.finish(),
+        )
+        .await
+        {
             Ok(()) | Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {}
             Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                if let Some(termination) = expired_authorization {
-                    ctx.record_authorization_termination_once(termination, auth_family);
-                }
                 crate::http3::stream_util::abort_response_stream(stream);
             }
         }
