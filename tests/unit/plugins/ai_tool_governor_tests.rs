@@ -12,8 +12,10 @@ use ferrum_edge::{
             AI_TOOL_GOVERNOR_OBSERVABILITY_KEYS, AI_TOOL_GOVERNOR_RESPONSE_KEYS,
             AI_TOOL_GOVERNOR_TOOL_POLICY_KEYS, AiToolGovernor,
         },
-        available_plugins, correlation_id::CorrelationId, create_plugin_with_http_client,
-        create_response_stream_inspector, plugin_failure_policy, priority, validate_plugin_config,
+        available_plugins,
+        correlation_id::CorrelationId,
+        create_plugin_with_http_client, create_response_stream_inspector, plugin_failure_policy,
+        priority, validate_plugin_config,
     },
     proxy::deferred_log::BodyOutcome,
 };
