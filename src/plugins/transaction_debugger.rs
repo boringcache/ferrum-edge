@@ -780,14 +780,28 @@ impl TransactionDebugger {
                     } else if ctx == JsonBodyRedactionContext::Normal
                         && is_azure_data_sources_field(&key)
                     {
-                        if let Value::Array(sources) = entry {
-                            for source in sources.iter_mut() {
-                                self.redact_json_value(
-                                    source,
-                                    depth + 1,
-                                    JsonBodyRedactionContext::DataSourceItem,
-                                );
+                        // The provider's conventional shape is an array of
+                        // data-source items, but a captured body is arbitrary
+                        // JSON and this name proves no type invariant. Every
+                        // other shape is traversed as a single data-source item
+                        // instead of falling out of the branch untouched: a
+                        // recognized container name must never bypass the
+                        // ordinary member-name and credential-string visitor.
+                        match entry {
+                            Value::Array(sources) => {
+                                for source in sources.iter_mut() {
+                                    self.redact_json_value(
+                                        source,
+                                        depth + 1,
+                                        JsonBodyRedactionContext::DataSourceItem,
+                                    );
+                                }
                             }
+                            other => self.redact_json_value(
+                                other,
+                                depth + 1,
+                                JsonBodyRedactionContext::DataSourceItem,
+                            ),
                         }
                     } else {
                         let next_ctx = if ctx == JsonBodyRedactionContext::DataSourceItem {
