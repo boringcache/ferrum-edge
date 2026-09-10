@@ -4,8 +4,9 @@ use ferrum_edge::_test_support::{
     oidc_sealed_refresh_session_cookie_for_test, oidc_sealed_session_cookie_for_test,
     oidc_session_state_from_set_cookie_for_test,
 };
+use chrono::Utc;
 use ferrum_edge::ConsumerIndex;
-use ferrum_edge::config::types::AuthMode;
+use ferrum_edge::config::types::{AuthMode, GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::plugins::validate_plugin_config;
 use ferrum_edge::plugins::{
     Plugin, PluginHttpClient, PluginResult, RequestContext, key_auth::KeyAuth,
@@ -3320,4 +3321,71 @@ async fn discovery_rejects_untrusted_revocation_endpoints() {
         .await
         .is_err()
     );
+}
+
+/// `ferrum-edge validate` runs the shared plugin-composition gate synchronously,
+/// with no Tokio reactor on the calling thread. That gate constructs every
+/// security-composition candidate, so a valid enabled OIDC plugin used to abort
+/// the CLI with "there is no reactor running" for a configuration that starts
+/// cleanly under `run` (issue #5024).
+///
+/// This is deliberately a plain `#[test]`: a regression that reintroduces
+/// `tokio::spawn` during admission panics here instead of passing under a
+/// runtime the CLI never has.
+#[test]
+fn cli_config_validation_admits_oidc_without_a_tokio_runtime() {
+    for (case, provider) in [
+        (
+            "discovery",
+            json!({
+                "issuer": "https://issuer.example.com",
+                "discovery_url": "https://issuer.example.com/.well-known/openid-configuration",
+                "client_id": "ferrum-gateway",
+                "client_auth": {"client_secret": "0123456789abcdef"},
+                "redirect_uri": "https://app.example.com/oauth/callback",
+                "scopes": ["openid"]
+            }),
+        ),
+        (
+            "explicit",
+            json!({
+                "issuer": "https://issuer.example.com",
+                "authorization_endpoint": "https://issuer.example.com/authorize",
+                "token_endpoint": "https://issuer.example.com/token",
+                "jwks_uri": "https://issuer.example.com/jwks",
+                "client_id": "ferrum-gateway",
+                "client_auth": {"client_secret": "0123456789abcdef"},
+                "redirect_uri": "https://app.example.com/oauth/callback",
+                "scopes": ["openid"]
+            }),
+        ),
+    ] {
+        let config = GatewayConfig {
+            plugin_configs: vec![PluginConfig {
+                id: format!("oidc-{case}"),
+                plugin_name: "oidc_relying_party".to_string(),
+                namespace: "default".to_string(),
+                config: json!({
+                    "providers": [provider],
+                    "session": {"encryption_secret": "01234567890123456789012345678901"}
+                }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                trigger: None,
+                api_spec_id: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }],
+            ..GatewayConfig::default()
+        };
+
+        let errors =
+            ferrum_edge::_test_support::collect_rejecting_runtime_config_errors_for_test(&config);
+        assert!(
+            errors.is_empty(),
+            "{case} endpoints must validate without a runtime: {errors:?}"
+        );
+    }
 }

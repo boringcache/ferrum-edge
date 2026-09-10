@@ -738,6 +738,22 @@ impl OidcRelyingParty {
         Self::new_internal(config, http_client, false).map(drop)
     }
 
+    /// Construct a fully parsed instance with every background worker
+    /// suppressed.
+    ///
+    /// Candidate composition admission needs the concrete plugin's
+    /// capabilities, but it also runs on the synchronous `ferrum-edge validate`
+    /// CLI path, which has no Tokio reactor: the production constructor's
+    /// discovery task and JWKS refresh worker abort the process there
+    /// (issue #5024). Every capability that gate inspects is derived from
+    /// parsed config, so this instance is an exact stand-in.
+    pub(crate) fn new_without_workers(
+        config: &Value,
+        http_client: PluginHttpClient,
+    ) -> Result<Self, String> {
+        Self::new_internal(config, http_client, false)
+    }
+
     fn new_internal(
         config: &Value,
         http_client: PluginHttpClient,
