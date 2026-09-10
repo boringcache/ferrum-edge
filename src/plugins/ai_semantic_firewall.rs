@@ -4401,9 +4401,8 @@ fn next_event_end(buf: &[u8]) -> Option<usize> {
 /// everything else is found by scanning `chunk` alone. Used to take exactly one
 /// event out of a coalesced transport write instead of the whole budget.
 fn next_event_boundary_in_chunk(carry: &[u8], chunk: &[u8]) -> Option<usize> {
-    let ends_with_lf_cr = carry.len() >= 2
-        && carry[carry.len() - 2] == b'\n'
-        && carry[carry.len() - 1] == b'\r';
+    let ends_with_lf_cr =
+        carry.len() >= 2 && carry[carry.len() - 2] == b'\n' && carry[carry.len() - 1] == b'\r';
     if ends_with_lf_cr && chunk.first() == Some(&b'\n') {
         return Some(1);
     }
