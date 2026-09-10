@@ -8205,57 +8205,65 @@ async fn validate_tool_results_rejects_malformed_json_rpc_protocol_errors() {
     .unwrap()
     .unwrap();
     let session_id = initialize(&plugin).await;
+    // An output-validation refusal names the ADMITTED REQUEST id (JSON-RPC 2.0
+    // section 5): the gateway knows exactly which call is still pending, and the
+    // id a malformed upstream envelope claims is untrusted — reflecting it would
+    // answer an id the client never sent. Only a request that admitted no
+    // singleton id is eligible for `id: null`.
     let malformed = [
         (
             "non-object envelope",
             json!(["not", "a", "response"]),
-            Value::Null,
+            json!(161),
         ),
         (
             "missing jsonrpc",
             json!({"id": 1, "error": {"code": -32603, "message": "bad"}}),
-            json!(1),
+            json!(163),
         ),
         (
             "wrong jsonrpc",
             json!({"jsonrpc": "1.0", "id": 2, "error": {"code": -32603, "message": "bad"}}),
-            json!(2),
+            json!(165),
         ),
         (
             "missing id",
             json!({"jsonrpc": "2.0", "error": {"code": -32603, "message": "bad"}}),
-            Value::Null,
+            json!(167),
         ),
         (
             "object id",
             json!({"jsonrpc": "2.0", "id": {}, "error": {"code": -32603, "message": "bad"}}),
-            Value::Null,
+            json!(169),
         ),
         (
             "array id",
             json!({"jsonrpc": "2.0", "id": [], "error": {"code": -32603, "message": "bad"}}),
-            Value::Null,
+            json!(171),
         ),
         (
             "boolean id",
             json!({"jsonrpc": "2.0", "id": true, "error": {"code": -32603, "message": "bad"}}),
-            Value::Null,
+            json!(173),
         ),
         (
             "non-integer error code",
             json!({"jsonrpc": "2.0", "id": 3, "error": {"code": 1.5, "message": "bad"}}),
-            json!(3),
+            json!(175),
         ),
         (
             "non-string error message",
             json!({"jsonrpc": "2.0", "id": 4, "error": {"code": -32603, "message": 4}}),
-            json!(4),
+            json!(177),
         ),
     ];
 
     for (offset, (case, upstream_value, expected_id)) in malformed.into_iter().enumerate() {
-        let mut ctx =
-            route_validated_tool_call(&plugin, &session_id, 160 + offset as i64 * 2).await;
+        // The table names the id of the request THIS iteration dispatches:
+        // `route_validated_tool_call` sends its tools/call under `base + 1`.
+        let base = 160 + offset as i64 * 2;
+        assert_eq!(expected_id, json!(base + 1), "{case}");
+        let mut ctx = route_validated_tool_call(&plugin, &session_id, base).await;
         let upstream_response = serde_json::to_vec(&upstream_value).unwrap();
         let headers = known_json_response_headers(&upstream_response);
         let (status, body, _) = reject_json(
@@ -8320,42 +8328,47 @@ async fn validate_tool_results_rejects_malformed_json_rpc_result_envelopes() {
             "conditions": "Clear"
         }
     });
+    // The same contract as the protocol-error corpus above: the refusal carries
+    // the admitted REQUEST id, never the id the malformed envelope claimed.
     let malformed = [
         (
             "missing jsonrpc",
             json!({"id": 157, "result": valid_result}),
-            json!(157),
+            json!(221),
         ),
         (
             "wrong jsonrpc",
             json!({"jsonrpc": "1.0", "id": 158, "result": valid_result}),
-            json!(158),
+            json!(223),
         ),
         (
             "missing id",
             json!({"jsonrpc": "2.0", "result": valid_result}),
-            Value::Null,
+            json!(225),
         ),
         (
             "object id",
             json!({"jsonrpc": "2.0", "id": {}, "result": valid_result}),
-            Value::Null,
+            json!(227),
         ),
         (
             "array id",
             json!({"jsonrpc": "2.0", "id": [], "result": valid_result}),
-            Value::Null,
+            json!(229),
         ),
         (
             "boolean id",
             json!({"jsonrpc": "2.0", "id": false, "result": valid_result}),
-            Value::Null,
+            json!(231),
         ),
     ];
 
     for (offset, (case, upstream_value, expected_id)) in malformed.into_iter().enumerate() {
-        let mut ctx =
-            route_validated_tool_call(&plugin, &session_id, 220 + offset as i64 * 2).await;
+        // The table names the id of the request THIS iteration dispatches:
+        // `route_validated_tool_call` sends its tools/call under `base + 1`.
+        let base = 220 + offset as i64 * 2;
+        assert_eq!(expected_id, json!(base + 1), "{case}");
+        let mut ctx = route_validated_tool_call(&plugin, &session_id, base).await;
         let upstream_response = serde_json::to_vec(&upstream_value).unwrap();
         let headers = known_json_response_headers(&upstream_response);
         let (status, body, _) = reject_json(
@@ -10274,12 +10287,11 @@ async fn route_tool_call_with_listener(
 #[tokio::test]
 async fn aggregate_sse_multiplexes_a_synthetic_list_and_a_routed_call_on_one_listener() {
     let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
-    let plugin = create_plugin(
-        "mcp_gateway",
-        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
-    )
-    .unwrap()
-    .unwrap();
+    // Multiplexed SSE delivery is the opt-in Ferrum transport extension, so
+    // this fixture names it explicitly rather than relying on a default.
+    let mut config = aggregate_output_validation_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({ "sse_multiplexing": true });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
     let session_id = initialize(&plugin).await;
     // Warm the per-session catalog before attaching so the multiplexed
     // tools/list below is answered from cache rather than upstream discovery.
@@ -10629,12 +10641,11 @@ async fn aggregate_sse_cancellation_after_staging_suppresses_the_gateway_authore
 #[tokio::test]
 async fn aggregate_sse_preserves_non_ok_upstream_http_status_inline() {
     let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
-    let plugin = create_plugin(
-        "mcp_gateway",
-        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
-    )
-    .unwrap()
-    .unwrap();
+    // Multiplexed SSE delivery is the opt-in Ferrum transport extension, so
+    // this fixture names it explicitly rather than relying on a default.
+    let mut config = aggregate_output_validation_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({ "sse_multiplexing": true });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
     let session_id = initialize(&plugin).await;
     let _ = aggregate_tool_names(&plugin, &session_id, 1).await;
     let mut stream = attach_sse_body(&plugin, &session_id).await;
@@ -10672,12 +10683,11 @@ async fn aggregate_sse_preserves_non_ok_upstream_http_status_inline() {
 #[tokio::test]
 async fn aggregate_sse_cancellation_marks_an_open_routed_request_and_suppresses_its_result() {
     let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
-    let plugin = create_plugin(
-        "mcp_gateway",
-        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
-    )
-    .unwrap()
-    .unwrap();
+    // Multiplexed SSE delivery is the opt-in Ferrum transport extension, so
+    // this fixture names it explicitly rather than relying on a default.
+    let mut config = aggregate_output_validation_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({ "sse_multiplexing": true });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
     let session_id = initialize(&plugin).await;
     let _ = aggregate_tool_names(&plugin, &session_id, 1).await;
     let mut stream = attach_sse_body(&plugin, &session_id).await;
