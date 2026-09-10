@@ -57,8 +57,9 @@ use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
 use super::utils::token_extract::{
     STRIP_QUERY_PARAM_METADATA_PREFIX, TokenHeaderLocation, TokenLocation, TokenLocationExtract,
-    extract_authorization_bearer, extract_from_location, mark_present_query_credential_locations,
-    provider_locations_extract_token, stage_original_token_stripping as stage_token_stripping,
+    extract_authorization_bearer, extract_authorization_dpop, extract_from_location,
+    mark_present_query_credential_locations, provider_locations_extract_token,
+    stage_original_token_stripping as stage_token_stripping,
 };
 use super::{JwtAuthAttributeValue, PluginResult, RequestContext};
 
@@ -147,6 +148,16 @@ pub struct JwksAuth {
     claim_header_destinations: ClaimHeaderDestinations,
     strip_authorization_on_success: bool,
     has_custom_query_token_locations: bool,
+    /// Providers that may accept an access token presented under the RFC 9449
+    /// `DPoP` authorization scheme (§7.1).
+    ///
+    /// Precomputed so the request path never walks the provider list to answer
+    /// it. Membership requires `require_dpop` — a `DPoP`-scheme presentation
+    /// asserts a key-bound token, so admitting one against a provider that
+    /// validates no proof would accept a sender-constrained token as a plain
+    /// bearer — and requires the `Authorization` header to be one of the
+    /// provider's token locations (explicitly, with no prefix, or by default).
+    dpop_authorization_scheme_providers: Vec<usize>,
     request_headers_to_redact: Vec<String>,
     emit_mesh_request_principal_metadata: bool,
     http_client: PluginHttpClient,
@@ -686,6 +697,12 @@ impl JwksAuth {
                     require_mtls_binding,
                     required_scopes: required_scopes.clone(),
                     required_roles: required_roles.clone(),
+                    scope_claim: scope_claim
+                        .clone()
+                        .unwrap_or_else(|| global_scope_claim.clone()),
+                    role_claim: role_claim
+                        .clone()
+                        .unwrap_or_else(|| global_role_claim.clone()),
                 };
                 if let Some(earlier) = equivalent_provider_replay.get(identity) {
                     reject_equivalent_provider_replay_disagreement(earlier, &admission)?;
@@ -826,6 +843,32 @@ impl JwksAuth {
                 .iter()
                 .any(|location| matches!(location, TokenLocation::QueryParam(_)))
         });
+        // RFC 9449 §7.1 presents a DPoP-bound access token as
+        // `Authorization: DPoP <token>` beside the proof header, and that is
+        // what conformant clients send. Accepting it is gated on a provider
+        // that actually requires a proof: matching a `DPoP`-scheme credential
+        // against a bearer-only provider would strip the sender constraint the
+        // scheme announces. The `Bearer` form stays accepted for every
+        // provider, which is the migration shape RFC 9449 §7.1 permits.
+        let dpop_authorization_scheme_providers: Vec<usize> = providers
+            .iter()
+            .enumerate()
+            .filter(|(_, provider)| {
+                provider.require_dpop
+                    && (provider.token_locations.is_empty()
+                        || provider
+                            .token_locations
+                            .iter()
+                            .any(|location| match location {
+                                TokenLocation::Header(header) => {
+                                    header.name.eq_ignore_ascii_case("authorization")
+                                        && header.prefix.is_none()
+                                }
+                                TokenLocation::QueryParam(_) => false,
+                            }))
+            })
+            .map(|(idx, _)| idx)
+            .collect();
         let mut request_headers_to_redact = Vec::new();
         for provider in &providers {
             if provider.token_locations.is_empty()
@@ -873,6 +916,7 @@ impl JwksAuth {
             claim_header_destinations,
             strip_authorization_on_success,
             has_custom_query_token_locations,
+            dpop_authorization_scheme_providers,
             request_headers_to_redact,
             emit_mesh_request_principal_metadata,
             http_client,
@@ -1147,8 +1191,8 @@ impl JwksAuth {
         }
 
         // RFC 9449 DPoP proofs are compact JWTs (base64url), visible ASCII. A
-        // present `dpop` field line that `materialize_headers()` omitted is
-        // malformed proof material, not a missing proof.
+        // present `dpop` field line that is not visible ASCII is malformed proof
+        // material, not a missing proof.
         let proof = match lookup_configured_header(ctx, "dpop", None) {
             ConfiguredHeaderLookup::Absent => {
                 return Err((401, r#"{"error":"DPoP proof required"}"#.to_string()));
@@ -1316,6 +1360,7 @@ impl JwksAuth {
             JwksExtractedCredential::BearerToken {
                 token,
                 provider_indices,
+                ..
             } => {
                 let (claims, provider_idx) = match self
                     .validate_token_for_providers(&token, &provider_indices)
@@ -1425,6 +1470,7 @@ impl JwksAuth {
                         return JwksExtractedCredential::BearerToken {
                             token,
                             provider_indices,
+                            dpop_scheme: false,
                         };
                     }
                     TokenLocationExtract::Credential(_) => {}
@@ -1438,28 +1484,54 @@ impl JwksAuth {
             .enumerate()
             .filter_map(|(idx, provider)| provider.token_locations.is_empty().then_some(idx))
             .collect();
-        if provider_indices.is_empty() {
-            return first_invalid_format
-                .map(JwksExtractedCredential::InvalidFormat)
-                .unwrap_or(JwksExtractedCredential::Missing);
+        if !provider_indices.is_empty() {
+            match extract_authorization_bearer(ctx) {
+                ExtractedCredential::BearerToken(token) => {
+                    return JwksExtractedCredential::BearerToken {
+                        token,
+                        provider_indices,
+                        dpop_scheme: false,
+                    };
+                }
+                ExtractedCredential::InvalidFormat(body) => {
+                    first_invalid_format.get_or_insert(body);
+                }
+                ExtractedCredential::Missing
+                | ExtractedCredential::ApiKey(_)
+                | ExtractedCredential::BasicAuth { .. }
+                | ExtractedCredential::HmacAuth(_)
+                | ExtractedCredential::MtlsCert { .. } => {}
+            }
         }
 
-        match extract_authorization_bearer(ctx) {
-            ExtractedCredential::Missing => first_invalid_format
-                .map(JwksExtractedCredential::InvalidFormat)
-                .unwrap_or(JwksExtractedCredential::Missing),
-            ExtractedCredential::InvalidFormat(body) => first_invalid_format
-                .map(JwksExtractedCredential::InvalidFormat)
-                .unwrap_or(JwksExtractedCredential::InvalidFormat(body)),
-            ExtractedCredential::BearerToken(token) => JwksExtractedCredential::BearerToken {
-                token,
-                provider_indices,
-            },
-            ExtractedCredential::ApiKey(_)
-            | ExtractedCredential::BasicAuth { .. }
-            | ExtractedCredential::HmacAuth(_)
-            | ExtractedCredential::MtlsCert { .. } => JwksExtractedCredential::Missing,
+        // RFC 9449 §7.1: a DPoP-bound access token is presented under the
+        // `DPoP` scheme. It is read only after every `Bearer` location has
+        // declined, and only against providers that require a proof, so the
+        // scheme can never authenticate without `check_sender_constraints`
+        // validating and claiming that proof.
+        if !self.dpop_authorization_scheme_providers.is_empty() {
+            match extract_authorization_dpop(ctx) {
+                ExtractedCredential::BearerToken(token) => {
+                    return JwksExtractedCredential::BearerToken {
+                        token,
+                        provider_indices: self.dpop_authorization_scheme_providers.clone(),
+                        dpop_scheme: true,
+                    };
+                }
+                ExtractedCredential::InvalidFormat(body) => {
+                    first_invalid_format.get_or_insert(body);
+                }
+                ExtractedCredential::Missing
+                | ExtractedCredential::ApiKey(_)
+                | ExtractedCredential::BasicAuth { .. }
+                | ExtractedCredential::HmacAuth(_)
+                | ExtractedCredential::MtlsCert { .. } => {}
+            }
         }
+
+        first_invalid_format
+            .map(JwksExtractedCredential::InvalidFormat)
+            .unwrap_or(JwksExtractedCredential::Missing)
     }
 }
 
@@ -1475,9 +1547,18 @@ impl AuthMechanism for JwksAuth {
             JwksExtractedCredential::InvalidFormat(body) => {
                 ExtractedCredential::InvalidFormat(body)
             }
-            JwksExtractedCredential::BearerToken { token, .. } => {
-                ExtractedCredential::BearerToken(token)
-            }
+            JwksExtractedCredential::BearerToken {
+                token,
+                dpop_scheme: false,
+                ..
+            } => ExtractedCredential::BearerToken(token),
+            // This mechanism path runs no sender-constraint check, so a
+            // `DPoP`-scheme presentation must not reach it as a plain bearer
+            // token. The plugin's own `authenticate` is the only entry point
+            // that validates and claims the proof.
+            JwksExtractedCredential::BearerToken {
+                dpop_scheme: true, ..
+            } => ExtractedCredential::Missing,
         }
     }
 
@@ -1518,6 +1599,10 @@ enum JwksExtractedCredential {
     BearerToken {
         token: String,
         provider_indices: Vec<usize>,
+        /// The token arrived under the RFC 9449 `DPoP` authorization scheme
+        /// rather than `Bearer`, so `provider_indices` names only providers
+        /// that require and validate a proof.
+        dpop_scheme: bool,
     },
     InvalidFormat(String),
     Missing,
@@ -2203,6 +2288,13 @@ struct EquivalentProviderReplayAdmission {
     require_mtls_binding: bool,
     required_scopes: Vec<String>,
     required_roles: Vec<String>,
+    /// EFFECTIVE claim path the scope gate reads for this provider: its own
+    /// `scope_claim` override, else the plugin-level default. The resolved
+    /// value is recorded rather than the override, so `scope_claim: "scope"`
+    /// and an omitted override under the default `scope` are the same gate.
+    scope_claim: String,
+    /// EFFECTIVE claim path the role gate reads, resolved the same way.
+    role_claim: String,
 }
 
 /// Refuse an equivalent provider that would split DPoP or authorization authority.
@@ -2212,7 +2304,11 @@ struct EquivalentProviderReplayAdmission {
 /// order is an authentication bypass (one sibling demands a single-use proof
 /// and the other accepts the bearer alone). The same bypass applies when one
 /// sibling requires RFC 8705 certificate binding or a stricter scope/role gate
-/// and the other does not. If both require DPoP but disagree on
+/// and the other does not. Requiring the same VALUES is not enough: the claim
+/// PATH those values are read from is per provider, so two siblings that both
+/// require `admin` while reading it from `delegated` and from `scope` are two
+/// different gates, and matching order again decides which one applies. If both
+/// require DPoP but disagree on
 /// `dpop_replay_scope`, the same proof is claimed in the process store by one
 /// sibling and in Redis by the other — exactly the cross-authority replay the
 /// issuer-realm identity exists to prevent. Process-lane capacity stays a
@@ -2263,11 +2359,28 @@ fn reject_equivalent_provider_replay_disagreement(
              realm with incompatible scope requirements"
         ));
     }
+    // The lists are equal here, so an empty one means neither sibling gates on
+    // scopes at all and the claim path is inert; a non-empty one means both
+    // gate on it and must read it from the same place.
+    if !later.required_scopes.is_empty() && earlier.scope_claim != later.scope_claim {
+        return Err(format!(
+            "jwks_auth: equivalent providers that require scopes must agree on \
+             'scope_claim'; provider[{earlier_idx}] and provider[{idx}] share one \
+             issuer realm but read their required scopes from different claim paths"
+        ));
+    }
     if earlier.required_roles != later.required_roles {
         return Err(format!(
             "jwks_auth: equivalent providers must agree on 'required_roles'; \
              provider[{earlier_idx}] and provider[{idx}] share one issuer \
              realm with incompatible role requirements"
+        ));
+    }
+    if !later.required_roles.is_empty() && earlier.role_claim != later.role_claim {
+        return Err(format!(
+            "jwks_auth: equivalent providers that require roles must agree on \
+             'role_claim'; provider[{earlier_idx}] and provider[{idx}] share one \
+             issuer realm but read their required roles from different claim paths"
         ));
     }
     Ok(())
@@ -2306,7 +2419,9 @@ fn reject_equivalent_provider_replay_disagreement(
 /// normalized here. Providers in one policy that share that exact issuer
 /// share one replay realm even when their JWKS sources, audiences, or key sets
 /// differ or overlap; they must therefore agree on `require_dpop`,
-/// `require_mtls_binding`, `required_scopes`, and `required_roles`, and when
+/// `require_mtls_binding`, `required_scopes`, and `required_roles` — plus the
+/// effective `scope_claim` / `role_claim` those requirements are read from,
+/// whenever the matching requirement list is non-empty — and when
 /// DPoP is required they must agree on replay scope and process capacity. A
 /// non-DPoP sibling for the same issuer is refused as a bearer-only bypass.
 /// Different exact issuers remain isolated.

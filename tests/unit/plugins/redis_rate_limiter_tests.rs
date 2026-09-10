@@ -1794,6 +1794,82 @@ fn classify_memory_info_accepts_unlimited_or_noeviction_only() {
     );
 }
 
+/// GHSA-26gf-943w-w5x8: the no-eviction prerequisite is a property of what the
+/// consumer retains, not of how it logs. A client whose retained record IS the
+/// control must demand the screen; a counter or cache client must not, because
+/// eviction only costs it accuracy and requiring `INFO MEMORY` of it would
+/// refuse deployments that are perfectly safe.
+#[test]
+fn only_retention_authorities_require_the_no_eviction_screen() {
+    let config = make_config("redis://127.0.0.1:6379/0", false);
+    let counters = RedisRateLimitClient::new(config.clone(), None, false, None)
+        .expect("construction without a CA path must succeed");
+    assert!(
+        !counters.requires_no_eviction_screen_for_test(),
+        "a counter/cache client must keep the topology-only screen"
+    );
+
+    let replay = RedisRateLimitClient::for_replay_authority(config.clone(), None, false, None)
+        .expect("construction without a CA path must succeed");
+    assert!(replay.requires_no_eviction_screen_for_test());
+
+    let retention = RedisRateLimitClient::for_retention_authority(config, None, false, None)
+        .expect("construction without a CA path must succeed");
+    assert!(
+        retention.requires_no_eviction_screen_for_test(),
+        "an idempotency authority must prove the endpoint retains its records"
+    );
+}
+
+/// The three memory-policy verdicts, applied exactly as a freshly established
+/// connection applies them: a proven non-evicting endpoint is usable, a proven
+/// evicting one is terminal for the client generation (no recovery ping can
+/// make the next operation correct), and an unproven screen is a recoverable
+/// outage that leaves the consumer's failure policy in charge.
+#[test]
+fn retention_authority_admits_only_a_proven_non_evicting_endpoint() {
+    use ferrum_edge::_test_support::MemoryPolicyScreen;
+
+    let config = make_config("redis://127.0.0.1:6379/0", false);
+
+    let usable = RedisRateLimitClient::for_retention_authority(config.clone(), None, false, None)
+        .expect("construction without a CA path must succeed");
+    assert!(usable.apply_memory_policy_screen_for_test(MemoryPolicyScreen::Usable));
+    assert!(usable.is_available());
+    assert!(!usable.is_topology_unsupported());
+
+    let evicting = RedisRateLimitClient::for_retention_authority(config.clone(), None, false, None)
+        .expect("construction without a CA path must succeed");
+    assert!(!evicting.apply_memory_policy_screen_for_test(MemoryPolicyScreen::UnsafeEviction));
+    assert!(!evicting.is_available());
+    assert!(
+        evicting.is_topology_unsupported(),
+        "a proven evicting endpoint is configuration, not an outage"
+    );
+    // Terminal means terminal: a later successful probe cannot republish it.
+    assert!(!evicting.publish_reachable_for_test());
+    assert!(!evicting.is_available());
+
+    let unproven = RedisRateLimitClient::for_retention_authority(config.clone(), None, false, None)
+        .expect("construction without a CA path must succeed");
+    assert!(!unproven.apply_memory_policy_screen_for_test(MemoryPolicyScreen::Unproven));
+    assert!(!unproven.is_available());
+    assert!(
+        !unproven.is_topology_unsupported(),
+        "an unproven screen must stay recoverable"
+    );
+    assert!(unproven.publish_reachable_for_test());
+    assert!(unproven.is_available());
+
+    // A counter/cache client never runs the screen, so even a proven evicting
+    // verdict leaves it usable.
+    let counters = RedisRateLimitClient::new(config, None, false, None)
+        .expect("construction without a CA path must succeed");
+    assert!(counters.apply_memory_policy_screen_for_test(MemoryPolicyScreen::UnsafeEviction));
+    assert!(counters.is_available());
+    assert!(!counters.is_topology_unsupported());
+}
+
 #[test]
 fn cluster_topology_codes_are_terminal_but_outage_codes_are_not() {
     use ferrum_edge::_test_support::is_cluster_topology_code;

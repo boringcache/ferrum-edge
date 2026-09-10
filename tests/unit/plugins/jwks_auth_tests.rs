@@ -3699,6 +3699,20 @@ struct DpopFixture {
 }
 
 fn build_dpop_fixture(jti: &str) -> (DpopFixture, serde_json::Value) {
+    let now = chrono::Utc::now().timestamp();
+    build_dpop_fixture_with_times(jti, now, Some(now + 60))
+}
+
+/// Build a DPoP fixture with an explicit `iat` and an OPTIONAL `exp`.
+///
+/// RFC 9449 §4.2 defines no `exp` proof claim, so `None` is the conformant
+/// shape most client libraries emit; `Some` covers the clients that send one
+/// anyway and must still be held to it.
+fn build_dpop_fixture_with_times(
+    jti: &str,
+    iat: i64,
+    exp: Option<i64>,
+) -> (DpopFixture, serde_json::Value) {
     use base64::Engine;
     use ferrum_edge::plugins::utils::dpop::jwk_thumbprint_sha256;
     use jsonwebtoken::{EncodingKey, Header, encode};
@@ -3718,20 +3732,22 @@ fn build_dpop_fixture(jti: &str) -> (DpopFixture, serde_json::Value) {
     hasher.update(access_token.as_bytes());
     let ath = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize());
 
-    let now = chrono::Utc::now().timestamp();
     let mut dpop_header = Header::new(jsonwebtoken::Algorithm::RS256);
     dpop_header.typ = Some("dpop+jwt".to_string());
     dpop_header.jwk = Some(jwk);
+    let mut proof_claims = json!({
+        "htm": "GET",
+        "htu": "http://example.com/test",
+        "iat": iat,
+        "jti": jti,
+        "ath": ath
+    });
+    if let Some(exp) = exp {
+        proof_claims["exp"] = json!(exp);
+    }
     let proof = encode(
         &dpop_header,
-        &json!({
-            "htm": "GET",
-            "htu": "http://example.com/test",
-            "iat": now,
-            "exp": now + 60,
-            "jti": jti,
-            "ath": ath
-        }),
+        &proof_claims,
         &EncodingKey::from_rsa_pem(private_key_pem).unwrap(),
     )
     .unwrap();
@@ -5137,4 +5153,371 @@ async fn kid_miss_refresh_cooldown_is_validated_and_defaults_to_thirty_seconds()
     .err()
     .expect("closed plugin config must reject a misspelled key");
     assert!(unknown_key.contains("kid_miss_refresh_cooldown"));
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Issue #5017 — RFC 9449 §7.1 `Authorization: DPoP <token>` presentation
+// ────────────────────────────────────────────────────────────────────
+
+/// The RFC 9449 §7.1 presentation form: the access token under the `DPoP`
+/// scheme beside the proof header.
+fn dpop_scheme_ctx(fixture: &DpopFixture) -> RequestContext {
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        format!("DPoP {}", fixture.access_token),
+    );
+    ctx.headers
+        .insert("dpop".to_string(), fixture.proof.clone());
+    ctx.headers
+        .insert("host".to_string(), "example.com".to_string());
+    ctx.metadata
+        .insert("ferrum.frontend_scheme".to_string(), "http".to_string());
+    ctx
+}
+
+#[tokio::test]
+async fn dpop_authorization_scheme_authenticates_with_a_valid_proof() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-scheme-valid");
+    let plugin = dpop_plugin(&jwks, "dpop-scheme-valid");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let mut ctx = dpop_scheme_ctx(&fixture);
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("idp-user"));
+}
+
+#[tokio::test]
+async fn dpop_authorization_scheme_rejects_an_invalid_proof() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-scheme-invalid");
+    let plugin = dpop_plugin(&jwks, "dpop-scheme-invalid");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let mut ctx = dpop_scheme_ctx(&fixture);
+    ctx.headers
+        .insert("dpop".to_string(), "not-a-proof".to_string());
+    assert_reject(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        Some(401),
+    );
+}
+
+#[tokio::test]
+async fn dpop_authorization_scheme_rejects_a_replayed_proof() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-scheme-replay");
+    let plugin = dpop_plugin(&jwks, "dpop-scheme-replay");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let mut first = dpop_scheme_ctx(&fixture);
+    assert_continue(plugin.authenticate(&mut first, &consumer_index).await);
+
+    let mut replay = dpop_scheme_ctx(&fixture);
+    assert_reject(
+        plugin.authenticate(&mut replay, &consumer_index).await,
+        Some(401),
+    );
+}
+
+/// A `DPoP`-scheme presentation announces a sender-constrained token. A plugin
+/// whose providers validate no proof must keep treating the scheme as foreign,
+/// otherwise the binding the scheme announces is silently dropped.
+#[tokio::test]
+async fn dpop_authorization_scheme_is_not_accepted_by_a_bearer_only_provider() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-scheme-bearer-only");
+    let plugin = JwksAuth::new_with_config_id(
+        &json!({
+            "providers": [{"jwks": jwks, "issuer": DPOP_TEST_ISSUER}]
+        }),
+        default_client(),
+        Some("dpop-scheme-bearer-only"),
+    )
+    .expect("bearer-only inline provider");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let mut ctx = dpop_scheme_ctx(&fixture);
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    assert!(ctx.identified_consumer.is_none());
+    assert!(ctx.authenticated_identity.is_none());
+}
+
+/// The migration form RFC 9449 §7.1 permits stays available: `Bearer` plus a
+/// `DPoP` proof header still authenticates against a `require_dpop` provider.
+#[tokio::test]
+async fn bearer_scheme_still_authenticates_a_dpop_provider() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-scheme-bearer-migration");
+    let plugin = dpop_plugin(&jwks, "dpop-scheme-bearer-migration");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let mut ctx = dpop_ctx(&fixture);
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("idp-user"));
+}
+
+#[tokio::test]
+async fn dpop_authorization_scheme_with_an_empty_token_rejects() {
+    let (_, jwks) = build_dpop_fixture("dpop-scheme-empty");
+    let plugin = dpop_plugin(&jwks, "dpop-scheme-empty");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), "DPoP   ".to_string());
+    assert_reject(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        Some(401),
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Issue #5018 — RFC 9449 §4.2 defines no `exp` proof claim
+// ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn dpop_proof_without_exp_is_accepted() {
+    let now = chrono::Utc::now().timestamp();
+    let (fixture, jwks) = build_dpop_fixture_with_times("dpop-no-exp", now, None);
+    let plugin = dpop_plugin(&jwks, "dpop-no-exp");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let mut ctx = dpop_ctx(&fixture);
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("idp-user"));
+}
+
+/// A client that sends the non-standard claim is still held to it, so a proof
+/// can never outlive its own declared expiry.
+#[tokio::test]
+async fn dpop_proof_with_a_past_exp_is_rejected() {
+    let now = chrono::Utc::now().timestamp();
+    let (fixture, jwks) = build_dpop_fixture_with_times("dpop-past-exp", now, Some(now - 3_600));
+    let plugin = dpop_plugin(&jwks, "dpop-past-exp");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let mut ctx = dpop_ctx(&fixture);
+    assert_reject_body(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        r#"{"error":"DPoP validation failed"}"#,
+    );
+}
+
+/// `iat` ± `dpop_clock_skew_secs` remains the freshness bound with `exp` gone.
+#[tokio::test]
+async fn dpop_proof_with_iat_outside_the_skew_window_is_rejected() {
+    let now = chrono::Utc::now().timestamp();
+    let (fixture, jwks) = build_dpop_fixture_with_times("dpop-stale-iat", now - 3_600, None);
+    let plugin = dpop_plugin(&jwks, "dpop-stale-iat");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let mut ctx = dpop_ctx(&fixture);
+    assert_reject_body(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        r#"{"error":"DPoP validation failed"}"#,
+    );
+}
+
+#[tokio::test]
+async fn dpop_proof_with_a_future_iat_outside_the_skew_window_is_rejected() {
+    let now = chrono::Utc::now().timestamp();
+    let (fixture, jwks) = build_dpop_fixture_with_times("dpop-future-iat", now + 3_600, None);
+    let plugin = dpop_plugin(&jwks, "dpop-future-iat");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let mut ctx = dpop_ctx(&fixture);
+    assert_reject_body(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        r#"{"error":"DPoP validation failed"}"#,
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Equivalent providers must agree on the claim PATH, not only the values
+// ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn equivalent_providers_reading_required_scopes_from_different_claims_are_rejected() {
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let jwks = build_rsa_jwks_from_pem(public_key_pem);
+    let error = JwksAuth::new(
+        &json!({
+            "providers": [
+                {
+                    "jwks": jwks,
+                    "issuer": DPOP_TEST_ISSUER,
+                    "required_scopes": ["admin"],
+                    "scope_claim": "delegated"
+                },
+                {
+                    "jwks": jwks,
+                    "issuer": DPOP_TEST_ISSUER,
+                    "required_scopes": ["admin"],
+                    "scope_claim": "scope"
+                }
+            ]
+        }),
+        default_client(),
+    )
+    .err()
+    .expect("same-issuer siblings reading different scope claims must be refused");
+    assert!(error.contains("scope_claim"), "unexpected error: {error}");
+}
+
+/// The override must be compared against the RESOLVED path, not the raw
+/// `Option`: an omitted override under the default is the same gate as one that
+/// spells the default out.
+#[test]
+fn equivalent_providers_agreeing_on_the_effective_scope_claim_are_admitted() {
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let jwks = build_rsa_jwks_from_pem(public_key_pem);
+    JwksAuth::new(
+        &json!({
+            "providers": [
+                {
+                    "jwks": jwks,
+                    "issuer": DPOP_TEST_ISSUER,
+                    "required_scopes": ["admin"],
+                    "scope_claim": "scope"
+                },
+                {
+                    "jwks": jwks,
+                    "issuer": DPOP_TEST_ISSUER,
+                    "required_scopes": ["admin"]
+                }
+            ]
+        }),
+        default_client(),
+    )
+    .expect("an explicit override equal to the default is the same scope gate");
+}
+
+#[test]
+fn equivalent_providers_reading_required_roles_from_different_claims_are_rejected() {
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let jwks = build_rsa_jwks_from_pem(public_key_pem);
+    let error = JwksAuth::new(
+        &json!({
+            "providers": [
+                {
+                    "jwks": jwks,
+                    "issuer": DPOP_TEST_ISSUER,
+                    "required_roles": ["admin"],
+                    "role_claim": "realm.roles"
+                },
+                {
+                    "jwks": jwks,
+                    "issuer": DPOP_TEST_ISSUER,
+                    "required_roles": ["admin"],
+                    "role_claim": "roles"
+                }
+            ]
+        }),
+        default_client(),
+    )
+    .err()
+    .expect("same-issuer siblings reading different role claims must be refused");
+    assert!(error.contains("role_claim"), "unexpected error: {error}");
+}
+
+/// With no requirement declared the claim path is inert, so disagreeing on it
+/// is not a split gate and must not be refused.
+#[test]
+fn equivalent_providers_without_requirements_may_differ_on_claim_paths() {
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let jwks = build_rsa_jwks_from_pem(public_key_pem);
+    JwksAuth::new(
+        &json!({
+            "providers": [
+                {"jwks": jwks, "issuer": DPOP_TEST_ISSUER, "scope_claim": "delegated"},
+                {"jwks": jwks, "issuer": DPOP_TEST_ISSUER, "scope_claim": "scope"}
+            ]
+        }),
+        default_client(),
+    )
+    .expect("an unused claim path cannot split a gate that is never evaluated");
+}
+
+/// The live consequence: a token satisfying only the permissive sibling's claim
+/// path must never reach the backend. The configuration that would allow it is
+/// refused at construction, so the only reachable shape is the single-gate one.
+#[tokio::test]
+async fn a_token_satisfying_only_a_permissive_claim_path_is_refused() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let jwks = build_rsa_jwks_from_pem(public_key_pem);
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "jwks": jwks,
+                "issuer": DPOP_TEST_ISSUER,
+                "required_scopes": ["admin"],
+                "scope_claim": "scope"
+            }]
+        }),
+        default_client(),
+    )
+    .expect("single scope gate");
+
+    let token = create_rs256_token(
+        &json!({
+            "sub": "idp-user",
+            "iss": DPOP_TEST_ISSUER,
+            "scope": "read",
+            "delegated": "admin"
+        }),
+        private_key_pem,
+    );
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {token}"));
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+    assert_reject(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        Some(403),
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Issue #5021 — the shared `Insufficient scope` body must be valid JSON
+// ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn insufficient_scope_body_is_valid_json_for_control_characters() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let jwks = build_rsa_jwks_from_pem(public_key_pem);
+    let required = "admin\nwrite\ttab\"quote\\slash<tag>";
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "jwks": jwks,
+                "issuer": DPOP_TEST_ISSUER,
+                "required_scopes": [required]
+            }]
+        }),
+        default_client(),
+    )
+    .expect("control characters inside a required scope are admitted");
+
+    let token = create_rs256_token(
+        &json!({"sub": "idp-user", "iss": DPOP_TEST_ISSUER, "scope": "read"}),
+        private_key_pem,
+    );
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {token}"));
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let PluginResult::Reject {
+        status_code, body, ..
+    } = plugin.authenticate(&mut ctx, &consumer_index).await
+    else {
+        panic!("an unsatisfied required scope must reject");
+    };
+    assert_eq!(status_code, 403);
+    let parsed: Value = serde_json::from_str(&body).expect("403 body must parse as JSON");
+    assert_eq!(parsed["error"], json!("Insufficient scope"));
+    assert_eq!(parsed["required"], json!(required));
+    // Angle brackets keep their JSON unicode-escape form so the body stays
+    // inert in a browser context, exactly as the previous HTML escaper
+    // produced.
+    assert!(body.contains("\\u003ctag\\u003e"), "body: {body}");
 }

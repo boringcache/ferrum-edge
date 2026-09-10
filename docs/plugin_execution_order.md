@@ -1609,7 +1609,7 @@ Given all built-in plugins enabled, the execution order is:
 | 18 | `jwt_auth` | 1100 | authenticate |
 | 19 | `key_auth` | 1200 | authenticate, before_proxy |
 | 20 | `ldap_auth` | 1250 | authenticate, before_proxy |
-| 21 | `basic_auth` | 1300 | authenticate |
+| 21 | `basic_auth` | 1300 | authenticate, before_proxy |
 | 22 | `hmac_auth` | 1400 | authenticate |
 | 23 | `soap_ws_security` | 1500 | authenticate, before_proxy, on_final_request_body |
 | 24 | `access_control` | 2000 | authorize, on_stream_connect |
@@ -1637,7 +1637,7 @@ Given all built-in plugins enabled, the execution order is:
 | 46 | `a2a_gateway` | 2993 | before_proxy, after_proxy, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector |
 | 47 | `mesh_route_dispatch` | 2995 | before_proxy |
 | 48 | `request_transformer` | 3000 | before_proxy, transform_request_body |
-| 49 | `request_deduplication` | 3010 | before_proxy, on_final_response_body, on_response_stream_terminated |
+| 49 | `request_deduplication` | 3010 | before_proxy, on_final_response_body, on_response_stream_terminated, on_response_committed |
 | 50 | `serverless_function` | 3025 | finalized request egress |
 | 51 | `response_mock` | 3030 | before_proxy |
 | 52 | `grpc_deadline` | 3050 | receipt-time deadline preflight, before_proxy |
@@ -1983,7 +1983,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `key_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers or query parameters |
 | `ldap_auth` | ✓ | ✓ | ✓ | | | Requires HTTP Basic auth header; authenticates against LDAP directory |
 | `basic_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
-| `hmac_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers and a buffered request body; HBONE CONNECT fails closed as incompatible |
+| `hmac_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers and a buffered request body; a WebSocket handshake is signed over the empty body and tunnel DATA is never drained; HBONE CONNECT fails closed as incompatible |
 | `soap_ws_security` | ✓ | | | | | SOAP XML body parsing (text/xml, application/soap+xml, application/xml, application/xop+xml, MTOM multipart/related) |
 | `access_control` | ✓ | ✓ | ✓ | ✓ | ✓ | Needs authenticated identity from an auth plugin; supports consumer username and ACL group allow/deny lists |
 | `tcp_connection_throttle` | | | | ✓ | | Tracks process-local active TCP/TCP+TLS connections per Consumer or canonical client IP; each replica enforces independently |
@@ -1993,7 +1993,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `request_deduplication` | ✓ | | | | | HTTP-only request deduplication and response replay |
 | `request_size_limiting` | ✓ | ✓ | | | | Enforces per-proxy request body size limits |
 | `ws_message_size_limiting` | | | ✓ | | | Enforces actual-frame and bounded-reassembly limits on WebSocket connections |
-| `graphql` | ✓ | | ✓ | | | GraphQL JSON over HTTP and GraphQL subscriptions over WebSocket |
+| `graphql` | ✓ | | ✓ | | | GraphQL JSON over HTTP; WebSocket upgrade handshakes are refused fail-closed and post-upgrade frames are never inspected |
 | `rate_limiting` | ✓ | ✓ | ✓ | ✓ | ✓ | Connection/session rate applies everywhere |
 | `ws_rate_limiting` | | | ✓ | | | Per-connection frame rate limiting for WebSocket |
 | `udp_rate_limiting` | | | | | ✓ | Per-client-IP datagram and byte rate limiting for UDP proxies |
@@ -2110,7 +2110,7 @@ An **absent** `Content-Type` is treated as JSON, and the representation gate's c
 
 All plugins in the execution pipeline work transparently with gRPC requests. gRPC metadata maps directly to HTTP/2 headers, so:
 
-- **Authentication plugins** (JWKS, JWT, API key, Basic) inspect the `authorization` header, which gRPC clients send as metadata.
+- **Authentication plugins** split by credential location. JWKS, JWT, and Basic inspect the `authorization` header, which gRPC clients send as metadata. `key_auth` uses its configured `key_location` and defaults to `x-api-key` metadata (`header:X-API-Key`); it does not read `authorization` unless you set `key_location: header:Authorization`. Configure `key_location: query:<name>` only when the gRPC request URI actually carries that query parameter.
 - **Rate limiting** works identically for gRPC — keyed by IP or consumer identity.
 - **Request/Response transformers** can add, modify, or remove gRPC metadata (HTTP/2 headers).
 - **Logging plugins** receive the same `TransactionSummary` with the gRPC path (e.g., `/my.Service/MyMethod`) and HTTP status. For gateway-generated gRPC errors, `metadata.grpc_status` and `metadata.grpc_message` are also populated so sinks can distinguish gRPC failures despite the HTTP `200`.

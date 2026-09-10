@@ -156,6 +156,7 @@ mod shared_invariant_parity_tests;
 mod sni_tests;
 mod socket_opts_tests;
 mod spiffe_identity_listener_wiring_tests;
+mod sse_h3_bridge_streaming_tests;
 mod startup_tests;
 mod sticky_session_binding_tests;
 mod stock_xds_tests;

@@ -4306,6 +4306,57 @@ fn client_request_body_proven_empty(client_request_body: &ClientRequestBody) -> 
     }
 }
 
+/// Publish the transport's proof that a WebSocket HANDSHAKE carries no request
+/// body, so integrity-verifying authentication plugins can verify a signature
+/// over the empty body (issue #5000).
+///
+/// WebSocket streams are categorically excluded from request-body collection:
+/// after the upgrade, DATA is tunnel payload rather than an HTTP request body,
+/// and draining it would break the relay. That left `hmac_auth` with absent
+/// digest snapshots on every WebSocket route, and absent snapshots MUST fail
+/// closed — so a correctly signed handshake was answered `401` with a digest
+/// mismatch even though the plugin declares WebSocket support.
+///
+/// The handshake itself is an ordinary HTTP request whose body the transport can
+/// prove empty from wire framing alone, without reading a single tunnel byte.
+/// This publishes exactly that proof and nothing else:
+///
+/// * Only for the WebSocket flavor. HBONE CONNECT and `connect-udp` tunnels
+///   keep their absent snapshots and their documented fail-closed behavior.
+/// * Only when [`inbound_request_declares_body`] — which fails closed on any
+///   `Transfer-Encoding` and on any `Content-Length` that is not provably zero —
+///   says the handshake declared no body. A handshake that did declare one keeps
+///   the absent snapshots and is still rejected.
+/// * Only when a configured plugin actually asked for body digests, so an
+///   ordinary WebSocket route does no hashing at all.
+///
+/// This is never a global substitution of the empty digest for "the body was not
+/// collected": the empty representation here is a transport fact about the
+/// handshake, not an assumption about an uncollected body. Only the digest
+/// snapshots are published — no buffered-body metadata, text view, or byte view
+/// is synthesized, so nothing else can mistake a handshake for a collected body.
+pub(crate) fn publish_websocket_handshake_body_digests(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+) {
+    use crate::fips::approved::{Sha256, Sha512};
+
+    if ctx.request_body_sha256.is_some() || ctx.request_body_sha512.is_some() {
+        return;
+    }
+    if inbound_request_declares_body(ctx) {
+        return;
+    }
+    if !plugins
+        .iter()
+        .any(|plugin| plugin.needs_request_body_digests())
+    {
+        return;
+    }
+    ctx.request_body_sha256 = Some(Sha256::digest(b""));
+    ctx.request_body_sha512 = Some(Sha512::digest(b""));
+}
+
 /// Whether a `Content-Length` field-line value provably declares a zero-length
 /// body. Anything that is not a parseable zero — a non-UTF-8 field line, a
 /// malformed number, a value out of `u64` range — answers `false` so the
@@ -16030,9 +16081,10 @@ fn proxy_header_entry_case_insensitive<'a>(
 }
 
 fn is_websocket_backend_strip_header(name: &str) -> bool {
-    matches!(
-        name,
-        "host"
+    headers_mod::is_consumer_assertion_header(name)
+        || matches!(
+            name,
+            "host"
             | "proxy-authenticate"
             | "sec-websocket-key"
             | "sec-websocket-version"
@@ -16044,10 +16096,8 @@ fn is_websocket_backend_strip_header(name: &str) -> bool {
             // down with a protocol error. Strip the offer so no extension is
             // ever negotiated end to end.
             | "sec-websocket-extensions"
-            | "x-consumer-username"
-            | "x-consumer-custom-id"
             | "x-geo-country"
-    )
+        )
 }
 
 fn push_forwardable_header_override(
@@ -30268,7 +30318,9 @@ async fn handle_proxy_request_inner(
     // materializing the full HashMap — only 2-3 targeted lookups on the raw
     // HeaderMap. The configured real-IP header is read as ALL of its field
     // lines, never a single `get()`, so duplicate lines cannot hide a competing
-    // attacker-supplied value (advisory GHSA-fx4w-68hx-mj7r).
+    // attacker-supplied value (advisory GHSA-fx4w-68hx-mj7r). X-Forwarded-For
+    // is read through the same byte-preserving accessor so no field line can
+    // leave the chain before it is walked (advisory GHSA-73ff-frj6-cpmp).
     if !state.trusted_proxies.is_empty() {
         // Latch the immediate-peer trust verdict for the whole request, before
         // any plugin phase runs. Plugin phases that build their own outbound
@@ -30286,19 +30338,8 @@ async fn handle_proxy_request_inner(
             {
                 request_scheme = forwarded_scheme;
             }
-            let xff_chain = {
-                let mut values = ctx.raw_header_values("x-forwarded-for");
-                values.next().map(|first| {
-                    let mut combined = String::from(first);
-                    for value in values {
-                        combined.push(',');
-                        combined.push_str(value);
-                    }
-                    combined
-                })
-            };
-            // Bound the immutable borrow of `ctx` (held by the field-line
-            // iterator) to this statement so the assignment below can take a
+            // Bound the immutable borrows of `ctx` (held by the field-line
+            // iterators) to this statement so the assignment below can take a
             // mutable borrow.
             let resolved = client_ip::resolve_forwarded_client_ip(
                 &socket_ip,
@@ -30311,7 +30352,7 @@ async fn handle_proxy_request_inner(
                     .map(|name| ctx.header_field_lines(name))
                     .into_iter()
                     .flatten(),
-                xff_chain.as_deref(),
+                ctx.header_field_lines("x-forwarded-for"),
                 &state.trusted_proxies,
             );
             if let Some(resolved) = resolved {
@@ -31164,6 +31205,14 @@ async fn handle_proxy_request_inner(
     } else {
         RequestBodyPhaseRequirements::default()
     };
+    // A WebSocket handshake declares no body on the wire, so the transport can
+    // prove the empty representation an integrity-verifying auth plugin has to
+    // sign over without touching a tunnel byte (issue #5000).
+    if matches!(flavor, HttpFlavor::WebSocket)
+        && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
+    {
+        publish_websocket_handshake_body_digests(&plugins, &mut ctx);
+    }
 
     if authenticate_body_requirements.required {
         client_request_body = match client_request_body {
@@ -41286,10 +41335,14 @@ pub(crate) async fn proxy_to_backend_retry(
                 .and_then(|len| usize::try_from(len).ok());
 
             // Fast path: reject immediately when Content-Length exceeds limit.
-            if effective_max_response_body_size_bytes > 0
-                && let Some(len) = content_length
-                && len > effective_max_response_body_size_bytes
-            {
+            // HEAD / 1xx / 204 / 205 / 304 advertise a representation length,
+            // not transferred body bytes, so they skip this comparison.
+            if let Some(len) = declared_response_length_exceeds_limit(
+                method,
+                status,
+                &resp_headers,
+                effective_max_response_body_size_bytes,
+            ) {
                 warn!(
                     "Backend response body ({} bytes) exceeds limit ({} bytes)",
                     len, effective_max_response_body_size_bytes
@@ -45158,13 +45211,18 @@ async fn proxy_to_backend(
                 // failing to parse and skipping this reject
                 // (`GHSA-xrfj-852f-645j`). An ambiguous declaration yields `None`
                 // and falls through to the bounded collect/stream paths below,
-                // which never trust a declared length.
+                // which never trust a declared length. HEAD / 1xx / 204 / 205 /
+                // 304 keep a representation Content-Length without transferring
+                // those bytes, so they are not compared against the ceiling.
                 let content_length = canonical_header_content_length(response.headers())
                     .and_then(|len| usize::try_from(len).ok());
 
-                if let Some(len) = content_length
-                    && len > effective_max_response_body_size_bytes
-                {
+                if let Some(len) = declared_response_length_exceeds_limit(
+                    method,
+                    status,
+                    &resp_headers,
+                    effective_max_response_body_size_bytes,
+                ) {
                     warn!(
                         "Backend response body ({} bytes) exceeds limit ({} bytes)",
                         len, effective_max_response_body_size_bytes
@@ -49553,12 +49611,14 @@ async fn proxy_to_backend_hbone_after_ready(
     };
 
     let status = response.status().as_u16();
-    let content_length = canonical_header_content_length(response.headers())
-        .and_then(|len| usize::try_from(len).ok());
-    if effective_max_response_body_size_bytes > 0
-        && let Some(len) = content_length
-        && len > effective_max_response_body_size_bytes
-    {
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    collect_hyper_response_headers(response.headers(), &mut resp_headers);
+    if let Some(len) = declared_response_length_exceeds_limit(
+        method,
+        status,
+        &resp_headers,
+        effective_max_response_body_size_bytes,
+    ) {
         return (
             hbone_response_body_too_large_response(
                 proxy,
@@ -49570,8 +49630,6 @@ async fn proxy_to_backend_hbone_after_ready(
             None,
         );
     }
-    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
-    collect_hyper_response_headers(response.headers(), &mut resp_headers);
 
     // Content-type-aware buffer -> stream downgrade (see `proxy_to_backend`).
     let stream_response = refine_stream_response_for_content_type(
@@ -50341,10 +50399,14 @@ async fn proxy_to_backend_unix(
     let status = response.status().as_u16();
     let content_length = canonical_header_content_length(response.headers())
         .and_then(|len| usize::try_from(len).ok());
-    if effective_max_response_body_size_bytes > 0
-        && let Some(len) = content_length
-        && len > effective_max_response_body_size_bytes
-    {
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    collect_hyper_response_headers(response.headers(), &mut resp_headers);
+    if let Some(len) = declared_response_length_exceeds_limit(
+        method,
+        status,
+        &resp_headers,
+        effective_max_response_body_size_bytes,
+    ) {
         return (
             unix_response_body_too_large_response(
                 proxy,
@@ -50356,8 +50418,6 @@ async fn proxy_to_backend_unix(
             None,
         );
     }
-    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
-    collect_hyper_response_headers(response.headers(), &mut resp_headers);
 
     let stream_response = refine_stream_response_for_content_type(
         stream_response,
@@ -51905,12 +51965,14 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
     };
 
     let status = response.status().as_u16();
-    let content_length = canonical_header_content_length(response.headers())
-        .and_then(|len| usize::try_from(len).ok());
-    if effective_max_response_body_size_bytes > 0
-        && let Some(len) = content_length
-        && len > effective_max_response_body_size_bytes
-    {
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    collect_hyper_response_headers(response.headers(), &mut resp_headers);
+    if let Some(len) = declared_response_length_exceeds_limit(
+        method,
+        status,
+        &resp_headers,
+        effective_max_response_body_size_bytes,
+    ) {
         return (
             if is_grpc_flavored {
                 mesh_grpc_response_body_too_large_response(
@@ -51931,8 +51993,6 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
             None,
         );
     }
-    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
-    collect_hyper_response_headers(response.headers(), &mut resp_headers);
 
     // Content-type-aware buffer -> stream downgrade (see `proxy_to_backend`).
     let stream_response = refine_stream_response_for_content_type(
@@ -53102,6 +53162,8 @@ async fn proxy_to_backend_http2(
     collect_hyper_response_headers(response.headers(), &mut resp_headers);
 
     if let Some(len) = declared_response_length_exceeds_limit(
+        method,
+        status,
         &resp_headers,
         effective_max_response_body_size_bytes,
     ) {
@@ -53621,6 +53683,7 @@ async fn proxy_to_backend_http3(
                                 h3_streaming_backend_response(
                                     response,
                                     proxy,
+                                    method,
                                     resolved_ip,
                                     effective_max_response_body_size_bytes,
                                 ),
@@ -54018,6 +54081,7 @@ async fn proxy_to_backend_http3(
                 h3_streaming_backend_response(
                     response,
                     proxy,
+                    method,
                     resolved_ip,
                     effective_max_response_body_size_bytes,
                 ),
@@ -54137,6 +54201,7 @@ async fn proxy_to_backend_http3(
                         h3_streaming_backend_response(
                             response,
                             proxy,
+                            method,
                             resolved_ip,
                             effective_max_response_body_size_bytes,
                         ),
@@ -54235,12 +54300,16 @@ async fn proxy_to_backend_http3(
 fn h3_streaming_backend_response(
     response: crate::http3::client::H3StreamingResponse,
     proxy: &Proxy,
+    method: &str,
     resolved_ip: Option<String>,
     max_response_body_size_bytes: usize,
 ) -> retry::BackendResponse {
-    if let Some(len) =
-        declared_response_length_exceeds_limit(&response.headers, max_response_body_size_bytes)
-    {
+    if let Some(len) = declared_response_length_exceeds_limit(
+        method,
+        response.status,
+        &response.headers,
+        max_response_body_size_bytes,
+    ) {
         return h3_response_body_too_large_response(
             proxy,
             resolved_ip,
@@ -54555,11 +54624,20 @@ fn h3_response_body_too_large_response(
 /// failed and skipped this fast path (`GHSA-xrfj-852f-645j`). An ambiguous fold
 /// yields `None` here and is bounded by the collection/streaming ceiling
 /// instead, which never trusts a declared length.
+///
+/// Bodyless semantics (`HEAD`, `1xx`, `204`/`205`/`304`) may advertise a
+/// representation `Content-Length` while transferring zero body bytes (RFC 9110
+/// §8.6 / §6.4.1). That value is not a transferable-body size and must not be
+/// compared against the ceiling.
 pub(crate) fn declared_response_length_exceeds_limit(
+    method: &str,
+    status: u16,
     headers: &HashMap<String, String>,
     max_response_body_size_bytes: usize,
 ) -> Option<usize> {
-    if max_response_body_size_bytes == 0 {
+    if max_response_body_size_bytes == 0
+        || crate::plugins::utils::synthetic_response::synthetic_response_omits_body(method, status)
+    {
         return None;
     }
     let len = canonical_header_content_length_from_map(headers)?;
@@ -54718,6 +54796,8 @@ async fn proxy_to_backend_http3_retry(
                 // oversized declared body unguarded (the downstream H3 body
                 // builder only size-limits when Content-Length is absent).
                 if let Some(len) = declared_response_length_exceeds_limit(
+                    method,
+                    response.status,
                     &response.headers,
                     effective_max_response_body_size_bytes,
                 ) {
@@ -55026,6 +55106,7 @@ mod tests {
             failure_status_codes: vec![500],
             half_open_max_requests: 1,
             trip_on_connection_errors: true,
+            half_open_probe_dwell_seconds: None,
         });
         cb.record_failure(500, false, false);
         assert!(
@@ -55878,6 +55959,7 @@ mod tests {
                 failure_status_codes: vec![500],
                 half_open_max_requests: 1,
                 trip_on_connection_errors: true,
+                half_open_probe_dwell_seconds: None,
             }
         }
 
@@ -59771,6 +59853,7 @@ mod tests {
         headers.insert("connection".to_string(), "upgrade".to_string());
         headers.insert("x-request-id".to_string(), "req-1".to_string());
         headers.insert("x-added-by-plugin".to_string(), "kept".to_string());
+        headers.insert("X-Consumer-Role".to_string(), "admin".to_string());
 
         let forwarded = collect_forwardable_proxy_headers(&headers);
 
@@ -59780,6 +59863,12 @@ mod tests {
         assert!(forwarded.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("x-added-by-plugin") && value == "kept"
         }));
+        assert!(
+            !forwarded
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-consumer-role")),
+            "the complete consumer assertion namespace must be stripped"
+        );
         assert!(
             !forwarded
                 .iter()
@@ -62152,22 +62241,44 @@ mod tests {
 
     /// Guards the declared-Content-Length fast-path reject used by every
     /// streaming H3 retry attempt: only a nonzero limit with a parseable
-    /// over-limit Content-Length triggers the pre-stream 502.
+    /// over-limit Content-Length on a body-bearing response triggers the
+    /// pre-stream 502. HEAD / 1xx / 204 / 205 / 304 keep a representation length.
     #[test]
     fn declared_response_length_exceeds_limit_only_when_header_is_over_cap() {
         let mut headers = HashMap::new();
-        assert_eq!(declared_response_length_exceeds_limit(&headers, 10), None);
+        assert_eq!(
+            declared_response_length_exceeds_limit("GET", 200, &headers, 10),
+            None
+        );
 
         headers.insert("content-length".to_string(), "11".to_string());
-        assert_eq!(declared_response_length_exceeds_limit(&headers, 0), None);
-        assert_eq!(declared_response_length_exceeds_limit(&headers, 11), None);
         assert_eq!(
-            declared_response_length_exceeds_limit(&headers, 10),
+            declared_response_length_exceeds_limit("GET", 200, &headers, 0),
+            None
+        );
+        assert_eq!(
+            declared_response_length_exceeds_limit("GET", 200, &headers, 11),
+            None
+        );
+        assert_eq!(
+            declared_response_length_exceeds_limit("GET", 200, &headers, 10),
             Some(11)
         );
 
         headers.insert("content-length".to_string(), "not-a-number".to_string());
-        assert_eq!(declared_response_length_exceeds_limit(&headers, 10), None);
+        assert_eq!(
+            declared_response_length_exceeds_limit("GET", 200, &headers, 10),
+            None
+        );
+
+        headers.insert("content-length".to_string(), "11".to_string());
+        for (method, status) in [("HEAD", 200), ("GET", 304), ("GET", 204)] {
+            assert_eq!(
+                declared_response_length_exceeds_limit(method, status, &headers, 10),
+                None,
+                "bodyless {method} {status} must not trip the declared-length ceiling"
+            );
+        }
     }
 
     /// The 502 built for an over-limit H3 response must not replay (no

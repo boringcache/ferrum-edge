@@ -1921,6 +1921,12 @@ fn access_control_schema_matches_runtime_validation() {
             "runtime should reject schema-invalid config: {config}"
         );
     }
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    assert!(
+        plugin_docs.contains("at most 255 Unicode characters"),
+        "access_control docs must state the 255-character username and group limits"
+    );
 }
 
 #[test]
@@ -2127,6 +2133,9 @@ fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
 fn graphql_config_schema_matches_runtime_validation() {
     use ferrum_edge::plugins::create_plugin;
     use ferrum_edge::plugins::graphql::GRAPHQL_CONFIG_KEYS;
+    use ferrum_edge::plugins::utils::rate_limit::{
+        MAX_RATE_LIMIT_MAX_REQUESTS, MAX_RATE_LIMIT_WINDOW_SECONDS,
+    };
     use ferrum_edge::plugins::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
 
     let spec: serde_json::Value =
@@ -2179,6 +2188,21 @@ fn graphql_config_schema_matches_runtime_validation() {
         Some(&json!(1))
     );
 
+    // Issue #5129: the three u32 policy limits carry their runtime range, so a
+    // schema-driven authoring tool refuses exactly what the constructor refuses.
+    for field in ["max_depth", "max_complexity", "max_aliases"] {
+        assert_eq!(
+            schema["properties"][field]["minimum"],
+            json!(0),
+            "{field} must advertise the unsigned floor"
+        );
+        assert_eq!(
+            schema["properties"][field]["maximum"],
+            json!(u32::MAX),
+            "{field} must advertise the 32-bit ceiling"
+        );
+    }
+
     let schema_fields: BTreeSet<_> = schema["properties"]
         .as_object()
         .expect("GraphqlConfig properties")
@@ -2213,6 +2237,20 @@ fn graphql_config_schema_matches_runtime_validation() {
     assert!(docs.contains("valid GraphQL Names"));
     assert!(docs.contains("`2`, not `2.0`"));
     assert!(docs.contains("validated even while `sync_mode` is `local`"));
+    // Issue #5129 / #5133: the operator-facing table states the enforced ranges
+    // for the u32 policy limits and for both rate-entry fields.
+    assert!(
+        docs.contains(&format!("`0..={}`", u32::MAX)),
+        "docs/plugins.md graphql section must document the u32 policy-limit range"
+    );
+    assert!(
+        docs.contains(&format!("`1..={MAX_RATE_LIMIT_MAX_REQUESTS}`")),
+        "docs/plugins.md graphql section must document the max_requests ceiling"
+    );
+    assert!(
+        docs.contains(&format!("`1..={MAX_RATE_LIMIT_WINDOW_SECONDS}`")),
+        "docs/plugins.md graphql section must document the window_seconds ceiling"
+    );
 
     let validator_schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2227,6 +2265,13 @@ fn graphql_config_schema_matches_runtime_validation() {
         json!({"max_depth": 5}),
         json!({"max_complexity": 100}),
         json!({"max_aliases": 3}),
+        // Issue #5129 boundaries: zero and u32::MAX are admitted by both.
+        json!({"max_depth": 0}),
+        json!({"max_complexity": 0}),
+        json!({"max_aliases": 0}),
+        json!({"max_depth": 4294967295u32}),
+        json!({"max_complexity": 4294967295u32}),
+        json!({"max_aliases": 4294967295u32}),
         json!({"introspection_allowed": false}),
         json!({"type_rate_limits": {"query": {"max_requests": 1, "window_seconds": 60}}}),
         json!({"type_rate_limits": {
@@ -2288,6 +2333,13 @@ fn graphql_config_schema_matches_runtime_validation() {
         json!({"operation_rate_limits": {"": {"max_requests": 1, "window_seconds": 60}}}),
         json!({"type_rate_limits": {"query": {"max_requests": 1, "window_seconds": 60, "burst": 2}}}),
         json!({"max_depth": 5, "introspection_allowd": false}),
+        // Issue #5129 boundaries: below zero and above u32::MAX are refused by both.
+        json!({"max_depth": -1}),
+        json!({"max_complexity": -1}),
+        json!({"max_aliases": -1}),
+        json!({"max_depth": 4294967296u64}),
+        json!({"max_complexity": 4294967296u64}),
+        json!({"max_aliases": 4294967296u64}),
         json!({"max_depth": 5, "sync_mdoe": "redis", "redis_url": "redis://localhost:6379/0"}),
         json!({
             "max_depth": 5,
@@ -2371,9 +2423,11 @@ fn request_deduplication_schema_matches_runtime_validation() {
         schema["properties"]["applicable_methods"]["minItems"],
         json!(1)
     );
+    // Issue #5070: the runtime trims each method before validating it, so the
+    // published item pattern tolerates exactly that padding.
     assert_eq!(
         schema["properties"]["applicable_methods"]["items"]["pattern"],
-        json!("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+        json!("^\\s*[!#$%&'*+.^_`|~0-9A-Za-z-]+\\s*$")
     );
     assert_eq!(
         schema["properties"]["redis_key_prefix"]["minLength"],
@@ -2393,11 +2447,16 @@ fn request_deduplication_schema_matches_runtime_validation() {
         schema["properties"]["redis_url"]["pattern"],
         json!("^rediss?://[^/?#\\s]+(?:/[^?#\\s]*)?(?:\\?[^\\s#]*)?$")
     );
+    // Issue #5070: the runtime lowercases `sync_mode` before comparing it, so
+    // the conditional selects on the same case-insensitive value rather than a
+    // `const` that would refuse a valid `"REDIS"` deployment's `redis_url`.
     let redis_guard = schema["allOf"]
         .as_array()
         .expect("RequestDeduplicationConfig allOf")
         .iter()
-        .find(|guard| guard["if"]["properties"]["sync_mode"]["const"] == json!("redis"))
+        .find(|guard| {
+            guard["if"]["properties"]["sync_mode"]["pattern"] == json!("^[Rr][Ee][Dd][Ii][Ss]$")
+        })
         .expect("sync_mode=redis conditional guard");
     assert_eq!(redis_guard["if"]["required"], json!(["sync_mode"]));
     assert_eq!(redis_guard["then"]["required"], json!(["redis_url"]));
@@ -2421,6 +2480,49 @@ fn request_deduplication_schema_matches_runtime_validation() {
             redis_guard["else"]["properties"][redis_only],
             json!(false),
             "{redis_only} must be refused outside sync_mode=redis"
+        );
+    }
+
+    // Issue #5070: explicit null is rejected by the constructor
+    // (`'anonymous_caller_scope' must be a string`), so the property is not
+    // nullable, and the enum carries the alias spelling the shared parser
+    // accepts.
+    assert_eq!(
+        schema["properties"]["anonymous_caller_scope"]["type"],
+        json!("string")
+    );
+    assert_eq!(
+        schema["properties"]["anonymous_caller_scope"]["enum"],
+        json!(["caller_address", "caller-address", "shared"])
+    );
+
+    // Issue #5070: every bounded unsigned field publishes the u64 ceiling the
+    // constructor enforces, so an oversized value is refused by both.
+    for bounded in [
+        "ttl_seconds",
+        "inflight_ttl_seconds",
+        "max_entries",
+        "max_entry_size_bytes",
+        "max_total_size_bytes",
+    ] {
+        assert_eq!(schema["properties"][bounded]["minimum"], json!(1));
+        assert_eq!(
+            schema["properties"][bounded]["maximum"].as_f64(),
+            Some(u64::MAX as f64),
+            "{bounded} must publish the unsigned 64-bit ceiling"
+        );
+    }
+
+    // Issue #5070: JSON Schema `enum` cannot express case-insensitivity, so the
+    // two normalized-value properties must SAY so rather than silently
+    // disagreeing with admission.
+    for normalized in ["sync_mode", "anonymous_caller_scope"] {
+        let description = schema["properties"][normalized]["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{normalized} carries a description"));
+        assert!(
+            description.contains("case-insensitiv"),
+            "{normalized} must document the runtime normalization the enum cannot express"
         );
     }
 
@@ -2494,6 +2596,13 @@ fn request_deduplication_schema_matches_runtime_validation() {
             "redis_url": "redis://cache.internal:6379",
             "on_redis_unavailable": "local_only"
         }),
+        // Issue #5070: the constructor trims each method, accepts the hyphen
+        // spelling of the anonymous scope, and requires `redis_url` under a
+        // case-insensitive `sync_mode` — all now expressible in the schema.
+        json!({"applicable_methods": [" POST "]}),
+        json!({"anonymous_caller_scope": "caller_address"}),
+        json!({"anonymous_caller_scope": "caller-address"}),
+        json!({"anonymous_caller_scope": "shared"}),
     ];
     for config in &accepted {
         assert!(
@@ -2556,6 +2665,15 @@ fn request_deduplication_schema_matches_runtime_validation() {
             "redis_url": "redis://host:6379",
             "redis_health_check_interval_seconds": 0
         }),
+        // Issue #5070: explicit null is not "omitted", an unknown scope is
+        // refused, and the bounded unsigned fields refuse zero.
+        json!({"anonymous_caller_scope": null}),
+        json!({"anonymous_caller_scope": "everyone"}),
+        json!({"ttl_seconds": 0}),
+        json!({"inflight_ttl_seconds": 0}),
+        json!({"max_entries": 0}),
+        json!({"max_entry_size_bytes": 0}),
+        json!({"max_total_size_bytes": 0}),
     ];
     for config in &rejected {
         assert!(
@@ -2565,6 +2683,25 @@ fn request_deduplication_schema_matches_runtime_validation() {
         assert!(
             create_plugin("request_deduplication", config).is_err(),
             "config should be runtime-invalid: {config}"
+        );
+    }
+
+    // Issue #5070, documented limitation: JSON Schema cannot express the
+    // runtime's case-insensitive, whitespace-trimming enum parsing. These two
+    // shapes are admitted by the gateway and refused by a strict validator;
+    // both property descriptions say so (asserted above). Pinned here so the
+    // divergence stays a known, described one instead of silent drift.
+    for config in [
+        json!({"sync_mode": "LOCAL"}),
+        json!({"anonymous_caller_scope": " SHARED "}),
+    ] {
+        assert!(
+            create_plugin("request_deduplication", &config).is_ok(),
+            "the gateway normalizes {config}"
+        );
+        assert!(
+            validator.validate(&config).is_err(),
+            "the schema cannot express the normalization for {config}"
         );
     }
 }
@@ -3348,6 +3485,127 @@ fn hmac_auth_config_root_is_closed_and_matches_openapi() {
     );
 }
 
+/// Issue #5001: key-set parity is not acceptance parity. `HmacAuthConfig` had
+/// no conditional constraints at all, so schema-based tooling approved
+/// deployments the gateway refuses to start with — an empty configuration,
+/// unsafe v1 without its acknowledgement, v2 without a replay scope, and every
+/// impossible Redis/scope pairing. This is the real schema-vs-runtime
+/// acceptance matrix.
+#[test]
+fn hmac_auth_schema_acceptance_matches_runtime_admission() {
+    use ferrum_edge::plugins::create_plugin;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let validator_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/HmacAuthConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&validator_schema)
+        .expect("HmacAuthConfig schema compiles");
+
+    let redis_url = "redis://127.0.0.1:6379/0";
+    let accepted = [
+        json!({"replay_scope": "process"}),
+        json!({"replay_scope": "process", "clock_skew_seconds": 60}),
+        json!({"replay_scope": "process", "replay_max_entries": 1}),
+        json!({"replay_scope": "process", "sync_mode": "local"}),
+        json!({"signing_profile": "ferrum-hmac-v2", "replay_scope": "process"}),
+        json!({
+            "signing_profile": "ferrum-hmac-v2",
+            "replay_scope": "process",
+            "allow_unsafe_replayable_v1": false
+        }),
+        json!({"signing_profile": "ferrum-hmac-v1", "allow_unsafe_replayable_v1": true}),
+        json!({
+            "replay_scope": "shared",
+            "sync_mode": "redis",
+            "redis_url": redis_url
+        }),
+    ];
+    for config in &accepted {
+        assert!(
+            validator.validate(config).is_ok(),
+            "config should be schema-valid: {config}"
+        );
+        assert!(
+            create_plugin("hmac_auth", config).is_ok(),
+            "config should be runtime-valid: {config}"
+        );
+    }
+
+    let rejected = [
+        // Profile / acknowledgement / scope admission (the #5001 matrix).
+        json!({}),
+        json!({"clock_skew_seconds": 60}),
+        json!({"signing_profile": "ferrum-hmac-v1"}),
+        json!({"signing_profile": "ferrum-hmac-v1", "allow_unsafe_replayable_v1": false}),
+        json!({
+            "signing_profile": "ferrum-hmac-v1",
+            "allow_unsafe_replayable_v1": true,
+            "replay_scope": "process"
+        }),
+        json!({"replay_scope": "process", "allow_unsafe_replayable_v1": true}),
+        json!({"replay_scope": "shared"}),
+        json!({"replay_scope": "shared", "sync_mode": "redis"}),
+        json!({"replay_scope": "process", "sync_mode": "redis", "redis_url": redis_url}),
+        json!({
+            "signing_profile": "ferrum-hmac-v1",
+            "allow_unsafe_replayable_v1": true,
+            "sync_mode": "redis",
+            "redis_url": redis_url
+        }),
+        // Scalar spellings: the enums are exact on both surfaces.
+        json!({"replay_scope": " PROCESS "}),
+        json!({"replay_scope": "Process"}),
+        json!({"replay_scope": "process", "signing_profile": " ferrum-hmac-v2 "}),
+        json!({"replay_scope": "process", "signing_profile": "FERRUM-HMAC-V2"}),
+        json!({
+            "replay_scope": "shared",
+            "sync_mode": "REDIS",
+            "redis_url": redis_url
+        }),
+        // Types, bounds, and the closed key set.
+        json!({"replay_scope": "process", "replay_max_entries": 0}),
+        json!({"replay_scope": "process", "clock_skew_seconds": 0}),
+        json!({"replay_scope": "process", "clock_skew_seconds": 301}),
+        json!({"replay_scope": true}),
+        json!({"replay_scope": "process", "replay_scop": "shared"}),
+        json!({"replay_scope": "process", "require_digest": true}),
+    ];
+    for config in &rejected {
+        assert!(
+            validator.validate(config).is_err(),
+            "config should be schema-invalid: {config}"
+        );
+        assert!(
+            create_plugin("hmac_auth", config).is_err(),
+            "config should be runtime-invalid: {config}"
+        );
+    }
+}
+
+/// The enclosing `PluginConfig` branch must demand `config` too: an omitted
+/// `config` defaults to null and `HmacAuth::build` refuses a non-object.
+#[test]
+fn hmac_auth_plugin_config_branch_requires_a_config_object() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let branch = spec
+        .pointer("/components/schemas/PluginConfig/allOf")
+        .and_then(serde_json::Value::as_array)
+        .expect("PluginConfig allOf")
+        .iter()
+        .find(|entry| {
+            entry.pointer("/if/properties/plugin_name/const") == Some(&json!("hmac_auth"))
+        })
+        .expect("hmac_auth PluginConfig branch");
+
+    assert_eq!(branch.pointer("/then/required"), Some(&json!(["config"])));
+}
+
 #[test]
 fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
     let spec: serde_json::Value =
@@ -3907,8 +4165,20 @@ fn plugin_config_schema_applies_plugin_specific_config() {
         "ws_message_size_limiting should reject a zero max_message_bytes"
     );
 
+    let empty_termination = plugin_config("request_termination", Some(json!({})));
+    assert!(
+        validator.validate(&empty_termination).is_ok(),
+        "empty request_termination config remains the maintenance-mode default"
+    );
+    let omitted_termination = plugin_config("request_termination", None);
+    assert!(
+        validator.validate(&omitted_termination).is_err(),
+        "enabled request_termination rows must require config"
+    );
+
     for (plugin_name, config) in [
         ("correlation_id", json!({})),
+        ("security_headers", json!({})),
         ("bot_detection", json!({})),
         ("udp_rate_limiting", json!({"datagrams_per_second": 100})),
         (
@@ -3941,6 +4211,12 @@ fn plugin_config_schema_applies_plugin_specific_config() {
         ("correlation_id", Some(serde_json::Value::Null)),
         ("correlation_id", Some(json!([]))),
         ("correlation_id", Some(json!({"echo_downsteam": false}))),
+        ("security_headers", None),
+        ("security_headers", Some(serde_json::Value::Null)),
+        (
+            "security_headers",
+            Some(json!({"set": {"Content-Length": "ordinary"}})),
+        ),
         ("bot_detection", None),
         ("bot_detection", Some(serde_json::Value::Null)),
         ("bot_detection", Some(json!([]))),
@@ -4930,22 +5206,25 @@ fn body_validator_grpc_max_decompressed_size_bytes_stays_in_openapi_docs_and_run
         );
     }
 
+    // Each instance carries a rule-bearing key: the schema now refuses a
+    // configuration with no validation rule at all, exactly as the constructor
+    // does (issue #5122).
     assert_component_validity(
         &spec,
         "BodyValidatorConfig",
-        &json!({"grpc_max_decompressed_size_bytes": 0}),
+        &json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": 0}),
         true,
     );
     assert_component_validity(
         &spec,
         "BodyValidatorConfig",
-        &json!({"grpc_max_decompressed_size_bytes": -1}),
+        &json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": -1}),
         false,
     );
     assert_component_validity(
         &spec,
         "BodyValidatorConfig",
-        &json!({"grpc_max_decompressed_size_bytes": "10"}),
+        &json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": "10"}),
         false,
     );
 
@@ -5121,6 +5400,8 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
         json!({"header_name": "x-request-id", "echo_downstream": false}),
         json!({"header_name": "X-Correlation-ID", "echo_downstream": true}),
         json!({"header_name": " X-Trimmed-ID "}),
+        json!({"header_name": "\u{0085}x-audit\u{0085}"}),
+        json!({"header_name": "a".repeat(65_535)}),
         json!({"header_name": null, "echo_downstream": null}),
     ] {
         assert_component_validity(&spec, "CorrelationIdConfig", &valid, true);
@@ -5136,6 +5417,8 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
         json!(true),
         json!({"echo_downsteam": false}),
         json!({"header_name": "x:request-id"}),
+        json!({"header_name": "\u{feff}x-audit\u{feff}"}),
+        json!({"header_name": "a".repeat(65_536)}),
         json!({"header_name": 42}),
         json!({"echo_downstream": "true"}),
         json!({"header_name": "API-Key"}),
@@ -6088,6 +6371,10 @@ fn ip_restriction_schema_matches_the_strict_runtime_shape() {
         json!({"allow": ["10.0.0.0/8"]}),
         json!({"allow": [], "deny": ["192.0.2.0/24"]}),
         json!({"allow": ["2001:db8::/32"], "deny": [], "mode": "deny_first"}),
+        json!({"allow": ["0.0.0.0/0", "255.255.255.255/32"]}),
+        json!({"allow": ["::/0", "2001:db8::1/128"]}),
+        json!({"allow": ["::ffff:127.0.0.1/96", "::ffff:127.0.0.1/128"]}),
+        json!({"allow": [" [::1] ", " fe80::1%eth0/64 "]}),
     ] {
         assert_component_validity(&spec, "IpRestrictionConfig", &config, true);
         assert!(
@@ -6109,6 +6396,13 @@ fn ip_restriction_schema_matches_the_strict_runtime_shape() {
         json!({"allow": "10.0.0.0/8"}),
         json!({"allow": [""]}),
         json!({"allow": ["   "]}),
+        json!({"allow": ["not-an-ip"]}),
+        json!({"allow": ["300.1.1.1"]}),
+        json!({"allow": ["127.0.0.1/33"]}),
+        json!({"allow": ["::/129"]}),
+        json!({"allow": ["::ffff:127.0.0.1/95"]}),
+        json!({"allow": ["010.1.2.3"]}),
+        json!({"allow": ["+10.1.2.3"]}),
     ] {
         assert_component_validity(&spec, "IpRestrictionConfig", &config, false);
         assert!(
@@ -8018,6 +8312,53 @@ fn adaptive_concurrency_schema_rejects_unknown_config_keys() {
         validator.validate(&json!({"max_limt": 32})).is_err(),
         "schema must reject unknown adaptive_concurrency policy keys"
     );
+
+    for field in [
+        "max_tracked_keys",
+        "min_limit",
+        "initial_limit",
+        "max_limit",
+        "min_samples",
+        "increase_step",
+    ] {
+        assert_eq!(
+            schema["properties"][field]["maximum"],
+            json!(u64::MAX),
+            "{field} must publish the u64 maximum"
+        );
+        assert_eq!(schema["properties"][field]["format"], json!("uint64"));
+        let mut at_max = serde_json::Map::new();
+        at_max.insert(field.to_string(), json!(u64::MAX));
+        assert_component_validity(
+            &spec,
+            "AdaptiveConcurrencyConfig",
+            &serde_json::Value::Object(at_max),
+            true,
+        );
+        let above_json = format!(r#"{{"{field}": 18446744073709551616}}"#);
+        let above = serde_json::from_str(&above_json)
+            .unwrap_or_else(|error| panic!("{field} 2^64 JSON number parses: {error}"));
+        assert_component_validity(&spec, "AdaptiveConcurrencyConfig", &above, false);
+        let mut admitted = json!({
+            "min_limit": 1,
+            "initial_limit": 32,
+            "max_limit": 1024,
+            "max_tracked_keys": 10000,
+            "min_samples": 20,
+            "increase_step": 1
+        });
+        admitted[field] = json!(u64::MAX);
+        if matches!(field, "min_limit" | "initial_limit") {
+            admitted["initial_limit"] = json!(u64::MAX);
+            admitted["max_limit"] = json!(u64::MAX);
+        }
+        ferrum_edge::plugins::validate_plugin_config("adaptive_concurrency", &admitted)
+            .unwrap_or_else(|error| panic!("{field}=u64::MAX must be admitted: {error}"));
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("adaptive_concurrency", &above).is_err(),
+            "{field} above u64 must be rejected at runtime"
+        );
+    }
 }
 
 #[test]
@@ -8747,6 +9088,7 @@ fn oidc_relying_party_schema_matches_strict_runtime_surface() {
 fn transaction_debugger_schema_matches_closed_runtime_surface() {
     use ferrum_edge::plugins::transaction_debugger::{
         DEFAULT_BODY_CAPTURE_BYTES, MAX_BODY_CAPTURE_BYTES, TRANSACTION_DEBUGGER_CONFIG_KEYS,
+        TransactionDebugger,
     };
 
     let spec: serde_json::Value =
@@ -8781,10 +9123,26 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
     for field in ["log_request_body", "log_response_body"] {
         assert_eq!(schema["properties"][field]["default"], json!(false));
     }
+    let header_items = &schema["properties"]["redacted_headers"]["items"];
+    assert_eq!(header_items["minLength"], json!(1));
+    assert_eq!(
+        header_items["pattern"],
+        json!("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+    );
     let body_field_items = &schema["properties"]["redacted_body_fields"]["items"];
     assert_eq!(body_field_items["minLength"], json!(1));
-    assert_eq!(body_field_items["maxLength"], json!(128));
-    assert_eq!(body_field_items["pattern"], json!("\\S"));
+    assert!(
+        body_field_items.get("maxLength").is_none() || body_field_items["maxLength"].is_null(),
+        "maxLength must not reject names that are 128 characters after trim"
+    );
+    assert_eq!(
+        body_field_items["pattern"],
+        json!("^\\s*\\S(?:[\\s\\S]{0,126}\\S)?\\s*$")
+    );
+    let admission_rules = schema["allOf"]
+        .as_array()
+        .expect("TransactionDebuggerConfig admission allOf");
+    assert_eq!(admission_rules.len(), 4);
 
     let description = schema["description"]
         .as_str()
@@ -8828,10 +9186,74 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
         "over_capture_limit",
         "unknown_length",
         "typed request provenance",
+        "metadata: {mode: omit}",
+        "default unprojected",
     ] {
         assert!(
             plugin_docs.contains(contract),
             "docs/plugins.md missing transaction_debugger contract `{contract}`"
+        );
+    }
+    assert!(
+        !plugin_docs.contains("The plugin never dumps the complete metadata map."),
+        "docs must not claim schema diagnostics omit the metadata map"
+    );
+
+    // Instance-based schema/runtime parity for constructor admission.
+    let padded_body_field = format!(" {} ", "x".repeat(128));
+    for valid in [
+        json!({}),
+        json!({"redacted_headers": []}),
+        json!({"redacted_headers": ["x-internal-id"]}),
+        json!({"redacted_body_fields": []}),
+        json!({"schema": {}}),
+        json!({
+            "log_request_body": true,
+            "redacted_body_fields": ["demo"]
+        }),
+        json!({
+            "log_request_body": true,
+            "log_response_body": true,
+            "max_request_body_bytes": 256,
+            "max_response_body_bytes": 256
+        }),
+        json!({
+            "log_request_body": true,
+            "redacted_body_fields": [padded_body_field]
+        }),
+    ] {
+        assert_component_validity(&spec, "TransactionDebuggerConfig", &valid, true);
+        TransactionDebugger::new(&valid)
+            .unwrap_or_else(|error| panic!("schema-valid config {valid} failed runtime: {error}"));
+    }
+    // Named-schema existence is config-graph validation, not this component.
+    assert_component_validity(
+        &spec,
+        "TransactionDebuggerConfig",
+        &json!({"schema_ref": "absent"}),
+        true,
+    );
+
+    for invalid in [
+        json!({"max_request_body_bytes": 256}),
+        json!({"log_response_body": false, "max_response_body_bytes": 256}),
+        json!({"redacted_body_fields": ["demo"]}),
+        json!({"redacted_headers": [""]}),
+        json!({"redacted_headers": ["invalid header"]}),
+        json!({"schema": {}, "schema_ref": "absent"}),
+        json!({"unknown": true}),
+        json!({"log_request_body": null}),
+        json!({"log_request_body": true, "max_request_body_bytes": 0}),
+        json!({"log_request_body": true, "max_request_body_bytes": 8193}),
+        json!({
+            "log_request_body": true,
+            "redacted_body_fields": ["x".repeat(129)]
+        }),
+    ] {
+        assert_component_validity(&spec, "TransactionDebuggerConfig", &invalid, false);
+        assert!(
+            TransactionDebugger::new(&invalid).is_err(),
+            "schema-invalid config unexpectedly passed runtime: {invalid}"
         );
     }
 }
@@ -9153,6 +9575,8 @@ fn ai_response_guard_schema_matches_strict_runtime_constraints() {
 
 #[test]
 fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
+    use ferrum_edge::plugins::security_headers::SecurityHeaders;
+
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
     let schema = spec
@@ -9209,6 +9633,64 @@ fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
     ] {
         assert_component_validity(&spec, "SecurityHeadersConfig", &non_ascii_value, false);
     }
+
+    for valid in [
+        json!({}),
+        json!({"override_existing": null}),
+        json!({"hsts": {"max_age": null, "include_subdomains": null, "preload": null}}),
+        json!({"hsts": {"max_age": u64::MAX}}),
+    ] {
+        assert_component_validity(&spec, "SecurityHeadersConfig", &valid, true);
+        SecurityHeaders::new(&valid).unwrap_or_else(|error| {
+            panic!("schema-valid security_headers config {valid} failed runtime: {error}")
+        });
+    }
+
+    for invalid in [
+        json!({"set": {"Content-Length": "ordinary"}}),
+        json!({"set": {"Connection": "close"}}),
+        json!({"set": {"Keep-Alive": "timeout=5"}}),
+        json!({"set": {"Proxy-Authenticate": "Basic"}}),
+        json!({"set": {"Proxy-Connection": "close"}}),
+        json!({"set": {"TE": "trailers"}}),
+        json!({"set": {"Trailer": "X-Checksum"}}),
+        json!({"set": {"Transfer-Encoding": "chunked"}}),
+        json!({"set": {"Upgrade": "websocket"}}),
+        json!({
+            "content_type_options": false,
+            "frame_options": false,
+            "referrer_policy": false,
+            "remove": []
+        }),
+        json!({
+            "content_type_options": "",
+            "frame_options": "",
+            "referrer_policy": "",
+            "remove": null
+        }),
+    ] {
+        assert_component_validity(&spec, "SecurityHeadersConfig", &invalid, false);
+        assert!(
+            SecurityHeaders::new(&invalid).is_err(),
+            "schema-invalid security_headers config passed runtime: {invalid}"
+        );
+    }
+
+    assert_eq!(
+        schema["properties"]["hsts"]["oneOf"][3]["properties"]["max_age"]["maximum"],
+        json!(u64::MAX)
+    );
+    let above_hsts = serde_json::from_str(r#"{"hsts":{"max_age":18446744073709551616}}"#)
+        .expect("2^64 JSON number parses");
+    assert_component_validity(&spec, "SecurityHeadersConfig", &above_hsts, false);
+    assert!(
+        SecurityHeaders::new(&above_hsts).is_err(),
+        "hsts.max_age above u64 must be rejected at runtime"
+    );
+    assert!(
+        SecurityHeaders::new(&json!({"hsts": {"max_age": 1.0}})).is_err(),
+        "hsts.max_age JSON floats must be rejected at runtime"
+    );
 }
 
 #[test]
@@ -9370,6 +9852,28 @@ fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract()
         "TcpConnectionThrottleConfig",
         &json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 86401}),
         false,
+    );
+    assert_eq!(
+        schema["properties"]["max_connections_per_key"]["maximum"],
+        json!(u64::MAX)
+    );
+    assert_component_validity(
+        &spec,
+        "TcpConnectionThrottleConfig",
+        &json!({"max_connections_per_key": u64::MAX}),
+        true,
+    );
+    let above = serde_json::from_str(r#"{"max_connections_per_key": 18446744073709551616}"#)
+        .expect("2^64 JSON number parses");
+    assert_component_validity(&spec, "TcpConnectionThrottleConfig", &above, false);
+    ferrum_edge::plugins::validate_plugin_config(
+        "tcp_connection_throttle",
+        &json!({"max_connections_per_key": u64::MAX}),
+    )
+    .expect("u64::MAX connection limit must be admitted");
+    assert!(
+        ferrum_edge::plugins::validate_plugin_config("tcp_connection_throttle", &above).is_err(),
+        "connection limit above u64 must be rejected at runtime"
     );
     for text in [schema_text.as_str(), plugin_docs, cache_docs] {
         assert!(
@@ -9570,6 +10074,98 @@ fn bot_detection_schema_matches_strict_runtime_and_documented_contract() {
 }
 
 #[test]
+fn fault_injection_schema_matches_runtime_contract() {
+    use ferrum_edge::plugins::fault_injection::FaultInjectionPlugin;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let scope_pattern = spec
+        .pointer(
+            "/components/schemas/FaultInjectionConfig/properties/runtime_overlay_scope/pattern",
+        )
+        .and_then(serde_json::Value::as_str)
+        .expect("runtime_overlay_scope pattern");
+    assert!(
+        scope_pattern.contains("\\u0085") || scope_pattern.contains('\u{0085}'),
+        "scope pattern must encode Rust White_Space including U+0085, got {scope_pattern}"
+    );
+    assert!(
+        !scope_pattern.contains("\\S"),
+        "scope pattern must not use ECMAScript \\S: {scope_pattern}"
+    );
+
+    let body_type = spec
+        .pointer("/components/schemas/FaultInjectionConfig/properties/abort/properties/body/type")
+        .expect("abort.body type");
+    assert!(
+        body_type.as_array().is_some_and(|types| {
+            types.iter().any(|value| value == "string") && types.iter().any(|value| value == "null")
+        }),
+        "abort.body must accept string or null, got {body_type}"
+    );
+
+    for valid in [
+        json!({"abort": {"status_code": 503, "percentage": 100, "body": null}}),
+        json!({"abort": {"status_code": 503, "percentage": 100, "body": ""}}),
+        json!({"abort": {"status_code": 503, "percentage": 100}}),
+        json!({"abort": {"status_code": 503, "percentage": 100, "body": "fault injected"}}),
+        json!({
+            "abort": {"status_code": 503, "percentage": 100},
+            "runtime_overlay_scope": "checkout"
+        }),
+        json!({
+            "abort": {"status_code": 503, "percentage": 100},
+            "runtime_overlay_scope": "\u{FEFF}"
+        }),
+        json!({
+            "abort": {"status_code": 503, "percentage": 100},
+            "runtime_overlay_scope": null
+        }),
+        serde_json::from_str(r#"{"abort":{"status_code":503.0,"percentage":100}}"#)
+            .expect("integral status"),
+        serde_json::from_str(r#"{"delay":{"duration_ms":80.0,"percentage":100}}"#)
+            .expect("integral duration"),
+        serde_json::from_str(
+            r#"{"abort":{"status_code":503,"percentage":100,"grpc_status":14.0}}"#,
+        )
+        .expect("integral grpc status"),
+    ] {
+        assert_component_validity(&spec, "FaultInjectionConfig", &valid, true);
+        FaultInjectionPlugin::new(&valid)
+            .unwrap_or_else(|error| panic!("schema-valid config {valid} failed runtime: {error}"));
+    }
+
+    for invalid in [
+        json!({"abort": {"status_code": 503, "percentage": 100, "body": 1}}),
+        json!({
+            "abort": {"status_code": 503, "percentage": 100},
+            "runtime_overlay_scope": "\u{0085}"
+        }),
+        json!({
+            "abort": {"status_code": 503, "percentage": 100},
+            "runtime_overlay_scope": "\u{00A0}"
+        }),
+        json!({
+            "abort": {"status_code": 503, "percentage": 100},
+            "runtime_overlay_scope": " \t "
+        }),
+        serde_json::from_str(r#"{"abort":{"status_code":503.1,"percentage":100}}"#)
+            .expect("fractional status"),
+    ] {
+        assert_component_validity(&spec, "FaultInjectionConfig", &invalid, false);
+        assert!(
+            FaultInjectionPlugin::new(&invalid).is_err(),
+            "schema-invalid config unexpectedly passed runtime: {invalid}"
+        );
+    }
+
+    let guide = include_str!("../../docs/plugins.md");
+    assert!(guide.contains("abort.body: null"));
+    assert!(guide.contains("application/json"));
+    assert!(guide.contains("text/plain"));
+}
+
+#[test]
 fn request_termination_schema_matches_strict_runtime_contract() {
     use ferrum_edge::plugins::request_termination::{
         REQUEST_TERMINATION_CONFIG_KEYS, REQUEST_TERMINATION_TRIGGER_KEYS, RequestTermination,
@@ -9618,6 +10214,23 @@ fn request_termination_schema_matches_strict_runtime_contract() {
     let runtime_trigger: BTreeSet<_> = REQUEST_TERMINATION_TRIGGER_KEYS.iter().copied().collect();
     assert_eq!(trigger_fields, runtime_trigger);
 
+    let request_termination_branch = spec
+        .pointer("/components/schemas/PluginConfig/allOf")
+        .and_then(serde_json::Value::as_array)
+        .expect("PluginConfig allOf")
+        .iter()
+        .find(|entry| {
+            entry
+                .pointer("/if/properties/plugin_name/const")
+                .and_then(serde_json::Value::as_str)
+                == Some("request_termination")
+        })
+        .expect("request_termination PluginConfig branch");
+    assert_eq!(
+        request_termination_branch.pointer("/then/required"),
+        Some(&json!(["config"]))
+    );
+
     let status_desc = schema["properties"]["status_code"]["description"]
         .as_str()
         .unwrap_or_default();
@@ -9656,6 +10269,7 @@ fn request_termination_schema_matches_strict_runtime_contract() {
         json!({}),
         json!({"status_code": 451, "message": "unavailable"}),
         json!({"status_code": 204}),
+        json!({"status_code": 204, "body": ""}),
         json!({"body": "", "message": "ignored"}),
         json!({
             "status_code": 403,
@@ -9673,6 +10287,14 @@ fn request_termination_schema_matches_strict_runtime_contract() {
             "content_type": "application/json",
             "message": "{invalid"
         }),
+        json!({"trigger": {"path_prefix": "*"}}),
+        json!({"trigger": {"path_prefix": "/"}}),
+        json!({
+            "content_type": "application/xml",
+            "body": "<ok/>",
+            "message": "\u{0001}"
+        }),
+        serde_json::from_str(r#"{"status_code":503.0}"#).expect("integral JSON number"),
     ] {
         assert_component_validity(&spec, "RequestTerminationConfig", &valid, true);
         RequestTermination::new(&valid)
@@ -9689,11 +10311,20 @@ fn request_termination_schema_matches_strict_runtime_contract() {
         json!({"status_code": 700}),
         json!({"status_code": null}),
         json!({"content_type": null}),
+        json!({"content_type": ""}),
+        json!({"content_type": "   "}),
         json!({"body": null}),
         json!({"message": null}),
         json!({"trigger": null}),
         json!({"trigger": {"path_prefix": null}}),
+        json!({"trigger": {"path_prefix": ""}}),
+        json!({"trigger": {"path_prefix": "admin"}}),
+        json!({"trigger": {"path_prefix": "/a?b"}}),
+        json!({"trigger": {"path_prefix": "/admin "}}),
+        json!({"trigger": {"path_prefix": "/a/../b"}}),
         json!({"trigger": {"header": null}}),
+        json!({"trigger": {"header": ""}}),
+        json!({"trigger": {"header": "invalid name"}}),
         json!({"trigger": {"header": "x-policy", "header_value": null}}),
         json!({"trigger": {}}),
         json!({"trigger": {"path_prefix": "/a", "header": "x-policy"}}),
@@ -9701,22 +10332,13 @@ fn request_termination_schema_matches_strict_runtime_contract() {
         json!({"trigger": {"header_value": "1"}}),
         json!({"trigger": {"path_prefix": "/a", "extra": true}}),
         json!({"unknown": true}),
+        json!({"status_code": 204, "body": "x"}),
+        json!({"content_type": "application/xml", "message": "\u{0001}"}),
     ] {
         assert_component_validity(&spec, "RequestTerminationConfig", &invalid, false);
         assert!(
             RequestTermination::new(&invalid).is_err(),
             "schema-invalid config unexpectedly passed runtime: {invalid}"
-        );
-    }
-
-    // Runtime contracts deliberately left to construction-time validation.
-    for runtime_only in [
-        json!({"status_code": 204, "body": "x"}),
-        json!({"content_type": "application/xml", "message": "\u{0001}"}),
-    ] {
-        assert!(
-            RequestTermination::new(&runtime_only).is_err(),
-            "runtime must reject {runtime_only}"
         );
     }
 
@@ -9731,6 +10353,9 @@ fn request_termination_schema_matches_strict_runtime_contract() {
     assert!(guide.contains("unambiguous JSON value"));
     assert!(guide.contains("fail safe into that envelope"));
     assert!(guide.contains(r#"message: '{"error":"scheduled-maintenance"}'"#));
+    assert!(guide.contains("trailers-only"));
+    assert!(guide.contains("INTERNAL"));
+    assert!(guide.contains("query delimiter"));
 }
 
 #[test]
@@ -10665,6 +11290,109 @@ fn body_validator_schema_is_closed_and_matches_the_runtime_key_set() {
     );
 }
 
+/// Issue #5122: the published `BodyValidatorConfig` schema must accept exactly
+/// the configurations the runtime constructor admits.
+///
+/// Two node-local dependencies stay runtime-only and are deliberately not
+/// represented statically: the descriptor file must exist, and every configured
+/// message type must resolve inside it. Everything else — rule presence,
+/// non-empty schemas/strings/map entries, unsigned bounds, media-type and
+/// Clark-notation shape, and gRPC method-path selectors — is asserted in both
+/// directions so a generated client cannot build a configuration the gateway
+/// then refuses.
+#[test]
+fn body_validator_schema_admits_exactly_what_the_constructor_admits() {
+    use ferrum_edge::plugins::body_validator::BodyValidator;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for config in [
+        // No validation rule at all.
+        json!({}),
+        json!({"validate_xml": false}),
+        json!({"response_validate_xml": false}),
+        json!({"required_fields": []}),
+        // Present but unusable rule values.
+        json!({"json_schema": {}}),
+        json!({"response_json_schema": {}}),
+        json!({"required_fields": [""]}),
+        json!({"response_required_fields": [""]}),
+        json!({"required_xml_elements": ["two words"]}),
+        json!({"required_xml_elements": ["{unclosed"]}),
+        json!({"response_required_xml_elements": ["two words"]}),
+        // Out-of-domain integers.
+        json!({"validate_xml": true, "xml_max_entities": -1}),
+        json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": -1}),
+        // Malformed media types.
+        json!({"validate_xml": true, "content_types": ["application"]}),
+        json!({"validate_xml": true, "content_types": [""]}),
+        json!({"validate_xml": true, "response_content_types": ["json"]}),
+        // Protobuf cross-field shape.
+        json!({"protobuf_request_type": "audit.Message"}),
+        json!({"protobuf_response_type": "audit.Message"}),
+        json!({"protobuf_descriptor_path": ""}),
+        json!({"protobuf_descriptor_path": "/srv/audit.bin"}),
+        json!({
+            "protobuf_descriptor_path": "/srv/audit.bin",
+            "protobuf_method_messages": {}
+        }),
+        json!({
+            "protobuf_descriptor_path": "/srv/audit.bin",
+            "protobuf_method_messages": {"/audit.Service/Echo": {}}
+        }),
+        json!({
+            "protobuf_descriptor_path": "/srv/audit.bin",
+            "protobuf_method_messages": {
+                "audit.Service/Echo": {"request": "audit.Message"}
+            }
+        }),
+    ] {
+        assert!(
+            BodyValidator::validate_config(&config).is_err(),
+            "runtime admission must reject {config}"
+        );
+        assert_component_validity(&spec, "BodyValidatorConfig", &config, false);
+    }
+
+    for config in [
+        json!({"validate_xml": true}),
+        json!({"response_validate_xml": true}),
+        json!({"required_fields": ["name"]}),
+        json!({"response_required_fields": ["id"]}),
+        json!({"json_schema": {"type": "object"}}),
+        json!({"response_json_schema": {"type": "object"}}),
+        json!({"required_xml_elements": ["item", "{}item"]}),
+        json!({"response_required_xml_elements": ["{urn:x}item"]}),
+        // An empty media list means "every valid media type", and an explicit
+        // zero cap disables the decompressed ceiling; both must survive.
+        json!({"validate_xml": true, "content_types": []}),
+        json!({"validate_xml": true, "xml_max_entities": 0}),
+        json!({
+            "validate_xml": true,
+            "content_types": ["application/json; charset=utf-8"]
+        }),
+        json!({
+            "protobuf_descriptor_path": "/srv/audit.bin",
+            "protobuf_request_type": "audit.Message"
+        }),
+        json!({
+            "protobuf_descriptor_path": "/srv/audit.bin",
+            "protobuf_response_type": "audit.Message"
+        }),
+        json!({
+            "protobuf_descriptor_path": "/srv/audit.bin",
+            "protobuf_method_messages": {
+                "/audit.Service/Echo": {"request": "audit.Message"}
+            }
+        }),
+    ] {
+        BodyValidator::validate_config(&config)
+            .unwrap_or_else(|error| panic!("runtime must accept {config}: {error}"));
+        assert_component_validity(&spec, "BodyValidatorConfig", &config, true);
+    }
+}
+
 /// Advisory GHSA-8594-2xhc-8g38: the observability sinks whose endpoint may
 /// embed a reusable credential must document that contract, and the
 /// `insert_query_params` credential-name rejection must be stated in the spec
@@ -10998,6 +11726,207 @@ fn mesh_plugin_config_roots_are_closed_and_match_openapi() {
     }
 }
 
+/// Issues #5111–#5115: size-limiting plugin configs are closed objects whose
+/// integer size fields advertise an enforceable uint64 maximum. `format: uint64`
+/// alone does not constrain Draft 2020-12 validators.
+#[test]
+fn size_limiting_plugin_configs_are_closed_and_bounded_in_openapi() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let uint64_max = json!(u64::MAX);
+    for (schema_name, runtime_keys, size_fields) in [
+        (
+            "RequestSizeLimitingConfig",
+            &["max_bytes"][..],
+            &["max_bytes"][..],
+        ),
+        (
+            "ResponseSizeLimitingConfig",
+            &["max_bytes", "require_buffered_check"][..],
+            &["max_bytes"][..],
+        ),
+        (
+            "WsMessageSizeLimitingConfig",
+            &["close_reason", "max_frame_bytes", "max_message_bytes"][..],
+            &["max_frame_bytes", "max_message_bytes"][..],
+        ),
+    ] {
+        let schema = spec
+            .pointer(&format!("/components/schemas/{schema_name}"))
+            .unwrap_or_else(|| panic!("{schema_name} component exists"));
+        assert_eq!(
+            schema["additionalProperties"],
+            json!(false),
+            "{schema_name} must reject unknown properties"
+        );
+
+        let schema_fields: BTreeSet<&str> = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{schema_name} properties"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let runtime_fields: BTreeSet<&str> = runtime_keys.iter().copied().collect();
+        assert_eq!(schema_fields, runtime_fields, "{schema_name} key drift");
+
+        for field in size_fields {
+            assert_eq!(
+                schema["properties"][field]["minimum"],
+                json!(1),
+                "{schema_name}.{field} must be a positive integer"
+            );
+            assert_eq!(
+                schema["properties"][field]["maximum"], uint64_max,
+                "{schema_name}.{field} must advertise the uint64 upper bound"
+            );
+            assert_eq!(
+                schema["properties"][field]["format"],
+                json!("uint64"),
+                "{schema_name}.{field} stays uint64"
+            );
+        }
+
+        let mut component_schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$ref": format!("#/components/schemas/{schema_name}")
+        });
+        component_schema
+            .as_object_mut()
+            .expect("schema should be object")
+            .insert("components".to_string(), spec["components"].clone());
+        let component_validator = jsonschema::draft202012::options()
+            .build(&component_schema)
+            .unwrap_or_else(|error| panic!("{schema_name} schema compiles: {error}"));
+
+        let minimal = match schema_name {
+            "RequestSizeLimitingConfig" | "ResponseSizeLimitingConfig" => {
+                json!({"max_bytes": 1})
+            }
+            "WsMessageSizeLimitingConfig" => json!({"max_frame_bytes": 1}),
+            _ => unreachable!(),
+        };
+        assert!(
+            component_validator.validate(&minimal).is_ok(),
+            "{schema_name} must accept the documented minimal config: {minimal}"
+        );
+
+        let mut unknown = minimal.clone();
+        unknown
+            .as_object_mut()
+            .expect("minimal config is an object")
+            .insert("max_bytez".to_string(), json!(64));
+        assert!(
+            component_validator.validate(&unknown).is_err(),
+            "{schema_name} must reject an unknown key: {unknown}"
+        );
+
+        let at_max = {
+            let mut at_max = minimal.clone();
+            for field in size_fields {
+                at_max
+                    .as_object_mut()
+                    .expect("minimal config is an object")
+                    .insert((*field).to_string(), json!(u64::MAX));
+            }
+            at_max
+        };
+        assert!(
+            component_validator.validate(&at_max).is_ok(),
+            "{schema_name} must accept u64::MAX: {at_max}"
+        );
+
+        let over = serde_json::from_str("18446744073709551616")
+            .expect("u64::MAX+1 must parse as a JSON number");
+        let mut over_range = minimal.clone();
+        over_range
+            .as_object_mut()
+            .expect("minimal config is an object")
+            .insert(size_fields[0].to_string(), over);
+        assert!(
+            component_validator.validate(&over_range).is_err(),
+            "{schema_name} must reject u64::MAX+1: {over_range}"
+        );
+    }
+
+    let mut plugin_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/PluginConfig"
+    });
+    plugin_schema
+        .as_object_mut()
+        .expect("schema should be object")
+        .insert("components".to_string(), spec["components"].clone());
+    let plugin_validator = jsonschema::draft202012::options()
+        .build(&plugin_schema)
+        .expect("PluginConfig schema compiles");
+
+    let plugin_config = |plugin_name: &str, config: serde_json::Value| -> serde_json::Value {
+        json!({
+            "plugin_name": plugin_name,
+            "scope": "global",
+            "enabled": true,
+            "config": config
+        })
+    };
+
+    for (plugin_name, minimal) in [
+        ("request_size_limiting", json!({"max_bytes": 1})),
+        ("response_size_limiting", json!({"max_bytes": 1})),
+        ("ws_message_size_limiting", json!({"max_frame_bytes": 1})),
+    ] {
+        assert!(
+            plugin_validator
+                .validate(&plugin_config(plugin_name, minimal.clone()))
+                .is_ok(),
+            "{plugin_name} PluginConfig branch must accept the documented minimal config"
+        );
+
+        let mut unknown = minimal.clone();
+        unknown
+            .as_object_mut()
+            .expect("minimal config is an object")
+            .insert("max_bytez".to_string(), json!(64));
+        assert!(
+            plugin_validator
+                .validate(&plugin_config(plugin_name, unknown))
+                .is_err(),
+            "{plugin_name} PluginConfig branch must reject an unknown key"
+        );
+
+        let mut at_max = minimal.clone();
+        let size_field = if plugin_name == "ws_message_size_limiting" {
+            "max_frame_bytes"
+        } else {
+            "max_bytes"
+        };
+        at_max
+            .as_object_mut()
+            .expect("minimal config is an object")
+            .insert(size_field.to_string(), json!(u64::MAX));
+        assert!(
+            plugin_validator
+                .validate(&plugin_config(plugin_name, at_max))
+                .is_ok(),
+            "{plugin_name} PluginConfig branch must accept u64::MAX"
+        );
+
+        let over = serde_json::from_str("18446744073709551616")
+            .expect("u64::MAX+1 must parse as a JSON number");
+        let mut over_range = minimal;
+        over_range
+            .as_object_mut()
+            .expect("minimal config is an object")
+            .insert(size_field.to_string(), over);
+        assert!(
+            plugin_validator
+                .validate(&plugin_config(plugin_name, over_range))
+                .is_err(),
+            "{plugin_name} PluginConfig branch must reject u64::MAX+1"
+        );
+    }
+}
+
 /// Three-way parity for the `ai_semantic_firewall` extraction-path allowlist.
 ///
 /// The same list exists in three places — the Rust constants that
@@ -11049,5 +11978,152 @@ fn ai_semantic_firewall_extraction_paths_match_openapi_and_docs() {
             plugin_docs.contains(&format!("`{path}`")),
             "docs/plugins.md must document the supported extraction path {path}"
         );
+    }
+}
+
+/// Issue #5022: `JwtAuthConfig` must reject exactly what `JwtAuth::new` rejects.
+/// Schema-driven tooling previously approved configurations `ferrum-edge
+/// validate` and the admin API refuse.
+#[test]
+fn jwt_auth_schema_matches_runtime_admission() {
+    use ferrum_edge::plugins::jwt_auth::JwtAuth;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let accepted = [
+        json!({}),
+        json!({"token_lookup": "header:Authorization"}),
+        json!({"token_lookup": "header:X-Token"}),
+        json!({"token_lookup": "query:token"}),
+        json!({"consumer_claim_field": "client_id"}),
+        json!({"expected_issuer": "https://issuer.example"}),
+        json!({"expected_issuers": ["https://issuer.example"]}),
+        json!({"audiences": ["payments-api"]}),
+        json!({"leeway_secs": 300}),
+        json!({"require_exp": false, "require_nbf": true}),
+    ];
+    for config in &accepted {
+        assert_component_validity(&spec, "JwtAuthConfig", config, true);
+        assert!(
+            JwtAuth::new(config).is_ok(),
+            "runtime should accept schema-valid config: {config}"
+        );
+    }
+
+    let rejected = [
+        json!({"token_lookup": "foo"}),
+        json!({"token_lookup": "header:   "}),
+        json!({"token_lookup": "header:x bad"}),
+        json!({"token_lookup": " header:Authorization"}),
+        json!({"token_lookup": "query:a b"}),
+        json!({"token_lookup": ""}),
+        json!({"consumer_claim_field": ""}),
+        json!({"expected_issuer": ""}),
+        json!({"expected_issuer": "https://a", "expected_issuers": ["https://b"]}),
+        json!({"expected_issuers": [""]}),
+        json!({"audiences": [""]}),
+        json!({"leeway_secs": -1}),
+        json!({"leeway_secs": 301}),
+        json!({"audience": ["payments-api"]}),
+    ];
+    for config in &rejected {
+        assert_component_validity(&spec, "JwtAuthConfig", config, false);
+        assert!(
+            JwtAuth::new(config).is_err(),
+            "runtime should reject schema-invalid config: {config}"
+        );
+    }
+}
+
+/// Issue #5023: `JwksAuthConfig` must encode the constructor's structural and
+/// cross-field admission rules. The two rules JSON Schema cannot practically
+/// express — the closed reserved-destination list for `output_claim_headers`
+/// and `jwks_refresh_interval_secs` <= the effective `jwks_max_stale_seconds` —
+/// are stated in the property descriptions instead and are deliberately absent
+/// from the rejected set below.
+#[test]
+fn jwks_auth_schema_matches_runtime_admission() {
+    const JWKS_URI: &str = "https://idp.example.com/jwks";
+    const DISCOVERY_URL: &str = "https://idp.example.com/.well-known/openid-configuration";
+    const ISSUER: &str = "https://idp.example.com";
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let inline = || json!({"keys": []});
+    // One remote provider plus the supplied per-provider overrides.
+    let remote = |extra: serde_json::Value| {
+        let mut provider = json!({"jwks_uri": JWKS_URI});
+        merge_into_object(&mut provider, &extra);
+        json!({"providers": [provider]})
+    };
+    // One inline provider plus the supplied per-provider overrides.
+    let local = |extra: serde_json::Value| {
+        let mut provider = json!({"jwks": inline()});
+        merge_into_object(&mut provider, &extra);
+        json!({"providers": [provider]})
+    };
+
+    let accepted = [
+        remote(json!({})),
+        remote(json!({"issuer": ISSUER})),
+        remote(json!({"from_headers": [{"name": "x-token", "prefix": null}]})),
+        remote(json!({"from_headers": [{"name": "x-token", "prefix": "Token "}]})),
+        remote(json!({"from_params": ["token"]})),
+        remote(json!({"required_scopes": ["admin"], "scope_claim": "realm.scope"})),
+        remote(json!({"jwks_max_stale_seconds": 600})),
+        remote(json!({"output_claim_headers": [{"header": "x-claim", "claim": "sub"}]})),
+        local(json!({})),
+        json!({"providers": [{"discovery_url": DISCOVERY_URL}]}),
+        json!({"providers": [{"jwks_uri": "http://127.0.0.1:9000/jwks"}]}),
+        json!({"providers": [{"jwks_uri": "http://localhost:9000/jwks"}]}),
+        local(json!({
+            "issuer": ISSUER,
+            "require_dpop": true,
+            "dpop_replay_scope": "process"
+        })),
+    ];
+    for config in &accepted {
+        assert_component_validity(&spec, "JwksAuthConfig", config, true);
+    }
+
+    let rejected = [
+        json!({"providers": []}),
+        json!({"providers": [{}]}),
+        remote(json!({"scope_claim": "a..b"})),
+        remote(json!({"role_claim": ".roles"})),
+        remote(json!({"claim_headers_separator": ""})),
+        remote(json!({"required_scopes": [""]})),
+        remote(json!({"from_headers": [{"name": "x token"}]})),
+        remote(json!({"output_claim_headers": [{"header": "x bad", "claim": "sub"}]})),
+        remote(json!({"discovery_url": DISCOVERY_URL})),
+        remote(json!({"jwks": inline()})),
+        json!({"providers": [{"jwks_uri": "not a url"}]}),
+        json!({"providers": [{"jwks_uri": "http://idp.example.com/jwks"}]}),
+        json!({"providers": [{"jwks_uri": "https://u:p@idp.example.com/jwks"}]}),
+        local(json!({"jwks_max_stale_seconds": 600})),
+        local(json!({"require_dpop": true})),
+        local(json!({"issuer": ISSUER, "require_dpop": true})),
+        local(json!({"dpop_replay_scope": "process"})),
+        json!({"providers": [{"jwks_uri": JWKS_URI}], "scope_claim": "a..b"}),
+        json!({"providers": [{"jwks_uri": JWKS_URI}], "claim_headers_separator": ""}),
+    ];
+    for config in &rejected {
+        assert_component_validity(&spec, "JwksAuthConfig", config, false);
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("jwks_auth", config).is_err(),
+            "runtime should reject schema-invalid config: {config}"
+        );
+    }
+}
+
+/// Shallow-merge every member of `extra` into the `target` JSON object.
+fn merge_into_object(target: &mut serde_json::Value, extra: &serde_json::Value) {
+    let (Some(target), Some(extra)) = (target.as_object_mut(), extra.as_object()) else {
+        panic!("merge_into_object expects two JSON objects");
+    };
+    for (key, value) in extra {
+        target.insert(key.clone(), value.clone());
     }
 }
