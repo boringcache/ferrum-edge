@@ -30267,7 +30267,9 @@ async fn handle_proxy_request_inner(
     // materializing the full HashMap — only 2-3 targeted lookups on the raw
     // HeaderMap. The configured real-IP header is read as ALL of its field
     // lines, never a single `get()`, so duplicate lines cannot hide a competing
-    // attacker-supplied value (advisory GHSA-fx4w-68hx-mj7r).
+    // attacker-supplied value (advisory GHSA-fx4w-68hx-mj7r). X-Forwarded-For
+    // is read through the same byte-preserving accessor so no field line can
+    // leave the chain before it is walked (advisory GHSA-73ff-frj6-cpmp).
     if !state.trusted_proxies.is_empty() {
         // Latch the immediate-peer trust verdict for the whole request, before
         // any plugin phase runs. Plugin phases that build their own outbound
@@ -30285,19 +30287,8 @@ async fn handle_proxy_request_inner(
             {
                 request_scheme = forwarded_scheme;
             }
-            let xff_chain = {
-                let mut values = ctx.raw_header_values("x-forwarded-for");
-                values.next().map(|first| {
-                    let mut combined = String::from(first);
-                    for value in values {
-                        combined.push(',');
-                        combined.push_str(value);
-                    }
-                    combined
-                })
-            };
-            // Bound the immutable borrow of `ctx` (held by the field-line
-            // iterator) to this statement so the assignment below can take a
+            // Bound the immutable borrows of `ctx` (held by the field-line
+            // iterators) to this statement so the assignment below can take a
             // mutable borrow.
             let resolved = client_ip::resolve_forwarded_client_ip(
                 &socket_ip,
@@ -30310,7 +30301,7 @@ async fn handle_proxy_request_inner(
                     .map(|name| ctx.header_field_lines(name))
                     .into_iter()
                     .flatten(),
-                xff_chain.as_deref(),
+                ctx.header_field_lines("x-forwarded-for"),
                 &state.trusted_proxies,
             );
             if let Some(resolved) = resolved {
