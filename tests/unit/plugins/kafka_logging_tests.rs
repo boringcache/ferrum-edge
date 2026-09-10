@@ -18,6 +18,7 @@ use ferrum_edge::plugins::kafka_logging::{
 use ferrum_edge::plugins::utils::byte_budget::RetainedByteCeiling;
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
 use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, PluginFailurePolicy, plugin_failure_policy};
+use rdkafka::mocking::MockCluster;
 use serde_json::json;
 use tokio::time::{Duration, sleep};
 
@@ -286,6 +287,120 @@ async fn test_kafka_logging_with_producer_config() {
     )
     .unwrap();
     assert_eq!(plugin.name(), "kafka_logging");
+}
+
+#[tokio::test]
+async fn kafka_rejects_overrides_of_managed_delivery_reporting() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("OpenAPI parses");
+    let schema = spec
+        .pointer("/components/schemas/KafkaLoggingConfig/properties/producer_config")
+        .expect("producer_config schema exists");
+    let validator = jsonschema::draft202012::new(schema).expect("producer_config schema compiles");
+    let client = default_http_client();
+
+    for property in [
+        "delivery.report.only.error",
+        "DELIVERY.REPORT.ONLY.ERROR",
+        "Delivery.Report.Only.Error",
+    ] {
+        for value in ["true", "false", "operator-supplied-value"] {
+            let config = json!({
+                "broker_list": "localhost:9092",
+                "topic": "delivery-accounting",
+                "producer_config": {property: value}
+            });
+            let error = KafkaLogging::new(&config, &client)
+                .err()
+                .expect("delivery reporting overrides must be rejected at construction");
+            assert!(error.contains(&format!("producer_config.{property}")));
+            assert!(error.contains("delivery reporting is managed"));
+            assert!(!error.contains(value));
+            assert_eq!(
+                kafka_logging_validate_producer_admission_for_test(&config, &client),
+                Err(error)
+            );
+            assert!(!validator.is_valid(&config["producer_config"]));
+        }
+    }
+    assert!(validator.is_valid(&json!({})));
+    assert!(validator.is_valid(&json!({"linger.ms": "50"})));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kafka_successful_deliveries_release_leases_before_finalization() {
+    let cluster = MockCluster::new(1).expect("create Kafka mock cluster");
+    let topic = "delivery-accounting";
+    cluster
+        .create_topic(topic, 1, 1)
+        .expect("create mock topic");
+    let client = default_http_client();
+
+    for key_field in ["client_ip", "none"] {
+        for acks in ["all", "0"] {
+            let plugin = KafkaLogging::new(
+                &json!({
+                    "broker_list": cluster.bootstrap_servers(),
+                    "topic": topic,
+                    "key_field": key_field,
+                    "acks": acks,
+                    "compression": "none",
+                    "max_entry_bytes": 4096,
+                    "buffer_max_bytes": 8192,
+                    "message_timeout_ms": 10_000,
+                    "flush_timeout_seconds": 5,
+                    "producer_config": {
+                        "linger.ms": "0",
+                        "enabled_events": "0",
+                        "produce.offset.report": "false"
+                    }
+                }),
+                &client,
+            )
+            .expect("construct Kafka logger for successful delivery");
+            start_kafka_logging(&plugin);
+            let baseline = plugin.snapshot().retained_bytes;
+            assert_eq!(baseline, 0);
+
+            // Event selection remains owned by rust-rdkafka, and the deprecated
+            // offset-report option does not change terminal delivery accounting.
+            // Reuse the same budget for a second pair of HTTP/stream records.
+            for expected in [2, 4] {
+                plugin.log(&create_test_transaction_summary()).await;
+                plugin
+                    .on_stream_disconnect(&create_test_stream_transaction_summary())
+                    .await;
+                let delivered = tokio::time::timeout(Duration::from_secs(15), async {
+                    loop {
+                        let snapshot = plugin.snapshot();
+                        if snapshot.admitted_total == expected
+                            && snapshot.delivered_total == expected
+                            && snapshot.retained_bytes == baseline
+                            && snapshot.in_flight == 0
+                        {
+                            break snapshot;
+                        }
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("successful delivery must return every lease before finalization");
+                assert!(!delivered.finalized);
+                assert_eq!(delivered.delivery_failed_total, 0);
+                assert_eq!(delivered.queue_rejected_total, 0);
+                assert_eq!(delivered.ferrum_dropped_total, 0);
+            }
+
+            plugin.finalize().await;
+            let finalized = plugin.snapshot();
+            assert!(finalized.finalized);
+            assert_eq!(finalized.retained_bytes, baseline);
+            assert_eq!(finalized.delivered_total, 4);
+            assert_eq!(finalized.delivery_failed_total, 0);
+            assert_eq!(finalized.flush_failures_total, 0);
+            assert_eq!(finalized.shutdown_incomplete_total, 0);
+        }
+    }
 }
 
 #[tokio::test]
@@ -943,7 +1058,8 @@ async fn test_kafka_logging_byte_budget_saturation_and_release() {
     for _ in 0..8 {
         plugin.log(&summary).await;
     }
-    // Allow the worker to attempt librdkafka admission (releases leases).
+    // Allow the worker to attempt librdkafka admission; leases stay charged
+    // through terminal delivery.
     sleep(Duration::from_millis(200)).await;
     let mid = plugin.snapshot();
     assert!(

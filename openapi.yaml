@@ -11563,6 +11563,15 @@ components:
             properties:
               config:
                 $ref: "#/components/schemas/MeshBpfMetricsConfig"
+            if:
+              required: [enabled]
+              properties:
+                enabled:
+                  const: true
+            then:
+              properties:
+                scope:
+                  const: global
         - if:
             required: [plugin_name]
             properties:
@@ -18292,6 +18301,9 @@ components:
               - type: string
                 minLength: 1
                 pattern: '^\S(?:[\s\S]*\S)?$'
+              # Delivery reporting is plugin-owned in every property-name casing.
+              - not:
+                  pattern: '^[dD][eE][lL][iI][vV][eE][rR][yY]\.[rR][eE][pP][oO][rR][tT]\.[oO][nN][lL][yY]\.[eE][rR][rR][oO][rR]$'
               # Properties the constructor refuses outright: bootstrap aliases,
               # every alias of an authoritative top-level TLS/SASL control, and
               # transactional.id (the sink owns no Kafka transaction). The
@@ -18351,7 +18363,11 @@ components:
             file-backed gateway CRL source when verification is enabled.
             transactional.id is refused outright: the logging lifecycle never
             calls init_transactions/begin_transaction/commit_transaction, so a
-            transactional producer would reject every record. Values carrying
+            transactional producer would reject every record.
+            delivery.report.only.error is refused regardless of value or casing:
+            Ferrum owns delivery reporting and always enables successful delivery
+            reports. Retained-byte leases release at terminal delivery, terminal
+            failure, purge-on-destroy, or immediate send rejection. Values carrying
             inline PEM private-key material are refused by shape, which JSON
             Schema does not model here.
         schema:
@@ -23415,25 +23431,40 @@ components:
             `trusted_hbone_assertors` / `trust_domain_aliases` instead.
 
     MeshBpfMetricsConfig:
-      type: object
+      type: [object, "null", string, array, number, boolean]
       description: |
         Plugin: __mesh_bpf_metrics - reserved internal mesh NodeWaypoint
         plugin that exposes BPF SOCK_OPS counters and fixed-bucket TCP
-        latency histograms (SRTT / SYN-to-ACK) on the Prometheus scrape
-        surface. Mesh mode auto-injects it when BPF metrics are available;
-        operator-managed plugin configs should not create names prefixed
-        with `__`.
+        latency histograms (SRTT / SYN-to-ACK / accept-to-first-byte)
+        on the Prometheus scrape surface. Mesh mode auto-injects a
+        global instance on NodeWaypoint; operator-managed plugin configs
+        should not create names prefixed with `__`. Enabled instances
+        must use `scope: global` (at most one enabled instance per
+        process). Registration is OptionalFailOpen: Admin create/update
+        still returns HTTP 400 for an invalid enabled config, while
+        file-mode load/`ferrum-edge validate` and plugin-cache rebuild
+        warn and omit the instance.
+
+        Object configs are closed: the only admitted key is `prefix`.
+        A string `prefix` is trimmed before the identifier check.
+        Non-object configs (null, string, array, number, boolean) keep
+        the default prefix `ferrum_mesh_bpf`.
       additionalProperties: false
       properties:
         prefix:
           type: string
-          pattern: "^[A-Za-z_][A-Za-z0-9_]*$"
+          pattern: "^\\s*[A-Za-z_][A-Za-z0-9_]*\\s*$"
           default: ferrum_mesh_bpf
           description: |
-            Prometheus metric name prefix for emitted BPF counters and
-            latency histograms (default families include
-            `{prefix}_srtt_microseconds` and
-            `{prefix}_syn_to_ack_microseconds`).
+            Prometheus metric name prefix for every emitted BPF family
+            (`{prefix}_tcp_events_total`, `{prefix}_drops_total`,
+            `{prefix}_srtt_microseconds`, `{prefix}_syn_to_ack_microseconds`,
+            `{prefix}_accept_to_first_byte_microseconds`, and the ringbuf
+            families). Surrounding whitespace is trimmed before the
+            identifier check; the trimmed value must match
+            `[A-Za-z_][A-Za-z0-9_]*` and must not be empty. There is no
+            declared length limit beyond that grammar. Omit the key to
+            keep `ferrum_mesh_bpf`.
 
     SoapWsSecurityConfig:
       type: object
@@ -30746,21 +30777,54 @@ components:
         order and reload generations. Unknown root, semantic-policy, and Redis
         sync keys are rejected at admission with path-qualified diagnostics
         (registration policy KeepLastKnownGood). There are no intentionally
-        open maps.
+        open maps. All numeric retention/time bounds must be positive. The
+        constructor additionally enforces max_entry_size_bytes <=
+        max_total_size_bytes (including omitted defaults), the 32 UTF-8 byte
+        redis_integrity_key minimum, platform-sized integer limits, URL parsing,
+        and the deployment backend egress policy. These residual checks are not
+        fully expressible in this schema. Provider-managed Responses conversations
+        and Gemini retained contexts bypass replay; other unmodeled root context
+        is canonically bound to exact and semantic identities. Cohere SYSTEM
+        history is retained as exact instruction state in semantic scopes.
+        Cache hits preserve finalized application bodies while current response
+        enforcement, live header rules, and negotiated compression still run.
+      allOf:
+        - if:
+            required: [semantic_similarity_enabled]
+            properties:
+              semantic_similarity_enabled:
+                const: true
+          then:
+            required: [semantic_embedding_endpoint]
+            properties:
+              semantic_embedding_endpoint:
+                pattern: '^[hH][tT][tT][pP][sS]?://[^/?#@\s]+(?:[/?#][\s\S]*)?(?![\s\S])'
+        - if:
+            required: [sync_mode]
+            properties:
+              sync_mode:
+                pattern: '^[rR][eE][dD][iI][sS](?![\s\S])'
+          then:
+            required: [redis_url, redis_integrity_key]
       properties:
         ttl_seconds:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 18446744073709551615
           default: 300
           description: Time-to-live for cached entries in seconds
         max_entries:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 18446744073709551615
           default: 10000
           description: Maximum number of cached entries (local mode). In semantic mode, HNSW snapshot memory scales with this count and is charged against max_total_size_bytes.
         max_entry_size_bytes:
           type: integer
           format: uint64
+          minimum: 1
           default: 1048576
           maximum: 16777216
           description: >-
@@ -30770,6 +30834,7 @@ components:
         max_total_size_bytes:
           type: integer
           format: uint64
+          minimum: 1
           default: 104857600
           maximum: 1073741824
           description: >-
@@ -30794,47 +30859,56 @@ components:
           default: true
           description: Additionally include the authenticated consumer's display identity in the cache key. Caller isolation no longer depends on this flag — every exact and semantic key binds a mandatory caller-authorization partition (authentication mechanism, resolved identity/consumer, peer SPIFFE identity, and SHA-256 digests of every credential header presented), so two credentials resolving to one display subject with different scopes can never share a retained completion. Setting `false` no longer lets distinct callers share entries.
         anonymous_caller_scope:
-          type: [string, "null"]
-          enum: ["caller_address", "shared", null]
+          type: string
+          pattern: '^[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*(?:[cC][aA][lL][lL][eE][rR]_[aA][dD][dD][rR][eE][sS][sS]|[cC][aA][lL][lL][eE][rR]-[aA][dD][dD][rR][eE][sS][sS]|[sS][hH][aA][rR][eE][dD])[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*(?![\s\S])'
           default: "caller_address"
           description: "How anonymous callers (no gateway identity, no credential header, no peer SPIFFE identity) are partitioned. caller_address (default) binds the gateway-resolved canonical peer address, which the origin observes through Ferrum's regenerated X-Forwarded-For; a request whose canonical address cannot be parsed is refused rather than keyed incompletely. shared is an explicit operator attestation that the origin does not vary its result by caller address on this route — only set it when that is known-safe, because it re-opens cross-caller replay for address-sensitive origins. It applies to anonymous callers only: an authenticated caller always binds its canonical peer address, because the backend receives Ferrum's regenerated forwarding identity for that caller too and may vary policy or content by it."
         cache_multimodal:
           type: string
-          enum: [reject, exact_only, exact-only, include_fingerprints, include-fingerprints]
+          pattern: '^[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*(?:[rR][eE][jJ][eE][cC][tT]|[eE][xX][aA][cC][tT]_[oO][nN][lL][yY]|[eE][xX][aA][cC][tT]-[oO][nN][lL][yY]|[iI][nN][cC][lL][uU][dD][eE]_[fF][iI][nN][gG][eE][rR][pP][rR][iI][nN][tT][sS]|[iI][nN][cC][lL][uU][dD][eE]-[fF][iI][nN][gG][eE][rR][pP][rR][iI][nN][tT][sS])[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*(?![\s\S])'
           default: exact_only
-          description: Multimodal request caching mode for non-text content parts. `reject` bypasses cache lookup/store, `exact_only` uses hashed fingerprints for exact matches and disables semantic hits, and `include_fingerprints` also includes those fingerprints in semantic scope keys. The runtime parser trims surrounding whitespace and is case-insensitive (e.g. `"Reject"`, `" exact_only "` are accepted), and `_`/`-` aliases are interchangeable; admin-API config validation runs through this lenient parser, not the schema `enum`. The `enum` lists only canonical/alias forms because JSON Schema cannot express case-insensitivity — strict schema validators may reject mixed-case or padded inputs the gateway itself accepts.
+          description: Multimodal request caching mode for non-text content parts. `reject` bypasses cache lookup/store, `exact_only` uses hashed fingerprints for exact matches and disables semantic hits, and `include_fingerprints` also includes those fingerprints in semantic scope keys. The parser and schema accept surrounding whitespace, ASCII case variants, and the listed underscore/hyphen aliases.
         semantic_similarity_enabled:
           type: boolean
           default: false
           description: Enable embedding-based semantic lookup after exact Redis/local misses. Exact matching remains active when this is disabled or enabled.
         semantic_embedding_provider:
           type: string
-          enum: [openai, openai_compatible, openai-compatible, azure, azure_openai, azure-openai, mistral, voyage, voyageai, voyage_ai, anthropic, claude, cohere, google, google_gemini, google-gemini, gemini, google_vertex, google-vertex, vertex, vertex_ai, vertex-ai, bedrock_titan, bedrock-titan, amazon_titan, amazon-titan, bedrock_cohere, bedrock-cohere, cohere_bedrock, cohere-bedrock]
+          pattern: '^[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*(?:[oO][pP][eE][nN][aA][iI]|[oO][pP][eE][nN][aA][iI]_[cC][oO][mM][pP][aA][tT][iI][bB][lL][eE]|[oO][pP][eE][nN][aA][iI]-[cC][oO][mM][pP][aA][tT][iI][bB][lL][eE]|[aA][zZ][uU][rR][eE]|[aA][zZ][uU][rR][eE]_[oO][pP][eE][nN][aA][iI]|[aA][zZ][uU][rR][eE]-[oO][pP][eE][nN][aA][iI]|[mM][iI][sS][tT][rR][aA][lL]|[vV][oO][yY][aA][gG][eE]|[vV][oO][yY][aA][gG][eE][aA][iI]|[vV][oO][yY][aA][gG][eE]_[aA][iI]|[aA][nN][tT][hH][rR][oO][pP][iI][cC]|[cC][lL][aA][uU][dD][eE]|[cC][oO][hH][eE][rR][eE]|[gG][oO][oO][gG][lL][eE]|[gG][oO][oO][gG][lL][eE]_[gG][eE][mM][iI][nN][iI]|[gG][oO][oO][gG][lL][eE]-[gG][eE][mM][iI][nN][iI]|[gG][eE][mM][iI][nN][iI]|[gG][oO][oO][gG][lL][eE]_[vV][eE][rR][tT][eE][xX]|[gG][oO][oO][gG][lL][eE]-[vV][eE][rR][tT][eE][xX]|[vV][eE][rR][tT][eE][xX]|[vV][eE][rR][tT][eE][xX]_[aA][iI]|[vV][eE][rR][tT][eE][xX]-[aA][iI]|[bB][eE][dD][rR][oO][cC][kK]_[tT][iI][tT][aA][nN]|[bB][eE][dD][rR][oO][cC][kK]-[tT][iI][tT][aA][nN]|[aA][mM][aA][zZ][oO][nN]_[tT][iI][tT][aA][nN]|[aA][mM][aA][zZ][oO][nN]-[tT][iI][tT][aA][nN]|[bB][eE][dD][rR][oO][cC][kK]_[cC][oO][hH][eE][rR][eE]|[bB][eE][dD][rR][oO][cC][kK]-[cC][oO][hH][eE][rR][eE]|[cC][oO][hH][eE][rR][eE]_[bB][eE][dD][rR][oO][cC][kK]|[cC][oO][hH][eE][rR][eE]-[bB][eE][dD][rR][oO][cC][kK])[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*(?![\s\S])'
           default: openai
-          description: Embedding provider request/response format. Compatibility aliases mirror the plugin parser; anthropic and claude are aliases for Voyage-compatible embeddings because Claude does not expose a native embedding model.
+          description: Embedding provider request/response format. Values are trimmed and ASCII case-insensitive. Aliases include openai_compatible/openai-compatible, azure/azure-openai, voyageai/voyage_ai/anthropic/claude, google/gemini/google-gemini, vertex/vertex_ai/vertex-ai/google-vertex, amazon_titan/amazon-titan/bedrock-titan, and cohere_bedrock/cohere-bedrock/bedrock-cohere; anthropic and claude are aliases for Voyage-compatible embeddings because Claude does not expose a native embedding model.
         semantic_embedding_endpoint:
           type: string
-          format: uri
-          description: Embedding endpoint URL. Required when semantic_similarity_enabled is true. Must not include URL userinfo; use semantic_embedding_api_key for credentials. Query parameters and path tokens required by signed or credential-bearing endpoints are preserved on the outbound request but stripped from logs and error diagnostics (canonical redacted form uses scheme/host/port plus /...). OpenAI-compatible endpoints use input/model JSON; other providers send native embedding JSON.
+          pattern: '[^\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]'
+          description: Nonblank embedding endpoint. Required and validated as an HTTP(S) URL when semantic_similarity_enabled is true; disabled semantic mode only checks that the supplied string is nonblank. Must not include URL userinfo; use semantic_embedding_api_key for credentials. Query parameters and path tokens required by signed or credential-bearing endpoints are preserved on the outbound request but stripped from logs and error diagnostics (canonical redacted form uses scheme/host/port plus /...). OpenAI-compatible endpoints use input/model JSON; other providers send native embedding JSON.
         semantic_embedding_model:
           type: string
+          pattern: '[^\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]'
           description: Model name sent in the embedding request body. Omit for local endpoints that do not require a model field.
         semantic_embedding_input_type:
           type: string
+          pattern: '[^\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]'
           description: Provider-specific input or task type, such as query/document for Voyage, search_query/search_document for Cohere, SEMANTIC_SIMILARITY for Gemini, or Vertex task_type.
         semantic_embedding_output_dimension:
           type: integer
           format: uint64
-          description: Provider-specific reduced embedding dimension when supported.
+          minimum: 1
+          maximum: 16384
+          description: Provider-specific reduced embedding dimension from 1 to 16384 when supported. Mistral uses output_dimension; OpenAI and Azure OpenAI use dimensions.
         semantic_embedding_api_key:
           type: string
+          pattern: '[^\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]'
           format: password
-          description: API key for the embedding endpoint. Sent in semantic_embedding_auth_header with semantic_embedding_auth_scheme when configured.
+          allOf:
+            - pattern: '^[^\u0000-\u0008\u000a-\u001f\u007f]*(?![\s\S])'
+          description: Nonblank API key; the final header value is validated at admission and retained as sensitive. Invalid header characters in the key or scheme are rejected without echoing values. Sent in semantic_embedding_auth_header with semantic_embedding_auth_scheme when configured.
         semantic_embedding_auth_header:
           type: string
+          pattern: '^[!#$%&''*+.^_`|~0-9A-Za-z-]+(?![\s\S])'
           description: HTTP header used for semantic_embedding_api_key. Defaults to Authorization, except Azure OpenAI uses api-key and Google Gemini uses x-goog-api-key.
         semantic_embedding_auth_scheme:
           type: string
+          pattern: '^[^\u0000-\u0008\u000a-\u001f\u007f]*(?![\s\S])'
           description: Prefix for the API key header value. Defaults to Bearer, except Azure OpenAI and Google Gemini send the raw key. Set to an empty string to send the raw key.
         semantic_similarity_threshold:
           type: number
@@ -30857,20 +30931,26 @@ components:
         semantic_embedding_timeout_ms:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 18446744073709551615
           default: 5000
           description: Per-request timeout for embedding calls in milliseconds. Embedding failures fall back to a normal exact-cache miss.
         sync_mode:
           type: string
-          enum: [local, redis]
+          pattern: '^(?:[lL][oO][cC][aA][lL]|[rR][eE][dD][iI][sS])(?![\s\S])'
           default: local
-          description: "Storage backend: 'local' (in-memory DashMap) or 'redis' (centralized Redis)"
+          description: "Storage backend: local or redis, ASCII case-insensitive without whitespace trimming. Redis requires redis_url and redis_integrity_key."
         redis_url:
           type: string
           minLength: 1
-          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
+          pattern: '^[rR][eE][dD][iI][sS][sS]?://[^/?#\s]+(?:/+(?:(?:\+?0*(?:[0-9]{1,9}|[0-1][0-9]{9}|20[0-9]{8}|21[0-3][0-9]{7}|214[0-6][0-9]{6}|2147[0-3][0-9]{5}|21474[0-7][0-9]{4}|214748[0-2][0-9]{3}|2147483[0-5][0-9]{2}|21474836[0-3][0-9]|214748364[0-6]|2147483647)|-0+))?/*)?(?:\?[^\s#]*)?(?![\s\S])'
           description: >-
             Redis connection URL (required when sync_mode is redis). Must not
-            carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY.
+            carry a URL fragment. The database path selects an integer from 0 to
+            2147483647; surrounding slashes, leading zeros, a leading plus, and
+            negative zero match the shared parser. URL port validity and server
+            database availability remain constructor/server checks. TLS skip-verify
+            is only FERRUM_TLS_NO_VERIFY.
             URL-embedded userinfo is accepted but never disclosed:
             connection/health-check logs and non-admin/audit projections keep
             only the scheme, host, port, and database, replace the userinfo, and
@@ -30881,6 +30961,7 @@ components:
           description: Enable TLS for Redis connection
         redis_key_prefix:
           type: string
+          minLength: 1
           description: >-
             Redis key namespace prefix. When omitted, the runtime derives
             `{FERRUM_NAMESPACE}:ai_cache` (for example `ferrum:ai_cache` when
@@ -30896,11 +30977,15 @@ components:
         redis_connect_timeout_seconds:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 18446744073709551615
           default: 5
           description: Redis connection timeout in seconds
         redis_health_check_interval_seconds:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 18446744073709551615
           default: 5
           description: Interval for background health check pings when Redis is unavailable
         redis_username:
@@ -30911,11 +30996,11 @@ components:
           description: Redis password
         redis_integrity_key:
           type: string
-          minLength: 32
           description: >-
             Narrowly scoped HMAC-SHA256 secret that authenticates Redis cache
             envelopes. Required when sync_mode is redis (fail closed if omitted).
-            Minimum 32 bytes. Bound to the full status/header/body envelope and
+            Minimum 32 UTF-8 bytes, checked by the constructor (JSON Schema string
+            length counts characters). Bound to the full status/header/body envelope and
             the Redis namespace/key context. Compared in constant time; never
             logged, and replaced by [REDACTED] in admin audit diffs and in
             viewer/operator plugin-config reads (full admin reads stay raw so
@@ -32186,27 +32271,27 @@ components:
     AiStreamRouterConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_stream_router — streaming counterpart to ai_federation. Claims ONLY OpenAI Chat Completions requests with `stream: true` and preserves true end-to-end SSE streaming. Runs at priority 2984 (before ai_semantic_cache at 4057, before ai_federation at 4060). Instead of an internal terminate-and-respond HTTP call, it rewrites the routing decision via RequestContext.route_override_* so the normal proxy dispatch streams the provider response straight back to the client. Strips client credential headers (Authorization, Proxy-Authorization, Cookie, and API-key headers) and injects the provider's credential; gateway-asserted x-consumer-* identity headers are also suppressed toward the provider. openai/openai_compatible providers pass through unchanged except optional stream_options.include_usage injection; anthropic requests are translated to the Anthropic Messages API streaming request and Anthropic SSE events are normalized to OpenAI chat.completion.chunk SSE. google_gemini requests are translated to Gemini/streamGenerateContent (Vertex-compatible) and provider SSE/JSON streams are normalized to OpenAI chat.completion.chunk SSE. When it claims a request it sets ctx.metadata ai_stream_router_claimed=true so ai_federation defers. Fails closed by default when a streaming request lacks a top-level string `model` or matches no provider. Non-streaming requests Continue to ai_federation. Provider fallback is NOT implemented and a `fallback` config block is REJECTED at admission (issue #3328): the plugin commits one provider route, credential set, backend TLS resolution, and translated request body before dispatch and never switches providers, pre- or post-first-byte, so a stored fallback policy could only be silently inert. No ai_stream_router.fallback_attempts metadata is emitted. Configuration is strict: unknown root and provider fields are rejected with path-qualified diagnostics (and spelling suggestions when useful), so typos such as `enabeld` cannot silently leave the router enabled. The same constructor contract admits file validate/startup, Admin/database writes, and CP/DP snapshot or reload publication; invalid enabled configs reject publication and retain the last-known-good instance under the plugin's FailClosed policy. NOTE: this plugin is HTTP-only and routes over the normal dispatch path, so per-proxy backend TLS/DNS egress policy applies to provider endpoints."
+      description: "Plugin: ai_stream_router — streaming counterpart to ai_federation. Claims ONLY OpenAI Chat Completions requests with `stream: true` and preserves true end-to-end SSE streaming. Runs at priority 2984 (before ai_semantic_cache at 4057, before ai_federation at 4060). Instead of an internal terminate-and-respond HTTP call, it rewrites the routing decision via RequestContext.route_override_* so the normal proxy dispatch streams the provider response straight back to the client. Strips client credential headers (Authorization, Proxy-Authorization, Cookie, and API-key headers) and injects the provider's credential; gateway-asserted x-consumer-* identity headers are also suppressed toward the provider. openai/openai_compatible providers pass through unchanged except optional stream_options.include_usage injection; anthropic requests are translated to the Anthropic Messages API streaming request and Anthropic SSE events are normalized to OpenAI chat.completion.chunk SSE. google_gemini requests are translated to Gemini/streamGenerateContent (Vertex-compatible) and provider SSE/JSON streams are normalized to OpenAI chat.completion.chunk SSE. When it claims a request it sets ctx.metadata ai_stream_router_claimed=true so ai_federation defers. Fails closed by default when a streaming request lacks a top-level string `model` or matches no provider. Non-streaming requests Continue to ai_federation. Provider fallback is NOT implemented and a `fallback` config block is REJECTED at admission (issue #3328): the plugin commits one provider route, credential set, backend TLS resolution, and translated request body before dispatch and never switches providers, pre- or post-first-byte, so a stored fallback policy could only be silently inert. No ai_stream_router.fallback_attempts metadata is emitted. Configuration is strict: unknown root and provider fields are rejected with path-qualified diagnostics (and spelling suggestions when useful), so typos such as `enabeld` cannot silently leave the router enabled. The same constructor contract admits file validate/startup, Admin/database writes, and CP/DP snapshot or reload publication; invalid enabled configs reject publication and retain the last-known-good instance under the plugin's FailClosed policy. NOTE: this plugin is HTTP-only and routes over the normal dispatch path, but the claim commits its own egress policy rather than inheriting the proxy's: an https provider endpoint is verified against the system trust store unless that provider sets inherit_backend_tls: true, and any dns_override inherited from the matched proxy is explicitly revoked so the provider host resolves through provider DNS."
       required: [providers]
       properties:
         enabled:
-          type: boolean
+          type: [boolean, "null"]
           default: true
           description: Master switch. When false the plugin never claims requests.
         fail_on_missing_model:
-          type: boolean
+          type: [boolean, "null"]
           default: true
           description: Reject a streaming request that lacks a top-level string `model`. Set to false to pass such requests through (to ai_federation / normal backend).
         fail_on_no_matching_provider:
-          type: boolean
+          type: [boolean, "null"]
           default: true
           description: Reject a streaming request whose `model` matches no configured provider. Set to false to pass such requests through.
         inject_usage_options:
-          type: boolean
+          type: [boolean, "null"]
           default: true
           description: For openai/openai_compatible providers, inject stream_options.include_usage=true so the provider emits a final usage event.
         normalize_response_stream:
-          type: boolean
+          type: [boolean, "null"]
           default: true
           description: Normalize provider-native SSE (e.g. Anthropic Messages API events) to OpenAI chat.completion.chunk SSE. Disabling forwards provider-native SSE verbatim.
         providers:
@@ -32220,7 +32305,8 @@ components:
             properties:
               name:
                 type: string
-                description: Unique provider name (surfaced in ai_stream_router.provider metadata).
+                minLength: 1
+                description: Unique provider name (surfaced in ai_stream_router.provider metadata). Must be non-empty, and unique across the instance's providers; that uniqueness check is a runtime admission rule this schema cannot express.
               provider_type:
                 type: string
                 enum:
@@ -32231,69 +32317,96 @@ components:
                 description: "Provider wire format. openai/openai_compatible pass through; anthropic and google_gemini are translated + normalized to OpenAI chat.completion.chunk SSE."
               endpoint:
                 type: string
+                minLength: 1
+                pattern: "^[Hh][Tt][Tt][Pp][Ss]?://"
                 description: "Full https (or http with allow_plaintext) provider streaming endpoint URL, e.g. https://api.openai.com/v1/chat/completions, https://api.anthropic.com/v1/messages, or https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent. May contain a literal {model} path placeholder (required for typical Gemini/Vertex model routing). An endpoint query string (e.g. an Azure-style ?api-version=...) is preserved and merged with the client's own query using '&'. IPv6 literal hosts are bracketed in the forwarded authority."
               api_key:
                 type: string
-                description: "Provider API key. Supports a ${ENV_VAR} reference resolved from the process environment. Injected as Authorization: Bearer for openai(-compatible), x-api-key for anthropic, x-goog-api-key for google_gemini."
+                minLength: 1
+                description: "Provider API key. The resolved value must be a valid HTTP header value (no CR, LF, NUL, or other control byte) or construction fails. Supports a ${ENV_VAR} reference resolved from the process environment. Injected as Authorization: Bearer for openai(-compatible), x-api-key for anthropic, x-goog-api-key for google_gemini."
               model_patterns:
                 type: array
                 minItems: 1
                 items:
                   type: string
-                description: "Non-empty glob patterns matched against the request `model` (exact or prefix, e.g. ['gpt-*', 'o*'] or ['claude-*'])."
+                  minLength: 1
+                description: "Non-empty glob patterns matched against the request `model`. `*` is the only wildcard, matches any run of characters except URL-structural separators (`/ ? # & \\`) and whitespace, and the pattern is anchored at both ends — so `*mini` matches `model-mini` and `mini-mini` alike, and never matches `mini-pro`. Example: ['gpt-*', 'o*'] or ['claude-*']."
               priority:
-                type: integer
+                type: [integer, "null"]
                 minimum: 1
-                description: "Lower = matched first. Defaults to provider index + 1."
+                maximum: 4294967295
+                description: "Lower = matched first. Defaults to provider index + 1. Stored as a u32, so a larger value is rejected; an explicit null means omission."
               allow_plaintext:
-                type: boolean
+                type: [boolean, "null"]
                 default: false
-                description: Permit an http:// endpoint (rejected by default).
+                description: "Permit an http:// endpoint. Plaintext provider egress is rejected by default, so this is the required opt-in for an internal HTTP-compatible provider. It has no effect on an https endpoint and does not relax runtime TLS/FIPS policy. An explicit null means omission."
               anthropic_version:
-                type: string
+                type: [string, "null"]
                 default: "2023-06-01"
-                description: anthropic-version header value sent to Anthropic providers.
+                description: "anthropic-version header value sent to Anthropic providers. Must be a valid HTTP header value; an explicit null means omission and keeps the default."
               inherit_backend_tls:
-                type: boolean
+                type: [boolean, "null"]
                 default: false
-                description: "By default an https provider endpoint is verified against the system trust store (default backend TLS). Set true to keep the proxy's own resolved backend TLS instead — custom CA bundle, SNI/SAN policy, and backend mTLS client certificate — for internal openai_compatible endpoints behind private PKI. No effect on http endpoints."
+                description: "By default an https provider endpoint is verified against the system trust store (default backend TLS). Set true to keep the proxy's own resolved backend TLS instead — custom CA bundle, SNI/SAN policy, and backend mTLS client certificate — for internal openai_compatible endpoints behind private PKI. No effect on http endpoints. An explicit null means omission."
+            allOf:
+              # Plaintext provider egress is opt-in: an http:// endpoint without
+              # allow_plaintext: true is refused by the constructor.
+              - if:
+                  required: [endpoint]
+                  properties:
+                    endpoint:
+                      pattern: "^[Hh][Tt][Tt][Pp]://"
+                then:
+                  required: [allow_plaintext]
+                  properties:
+                    allow_plaintext:
+                      const: true
 
     A2aGatewayConfig:
       type: object
       required: [discovery]
-      description: "Plugin: a2a_gateway — transparent Agent-to-Agent protocol gateway for HTTP JSON-RPC, HTTP+JSON/REST, and gRPC/grpcs A2A traffic. The implemented A2A protocol version is 0.3.x, whose canonical gRPC service is a2a.v1.A2AService (package a2a.v1); A2A 1.0's lf.a2a.v1.A2AService carries a renumbered AgentCard and is never decoded as 0.3. Detects standard A2A methods, optionally denies methods by gateway policy, rewrites HTTP JSON and unary gRPC Agent Card endpoint URLs to the gateway address, preserves SSE/gRPC streaming for non-card traffic, and emits a2a.* metadata for existing Ferrum logging, tracing, chargeback, WAF, and alerting plugins. It does not manage A2A task state or aggregate multiple agents in V1. Cannot be composed with request_deduplication on the same proxy while discovery.public_base_url is unset and discovery.trust_forwarded_headers is true; admission rejects that pairing with 400 because the rewritten Agent Card origin is then derived from per-request forwarded headers and the connection's TLS SNI, neither of which a replay fingerprint binds. A configured discovery.public_base_url composes normally."
+      additionalProperties: false
+      description: "Plugin: a2a_gateway — transparent Agent-to-Agent protocol gateway for HTTP JSON-RPC, HTTP+JSON/REST, and gRPC/grpcs A2A traffic. The implemented A2A protocol version is 0.3.x, whose canonical gRPC service is a2a.v1.A2AService (package a2a.v1); A2A 1.0's lf.a2a.v1.A2AService carries a renumbered AgentCard and is never decoded as 0.3. Detects standard A2A methods, optionally denies methods by gateway policy, rewrites HTTP JSON and unary gRPC Agent Card endpoint URLs to the gateway address, preserves SSE/gRPC streaming for non-card traffic, and emits a2a.* metadata for existing Ferrum logging, tracing, chargeback, WAF, and alerting plugins. It does not manage A2A task state or aggregate multiple agents in V1. Cannot be composed with request_deduplication on the same proxy while discovery.public_base_url is unset and discovery.trust_forwarded_headers is true; admission rejects that pairing with 400 because the rewritten Agent Card origin is then derived from per-request forwarded headers and the connection's TLS SNI, neither of which a replay fingerprint binds. A configured discovery.public_base_url composes normally. Null is accepted everywhere a value is optional and means the same thing as omitting the key. Unknown keys are rejected at construction, at the root and inside every nested fixed-shape object."
       properties:
         enabled:
-          type: boolean
+          type: [boolean, "null"]
           default: true
         mode:
-          type: string
-          enum: [transparent_proxy]
+          type: [string, "null"]
+          enum: [transparent_proxy, null]
           default: transparent_proxy
         endpoint:
-          type: object
+          type: [object, "null"]
+          additionalProperties: false
           properties:
             path:
-              type: string
+              type: [string, "null"]
+              minLength: 1
+              pattern: '^/'
               default: /a2a
-              description: Public JSON-RPC A2A endpoint path.
+              description: Public JSON-RPC A2A endpoint path. Must be a non-empty absolute path beginning with /.
             agent_card_path:
-              type: string
+              type: [string, "null"]
+              minLength: 1
+              pattern: '^/'
               default: /.well-known/agent-card.json
-              description: Public Agent Card discovery path suffix.
+              description: Public Agent Card discovery path suffix. Must be a non-empty absolute path beginning with /.
             protocol_versions:
-              type: array
+              type: [array, "null"]
               minItems: 1
               items:
                 type: string
+                minLength: 1
+                pattern: '\S'
               default: ["0.3.0"]
               description: Supported A2A protocol versions as EXACT version strings. There is no family, range, or wildcard syntax - listing 0.3.0 admits 0.3.0 and not 0.3.99. The first entry is the gateway's preferred version for a2a.protocol_version metadata. gRPC Agent Card rewriting additionally requires the responding gRPC service to declare the a2a-0.3 card schema (see endpoint.grpc_services) AND the matched version to belong to the implemented A2A 0.3 wire layout, so an exactly-configured 1.0.0 is still refused.
             grpc_services:
-              type: array
+              type: [array, "null"]
               minItems: 1
               items:
                 oneOf:
                   - type: string
+                    pattern: '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$'
                     description: Fully-qualified gRPC service name. A published A2A service name resolves to the Agent Card wire layout the A2A specification gives it - a2a.v1.A2AService is A2A 0.3 (card_schema a2a-0.3) and lf.a2a.v1.A2AService is A2A 1.0 (card_schema a2a-1.0). Any other name is a custom service with no published layout and resolves to card_schema none.
                   - type: object
                     required: [service]
@@ -32301,42 +32414,50 @@ components:
                     properties:
                       service:
                         type: string
-                        description: Fully-qualified gRPC service name.
+                        pattern: '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$'
+                        description: Fully-qualified gRPC service name. Required; null is not accepted here. Duplicate service names across entries are rejected.
                       card_schema:
-                        type: string
-                        enum: [a2a-0.3, a2a-1.0, none]
+                        type: [string, "null"]
+                        enum: [a2a-0.3, a2a-1.0, none, null]
                         description: Agent Card protobuf wire layout this service is declared to serve. a2a-0.3 is the only layout the gateway decodes and rewrites; a2a-1.0 and none are detected and policed but fail card rewriting closed. Omitted means the published layout for a published A2A service name and none for a custom one. Declaring a value that contradicts a published A2A service name is rejected - the layout is a property of the protocol, not of the deployment.
               default: ["a2a.v1.A2AService", "lf.a2a.v1.A2AService"]
               description: "Fully-qualified gRPC service names recognized as A2A services, each with a declared Agent Card wire layout. RPCs on these services are detected, mapped to canonical a2a.method names, and gated by method policy from request metadata alone - request protobuf payloads are never decoded. The defaults recognize both the canonical A2A 0.3 service a2a.v1.A2AService (package a2a.v1 in a2aproject/A2A at tag v0.3.0) and A2A 1.0's lf.a2a.v1.A2AService so upgrades preserve method-policy enforcement for either published identity. The 0.3 service is the identity whose card layout the default endpoint.protocol_versions 0.3.0 describes. The 1.0 service uses package lf.a2a.v1 with a renumbered AgentCard; it is detected and policed by default while card rewriting on it fails closed with agent_card_grpc_schema_unsupported rather than decoding a 1.0 card as 0.3. The one decoded payload is the unary Agent Card reply (GetAgentCard / GetExtendedAgentCard) on an a2a-0.3 service when discovery.rewrite_agent_card_urls is enabled - a proven-successful reply is decoded against the A2A 0.3.x Agent Card wire layout, rewritten, and re-encoded as a single uncompressed frame, and anything unsupported or malformed fails closed with a fixed diagnostic. A card RPC on a service whose declared layout is none fails closed with agent_card_grpc_schema_undeclared; set discovery.rewrite_agent_card_urls false or declare card_schema a2a-0.3 for such a deployment. All other gRPC responses, including streaming ones, pass through undecoded."
         detection:
-          type: object
+          type: [object, "null"]
+          additionalProperties: false
           properties:
             bindings:
-              type: array
+              type: [array, "null"]
               minItems: 1
               items:
                 type: string
-                enum: [jsonrpc, rest, grpc]
+                enum: [jsonrpc, "json-rpc", rest, http_json, "http+json", grpc]
               default: [jsonrpc, rest, grpc]
+              description: A2A bindings to detect. Each entry is one of three bindings, and two of them accept aliases that normalize to the canonical name - "json-rpc" is "jsonrpc", and "http_json" and "http+json" are "rest". The list must be non-empty; repeating a binding under two spellings is accepted and deduplicates.
             version_header:
-              type: string
+              type: [string, "null"]
+              minLength: 1
+              pattern: '^[!#$%&''*+.^_`|~0-9A-Za-z-]+$'
               default: A2A-Version
-              description: Header used to record/accept A2A protocol version hints.
+              description: Header used to record/accept A2A protocol version hints. Must be a valid non-empty HTTP field name.
             max_request_body_size:
-              type: integer
+              type: [integer, "null"]
               format: uint64
+              minimum: 0
+              maximum: 18446744073709551615
               default: 1048576
               description: Maximum JSON-RPC request body bytes parsed for A2A detection; 0 means no plugin-level detection limit. Oversized JSON-RPC candidates fail closed when default_action is deny or any per-method deny rule is configured.
             allow_unknown_methods_with_version_header:
-              type: boolean
+              type: [boolean, "null"]
               default: true
               description: Treat JSON-RPC requests carrying the version header as A2A even when the method is not in the built-in standard-method table. Metadata records method as unknown to bound cardinality.
             strip_accept_encoding:
-              type: boolean
+              type: [boolean, "null"]
               default: true
               description: Remove Accept-Encoding on non-streaming A2A HTTP requests whose responses may be parsed or rewritten by the plugin. Enabling this plugin with the default true value marks request headers mutable for all traffic on the proxy.
         discovery:
           type: object
+          additionalProperties: false
           anyOf:
             - required: [rewrite_agent_card_urls]
               properties:
@@ -32351,51 +32472,93 @@ components:
                   minItems: 1
           properties:
             rewrite_agent_card_urls:
-              type: boolean
+              type: [boolean, "null"]
               default: true
               description: Rewrite Agent Card endpoint URLs for detected HTTP JSON and unary gRPC card requests. Rewrites JSON-RPC endpoint URLs, preserves non-JSONRPC interface URLs such as GRPC and HTTP+JSON, removes stale signatures after mutation, and re-encodes A2A 0.3.x protobuf Agent Cards on the gRPC path. The gRPC path only inspects a proven-successful reply - HTTP 200 with a terminal grpc-status of exactly 0 - so a non-OK upstream response is forwarded as written rather than mistaken for a card. It rewrites the A2A 0.3.x wire layout only and requires positive proof of it TWICE - the responding gRPC service must be declared to carry the a2a-0.3 card schema (endpoint.grpc_services; a service declared a2a-1.0 or none fails closed with agent_card_grpc_schema_unsupported / agent_card_grpc_schema_undeclared before a byte is decoded) AND the card must carry an explicit protocol_version that exactly matches a configured endpoint.protocol_versions entry AND belongs to the 0.3 family. A card with an absent or empty protocol_version fails closed with a trailers-only gRPC INTERNAL under HTTP 200 and an unsupported_agent_card_protobuf_version diagnostic, and is not assumed to be 0.3.x even when endpoint.protocol_versions lists only 0.3.x. A2A renumbered AgentCard for 1.0, so guessing would corrupt the card and re-serve it under a stale signature. All seventeen known 0.3 top-level fields are schema-validated before any rewrite - each must carry the wire type the 0.3 schema declares (a canonical 0/1 varint for supports_authenticated_extended_card), each singular field may appear at most once, and every known string that is re-emitted must be valid UTF-8. url and every AgentInterface url must parse as a bounded absolute http/https URL with a real host and no embedded credentials, and an AgentInterface without a url is refused rather than counted as a usable endpoint. Faults fail closed with agent_card_protobuf_field_wire_mismatch, agent_card_protobuf_field_duplicated, agent_card_protobuf_string_invalid, agent_card_protobuf_bool_invalid, agent_card_protobuf_interface_url_missing, or agent_card_protobuf_url_layout_mismatch. The submessages the rewriter preserves rather than parses - provider, capabilities, security_schemes, security, skills, and signatures - are checked for wire type and multiplicity only; their contents are never decoded and are not claimed to be well formed. Unknown fields with any valid wire type are preserved untouched. Diagnostics are fixed strings; response bytes are never reflected into grpc-message or metadata. Set this to false when fronting a non-0.3 A2A backend; leaving it true refuses such cards rather than serving un-rewritten internal URLs.
             public_base_url:
-              type: string
+              type: [string, "null"]
               format: uri
+              maxLength: 4096
+              pattern: '^[Hh][Tt][Tt][Pp][Ss]?://(?![^/?#]*@)[^/?#\s\\][^\s?#\\]*$'
               description: Explicit public gateway base URL, for example https://agents.example.com. Rewriting defaults to enabled and requires this value or trust_forwarded_headers=true with nonempty allowed_public_origins. Empty plugin configurations fail admission. Explicit rewrite_agent_card_urls=false selects unchanged backend cards. When deriving an origin, X-Forwarded-* and Host must select an allowed normalized origin; missing, malformed, comma-separated or unlisted origins fail closed before backend dispatch with agent_card_public_origin_unavailable (HTTP 502 or gRPC INTERNAL). Configuring this value is also what makes the Agent Card rewrite a pure function of configuration, which is required to compose this plugin with request_deduplication on the same proxy.
             trust_forwarded_headers:
-              type: boolean
+              type: [boolean, "null"]
               default: false
               description: Derive the public gateway origin from X-Forwarded-Proto, X-Forwarded-Host, and Host when discovery.public_base_url is omitted. Requires nonempty allowed_public_origins when rewriting is enabled; the trusted front door must replace forwarded headers. Schemes and ports must match an allowed normalized origin. In that request-derived mode the origin also depends on whether the connection carried a TLS SNI hostname, which no replay fingerprint binds, so admission rejects the pair with request_deduplication on the same proxy with 400 (fatal in file mode, rejected update in DP) and the runtime retains and replays nothing. Setting discovery.public_base_url resolves it; a configured public base composes normally.
             allowed_public_origins:
-              type: array
+              type: [array, "null"]
               default: []
               items:
                 type: string
                 format: uri
+                maxLength: 4096
+                pattern: '^[Hh][Tt][Tt][Pp][Ss]?://(?![^/?#]*@)[^/?#\s\\]+/?$'
               description: Allowed absolute HTTP(S) origins for request-derived card URLs, without paths, credentials, queries or fragments. Required with trust_forwarded_headers when rewriting is enabled and public_base_url is absent. Compared after URL origin normalization, including scheme and non-default port. A configured public_base_url takes precedence.
         observability:
-          type: object
+          type: [object, "null"]
+          additionalProperties: false
           properties:
             emit_metadata:
-              type: boolean
+              type: [boolean, "null"]
               default: true
               description: Emit a2a.* request and response metadata for downstream logging, tracing, authz, and chargeback plugins. When true (default), detected non-streaming A2A HTTP responses are buffered so response metadata (a2a.task_id, a2a.context_id, a2a.task_state, a2a.error) can be extracted; SSE and non-card gRPC responses are never buffered for metadata. Detected unary gRPC Agent Card responses are buffered when discovery.rewrite_agent_card_urls is true so protobuf cards can be rewritten. Detected 2xx SSE streams are observed without buffering and write a2a.stream_events plus any observed a2a.task_id, a2a.context_id, and a2a.task_state into transaction metadata at stream termination, where key-based metadata redaction applies. The buffer is bounded by the global FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES limit, not max_payload_size. Set false together with discovery.rewrite_agent_card_urls=false to keep responses fully streaming; request detection and method policy still apply.
             log_payloads:
-              type: boolean
+              type: [boolean, "null"]
               default: false
               description: Copies bounded A2A response payloads into metadata. Payloads can contain secrets or PII and are copied verbatim into a2a.payload.response rather than field-redacted; enable only for protected logging paths. Request payloads are not logged. Requires emit_metadata=true, because payload capture writes the a2a.payload.response metadata key; with emit_metadata=false this option has no effect.
             max_payload_size:
-              type: integer
+              type: [integer, "null"]
               format: uint64
               default: 1048576
               minimum: 1
+              maximum: 18446744073709551615
               description: Payload logging byte limit. Task and context identifiers, textual errors and protocol-version metadata are capped at min(max_payload_size, 1024) UTF-8 bytes including a trailing ~ marker, with a companion .truncated flag. Task states are normalized to the protocol state set; unrecognized states become unknown with .unrecognized=true, and normalized states too large for this limit are omitted with .truncated=true. Applies to request hints, JSON replies and SSE completion metadata; does not cap response buffering or alter response bytes.
         policy:
-          type: object
+          type: [object, "null"]
+          additionalProperties: false
           properties:
             default_action:
-              type: string
-              enum: [allow, deny]
+              type: [string, "null"]
+              enum: [allow, deny, null]
               default: allow
               description: With deny or any per-method deny rule, unrecognized requests inside the configured endpoint, discovery or gRPC-service scope fail closed, including unsupported payloads, methods, paths and disabled bindings. Known batch members are individually policed. Unrelated sibling paths and services are outside scope.
             methods:
-              type: object
+              type: [object, "null"]
+              propertyNames:
+                enum:
+                  - message/send
+                  - message/stream
+                  - tasks/get
+                  - tasks/list
+                  - tasks/cancel
+                  - tasks/resubscribe
+                  - tasks/pushNotificationConfig/set
+                  - tasks/pushNotificationConfig/get
+                  - tasks/pushNotificationConfig/list
+                  - tasks/pushNotificationConfig/delete
+                  - agent/getCard
+                  - agent/getExtendedAgentCard
+                  - agent/getAuthenticatedExtendedCard
+                  - unknown
+                  - SendMessage
+                  - SendStreamingMessage
+                  - GetTask
+                  - ListTasks
+                  - CancelTask
+                  - SubscribeToTask
+                  - TaskSubscription
+                  - CreateTaskPushNotificationConfig
+                  - CreateTaskPushNotification
+                  - GetTaskPushNotificationConfig
+                  - GetTaskPushNotification
+                  - ListTaskPushNotificationConfigs
+                  - ListTaskPushNotificationConfig
+                  - ListTaskPushNotification
+                  - DeleteTaskPushNotificationConfig
+                  - DeleteTaskPushNotification
+                  - GetAgentCard
+                  - GetExtendedAgentCard
+                  - GetAuthenticatedExtendedCard
               description: >-
                 Per-method policy overrides. Keys must be a canonical A2A method name —
                 message/send, message/stream, tasks/get, tasks/list, tasks/cancel,
@@ -32405,14 +32568,20 @@ components:
                 agent/getExtendedAgentCard, agent/getAuthenticatedExtendedCard — or the
                 literal "unknown". PascalCase gRPC/REST aliases such as SendMessage or
                 GetTask are accepted and normalized to these canonical names.
-                Unrecognized keys are rejected at config validation.
+                Unrecognized keys are rejected at config validation. Two keys that
+                canonicalize to the same method — for example "tasks/get" and
+                "GetTask", or "SubscribeToTask" and "TaskSubscription" — are a
+                duplicate and are rejected; that cross-key restriction is not
+                expressible in this schema.
               additionalProperties:
                 type: object
                 required: [action]
+                additionalProperties: false
                 properties:
                   action:
                     type: string
                     enum: [allow, deny]
+                    description: Required; null is not accepted here.
 
     McpGatewayConfig:
       type: object
@@ -32991,6 +33160,66 @@ components:
             api_chargeback instance must resolve to the same projection because
             one render cache serves them all. See docs/log_schema.md.
 
+    ApiChargebackSinkLogField:
+      type: string
+      description: Native exported charge-event field available to omit or rename.
+      enum:
+        - event_id
+        - received_at
+        - node_id
+        - namespace
+        - consumer_id
+        - consumer_name
+        - proxy_id
+        - proxy_name
+        - route_id
+        - status_code
+        - http_status_code
+        - grpc_status
+        - protocol
+        - call_count
+        - charge_call
+        - bytes_sent
+        - bytes_received
+        - charge_bytes_sent
+        - charge_bytes_received
+        - charge_total
+        - currency
+        - pricing_version
+        - request_id
+        - trace_id
+        - snapshot_id
+
+    ApiChargebackSinkLogSchema:
+      description: >-
+        Projection of the exported charge-event record. Supports omit, rename,
+        order, static_fields, and derived_fields. The summary_type,
+        timestamp_format, and metadata keys are forbidden, even with null or
+        default values. received_at remains an epoch-nanosecond integer.
+        Derived kinds are status_class (from billable status_code), summary_kind
+        (always charge_event), and outcome (error for status_code >= 500 or a
+        nonzero grpc_status, otherwise ok). backend_host is unavailable.
+        Shared constructor checks still enforce output-key uniqueness,
+        sensitive-data restrictions, omit/rename conflicts, and order coverage
+        against the final output keys. See docs/log_schema.md.
+      allOf:
+        - $ref: "#/components/schemas/SummaryLogSchema"
+        - properties:
+            summary_type: false
+            timestamp_format: false
+            metadata: false
+            omit:
+              items:
+                $ref: "#/components/schemas/ApiChargebackSinkLogField"
+            rename:
+              propertyNames:
+                $ref: "#/components/schemas/ApiChargebackSinkLogField"
+            derived_fields:
+              items:
+                properties:
+                  kind:
+                    enum: [status_class, summary_kind, outcome]
+
     ApiChargebackSinkConfig:
       type: object
       additionalProperties: false
@@ -33056,6 +33285,8 @@ components:
         `validate` can still abort serving startup on a node missing those
         files or variables.
       allOf:
+        - not:
+            required: [schema, schema_ref]
         - anyOf:
             - required: [pricing_tiers]
               properties:
@@ -33619,12 +33850,19 @@ components:
                 additionally requires the value to be at least one bounded
                 charge-event size.
         schema:
-          $ref: "#/components/schemas/SummaryLogSchema"
+          $ref: "#/components/schemas/ApiChargebackSinkLogSchema"
         schema_ref:
           type: string
+          minLength: 1
           description: >-
-            Name of a schema registered by a `transaction_log_schema` plugin.
-            Mutually exclusive with `schema`. Projects the exported charge-event
+            Nonempty name of a schema registered by a `transaction_log_schema`
+            plugin. Mutually exclusive with `schema` by key presence, including
+            null values. The referenced definition must also satisfy
+            ApiChargebackSinkLogSchema; existence and compatibility are checked
+            at construction, since JSON Schema cannot resolve registry contents.
+            Named definitions must first compile against the transaction-summary
+            field inventory, so use inline schema for charge-event-only fields.
+            Projects the exported charge-event
             record (the JSONEachRow row delivered to ClickHouse and the durable
             spool artifact that replays it), not the pricing, the accumulator
             identities, or the snapshot keys. Renaming a field renames the

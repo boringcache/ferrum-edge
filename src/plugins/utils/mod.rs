@@ -3,6 +3,7 @@
 //! This module contains infrastructure that plugins share, keeping plugin
 //! implementation files focused on their core logic.
 
+pub mod ai_model_glob;
 pub mod ai_pii;
 pub mod ai_providers;
 pub mod ai_usage_stream;
