@@ -3251,6 +3251,71 @@ fn ai_stream_router_schema_rejects_unknown_keys_and_matches_runtime_surface() {
     ] {
         assert_component_validity(&spec, "AiStreamRouterConfig", &invalid, false);
     }
+
+    // Issue #5303: the component must accept nothing the constructor rejects,
+    // and must accept the explicit nulls the constructor reads as omission.
+    let provider_with = |overrides: serde_json::Value| {
+        let mut provider = json!({
+            "name": "p",
+            "provider_type": "openai",
+            "endpoint": "https://a.example.com/v1",
+            "api_key": "k",
+            "model_patterns": ["gpt-*"]
+        });
+        if let (Some(base), Some(extra)) = (provider.as_object_mut(), overrides.as_object()) {
+            for (key, value) in extra {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+        json!({ "providers": [provider] })
+    };
+
+    for valid in [
+        // Every optional field the constructor treats as omitted when null.
+        json!({
+            "enabled": null,
+            "fail_on_missing_model": null,
+            "fail_on_no_matching_provider": null,
+            "inject_usage_options": null,
+            "normalize_response_stream": null,
+            "providers": [{
+                "name": "p",
+                "provider_type": "anthropic",
+                "endpoint": "https://a.example.com/v1",
+                "api_key": "k",
+                "model_patterns": ["claude-*"],
+                "priority": null,
+                "allow_plaintext": null,
+                "anthropic_version": null,
+                "inherit_backend_tls": null
+            }]
+        }),
+        // Plaintext with the opt-in the constructor requires.
+        provider_with(json!({
+            "endpoint": "http://internal.example.com/v1",
+            "allow_plaintext": true
+        })),
+        provider_with(json!({"priority": 4294967295u64})),
+    ] {
+        assert_component_validity(&spec, "AiStreamRouterConfig", &valid, true);
+    }
+
+    for invalid in [
+        provider_with(json!({"priority": 4294967296u64})),
+        provider_with(json!({"name": ""})),
+        provider_with(json!({"api_key": ""})),
+        provider_with(json!({"model_patterns": [""]})),
+        provider_with(json!({"endpoint": "not-url"})),
+        provider_with(json!({"endpoint": "ftp://api.example.com/a"})),
+        // HTTP without the plaintext opt-in, and with it explicitly disabled.
+        provider_with(json!({"endpoint": "http://internal.example.com/v1"})),
+        provider_with(json!({
+            "endpoint": "http://internal.example.com/v1",
+            "allow_plaintext": false
+        })),
+    ] {
+        assert_component_validity(&spec, "AiStreamRouterConfig", &invalid, false);
+    }
 }
 
 #[test]
