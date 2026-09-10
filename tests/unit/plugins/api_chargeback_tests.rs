@@ -4927,7 +4927,9 @@ fn test_either_export_format_acknowledges_collection() {
 fn test_failed_render_does_not_acknowledge_collection() {
     let registry = ChargebackRegistry::new();
     registry.configure(600, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
-    let poison = MAX_UNIT_PRICE;
+    // Two calls at `f64::MAX` overflow `checked_mul_quantity` to infinity, so
+    // both renders fail closed before any document is produced.
+    let poison = f64::MAX;
     registry.record_http(
         &scope(),
         "alice",
