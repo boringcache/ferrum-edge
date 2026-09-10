@@ -263,7 +263,9 @@ fn parse_trigger(config: &Map<String, Value>) -> Result<Trigger, String> {
             ));
         }
         if let Some(reason) = unreachable_parsed_path_prefix_reason(path) {
-            return Err(format!("request_termination: 'trigger.path_prefix' {reason}"));
+            return Err(format!(
+                "request_termination: 'trigger.path_prefix' {reason}"
+            ));
         }
         return Ok(Trigger::PathPrefix(path.to_string()));
     }

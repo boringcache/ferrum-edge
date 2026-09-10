@@ -9500,8 +9500,7 @@ fn fault_injection_schema_matches_runtime_contract() {
         .expect("abort.body type");
     assert!(
         body_type.as_array().is_some_and(|types| {
-            types.iter().any(|value| value == "string")
-                && types.iter().any(|value| value == "null")
+            types.iter().any(|value| value == "string") && types.iter().any(|value| value == "null")
         }),
         "abort.body must accept string or null, got {body_type}"
     );

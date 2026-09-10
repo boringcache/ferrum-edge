@@ -251,12 +251,9 @@ impl FaultInjectionPlugin {
         let delay = match obj.get("delay") {
             Some(Value::Object(delay_obj)) => {
                 reject_unknown_keys(delay_obj.keys(), &["duration_ms", "percentage"], "delay")?;
-                let duration_ms = delay_obj
-                    .get("duration_ms")
-                    .and_then(json_u64)
-                    .ok_or(
-                        "fault_injection: delay.duration_ms is required and must be a positive integer",
-                    )?;
+                let duration_ms = delay_obj.get("duration_ms").and_then(json_u64).ok_or(
+                    "fault_injection: delay.duration_ms is required and must be a positive integer",
+                )?;
 
                 if duration_ms == 0 {
                     return Err(
