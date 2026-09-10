@@ -1,10 +1,13 @@
 name: Fuzz Cache Inspection
 
 on:
-  push:
-    branches: [fuzz-cache-inspection]
-    paths: [.github/workflows/fuzz-cache-inspection.yml]
   workflow_dispatch:
+    inputs:
+      cli_version:
+        description: Optional CLI version for canary validation
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -22,8 +25,9 @@ jobs:
           persist-credentials: false
 
       - name: Set up BoringCache
-        uses: boringcache/one@a610ec5a564efd9b360925056dbade04deb5def6 # v1.30.0
+        uses: boringcache/one@404b744a2053da4cf963f13f615f7fafe94f3cf7 # v1.30.1
         with:
+          cli-version: ${{ inputs.cli_version }}
           setup: none
           mode: archive
           cache-profiles: dependencies
