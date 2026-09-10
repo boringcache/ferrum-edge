@@ -12304,3 +12304,351 @@ fn configuration_guide_documents_every_accepted_key() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wrong-typed admission diagnostics (#5395)
+// ---------------------------------------------------------------------------
+
+/// Issue #5395: a present-but-non-string `action` was reported as
+/// `is missing required 'action'`, sending an operator hunting for a key that
+/// is right there in the document. Name the supplied JSON kind instead, exactly
+/// as `risk` and `approval.fail_on_error` already do.
+#[test]
+fn non_string_tool_action_is_reported_as_a_type_error_not_a_missing_key() {
+    let validator = openapi_config_validator();
+    let with_action = |action: Value| {
+        json!({
+            "default_action": "deny",
+            "tools": { "lookup": { "action": action } }
+        })
+    };
+
+    for (wrong, kind) in [
+        (json!(7), "a number"),
+        (json!(null), "null"),
+        (json!(false), "a boolean"),
+        (json!(["allow"]), "an array"),
+        (json!({ "verb": "allow" }), "an object"),
+    ] {
+        let config = with_action(wrong.clone());
+        let err = try_make(config.clone())
+            .err()
+            .expect("a present non-string action must fail admission");
+        assert!(err.contains("'action'"), "{err}");
+        assert!(err.contains("must be a string"), "{err}");
+        assert!(
+            err.contains(kind),
+            "the error must name the JSON kind: {err}"
+        );
+        assert!(
+            err.contains("lookup"),
+            "the error must name the tool: {err}"
+        );
+        assert!(
+            !err.contains("missing"),
+            "a supplied key must not be reported as missing: {err}"
+        );
+        assert!(!validator.is_valid(&config), "schema must reject {wrong}");
+    }
+
+    // An omitted key keeps the missing-key diagnostic...
+    let omitted = json!({ "default_action": "deny", "tools": { "lookup": {} } });
+    let err = try_make(omitted.clone())
+        .err()
+        .expect("an omitted action must fail admission");
+    assert!(err.contains("missing required 'action'"), "{err}");
+    assert!(!validator.is_valid(&omitted));
+
+    // ...and a non-enum *string* keeps its own distinct diagnostic.
+    let misspelled = with_action(json!("permit"));
+    let err = try_make(misspelled.clone())
+        .err()
+        .expect("an unknown action must fail admission");
+    assert!(err.contains("invalid action"), "{err}");
+    assert!(!validator.is_valid(&misspelled));
+
+    // Every valid spelling reachable without an approval webhook is unchanged.
+    for spelling in ["allow", "deny", "dry_run"] {
+        assert_admission_parity(&validator, &with_action(json!(spelling)), true, spelling);
+    }
+}
+
+/// Issue #5395: the same rule for `approval.endpoint_url`, where a non-string
+/// value — and an empty string, which the published schema rejects with
+/// `minLength: 1` — were both reported as the key being required.
+#[test]
+fn non_string_approval_endpoint_url_is_reported_as_a_type_error_not_a_missing_key() {
+    let validator = openapi_config_validator();
+    let with_endpoint = |endpoint_url: Value| {
+        json!({
+            "default_action": "deny",
+            "tools": { "deploy": { "action": "require_approval" } },
+            "approval": { "endpoint_url": endpoint_url }
+        })
+    };
+
+    for (wrong, kind) in [
+        (json!(7), "a number"),
+        (json!(null), "null"),
+        (json!(true), "a boolean"),
+        (json!(["https://approve.example/x"]), "an array"),
+        (json!({ "url": "https://approve.example/x" }), "an object"),
+    ] {
+        let config = with_endpoint(wrong.clone());
+        let err = try_make(config.clone())
+            .err()
+            .expect("a present non-string endpoint_url must fail admission");
+        assert!(err.contains("'approval.endpoint_url'"), "{err}");
+        assert!(err.contains("must be a string"), "{err}");
+        assert!(
+            err.contains(kind),
+            "the error must name the JSON kind: {err}"
+        );
+        assert!(
+            !err.contains("is required"),
+            "a supplied key must not be reported as required: {err}"
+        );
+        assert!(!validator.is_valid(&config), "schema must reject {wrong}");
+    }
+
+    // A present empty string is empty, not absent.
+    let empty = with_endpoint(json!(""));
+    let err = try_make(empty.clone())
+        .err()
+        .expect("an empty endpoint_url must fail admission");
+    assert!(err.contains("must not be empty"), "{err}");
+    assert!(!err.contains("is required"), "{err}");
+    assert!(!validator.is_valid(&empty), "minLength: 1 must reject \"\"");
+
+    // An omitted key keeps the required-key diagnostic.
+    let omitted = json!({
+        "default_action": "deny",
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": { "timeout_ms": 1500 }
+    });
+    let err = try_make(omitted.clone())
+        .err()
+        .expect("an omitted endpoint_url must fail admission");
+    assert!(err.contains("'approval.endpoint_url' is required"), "{err}");
+    assert!(!validator.is_valid(&omitted));
+
+    // A valid URL is unchanged.
+    assert_admission_parity(
+        &validator,
+        &with_endpoint(json!("https://approval.example/decide")),
+        true,
+        "valid endpoint_url",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Bounded per-stream observation ledgers
+//
+// The `ai_tool_governor.*` comma-delimited observation fields aggregate across
+// every completed batch of one response stream: per-batch state resets at each
+// release boundary, but the metadata slot lives until the stream terminates.
+// Without an explicit ceiling a backend that keeps emitting batches of distinct
+// tool names grows that slot for the life of the stream, and deduplication that
+// rescans the whole accumulated string per appended value makes the work grow
+// with it. Unlimited streaming is a documented response-byte setting, so no
+// wire-byte ceiling can serve as the bound.
+// ---------------------------------------------------------------------------
+
+/// A streaming config that permits every observed call, so successive batches
+/// are released and folded into the per-stream ledger rather than cut.
+fn streaming_ledger_config() -> Value {
+    json!({
+        "default_action": "allow",
+        "tools": { "keep": { "action": "allow" } },
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+    })
+}
+
+/// One complete OpenAI-shaped streaming tool-call batch: the `tool_calls` delta
+/// plus the `finish_reason` frame that closes it.
+fn sse_tool_call_batch(index: usize, name: &str) -> String {
+    format!(
+        concat!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,",
+            "\"id\":\"call_{index}\",\"function\":{{\"name\":\"{name}\",",
+            "\"arguments\":\"{{}}\"}}}}]}}}}]}}\n\n",
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},",
+            "\"finish_reason\":\"tool_calls\"}}]}}\n\n"
+        ),
+        index = index,
+        name = name
+    )
+}
+
+/// Drive `batches` complete tool-call batches through one stream and fold the
+/// per-stream slot into `ctx.metadata`, as the terminal hook does in production.
+async fn drive_ledger_stream(plugin: Arc<AiToolGovernor>, body: String) -> RequestContext {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut ctx = create_test_context();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("stream inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+    assert!(!terminated, "every batch is permitted, so nothing is cut");
+    drop(inspector);
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(out.len() as u64))
+        .await;
+    assert_eq!(
+        plugin.pending_stream_metadata_len(),
+        0,
+        "the terminal hook must release the per-stream slot"
+    );
+    ctx
+}
+
+/// A stream of distinct tool names stops at the entry cap and says how many
+/// distinct observations it dropped, instead of retaining all of them.
+#[tokio::test]
+async fn streaming_observation_ledger_is_capped_and_counts_omissions() {
+    let plugin = Arc::new(make(streaming_ledger_config()));
+    let cap = AiToolGovernor::max_metadata_ledger_entries();
+    let batches = cap + 25;
+    let mut body = String::new();
+    for index in 0..batches {
+        body.push_str(&sse_tool_call_batch(index, &format!("tool_{index}")));
+    }
+    body.push_str("data: [DONE]\n\n");
+
+    let ctx = drive_ledger_stream(plugin, body).await;
+
+    let names = ctx
+        .metadata
+        .get("ai_tool_governor.tool_names")
+        .expect("a governed stream must record its tool names");
+    let entries: Vec<&str> = names.split(',').collect();
+    assert_eq!(entries.len(), cap, "the ledger must stop at its entry cap");
+    assert!(
+        names.len() <= AiToolGovernor::max_metadata_ledger_bytes(),
+        "the ledger must stay inside its byte budget: {} bytes",
+        names.len()
+    );
+    assert_eq!(entries[0], "tool_0", "the earliest observations are kept");
+    assert_eq!(entries[cap - 1], format!("tool_{}", cap - 1));
+    assert!(
+        !names.contains(&format!("tool_{}", batches - 1)),
+        "a value past the cap must not be retained"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get(AiToolGovernor::observations_omitted_key())
+            .map(String::as_str),
+        Some((batches - cap).to_string().as_str()),
+        "a capped ledger must report exactly how many distinct values it dropped"
+    );
+    // Enforcement and the aggregate decision are untouched by truncation.
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.decision")
+            .map(String::as_str),
+        Some("allow")
+    );
+}
+
+/// Repeats collapse: an arbitrarily long stream that keeps naming the SAME tool
+/// retains one entry and omits nothing, so deduplication is what bounds it —
+/// not the cap.
+#[tokio::test]
+async fn repeated_stream_observations_dedup_without_growing_the_ledger() {
+    let plugin = Arc::new(make(streaming_ledger_config()));
+    let batches = AiToolGovernor::max_metadata_ledger_entries() * 4;
+    let mut body = String::new();
+    for index in 0..batches {
+        body.push_str(&sse_tool_call_batch(index, "repeat_tool"));
+    }
+    body.push_str("data: [DONE]\n\n");
+
+    let ctx = drive_ledger_stream(plugin, body).await;
+
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.tool_names")
+            .map(String::as_str),
+        Some("repeat_tool"),
+        "{batches} identical observations must collapse to one entry"
+    );
+    // Every batch carried the same `{}` arguments, so its hash repeats too.
+    let hashes = ctx
+        .metadata
+        .get("ai_tool_governor.arguments_hashes")
+        .expect("hash_arguments defaults on");
+    assert!(
+        !hashes.contains(','),
+        "identical arguments must record one hash: {hashes}"
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key(AiToolGovernor::observations_omitted_key()),
+        "nothing was dropped, so no omission count belongs in the summary"
+    );
+}
+
+/// An individual observed value is bounded too: tool names come from the
+/// governed payload and carry no length limit of their own.
+#[tokio::test]
+async fn long_observed_tool_name_is_truncated_with_a_marker() {
+    let plugin = make(json!({
+        "default_action": "allow",
+        "tools": { "keep": { "action": "allow" } }
+    }));
+    let max = AiToolGovernor::max_metadata_value_bytes();
+    let marker = AiToolGovernor::metadata_value_truncation_marker();
+    let long_name = "z".repeat(max * 2);
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(
+                &mut ctx,
+                200,
+                &mut json_headers(),
+                &response_with_tool_call(&long_name, "{}"),
+            )
+            .await,
+    );
+
+    let names = ctx
+        .metadata
+        .get("ai_tool_governor.tool_names")
+        .expect("an allowed call still records its name");
+    assert_eq!(
+        names,
+        &format!("{}{marker}", "z".repeat(max)),
+        "a long name must be stored as a marked, bounded prefix"
+    );
+    assert!(
+        names.len() < long_name.len(),
+        "the retained value must be shorter than the observed one"
+    );
+}
+
+/// Turning metadata off keeps the whole ledger — omission count included — out
+/// of the transaction summary, and allocates no per-stream slot to bound.
+#[tokio::test]
+async fn disabled_metadata_records_no_observation_ledger() {
+    let mut config = streaming_ledger_config();
+    config["observability"] = json!({ "emit_metadata": false });
+    let plugin = Arc::new(make(config));
+    let batches = AiToolGovernor::max_metadata_ledger_entries() + 5;
+    let mut body = String::new();
+    for index in 0..batches {
+        body.push_str(&sse_tool_call_batch(index, &format!("tool_{index}")));
+    }
+    body.push_str("data: [DONE]\n\n");
+
+    let ctx = drive_ledger_stream(plugin, body).await;
+
+    let governor_keys: Vec<&String> = ctx
+        .metadata
+        .keys()
+        .filter(|key| key.starts_with("ai_tool_governor."))
+        .collect();
+    assert!(
+        governor_keys.is_empty(),
+        "emit_metadata: false must publish nothing: {governor_keys:?}"
+    );
+}

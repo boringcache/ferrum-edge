@@ -6299,6 +6299,18 @@ the documented `allow` opt-out forwards it. Both settings record the fixed
 observation without claiming a decision, so the case is never silent in either
 mode.
 
+**Bounded observation metadata.** The cumulative comma-delimited fields
+(`tool_names`, `policy_ids`, `approval_id`, `arguments_hashes`,
+`redacted_tools`) aggregate across every governed surface of a request and
+every completed batch of a response stream, so each is capped at 64 distinct
+values and 8192 bytes, with individual values retained to 256 bytes. A stream
+that keeps emitting distinct tool names cannot grow that state without limit —
+unlimited streaming is a documented response-byte setting, so no wire-byte
+ceiling bounds it. Dropped distinct values are counted in
+`ai_tool_governor.observations_omitted`; enforcement, the sticky highest
+`decision`, and the maximum `risk` are unaffected. See the guide's
+[observability metadata](plugins/ai_tool_governor.md#observability-metadata).
+
 ### `ai_transcript_audit`
 
 In redacted captures, malformed JSON in `tool_calls[].function.arguments` is replaced wholesale with the fixed `[UNPARSEABLE]` marker. The captured function object carries `arguments_redaction_failed: true` to record that field-name redaction could not be applied. No original argument bytes are retained in the excerpt; valid argument JSON still receives member-name redaction. This applies to buffered JSON and reassembled streaming tool calls. The explicit raw `full_body` mode is unchanged.
