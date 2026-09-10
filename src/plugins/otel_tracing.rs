@@ -2118,7 +2118,8 @@ async fn deliver_trace_payload(
         let Some(http) = cfg.http_client.get().ok() else {
             warn_sampled!(
                 "{} export batch discarded: plugin HTTP client unavailable ({} spans lost)",
-                cfg.provider_name, entry_count,
+                cfg.provider_name,
+                entry_count,
             );
             return;
         };
@@ -2155,12 +2156,18 @@ async fn deliver_trace_payload(
                 let status = response.status();
                 warn_sampled!(
                     "{} export failed with status {} for {} (attempt {}/{})",
-                    cfg.provider_name, status, cfg.endpoint_for_logs, attempt, total_attempts,
+                    cfg.provider_name,
+                    status,
+                    cfg.endpoint_for_logs,
+                    attempt,
+                    total_attempts,
                 );
                 if !trace_status_is_retryable(cfg.payload_kind, status) {
                     warn_sampled!(
                         "{} export batch discarded due to {} response ({} spans lost)",
-                        cfg.provider_name, status, entry_count,
+                        cfg.provider_name,
+                        status,
+                        entry_count,
                     );
                     return;
                 }
@@ -2169,7 +2176,10 @@ async fn deliver_trace_payload(
             Err(e) => {
                 warn_sampled!(
                     "{} export failed: {} (attempt {}/{})",
-                    cfg.provider_name, e, attempt, total_attempts,
+                    cfg.provider_name,
+                    e,
+                    attempt,
+                    total_attempts,
                 );
             }
         }
@@ -2182,7 +2192,9 @@ async fn deliver_trace_payload(
 
     warn_sampled!(
         "{} export batch discarded after {} attempts ({} spans lost)",
-        cfg.provider_name, total_attempts, entry_count,
+        cfg.provider_name,
+        total_attempts,
+        entry_count,
     );
 }
 

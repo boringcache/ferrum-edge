@@ -2557,10 +2557,7 @@ async fn claimed_body_rewrite_marks_capacity_refusal_distinct_from_noop() {
         .expect("each refusal retains its debug diagnostic");
     assert!(rejection.contains("response_transformer"), "{logs}");
     assert!(rejection.contains("proxy_id="), "{logs}");
-    assert!(
-        rejection.contains("produced_bytes_at_least=210"),
-        "{logs}"
-    );
+    assert!(rejection.contains("produced_bytes_at_least=210"), "{logs}");
     assert!(rejection.contains("ceiling=40"), "{logs}");
     assert!(
         !logs.contains(&"x".repeat(200)),

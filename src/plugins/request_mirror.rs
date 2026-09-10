@@ -2648,7 +2648,9 @@ impl Plugin for RequestMirror {
                 // failure now that the target URL is known.
                 warn_sampled!(
                     "request_mirror: dropped mirror request for {} {} at pre-buffer admission: {}",
-                    method, mirror_url_for_log, reason
+                    method,
+                    mirror_url_for_log,
+                    reason
                 );
                 ctx.push_mirror_result_rx(completed_mirror_result(mirror_failure_meta(
                     self.plugin_config_id.clone(),
@@ -2668,7 +2670,8 @@ impl Plugin for RequestMirror {
                     self.metrics.bump_concurrency_drop();
                     warn_sampled!(
                         "request_mirror: dropping mirror request for {} {} because max_in_flight limit was reached",
-                        method, mirror_url_for_log
+                        method,
+                        mirror_url_for_log
                     );
                     ctx.push_mirror_result_rx(completed_mirror_result(mirror_failure_meta(
                         self.plugin_config_id.clone(),
@@ -2729,7 +2732,9 @@ impl Plugin for RequestMirror {
                 self.metrics.bump_budget_drop();
                 warn_sampled!(
                     "request_mirror: dropped mirror request for {} {} after body collection: {}",
-                    method, mirror_url_for_log, reason
+                    method,
+                    mirror_url_for_log,
+                    reason
                 );
                 drop(permit);
                 ctx.push_mirror_result_rx(completed_mirror_result(mirror_failure_meta(
@@ -2905,7 +2910,10 @@ impl Plugin for RequestMirror {
                             warn_sampled!(
                                 "request_mirror: response from {} truncated at {} bytes \
                                      (max_response_body_bytes = {}; advertised = {:?})",
-                                mirror_url_for_log, observed, max_response_body_bytes, advertised
+                                mirror_url_for_log,
+                                observed,
+                                max_response_body_bytes,
+                                advertised
                             );
                             (Some(observed), None)
                         }
@@ -2939,7 +2947,9 @@ impl Plugin for RequestMirror {
                     }
                     warn_sampled!(
                         "request_mirror: failed to mirror {} {} → {}",
-                        method, mirror_url_for_log, err
+                        method,
+                        mirror_url_for_log,
+                        err
                     );
                     (None, None, None, Some(err))
                 }

@@ -658,7 +658,8 @@ impl Oauth2Introspection {
         let Some(resolved) = guard.as_ref().as_ref() else {
             warn_sampled!(
                 plugin = "oauth2_introspection",
-                provider_idx, "introspection endpoint unresolved"
+                provider_idx,
+                "introspection endpoint unresolved"
             );
             return Err(IntrospectionDecision::Unavailable);
         };
@@ -672,7 +673,8 @@ impl Oauth2Introspection {
             .map_err(|_| {
                 warn_sampled!(
                     plugin = "oauth2_introspection",
-                    provider_idx, "provider introspection concurrency limit reached"
+                    provider_idx,
+                    "provider introspection concurrency limit reached"
                 );
                 IntrospectionDecision::Unavailable
             })?;
@@ -683,7 +685,8 @@ impl Oauth2Introspection {
             .map_err(|_| {
                 warn_sampled!(
                     plugin = "oauth2_introspection",
-                    provider_idx, "global introspection concurrency limit reached"
+                    provider_idx,
+                    "global introspection concurrency limit reached"
                 );
                 IntrospectionDecision::Unavailable
             })?;
@@ -823,7 +826,8 @@ impl Oauth2Introspection {
             Some(_) => {
                 warn_sampled!(
                     plugin = "oauth2_introspection",
-                    provider_idx, "token introspection response has a non-string token_type member"
+                    provider_idx,
+                    "token introspection response has a non-string token_type member"
                 );
                 return Err(IntrospectionDecision::Unavailable);
             }

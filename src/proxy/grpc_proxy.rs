@@ -5203,9 +5203,7 @@ pub(crate) async fn proxy_grpc_request_core(
             .await
             .map_err(|_| {
                 if response_deadline_is_client {
-                    warn_sampled!(
-                        "gRPC client deadline exceeded while collecting response body"
-                    );
+                    warn_sampled!("gRPC client deadline exceeded while collecting response body");
                     GrpcProxyError::ClientDeadlineExceeded(
                         "gRPC deadline exceeded while collecting response body".to_string(),
                     )

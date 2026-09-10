@@ -27464,7 +27464,8 @@ async fn transform_buffered_response_body_with_deadline_inner(
             ) {
                 warn_sampled!(
                     plugin = plugin.name(),
-                    reason, "Response body transform refused before invoking the producer"
+                    reason,
+                    "Response body transform refused before invoking the producer"
                 );
                 replace_buffered_response_with_capacity_refusal(
                     ctx,
@@ -41345,7 +41346,8 @@ pub(crate) async fn proxy_to_backend_retry(
             ) {
                 warn_sampled!(
                     "Backend response body ({} bytes) exceeds limit ({} bytes)",
-                    len, effective_max_response_body_size_bytes
+                    len,
+                    effective_max_response_body_size_bytes
                 );
                 return retry::BackendResponse {
                     status_code: 502,
@@ -45225,7 +45227,8 @@ async fn proxy_to_backend(
                 ) {
                     warn_sampled!(
                         "Backend response body ({} bytes) exceeds limit ({} bytes)",
-                        len, effective_max_response_body_size_bytes
+                        len,
+                        effective_max_response_body_size_bytes
                     );
                     return backend_dispatch_response(
                         retry::BackendResponse {
@@ -47594,9 +47597,7 @@ fn grpc_web_reframe_capacity_terminal(
     response_headers: &mut HashMap<String, String>,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) {
-    warn_sampled!(
-        "gRPC-Web trailer reframing refused: retained-response capacity unavailable"
-    );
+    warn_sampled!("gRPC-Web trailer reframing refused: retained-response capacity unavailable");
     replace_buffered_response_with_capacity_refusal(
         ctx,
         response_status,

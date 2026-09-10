@@ -656,9 +656,7 @@ impl CompressionPlugin {
         limits: DecodeLimits,
     ) -> Result<Vec<u8>, RequestDecodeRefusal> {
         let Ok(permit) = try_acquire_codec_permit() else {
-            warn_sampled!(
-                "compression: codec admission saturated while decoding request body"
-            );
+            warn_sampled!("compression: codec admission saturated while decoding request body");
             return Err(RequestDecodeRefusal::CodecUnavailable);
         };
         let decoded = tokio::task::spawn_blocking(move || {
@@ -678,18 +676,14 @@ impl CompressionPlugin {
                 // aggregate budget simply had no room for this decode's working
                 // set. Counting it as a codec fault would misreport capacity
                 // pressure as corruption.
-                warn_sampled!(
-                    "compression: request-decode budget refused the decode working set"
-                );
+                warn_sampled!("compression: request-decode budget refused the decode working set");
                 Err(RequestDecodeRefusal::DecodeCapacity)
             }
             Ok(Err(_)) => {
                 CODEC_WORKER_FAILURES.fetch_add(1, Ordering::Relaxed);
                 // Fixed-cardinality: never interpolate the coding token or any
                 // decoder detail derived from client bytes.
-                warn_sampled!(
-                    "compression: rejecting request with undecodable Content-Encoding"
-                );
+                warn_sampled!("compression: rejecting request with undecodable Content-Encoding");
                 Err(RequestDecodeRefusal::Representation)
             }
             Err(_) => {
@@ -2418,9 +2412,7 @@ impl Plugin for CompressionPlugin {
         // header or against `identity;q=0`.
         let Ok(permit) = try_acquire_codec_permit() else {
             drop(buffer_permit);
-            warn_sampled!(
-                "compression: codec admission saturated while encoding response body"
-            );
+            warn_sampled!("compression: codec admission saturated while encoding response body");
             ctx.mark_compression_response_encode_aborted();
             return None;
         };

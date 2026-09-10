@@ -1,4 +1,6 @@
-use ferrum_edge::plugins::utils::log_sampling::{WARNING_INTERVAL_MS, WarningSampler, warn_sampled};
+use ferrum_edge::plugins::utils::log_sampling::{
+    WARNING_INTERVAL_MS, WarningSampler, warn_sampled,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
