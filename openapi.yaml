@@ -24138,15 +24138,16 @@ components:
           type: integer
           format: uint64
           minimum: 1
-          description: "EventSource reconnection hint in milliseconds (must be >= 1 when set)"
+          maximum: 18446744073709551615
+          description: "EventSource reconnection hint in milliseconds, prepended as a retry: field when wrapping. Admitted over the JSON numeric VALUE, so an exact integer-valued number (2500.0) is accepted exactly as 2500 is; fractional values and magnitudes outside the unsigned 64-bit range above are rejected."
         force_sse_content_type:
           type: boolean
           default: false
-          description: "Force Content-Type: text/event-stream even if backend returns something else"
+          description: "Force Content-Type: text/event-stream even if backend returns something else. Not applied to a response carrying Cache-Control: no-transform (RFC 9110 section 7.7 forbids an intermediary changing Content-Type on one)."
         wrap_non_sse_responses:
           type: boolean
           default: false
-          description: "Wrap non-SSE response bodies in data: ...\\n\\n SSE event framing (enables response buffering). Implies client-visible text/event-stream for wrapped responses and composes with force_sse_content_type."
+          description: "Wrap non-SSE response bodies in data: ...\\n\\n SSE event framing (enables response buffering). Implies client-visible text/event-stream for wrapped responses and composes with force_sse_content_type. Wrapping and its relabel are declined together — the origin representation is forwarded unchanged — for 206/226 responses, responses carrying Cache-Control: no-transform (RFC 9110 section 7.7, which also blocks force_sse_content_type), and bodies under a non-identity Content-Encoding. A framed event that exceeds the effective response-body ceiling returns the gateway capacity refusal instead of the unframed body."
 
     RateLimitingRuleConfig:
       type: object
@@ -26902,15 +26903,27 @@ components:
         max_depth:
           type: integer
           format: uint32
-          description: Maximum allowed query nesting depth
+          minimum: 0
+          maximum: 4294967295
+          description: >-
+            Maximum allowed query nesting depth. Admission requires an unsigned
+            integer that fits in 32 bits, so the inclusive range is 0-4294967295.
         max_complexity:
           type: integer
           format: uint32
-          description: Maximum allowed field count
+          minimum: 0
+          maximum: 4294967295
+          description: >-
+            Maximum allowed field count. Admission requires an unsigned integer
+            that fits in 32 bits, so the inclusive range is 0-4294967295.
         max_aliases:
           type: integer
           format: uint32
-          description: Maximum allowed alias count
+          minimum: 0
+          maximum: 4294967295
+          description: >-
+            Maximum allowed alias count. Admission requires an unsigned integer
+            that fits in 32 bits, so the inclusive range is 0-4294967295.
         introspection_allowed:
           type: boolean
           default: true

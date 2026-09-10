@@ -4746,10 +4746,23 @@ Server-Sent Events stream handler. Validates inbound SSE client criteria, shapes
 
 1. **`on_request_received`** — Validates SSE client conformance: rejects non-GET with 405 + `Allow: GET`, rejects missing/wrong `Accept` with 406, bounds `Last-Event-ID` (max 1024 bytes) and stashes it for backend forwarding. The raw ID is omitted from transaction logs (`sse:leid_present` / `sse:leid_bytes` correlation only) and never interpolated into diagnostics.
 2. **`before_proxy`** — Strips `Accept-Encoding` to prevent compressed responses from breaking SSE line-delimited framing. Forwards `Last-Event-ID` header to the backend.
-3. **`after_proxy`** — Conservatively merges `Cache-Control` with `no-cache` without removing origin `private` / `no-store` / `no-transform` / extensions. Adds `X-Accel-Buffering: no`. Strips `Content-Length`. Does **not** emit `Connection: keep-alive` (illegal on HTTP/2 and HTTP/3; unnecessary on HTTP/1.1). Relabels non-SSE responses as `text/event-stream` when `force_sse_content_type` is set and/or when `wrap_non_sse_responses` will convert the body.
+3. **`after_proxy`** — Conservatively merges `Cache-Control` with `no-cache` without removing origin `private` / `no-store` / `no-transform` / extensions. Adds `X-Accel-Buffering: no`. Strips `Content-Length`. Does **not** emit `Connection: keep-alive` (illegal on HTTP/2 and HTTP/3; unnecessary on HTTP/1.1). Relabels non-SSE responses as `text/event-stream` when `force_sse_content_type` is set and/or when `wrap_non_sse_responses` will convert the body — and declines both for the representations listed under [Representations wrapping declines](#representations-wrapping-declines).
 4. **`transform_response_body`** — Optionally wraps non-SSE response bodies in `data: ...\n\n` SSE event framing (buffered responses only), preserving terminal line-break semantics for EventSource `MessageEvent.data`. Wrapping uses the request-scoped wrap decision from `after_proxy`, so it composes with content-type forcing instead of canceling it.
 
-**Config admission:** Config must be a JSON object. Unknown keys are rejected. Explicit `null` members are rejected; omitted keys keep defaults. `retry_ms` must be an integer ≥ 1 when set.
+**Config admission:** Config must be a JSON object. Unknown keys are rejected. Explicit `null` members are rejected; omitted keys keep defaults. `retry_ms` must be an unsigned 64-bit integer ≥ 1 when set. Admission is over the JSON numeric **value**, matching the published `SseConfig` schema (JSON Schema `type: integer` admits `2500.0` exactly as it admits `2500`), so an exact integer-valued number is accepted while fractional values and magnitudes outside the `minimum`/`maximum` pair are rejected on both sides.
+
+#### Representations wrapping declines
+
+`wrap_non_sse_responses` rewrites both the body and its media type, so it is refused outright — relabel included — for a representation it cannot convert. The decision happens in `after_proxy`, before any header is touched, so the client receives the origin's own representation instead of reframed bytes under an event-stream label:
+
+| Origin response | Outcome |
+|---|---|
+| `206 Partial Content` / `226 IM Used` | Forwarded unchanged; a fragment is not a complete event |
+| `Cache-Control: no-transform` | Forwarded unchanged (RFC 9110 §7.7). This also suppresses `force_sse_content_type`, which §7.7 lists among the fields a `no-transform` response forbids changing. The directive is read from the pristine pre-`after_proxy` snapshot, so a later header rule that strips it cannot unlock wrapping. A `no-transform` token inside a quoted extension value is not the directive |
+| Non-identity `Content-Encoding` | Forwarded unchanged; compressed octets are not the UTF-8 text `data:` framing describes. `strip_accept_encoding` (default on) is what normally prevents this |
+| Genuine `text/event-stream` | Streamed, never double-wrapped — including when retries are configured |
+
+A framed event that would exceed the effective response-body ceiling is a different outcome: the rewrite was claimed and could not be produced, so the shared gateway capacity refusal owns the response rather than the unconverted body being published under the `text/event-stream` label already selected.
 
 **Request validation:**
 
@@ -4770,11 +4783,11 @@ Server-Sent Events stream handler. Validates inbound SSE client criteria, shapes
 |---|---|---|---|
 | `add_no_buffering_header` | bool | `true` | Add `X-Accel-Buffering: no` to disable nginx/ALB buffering |
 | `strip_content_length` | bool | `true` | Remove `Content-Length` from the initial response map (SSE streams are indefinite). `false` no longer leaves one on the wire: [final response framing](#final-response-framing) removes `Content-Length` from every ordinary streamed response. The flag still governs whether `content-length` joins this instance's response-trailer policy names and whether the gateway's own declared-length accounting sees the backend value. |
-| `retry_ms` | u64 | _(none)_ | EventSource reconnection hint (ms), prepended as `retry:` when wrapping; must be ≥ 1 |
+| `retry_ms` | u64 | _(none)_ | EventSource reconnection hint (ms), prepended as `retry:` when wrapping; must be ≥ 1 and within the unsigned 64-bit range |
 | `force_sse_content_type` | bool | `false` | Force `Content-Type: text/event-stream` even if backend returns something else |
-| `wrap_non_sse_responses` | bool | `false` | Wrap non-SSE response bodies in `data: ...\n\n` SSE event framing; implies client-visible `text/event-stream` for wrapped responses |
+| `wrap_non_sse_responses` | bool | `false` | Wrap non-SSE response bodies in `data: ...\n\n` SSE event framing; implies client-visible `text/event-stream` for wrapped responses. See [Representations wrapping declines](#representations-wrapping-declines) |
 
-**Note:** When `wrap_non_sse_responses` is enabled, the plugin requires response body buffering and delivers a correctly framed `text/event-stream` response (composing with `force_sse_content_type`). When disabled (default), the response streams through with zero overhead — ideal for backends that already emit `text/event-stream`. Genuine upstream `text/event-stream` bodies are never double-wrapped. Wrapping normalizes CR/CRLF to LF and preserves terminal newlines in `MessageEvent.data` (lossy UTF-8 replacement of invalid bytes is separate from newline fidelity).
+**Note:** When `wrap_non_sse_responses` is enabled, the plugin requires response body buffering and delivers a correctly framed `text/event-stream` response (composing with `force_sse_content_type`). When disabled (default), the response streams through with zero overhead — ideal for backends that already emit `text/event-stream`. Genuine upstream `text/event-stream` bodies are never double-wrapped: buffering is released as soon as the backend response headers prove the origin selected an event stream, including on a retry-enabled proxy and on the HTTP/3 → HTTP bridge. Wrapping normalizes CR/CRLF to LF and preserves terminal newlines in `MessageEvent.data` (lossy UTF-8 replacement of invalid bytes is separate from newline fidelity).
 
 ```yaml
 config:
@@ -5433,9 +5446,9 @@ Request buffering is only enabled when at least one GraphQL policy is configured
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_depth` | u32 (optional) | — | Maximum allowed query nesting depth |
-| `max_complexity` | u32 (optional) | — | Maximum allowed field count |
-| `max_aliases` | u32 (optional) | — | Maximum allowed alias count |
+| `max_depth` | u32 (optional) | — | Maximum allowed query nesting depth. Inclusive range `0..=4294967295`; negative values and values above `4294967295` are rejected at plugin load time |
+| `max_complexity` | u32 (optional) | — | Maximum allowed field count. Inclusive range `0..=4294967295`; negative values and values above `4294967295` are rejected at plugin load time |
+| `max_aliases` | u32 (optional) | — | Maximum allowed alias count. Inclusive range `0..=4294967295`; negative values and values above `4294967295` are rejected at plugin load time |
 | `introspection_allowed` | bool | `true` | Whether introspection queries are permitted. Only `false` counts as an effective protection rule; the default `true` does not. |
 | `limit_by` | String | `ip` | Rate limit key: exact lowercase `ip` or `consumer`. Other values are rejected at plugin load time. |
 | `type_rate_limits` | Object | `{}` | Rate limits by operation type. Only exact lowercase `query`, `mutation`, and `subscription` keys are accepted; unknown keys are rejected. |
@@ -5451,7 +5464,7 @@ Request buffering is only enabled when at least one GraphQL policy is configured
 | `redis_password` | String (optional) | — | Redis password |
 | `redis_failure_policy` | String | `fail_closed` | Behavior when the centralized store cannot be consulted (outage, egress/DNS screen failure, or an endpoint rejected as Redis Cluster). `fail_closed` refuses with `503`; `local_fallback` explicitly opts into per-process budgets for availability. Only meaningful when `sync_mode: "redis"`, but validated in either mode |
 
-Each rate limit entry: `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive integer JSON values (`2`, not `2.0`) — missing, zero, or unknown keys are rejected at plugin load time so a typo cannot silently disable a rate limit. The same integer-encoding rule applies to the top-level numeric limits and Redis pool/timeout settings.
+Each rate limit entry: `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive integer JSON values (`2`, not `2.0`) — missing, zero, or unknown keys are rejected at plugin load time so a typo cannot silently disable a rate limit. Both fields are also bounded above by the shared rate-limit maxima, and both bounds apply identically to `type_rate_limits` and `operation_rate_limits` entries: `max_requests` accepts the inclusive range `1..=1000000` (an operational budget ceiling) and `window_seconds` the inclusive range `1..=2678400` (31 days, so the window stays representable as a monotonic duration and a signed Redis TTL). The same integer-encoding rule applies to the top-level numeric limits and Redis pool/timeout settings.
 
 The plugin requires at least one effective rule (`max_depth`, `max_complexity`, `max_aliases`, `introspection_allowed: false`, a non-empty `type_rate_limits`, or a non-empty `operation_rate_limits`) — an empty or no-op config is rejected. Unknown top-level keys are rejected so misspelled introspection, identity, rate-map, or Redis synchronization fields cannot silently fall back to defaults.
 
