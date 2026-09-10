@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use base64::Engine as _;
+use ferrum_edge::_test_support::request_credential_deadline_at;
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::AuthMode;
@@ -364,6 +365,66 @@ async fn active_token_sets_authenticated_identity_when_no_consumer_match() {
     assert_continue(result);
     assert_eq!(ctx.authenticated_identity.as_deref(), Some("external-user"));
     assert_eq!(ctx.auth_method, Some("oauth2_introspection"));
+}
+
+#[tokio::test]
+async fn active_token_with_a_far_future_exp_publishes_no_credential_deadline() {
+    // Issue #5420: an introspection `exp` further out than a monotonic
+    // `Instant` can express describes a valid long-lived grant. It must admit
+    // with NO bound rather than with one that has already elapsed.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "active": true,
+            "username": "external-user",
+            "exp": i64::MAX
+        })))
+        .mount(&server)
+        .await;
+
+    let endpoint = format!("{}/introspect", server.uri());
+    let plugin = Oauth2Introspection::new(&config(&endpoint), PluginHttpClient::default()).unwrap();
+    let mut ctx = make_ctx("far-future-exp-token");
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+
+    assert_continue(result);
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("external-user"));
+    assert_eq!(
+        request_credential_deadline_at(&ctx),
+        None,
+        "a far-future introspection `exp` must publish no monotonic bound \
+         rather than one that already elapsed"
+    );
+}
+
+#[tokio::test]
+async fn active_token_with_a_representable_exp_still_publishes_a_deadline() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "active": true,
+            "username": "external-user",
+            "exp": 9_999_999_999u64
+        })))
+        .mount(&server)
+        .await;
+
+    let endpoint = format!("{}/introspect", server.uri());
+    let plugin = Oauth2Introspection::new(&config(&endpoint), PluginHttpClient::default()).unwrap();
+    let mut ctx = make_ctx("bounded-exp-token");
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+
+    assert_continue(result);
+    assert!(
+        request_credential_deadline_at(&ctx).is_some(),
+        "an ordinary introspection expiry must still bound the authenticated stream"
+    );
 }
 
 #[tokio::test]
