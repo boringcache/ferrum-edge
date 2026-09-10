@@ -25,6 +25,7 @@ use ferrum_edge::retry::{
     intern_http_observability_error_class,
 };
 use serde_json::json;
+use serial_test::serial;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -1546,6 +1547,7 @@ async fn test_histogram_multiple_observations() {
 }
 
 #[tokio::test]
+#[serial(prometheus_global_registry)]
 async fn test_plugin_log_hook_records_metrics() {
     // Use a fresh registry via the plugin's log hook
     let config = json!({});
@@ -3053,6 +3055,7 @@ fn test_construction_does_not_mutate_live_registry_policy() {
 }
 
 #[test]
+#[serial(prometheus_global_registry)]
 fn test_validate_plugin_config_does_not_publish_registry_tunables() {
     let registry = global_registry();
     let snapshot = snapshot_global_registry_policy();
@@ -3149,6 +3152,7 @@ fn invalid_key_auth_plugin_config() -> PluginConfig {
 }
 
 #[test]
+#[serial(prometheus_global_registry)]
 fn test_rejected_plugin_cache_rebuild_leaves_registry_policy_untouched() {
     let registry = global_registry();
     let snapshot = snapshot_global_registry_policy();
@@ -3191,6 +3195,7 @@ fn test_rejected_plugin_cache_rebuild_leaves_registry_policy_untouched() {
 }
 
 #[test]
+#[serial(prometheus_global_registry)]
 fn test_rejected_plugin_cache_delta_leaves_registry_policy_untouched() {
     let registry = global_registry();
     let snapshot = snapshot_global_registry_policy();
