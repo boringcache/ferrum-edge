@@ -3967,6 +3967,15 @@ impl StreamWindowEngine {
             .saturating_sub(self.retained_bytes());
         let capacity = input_capacity.min(retained_capacity);
         if capacity == 0 {
+            // Drain the held backlog before treating an un-terminated `carry` as
+            // an overflow: it is only oversized once nothing else is retained.
+            if !self.held.is_empty() {
+                return IngestStep {
+                    consumed: 0,
+                    progressed: false,
+                    window_ready: self.window_ready(false, true),
+                };
+            }
             if !self.carry.is_empty() {
                 let raw = std::mem::take(&mut self.carry);
                 self.absorb_event(raw, true);
@@ -3995,7 +4004,19 @@ impl StreamWindowEngine {
         // complete event is absorbed by the `carry` branch on the next step, so
         // its budget projection sees only what is actually retained.
         let boundary = next_event_boundary_in_chunk(&self.carry, chunk);
-        let consumed = boundary.unwrap_or(chunk.len()).min(capacity);
+        let wanted = boundary.unwrap_or(chunk.len());
+        if wanted > capacity && !self.held.is_empty() {
+            // The bytes this step wants do not fit what the held backlog left
+            // over. Releasing first restores the full window budget, so an event
+            // that only overflowed because earlier events were still held is not
+            // force-flushed as a partial, uninspectable one.
+            return IngestStep {
+                consumed: 0,
+                progressed: false,
+                window_ready: self.window_ready(false, true),
+            };
+        }
+        let consumed = wanted.min(capacity);
         self.carry.extend_from_slice(&chunk[..consumed]);
         if next_event_end(&self.carry).is_none()
             && (self.input_window_bytes() >= self.config.max_window_bytes
