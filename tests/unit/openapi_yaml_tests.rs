@@ -3044,12 +3044,59 @@ fn ai_federation_schema_publishes_security_fields_and_rejects_unknown_keys() {
         json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "model_mapping": {"gpt-../unsafe": "gpt-4o"}}]}),
         json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "max_response_body_bytes": 0}]}),
         json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "max_response_body_bytes": 67_108_865}]}),
+        // Issue #5260: the component used to admit configurations the
+        // constructor rejects, so `validate` reported success for a file that
+        // could never load. An empty or absent static credential is a
+        // configuration error for every provider type that reads one.
+        json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": ""}]}),
+        json!({"providers": [{"name": "p", "provider_type": "anthropic"}]}),
+        json!({"providers": [{"name": "p", "provider_type": "google_vertex", "google_project_id": "proj", "google_region": "us-central1", "google_service_account_json": ""}]}),
+        // Providers that interpolate the resolved model into the endpoint path
+        // restrict every provider-native model identifier to a safe URL path
+        // component.
+        json!({"providers": [{"name": "p", "provider_type": "google_gemini", "api_key": "test", "default_model": "family/model"}]}),
+        json!({"providers": [{"name": "p", "provider_type": "aws_bedrock", "aws_region": "us-east-1", "model_mapping": {"gpt-4o": "family/model"}}]}),
+        // The endpoint path components exclude the traversal sequence exactly
+        // as `validate_url_path_component` does at load.
+        json!({"providers": [{"name": "p", "provider_type": "azure_openai", "api_key": "test", "azure_resource": "res", "azure_deployment": "v..1"}]}),
+        json!({"providers": [{"name": "p", "provider_type": "azure_openai", "api_key": "test", "azure_resource": "res", "azure_deployment": "dep", "azure_api_version": "v..1"}]}),
+        json!({"providers": [{"name": "p", "provider_type": "google_vertex", "google_project_id": "a..b", "google_region": "us-central1", "google_service_account_json": "{}"}]}),
     ] {
         assert!(
             validator.validate(&invalid).is_err(),
             "schema accepted {invalid}"
         );
     }
+
+    // The tightening must not reject what the constructor accepts: the model
+    // component rule is provider-conditional, and the credential rule does not
+    // apply to the two provider types that never read `api_key`.
+    for accepted in [
+        json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "default_model": "family/model"}]}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "model_mapping": {"gpt-4o": "family/model"}}]}),
+        json!({"providers": [{"name": "b", "provider_type": "aws_bedrock", "aws_region": "us-east-1"}]}),
+        json!({"providers": [{"name": "v", "provider_type": "google_vertex", "google_project_id": "proj", "google_region": "us-central1", "google_service_account_json": "{}"}]}),
+        json!({"providers": [{"name": "g", "provider_type": "google_gemini", "api_key": "test", "default_model": "gemini-1.5-pro"}]}),
+    ] {
+        assert!(
+            validator.validate(&accepted).is_ok(),
+            "schema rejected {accepted}"
+        );
+    }
+
+    // Issue #5262: a completed 2xx that cannot be normalized is terminal, so
+    // the component overview must not still promise priority fallback for it.
+    let description = schema["description"]
+        .as_str()
+        .expect("AiFederationConfig must document itself");
+    assert!(
+        !description.contains("malformed provider success responses"),
+        "AiFederationConfig still promises fallback after a completed malformed success"
+    );
+    assert!(
+        description.contains("response_normalization_failed"),
+        "AiFederationConfig must state that a completed 2xx normalization failure is terminal"
+    );
 }
 
 #[test]
