@@ -5416,6 +5416,15 @@ pub mod _test_support {
         }
     }
 
+    /// Mark a constructed `rate_limiting` policy's centralized store
+    /// unavailable so its next enforcement decision fails closed. `false` when
+    /// the policy is local-only and has no client to mark.
+    pub fn rate_limiting_mark_redis_unavailable_for_test(
+        plugin: &crate::plugins::rate_limiting::RateLimiting,
+    ) -> bool {
+        plugin.mark_redis_unavailable_for_test()
+    }
+
     /// Refusal a `rate_limiting` policy emits while the centralized store is
     /// unavailable: `Some((status, body))`, or `None` when it degraded to
     /// per-process admission instead of refusing.
@@ -9820,6 +9829,12 @@ pub mod _test_support {
     /// hook-ingress channel) that external coverage drives through the
     /// production datagram paths.
     pub use crate::proxy::udp_proxy::UdpAuthorizationSessionProbe;
+
+    /// A real plain-UDP session driven through the production non-blocking
+    /// client→backend admission and its bounded per-session backend-send writer
+    /// (issue #5045), with only the backend send itself injectable so a parked
+    /// send needs no sleep.
+    pub use crate::proxy::udp_proxy::{UdpEgressAdmissionForTest, UdpEgressWriterProbe};
 
     /// The fixed PRE-COMMITMENT terminal the H1/H2 dispatch funnel substitutes
     /// when a request-upload authorization expiry cancelled the backend

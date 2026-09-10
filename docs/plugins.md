@@ -3920,9 +3920,12 @@ Rejects HTTP-family requests whose `Host` / `:authority` destination is not in a
 |---|---|---|---|
 | `registry` | String[] | `[]` | Known destinations. Entries can be bare hosts (`reviews.default.svc.cluster.local`), exact host/port pairs (`reviews.default.svc.cluster.local:8080`), any-explicit-port markers (`reviews.default.svc.cluster.local:*`), or one-label wildcards (`*.example.com`, `*.example.com:443`, `*.example.com:*`). |
 | `reject_status` | u16 | `502` | HTTP 4xx/5xx status returned for unknown destinations. Use `404` when you want to mask policy details. |
-| `outbound_listen_ports` | u16[] | `[]` | Optional frontend listener ports where the registry applies. Mesh auto-injection sets this to the outbound capture listener so inbound sidecar/ambient traffic is not gated by outbound policy. Empty applies wherever the plugin runs. Port `0` is rejected at construction; use `[]` for intentional global scope. |
+| `outbound_listen_ports` | u16[] | `[]` | Optional frontend listener ports (1–65535) where the registry applies. Mesh auto-injection sets this to the outbound capture listener so inbound sidecar/ambient traffic is not gated by outbound policy. Empty applies wherever the plugin runs; use `[]` for intentional global scope. |
+| `namespace` | String | `ferrum` | Value of the `mesh_namespace` label on `ferrum_mesh_outbound_registry_decisions_total`. Mesh injection explicitly supplies the runtime namespace. Direct instances use this config value independently of the enclosing `PluginConfig` resource namespace. |
 
-Unknown top-level keys are rejected at construction (for example a misspelled `regsitry` cannot silently leave the registry empty and admit every destination).
+Unknown top-level keys (for example `regsitry`) are rejected at construction. An intentionally empty registry is valid and rejects all destinations wherever enforcement applies. Empty or whitespace-only entries are ignored, so a registry containing only those entries also fails closed.
+
+Hostname labels use ASCII letters, digits, and interior hyphens; supply internationalized names in punycode (for example `xn--bcher-kva.example`). IPv4 names and IPv6 literals are supported. Bracket IPv6 when specifying a numeric port (`[2001:db8::1]:443`); bare IPv6 and the any-port form `2001:db8::1:*` are also accepted. Numeric destination ports are decimal 1–65535, with leading zeros allowed. Surrounding whitespace, hostname case, trailing hostname dots, and IPv6 spelling are normalized. URLs, paths, userinfo, internal whitespace, malformed brackets, misplaced wildcards, and invalid ports fail construction with the zero-based `registry[index]` in the error.
 
 Bare-host registry entries match only requests whose Host header omits an explicit port. `host:port` entries match only that exact port. `host:*` entries match any explicit Host port; mesh-generated registries use this marker for services, ServiceEntries, or workload addresses with no declared ports so known destinations remain reachable when callers include `Host: service:9080`. One-label wildcards (`*.example.com`) are indexed by suffix so lookup cost does not grow with unrelated wildcard count. Decision metrics use fixed `host` buckets (`<admit_explicit>`, `<admit_wildcard>`, `<denied>`).
 
@@ -4080,6 +4083,20 @@ Each `limits[]` rule configures rate windows in one of two ways:
 1. `window_seconds` + `max_requests` — exact custom window
 2. One or more of `requests_per_second` / `requests_per_minute` / `requests_per_hour`
 
+**Schema parity.** `RateLimitingConfig` and `RateLimitingRuleConfig` in
+`openapi.yaml` encode the constructor's admission rules, so a schema-driven
+editor agrees with file and admin admission: exactly one `scope: default` rule,
+`scope: consumers` only with `limit_by: consumer`, `sync_mode: redis` requiring
+`redis_url`, positive `redis_connect_timeout_seconds` /
+`redis_health_check_interval_seconds`, a non-empty `redis_key_prefix`, unique
+identities within one `consumers` list, and the case-insensitive spellings of
+`limit_by` / `sync_mode` / `scope` (`limit_by: null` means `ip`, exactly as
+omitting it does). Three residual rules JSON Schema cannot express are enforced
+by the constructor alone and are documented on the fields themselves: one
+consumer identity named in two *different* `scope: consumers` rules, an
+out-of-range TCP port in `redis_url`, and a `redis_url` database index above the
+server's own `databases` setting.
+
 **Configuration bounds.** Every explicit `window_seconds` accepted by the
 rate-limit plugins is capped at `2678400` seconds (31 days). Ordinary HTTP,
 GraphQL, and gRPC method request caps are capped at `1000000`; zero and values
@@ -4123,8 +4140,8 @@ At least one rate window must be configured in every rule. Do not combine the cu
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:rate_limiting:{plugin-config-id}` | Redis key namespace prefix. Defaults to the gateway namespace, the plugin name, and this plugin config's stable resource id (for example `ferrum:rate_limiting:rl-public-api`), so two independent policies of this type in one namespace never share counters. Must be non-empty when set; setting it explicitly is the documented opt-in for a deliberately shared budget. |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Sizes a bounded pool of non-reconnecting `MultiplexedConnection` slots selected round-robin on the hot path; a broken slot is never silently re-dialed by redis-rs — it is cleared and re-established through Ferrum's DNS/egress/`INFO CLUSTER` screening path |
-| `redis_connect_timeout_seconds` | u64 | `5` | Effective Redis connection-attempt timeout in seconds (must be > 0). Applied to redis-rs inner connection config for cached, dedicated, and health-check paths (TCP connect, TLS handshake when enabled, Redis protocol handshake), and as the deadline for the proactive `INFO CLUSTER` topology screen on those connections. Gateway DNS screening/resolution of the Redis hostname runs before this timeout starts |
-| `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
+| `redis_connect_timeout_seconds` | u64 | `5` | Effective Redis connection-attempt timeout in seconds (must be > 0). Applied to redis-rs inner connection config for cached, dedicated, and health-check paths (TCP connect, TLS handshake when enabled, Redis protocol handshake), and as the deadline for the proactive `INFO CLUSTER` topology screen (plus the no-eviction memory screen) on those connections — the redis-rs 500 ms command-response cap is lifted for the screen and reinstalled on the connection once it is screened, so a server that answers `INFO` in 750 ms fits a configured 2-second deadline while ordinary commands stay bounded. Gateway DNS screening/resolution of the Redis hostname runs before this timeout starts |
+| `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable (must be > 0) |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | — | Redis password |
 | `redis_failure_policy` | String | `fail_closed` | Behavior when the centralized store cannot be consulted (outage, egress/DNS screen failure, or an endpoint rejected as Redis Cluster). `fail_closed` refuses with `503`; `local_fallback` explicitly opts into per-process budgets for availability. Only meaningful when `sync_mode: "redis"`, but validated in either mode |
@@ -4140,6 +4157,8 @@ At least one rate window must be configured in every rule. Do not combine the cu
 The resolved request client identity canonicalizes IPv4-mapped IPv6 to native IPv4 once before plugin execution. Every local or Redis fallback key therefore uses the same canonical text without reparsing it in each limiter.
 
 **Rate limit headers** (when `expose_headers: true`): `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-window`. Every admitted (counted) request's client-visible response carries them — including gateway-generated responses such as cache hits, response mocks, serverless short-circuits, and rejections raised by plugins that run after `rate_limiting`; requests that never reached the rate-limit check carry no metadata and get no synthesized headers. The limiter key/identity is never exposed: for `limit_by: "consumer"`/`"spiffe_identity"` it would echo the gateway's internal caller identity (consumer username) or the peer workload SVID back to the client.
+
+**Composed limiters publish one verdict.** The three header names are a single public contract, so when a route carries more than one `rate_limiting` instance exactly one instance's values are published, and the choice does not depend on plugin order. A limiter that *refuses* the request owns the header set: its `limit` / `remaining: 0` / `window` survive the shared rejection finalizer, and a sibling that admitted the same request earlier never re-publishes its positive budget over the `429`. When every limiter admitted, the tightest remaining budget wins — the same rule one instance already applies across its own windows — so the client backs off against the limit that will refuse it next. Two responses carry no rate-limit headers at all: a refusal from a limiter configured with `expose_headers: false` (that policy's verdict is that the client is told no budget), and any fail-closed `503`, where the gateway has no authoritative counter to report.
 
 Returns HTTP `429 Too Many Requests` when exceeded.
 
@@ -4199,7 +4218,7 @@ Prevents duplicate API calls by tracking idempotency keys. When a request arrive
 | `anonymous_caller_scope` | String | `"caller_address"` | How **anonymous** callers are partitioned. `caller_address` binds the gateway-resolved canonical peer address; a request whose canonical address cannot be parsed is not deduplicated (and is refused with `503` when `enforce_required` is set) rather than keyed incompletely. `shared` is an explicit operator attestation that the origin does not vary by caller address on this route. It does not apply to authenticated callers, which always bind their canonical address |
 | `enforce_required` | bool | `false` | Reject requests missing the idempotency header with 400 |
 | `sync_mode` | String | `"local"` | `local` (in-memory) or `redis` (centralized) |
-| `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`). Must use the `redis://` or `rediss://` scheme with a hostname. Must not carry a URL fragment (`#insecure` or otherwise); TLS skip-verify is only `FERRUM_TLS_NO_VERIFY` |
+| `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`). Must use the `redis://` or `rediss://` scheme with a hostname. Must not carry a URL fragment (`#insecure` or otherwise); TLS skip-verify is only `FERRUM_TLS_NO_VERIFY`. The path, when present, is the database selector and is validated at plugin admission: a single non-negative integer no greater than `2147483647` (`redis://host:6379/0`). A non-numeric, multi-segment, negative, or out-of-range selector is refused at construction rather than failing at first use. |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `"{FERRUM_NAMESPACE}:dedup"` | Redis key namespace prefix. Defaults to `ferrum:dedup` when namespace is `"ferrum"`. Must be non-empty when supplied. Sibling instances stay isolated under a shared default/explicit prefix via stable `plugin_config_id` in logical keys, and matched proxy namespaces remain isolated even when an explicit prefix is shared across namespaces |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Sizes a bounded pool of non-reconnecting `MultiplexedConnection` slots selected round-robin on the hot path; a broken slot is never silently re-dialed by redis-rs — it is cleared and re-established through Ferrum's DNS/egress/`INFO CLUSTER` screening path |
@@ -5855,7 +5874,7 @@ Request buffering is only enabled when at least one GraphQL policy is configured
 | `type_rate_limits` | Object | `{}` | Rate limits by operation type. Only exact lowercase `query`, `mutation`, and `subscription` keys are accepted; unknown keys are rejected. |
 | `operation_rate_limits` | Object | `{}` | Rate limits by named operation. Keys must be valid GraphQL Names (`[_A-Za-z][_0-9A-Za-z]*`). |
 | `sync_mode` | String | `local` | Exact lowercase `local` (in-memory per instance) or `redis` (centralized) for GraphQL rate-limit counters |
-| `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`). Must not carry a URL fragment (`#insecure` or otherwise); TLS skip-verify is only `FERRUM_TLS_NO_VERIFY` |
+| `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`). Must not carry a URL fragment (`#insecure` or otherwise); TLS skip-verify is only `FERRUM_TLS_NO_VERIFY`. The path, when present, is the database selector and is validated at plugin admission: a single non-negative integer no greater than `2147483647` (`redis://host:6379/0`). A non-numeric, multi-segment, negative, or out-of-range selector is refused at construction rather than failing at first use. |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:graphql:{plugin-config-id}` | Redis key namespace prefix. Defaults to the gateway namespace, the plugin name, and this plugin config's stable resource id (for example `ferrum:graphql:rl-public-api`), so two independent policies of this type in one namespace never share counters. Must be non-empty when set; setting it explicitly is the documented opt-in for a deliberately shared budget. |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Sizes a bounded pool of non-reconnecting `MultiplexedConnection` slots selected round-robin on the hot path; a broken slot is never silently re-dialed by redis-rs — it is cleared and re-established through Ferrum's DNS/egress/`INFO CLUSTER` screening path |
@@ -6025,7 +6044,7 @@ Enables per-method access control and rate limiting for canonical gRPC paths (`/
 | `method_rate_limits` | Object or null | `{}` | Per-method rate limits keyed by full method path. Each entry accepts only `max_requests` (1–1000000) and `window_seconds` (1–2678400); unknown keys are rejected. `null` is the same as omission. |
 | `limit_by` | String or null | `ip` | Rate limit key: `ip` or `consumer`. ASCII case is ignored (`CONSUMER` and `Ip` are admitted). `null` is the same as omission (`ip`). Other values are rejected at plugin load time. |
 | `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) for method rate-limit counters. ASCII case is ignored (`LOCAL` and `Redis` are admitted). `redis_failure_policy` remains case-sensitive. |
-| `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`). Must not carry a URL fragment (`#insecure` or otherwise); TLS skip-verify is only `FERRUM_TLS_NO_VERIFY` |
+| `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`). Must not carry a URL fragment (`#insecure` or otherwise); TLS skip-verify is only `FERRUM_TLS_NO_VERIFY`. The path, when present, is the database selector and is validated at plugin admission: a single non-negative integer no greater than `2147483647` (`redis://host:6379/0`). A non-numeric, multi-segment, negative, or out-of-range selector is refused at construction rather than failing at first use. |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:grpc_method_router:{plugin-config-id}` | Redis key namespace prefix. Defaults to the gateway namespace, the plugin name, and this plugin config's stable resource id (for example `ferrum:grpc_method_router:rl-public-api`), so two independent policies of this type in one namespace never share counters. Must be non-empty when set; setting it explicitly is the documented opt-in for a deliberately shared budget. |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Sizes a bounded pool of non-reconnecting `MultiplexedConnection` slots selected round-robin on the hot path; a broken slot is never silently re-dialed by redis-rs — it is cleared and re-established through Ferrum's DNS/egress/`INFO CLUSTER` screening path |
@@ -7409,22 +7428,27 @@ At least one policy field (`max_tokens_limit`, `default_max_tokens`, `allowed_mo
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_tokens_limit` | Integer | *(none)* | Maximum allowed output-token request value across OpenAI and provider-native token fields |
+| `max_tokens_limit` | Unsigned integer (`uint64`) | *(none)* | Maximum allowed output-token request value across OpenAI and provider-native token fields. `0` is accepted (refuses any request asking for a positive number of tokens); must be `>= default_max_tokens` when both are set |
 | `enforce_max_tokens` | String | `"reject"` | `reject` (400 error) or `clamp` (silently cap) |
-| `default_max_tokens` | Integer | *(none)* | Inject a default output-token limit if no supported token field is present; an OpenAI-shaped body keeps a top-level `max_tokens` fallback (so a spoofed provider marker cannot uncap it), while an unambiguously provider-native body receives only its native cap (including TGI `parameters.max_new_tokens`) |
+| `default_max_tokens` | Unsigned integer (`uint64`) | *(none)* | Must be `<= max_tokens_limit` when that limit is also configured. Inject a default output-token limit if no supported token field is present; an OpenAI-shaped body keeps a top-level `max_tokens` fallback (so a spoofed provider marker cannot uncap it), while an unambiguously provider-native body receives only its native cap (including TGI `parameters.max_new_tokens`) |
 | `supported_schema` | String | `"auto"` | Schema family used when `strict_schema` is true: `chat_completions`, `responses`, `provider_native`, or `auto` |
 | `strict_schema` | Boolean | `false` | Reject request bodies that do not match `supported_schema` coverage |
 | `allowed_models` | String[] | `[]` | Whitelist of allowed model names (empty = allow all) |
 | `blocked_models` | String[] | `[]` | Blacklist of model names (takes precedence) |
 | `require_model_for_model_policy` | Boolean | `true` | Require a non-empty string `model` when `allowed_models` or `blocked_models` is configured. Set `false` to allow a genuinely-absent `model`; a present-but-invalid `model` (non-string or empty/whitespace) is rejected regardless |
 | `require_user_field` | Boolean | `false` | Require `user` field in request body |
-| `max_messages` | Integer | *(none)* | Maximum message entries across `messages`, Responses `input`, Gemini `contents`, and Cohere `chat_history` arrays, plus a non-empty Cohere top-level `message` (the current turn) counted as one entry |
-| `max_prompt_characters` | Integer | *(none)* | Maximum total prompt characters across prompt/input/system fields, message text, text multimodal parts, Bedrock Converse `messages[].content[]` `toolResult` content and `guardContent` text, tools, tool arguments, document/RAG fields (including Anthropic text-document `source.data`), Google Vertex legacy `predict` `instances[].prompt`, and Azure "On Your Data" `data_sources[].parameters.role_information` |
-| `temperature_range` | Float[2] | *(none)* | Allowed [min, max] range for top-level `temperature`, Gemini `generationConfig.temperature`, and Bedrock `inferenceConfig.temperature`; wrong-typed or conflicting aliases are rejected |
+| `max_messages` | Unsigned integer (`uint64`) | *(none)* | Maximum message entries across `messages`, Responses `input`, Gemini `contents`, and Cohere `chat_history` arrays, plus a non-empty Cohere top-level `message` (the current turn) counted as one entry. `0` is accepted (refuses any request carrying a counted message entry) |
+| `max_prompt_characters` | Unsigned integer (`uint64`) | *(none)* | Maximum total prompt characters across prompt/input/system fields, message text, text multimodal parts, Bedrock Converse `messages[].content[]` `toolResult` content and `guardContent` text, tools, tool arguments (including Bedrock Converse `messages[].content[].toolUse.input`), document/RAG fields (including Anthropic text-document `source.data` and every eligible member of a Cohere `documents[]` map), Google Vertex legacy `predict` `instances[].prompt`, and Azure "On Your Data" `data_sources[].parameters.role_information`. `0` is accepted (refuses any request carrying counted text) |
+| `temperature_range` | Float[2] | *(none)* | Allowed [min, max] range for top-level `temperature`, Gemini `generationConfig.temperature`, and Bedrock `inferenceConfig.temperature`; wrong-typed or conflicting aliases are rejected. Both bounds must be finite and `temperature_range[0] <= temperature_range[1]` |
 | `block_system_prompts` | Boolean | `false` | Reject system/developer prompt fields and roles, including Responses `instructions`, provider-native top-level system fields, and Azure "On Your Data" `data_sources[].parameters.role_information` (a de-facto system instruction the backend applies) |
 | `system_prompt_aliases` | String[] | `[]` | Additional message roles or top-level fields treated as system prompts when `block_system_prompts` is true |
 | `required_metadata_fields` | String[] | `[]` | Required fields in request body |
 | `fail_on_uninspectable_body` | Boolean | `true` | Reject matching JSON `POST` requests whose body is missing, empty, non-UTF-8, malformed JSON, or still compressed after request transforms (no `compression`/`decompress_request` decoded it) |
+
+**Numeric configuration contract.** `max_tokens_limit`, `default_max_tokens`, `max_messages`, and `max_prompt_characters` are unsigned 64-bit integers. A negative, fractional, or above-`uint64` value is rejected at plugin construction (`ferrum-edge validate` and startup both fail), and `0` is a valid, maximally strict setting rather than "unset" — omit the field to leave that policy unconfigured. Two relationships between sibling values are also enforced at construction and cannot be expressed in JSON Schema 2020-12, so the published `AiRequestGuardConfig` component admits configurations the gateway then refuses; operator tooling that generates or validates configs must apply both as supplemental checks:
+
+- `default_max_tokens <= max_tokens_limit` whenever both are configured (the injected default is never clamped, so a larger default would make the gateway emit a value that violates the operator's own limit).
+- `temperature_range[0] <= temperature_range[1]`, with both bounds finite.
 
 **Schema coverage**
 
@@ -7434,14 +7458,16 @@ At least one policy field (`max_tokens_limit`, `default_max_tokens`, `allowed_mo
 | OpenAI Responses API | `input[]` message entries | `instructions`, `input` string/array/message content, `tools[]`, function-call `arguments`, `function_call_output.output` tool results | `instructions`, `input[].role: "system"|"developer"` | `max_output_tokens`, `max_tokens` |
 | Anthropic Messages | `messages[]` | top-level `system`, `messages[].content`, text-document `content[].source.data`, `content[]` `tool_use` block `input` tool arguments, `documents`, `context`, `retrieved_context`, `tool_results` | top-level `system`, system/developer roles if present | `max_tokens` |
 | Gemini/Vertex native-ish | `contents[]` | `systemInstruction`, `system_instruction`, `contents[].parts[].text`, `contents[].parts[].functionCall.args` tool arguments, tools, document/RAG fields | `systemInstruction`, `system_instruction`, aliased roles/fields | `generationConfig.maxOutputTokens`, top-level `maxOutputTokens` |
-| Bedrock Converse/native-ish | `messages[]` | `system`, `messages[].content`, `content[]` `tool_use` block `input` tool arguments, `content[].toolResult` content, `content[].guardContent` text, tool results, document/RAG fields | top-level `system`, system/developer roles if present | `inferenceConfig.maxTokens`, top-level `maxTokens` (see token-injection note) |
-| Cohere native-ish | `chat_history[]` plus `message` | `preamble`, `message`, `chat_history[].message`, documents, tool arguments/results | `preamble`, aliased roles/fields | `max_tokens`, `max_new_tokens` |
+| Bedrock Converse/native-ish | `messages[]` | `system`, `messages[].content`, `content[].toolUse.input` tool arguments (the canonical Converse spelling) and `content[]` `tool_use` block `input` (the typed Anthropic spelling), `content[].toolResult` content, `content[].guardContent` text, tool results, document/RAG fields | top-level `system`, system/developer roles if present | `inferenceConfig.maxTokens`, top-level `maxTokens` (see token-injection note) |
+| Cohere native-ish | `chat_history[]` plus `message` | `preamble`, `message`, `chat_history[].message`, every eligible member value of each `documents[]` map (excluding `id` and `_excludes`-named members), tool arguments/results | `preamble`, aliased roles/fields | `max_tokens`, `max_new_tokens` |
 | Amazon Titan text-generation | *(not a message array)* | top-level `inputText` | system/developer roles if present | `textGenerationConfig.maxTokenCount` |
 | Azure OpenAI "On Your Data" | `messages[]` (chat completions shape) | `messages[].content` and other chat-completions fields, plus `data_sources[]`/`dataSources[]` `parameters.role_information`/`roleInformation` | `messages[].role: "system"|"developer"`, aliases, and any non-empty `role_information`/`roleInformation` | `max_tokens`, `max_completion_tokens` |
 | Legacy completions / text-generation | *(not a message array)* | top-level `prompt`, `input`, TGI/HuggingFace `inputs` | system/developer roles if present | `max_tokens`, `max_new_tokens`, `max_tokens_to_sample`, TGI `parameters.max_new_tokens` |
 | Google Vertex legacy `predict` | *(not a message array)* | `instances[].prompt` | system/developer roles if present | top-level `maxOutputTokens` only — the Vertex-native `parameters.maxOutputTokens` is **not** read, so token policy does not apply to a canonical `predict` body |
 
-`max_prompt_characters` counts Unicode scalar values, not UTF-8 bytes. It counts only string *values*, including those inside tool/function definitions; JSON-Schema boilerplate keys (`type`, `properties`, `description`, ...) are not counted. Multimodal image, audio, and file parts are ignored unless they expose a recognized text field or text content-part type (`text`, `input_text`, `output_text`). Tool-call argument payloads are counted, but only from the legitimate tool-call locations of the supported schemas — OpenAI Chat Completions `messages[].tool_calls[].function.arguments`, OpenAI Responses `input[].arguments`, Anthropic/Bedrock `messages[].content[]` `tool_use` block `input`, and Gemini `contents[].parts[].functionCall.args` — not arbitrary `arguments`/`input` keys elsewhere in the body (e.g. `metadata.arguments`). `system_prompt_aliases` is case-insensitive for role names and top-level field names. System-prompt blocking inspects message/content arrays only at the array-item level (`role`/`author` on each entry), so a nested `role`/`author` key buried in arbitrary user data (e.g. an embedded transcript under `metadata`) does not trip `block_system_prompts`. The one nested field treated as a system prompt is the Azure OpenAI "On Your Data" data-source instruction — both the GA snake_case `data_sources[].parameters.role_information` and the original extensions-API camelCase `dataSources[].parameters.roleInformation` are recognized: it is a free-text instruction the backend applies as a de-facto system prompt, so a non-blank value trips `block_system_prompts` (even when `messages` carry only ordinary user turns) and its text counts toward `max_prompt_characters`. A blank `role_information` (empty or whitespace-only) is intentionally allowed (it carries no directive, so blocking it would falsely reject Azure requests that merely attach data sources). Both casings of both the array key and the inner field are inspected (an empty/`null` `data_sources` next to a populated `dataSources`, or a blank `role_information` next to a populated `roleInformation`, does not bypass the check). Only `role_information`/`roleInformation` is inspected/counted under `parameters` — the surrounding connection config (endpoint, key, index name, embedding settings) is neither blocked nor counted.
+`max_prompt_characters` counts Unicode scalar values, not UTF-8 bytes. It counts only string *values*, including those inside tool/function definitions; JSON-Schema boilerplate keys (`type`, `properties`, `description`, ...) are not counted. Multimodal image, audio, and file parts are ignored unless they expose a recognized text field or text content-part type (`text`, `input_text`, `output_text`). Tool-call argument payloads are counted, but only from the legitimate tool-call locations of the supported schemas — OpenAI Chat Completions `messages[].tool_calls[].function.arguments`, OpenAI Responses `input[].arguments`, Anthropic `messages[].content[]` `tool_use` block `input`, the canonical Bedrock Converse spelling of the same call (`messages[].content[].toolUse.input`, an untyped union member rather than a `type: "tool_use"` block), and Gemini `contents[].parts[].functionCall.args` — not arbitrary `arguments`/`input` keys elsewhere in the body (e.g. `metadata.arguments`). Only the arguments are counted from a tool-call block; the sibling `toolUseId`/`name`/`id` call plumbing is not model-visible prose. `system_prompt_aliases` is case-insensitive for role names and top-level field names. System-prompt blocking inspects message/content arrays only at the array-item level (`role`/`author` on each entry), so a nested `role`/`author` key buried in arbitrary user data (e.g. an embedded transcript under `metadata`) does not trip `block_system_prompts`. The one nested field treated as a system prompt is the Azure OpenAI "On Your Data" data-source instruction — both the GA snake_case `data_sources[].parameters.role_information` and the original extensions-API camelCase `dataSources[].parameters.roleInformation` are recognized: it is a free-text instruction the backend applies as a de-facto system prompt, so a non-blank value trips `block_system_prompts` (even when `messages` carry only ordinary user turns) and its text counts toward `max_prompt_characters`. A blank `role_information` (empty or whitespace-only) is intentionally allowed (it carries no directive, so blocking it would falsely reject Azure requests that merely attach data sources). Both casings of both the array key and the inner field are inspected (an empty/`null` `data_sources` next to a populated `dataSources`, or a blank `role_information` next to a populated `roleInformation`, does not bypass the check). Only `role_information`/`roleInformation` is inspected/counted under `parameters` — the surrounding connection config (endpoint, key, index name, embedding settings) is neither blocked nor counted.
+
+**Document/RAG fields.** Top-level `documents` entries are read **member-wise**, because a Cohere v1 document is an arbitrary string-to-string map and the provider serializes its eligible members into the prompt the model reads: `{"title": ..., "snippet": ..., "url": ...}` counts every one of those values, not just a recognized `text`/`content` member. Two members are excluded because Cohere itself keeps them out of the model-visible rendering — `id` (the citation identifier) and `_excludes` (the control list, plus every member it names, which stay available for citation retrieval only). Member *names* are not counted, matching the tool-definition rule above. An entry that carries a `type` discriminator is treated as a content *part* rather than a document map, so multimodal image/audio/file parts and base64 document sources stay excluded from prose accounting while Anthropic text-document `source.data` is still counted. `retrieved_context`, `tool_results`, and `toolResults` keep the recognized-content-member reading.
 
 `supported_schema: auto` accepts any covered family — including legacy OpenAI completions (`{"model", "prompt"}`), canonical TGI/HuggingFace text-generation (`{"inputs", "parameters": {"max_new_tokens": ...}}`), Amazon Titan text-generation (`{"inputText", "textGenerationConfig"}`), and Google Vertex legacy `predict` (`{"instances": [{"prompt": ...}]}`) bodies — and `strict_schema: true` admits all of these while rejecting unknown JSON shapes. Vertex `predict` is recognized (and admitted under `supported_schema: provider_native`) by the **shape**, not by a bare `instances` key: at least one entry must carry a `prompt`, since `instances` is an ordinary word in unrelated JSON and this predicate decides what strict mode admits. TGI and Titan bodies are also admitted under `supported_schema: provider_native` so their native output-cap reject/clamp logic runs. Plain `messages[]` payloads without provider-specific fields can be indistinguishable across OpenAI Chat, Anthropic Messages, and Cohere v2, so strict provider matching is intentionally schema-family based rather than vendor-authentication based. Note that `supported_schema: chat_completions` is stricter than a bare `messages` array check: a body that also carries a provider-native top-level marker (`system`, `preamble`, `message`, `chat_history`, `inputs`, `documents`, `retrieved_context`, `tool_results`) is treated as that provider's schema and rejected under strict `chat_completions`.
 
@@ -7476,20 +7502,20 @@ Supports both regular JSON and streaming responses. A JSON usage document is rea
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `token_limit` | Integer | *(required)* | Maximum tokens allowed per window. Required at construction; there is no default. |
+| `token_limit` | Integer | *(required)* | Maximum tokens allowed per window. Must be a positive unsigned 64-bit integer (`0` and values above `18446744073709551615` are rejected). Required at construction; there is no default. |
 | `window_seconds` | Integer | `60` | Sliding window duration in seconds. Range 1–2678400 (31 days) |
 | `count_mode` | String | `"total_tokens"` | What to count: `total_tokens`, `prompt_tokens`, or `completion_tokens`. Unknown values are rejected at construction time. |
 | `limit_by` | String | `"consumer"` | Rate limit key: authenticated identity (`consumer`) or `ip`. Unknown values are rejected at construction time. |
-| `expose_headers` | Boolean | `false` | Inject `x-ai-ratelimit-*` headers. Streamed responses commit their headers before the body flows, so they carry the admission-time values and are not refreshed after reconciliation. On successful buffered metered responses, `x-ai-ratelimit-usage` and `x-ai-ratelimit-remaining` describe the bucket **after** provider-usage reconciliation (not the pre-request reservation estimate). `x-ai-ratelimit-limit` and `x-ai-ratelimit-window` stay coherent with the configured budget. Admission-time values may appear briefly after `after_proxy` and are refreshed once `on_response_body` reconciles. Unmetered `charge_estimate` keeps the reservation (and those header values); `warn` releases and refreshes; `reject` substitutes a 502 without ratelimit headers. Non-2xx and gateway-rejection releases refresh to the post-release bucket. Federation reconciles in rejection-path `after_proxy` before headers are copied, so federation responses already expose post-reconcile values. Synthetic short-circuits (non-federation) do not charge and do not rewrite these headers from a fake usage block. |
+| `expose_headers` | Boolean | `false` | Inject `x-ai-ratelimit-*` headers. Streamed responses commit their headers before the body flows, so they carry the admission-time values and are not refreshed after reconciliation. On successful buffered metered responses, `x-ai-ratelimit-usage` and `x-ai-ratelimit-remaining` describe the bucket **after** provider-usage reconciliation (not the pre-request reservation estimate). `x-ai-ratelimit-limit` and `x-ai-ratelimit-window` stay coherent with the configured budget. Admission-time values may appear briefly after `after_proxy` and are refreshed once `on_response_body` reconciles. Unmetered `charge_estimate` keeps the reservation (and those header values); `warn` releases and refreshes; `reject` substitutes a 502 that **still carries all four headers**, describing the reservation it retained — the rejection-path `after_proxy` publishes this instance's telemetry onto the final response. The only refusal that carries no rate-limit headers is the centralized-enforcement 503, which has no authoritative counter to report. Non-2xx and gateway-rejection releases refresh to the post-release bucket. Federation reconciles in rejection-path `after_proxy` before headers are copied, so federation responses already expose post-reconcile values. Synthetic short-circuits (non-federation) do not charge and do not rewrite these headers from a fake usage block. |
 | `provider` | String | `"auto"` | LLM provider format for token extraction: `auto`, `openai`, `anthropic`, `google`, `cohere`, `mistral`, `bedrock`, or `tgi`. Unknown values are rejected at construction time. |
-| `on_unmetered_response` | String | `"charge_estimate"` | Action for successful responses without usage metadata: `charge_estimate` keeps the pre-request reservation, `reject` returns a 502 and keeps the reservation, `warn` logs and releases the reservation. A stream with a non-zero reservation is reconciled after termination; if `reject` cannot substitute a 502 then, it keeps that reservation charged and logs the violation. A stream with no reservation whose policy would require rejection is refused with 502 before its headers are committed, because terminal reconciliation would otherwise have nothing to charge. |
-| `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) |
+| `on_unmetered_response` | String | `"charge_estimate"` | Action for successful responses without usage metadata: `charge_estimate` keeps the pre-request reservation, `reject` returns a 502 and keeps the reservation (with `expose_headers: true` that 502 carries the four `x-ai-ratelimit-*` headers), `warn` logs and releases the reservation. A stream with a non-zero reservation is reconciled after termination; if `reject` cannot substitute a 502 then, it keeps that reservation charged and logs the violation. A stream with no reservation whose policy would require rejection is refused with 502 before its headers are committed, because terminal reconciliation would otherwise have nothing to charge. |
+| `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized), parsed case-insensitively (`LOCAL`, `Redis`). `redis` requires `redis_url`; every explicitly supplied `redis_*` field is validated in either mode |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`). Must not carry a URL fragment (`#insecure` or otherwise); TLS skip-verify is only `FERRUM_TLS_NO_VERIFY`. The path, when present, is the database selector and is validated at plugin admission: a single non-negative integer no greater than `2147483647` (`redis://host:6379/0`). A non-numeric, multi-segment, negative, or out-of-range selector is refused at construction rather than failing at first use. |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:ai_rate_limiter:{plugin-config-id}` | Redis key namespace prefix. Defaults to the gateway namespace, the plugin name, and this plugin config's stable resource id (for example `ferrum:ai_rate_limiter:rl-public-api`), so two independent policies of this type in one namespace never share counters. Must be non-empty when set; setting it explicitly is the documented opt-in for a deliberately shared budget. |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Sizes a bounded pool of non-reconnecting `MultiplexedConnection` slots selected round-robin on the hot path; a broken slot is never silently re-dialed by redis-rs — it is cleared and re-established through Ferrum's DNS/egress/`INFO CLUSTER` screening path |
-| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
-| `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
+| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds. Must be a positive unsigned 64-bit integer: `0`, a negative value, and anything above `18446744073709551615` are rejected at construction, in either `sync_mode` |
+| `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable. Must be a positive unsigned 64-bit integer, validated in either `sync_mode` |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | — | Redis password |
 | `redis_failure_policy` | String | `fail_closed` | Behavior when the centralized store cannot be consulted (outage, egress/DNS screen failure, or an endpoint rejected as Redis Cluster). `fail_closed` refuses with `503`; `local_fallback` explicitly opts into per-process budgets for availability. Only meaningful when `sync_mode: "redis"`, but validated in either mode |
@@ -7507,9 +7533,13 @@ When `limit_by: "ip"`, the request client identity has already canonicalized IPv
 
 **Centralized mode** (`sync_mode: "redis"`): Token budgets are shared across all gateway instances so consumers cannot exceed limits by spreading requests across data planes. Uses the same two-window weighted approximation (single-timestamp subsecond elapsed fraction), `redis_failure_policy`, and Cluster screening as `rate_limiting`, including instance-owned Redis health tasks that stop on plugin drop/reload. While centralized budgets cannot be consulted, the default `fail_closed` policy refuses with `503` and no `x-ai-ratelimit-*` headers; `local_fallback` is the explicit opt-in to per-process token budgets. Admission remains fail closed. If Redis becomes unavailable during authoritative post-response reconciliation, actual usage is charged to the local window, including when the original reservation was zero. A reservation held on Redis is not subtracted from unrelated local usage; its Redis entry expires by TTL. Each reconciled request finalizes its instance-scoped reservation marker on every exit, and successful local accounting sets `ai_ratelimit_locally_accounted#<instance>` to `true`. Buffered/federated successful responses still receive the generic `503`; committed streams keep their original response. Already non-2xx responses retain their status. Local accounting is per-process and is not replayed to Redis on recovery. `ferrum_ai_rate_limit_local_accounting_tokens_total` counts tokens charged by this fallback, with only the gateway namespace label. The existing local identity cap remains enforced; `ferrum_ai_rate_limit_unaccounted_tokens_total` exposes tokens that could not be charged because that cap was exhausted. Under the explicit `local_fallback` policy, ordinary per-process enforcement and reconciliation remain unchanged. Compatible with any RESP-protocol server running in single-endpoint topology: Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Namespace-aware key prefix prevents collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster. Database-backed token counters are intentionally unsupported.
 
-**Memory protection:** Local (and Redis-fallback) token-state maps are capped at 100,000 keys. Sampled piggyback sweeps (every 1,024 requests, cooldown-gated to at most once per second) prune idle identity state below that hard cap. Hard cardinality is enforced by atomic reservation on admission: existing keys continue at capacity, and previously unseen local/fallback keys are denied fail-closed without deleting active budgets.
+**Memory protection:** Two independent bounds apply. *Per identity*, one key's sliding window retains at most 1,024 usage records: once a key exceeds that, its two OLDEST records are aggregated into one that keeps the sum of their tokens and the newer of their timestamps. No usage is ever discarded to meet the bound and no live budget is evicted — the merged tokens expire slightly LATER than they otherwise would, which is the conservative direction — so retained bytes per identity stop growing with request volume instead of scaling with `token_limit × window_seconds`. Only the absorbed record's reservation id is lost; because merging always starts from the oldest end and in-flight reservations are the newest records, an identity would have to hold more than 1,024 unreconciled requests at once before a reservation could lose its release (and a lost release keeps the charge, never drops it). *Per gateway*, local (and Redis-fallback) token-state maps are capped at 100,000 keys. Sampled piggyback sweeps (every 1,024 requests, cooldown-gated to at most once per second) prune idle identity state below that hard cap. Hard cardinality is enforced by atomic reservation on admission: existing keys continue at capacity, and previously unseen local/fallback keys are denied fail-closed without deleting active budgets.
+
+**Only an identified AI request has a response lifecycle at all.** Every response hook — the buffered `on_response_body`, the streaming inspector, and the terminal stream hook — first re-checks whether **this instance** classified the request as an AI call (or is still holding one of its own reservations). A response some *other* plugin pinned onto the buffered path is otherwise indistinguishable to this hook from one the limiter asked for, so without that check an ordinary non-AI reply whose JSON happens to carry a usage-shaped object — a stored transcript, a usage-reporting endpoint, a sibling plugin's token metadata — was charged against the budget, and the same `GET` was billed over HTTP/1.1 and HTTP/2 while the streamed HTTP/3 path left it alone. All four paths now agree: a non-AI request is never charged and never released, whatever its response body or transport looks like.
 
 **Response buffering is scoped, not universal.** The limiter no longer pins every response on its proxy onto the buffered path. Buffering is requested only for a request **this instance** classified as an AI call, and only for a successful response whose `Content-Type` is JSON — the one representation whose usage lives in a document that must be complete to parse. Non-AI traffic, non-2xx responses, framed gRPC-Web, other non-JSON media, and every streaming representation are released to the streaming path at header time. This holds under retries too: the limiter explicitly votes to release an inherently streaming response once its headers are known.
+
+**Encoded responses are inspected through a bounded, budget-charged decode.** A provider or intermediary may ship an ordinary usage document under `Content-Encoding: gzip` or `br`. On the **buffered** path the limiter decodes a transient plaintext view before looking for usage, using the gateway's strict, Large-Window-refusing codecs; the decoder's own heap and every growth of the output buffer are reserved against the shared retained-response budget *before* they are allocated, and the whole charge is released as soon as the usage document has been read. The client still receives the original encoded bytes untouched — nothing is re-encoded and no response is rewritten. Bounds: at most 4 MiB of encoded input, 4 MiB per decoded layer, 8 MiB across a stacked chain, 4 coding layers, and a 500:1 amplification ceiling per layer and end to end. A representation that cannot be reduced safely (an unsupported or malformed coding, a bound overrun, or a budget refusal) is **never** parsed as if it were plaintext: it is treated as usage-less and resolved by `on_unmetered_response`, which is fail-closed by default. On the **streaming** path the incremental parsers understand SSE and AWS event-stream *framing*, not content codings, so a content-coded stream is declined outright by the inspector factory and likewise resolved by `on_unmetered_response` rather than being parsed as if the compressed octets were frames.
 
 **Streaming token accounting is incremental and bounded.** A meterable AI stream is inspected chunk-by-chunk by a pass-through response stream inspector. Bytes are forwarded unchanged and never held, so SSE event latency, HTTP/1.1, HTTP/2, and HTTP/3 backpressure, and trailer handling are exactly what they would be with no plugin attached; the inspector never truncates a stream (headers are already committed, so cutting would only corrupt a generation the client is already being charged for). Retention per stream is one bounded parser carry (64 KiB for an SSE line, 64 KiB for an AWS event-stream message; an oversized unit is discarded or skipped by length, never buffered) plus three token counters — independent of stream length, so a never-ending stream costs a fixed, small amount of memory. The number of concurrently inspected streams is capped process-wide at 4,096; beyond that no inspector is attached, the stream is still forwarded untouched, and the response is resolved by `on_unmetered_response` (fail-closed by default), with a sampled operational warning.
 
@@ -7522,11 +7552,16 @@ Terminal usage signals understood on the streaming path:
 | Cohere v2 | `message-end` event's `delta.usage.tokens.*` |
 | Google Gemini / Vertex | `usageMetadata` on a `streamGenerateContent` SSE event |
 | AWS Bedrock | `application/vnd.amazon.eventstream` framing — prelude CRC32 (over the first eight bytes) is verified before any declared length is trusted (including before oversized-message skipping), and the final message CRC32 is verified before headers/payload are parsed or usage is recorded; then `amazon-bedrock-invocationMetrics` inside the base64 `bytes` chunk payload (`InvokeModelWithResponseStream`), or a `ConverseStream` `metadata` event's `usage`. A CRC mismatch stops the binary parser cleanly without resynchronization; already-observed usage from earlier valid frames is retained, and usage from the corrupt frame is never admitted |
+| OpenAI Responses | the terminal `response.completed` event's **nested** `response.usage` (`input_tokens` / `output_tokens` / `total_tokens`). Non-terminal `response.*` progress events (`response.created`, `response.in_progress`, `response.incomplete`, `response.failed`, per-item deltas) are never treated as usage authorities |
 | Hugging Face TGI | terminal `details.generated_tokens` (`/generate_stream`) |
+
+**SSE events are assembled before they are parsed.** An event may legally carry several `data:` fields, whose values the event-stream grammar joins with newlines and dispatches as ONE payload; blank lines are event boundaries and `:`-prefixed lines are comments. Both the streamed and the buffered SSE paths run the *same* extractor, so a usage document split across two `data:` fields reconciles identically to its single-line counterpart instead of being discarded. Assembly is bounded across the whole event (64 KiB, the same ceiling a single oversized line already had): an event past that cap is abandoned and the parser resumes at the next boundary, so no unbounded carry can accumulate. A provider that omits the blank line between two complete documents still has each line parsed on its own, and a stream that ends without its final blank line still dispatches the event it had assembled — including when the client disconnects or a later inspector cuts the stream.
 
 Configure OpenAI-compatible clients to send `stream_options.include_usage: true` whenever possible. Reconciliation happens only on an **explicit authoritative usage signal**; a malformed, truncated, CRC-invalid, or usage-less stream is never charged as zero. Instead the terminal stream hook applies `on_unmetered_response` exactly once — including when the client disconnects mid-stream, when the backend errors, and when the stream never terminates normally — so the default `charge_estimate` keeps the pre-request reservation and streaming is never free. When only a partial token signal is observed (for example an Anthropic `message_delta` without `message_start`, or TGI `generated_tokens` without a populated `prefill` array), the available count remains an authoritative lower bound but cannot release the selected mode's unreported portion: reconciliation charges the larger of that partial count and the existing reservation. A complete selected-mode count still replaces the estimate normally. A later explicit value replaces an earlier one; an absent field never erases a previously observed one. Token sums use checked arithmetic; overflow is treated as unmetered and resolved by the configured policy.
 
 **Synthetic responses are not charged**: A *synthetic* response is any plugin-generated 2xx that never reached the upstream model — an `ai_semantic_cache` hit, a `response_caching` hit/revalidation, a `request_deduplication` idempotent replay, or a `response_mock` / `serverless_function` / `request_termination` short-circuit. None of these consumed provider tokens, so the limiter does not charge their bodies against the window even when the body carries an OpenAI-shaped `usage` block. The exemption is driven by an **internal, unspoofable** marker (`ferrum:synthetic_short_circuit`) that the proxy sets while replaying a synthetic body through the response-body hooks — *not* by any response header. This matters: a backend (or a `response_transformer` rewrite) emitting `x-idempotent-replayed`, a cache-status header, or a `usage` block on a genuine model response cannot trick the limiter into skipping a real charge. A fresh backend response carries no synthetic marker and is charged normally. `ai_federation` synthetic responses are the one exception that *is* charged — they represent a real provider call — and are reconciled once per limiter instance via the rejection-path `after_proxy` hook.
+
+**Composition:** `expose_headers` writes RESPONSE headers only. The limiter declares no backend-visible request-header mutation, so enabling response telemetry does not disturb replay/cache composition admission: `request_deduplication` (3010) and `response_caching` (3500) still validate alongside an `ai_rate_limiter` at 4200 with `expose_headers: true`, exactly as they do with it off.
 
 **Multiple instances**: A proxy may carry several `ai_rate_limiter` instances with independent budgets (for example a per-consumer and a per-IP limiter, or two instances pointing at different `redis_key_prefix` backends). Each instance tracks and charges its own window independently, including for `ai_federation` synthetic responses.
 
@@ -7563,7 +7598,7 @@ Because the `x-ai-ratelimit-*` header **names** are a fixed public contract, two
 
 > **Compressed request accounting follows the normalized representation.** With a co-located `compression` plugin using `decompress_request: true`, supported gzip/Brotli uploads are bounded and decoded before `before_proxy`; `ai_rate_limiter` therefore classifies and pre-reserves from the same plaintext the backend receives. Without a matching decoder, or for an unsupported coding, the limiter does not estimate from compressed wire bytes: it performs only the plain budget check and treats a JSON-content-type `POST` as a fail-closed AI candidate for `on_unmetered_response`, so an uninspectable compressed AI call cannot bypass `reject`/`charge_estimate` enforcement. Post-response reconciliation still charges provider-reported usage. The limiter never decompresses bodies itself.
 
-**Local-mode performance**: The sliding window keeps a running sum so each `current_usage()` call is amortised O(stale-evicted) rather than O(n) per request. Post-response **reconciliation** (the reserve-then-reconcile correction applied after the backend responds) is the exception: it locates the request's reservation by `reservation_id` with a linear scan of the window's entries while holding the per-key shard write-lock, so it is O(n) in the number of live entries for that key — n ≈ `window_seconds × requests-per-second` for a hot consumer/IP. This runs at most once per request (the correction is idempotent), and only for requests that took a pre-reservation; it does not affect the request-admission hot path. For very hot single keys with long windows this scan can dominate the reconcile cost.
+**Local-mode performance**: The sliding window keeps a running sum so each `current_usage()` call is amortised O(stale-evicted) rather than O(n) per request. Post-response **reconciliation** (the reserve-then-reconcile correction applied after the backend responds) is the exception: it locates the request's reservation by `reservation_id` with a linear scan of the window's entries while holding the per-key shard write-lock, so it is O(n) in the number of live entries for that key — n ≈ `window_seconds × requests-per-second` for a hot consumer/IP. That scan is bounded by the per-identity record cap described under **Memory protection** (1,024), not by the key's history, so it no longer grows with `window_seconds × requests-per-second`. It runs at most once per request (the correction is idempotent), and only for requests that took a pre-reservation; it does not affect the request-admission hot path.
 
 **Centralized-mode (Redis) reconciliation targets the reserved window.** In `sync_mode: redis` the reservation records the Redis sliding-window index it credited and carries it through to reconciliation, so a negative correction (actual ≪ reserved, a non-2xx release, or `on_unmetered_response: "warn"`) debits the **same** window the reservation landed in — even when the request straddles a window rollover before completing. This prevents the case where a correction would otherwise subtract from the new window, erasing another consumer's freshly-reserved budget there. Both the per-window counter floor-at-zero (so a correction can never drive a counter negative and read as free capacity) and the reserved-window targeting are applied; if a reservation was made during a Redis outage (local fallback) and reconciled after recovery, the correction falls back to the current window with the floor still in force.
 
@@ -8537,6 +8572,292 @@ Applies per-request route overrides generated from mesh/Istio routing resources.
 An `upstream_id` destination resolves in the matched proxy's namespace. Scoped plugin references are validated in their resource namespace; a gateway-wide global reference must exist in every proxy namespace where that global is effective (excluding proxies that replace it with a scoped `mesh_route_dispatch` instance). A same-ID upstream in another namespace never satisfies the reference.
 
 **Query predicates are fail-closed (advisories GHSA-j2j6-f9c7-hh85, GHSA-gr4p-3qw3-87r5).** `match.query_params` compares against the canonical decoding of the backend-bound query representation available at the dispatch hook, after authentication-owned credential strips and any priority-overridden query transformer that already ran. Selecting a route is a security decision, so a request whose query cannot be decoded to one value is rejected with `400` **before any rule is evaluated**, using the same [classifications](#query-canonicalization-advisories-ghsa-j2j6-f9c7-hh85-ghsa-gr4p-3qw3-87r5) OPA applies: a repeated or percent-encoded duplicate name (`?tenant=victim&tenant=admin`, `?a=1&%61=2`, `?flag&flag=1`), a literal `+`, malformed percent-encoding, or a non-UTF-8 decoding. `%20` and `%2B` are unambiguous. Behavior is identical on HTTP/1.1, HTTP/2, and HTTP/3, because predicates no longer read the protocol-dependent `ctx.query_params` map. A later route/request transform remains an intentional, separately ordered operation. A dispatch config that declares no `query_params` predicate is completely unaffected — no query is decoded and no request is rejected on this path.
+
+#### Standalone configuration
+
+`mesh_route_dispatch` is auto-emitted by the mesh/Istio translators, but it is an
+ordinary operator-configurable plugin: the table below is the complete accepted
+shape, and the constructor is the source of truth for it (`openapi.yaml` →
+`MeshRouteDispatchConfig` mirrors it, with the two runtime-only checks called out
+below). Omitted keys take the listed default; `null` is accepted only where the
+type column says so. Unknown keys are rejected at every level.
+
+**Root**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `rules` | Object[] | — | Required, at least one entry. Ordered; **first match wins** and evaluation stops there |
+| `reject_unmatched` | bool | `false` | `true` answers `404` when no rule matched instead of falling through to the proxy's own backend. The translator sets this; a hand-written soft override normally leaves it `false` |
+
+**`rules[]`**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `match` | Object | `{}` | Predicates, all-of across the fields below. An empty match is rejected **unless** the rule carries a route action (`request_transform`, `response_transform`, `fault`, `rewrite`, `redirect`), which makes it the deliberate action-only catch-all; otherwise it would silently shadow every later rule |
+| `destination` | Object | `{}` | Route override applied on match. At least one field must be set unless the rule carries a `redirect` |
+| `timeout_ms` | u64 \| null | omitted | Route-local backend response/read timeout. `0` means "no timeout". Cannot be combined with `timeout_disabled: true` |
+| `timeout_disabled` | bool | `false` | Clear the selected proxy's inherited backend read timeout for this route (resolves to `0`). Cannot be combined with `timeout_ms` |
+| `retry` | Object \| null | omitted | Route-local retry policy (below). Cannot be combined with `retry_disabled: true` |
+| `retry_disabled` | bool | `false` | Clear the selected proxy's inherited retry policy for this route. Cannot be combined with `retry` |
+| `request_transform` | Object[] | `[]` | Route-level request header transforms (below). Requires an eligible consumer — see [Route transforms need a consumer](#route-transforms-need-a-consumer) |
+| `response_transform` | Object[] | `[]` | Route-level response header transforms. Same shape and same consumer requirement, plus the closed protocol-managed destination set described above |
+| `fault` | Object \| null | omitted | Per-rule delay / abort, applied before any route override |
+| `rewrite` | Object \| null | omitted | Per-rule URI / authority rewrite applied to the backend request |
+| `redirect` | Object \| null | omitted | Per-rule 3xx answer. Highest precedence: the request never reaches a backend, so the rule needs no `destination` |
+
+**`rules[].match`**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `methods` | (String \| Object)[] | `[]` | Any-of. A bare string is an `exact` match; the object form is an Istio `StringMatch` with **exactly one** of `exact` / `prefix` / `regex`. `exact` and `prefix` operands must be non-empty RFC 9110 method tokens — an empty value or one containing a space (`"GET POST"`) is rejected at load, because it could never match. `exact` preserves operator casing (`"get"` matches only `get`); `prefix` is ASCII-uppercased at load; `regex` is compiled verbatim between full-input anchors. Empty array = no method restriction |
+| `headers` | Object | `{}` | All-of, keyed by header name. Names must be RFC 9110 tokens and are ASCII-lowercased at load; duplicates after normalization are rejected. Values take the same bare-string / `StringMatch` shapes as `methods`. An `exact: ""` predicate legitimately means "present and empty"; empty `prefix` / `regex` operands are rejected |
+| `query_params` | Object | `{}` | All-of equality on the canonical decoded query — see the fail-closed contract above |
+| `authority` | String \| Object \| null | omitted | `Host` / `:authority` predicate, bare string or `StringMatch`. Case-sensitive for `exact` / `prefix`, including an explicit request port; write `(?i)` for a case-insensitive `regex`. All operands must be non-empty |
+| `source_namespace` | String \| null | omitted | Source workload namespace, read from the peer SPIFFE ID. Exact and case-sensitive; empty or whitespace-bearing values are rejected. Fails closed (no match) when there is no resolved peer identity |
+| `uri` | Object \| null | omitted | `StringMatch` on the request path. Normally omitted because the proxy's `listen_path` already gates URI selection; the translator emits it for `ignoreUriCase` routes and collapsed route-order fallbacks. `regex` must match the full path |
+| `ignore_uri_case` | bool | `false` | Fold ASCII case for `uri.exact` / `uri.prefix` only. Rejected without a `uri` predicate, and it never affects `uri.regex`, headers, methods, or authority |
+
+**`rules[].destination`**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `upstream_id` | String \| null | omitted | Override the proxy's upstream. Resolved in the matched proxy's namespace. Mutually exclusive with every direct-backend field |
+| `backend_host` | String \| null | omitted | Direct-backend host. A **bare host**: a DNS name, an IPv4 literal, or an IPv6 literal in either `::1` or `[::1]` form. The port belongs in `backend_port`; an embedded authority port, scheme, path, query, fragment, or userinfo is rejected at load rather than failing DNS resolution with a 502 on every matching request. Trimmed and ASCII-lowercased at load; max 255 characters |
+| `backend_port` | 1–65535 \| null | omitted | Direct-backend port. Must be set together with `backend_host` |
+| `backend_tls` | Object \| null | omitted | Route-local backend TLS (below). **Direct backends only** — an `upstream_id` destination inherits TLS from the referenced `Upstream` (including mesh `DestinationRule` projection), so per-canary TLS for an upstream override is modeled as a separate upstream resource |
+| `requires_node_waypoint_authz` | bool | `false` | Trusted mesh-translator marker. Under scoped NodeWaypoint authorization, a matching destination carrying it fails closed without an authorized destination stamp. Not for hand-authored config |
+
+**`rules[].fault`** — at least one of `delay` / `abort` is required.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `delay.duration_ms` | u64 | — | Required. `1`–`60000` |
+| `delay.percentage` | f64 | — | Required. `(0.0, 100.0]`; `0.0` is rejected (omit the action instead). A positive value below one 64-bit sampler bucket rounds up so every accepted value can fire |
+| `abort.status_code` | u16 | — | Required. `200`–`599` |
+| `abort.percentage` | f64 | — | Required. Same `(0.0, 100.0]` range as the delay |
+| `abort.grpc_status` | u32 \| null | omitted | `0`–`16`, emitted only when the immutable pre-plugin request flavor is native gRPC |
+| `abort.body` | String \| null | omitted | Response body; empty when unset |
+
+**`rules[].rewrite`** — at least one of `uri` / `authority` is required.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `uri` | String \| null | omitted | Replacement path. Must be a canonical absolute path with no query or fragment; percent escapes, dot segments, backslashes, and CRLF are rejected at load, and the composed path is re-checked before publication |
+| `authority` | String \| null | omitted | Replacement `Host` / `:authority`. Non-empty, CRLF-free, no whitespace |
+| `match_prefix` | String \| null | omitted | The literal prefix to replace with `uri`. Replacement is literal: the unmatched suffix is appended **verbatim**, so `match_prefix: /prefix/old` + `uri: /new` forwards `/prefix/oldtail` as `/newtail`, never `/new/tail`. A doubled separator is collapsed when both sides carry a `/` (`match_prefix: /prefix` + `uri: /` forwards `/prefix/etc` as `/etc`), and a suffix that opens with a `.` keeps its own segment boundary so the canonical-path check still sees a whole segment — `/prefix/old../admin` composes `/new/../admin` and is rejected with `400`, never laundered into `/new../admin` and forwarded; `..hidden` is not a dot segment and forwards as `/new/..hidden`. An empty string means "no prefix" — `uri` replaces the whole path |
+
+**`rules[].redirect`** — every field is optional; a status-only redirect preserves the request URL.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `uri` | String \| null | omitted | Replacement `Location` path; the request path is preserved when unset |
+| `match_prefix` | String \| null | omitted | Prefix replaced by `uri`, with the same literal-substitution contract as `rewrite.match_prefix` |
+| `authority` | String \| null | omitted | Replacement `Location` authority; the request authority is preserved when unset |
+| `port` | 1–65535 \| null | omitted | Replacement authority port. Mutually exclusive with `derive_port` |
+| `derive_port` | String \| null | omitted | `FROM_PROTOCOL_DEFAULT` (80/http, 443/https) or `FROM_REQUEST_PORT` (original-destination port under capture, otherwise the frontend listener port — never `X-Forwarded-Port` / `Forwarded`). Mutually exclusive with `port` |
+| `scheme` | String \| null | omitted | `http` or `https`, ASCII-lowercased before validation (so `HTTPS` is accepted). The request's frontend scheme is preserved when unset |
+| `redirect_code` | u16 | `301` | `300`–`399` |
+
+Scheme-default ports are omitted from the rendered authority, and the original query string is preserved unless the redirect `uri` supplies its own.
+
+**`rules[].retry`** — a strict route-local wire shape that converts to the gateway `RetryConfig`.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `max_retries` | u32 | `3` | `0`–`100` |
+| `retryable_status_codes` | u16[] | `[]` | Each `100`–`599`; at most 500 entries |
+| `retryable_methods` | String[] | `["GET", "HEAD", "OPTIONS", "PUT", "DELETE"]` | One of GET / POST / PUT / PATCH / DELETE / HEAD / OPTIONS / TRACE / CONNECT, ASCII-uppercased before comparison (so `get` is accepted). At most 9 entries |
+| `backoff` | Object | `{"fixed": {"delay_ms": 100}}` | Either `{"fixed": {"delay_ms": N}}` or `{"exponential": {"base_ms": N, "max_ms": M}}`. Each delay is `0`–`300000` ms and `base_ms` must not exceed `max_ms` |
+| `retry_on_connect_failure` | bool | `true` | Retry connection failures |
+
+**`rules[].destination.backend_tls`** — a strict route-local wire shape that converts to the gateway `BackendTlsConfig`.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `client_cert_path` | String \| null | omitted | Client certificate PEM path. Non-empty, and must be set together with `client_key_path` |
+| `client_key_path` | String \| null | omitted | Client key PEM path. Non-empty, and must be set together with `client_cert_path` |
+| `server_ca_cert_path` | String \| null | omitted | Backend CA PEM path, or `system://` for the platform roots. Non-empty |
+| `verify_server_cert` | bool | `true` | Verify the backend certificate. Cannot be `false` alongside a `system://` `server_ca_cert_path` |
+| `sni` | String \| null | omitted | SNI override, max 253 characters, ASCII-lowercased at load |
+| `san_allow_list` | String[] | `[]` | Accepted backend SAN entries, at most 256 |
+
+**`rules[].{request,response}_transform[]`**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `operation` | String | — | Required. `add` (append with a comma separator, or insert), `update` (insert or replace), or `remove` |
+| `target` | String | `header` | Only `header` is accepted for route-level transforms |
+| `key` | String | — | Required. A valid HTTP header name |
+| `value` | String \| null | omitted | Required and non-null for `add` / `update`; omitted or null for `remove`. Must parse as an HTTP `HeaderValue`; CRLF is rejected |
+
+**Two admission rules the JSON Schema cannot express** and that only the constructor
+enforces: `backoff.base_ms <= backoff.max_ms` (a comparison between two sibling
+properties), and the `system://` CA versus `verify_server_cert: false`
+contradiction (a value-prefix test combined with a sibling boolean). The
+`backend_host` schema `pattern` is likewise a conservative approximation — a
+colon-bearing value that is not a valid IPv6 literal passes the schema and is
+still rejected at admission.
+
+##### Matching and dispatch semantics
+
+- **Soft fallback is the default.** With `reject_unmatched: false`, a request that
+  matches no rule is simply proxied to the matched proxy's own backend. That makes
+  a broken predicate look like healthy traffic, so verify a new canary rule
+  actually fires before relying on it.
+- **Aggregate unmatched handling.** `reject_unmatched` is finalized across every
+  attached instance: a local miss never short-circuits a later instance, and the
+  `404` is returned only after all instances have run with no match and no earlier
+  route override. All attached instances must stay a contiguous priority block.
+- **Whole-destination replacement.** A matching instance replaces all four
+  override fields (`upstream_id`, `backend_host`, `backend_port`, `backend_tls`);
+  a non-matching instance leaves an earlier instance's override intact.
+- **Protocol scope.** The plugin runs on HTTP, gRPC, and WebSocket at priority
+  2995. A WebSocket override selects the upgrade backend only — frames are not
+  re-routed after the upgrade — and an HBONE `CONNECT` is matched on the outer
+  request before the relay branch, after which the tunnel is a transparent relay.
+- **Clearing inherited policy.** `timeout_disabled` / `retry_disabled` are the only
+  way to clear a timeout or retry policy the selected proxy carries; leaving the
+  field unset inherits it, which is the opposite of the operator's intent for a
+  collapsed route.
+
+##### Route transforms need a consumer
+
+Route header transforms are published onto the request context and applied by
+proxy core after the last **eligible** (enabled) `request_transformer` /
+`response_transformer` in the chain. A proxy with no such instance forwards the
+request normally and applies neither transform. The VirtualService translator
+auto-emits an `apply_route_overrides: true` consumer; when configuring the plugin
+directly, add one yourself (see the third example below).
+
+##### Examples
+
+A minimal direct override — a `POST` carrying `x-canary: v2` goes to the canary
+backend, everything else keeps the proxy's own backend:
+
+```yaml
+version: "1"
+plugin_configs:
+  - id: reviews-canary
+    plugin_name: mesh_route_dispatch
+    scope: proxy
+    proxy_id: reviews
+    enabled: true
+    config:
+      rules:
+        - match:
+            methods: ["POST"]
+            headers:
+              x-canary: v2
+          destination:
+            backend_host: reviews-v2.default.svc.cluster.local
+            backend_port: 9080
+          timeout_ms: 1500
+proxies:
+  - id: reviews
+    listen_path: /reviews
+    backend_scheme: http
+    backend_host: reviews-v1.default.svc.cluster.local
+    backend_port: 9080
+    plugins:
+      - plugin_config_id: reviews-canary
+```
+
+A redirect-only rule needs no `destination`. `/reviews/legacyitem` is answered
+`301` with a `Location` path of `/reviews/v2item` — literal prefix substitution,
+with no separator synthesized at the segment boundary:
+
+```yaml
+version: "1"
+plugin_configs:
+  - id: reviews-redirect
+    plugin_name: mesh_route_dispatch
+    scope: proxy
+    proxy_id: reviews
+    enabled: true
+    config:
+      rules:
+        - match:
+            uri:
+              prefix: /reviews/legacy
+          redirect:
+            uri: /reviews/v2
+            match_prefix: /reviews/legacy
+            redirect_code: 301
+proxies:
+  - id: reviews
+    listen_path: /reviews
+    backend_scheme: http
+    backend_host: reviews-v1.default.svc.cluster.local
+    backend_port: 9080
+    plugins:
+      - plugin_config_id: reviews-redirect
+```
+
+Route header transforms with the eligible consumers they require. Without the two
+transformer instances the rule still forwards to the backend, but neither header
+change is applied:
+
+```yaml
+version: "1"
+plugin_configs:
+  - id: reviews-routing
+    plugin_name: mesh_route_dispatch
+    scope: proxy
+    proxy_id: reviews
+    enabled: true
+    config:
+      reject_unmatched: true
+      rules:
+        - match:
+            uri:
+              prefix: /reviews/api
+          destination:
+            backend_host: reviews-v2.default.svc.cluster.local
+            backend_port: 9080
+          rewrite:
+            uri: /v2
+            match_prefix: /reviews/api
+          request_transform:
+            - operation: update
+              key: x-route
+              value: reviews-v2
+            - operation: remove
+              key: x-internal-debug
+          response_transform:
+            - operation: add
+              key: x-served-by
+              value: edge
+  - id: reviews-route-request-consumer
+    plugin_name: request_transformer
+    scope: proxy
+    proxy_id: reviews
+    enabled: true
+    config:
+      apply_route_overrides: true
+      rules: []
+  - id: reviews-route-response-consumer
+    plugin_name: response_transformer
+    scope: proxy
+    proxy_id: reviews
+    enabled: true
+    config:
+      apply_route_overrides: true
+      rules: []
+proxies:
+  - id: reviews
+    listen_path: /reviews
+    backend_scheme: http
+    backend_host: reviews-v1.default.svc.cluster.local
+    backend_port: 9080
+    plugins:
+      - plugin_config_id: reviews-routing
+      - plugin_config_id: reviews-route-request-consumer
+      - plugin_config_id: reviews-route-response-consumer
+```
+
+With `reject_unmatched: true` in that last example, a request under `/reviews`
+that does not start with `/reviews/api` is answered `404` rather than reaching
+`reviews-v1`.
 
 See [Mesh VirtualService translation](mesh.md#virtualservice-translation) and [plugin execution order](plugin_execution_order.md#why-this-order-matters) for route-collapse, fault, rewrite, redirect, and HBONE behavior.
 
