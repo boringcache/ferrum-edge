@@ -5563,7 +5563,9 @@ impl RequestContext {
     /// Single hash lookup for call sites that only need one field-line value.
     /// Multiple `Host` headers are rejected earlier by `check_protocol_headers()`.
     /// For list-style headers that may span multiple field-lines (for example
-    /// `x-forwarded-for`), use `raw_header_values()` and fold them explicitly.
+    /// `x-forwarded-for`), use [`Self::header_field_lines`] and fold them
+    /// explicitly — `raw_header_values()` is text-only and drops a field-line
+    /// the client made unrepresentable.
     #[inline]
     pub fn raw_header_get(&self, name: &str) -> Option<&str> {
         self.raw_headers
@@ -5572,10 +5574,15 @@ impl RequestContext {
             .and_then(|v| v.to_str().ok())
     }
 
-    /// Iterate all UTF-8 values for a raw header without materializing the full
-    /// header map. Returns an empty iterator when raw headers were never set.
-    /// Non-UTF-8 field lines are skipped here; security decisions that must see
-    /// every field line should use [`Self::raw_header_value_bytes`].
+    /// Iterate all visible-ASCII values for a raw header without materializing
+    /// the full header map. Returns an empty iterator when raw headers were
+    /// never set.
+    ///
+    /// A field line that `HeaderValue::to_str()` cannot represent — any
+    /// obs-text byte, valid UTF-8 included — is skipped here, whole. Security
+    /// decisions must therefore use [`Self::raw_header_value_bytes`] or
+    /// [`Self::header_field_lines`]: the remote peer chooses whether a field
+    /// line is representable, so what this accessor yields is peer-controlled.
     #[inline]
     pub fn raw_header_values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
         self.raw_headers

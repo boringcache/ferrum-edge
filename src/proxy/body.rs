@@ -1290,6 +1290,42 @@ impl ProxyBody {
         (self, metrics)
     }
 
+    /// Positive end-of-stream proof for the `Drop` safety net.
+    ///
+    /// "Polled but never drained" is normally a client disconnect, but it is
+    /// also the ordinary shape of a *successful* finite stream: a streaming
+    /// adapter may consume the backend's `Ready(None)`, mark itself done, and
+    /// yield its final buffered DATA frame, after which hyper is permitted to
+    /// observe `is_end_stream()` and drop the body without one redundant EOF
+    /// poll. `poll_frame` already trusts exactly that proof to return a pooled
+    /// HTTP/1.1 carrier (`clean_backend_end`), which is a strictly more
+    /// dangerous decision than a log classification.
+    ///
+    /// Classifying that case as a disconnect made a fully delivered finite
+    /// stream — a length-delimited `text/event-stream` response on H1/H2 —
+    /// report `body_completed: false`, which kept `request_deduplication`'s
+    /// in-flight lease until `inflight_ttl_seconds` and trained the adaptive
+    /// limiter on a client disconnect that never happened.
+    ///
+    /// Only the `true` direction is trusted, which is what makes this safe: a
+    /// wrapper that has not terminated may still report `false` before its
+    /// terminal poll, so this can never turn a real mid-stream disconnect into
+    /// a success. A synthesized client/authorization deadline terminal is
+    /// excluded by the caller, exactly as in `poll_frame`.
+    ///
+    /// Streaming kinds only. A `Full` body reports end-of-stream as soon as its
+    /// single buffered frame has been handed over, which says nothing about
+    /// whether the client was still there — that case keeps the existing
+    /// "polled but never drained is a disconnect" reading, the same asymmetry
+    /// the never-polled branch below already applies.
+    fn proved_end_of_stream_on_drop(&self) -> bool {
+        match &self.kind {
+            ProxyBodyKind::Full(_) => false,
+            ProxyBodyKind::Stream(body) => body.is_end_stream(),
+            ProxyBodyKind::Tracked(body) => body.inner.is_end_stream(),
+        }
+    }
+
     fn record_deferred_backend_admission(
         &mut self,
         error_class: Option<ErrorClass>,
@@ -1683,15 +1719,17 @@ impl Drop for ProxyBody {
             //    `is_end_stream()` is still unreliable before terminal poll,
             //    so we trust `polled` exclusively and treat never-polled as
             //    success.
-            let completed_declared_bytes = self
+            let proved_complete = self
                 .success_on_drop_after_bytes
-                .is_some_and(|expected| bytes == expected);
+                .is_some_and(|expected| bytes == expected)
+                || (!client_deadline_fired && self.proved_end_of_stream_on_drop());
             let outcome = if self.polled.load(Ordering::Relaxed) {
                 // Polled at least once but never reached Ready(None) or an
                 // error terminal. That's normally a client disconnect
-                // mid-stream, except for protocol adapters that can prove the
-                // downstream body completed from the declared byte count.
-                if completed_declared_bytes {
+                // mid-stream, except when the body itself proves it ended:
+                // a protocol adapter's declared byte count, or an inner
+                // wrapper already reporting end-of-stream.
+                if proved_complete {
                     crate::proxy::deferred_log::BodyOutcome::success(bytes)
                 } else {
                     crate::proxy::deferred_log::BodyOutcome::client_disconnect(bytes)
@@ -1735,6 +1773,10 @@ impl Drop for ProxyBody {
             && self
                 .success_on_drop_after_bytes
                 .is_none_or(|expected| self.bytes_streamed.load(Ordering::Relaxed) != expected)
+            // Same proof as the logger branch above: a body whose wrapper
+            // already reported end-of-stream completed, so backend admission
+            // and dispatch accounting must not record a client disconnect.
+            && (client_deadline_fired || !self.proved_end_of_stream_on_drop())
         {
             deferred_admission_error_class = Some(ErrorClass::ClientDisconnect);
             deferred_admission_client_disconnected = true;

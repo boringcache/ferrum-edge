@@ -351,6 +351,7 @@ fn probe_breaker_config() -> CircuitBreakerConfig {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     }
 }
 
@@ -945,5 +946,63 @@ async fn every_pool_family_key_is_drained_by_the_svid_generation_matcher() {
                 );
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Declared response Content-Length ceiling skips bodyless replies (issue #5116)
+//
+// A representation Content-Length on HEAD / 1xx / 204 / 205 / 304 is not a
+// transferable-body size. The shared helper is the single predicate; a sibling
+// that compares a parsed Content-Length against the response ceiling without
+// going through it reintroduces the 502.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn response_content_length_ceiling_skips_bodyless_semantics_on_every_path() {
+    let proxy = source("src/proxy/mod.rs");
+    let helper = item_body(
+        &proxy,
+        "pub(crate) fn declared_response_length_exceeds_limit(",
+        "\n}",
+    );
+    assert!(
+        helper.contains("synthetic_response_omits_body(method, status)"),
+        "the shared declared-length ceiling must skip HEAD/1xx/204/205/304"
+    );
+
+    for relative in [
+        "src/proxy/mod.rs",
+        "src/http3/server.rs",
+        "src/http3/cross_protocol.rs",
+    ] {
+        assert!(
+            source(relative).contains("declared_response_length_exceeds_limit("),
+            "{relative} must run the shared declared-length ceiling"
+        );
+    }
+
+    for (path, text) in production_sources() {
+        assert!(
+            !text.contains(
+                "&& let Some(len) = content_length\n                && len > effective_max_response_body_size_bytes"
+            ),
+            "{path} compared a parsed Content-Length against the response ceiling \
+             without the bodyless-aware helper"
+        );
+        assert!(
+            !text.contains(
+                "&& let Some(len) = content_length\n        && len > effective_max_response_body_size_bytes"
+            ),
+            "{path} compared a parsed Content-Length against the response ceiling \
+             without the bodyless-aware helper"
+        );
+        assert!(
+            !text.contains(
+                "content_length.is_some_and(|len| len > effective_max_response_body_size_bytes as u64)"
+            ),
+            "{path} compared a parsed Content-Length against the response ceiling \
+             without the bodyless-aware helper"
+        );
     }
 }

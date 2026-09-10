@@ -2833,7 +2833,10 @@ async fn handle_h3_request(
     // materializing the full HashMap — only 2-3 targeted lookups on the raw
     // HeaderMap. Parity with the H1/H2 path: the configured real-IP header is
     // read as ALL of its field lines so duplicate lines cannot hide a competing
-    // attacker-supplied value (advisory GHSA-fx4w-68hx-mj7r).
+    // attacker-supplied value (advisory GHSA-fx4w-68hx-mj7r), and
+    // X-Forwarded-For is read through that same byte-preserving accessor so no
+    // field line can leave the chain before it is walked
+    // (advisory GHSA-73ff-frj6-cpmp).
     if !state.trusted_proxies.is_empty() {
         // Latch the immediate-peer trust verdict for the whole request, before
         // any plugin phase runs — same contract as the H1/H2 frontend. Computed
@@ -2849,19 +2852,9 @@ async fn handle_h3_request(
         ) {
             request_scheme = forwarded_scheme;
         }
-        let xff_chain = {
-            let mut values = ctx.raw_header_values("x-forwarded-for");
-            values.next().map(|first| {
-                let mut combined = String::from(first);
-                for value in values {
-                    combined.push(',');
-                    combined.push_str(value);
-                }
-                combined
-            })
-        };
-        // Bound the immutable borrow of `ctx` (held by the field-line iterator)
-        // to this statement so the assignment below can take a mutable borrow.
+        // Bound the immutable borrows of `ctx` (held by the field-line
+        // iterators) to this statement so the assignment below can take a
+        // mutable borrow.
         let resolved = crate::proxy::client_ip::resolve_forwarded_client_ip(
             socket_ip,
             &socket_addr,
@@ -2873,7 +2866,7 @@ async fn handle_h3_request(
                 .map(|name| ctx.header_field_lines(name))
                 .into_iter()
                 .flatten(),
-            xff_chain.as_deref(),
+            ctx.header_field_lines("x-forwarded-for"),
             &state.trusted_proxies,
         )
         .unwrap_or_else(|| socket_ip.to_string());
@@ -7102,6 +7095,8 @@ async fn handle_h3_request(
 
         // Enforce response body size limit via Content-Length fast path
         if let Some(len) = crate::proxy::declared_response_length_exceeds_limit(
+            &method,
+            response_status,
             &response_headers,
             effective_max_response_body_size_bytes,
         ) && !response_omits_body
@@ -10875,8 +10870,13 @@ async fn collect_h3_open_response_body(
     // honored by both the ceiling check and the preallocation hint below
     // (`GHSA-xrfj-852f-645j`).
     let content_length = crate::proxy::canonical_header_content_length_from_map(&response_headers);
-    if effective_max_response_body_size_bytes > 0
-        && content_length.is_some_and(|len| len > effective_max_response_body_size_bytes as u64)
+    if crate::proxy::declared_response_length_exceeds_limit(
+        method,
+        response_status,
+        &response_headers,
+        effective_max_response_body_size_bytes,
+    )
+    .is_some()
     {
         return H3BufferedDispatchResult {
             status: 502,
@@ -11143,6 +11143,8 @@ async fn stream_h3_open_response_to_client(
     let effective_max_response_body_size_bytes = ctx.effective_max_response_body_size_bytes();
     // A HEAD representation length is metadata, not bytes to retain or relay.
     if let Some(len) = crate::proxy::declared_response_length_exceeds_limit(
+        method,
+        response_status,
         &response_headers,
         effective_max_response_body_size_bytes,
     ) && !response_omits_body
@@ -13402,6 +13404,8 @@ async fn dispatch_grpc_native_h3(
     // apply — NOT the request-side gRPC receive cap, so a large-but-valid gRPC
     // response is not spuriously rejected.
     if let Some(len) = crate::proxy::declared_response_length_exceeds_limit(
+        method,
+        response_status,
         &response_headers,
         effective_max_response_body_size_bytes,
     ) {
@@ -15220,6 +15224,8 @@ async fn proxy_to_backend_h3_streaming(
     );
     // Enforce response body size limit via Content-Length fast path
     if let Some(len) = crate::proxy::declared_response_length_exceeds_limit(
+        method,
+        response_status,
         &response_headers,
         effective_max_response_body_size_bytes,
     ) && !response_omits_body
@@ -18107,6 +18113,7 @@ mod h3_request_body_timeout_tests {
             failure_status_codes: vec![500],
             half_open_max_requests: 1,
             trip_on_connection_errors: true,
+            half_open_probe_dwell_seconds: None,
         });
         cb.record_failure(500, false, false);
         assert!(
