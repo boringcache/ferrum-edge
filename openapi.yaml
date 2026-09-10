@@ -17570,7 +17570,12 @@ components:
     StdoutLoggingConfig:
       type: [object, "null"]
       additionalProperties: false
-      description: "Plugin: stdout_logging — Writes one JSON transaction/stream summary per line to the bounded non-blocking stdout writer. Independent of FERRUM_LOG_LEVEL. Accepted keys are filter, schema, and schema_ref; null or an empty object uses defaults. The optional filter runs before schema application."
+      description: "Plugin: stdout_logging — Writes one JSON transaction/stream summary per line to the bounded non-blocking stdout writer. Independent of FERRUM_LOG_LEVEL. Accepted keys are filter, schema, and schema_ref; null or an empty object uses defaults. The optional filter runs before schema application. `schema` and `schema_ref` are mutually exclusive. `filter.expression` is mutually exclusive with the flat filter keys (status_code_min, status_code_max, min_latency_ms, errors_only) by key presence, including `errors_only: false`."
+      if:
+        type: object
+      then:
+        not:
+          required: [schema, schema_ref]
       properties:
         filter:
           type: [object, "null"]
@@ -17580,6 +17585,15 @@ components:
             serialized. All present fields must match for an entry to be
             logged. The expression form is mutually exclusive with the flat
             predicates. When omitted, every transaction is logged.
+          if:
+            type: object
+          then:
+            not:
+              anyOf:
+                - required: [expression, status_code_min]
+                - required: [expression, status_code_max]
+                - required: [expression, min_latency_ms]
+                - required: [expression, errors_only]
           properties:
             status_code_min:
               type: integer
@@ -17611,25 +17625,32 @@ components:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
           type: string
+          minLength: 1
           description: >-
             Name of a schema registered by a `transaction_log_schema` plugin.
             Mutually exclusive with `schema`. See docs/log_schema.md.
 
     HttpLoggingConfig:
       type: object
-      description: "Plugin: http_logging — Sends transaction logs to an HTTP endpoint in batches."
+      additionalProperties: false
+      description: "Plugin: http_logging — Sends transaction logs to an HTTP endpoint in batches. Unknown top-level keys are rejected. `schema` and `schema_ref` are mutually exclusive. Registration policy is OptionalFailOpen."
       required:
         - endpoint_url
+      not:
+        required: [schema, schema_ref]
       properties:
         endpoint_url:
           type: string
+          minLength: 1
+          format: uri
+          pattern: '^[hH][tT][tT][pP][sS]?://(?![^/?#]*@)(?:\[[^\]\s]+\]|[^/?#:\s]+)(?::[0-9]+)?(?:[/?#]\S*)?$'
           description: >-
-            URL to POST transaction logs to. Must be http:// or https:// with a
-            hostname or IP address; userinfo credentials
-            (https://user:pass@host) are rejected — authenticate with
-            custom_headers. Some collectors require a credential in the URL
-            (Sumo Logic path token, Mezmo apikey query parameter), so this value
-            is never rendered in operational output: egress-denial, DNS/TLS,
+            Required URL to POST transaction logs to. Must be http:// or https://
+            with a hostname or IP address (IPv6 authorities are allowed); empty
+            strings and userinfo credentials (https://user:pass@host) are
+            rejected — authenticate with custom_headers. Some collectors require
+            a credential in the URL (Sumo Logic path token), so this value is
+            never rendered in operational output: egress-denial, DNS/TLS,
             retry, slow-call, and batch-failure diagnostics show only a
             structurally redacted scheme://host:port/redacted form. The admin
             audit and non-admin read projections apply the schema-aware
@@ -17638,9 +17659,15 @@ components:
             `[REDACTED_FRAGMENT]` markers.
         custom_headers:
           type: object
+          propertyNames:
+            type: string
+            minLength: 1
+            maxLength: 65535
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           additionalProperties:
             type: string
-          description: "Key-value pairs of custom HTTP headers to include on every batch request. Use this for service-specific auth (e.g., DD-API-KEY for Datadog, Api-Key for New Relic) or metadata headers."
+            pattern: '^[\u0009\u0020-\u007E]*$'
+          description: "Key-value pairs of custom HTTP headers to include on every batch request. Names use HTTP token syntax. Values are visible ASCII plus HTAB; CR/LF and other controls are rejected. Use this for service-specific auth (e.g., DD-API-KEY for Datadog, Api-Key for New Relic) or metadata headers."
           example:
             DD-API-KEY: your-datadog-api-key
         batch_size:
@@ -17695,6 +17722,7 @@ components:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
           type: string
+          minLength: 1
           description: >-
             Name of a schema registered by a `transaction_log_schema` plugin.
             Mutually exclusive with `schema`. See docs/log_schema.md.

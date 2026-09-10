@@ -4908,6 +4908,11 @@ fn stdout_logging_schema_rejects_unknown_outer_and_filter_keys() {
         json!({}),
         json!({"filter": null}),
         json!({"filter": {"status_code_min": 500, "errors_only": true}}),
+        json!({"filter": {"status_code_max": 599}}),
+        json!({"filter": {"min_latency_ms": 250}}),
+        json!({"filter": {"errors_only": false}}),
+        json!({"filter": {"expression": {"op": "errors_only"}}}),
+        json!({"schema": {}}),
         json!({"schema_ref": "common"}),
     ] {
         assert_component_validity(&spec, "StdoutLoggingConfig", &valid, true);
@@ -4917,8 +4922,85 @@ fn stdout_logging_schema_rejects_unknown_outer_and_filter_keys() {
         json!({"log_level": "info"}),
         json!({"filter": {"error_only": true}}),
         json!({"filter": {"min_latency_msec": 100}}),
+        json!({
+            "filter": {
+                "expression": {"op": "errors_only"},
+                "status_code_min": 500
+            }
+        }),
+        json!({
+            "filter": {
+                "expression": {"op": "errors_only"},
+                "status_code_max": 599
+            }
+        }),
+        json!({
+            "filter": {
+                "expression": {"op": "errors_only"},
+                "min_latency_ms": 10
+            }
+        }),
+        json!({
+            "filter": {
+                "expression": {"op": "errors_only"},
+                "errors_only": false
+            }
+        }),
+        json!({"schema": {}, "schema_ref": "known"}),
     ] {
         assert_component_validity(&spec, "StdoutLoggingConfig", &invalid, false);
+    }
+}
+
+#[test]
+fn http_logging_schema_rejects_unknown_keys_and_invalid_endpoints() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/HttpLoggingConfig")
+        .expect("HttpLoggingConfig exists");
+    assert_eq!(schema.get("additionalProperties"), Some(&json!(false)));
+    assert_eq!(schema.get("required"), Some(&json!(["endpoint_url"])));
+
+    let endpoint = "http://127.0.0.1:29001/ingest";
+    for valid in [
+        json!({"endpoint_url": endpoint}),
+        json!({"endpoint_url": "http://[::1]/logs"}),
+        json!({"endpoint_url": "HTTP://localhost:9200/logs"}),
+        json!({
+            "endpoint_url": endpoint,
+            "custom_headers": {
+                "Authorization": "Bearer token",
+                "X-Custom": "x",
+                "authorization": "Bearer other"
+            }
+        }),
+        json!({"endpoint_url": endpoint, "schema": {}}),
+        json!({"endpoint_url": endpoint, "schema_ref": "known"}),
+    ] {
+        assert_component_validity(&spec, "HttpLoggingConfig", &valid, true);
+    }
+    for invalid in [
+        json!({"endpoint_url": endpoint, "typo": 1}),
+        json!({"endpoint_url": ""}),
+        json!({"endpoint_url": "ftp://localhost"}),
+        json!({"endpoint_url": "http:///ingest"}),
+        json!({"endpoint_url": "http://user:pass@localhost"}),
+        json!({
+            "endpoint_url": endpoint,
+            "custom_headers": {"bad name": "x"}
+        }),
+        json!({
+            "endpoint_url": endpoint,
+            "custom_headers": {"X-Token": "bad\r\nvalue"}
+        }),
+        json!({
+            "endpoint_url": endpoint,
+            "schema": {},
+            "schema_ref": "known"
+        }),
+    ] {
+        assert_component_validity(&spec, "HttpLoggingConfig", &invalid, false);
     }
 }
 
