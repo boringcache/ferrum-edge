@@ -34,7 +34,9 @@
 //!    transaction rather than as the outer error's own code
 //!    ([`is_cluster_topology_error`]).
 //!
-//! Replay-authority clients (`RedisRateLimitClient::for_replay_authority`)
+//! Clients whose retained record *is* the control
+//! (`RedisRateLimitClient::for_replay_authority`, and
+//! `RedisRateLimitClient::for_retention_authority` for `request_deduplication`)
 //! additionally prove the server will not evict a still-live `SET NX EX`
 //! marker. After a usable topology screen they issue bounded `INFO MEMORY` and
 //! accept the connection only when `maxmemory` is `0` (no memory limit, so
@@ -42,8 +44,13 @@
 //! or `volatile-*` policy is terminal for that client generation — the same
 //! sticky refusal as Redis Cluster. ACL denial, malformed or missing fields,
 //! timeout, or a protocol error leave the authority unavailable and
-//! recoverable (`memory_policy_unproven`). Generic rate-limiter clients never
-//! run this screen and keep their existing topology-only behavior.
+//! recoverable (`memory_policy_unproven`). The requirement is
+//! [`RedisRetentionRequirement`], carried independently of the diagnostic
+//! [`RedisClientLogPolicy`]: an idempotency authority needs the retention
+//! proof while keeping ordinary operational diagnostics. Cache and budget
+//! clients (`RedisRateLimitClient::new`) never run this screen and keep their
+//! existing topology-only behavior, because eviction there degrades a counter
+//! or a cache rather than voiding a guarantee.
 //!
 //! The proactive probe is bounded by the configured
 //! `redis_connect_timeout_seconds` (no separate knob): a server can accept and
@@ -55,8 +62,8 @@
 //! ([`TopologyScreen::ProbeFailed`]).
 //!
 //! The same bound covers the background recovery checker's `PING` and, for
-//! replay-authority clients, the `INFO MEMORY` screen. That checker is
-//! single-flight (`health_checker_started`): an accepted socket that never
+//! clients that require the retention proof, the `INFO MEMORY` screen. That
+//! checker is single-flight (`health_checker_started`): an accepted socket that never
 //! answers `PING` must time out and retry rather than wedging the only
 //! recovery task, or fail-closed consumers could never recover even after the
 //! backend became healthy.
@@ -1129,7 +1136,7 @@ fn is_unproven_memory_probe_error(error: &redis::RedisError) -> bool {
 }
 
 /// Verdict of the proactive `INFO MEMORY` eviction-policy screen used only by
-/// replay-authority Redis clients.
+/// Redis clients that declare [`RedisRetentionRequirement::NoEviction`].
 ///
 /// Distinct from [`TopologyScreen`]: an absent `cluster_enabled` field is
 /// compatible (not proven Cluster), but an absent memory-policy proof cannot
@@ -1182,7 +1189,7 @@ fn policy_is_evicting(policy: &str) -> bool {
     lowered.starts_with("allkeys-") || lowered.starts_with("volatile-")
 }
 
-/// Classify an `INFO MEMORY` payload for replay-authority use.
+/// Classify an `INFO MEMORY` payload for retention-authority use.
 ///
 /// Usable only when the server proves either unlimited memory (`maxmemory` is
 /// present and `0`) or `noeviction`. A reported `allkeys-*` / `volatile-*`
@@ -1217,7 +1224,8 @@ fn memory_screen_from_info_value(value: &redis::Value) -> MemoryPolicyScreen {
 }
 
 /// Ask a freshly topology-screened connection whether it will evict live keys,
-/// under a hard `probe_timeout` deadline. Replay-authority clients only.
+/// under a hard `probe_timeout` deadline. Only clients that declare
+/// [`RedisRetentionRequirement::NoEviction`] run it.
 async fn screen_connection_memory_policy(
     conn: &mut impl redis::aio::ConnectionLike,
     probe_timeout: Duration,
@@ -1833,6 +1841,13 @@ pub struct RedisRateLimitClient {
     /// `key_prefix`). Replay-authority clients publish only a fixed
     /// classification beside the already-redacted endpoint.
     log_policy: RedisClientLogPolicy,
+    /// Whether this client must prove the endpoint will not evict live keys.
+    ///
+    /// Deliberately independent of [`RedisClientLogPolicy`]: the diagnostic
+    /// posture and the retention prerequisite are different questions, and
+    /// `request_deduplication` needs the second without the first
+    /// (`GHSA-26gf-943w-w5x8`).
+    retention: RedisRetentionRequirement,
     /// Lifecycle registration for shared-replay readiness/metrics. Present
     /// only after [`Self::register_as_shared_replay_authority`]; independent of
     /// connections, endpoints, and credentials. Drop of this client drops the
@@ -1851,6 +1866,49 @@ enum RedisClientLogPolicy {
     ClassificationOnly,
 }
 
+/// Whether a client's retained records may be evicted by the server.
+///
+/// Availability and atomic ownership transitions do not establish that an
+/// acknowledged record survives its lease: an `allkeys-*` / `volatile-*` Redis
+/// under memory pressure drops live keys, TTL or not. For a limiter or a cache
+/// that only degrades a budget or forces a miss; for an idempotency or
+/// single-use authority the record *is* the control, so a silent eviction lets
+/// a retried non-idempotent operation execute twice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RedisRetentionRequirement {
+    /// Counters and caches: eviction degrades accuracy, never correctness.
+    BestEffort,
+    /// The retained record is the control. Every connection must prove
+    /// `maxmemory == 0` or `maxmemory_policy == noeviction` before it may carry
+    /// a command, and a proven evicting endpoint is terminal.
+    NoEviction,
+}
+
+/// Why an endpoint is permanently refused for this client generation.
+///
+/// Both faults are configuration, not outage: no amount of recovery pinging
+/// can make the next policy operation correct, so they latch through
+/// [`EnforcementAvailability::reject_topology`] and the consumer's failure
+/// policy governs from there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EndpointTerminalFault {
+    /// The server reports Redis Cluster topology.
+    UnsupportedTopology,
+    /// The server proves an evicting `maxmemory` policy under a memory limit.
+    UnsafeEviction,
+}
+
+impl EndpointTerminalFault {
+    /// Fixed classification published beside the redacted endpoint. Closed set,
+    /// never interpolated from backend text.
+    fn classification(self) -> &'static str {
+        match self {
+            Self::UnsupportedTopology => "unsupported_topology",
+            Self::UnsafeEviction => "unsafe_eviction_policy",
+        }
+    }
+}
+
 /// Classification-only diagnostic for a Redis client owned by the replay
 /// authority. Never interpolates backend text, keys, prefixes, or credentials.
 fn warn_replay_backend(redacted_url: &str, classification: &'static str, message: &'static str) {
@@ -1859,6 +1917,36 @@ fn warn_replay_backend(redacted_url: &str, classification: &'static str, message
         classification,
         "{message}"
     );
+}
+
+/// Terminal no-eviction rejection. Operational clients keep the historical
+/// `key_prefix` + `reason` fields; replay clients publish only the fixed
+/// classification beside the redacted endpoint.
+fn warn_unsafe_eviction(
+    redacted_url: &str,
+    key_prefix: &str,
+    reason: &str,
+    log_policy: RedisClientLogPolicy,
+) {
+    match log_policy {
+        RedisClientLogPolicy::Operational => {
+            warn!(
+                redis_url = %redacted_url,
+                key_prefix = %key_prefix,
+                reason,
+                "Redis endpoint reports an evicting maxmemory policy and cannot retain \
+                 idempotency records for their full lease — centralized Redis access is \
+                 disabled for this configuration until the endpoint is set to noeviction"
+            );
+        }
+        RedisClientLogPolicy::ClassificationOnly => {
+            warn_replay_backend(
+                redacted_url,
+                EndpointTerminalFault::UnsafeEviction.classification(),
+                "Redis single-use claim failed",
+            );
+        }
+    }
 }
 
 /// Terminal Cluster rejection. Operational clients keep the historical
@@ -2022,6 +2110,44 @@ impl RedisRateLimitClient {
             tls_no_verify,
             tls_ca_bundle_path,
             RedisClientLogPolicy::Operational,
+            RedisRetentionRequirement::BestEffort,
+        )
+    }
+
+    /// Redis client for a consumer whose retained record IS the control
+    /// (`request_deduplication`'s idempotency records today).
+    ///
+    /// Identical to [`Self::new`] except that every connection — first dial,
+    /// dedicated transaction connection, and background recovery probe — must
+    /// prove the endpoint will not evict live keys (`maxmemory == 0` or
+    /// `maxmemory_policy == noeviction`) before it may carry a command. A
+    /// proven `allkeys-*` / `volatile-*` policy is terminal for this client
+    /// generation and an unproven query is a recoverable outage, so the
+    /// consumer's failure policy (`on_redis_unavailable`, fail-closed by
+    /// default) governs instead of an endpoint that can silently drop an
+    /// acknowledged operation record mid-lease (`GHSA-26gf-943w-w5x8`).
+    ///
+    /// Diagnostics stay [`RedisClientLogPolicy::Operational`]: retention safety
+    /// and log redaction are independent choices, and this consumer is an
+    /// ordinary plugin whose operators need the historical `key_prefix` /
+    /// `reason` fields. Counter and cache clients must keep [`Self::new`] —
+    /// eviction only degrades a budget or forces a miss there, and requiring
+    /// `INFO MEMORY` of them would refuse deployments that are perfectly safe.
+    ///
+    /// Returns `Err` under the same exclusive-CA load failure as [`Self::new`].
+    pub fn for_retention_authority(
+        config: RedisConfig,
+        dns_cache: Option<DnsCache>,
+        tls_no_verify: bool,
+        tls_ca_bundle_path: Option<&str>,
+    ) -> Result<Self, String> {
+        Self::construct(
+            config,
+            dns_cache,
+            tls_no_verify,
+            tls_ca_bundle_path,
+            RedisClientLogPolicy::Operational,
+            RedisRetentionRequirement::NoEviction,
         )
     }
 
@@ -2053,6 +2179,7 @@ impl RedisRateLimitClient {
             tls_no_verify,
             tls_ca_bundle_path,
             RedisClientLogPolicy::ClassificationOnly,
+            RedisRetentionRequirement::NoEviction,
         )
     }
 
@@ -2062,6 +2189,7 @@ impl RedisRateLimitClient {
         tls_no_verify: bool,
         tls_ca_bundle_path: Option<&str>,
         log_policy: RedisClientLogPolicy,
+        retention: RedisRetentionRequirement,
     ) -> Result<Self, String> {
         let tls_ca_bundle_pem = load_redis_tls_ca_bundle(tls_no_verify, tls_ca_bundle_path)?;
 
@@ -2078,6 +2206,7 @@ impl RedisRateLimitClient {
             tls_no_verify,
             tls_ca_bundle_pem,
             log_policy,
+            retention,
             shared_replay_health: OnceLock::new(),
         })
     }
@@ -2136,6 +2265,40 @@ impl RedisRateLimitClient {
 
     fn classification_only(&self) -> bool {
         matches!(self.log_policy, RedisClientLogPolicy::ClassificationOnly)
+    }
+
+    /// Whether every connection must prove a non-evicting endpoint before it
+    /// may carry a command.
+    fn requires_no_eviction(&self) -> bool {
+        matches!(self.retention, RedisRetentionRequirement::NoEviction)
+    }
+
+    /// Whether this client requires the no-eviction retention proof
+    /// (test support).
+    ///
+    /// The screen itself needs a live server, so this is how coverage proves a
+    /// consumer asked for the prerequisite at construction — the exact
+    /// distinction `GHSA-26gf-943w-w5x8` turned on.
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn requires_no_eviction_screen_for_test(&self) -> bool {
+        self.requires_no_eviction()
+    }
+
+    /// Apply a memory-policy verdict exactly as a freshly established
+    /// connection would (test support), so admission coverage can exercise
+    /// acceptance, terminal refusal, and recoverable refusal without a live
+    /// server that can be reconfigured mid-test.
+    ///
+    /// Carries the same requirement gate as [`Self::screen_memory_policy`], so
+    /// a cache/counter client reports "usable" without publishing a verdict —
+    /// otherwise this helper would prove something the production path does
+    /// not do.
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn apply_memory_policy_screen_for_test(&self, screen: MemoryPolicyScreen) -> bool {
+        if !self.requires_no_eviction() {
+            return true;
+        }
+        self.apply_memory_policy_screen(screen)
     }
 
     fn warn_connect_failure(
@@ -2797,32 +2960,33 @@ impl RedisRateLimitClient {
     /// [`Self::is_available`] load stays false and the consumer's configured
     /// failure policy governs from here on.
     fn mark_topology_unsupported(&self, reason: &str) {
-        self.mark_endpoint_terminal("unsupported_topology", reason);
+        self.mark_endpoint_terminal(EndpointTerminalFault::UnsupportedTopology, reason);
     }
 
-    fn mark_endpoint_terminal(&self, classification: &'static str, reason: &str) {
+    fn mark_endpoint_terminal(&self, fault: EndpointTerminalFault, reason: &str) {
         let first = self.availability.reject_topology();
         // Drop cached connections so no slot can keep serving the refused
         // endpoint. `reject_topology` already made the state terminal, so this
         // cannot be downgraded back to a plain outage.
         self.clear_connection();
         if first {
-            match self.log_policy {
-                RedisClientLogPolicy::Operational => {
-                    warn_topology_unsupported(
-                        &self.config.redacted_url(),
-                        &self.config.key_prefix,
-                        reason,
-                        self.log_policy,
-                    );
-                }
-                RedisClientLogPolicy::ClassificationOnly => {
-                    warn_replay_backend(
-                        &self.config.redacted_url(),
-                        classification,
-                        "Redis single-use claim failed",
-                    );
-                }
+            let redacted = self.config.redacted_url();
+            // Each warner owns both log policies, so an operational retention
+            // authority reports the fault it actually hit rather than borrowing
+            // the Cluster message.
+            match fault {
+                EndpointTerminalFault::UnsupportedTopology => warn_topology_unsupported(
+                    &redacted,
+                    &self.config.key_prefix,
+                    reason,
+                    self.log_policy,
+                ),
+                EndpointTerminalFault::UnsafeEviction => warn_unsafe_eviction(
+                    &redacted,
+                    &self.config.key_prefix,
+                    reason,
+                    self.log_policy,
+                ),
             }
         }
     }
@@ -2862,7 +3026,7 @@ impl RedisRateLimitClient {
             TopologyScreen::Usable => true,
             TopologyScreen::ClusterProven => {
                 self.mark_endpoint_terminal(
-                    "unsupported_topology",
+                    EndpointTerminalFault::UnsupportedTopology,
                     "server reported cluster_enabled",
                 );
                 false
@@ -2891,38 +3055,60 @@ impl RedisRateLimitClient {
         }
     }
 
-    /// Replay-authority no-eviction screen. Generic clients skip this.
+    /// No-eviction screen for clients whose retained record is the control.
+    /// Cache and counter clients skip this.
     ///
     /// Must run after a usable topology screen and before any claim command.
     /// A proven `allkeys-*` / `volatile-*` policy is terminal for this client
     /// generation; an unproven query is a recoverable outage.
     async fn screen_memory_policy(&self, conn: &mut impl redis::aio::ConnectionLike) -> bool {
-        if !self.classification_only() {
+        if !self.requires_no_eviction() {
             return true;
         }
-        match screen_connection_memory_policy(conn, self.connect_timeout()).await {
+        self.apply_memory_policy_screen(
+            screen_connection_memory_policy(conn, self.connect_timeout()).await,
+        )
+    }
+
+    /// Publish one memory-policy verdict. Split from the I/O so the gate and
+    /// its coverage cannot drift, and so the recovery probe's identical
+    /// classification stays comparable.
+    fn apply_memory_policy_screen(&self, screen: MemoryPolicyScreen) -> bool {
+        match screen {
             MemoryPolicyScreen::Usable => true,
             MemoryPolicyScreen::UnsafeEviction => {
                 self.mark_endpoint_terminal(
-                    "unsafe_eviction_policy",
+                    EndpointTerminalFault::UnsafeEviction,
                     "server reported an evicting maxmemory policy",
                 );
                 false
             }
             MemoryPolicyScreen::Unproven => {
-                warn_replay_backend(
-                    &self.config.redacted_url(),
-                    "memory_policy_unproven",
-                    "Redis single-use claim backend failed",
-                );
+                if self.classification_only() {
+                    warn_replay_backend(
+                        &self.config.redacted_url(),
+                        "memory_policy_unproven",
+                        "Redis single-use claim backend failed",
+                    );
+                } else {
+                    warn!(
+                        redis_url = %self.config.redacted_url(),
+                        key_prefix = %self.config.key_prefix,
+                        timeout_seconds = self.config.connect_timeout_seconds,
+                        "Redis memory-policy screen did not complete — cannot prove the endpoint \
+                         retains records for their full lease; centralized Redis unavailable, \
+                         will retry"
+                    );
+                }
                 self.mark_unavailable();
                 false
             }
         }
     }
 
-    /// Topology plus, for replay-authority clients, the no-eviction memory
-    /// screen. No command may run on an unscreened replay connection.
+    /// Topology plus, for clients that require the retention proof, the
+    /// no-eviction memory screen. No command may run on an unscreened
+    /// connection.
     async fn screen_established_connection(
         &self,
         conn: &mut impl redis::aio::ConnectionLike,
@@ -2974,6 +3160,11 @@ impl RedisRateLimitClient {
         let tls_no_verify = self.tls_no_verify;
         let tls_ca_bundle_pem = self.tls_ca_bundle_pem.clone();
         let log_policy = self.log_policy;
+        // Recovery must re-prove retention safety, not just reachability: an
+        // operator can switch `maxmemory-policy` on a live endpoint, and a
+        // cached-socket generation would otherwise never re-screen.
+        let key_prefix = self.config.key_prefix.clone();
+        let requires_no_eviction = self.requires_no_eviction();
 
         let handle = runtime.spawn(async move {
             let mut delay_before_probe = !probe_immediately;
@@ -3082,10 +3273,8 @@ impl RedisRateLimitClient {
                             return Err(incomplete_topology_probe_error());
                         }
                     }
-                    if matches!(log_policy, RedisClientLogPolicy::ClassificationOnly) {
-                        match screen_connection_memory_policy(&mut conn, connect_timeout)
-                            .await
-                        {
+                    if requires_no_eviction {
+                        match screen_connection_memory_policy(&mut conn, connect_timeout).await {
                             MemoryPolicyScreen::Usable => {}
                             MemoryPolicyScreen::UnsafeEviction => {
                                 let first = availability.reject_topology();
@@ -3093,10 +3282,12 @@ impl RedisRateLimitClient {
                                     pool.clear();
                                 }
                                 if first {
-                                    warn_replay_backend(
+                                    warn_unsafe_eviction(
                                         &config.redacted_url(),
-                                        "unsafe_eviction_policy",
-                                        "Redis single-use claim failed",
+                                        &key_prefix,
+                                        "server reported an evicting maxmemory policy \
+                                         during recovery",
+                                        log_policy,
                                     );
                                 }
                                 return Err(unsafe_eviction_probe_error());

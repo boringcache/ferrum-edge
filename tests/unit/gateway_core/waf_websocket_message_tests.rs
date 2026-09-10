@@ -721,3 +721,73 @@ async fn anomaly_scoring_is_evaluated_per_message() {
     let outgoing = relay_to_backend(&plugins, &ctx, both).await;
     assert_policy_close(&outgoing);
 }
+
+// ── Issue #5118: fp filters govern non-UTF-8 binary messages too ────────────
+
+/// A binary message carrying non-UTF-8 bytes went down the byte-match path,
+/// which recorded the hit without consulting per-rule `fp_filters` or global
+/// `fp_capture_filters`. WebSocket messages carry no Content-Type, so this is
+/// the ordinary shape of binary WebSocket traffic, not an edge case.
+fn fp_filtered_request_rule(global: bool) -> Value {
+    let mut rule = json!({
+        "id": "CUSTOM-WS-FP",
+        "name": "prohibited request token",
+        "category": "custom",
+        "target": "body_text",
+        "match_kind": "contains",
+        "pattern": PROHIBITED,
+        "action": "enforce"
+    });
+    let mut config = json!({ "include_default_rules": false });
+    if global {
+        config["global_exemptions"] = json!({ "fp_capture_filters": ["allow-note"] });
+    } else {
+        rule["fp_filters"] = json!(["allow-note"]);
+    }
+    config["custom_rules"] = json!([rule]);
+    config
+}
+
+fn non_utf8_message(payload: &str) -> Message {
+    let mut bytes = payload.as_bytes().to_vec();
+    bytes.push(0xff);
+    Message::Binary(bytes.into())
+}
+
+#[tokio::test]
+async fn non_utf8_binary_message_honours_per_rule_fp_filters() {
+    let plugins = vec![waf(fp_filtered_request_rule(false))];
+    let ctx = upgrade_ctx("/ws");
+    let filtered = format!("{PROHIBITED} allow-note");
+
+    let outgoing = relay_to_backend(&plugins, &ctx, non_utf8_message(&filtered)).await;
+
+    assert_eq!(
+        outgoing,
+        non_utf8_message(&filtered),
+        "a filtered binary message must be forwarded verbatim"
+    );
+}
+
+#[tokio::test]
+async fn non_utf8_binary_message_honours_global_fp_capture_filters() {
+    let plugins = vec![waf(fp_filtered_request_rule(true))];
+    let ctx = upgrade_ctx("/ws");
+    let filtered = format!("{PROHIBITED} allow-note");
+
+    let outgoing = relay_to_backend(&plugins, &ctx, non_utf8_message(&filtered)).await;
+
+    assert_eq!(outgoing, non_utf8_message(&filtered));
+}
+
+#[tokio::test]
+async fn a_non_utf8_binary_filter_miss_is_still_blocked() {
+    for global in [false, true] {
+        let plugins = vec![waf(fp_filtered_request_rule(global))];
+        let ctx = upgrade_ctx("/ws");
+
+        let outgoing = relay_to_backend(&plugins, &ctx, non_utf8_message(PROHIBITED)).await;
+
+        assert_policy_close(&outgoing);
+    }
+}

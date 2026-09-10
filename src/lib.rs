@@ -2926,6 +2926,14 @@ pub mod _test_support {
         plugin.inflight_count_snapshot_for_tests()
     }
 
+    /// Whether a constructed `request_deduplication` instance's Redis client
+    /// requires the no-eviction retention screen (`None` in local mode).
+    pub fn request_deduplication_redis_requires_no_eviction_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+    ) -> Option<bool> {
+        plugin.redis_requires_no_eviction_for_tests()
+    }
+
     pub fn request_deduplication_request_identity_for_test(
         plugin: &crate::plugins::request_deduplication::RequestDeduplication,
         ctx: &crate::plugins::RequestContext,
@@ -12865,11 +12873,20 @@ pub mod _test_support {
     }
 
     /// Response-side declared-length reject predicate used by every dispatch path.
+    /// Bodyless `HEAD` / `1xx` / `204` / `205` / `304` replies must not reject
+    /// on a representation `Content-Length`.
     pub fn declared_response_length_exceeds_limit_for_test(
+        method: &str,
+        status: u16,
         headers: &std::collections::HashMap<String, String>,
         max_response_body_size_bytes: usize,
     ) -> Option<usize> {
-        crate::proxy::declared_response_length_exceeds_limit(headers, max_response_body_size_bytes)
+        crate::proxy::declared_response_length_exceeds_limit(
+            method,
+            status,
+            headers,
+            max_response_body_size_bytes,
+        )
     }
 
     pub async fn collect_h1h2_request_body_with_deadline_for_test<F, T, E>(
