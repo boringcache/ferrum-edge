@@ -710,6 +710,12 @@ impl WorkloadMetrics {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> bool {
+        // Metrics-only instances compose labels and custom tags without owning
+        // trace context. Clearing a sibling's trace IDs here would suppress all
+        // of its span exporters because this instance cannot rebuild the IDs.
+        if !self.trace_context_enabled() {
+            return false;
+        }
         // `on_request_received` imports inbound context early so authorization
         // rejects remain observable. For accepted requests, request_transformer
         // runs before this hook and its final header policy is authoritative.

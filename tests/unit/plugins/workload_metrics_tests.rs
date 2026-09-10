@@ -313,6 +313,60 @@ async fn custom_tags_compose_across_sources_hooks_and_skipped_instances() {
     );
 }
 
+#[tokio::test]
+async fn metrics_only_instances_preserve_shared_http_trace_context() {
+    for metrics_only_index in 0..3 {
+        for (incoming_headers, sampled) in [
+            (json!({}), "true"),
+            (
+                json!({"traceparent": "00-abcdef1234567890abcdef1234567890-1234567890abcdef-01"}),
+                "true",
+            ),
+            (
+                json!({"traceparent": "00-abcdef1234567890abcdef1234567890-1234567890abcdef-00"}),
+                "false",
+            ),
+            (
+                json!({"b3": "abcdef1234567890abcdef1234567890-1234567890abcdef-1"}),
+                "true",
+            ),
+            (
+                json!({"b3": "abcdef1234567890abcdef1234567890-1234567890abcdef-0"}),
+                "false",
+            ),
+        ] {
+            let mut plugins = vec![
+                WorkloadMetrics::new(&json!({"sampling_percentage": 100})).unwrap(),
+                WorkloadMetrics::new(&json!({"sampling_percentage": 100})).unwrap(),
+            ];
+            plugins.insert(
+                metrics_only_index,
+                WorkloadMetrics::new(&json!({"custom_tags": {"region": "metrics-only"}})).unwrap(),
+            );
+            let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/api".into());
+            ctx.headers = serde_json::from_value(incoming_headers).unwrap();
+            for plugin in &plugins {
+                plugin.on_request_received(&mut ctx).await;
+            }
+            let mut headers = ctx.headers.clone();
+            for (index, plugin) in plugins.iter().enumerate() {
+                let before = ctx.metadata.clone();
+                plugin.before_proxy(&mut ctx, &mut headers).await;
+                if index == metrics_only_index {
+                    for key in ["trace_id", "span_id", "parent_span_id", "traceparent"] {
+                        assert_eq!(ctx.metadata.get(key), before.get(key), "{key}");
+                    }
+                }
+            }
+            assert!(ctx.metadata.contains_key("trace_id"));
+            assert!(ctx.metadata.contains_key("span_id"));
+            assert_eq!(ctx.metadata["trace_sampled"], sampled);
+            assert_eq!(ctx.metadata["region"], "metrics-only");
+            assert_eq!(ctx.metadata["workload_metrics.trace_attributes"], "region");
+        }
+    }
+}
+
 #[test]
 fn provider_operation_and_default_schema_matches_constructor_admission() {
     let spec: Value = serde_yaml::from_str(include_str!("../../../openapi.yaml")).unwrap();

@@ -13172,10 +13172,14 @@ fn inject_mesh_global_plugins(
         "node_id": runtime.node_id.clone(),
         "topology": runtime.topology.as_str(),
         "namespace": mesh_slice.namespace.clone(),
-        "workload_spiffe_id": mesh_slice.workload_spiffe_id.clone(),
         "labels": mesh_slice.labels.clone(),
         "trust_domain_aliases": trust_domain_aliases,
     });
+    // Optional identity hints must be omitted: explicit null is a type error
+    // under workload_metrics admission, including for mesh-managed instances.
+    if let Some(workload_spiffe_id) = &mesh_slice.workload_spiffe_id {
+        workload_metrics_config["workload_spiffe_id"] = serde_json::json!(workload_spiffe_id);
+    }
     // Mirror EVERY enabled global mesh_authz baggage gate PluginCache will
     // execute (issue #4274). Capture-on force-injects reserved `__mesh_authz`
     // beside an operator global; multiple enabled operator globals are also
