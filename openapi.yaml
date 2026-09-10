@@ -20089,33 +20089,87 @@ components:
           items:
             type: object
             additionalProperties: false
+            # `client_auth` is effectively required: an omitted object defaults
+            # `method` to client_secret_basic, which then rejects for a missing
+            # client_id. Model that as a required key rather than leaving the
+            # schema to accept a provider the constructor always refuses.
+            required: [client_auth]
+            oneOf:
+              - required: [introspection_endpoint]
+              - required: [discovery_url]
             properties:
               introspection_endpoint:
                 type: string
+                minLength: 1
+                pattern: '^\s*[hH][tT][tT][pP][sS]?://[^/?#\s]+([/?#][^\s]*)?\s*$'
                 description: >-
-                  Direct token introspection endpoint URL. Must use https when
+                  Direct token introspection endpoint URL. Exactly one of
+                  introspection_endpoint or discovery_url must be configured.
+                  Must use https when
                   client_auth.method is credentialed (client_secret_basic,
                   client_secret_post, or private_key_jwt) and the host is not
                   loopback/localhost; http is only permitted for loopback hosts.
+                  Surrounding whitespace is trimmed. A path or query is
+                  accepted, but operational diagnostics record only the endpoint
+                  origin (scheme, host, port).
               discovery_url:
                 type: string
+                minLength: 1
+                pattern: '^\s*[hH][tT][tT][pP][sS]?://[^/?#\s]+([/?#][^\s]*)?\s*$'
                 description: >-
-                  OIDC discovery URL used to resolve introspection_endpoint. Must
+                  OIDC discovery URL used to resolve introspection_endpoint.
+                  Exactly one of introspection_endpoint or discovery_url must be
+                  configured. Must
                   use https when client_auth.method is credentialed and the host
                   is not loopback/localhost; http is only permitted for loopback
                   hosts. The discovered endpoint must preserve the discovery
                   URL's scheme, normalized host, and effective port.
               issuer:
                 type: string
-                description: Expected iss claim in active introspection responses
+                pattern: '\S'
+                description: >-
+                  Expected iss claim in active introspection responses. Trimmed;
+                  a blank value is rejected. Also used as the audience of a
+                  private_key_jwt client assertion.
               audiences:
                 type: array
                 items:
                   type: string
-                description: Accepted aud claims; OR matched
+                  pattern: '\S'
+                description: Accepted aud claims; OR matched. Entries are trimmed and must not be blank.
               client_auth:
                 type: object
                 additionalProperties: false
+                allOf:
+                  # `method` defaults to client_secret_basic when absent, so the
+                  # secret-based branch also covers the omitted key.
+                  - if:
+                      anyOf:
+                        - not:
+                            required: [method]
+                        - required: [method]
+                          properties:
+                            method:
+                              enum: [client_secret_basic, client_secret_post]
+                    then:
+                      required: [client_id, client_secret]
+                      properties:
+                        client_id:
+                          pattern: '\S'
+                        client_secret:
+                          minLength: 1
+                  - if:
+                      required: [method]
+                      properties:
+                        method:
+                          const: private_key_jwt
+                    then:
+                      required: [client_id, private_key_pem]
+                      properties:
+                        client_id:
+                          pattern: '\S'
+                        private_key_pem:
+                          minLength: 1
                 properties:
                   method:
                     type: string
@@ -20127,11 +20181,15 @@ components:
                     default: client_secret_basic
                     description: >-
                       Client authentication method against the introspection
-                      endpoint. Credentialed methods (client_secret_basic,
+                      endpoint. Surrounding whitespace is trimmed before
+                      matching. Credentialed methods (client_secret_basic,
                       client_secret_post, private_key_jwt) require an https
                       endpoint for non-loopback hosts; http is only accepted
                       for loopback/localhost endpoints. The 'none' method is
                       loopback/localhost-only regardless of scheme.
+                      client_secret_basic and client_secret_post require
+                      client_id and client_secret; private_key_jwt requires
+                      client_id and private_key_pem.
                   client_id:
                     type: string
                   client_secret:
@@ -20140,9 +20198,17 @@ components:
                   private_key_pem:
                     type: string
                     format: password
+                    description: >-
+                      PEM private key for private_key_jwt. The key must be
+                      usable with private_key_jwt_alg: an EC key's curve must
+                      match the selected ES algorithm (P-256 for ES256, P-384
+                      for ES384) and an RSA key must meet the signing
+                      backend's minimum modulus size. A mismatch is rejected at
+                      config load, not at request time.
                   private_key_jwt_alg:
                     type: string
                     enum: [RS256, RS384, RS512, ES256, ES384, EdDSA]
+                    default: RS256
                   private_key_jwt_kid:
                     type: string
               from_headers:
@@ -20154,12 +20220,20 @@ components:
                   properties:
                     name:
                       type: string
+                      pattern: '^\s*[!#$%&''*+.^_`|~0-9A-Za-z-]+\s*$'
+                      description: >-
+                        Header carrying the token. Trimmed and lowercased; must
+                        be a valid HTTP header name.
                     prefix:
-                      type: string
+                      type: ["string", "null"]
+                      description: >-
+                        Scheme prefix stripped from the header value. Null and
+                        the empty string both mean "no prefix".
               from_params:
                 type: array
                 items:
                   type: string
+                  pattern: '\S'
               forward_original_token:
                 type: boolean
                 default: true
@@ -20167,14 +20241,27 @@ components:
                 type: integer
                 format: uint64
                 default: 60
+                minimum: 0
+                maximum: 86400
+                description: >-
+                  Active-token cache TTL cap, in seconds. 0 disables positive
+                  caching.
               negative_cache_ttl_secs:
                 type: integer
                 format: uint64
                 default: 10
+                minimum: 0
+                maximum: 300
+                description: >-
+                  Inactive-token cache TTL, in seconds. 0 disables negative
+                  caching.
               request_timeout_ms:
                 type: integer
                 format: uint64
                 default: 5000
+                minimum: 100
+                maximum: 30000
+                description: Per-introspection-request timeout, in milliseconds.
               max_cache_entries:
                 type: integer
                 format: uint64
@@ -20209,26 +20296,52 @@ components:
                   max_cache_entry_bytes result.
               token_hint_param:
                 type: [string, "null"]
+                pattern: '\S'
+                description: >-
+                  Value sent as RFC 7662 `token_type_hint` on every
+                  introspection request (for example `access_token`). Null and
+                  an omitted key both send no hint; a blank string is rejected.
               required_scopes:
                 type: array
                 items:
                   type: string
+                  pattern: '\S'
               required_roles:
                 type: array
                 items:
                   type: string
+                  pattern: '\S'
               scope_claim:
                 type: string
+                pattern: '^[^.]+(\.[^.]+)*$'
+                description: >-
+                  Per-provider override of the global scope claim path.
               role_claim:
                 type: string
+                pattern: '^[^.]+(\.[^.]+)*$'
+                description: >-
+                  Per-provider override of the global role claim path.
               consumer_identity_claim:
                 type: string
+                pattern: '^[^.]+(\.[^.]+)*$'
+                description: >-
+                  Per-provider override of the global consumer-lookup claim
+                  path.
               consumer_header_claim:
                 type: string
+                pattern: '^[^.]+(\.[^.]+)*$'
+                description: >-
+                  Per-provider override of the global X-Consumer-Username
+                  display claim path.
               claim_headers:
                 type: object
+                propertyNames:
+                  pattern: '^[^.]+(\.[^.]+)*$'
                 additionalProperties:
                   type: string
+                  pattern: '^\s*[!#$%&''*+.^_`|~0-9A-Za-z-]+\s*$'
+                  not:
+                    pattern: '^\s*([Xx]-[Cc][Oo][Nn][Ss][Uu][Mm][Ee][Rr]-[Uu][Ss][Ee][Rr][Nn][Aa][Mm][Ee]|[Xx]-[Cc][Oo][Nn][Ss][Uu][Mm][Ee][Rr]-[Cc][Uu][Ss][Tt][Oo][Mm]-[Ii][Dd]|[Hh][Oo][Ss][Tt]|[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Ee]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn])\s*$'
                 description: >-
                   Claim path to upstream header mappings. Destination headers are
                   gateway-owned and always sanitized: every configured destination is
@@ -20247,15 +20360,22 @@ components:
             one provider that uses the Authorization location.
         scope_claim:
           type: string
+          pattern: '^[^.]+(\.[^.]+)*$'
           default: scope
         role_claim:
           type: string
+          pattern: '^[^.]+(\.[^.]+)*$'
           default: roles
         consumer_identity_claim:
           type: string
+          pattern: '^[^.]+(\.[^.]+)*$'
           default: username
         consumer_header_claim:
           type: string
+          pattern: '^[^.]+(\.[^.]+)*$'
+          description: >-
+            Claim used for X-Consumer-Username when no consumer maps. Defaults
+            to the effective consumer_identity_claim.
 
     OidcRelyingPartyConfig:
       type: object
@@ -22993,6 +23113,8 @@ components:
       type: object
       additionalProperties: false
       required: [opa_host, policy_path]
+      not:
+        required: [fail_open, fail_closed]
       description: |
         Plugin: opa — Delegates HTTP request authorization to Open Policy
         Agent's Data API in the `authorize` phase. The gateway POSTs
@@ -23006,26 +23128,40 @@ components:
         opa_host:
           type: string
           format: uri
+          minLength: 1
+          pattern: '^[hH][tT][tT][pP][sS]?://[^@/?#\s]+(/[^?#\s]*)?$'
           description: >-
             Base OPA URL using http:// or https://. URL credentials are not
-            allowed; use `headers` for OPA authentication.
+            allowed; use `headers` for OPA authentication. A query string or
+            fragment is rejected; a base path is accepted and is prepended to
+            /v1/data/{policy_path}. Operational diagnostics record only the
+            endpoint origin (scheme, host, port), never the configured path.
           example: "http://opa.opa-system.svc.cluster.local:8181"
         policy_path:
           type: string
+          minLength: 1
+          pattern: '^(?!(\.|\.\.)(/|$))[^/?#%]+(/(?!(\.|\.\.)(/|$))[^/?#%]+)*$'
           description: >-
             OPA data path appended under /v1/data/. Must be non-empty, must not
-            start with '/', must not contain percent-encoding, and must not
-            contain empty, '.', or '..' segments.
+            start with '/', must not contain percent-encoding, a query, or a
+            fragment, and must not contain empty, '.', or '..' segments.
           example: "ferrum/authz/allow"
         headers:
           type: object
+          propertyNames:
+            type: string
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+            not:
+              pattern: '^[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Tt][Yy][Pp][Ee]$'
           additionalProperties:
             type: string
+            pattern: '^[\u0009\u0020-\u007E]*$'
           default: {}
           description: >-
-            Static HTTP headers sent to OPA on every decision request. The
+            Static HTTP headers sent to OPA on every decision request. Names use
+            HTTP token syntax and values are visible ASCII (plus tab). The
             `content-type` header is managed by the plugin and cannot be
-            configured here.
+            configured here, case-insensitively.
           example:
             Authorization: "Bearer opa-client-token"
         timeout_ms:
@@ -23038,13 +23174,14 @@ components:
             value is accepted; the effective runtime timeout is capped at
             30000 milliseconds.
         max_response_bytes:
-          type: integer
+          type: [integer, "null"]
           format: uint64
           minimum: 1
           default: 262144
           description: >-
             Maximum decoded OPA response size. Oversized declared or streamed
-            responses use the configured fail-open/fail-closed posture.
+            responses use the configured fail-open/fail-closed posture. An
+            explicit null selects the default, exactly like omitting the key.
         fail_open:
           type: boolean
           default: false
@@ -23052,7 +23189,9 @@ components:
         fail_closed:
           type: boolean
           default: true
-          description: Inverse of `fail_open`; do not set both fields.
+          description: >-
+            Inverse of `fail_open`. Configuring both fields is rejected at
+            config load, even when the two values agree.
         deny_status:
           type: integer
           format: uint16
@@ -23066,8 +23205,14 @@ components:
           description: Response body returned on policy denial.
         deny_headers:
           type: object
+          propertyNames:
+            type: string
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+            not:
+              pattern: '^([Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Ee]|[Tt][Rr][Aa][Ii][Ll][Ee][Rr]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee])$'
           additionalProperties:
             type: string
+            pattern: '^[\u0009\u0020-\u007E]*$'
           default: {}
           description: >-
             Headers added to the policy-denial response. Names and values are
@@ -23092,8 +23237,14 @@ components:
           description: Response body returned on fail-closed OPA errors.
         fail_closed_headers:
           type: object
+          propertyNames:
+            type: string
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+            not:
+              pattern: '^([Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Ee]|[Tt][Rr][Aa][Ii][Ll][Ee][Rr]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee])$'
           additionalProperties:
             type: string
+            pattern: '^[\u0009\u0020-\u007E]*$'
           default: {}
           description: >-
             Headers added to fail-closed OPA error responses. Same name/value
@@ -23139,7 +23290,7 @@ components:
             body. UTF-8 bodies use `body`; non-UTF-8 raw bytes use
             `body_base64`.
         max_body_bytes:
-          type: integer
+          type: [integer, "null"]
           format: uint64
           minimum: 1
           default: 1048576
@@ -23147,7 +23298,8 @@ components:
             Plugin-local request body ceiling when include_body is enabled.
             The strictest of this value and the positive global request body
             limit is enforced; this value remains active when the global
-            limit is unlimited (0).
+            limit is unlimited (0). An explicit null selects the default,
+            exactly like omitting the key.
         include_consumer:
           type: boolean
           default: true
@@ -23185,6 +23337,8 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           default:
             - authorization
             - proxy-authorization
