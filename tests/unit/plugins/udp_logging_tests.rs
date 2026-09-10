@@ -667,16 +667,14 @@ fn test_udp_logging_shared_validation_enforces_byte_limits() {
         let shared = validate_plugin_config("udp_logging", &config)
             .expect_err("shared validation must reject invalid byte limits");
         assert!(
-            shared.contains("max_entry_bytes")
-                || shared.contains("buffer_max_bytes"),
+            shared.contains("max_entry_bytes") || shared.contains("buffer_max_bytes"),
             "shared validation {config} got: {shared}"
         );
         let constructed = UdpLogging::new(&config, test_client())
             .err()
             .unwrap_or_else(|| panic!("constructor must reject {config}"));
         assert!(
-            constructed.contains("max_entry_bytes")
-                || constructed.contains("buffer_max_bytes"),
+            constructed.contains("max_entry_bytes") || constructed.contains("buffer_max_bytes"),
             "constructor {config} got: {constructed}"
         );
     }
