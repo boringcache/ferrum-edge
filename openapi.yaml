@@ -23601,6 +23601,62 @@ components:
             and non-integer values are rejected. `null` is the same as omission
             and selects 403.
 
+    TransformerOperationFieldExactness:
+      description: |
+        The operation-exact field contract both transformers enforce at plugin
+        load time, shared by every header / query / body rule schema: `add` and
+        `update` require `value` and forbid `new_key`; `rename` requires
+        `new_key` and forbids `value`; `remove` forbids both. Forbidden
+        properties are rejected by PRESENCE, so an explicit `null` fails exactly
+        as a string would. A body `value` may itself be `null` on `add` /
+        `update` — that sets the target field to JSON null.
+      allOf:
+        - if:
+            required: [operation]
+            properties:
+              operation:
+                enum: [add, update]
+          then:
+            required: [value]
+            not:
+              required: [new_key]
+        - if:
+            required: [operation]
+            properties:
+              operation:
+                const: rename
+          then:
+            required: [new_key]
+            not:
+              required: [value]
+        - if:
+            required: [operation]
+            properties:
+              operation:
+                const: remove
+          then:
+            allOf:
+              - not:
+                  required: [value]
+              - not:
+                  required: [new_key]
+
+    TransformerBodyRenamePath:
+      type: string
+      description: |
+        A dot-notation body path usable as a `rename` source or destination.
+        Array indices are rejected at plugin load time: rename over an array is
+        ambiguous (move? swap? overwrite?) and `Vec::remove`'s leftward shift
+        would silently drop a trailing element. Use `remove` + `add` to relocate
+        an array element. An ESCAPED numeric segment (`counts\.0` — a literal
+        key named `counts.0`) remains valid, so the exclusion applies only to an
+        unescaped path whose dot-delimited segments contain a plain integer.
+      anyOf:
+        # An escaped path (`counts\.0`) keeps its literal key and is accepted.
+        - pattern: '\\'
+        - not:
+            pattern: '(^|\.)\+?[0-9]{1,19}($|\.)'
+
     RequestTransformerConfig:
       type: object
       additionalProperties: false
@@ -23627,12 +23683,30 @@ components:
         priority overrides. The Istio VirtualService translator auto-emits a
         proxy-scoped instance with `rules: []` + `apply_route_overrides: true`
         on routes that carry `headers.request.{set,add,remove}` and have no
-        operator-configured `request_transformer`. Operators with a global
-        `request_transformer` should be aware: a proxy-scoped instance
-        REPLACES the global on that proxy, so the global's static body /
-        query rules will not apply to VS-translated routes that auto-emit
-        this plugin. The plugin_cache logs a `warn!` when this shadowing
-        happens.
+        operator-configured `request_transformer`. That exact translator-owned
+        consumer — generated id, proxy scope and ownership, empty `rules`, and
+        `apply_route_overrides: true` — is ADDITIVE: a same-name global
+        transformer keeps its operator-authored header / query / body rules, so
+        a VS-translated route does not silently lose them and no shadowing
+        warning is emitted for it. An ordinary operator-configured proxy-scoped
+        instance keeps the normal proxy-replaces-global contract.
+
+        At least one of a non-empty `rules` array or `apply_route_overrides:
+        true` is required: a config with no effect is rejected at plugin load
+        time. Per-operation required and forbidden properties are modelled in
+        the target-specific rule schemas below. Operation-incompatible extras
+        are rejected by PRESENCE, so an explicit `null` fails exactly as a
+        string would; explicit `null` on an optional top-level field is
+        accepted and treated as absent.
+      anyOf:
+        - required: [rules]
+          properties:
+            rules:
+              minItems: 1
+        - required: [apply_route_overrides]
+          properties:
+            apply_route_overrides:
+              const: true
       properties:
         rules:
           type: array
@@ -23648,7 +23722,7 @@ components:
                 query: "#/components/schemas/RequestTransformerQueryRule"
                 body: "#/components/schemas/RequestTransformerBodyRule"
         apply_route_overrides:
-          type: boolean
+          type: [boolean, "null"]
           default: false
           description: |
             When `true`, this instance accepts an empty `rules` array and
@@ -23658,20 +23732,22 @@ components:
             allocates a separate cloned header map for route-level writes
             (preserving the gateway invariant that `ctx.headers` carries the
             original inbound headers during `before_proxy`). Auto-emitted by the
-            Istio VirtualService translator.
+            Istio VirtualService translator. Explicit `null` is accepted and
+            treated as `false`.
         runtime_overlay_scope:
-          type: string
+          type: [string, "null"]
           minLength: 1
           pattern: "\\S"
-          description: Optional RTDS boolean key controlling whether the transformer runs. Must contain at least one non-whitespace character; surrounding whitespace is trimmed at runtime.
+          description: Optional RTDS boolean key controlling whether the transformer runs. Must contain at least one non-whitespace character; surrounding whitespace is trimmed at runtime. Explicit `null` is accepted and treated as absent.
         default_enabled:
-          type: boolean
+          type: [boolean, "null"]
           default: true
           description: >-
             Fallback when `runtime_overlay_scope` is configured but the accepted
-            RTDS overlay has no boolean value for that key.
+            RTDS overlay has no boolean value for that key. Explicit `null` is
+            accepted and treated as absent (so the `true` default applies).
         runtime_overlay_resolved_enabled:
-          type: boolean
+          type: [boolean, "null"]
           description: >-
             Reserved, mesh-managed. Mesh slice preparation writes the accepted
             RTDS overlay's value for `runtime_overlay_scope` here, so the gate is
@@ -23687,6 +23763,8 @@ components:
       type: object
       additionalProperties: false
       required: [operation, target, key]
+      allOf:
+        - $ref: "#/components/schemas/TransformerOperationFieldExactness"
       properties:
         operation:
           type: string
@@ -23706,8 +23784,13 @@ components:
           const: header
         key:
           type: string
+          minLength: 1
+          not:
+            pattern: "[^-!#$%&'*+.^_`|~0-9A-Za-z]"
           description: |
-            HTTP header name. Add/update destinations and rename destinations
+            HTTP header name; must be a complete HTTP field-name token (the
+            same grammar `HeaderName` accepts). Add/update destinations and
+            rename destinations
             reject gateway-owned names (case-insensitive): host, content-length,
             connection, transfer-encoding, keep-alive, proxy-authorization,
             proxy-connection, te, trailer, upgrade, expect, x-forwarded-for,
@@ -23717,6 +23800,8 @@ components:
             for Host or trusted-proxy configuration for forwarding identity.
         value:
           type: string
+          not:
+            pattern: '[\x00-\x08\x0a-\x1f\x7f]'
           description: |
             Required for add/update; must not be set for remove/rename.
             Must be a valid HTTP HeaderValue (HTAB, visible ASCII, and
@@ -23724,14 +23809,20 @@ components:
             rejected).
         new_key:
           type: string
+          minLength: 1
+          not:
+            pattern: "[^-!#$%&'*+.^_`|~0-9A-Za-z]"
           description: |
             Required for rename; must not be set for add/update/remove.
-            Must not be a gateway-owned destination listed under key.
+            Must be a complete HTTP field-name token and must not be a
+            gateway-owned destination listed under key.
 
     RequestTransformerQueryRule:
       type: object
       additionalProperties: false
       required: [operation, target, key]
+      allOf:
+        - $ref: "#/components/schemas/TransformerOperationFieldExactness"
       properties:
         operation:
           type: string
@@ -23759,17 +23850,23 @@ components:
           const: query
         key:
           type: string
+          not:
+            pattern: '[\r\n]'
           description: |
             Query parameter name matched after percent-decoding. Must not
             contain CR or LF.
         value:
           type: string
+          not:
+            pattern: '[\r\n]'
           description: |
             Required for add/update; must not be set for remove/rename.
             Must not contain CR or LF. Authored onto the outbound query with
             RFC 3986 percent-encoding (`%20` for spaces, never `+`).
         new_key:
           type: string
+          not:
+            pattern: '[\r\n]'
           description: |
             Required for rename; must not be set for add/update/remove.
             Must not contain CR or LF.
@@ -23778,6 +23875,19 @@ components:
       type: object
       additionalProperties: false
       required: [operation, target, key]
+      allOf:
+        - $ref: "#/components/schemas/TransformerOperationFieldExactness"
+        - if:
+            required: [operation]
+            properties:
+              operation:
+                const: rename
+          then:
+            properties:
+              key:
+                $ref: "#/components/schemas/TransformerBodyRenamePath"
+              new_key:
+                $ref: "#/components/schemas/TransformerBodyRenamePath"
       properties:
         operation:
           type: string
@@ -23799,11 +23909,13 @@ components:
             Dot-notation body path. Supports nested objects
             ('user.address.city'), array indexing via numeric segments
             ('items.0.name'), and backslash-escaped literal dots
-            ('meta.weird\\.key').
+            ('meta.weird\\.key'). `rename` additionally rejects unescaped
+            numeric segments here and in `new_key`.
         value:
           description: |
-            Required for add/update. Accepts any JSON value — strings,
-            numbers, booleans, objects, arrays, and explicit null.
+            Required for add/update; must not be set for remove/rename.
+            Accepts any JSON value — strings, numbers, booleans, objects,
+            arrays, and explicit null.
             Strings that parse as JSON (e.g., "42", "true", '{"a":1}')
             are inserted as the parsed type at runtime; otherwise kept
             as a JSON string.
@@ -23811,6 +23923,7 @@ components:
           type: string
           description: |
             Required for rename; must not be set for add/update/remove.
+            Array indices are rejected in a rename `key` / `new_key`.
 
     ResponseTransformerConfig:
       type: object
@@ -23850,8 +23963,27 @@ components:
         `RequestContext.route_override_response_transform`. Every enabled
         instance applies only its static rules first; proxy core then applies
         the matched route list exactly once after the last eligible instance.
-        See the `request_transformer` notes on shadowing of operator-configured
-        globals — the same applies on the response side.
+        The same composition contract as `request_transformer` applies on the
+        response side: the exact translator-owned empty-rule consumer is
+        ADDITIVE to a same-name global transformer (no shadowing, no warning),
+        while an ordinary operator-configured proxy-scoped instance replaces the
+        global.
+
+        At least one of a non-empty `rules` array or `apply_route_overrides:
+        true` is required: a config with no effect is rejected at plugin load
+        time. Per-operation required and forbidden properties are modelled in
+        the target-specific rule schemas below, by PRESENCE — an explicit `null`
+        fails exactly as a string would. Explicit `null` on an optional
+        top-level field is accepted and treated as absent.
+      anyOf:
+        - required: [rules]
+          properties:
+            rules:
+              minItems: 1
+        - required: [apply_route_overrides]
+          properties:
+            apply_route_overrides:
+              const: true
       properties:
         rules:
           type: array
@@ -23865,7 +23997,7 @@ components:
                 header: "#/components/schemas/ResponseTransformerHeaderRule"
                 body: "#/components/schemas/ResponseTransformerBodyRule"
         apply_route_overrides:
-          type: boolean
+          type: [boolean, "null"]
           default: false
           description: |
             Counterpart to `request_transformer.apply_route_overrides` for
@@ -23873,20 +24005,22 @@ components:
             chain-level route-header finalization phase. Auto-emitted by the
             Istio VirtualService translator on routes carrying
             `headers.response.{set,add,remove}` that have no operator-configured
-            `response_transformer`.
+            `response_transformer`. Explicit `null` is accepted and treated as
+            `false`.
         runtime_overlay_scope:
-          type: string
+          type: [string, "null"]
           minLength: 1
           pattern: "\\S"
-          description: Optional RTDS boolean key controlling whether the transformer runs. Must contain at least one non-whitespace character; surrounding whitespace is trimmed at runtime.
+          description: Optional RTDS boolean key controlling whether the transformer runs. Must contain at least one non-whitespace character; surrounding whitespace is trimmed at runtime. Explicit `null` is accepted and treated as absent.
         default_enabled:
-          type: boolean
+          type: [boolean, "null"]
           default: true
           description: >-
             Fallback when `runtime_overlay_scope` is configured but the accepted
-            RTDS overlay has no boolean value for that key.
+            RTDS overlay has no boolean value for that key. Explicit `null` is
+            accepted and treated as absent (so the `true` default applies).
         runtime_overlay_resolved_enabled:
-          type: boolean
+          type: [boolean, "null"]
           description: >-
             Reserved, mesh-managed. Counterpart to
             `RequestTransformerConfig.runtime_overlay_resolved_enabled`. Binding
@@ -23900,6 +24034,24 @@ components:
       type: object
       additionalProperties: false
       required: [operation, target, key]
+      allOf:
+        - $ref: "#/components/schemas/TransformerOperationFieldExactness"
+        # Set-Cookie's newline-joined multi-value representation is bound to
+        # that field name, so it is rejected as either rename source or
+        # destination (case-insensitive), regardless of cookie count.
+        - if:
+            required: [operation]
+            properties:
+              operation:
+                const: rename
+          then:
+            properties:
+              key:
+                not:
+                  pattern: "^[sS][eE][tT]-[cC][oO][oO][kK][iI][eE]$"
+              new_key:
+                not:
+                  pattern: "^[sS][eE][tT]-[cC][oO][oO][kK][iI][eE]$"
       properties:
         operation:
           type: string
@@ -23919,14 +24071,21 @@ components:
           const: header
         key:
           type: string
+          minLength: 1
+          not:
+            pattern: "[^-!#$%&'*+.^_`|~0-9A-Za-z]"
           description: |
-            HTTP header name. For add/update, must not be a protocol-managed
+            HTTP header name; must be a complete HTTP field-name token (the same
+            grammar `HeaderName` accepts). For add/update, must not be a
+            protocol-managed
             hop-by-hop or framing destination (`connection`, `content-length`,
             `keep-alive`, `proxy-authenticate`, `proxy-connection`, `te`,
             `trailer`, `transfer-encoding`, `upgrade`). Remove may target
-            those names.
+            those names. `rename` additionally rejects `set-cookie` as source.
         value:
           type: string
+          not:
+            pattern: '[\x00-\x08\x0a-\x1f\x7f]'
           description: |
             Required for add/update; must not be set for remove/rename.
             Must be a valid HTTP HeaderValue (HTAB, visible ASCII, and
@@ -23934,9 +24093,13 @@ components:
             rejected).
         new_key:
           type: string
+          minLength: 1
+          not:
+            pattern: "[^-!#$%&'*+.^_`|~0-9A-Za-z]"
           description: |
             Required for rename; must not be set for add/update/remove.
-            Must not be a protocol-managed hop-by-hop or framing destination
+            Must be a complete HTTP field-name token, must not be `set-cookie`,
+            and must not be a protocol-managed hop-by-hop or framing destination
             (`connection`, `content-length`, `keep-alive`,
             `proxy-authenticate`, `proxy-connection`, `te`, `trailer`,
             `transfer-encoding`, `upgrade`).
@@ -23945,6 +24108,19 @@ components:
       type: object
       additionalProperties: false
       required: [operation, target, key]
+      allOf:
+        - $ref: "#/components/schemas/TransformerOperationFieldExactness"
+        - if:
+            required: [operation]
+            properties:
+              operation:
+                const: rename
+          then:
+            properties:
+              key:
+                $ref: "#/components/schemas/TransformerBodyRenamePath"
+              new_key:
+                $ref: "#/components/schemas/TransformerBodyRenamePath"
       properties:
         operation:
           type: string
@@ -23964,7 +24140,9 @@ components:
           type: string
           description: |
             Dot-notation body path. Supports nested objects, array indexing
-            ('items.0'), and backslash-escaped literal dots.
+            ('items.0'), and backslash-escaped literal dots. `rename`
+            additionally rejects unescaped numeric segments here and in
+            `new_key`.
         value:
           description: |
             Required for add/update; must not be set for remove/rename.
@@ -23976,6 +24154,7 @@ components:
           type: string
           description: |
             Required for rename; must not be set for add/update/remove.
+            Array indices are rejected in a rename `key` / `new_key`.
 
     SecurityHeadersConfig:
       type: object
