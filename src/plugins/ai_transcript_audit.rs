@@ -1332,6 +1332,14 @@ struct AuditRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<String>,
     status_code: u16,
+    /// Final client-visible gRPC application status. Present only when the
+    /// transaction ended as a gRPC call: native gRPC reports application
+    /// failure under HTTP 200, so `status_code` alone cannot convey the
+    /// outcome. A malformed peer value is reported as `u32::MAX` rather than
+    /// being allowed to look like success. Never the peer's `grpc-message`
+    /// text or `grpc-status-details-bin`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grpc_status: Option<u32>,
     mode: &'static str,
     sampled: bool,
     capture_reason: &'static str,
@@ -4167,6 +4175,7 @@ impl AiTranscriptAudit {
             model,
             provider,
             status_code: envelope.status_code,
+            grpc_status: final_grpc_status(metadata, response_headers),
             mode: self.mode.as_str(),
             sampled,
             capture_reason: reason,
@@ -4883,11 +4892,13 @@ impl Plugin for AiTranscriptAudit {
             return;
         };
         let sample_hit = staging.sample_hit;
-        let (emit, reason) = self.emit_decision(
-            sample_hit,
-            guardrail_fired(&ctx.metadata),
-            response_status >= 400,
-        );
+        // A native gRPC call normally fails under HTTP 200, so the transport
+        // status alone would drop an ordinary RPC failure whenever the sampling
+        // roll lost — exactly the case `always_capture_on_error` covers.
+        let errored =
+            response_status >= 400 || grpc_call_failed(&ctx.metadata, Some(response_headers));
+        let (emit, reason) =
+            self.emit_decision(sample_hit, guardrail_fired(&ctx.metadata), errored);
         ctx.metadata
             .insert(MD_SAMPLED.to_string(), bool_str(sample_hit));
 
@@ -5210,7 +5221,13 @@ impl Plugin for AiTranscriptAudit {
             };
             sample_hit
         };
-        let errored = response_status >= 400 || !outcome.body_completed;
+        // The terminal gRPC status is known here: the deferred logger folds
+        // `outcome.grpc_status` into `metadata["grpc_status"]` before running
+        // these hooks, so a server-streaming RPC that completed its body under
+        // HTTP 200 with a non-zero final status is still an error for capture.
+        let errored = response_status >= 400
+            || !outcome.body_completed
+            || grpc_call_failed(&ctx.metadata, None);
         let guardrail = guardrail_fired(&ctx.metadata) || downstream_terminated;
         let response = if revoked || downstream_terminated {
             ResponseCapture {
@@ -5331,9 +5348,15 @@ impl Plugin for AiTranscriptAudit {
         };
 
         let sample_hit = staging.sample_hit;
+        // `TransactionSummary::grpc_status` is the same normalized terminal
+        // status the transaction log reports, including the Trailers-Only
+        // encoding and the `UNKNOWN` a gRPC transaction that never produced a
+        // terminal status carries. Without it a completed RPC failure — HTTP
+        // 200 plus a non-zero `grpc-status` — is lost whenever sampling loses.
         let errored = summary.response_status_code >= 400
             || (summary.response_streamed
-                && (!summary.body_completed || summary.body_error_class.is_some()));
+                && (!summary.body_completed || summary.body_error_class.is_some()))
+            || summary.grpc_status().is_some_and(|status| status != 0);
         let (emit, reason) =
             self.emit_decision(sample_hit, guardrail_fired(&summary.metadata), errored);
         if !emit {
@@ -6764,6 +6787,52 @@ fn redact_headers(headers: &HashMap<String, String>) -> BTreeMap<String, String>
             (name.clone(), value)
         })
         .collect()
+}
+
+/// Final client-visible gRPC application status for this transaction, or
+/// `None` when it did not end as a gRPC call.
+///
+/// Native gRPC reports application failure with HTTP 200 plus a non-zero
+/// `grpc-status`, so the transport status alone cannot say whether the call
+/// failed. The proxy core normalizes both wire encodings — the terminal
+/// TRAILERS frame and the Trailers-Only initial HEADERS block — into
+/// `metadata["grpc_status"]` before the committed and stream-termination hooks
+/// run (the streaming path folds `BodyOutcome::grpc_status` into the same key),
+/// and [`TransactionSummary::grpc_status`] exposes it to the log fallback. That
+/// normalized value is what the transaction log, the access log, and the
+/// Prometheus status bucket already report, so reading it here keeps audit
+/// retention from disagreeing with the recorded outcome.
+///
+/// `response_headers` is the Trailers-Only fallback for a hook that holds the
+/// initial header block and whose status never reached metadata. A gRPC
+/// transaction that ends with no terminal status at all is `UNKNOWN` for the
+/// client, matching [`TransactionSummary::grpc_status`].
+fn final_grpc_status(
+    metadata: &HashMap<String, String>,
+    response_headers: Option<&HashMap<String, String>>,
+) -> Option<u32> {
+    if let Some(status) = metadata.get("grpc_status") {
+        return Some(crate::proxy::grpc_proxy::parse_grpc_status_value(status));
+    }
+    if let Some(status) =
+        response_headers.and_then(crate::proxy::grpc_proxy::grpc_status_from_headers)
+    {
+        return Some(status);
+    }
+    metadata
+        .get("request_protocol")
+        .is_some_and(|protocol| protocol == "grpc")
+        .then_some(crate::proxy::grpc_proxy::grpc_status::UNKNOWN)
+}
+
+/// Whether this transaction ended as a FAILED gRPC call, which
+/// `always_capture_on_error` must retain exactly like an HTTP error status.
+/// `false` for every non-gRPC transaction, so HTTP retention is unchanged.
+fn grpc_call_failed(
+    metadata: &HashMap<String, String>,
+    response_headers: Option<&HashMap<String, String>>,
+) -> bool {
+    final_grpc_status(metadata, response_headers).is_some_and(|status| status != 0)
 }
 
 /// Whether any guard plugin fired on this transaction (drives
