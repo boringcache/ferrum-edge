@@ -315,7 +315,7 @@ async fn custom_tags_compose_across_sources_hooks_and_skipped_instances() {
 
 #[test]
 fn provider_operation_and_default_schema_matches_constructor_admission() {
-    let spec: Value = serde_yaml::from_str(include_str!("../../../../openapi.yaml")).unwrap();
+    let spec: Value = serde_yaml::from_str(include_str!("../../../openapi.yaml")).unwrap();
     let schema = json!({
         "$ref": "#/components/schemas/WorkloadMetricsConfig",
         "components": spec["components"]
@@ -463,7 +463,7 @@ fn metric_operation(operation: Value) -> Value {
 
 #[test]
 fn standalone_documented_configuration_is_admitted() {
-    let docs = include_str!("../../../../docs/plugins.md");
+    let docs = include_str!("../../../docs/plugins.md");
     let section = docs.split("### `workload_metrics`").nth(1).unwrap();
     let yaml = section
         .split("```yaml\n")
@@ -474,7 +474,7 @@ fn standalone_documented_configuration_is_admitted() {
         .unwrap();
     let config: GatewayConfig = serde_yaml::from_str(yaml).unwrap();
     assert!(PluginCache::new(&config).is_ok());
-    let spec: Value = serde_yaml::from_str(include_str!("../../../../openapi.yaml")).unwrap();
+    let spec: Value = serde_yaml::from_str(include_str!("../../../openapi.yaml")).unwrap();
     let schema = json!({
         "$ref": "#/components/schemas/WorkloadMetricsConfig",
         "components": spec["components"]
