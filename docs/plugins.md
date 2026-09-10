@@ -821,17 +821,17 @@ Sends transaction summaries as newline-delimited JSON (NDJSON) over a persistent
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `host` | String | *(required)* | Hostname or IP of the TCP log receiver |
+| `host` | String | *(required)* | Hostname or IP of the TCP log receiver. Surrounding whitespace is trimmed. Must be a bare hostname or IP (no scheme, path, query, fragment, credentials, or host:port; brackets only around IPv6). |
 | `port` | Integer | *(required)* | Port of the TCP log receiver (1–65535) |
 | `tls` | Boolean | `false` | Enable TLS encryption for the connection |
-| `tls_server_name` | String | *(none)* | DNS or IP identity for TLS SNI/cert verification (defaults to `host`). Allowed only when `tls: true`. Must be a rustls-acceptable server name (no URL scheme, path, query, fragment, credentials, whitespace, or host:port); invalid values fail admission. |
+| `tls_server_name` | String | *(none)* | DNS or IP identity for TLS SNI/cert verification (defaults to `host`). Allowed only when `tls: true`. Must be a rustls-acceptable server name, including absolute DNS names (trailing dot) and underscore labels; no URL scheme, path, query, fragment, credentials, whitespace, or host:port. Invalid values fail admission. |
 | `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch (1–10000) |
 | `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (100–600000) |
 | `max_retries` | Integer | `3` | Retry attempts on failed batch delivery (0–10) |
 | `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts (0–60000) |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full (1–1000000) |
 | `max_entry_bytes` | Integer | `65536` | Maximum serialized size of one admitted NDJSON record (1024–1048576). Oversized records are dropped before enqueue. |
-| `buffer_max_bytes` | Integer | `16777216` | Aggregate retained serialized-content budget across queued, assembled, and retrying records (must be ≥ `2 * (max_entry_bytes + 1)`). |
+| `buffer_max_bytes` | Integer | `16777216` | Aggregate retained serialized-content budget across queued, assembled, and retrying records (must be ≥ `2 * (max_entry_bytes + 1)` and ≤ 268435456 / 256 MiB). |
 | `connect_timeout_ms` | Integer | `5000` | Connection establishment timeout in milliseconds (100–60000). Covers DNS resolution, TCP connect, and the TLS handshake when `tls: true`. |
 | `write_timeout_ms` | Integer | `5000` | Per-batch socket `write_all` + `flush` timeout in milliseconds (100–60000). On timeout the persistent writer is discarded and the shared retry/reconnect path runs. |
 | `schema` | Object | *(none)* | Inline log schema (see [docs/log_schema.md](log_schema.md)); mutually exclusive with `schema_ref` |
@@ -867,7 +867,19 @@ input {
 }
 ```
 
-For TLS, add `ssl_enable => true` with your certificate configuration to the Logstash TCP input.
+For TLS, Logstash TCP input 7.0.0+ uses `ssl_enabled` (the older `ssl_enable` option was removed and now fails startup):
+
+```
+input {
+  tcp {
+    port => 5140
+    codec => json_lines
+    ssl_enabled => true
+    ssl_certificate => "/etc/logstash/certs/server.crt"
+    ssl_key => "/etc/logstash/certs/server.key"
+  }
+}
+```
 
 ### `udp_logging`
 
@@ -879,12 +891,12 @@ Unknown top-level keys are rejected at construction / Admin validation (OpenAPI 
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `host` | String | *(required)* | UDP endpoint hostname or IP address |
+| `host` | String | *(required)* | UDP endpoint hostname or IP address. Surrounding whitespace is trimmed. Must be a bare hostname or IP (no scheme, path, query, fragment, credentials, or host:port; brackets only around IPv6). |
 | `port` | Integer | *(required)* | UDP endpoint port (1–65535) |
 | `dtls` | Boolean | `false` | Enable DTLS encryption for log datagrams |
-| `dtls_cert_path` | String | *(none)* | PEM client certificate for DTLS mutual TLS (requires `dtls: true`; materialized on the consuming node) |
-| `dtls_key_path` | String | *(none)* | PEM private key for DTLS mutual TLS (requires `dtls: true`; must be paired with `dtls_cert_path`; ECDSA P-256/P-384 only) |
-| `dtls_ca_cert_path` | String | *(none)* | PEM CA certificate for verifying the DTLS server (requires `dtls: true`; materialized on the consuming node when set, even if `dtls_no_verify` disables use of the resulting verifier) |
+| `dtls_cert_path` | String | *(none)* | PEM client certificate for DTLS mutual TLS (requires `dtls: true`; materialized on the consuming node; whitespace-only values are rejected) |
+| `dtls_key_path` | String | *(none)* | PEM private key for DTLS mutual TLS (requires `dtls: true`; must be paired with `dtls_cert_path`; ECDSA P-256/P-384 only; whitespace-only values are rejected) |
+| `dtls_ca_cert_path` | String | *(none)* | PEM CA certificate for verifying the DTLS server (requires `dtls: true`; materialized on the consuming node when set, even if `dtls_no_verify` disables use of the resulting verifier; whitespace-only values are rejected) |
 | `dtls_no_verify` | Boolean | `false` | Skip DTLS server certificate verification (testing only; requires `dtls: true`) |
 | `batch_size` | Integer | `10` | Number of entries to buffer before sending a batch (1–10000) |
 | `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (100–600000) |
@@ -892,7 +904,9 @@ Unknown top-level keys are rejected at construction / Admin validation (OpenAPI 
 | `retry_delay_ms` | Integer | `500` | Delay in milliseconds between retry attempts (0–60000) |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full (1–1000000) |
 | `max_entry_bytes` | Integer | `65536` | Maximum serialized size of one admitted JSON record (1024–1048576). Oversized records are dropped before enqueue. |
-| `buffer_max_bytes` | Integer | `16777216` | Aggregate retained serialized-content budget across queued, assembled, and retrying records (must be ≥ `2 * (max_entry_bytes + 1)`). |
+| `buffer_max_bytes` | Integer | `16777216` | Aggregate retained serialized-content budget across queued, assembled, and retrying records (must be ≥ `2 * (max_entry_bytes + 1)` and ≤ 268435456 / 256 MiB). |
+| `schema` | Object | *(none)* | Inline log schema (see [docs/log_schema.md](log_schema.md)); mutually exclusive with `schema_ref` |
+| `schema_ref` | String | *(none)* | Named schema from `transaction_log_schema`; mutually exclusive with `schema` |
 
 Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Each batch is serialized as a JSON array and sent as a single UDP datagram.
 
@@ -900,7 +914,7 @@ Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elap
 
 **Datagram size:** Every batch is gated by the per-datagram ceiling of the transport actually in use, not only under DTLS. For DTLS the ceiling is the plaintext limit `FERRUM_DTLS_MAX_PLAINTEXT_BYTES` (default **16,384**). For plain UDP the ceiling is the datagram maximum for the resolved collector's address family — **65,507** payload bytes over IPv4 (65,535 minus the 20-byte IP header and the 8-byte UDP header) and **65,527** over IPv6. The plain-UDP bound is fixed by the transport and is not configurable; a destination that has not resolved yet is gated on the smaller IPv4 bound so the gate can never be skipped.
 
-Ferrum bounds the assembled datagram by construction: the serialized length of a batch is computed before the batch is assembled, so a payload the transport cannot carry is never materialized. A single-entry batch that exceeds the ceiling fails closed into retry/final-loss. A multi-entry batch that exceeds the ceiling is split per entry so one oversized record cannot erase co-batched siblings; each oversized single is discarded with explicit, rate-limited loss accounting. A record dropped this way is published on `ferrum_plugin_log_sink_records_dropped_total{plugin="udp_logging",reason="sink_error"}`: it was already admitted and counted as accepted, and `record_too_large` is reserved for admission-time refusals so the accepted-plus-admission-loss identity stays exact. Split delivery is at-least-once: if an earlier entry succeeds and a later entry fails, retrying the original batch can duplicate the earlier entry, so collectors must tolerate duplicates.
+Ferrum bounds the assembled datagram by construction: the serialized length of a batch is computed before the batch is assembled, so a payload the transport cannot carry is never materialized. A single-entry batch that exceeds the ceiling fails closed into retry/final-loss. A multi-entry batch that exceeds the ceiling is split per entry so one oversized record cannot erase co-batched siblings; each oversized single is discarded with explicit, rate-limited loss accounting. A record dropped this way is published on `ferrum_plugin_log_sink_records_dropped_total{plugin="udp_logging",reason="sink_error"}`: it was already admitted and counted as accepted, and `record_too_large` is reserved for admission-time refusals so the accepted-plus-admission-loss identity stays exact. A locally rejected record is counted once; if a later sibling then hits a transport error, retry of the original batch does not increment the same loss again, and terminal `batch_discard` accounts for the original batch as a whole. Split delivery is at-least-once: if an earlier entry succeeds and a later entry fails, retrying the original batch can duplicate the earlier entry, so collectors must tolerate duplicates.
 
 The per-entry split — not admission validation — is what keeps every admitted configuration deliverable. `batch_size` x `max_entry_bytes` reaches roughly 640 KB at the defaults, an order of magnitude past any UDP datagram, so refusing such a configuration at admission would refuse the defaults themselves; instead an over-ceiling batch is re-sent one record per datagram and no record is lost because of a neighbour's size. A record whose *own* datagram still exceeds the ceiling cannot be carried by that transport at all and is dropped alone: keep `max_entry_bytes` at or below **65,505** (the plain-UDP IPv4 bound minus the two bytes of JSON array framing), or below `FERRUM_DTLS_MAX_PLAINTEXT_BYTES - 2` under DTLS, if every admitted record must be deliverable. Operators should still size `batch_size` so serialized payloads stay under the network MTU (typically ~1400 bytes for DTLS, ~1472 bytes for plain UDP over Ethernet); an in-ceiling but over-MTU datagram may still be fragmented or dropped by the network.
 
