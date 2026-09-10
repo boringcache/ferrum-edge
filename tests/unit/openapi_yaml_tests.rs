@@ -11570,15 +11570,46 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         schema["properties"]["max_total_size_bytes"]["minimum"],
         json!(1)
     );
-    // ttl_seconds intentionally has no minimum: the runtime accepts 0.
-    assert!(schema["properties"]["ttl_seconds"]["minimum"].is_null());
+    // Issue #5144: `format: uint64` asserts no bound under Draft 2020-12, so
+    // every unsigned field carries its explicit range. ttl_seconds keeps a zero
+    // minimum because the runtime accepts 0.
+    assert_eq!(schema["properties"]["ttl_seconds"]["minimum"], json!(0));
+    assert_eq!(
+        schema["properties"]["ttl_seconds"]["maximum"],
+        json!(u64::MAX)
+    );
+    assert_eq!(
+        schema["properties"]["max_entries"]["maximum"],
+        json!(u64::MAX)
+    );
+    assert_eq!(
+        schema["properties"]["max_entry_size_bytes"]["maximum"],
+        json!(u64::MAX)
+    );
+    assert_eq!(
+        schema["properties"]["max_total_size_bytes"]["maximum"],
+        json!(u64::MAX)
+    );
     assert_eq!(
         schema["properties"]["cacheable_methods"]["minItems"],
         json!(1)
     );
+    // Issue #5144: the runtime admits only case-insensitive GET/HEAD, not every
+    // RFC 9110 method token.
     assert_eq!(
         schema["properties"]["cacheable_methods"]["items"]["pattern"],
-        json!("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+        json!("^([Gg][Ee][Tt]|[Hh][Ee][Aa][Dd])$")
+    );
+    // Issue #5144: `anonymous_caller_scope` is trimmed and ASCII-lowercased,
+    // and `caller-address` is an accepted alias, so a canonical-only enum
+    // rejected values the constructor admits.
+    assert!(
+        schema["properties"]["anonymous_caller_scope"]["enum"].is_null(),
+        "a canonical-only enum cannot describe the normalized scope domain"
+    );
+    assert!(
+        schema["properties"]["anonymous_caller_scope"]["pattern"].is_string(),
+        "anonymous_caller_scope must publish its accepted spellings"
     );
     assert_eq!(
         schema["properties"]["cacheable_status_codes"]["minItems"],
@@ -11636,8 +11667,15 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         json!({"ttl_seconds": 0}),
         // Positive capacity boundary values.
         json!({"max_entries": 1, "max_entry_size_bytes": 1, "max_total_size_bytes": 1}),
-        // Extension-method casing is accepted and uppercased by the runtime.
+        // Method casing is accepted and uppercased by the runtime.
         json!({"cacheable_methods": ["get"]}),
+        json!({"cacheable_methods": ["Head"]}),
+        // Issue #5144: the normalized/alias scope spellings the constructor
+        // admits must validate too.
+        json!({"anonymous_caller_scope": "caller_address"}),
+        json!({"anonymous_caller_scope": "caller-address"}),
+        json!({"anonymous_caller_scope": " SHARED "}),
+        json!({"anonymous_caller_scope": "Shared"}),
         // Status-code boundary values (1xx / 206 / 304 are excluded below).
         json!({"cacheable_status_codes": [200, 599]}),
         // An explicitly empty Vary list is accepted (no extra key dimensions).
@@ -11705,6 +11743,20 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         json!({"cacheable_status_codes": [200, 206]}),
         json!({"vary_by_headers": [""]}),
         json!({"vary_by_headers": ["bad header"]}),
+        // Issue #5144: body-bearing and non-retrieval methods are refused by
+        // the constructor and must fail the schema too.
+        json!({"cacheable_methods": ["POST"]}),
+        json!({"cacheable_methods": ["OPTIONS"]}),
+        json!({"cacheable_methods": ["GET", "POST"]}),
+        // Negative and out-of-u64 unsigned scalars.
+        json!({"ttl_seconds": -1}),
+        json!({"max_entries": -1}),
+        json!({"max_entry_size_bytes": -1}),
+        json!({"max_total_size_bytes": -1}),
+        // An unknown scope spelling stays refused by both.
+        json!({"anonymous_caller_scope": "caller address"}),
+        json!({"anonymous_caller_scope": "callerAddress"}),
+        json!({"anonymous_caller_scope": ""}),
     ] {
         assert_component_validity(&spec, "ResponseCachingConfig", &invalid, false);
         assert!(
@@ -11714,6 +11766,30 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         assert!(
             validate_plugin_config("response_caching", &invalid).is_err(),
             "shared admission accepted OpenAPI-invalid response_caching config: {invalid}"
+        );
+    }
+
+    // Issue #5144: an unsigned value beyond u64 cannot be written with `json!`,
+    // so it is parsed from its literal wire form. JSON numbers that large are
+    // carried as doubles, so the case is taken a full binade past u64::MAX
+    // rather than at 2^64, where the two are indistinguishable in double
+    // precision.
+    for literal in [
+        r#"{"ttl_seconds": 36893488147419103232}"#,
+        r#"{"max_entries": 36893488147419103232}"#,
+        r#"{"max_entry_size_bytes": 36893488147419103232}"#,
+        r#"{"max_total_size_bytes": 36893488147419103232}"#,
+    ] {
+        let invalid: serde_json::Value =
+            serde_json::from_str(literal).expect("oversized unsigned literal parses");
+        assert_component_validity(&spec, "ResponseCachingConfig", &invalid, false);
+        assert!(
+            ResponseCaching::new(&invalid).is_err(),
+            "runtime accepted an out-of-u64 response_caching value: {literal}"
+        );
+        assert!(
+            validate_plugin_config("response_caching", &invalid).is_err(),
+            "shared admission accepted an out-of-u64 response_caching value: {literal}"
         );
     }
 
