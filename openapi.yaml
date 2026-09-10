@@ -33408,6 +33408,64 @@ components:
               default: true
               description: Emits mcp.arguments_hash. Evaluated independently of validation.validate_tool_arguments.
 
+    ApiChargebackRenderSchema:
+      description: >-
+        `SummaryLogSchema` narrowed to what an `api_chargeback` billing row can
+        actually express. The `/charges` row is an aggregate assembled into a
+        `serde_json::Map`-backed document, so it has no HTTP/stream summary
+        type, no RFC3339 timestamp field, no metadata map, and no member order
+        under the projection's control: `summary_type`, `timestamp_format`,
+        `metadata`, and `order` are rejected at construction rather than
+        silently ignored. `omit` names and `rename` sources must be native
+        billing-row fields, and `summary_kind` is the only derived kind
+        representable from a row that spans many transactions (it has no single
+        status, backend, or outcome). See docs/log_schema.md.
+      allOf:
+        - $ref: "#/components/schemas/SummaryLogSchema"
+        - type: object
+          not:
+            anyOf:
+              - required: [summary_type]
+              - required: [timestamp_format]
+              - required: [metadata]
+              - required: [order]
+          properties:
+            omit:
+              type: array
+              items:
+                enum:
+                  - proxy_id
+                  - namespace
+                  - proxy_name
+                  - currency
+                  - protocol_family
+                  - total_calls
+                  - total_charges
+                  - by_status
+                  - bandwidth
+                  - stream
+            rename:
+              type: object
+              propertyNames:
+                enum:
+                  - proxy_id
+                  - namespace
+                  - proxy_name
+                  - currency
+                  - protocol_family
+                  - total_calls
+                  - total_charges
+                  - by_status
+                  - bandwidth
+                  - stream
+            derived_fields:
+              type: array
+              items:
+                type: object
+                properties:
+                  kind:
+                    const: summary_kind
+
     ApiChargebackConfig:
       type: object
       additionalProperties: false
@@ -33453,11 +33511,66 @@ components:
         claim above 512 bytes is rejected at authentication, and any remaining
         oversized value is represented as a prefix plus a domain-separated
         SHA-256 digest of the complete value.
+        Runtime-only admission (not expressible here): every enabled instance
+        must resolve to the same shared tunables and the same projection; a
+        `schema_ref` must name a definition a `transaction_log_schema` plugin
+        registered; a status code must not appear in more than one tier across
+        the whole `pricing_tiers` array; and `stale_entry_ttl_seconds` /
+        `cleanup_interval_seconds` interact with the collection contract
+        described in docs/plugins.md.
+      allOf:
+        # Effective pricing must exist, matching `PricingConfig::has_any_pricing`:
+        # a nonempty `pricing_tiers` counts even when every price is zero
+        # (explicitly zero-priced tiers still meter calls), while a
+        # bandwidth-only or stream-only configuration must price something above
+        # zero or the plugin would record nothing and is rejected at startup.
+        - anyOf:
+            - required: [pricing_tiers]
+              properties:
+                pricing_tiers:
+                  type: array
+                  minItems: 1
+            - required: [bandwidth_pricing]
+              properties:
+                bandwidth_pricing:
+                  type: object
+                  anyOf:
+                    - required: [price_per_byte_sent]
+                      properties:
+                        price_per_byte_sent:
+                          type: number
+                          exclusiveMinimum: 0
+                          maximum: 1.0e288
+                    - required: [price_per_byte_received]
+                      properties:
+                        price_per_byte_received:
+                          type: number
+                          exclusiveMinimum: 0
+                          maximum: 1.0e288
+            - required: [stream_connection_pricing]
+              properties:
+                stream_connection_pricing:
+                  type: object
+                  required: [price_per_connection]
+                  properties:
+                    price_per_connection:
+                      type: number
+                      exclusiveMinimum: 0
+                      maximum: 1.0e288
+        # `schema` and `schema_ref` are mutually exclusive projections.
+        - not:
+            required: [schema, schema_ref]
       properties:
         currency:
           type: string
+          minLength: 1
+          pattern: '\S'
           default: "USD"
-          description: Currency label included in Prometheus metrics and JSON output. Informational only — the plugin does not perform currency conversion.
+          description: |
+            Currency label included in Prometheus metrics and JSON output.
+            Informational only — the plugin does not perform currency
+            conversion. Trimmed at admission and rejected when the trimmed
+            value is empty, so a whitespace-only label cannot become a currency.
         pricing_tiers:
           type: array
           minItems: 1
@@ -33469,9 +33582,12 @@ components:
               status_codes:
                 type: array
                 minItems: 1
+                uniqueItems: true
                 items:
                   type: integer
-                description: Billable status codes that trigger this tier's charge. Ordinary HTTP uses the wire status. Native gRPC and translated gRPC-Web map final terminal codes as 0→200, 1→499, 2→500, 3→400, 4→504, 5→404, 6→409, 7→403, 8→429, 9→400, 10→409, 11→400, 12→501, 13→500, 14→503, 15→500, and 16→401; missing, malformed, or unknown terminal codes map to 500. A status code must appear in exactly one tier.
+                  minimum: 100
+                  maximum: 599
+                description: Billable status codes that trigger this tier's charge. Must be real HTTP status codes in 100–599 and distinct within the tier. Ordinary HTTP uses the wire status. Native gRPC and translated gRPC-Web map final terminal codes as 0→200, 1→499, 2→500, 3→400, 4→504, 5→404, 6→409, 7→403, 8→429, 9→400, 10→409, 11→400, 12→501, 13→500, 14→503, 15→500, and 16→401; missing, malformed, or unknown terminal codes map to 500. A status code must appear in exactly one tier; cross-tier duplication is rejected at construction.
               price_per_call:
                 type: number
                 minimum: 0
@@ -33536,36 +33652,52 @@ components:
                 as `price_per_call`).
         render_cache_ttl_seconds:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
           default: 5
           description: |
             How long the cached /charges response is served before rebuilding.
-            Process-global: every enabled api_chargeback instance must use the
-            same value.
+            Unsigned 64-bit; a negative or fractional value is rejected at
+            construction. Process-global: every enabled api_chargeback instance
+            must use the same value.
         stale_entry_ttl_seconds:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
           default: 3600
           description: |
-            How long idle chargeback entries live before eviction.
-            Process-global: every enabled api_chargeback instance must use the
-            same value.
+            How long an idle chargeback entry may live before it becomes
+            eligible for eviction. Eligibility is not deletion: an idle entry is
+            removed only once a completed GET /charges export has collected its
+            current counters, so uncollected billing state is never discarded on
+            age alone. Unsigned 64-bit. Process-global: every enabled
+            api_chargeback instance must use the same value.
         cache_invalidation_min_age_ms:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
           default: 500
           description: |
-            Minimum age (ms) of the render cache before record() will invalidate
-            it. Process-global: every enabled api_chargeback instance must use
-            the same value.
+            Minimum age (ms) of a render cache before record() will invalidate
+            it. Evaluated per format against that document's own timestamp, so
+            a JSON-only collector gets the same protection as a Prometheus one.
+            Unsigned 64-bit. Process-global: every enabled api_chargeback
+            instance must use the same value.
         cleanup_interval_seconds:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
           default: 300
           description: |
             How often (seconds) the background task evicts entries that have
-            been idle longer than stale_entry_ttl_seconds. Set to 0 to disable.
-            Process-global: every enabled api_chargeback instance must use the
-            same value.
+            been idle longer than stale_entry_ttl_seconds AND have already been
+            collected by a completed export. Set to 0 to disable. Unsigned
+            64-bit. Process-global: every enabled api_chargeback instance must
+            use the same value.
         max_entries:
           type: integer
           minimum: 1
+          maximum: 18446744073709551615
           default: 100000
           description: |
             Hard ceiling on retained billing rows (complete registry entry keys)
@@ -33581,6 +33713,7 @@ components:
         max_retained_bytes:
           type: integer
           minimum: 1
+          maximum: 18446744073709551615
           default: 67108864
           description: |
             Hard ceiling on estimated retained registry bytes, covering ordinary
@@ -33588,7 +33721,7 @@ components:
             Process-global: every enabled api_chargeback instance must use the
             same value.
         schema:
-          $ref: "#/components/schemas/SummaryLogSchema"
+          $ref: "#/components/schemas/ApiChargebackRenderSchema"
         schema_ref:
           type: string
           description: >-
@@ -34353,6 +34486,8 @@ components:
             lost); `dropped_charges_total` counts charges that could not be
             retained at all, which is only reachable when `max_retained_bytes`
             is too small for the configured proxy/status matrix.
+            `uncollected_retained_entries` reports rows held past
+            `stale_entry_ttl_seconds` awaiting collection.
           properties:
             entries:
               type: integer
@@ -34376,6 +34511,14 @@ components:
             dropped_charges_total:
               type: integer
               description: Charges lost because no row could be admitted.
+            uncollected_retained_entries:
+              type: integer
+              description: |
+                Billing rows the last eviction pass kept past
+                `stale_entry_ttl_seconds` because no completed `/charges` export
+                has collected their current counters. Idle age alone never
+                deletes uncollected billing state; a sustained nonzero value
+                means rows are ageing out faster than they are being scraped.
             overflow_consumer_id:
               type: string
               description: |
