@@ -8641,6 +8641,7 @@ fn oidc_relying_party_schema_matches_strict_runtime_surface() {
 fn transaction_debugger_schema_matches_closed_runtime_surface() {
     use ferrum_edge::plugins::transaction_debugger::{
         DEFAULT_BODY_CAPTURE_BYTES, MAX_BODY_CAPTURE_BYTES, TRANSACTION_DEBUGGER_CONFIG_KEYS,
+        TransactionDebugger,
     };
 
     let spec: serde_json::Value =
@@ -8675,10 +8676,26 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
     for field in ["log_request_body", "log_response_body"] {
         assert_eq!(schema["properties"][field]["default"], json!(false));
     }
+    let header_items = &schema["properties"]["redacted_headers"]["items"];
+    assert_eq!(header_items["minLength"], json!(1));
+    assert_eq!(
+        header_items["pattern"],
+        json!("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+    );
     let body_field_items = &schema["properties"]["redacted_body_fields"]["items"];
     assert_eq!(body_field_items["minLength"], json!(1));
-    assert_eq!(body_field_items["maxLength"], json!(128));
-    assert_eq!(body_field_items["pattern"], json!("\\S"));
+    assert!(
+        body_field_items.get("maxLength").is_none() || body_field_items["maxLength"].is_null(),
+        "maxLength must not reject names that are 128 characters after trim"
+    );
+    assert_eq!(
+        body_field_items["pattern"],
+        json!("^\\s*\\S(?:[\\s\\S]{0,126}\\S)?\\s*$")
+    );
+    let admission_rules = schema["allOf"]
+        .as_array()
+        .expect("TransactionDebuggerConfig admission allOf");
+    assert_eq!(admission_rules.len(), 4);
 
     let description = schema["description"]
         .as_str()
@@ -8726,6 +8743,65 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
         assert!(
             plugin_docs.contains(contract),
             "docs/plugins.md missing transaction_debugger contract `{contract}`"
+        );
+    }
+
+    // Instance-based schema/runtime parity for constructor admission.
+    let padded_body_field = format!(" {} ", "x".repeat(128));
+    for valid in [
+        json!({}),
+        json!({"redacted_headers": []}),
+        json!({"redacted_headers": ["x-internal-id"]}),
+        json!({"redacted_body_fields": []}),
+        json!({"schema": {}}),
+        json!({
+            "log_request_body": true,
+            "redacted_body_fields": ["demo"]
+        }),
+        json!({
+            "log_request_body": true,
+            "log_response_body": true,
+            "max_request_body_bytes": 256,
+            "max_response_body_bytes": 256
+        }),
+        json!({
+            "log_request_body": true,
+            "redacted_body_fields": [padded_body_field]
+        }),
+    ] {
+        assert_component_validity(&spec, "TransactionDebuggerConfig", &valid, true);
+        TransactionDebugger::new(&valid).unwrap_or_else(|error| {
+            panic!("schema-valid config {valid} failed runtime: {error}")
+        });
+    }
+    // Named-schema existence is config-graph validation, not this component.
+    assert_component_validity(
+        &spec,
+        "TransactionDebuggerConfig",
+        &json!({"schema_ref": "absent"}),
+        true,
+    );
+
+    for invalid in [
+        json!({"max_request_body_bytes": 256}),
+        json!({"log_response_body": false, "max_response_body_bytes": 256}),
+        json!({"redacted_body_fields": ["demo"]}),
+        json!({"redacted_headers": [""]}),
+        json!({"redacted_headers": ["invalid header"]}),
+        json!({"schema": {}, "schema_ref": "absent"}),
+        json!({"unknown": true}),
+        json!({"log_request_body": null}),
+        json!({"log_request_body": true, "max_request_body_bytes": 0}),
+        json!({"log_request_body": true, "max_request_body_bytes": 8193}),
+        json!({
+            "log_request_body": true,
+            "redacted_body_fields": ["x".repeat(129)]
+        }),
+    ] {
+        assert_component_validity(&spec, "TransactionDebuggerConfig", &invalid, false);
+        assert!(
+            TransactionDebugger::new(&invalid).is_err(),
+            "schema-invalid config unexpectedly passed runtime: {invalid}"
         );
     }
 }
