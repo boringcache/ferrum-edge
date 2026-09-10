@@ -19,22 +19,54 @@
 //! this bare-JSON policy: they are not buffered, decoded, or rewritten, so
 //! message framing is never double-decoded or corrupted.
 //!
+//! ## The final backend-visible body is authoritative
+//!
+//! `before_proxy` is not the last word on the bytes a backend receives: every
+//! `transform_request_body` hook — a `request_transformer` body rule, a
+//! header-to-body overlay, a custom body plugin — runs afterwards and can put
+//! content back that the shield already decided about. Every request this
+//! shield admits into scope therefore carries an instance-private marker into
+//! `on_final_request_body`, where the same detection runs again over the exact
+//! dispatched representation. Reject and warn re-decide there; redact fails the
+//! request closed, because that hook can refuse a request but cannot rewrite
+//! wire bytes. A rejection there precedes backend dispatch and finalized-request
+//! egress.
+//!
+//! Reject/redact instances additionally claim the finalized representation
+//! (`Plugin::enforces_final_request_body_policy`), so the shared request
+//! representation gate reduces a content coding to plaintext before this hook
+//! reads it, or fails the request closed when it cannot.
+//!
 //! ## Compressed request bodies
 //!
-//! Request decompression runs in the later `transform_request_body` phase, so a
-//! body with a non-identity `Content-Encoding` cannot be inspected during
-//! `before_proxy`. The shield marks that request for deferred inspection and
-//! re-evaluates the final backend-visible body in `on_final_request_body`, after
-//! request transforms have run. Reject policy is enforced there, warn policy
-//! records its event there, and redact policy fails closed when PII is present
-//! because the final-body hook cannot safely rewrite the wire body. If no
-//! decompressor removed the encoding, enforcing actions reject the uninspectable
-//! request instead of silently forwarding it.
+//! With the `compression` plugin's `decompress_request` enabled, request
+//! decoding runs in the shared pre-`before_proxy` normalization phase: the
+//! encoding header is gone by the time this plugin runs, so an ordinary
+//! compressed request is scanned — and, in redact mode, rewritten — exactly
+//! like a plaintext one. That is the configured path.
+//!
+//! A body that still carries a non-identity `Content-Encoding` when
+//! `before_proxy` runs cannot be parsed there. The shield marks it for deferred
+//! inspection and decides it in `on_final_request_body` instead, after request
+//! transforms. Reject policy is enforced there, warn policy records its event
+//! there, and redact policy fails closed when PII is present, because the
+//! final-body hook cannot safely rewrite the wire body. If nothing reduced the
+//! body to plaintext, enforcing actions reject the uninspectable request instead
+//! of silently forwarding it.
+//!
+//! ## Bounded redaction output
+//!
+//! Redaction replaces each match with a configured placeholder, which can be
+//! longer than the value it removes. Rewriting is therefore charged against an
+//! aggregate per-request growth budget and stops before allocating past it;
+//! `custom_patterns` that match the empty string are refused at construction so
+//! a zero-width rule cannot amplify at every position.
 
 use async_trait::async_trait;
-use regex::{NoExpand, Regex, RegexSet};
+use regex::{Regex, RegexSet};
 use serde_json::Value;
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -127,6 +159,54 @@ const ALLOWED_CONFIG_KEYS: &[&str] = &[
     "max_scan_bytes",
 ];
 
+/// Every accepted member of one `custom_patterns` entry. Entries are parsed
+/// manually from `serde_json::Value`, so this allow-list is the nested
+/// equivalent of the top-level [`ALLOWED_CONFIG_KEYS`] gate: without it an
+/// unsupported nested option is read as `name`/`regex`, silently ignored, and
+/// never diagnosed at admission.
+const ALLOWED_CUSTOM_PATTERN_KEYS: &[&str] = &["name", "regex"];
+
+/// Upper bound on one `custom_patterns[].name`. The name is operator-supplied,
+/// is substituted into `redaction_placeholder`, and is echoed in construction
+/// errors, so it has to be bounded before it can be multiplied by the number of
+/// matches a request produces.
+///
+/// Counted in CHARACTERS, not bytes, so it means exactly what the published
+/// `maxLength` on that property means — a byte bound here would reject names the
+/// component accepts. The byte cost of a rendered replacement is bounded
+/// separately and precisely by [`MAX_REDACTION_PLACEHOLDER_BYTES`].
+const MAX_CUSTOM_PATTERN_NAME_CHARS: usize = 128;
+
+/// Upper bound on the RENDERED per-pattern redaction placeholder — the
+/// configured template with `{type}` already substituted. Bounding the rendered
+/// form rather than the template is what actually caps amplification: a
+/// template may repeat `{type}`, so a short template plus a long pattern name
+/// can still render a large replacement that every match then re-emits.
+const MAX_REDACTION_PLACEHOLDER_BYTES: usize = 512;
+
+/// How much larger than its own input one redaction pass may make a request
+/// body. The input is already bounded by `max_scan_bytes`, but the OUTPUT is
+/// not a function of the input alone: a short pattern with a long placeholder
+/// re-emits the replacement at every match, so an admitted expanding policy
+/// could otherwise turn a bounded body into an unbounded allocation and an
+/// unbounded synchronous rewrite. Only net growth is charged, so a redaction
+/// that shrinks or preserves the body spends nothing.
+const REDACTION_OUTPUT_EXPANSION_FACTOR: usize = 4;
+
+/// Floor for the growth allowance so a deliberately tiny `max_scan_bytes` (or a
+/// very small body) still admits ordinary placeholder expansion.
+const MIN_REDACTION_OUTPUT_GROWTH_BYTES: usize = 64 * 1024;
+
+/// Absolute ceiling on the growth allowance, independent of `max_scan_bytes`.
+const MAX_REDACTION_OUTPUT_GROWTH_BYTES: usize = 64 * 1024 * 1024;
+
+/// Prefix for the instance-specific marker recording that `before_proxy`
+/// admitted a request into this shield instance's scope, so
+/// `on_final_request_body` revalidates the exact backend-visible body it
+/// decided about. Instance-scoped for the same reason the deferral marker is:
+/// co-located shield instances must not consume each other's final check.
+const FINAL_INSPECTION_MARKER_PREFIX: &str = "ai_prompt_shield.final_inspection.";
+
 /// Prefix for the instance-specific marker used to defer compressed request
 /// inspection until after all request-body transforms. Multiple shield
 /// instances may coexist on a proxy, so each instance must own an independent
@@ -174,6 +254,146 @@ enum RedactionOutcome {
     /// the body-transform path, which cannot reject, still emits this
     /// best-effort body so it never forwards the *original* unredacted bytes.
     Incomplete(Value),
+    /// Redaction could not be completed inside the per-request output/work
+    /// budget (see [`REDACTION_OUTPUT_EXPANSION_FACTOR`]), or a configured
+    /// pattern produced a zero-width match that would amplify at every
+    /// position.
+    ///
+    /// Deliberately carries NO body: a partially rewritten document must never
+    /// be forwarded. `before_proxy` fails the request closed, and the
+    /// body-transform path leaves the wire bytes untouched so the final
+    /// request-body hook — which sees the same unredacted PII — rejects before
+    /// dispatch.
+    BudgetExceeded,
+}
+
+/// Aggregate output/work allowance for one redaction pass over one request
+/// body, shared by every string the pass rewrites.
+///
+/// Interior mutability because the redactors are handed to the JSON walkers as
+/// `&impl Fn(&str) -> String`. The budget is created and dropped entirely
+/// inside one synchronous call, so it never crosses an `.await`.
+struct RedactionBudget {
+    /// Remaining net growth, in bytes, that this pass may still produce.
+    remaining: Cell<usize>,
+    /// Set once the pass has provably failed. Every later rewrite is skipped
+    /// and the caller discards the partially rewritten document.
+    exhausted: Cell<bool>,
+}
+
+impl RedactionBudget {
+    /// Allowance for a body of `body_len` bytes: growth is capped at a small
+    /// multiple of the input, with a floor so tiny bodies still admit ordinary
+    /// placeholder expansion and an absolute ceiling regardless of config.
+    fn for_body(body_len: usize) -> Self {
+        let limit = body_len
+            .saturating_mul(REDACTION_OUTPUT_EXPANSION_FACTOR)
+            .max(MIN_REDACTION_OUTPUT_GROWTH_BYTES)
+            .min(MAX_REDACTION_OUTPUT_GROWTH_BYTES);
+        Self {
+            remaining: Cell::new(limit),
+            exhausted: Cell::new(false),
+        }
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.exhausted.get()
+    }
+
+    fn remaining(&self) -> usize {
+        self.remaining.get()
+    }
+
+    /// Mark the whole pass failed. Callers return the ORIGINAL text so no
+    /// half-rewritten string is retained.
+    fn fail(&self) {
+        self.exhausted.set(true);
+    }
+
+    /// Charge `bytes` of net growth, failing the pass when it does not fit.
+    fn charge_growth(&self, bytes: usize) -> bool {
+        match self.remaining.get().checked_sub(bytes) {
+            Some(left) => {
+                self.remaining.set(left);
+                true
+            }
+            None => {
+                self.fail();
+                false
+            }
+        }
+    }
+}
+
+/// Append `value` to `output` only while the result stays within `ceiling`,
+/// so an expanding rewrite is refused BEFORE it allocates rather than after.
+fn push_within_ceiling(output: &mut String, value: &str, ceiling: usize) -> bool {
+    match output.len().checked_add(value.len()) {
+        Some(next) if next <= ceiling => {
+            output.push_str(value);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Replace every configured pattern's matches in `text` with that pattern's
+/// pre-rendered placeholder, under `budget`.
+///
+/// Replacement is literal — the placeholder is appended verbatim, so `$0`,
+/// `$1`, `${name}`, and `$$` are never expanded as capture references (the
+/// same contract `regex::NoExpand` provided before this became a bounded
+/// sink). Each append is checked against a per-string ceiling derived from the
+/// remaining allowance, so no intermediate pass can allocate past the budget,
+/// and only the pass's NET growth is charged, so a non-expanding redaction
+/// spends nothing.
+///
+/// On refusal the ORIGINAL `text` is returned and the budget is marked failed:
+/// the caller discards the document rather than forwarding a partial rewrite.
+fn redact_text_bounded(text: &str, patterns: &[PiiPattern], budget: &RedactionBudget) -> String {
+    if budget.is_exhausted() {
+        return text.to_string();
+    }
+    // Every intermediate pass over this one string is bounded by what the
+    // aggregate allowance can still pay for.
+    let ceiling = text.len().saturating_add(budget.remaining());
+    let mut result = text.to_string();
+    for pattern in patterns {
+        let mut matches = pattern.regex.find_iter(&result);
+        let Some(first_match) = matches.next() else {
+            continue;
+        };
+        let mut replaced = String::with_capacity(result.len());
+        let mut cursor = 0usize;
+        for matched in std::iter::once(first_match).chain(matches) {
+            // A zero-width match inserts the placeholder at every position and
+            // amplifies a bounded body without bound. Config admission already
+            // refuses patterns that match the empty string; a contextual
+            // assertion can still produce an empty span beside non-empty input,
+            // so refuse those here too.
+            if matched.start() == matched.end() {
+                budget.fail();
+                return text.to_string();
+            }
+            if !push_within_ceiling(&mut replaced, &result[cursor..matched.start()], ceiling)
+                || !push_within_ceiling(&mut replaced, &pattern.placeholder, ceiling)
+            {
+                budget.fail();
+                return text.to_string();
+            }
+            cursor = matched.end();
+        }
+        if !push_within_ceiling(&mut replaced, &result[cursor..], ceiling) {
+            budget.fail();
+            return text.to_string();
+        }
+        result = replaced;
+    }
+    let growth = result.len().saturating_sub(text.len());
+    if growth > 0 && !budget.charge_growth(growth) {
+        return text.to_string();
+    }
+    result
 }
 
 /// A named regex pattern for PII detection.
@@ -202,6 +422,10 @@ pub struct AiPromptShield {
     requires_request_body: bool,
     /// Instance-specific metadata marker for compressed-body deferral.
     deferred_compressed_marker: String,
+    /// Instance-specific metadata marker recording that `before_proxy` admitted
+    /// this request into scope, so `on_final_request_body` revalidates the
+    /// backend-visible body this instance already decided about.
+    final_inspection_marker: String,
 }
 
 /// Built-in PII pattern definitions.
@@ -303,7 +527,7 @@ impl AiPromptShield {
             if let Some(regex_str) = builtin_pattern(name) {
                 match Regex::new(regex_str) {
                     Ok(regex) => {
-                        let placeholder = redaction_template.replace("{type}", name);
+                        let placeholder = render_placeholder(redaction_template, name)?;
                         patterns.push(PiiPattern {
                             name: name.clone(),
                             regex,
@@ -327,16 +551,49 @@ impl AiPromptShield {
 
         // Add custom patterns
         if let Some(custom) = optional_array(config, "custom_patterns")? {
-            for entry in custom {
-                let name = entry["name"]
-                    .as_str()
+            for (index, entry) in custom.iter().enumerate() {
+                // Closed member set, exactly like the top-level gate: an
+                // unsupported nested option must be diagnosed at admission
+                // instead of being read as `name`/`regex` and dropped.
+                let Some(entry_object) = entry.as_object() else {
+                    return Err(format!(
+                        "ai_prompt_shield: 'custom_patterns[{index}]' must be an object"
+                    ));
+                };
+                if let Some(unknown) = entry_object
+                    .keys()
+                    .find(|key| !ALLOWED_CUSTOM_PATTERN_KEYS.contains(&key.as_str()))
+                {
+                    return Err(format!(
+                        "ai_prompt_shield: unknown config field 'custom_patterns[{index}].{unknown}'; allowed fields: {}",
+                        ALLOWED_CUSTOM_PATTERN_KEYS.join(", ")
+                    ));
+                }
+                let name = entry_object
+                    .get("name")
+                    .and_then(Value::as_str)
                     .ok_or("ai_prompt_shield: custom_patterns entries require string 'name'")?;
-                let regex_str = entry["regex"]
-                    .as_str()
+                if name.chars().count() > MAX_CUSTOM_PATTERN_NAME_CHARS {
+                    return Err(format!(
+                        "ai_prompt_shield: 'custom_patterns[{index}].name' must be at most {MAX_CUSTOM_PATTERN_NAME_CHARS} characters"
+                    ));
+                }
+                let regex_str = entry_object
+                    .get("regex")
+                    .and_then(Value::as_str)
                     .ok_or("ai_prompt_shield: custom_patterns entries require string 'regex'")?;
                 match Regex::new(regex_str) {
                     Ok(regex) => {
-                        let placeholder = redaction_template.replace("{type}", name);
+                        // A pattern that matches the empty string inserts its
+                        // placeholder at every position, turning a bounded body
+                        // into an unbounded rewrite. Refuse it at admission
+                        // rather than discovering it per request.
+                        if regex.is_match("") {
+                            return Err(format!(
+                                "ai_prompt_shield: 'custom_patterns[{index}].regex' must not match the empty string (zero-width redaction is rejected)"
+                            ));
+                        }
+                        let placeholder = render_placeholder(redaction_template, name)?;
                         patterns.push(PiiPattern {
                             name: name.to_string(),
                             regex,
@@ -376,6 +633,7 @@ impl AiPromptShield {
             })?;
         let marker_id = DEFERRED_MARKER_COUNTER.fetch_add(1, Ordering::Relaxed);
         let deferred_compressed_marker = format!("{DEFERRED_COMPRESSED_MARKER_PREFIX}{marker_id}");
+        let final_inspection_marker = format!("{FINAL_INSPECTION_MARKER_PREFIX}{marker_id}");
 
         Ok(Self {
             action,
@@ -387,6 +645,7 @@ impl AiPromptShield {
             needs_body_transform,
             requires_request_body,
             deferred_compressed_marker,
+            final_inspection_marker,
         })
     }
 
@@ -519,37 +778,7 @@ impl AiPromptShield {
             }
         }
 
-        if let Some(messages) = json.get("messages").and_then(Value::as_array) {
-            for message in messages {
-                if message
-                    .get("role")
-                    .and_then(Value::as_str)
-                    .is_some_and(|role| self.exclude_roles.contains(role))
-                {
-                    continue;
-                }
-                if let Some(content) = message.get("content") {
-                    self.mark_cross_part_hits_in_value(content, &mut hit);
-                }
-            }
-        }
-
-        for field in CONTENT_SCAN_FIELDS {
-            if is_system_prompt_scan_field(field) && self.exclude_roles.contains("system") {
-                continue;
-            }
-            if let Some(value) = json.get(field) {
-                self.mark_cross_part_hits_in_value(value, &mut hit);
-            }
-        }
-
-        // Gemini concatenates the `parts[]` of one turn into a single prompt
-        // exactly as OpenAI concatenates adjacent text content parts, so give
-        // them the same boundary-crossing pass — otherwise a value split across
-        // two adjacent `parts` entries would evade Content mode.
-        for_each_gemini_parts(json, &self.exclude_roles, &mut |parts| {
-            self.mark_adjacent_text_part_hits(parts, &mut hit);
-        });
+        self.mark_logical_message_boundary_hits(json, &mut hit, &self.exclude_roles);
 
         hit.iter()
             .enumerate()
@@ -563,8 +792,67 @@ impl AiPromptShield {
             .collect()
     }
 
+    /// The shared logical-message boundary traversal, used by BOTH scan modes.
+    ///
+    /// Providers concatenate the adjacent text parts of one logical message
+    /// into a single prompt, so a value split across two parts reaches the model
+    /// intact while every per-fragment scan sees only halves. This pass joins
+    /// each run of consecutive text parts, records the byte offsets of the
+    /// joins, and adds a detection only when a concrete regex occurrence
+    /// actually crosses one — independent messages and runs separated by a
+    /// non-text part are never joined.
+    ///
+    /// `exclude_roles` is a parameter rather than `self.exclude_roles` because
+    /// the two modes scope role exclusions differently: Content mode honours
+    /// them, while `ScanMode::All` deliberately scans every value in the body
+    /// regardless of role and therefore passes an empty set, so this pass can
+    /// never be narrower than the token pass it supplements.
+    fn mark_logical_message_boundary_hits(
+        &self,
+        json: &Value,
+        hit: &mut [bool],
+        exclude_roles: &HashSet<String>,
+    ) {
+        if let Some(messages) = json.get("messages").and_then(Value::as_array) {
+            for message in messages {
+                if message
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .is_some_and(|role| exclude_roles.contains(role))
+                {
+                    continue;
+                }
+                if let Some(content) = message.get("content") {
+                    self.mark_cross_part_hits_in_value(content, hit, exclude_roles);
+                }
+            }
+        }
+
+        for field in CONTENT_SCAN_FIELDS {
+            if is_system_prompt_scan_field(field) && exclude_roles.contains("system") {
+                continue;
+            }
+            if let Some(value) = json.get(field) {
+                self.mark_cross_part_hits_in_value(value, hit, exclude_roles);
+            }
+        }
+
+        // Gemini concatenates the `parts[]` of one turn into a single prompt
+        // exactly as OpenAI concatenates adjacent text content parts, so give
+        // them the same boundary-crossing pass — otherwise a value split across
+        // two adjacent `parts` entries would evade the scan.
+        for_each_gemini_parts(json, exclude_roles, &mut |parts| {
+            self.mark_adjacent_text_part_hits(parts, hit);
+        });
+    }
+
     /// Find adjacent content-part runs recursively within one prompt field.
-    fn mark_cross_part_hits_in_value(&self, value: &Value, hit: &mut [bool]) {
+    fn mark_cross_part_hits_in_value(
+        &self,
+        value: &Value,
+        hit: &mut [bool],
+        exclude_roles: &HashSet<String>,
+    ) {
         match value {
             Value::Array(items) => {
                 self.mark_adjacent_text_part_hits(items, hit);
@@ -575,12 +863,19 @@ impl AiPromptShield {
                     if object
                         .get("role")
                         .and_then(Value::as_str)
-                        .is_some_and(|role| self.exclude_roles.contains(role))
+                        .is_some_and(|role| exclude_roles.contains(role))
                     {
                         continue;
                     }
+                    // An OpenAI Responses function-result item carries its
+                    // model-visible text under `output`, not `content`, and that
+                    // payload can be an array of adjacent text parts too.
+                    if let Some(output) = function_call_output_payload(object) {
+                        self.mark_cross_part_hits_in_value(output, hit, exclude_roles);
+                        continue;
+                    }
                     if let Some(content) = object.get("content") {
-                        self.mark_cross_part_hits_in_value(content, hit);
+                        self.mark_cross_part_hits_in_value(content, hit, exclude_roles);
                     }
                 }
             }
@@ -588,12 +883,16 @@ impl AiPromptShield {
                 if object
                     .get("role")
                     .and_then(Value::as_str)
-                    .is_some_and(|role| self.exclude_roles.contains(role))
+                    .is_some_and(|role| exclude_roles.contains(role))
                 {
                     return;
                 }
+                if let Some(output) = function_call_output_payload(object) {
+                    self.mark_cross_part_hits_in_value(output, hit, exclude_roles);
+                    return;
+                }
                 if let Some(content) = object.get("content") {
-                    self.mark_cross_part_hits_in_value(content, hit);
+                    self.mark_cross_part_hits_in_value(content, hit, exclude_roles);
                 }
             }
             _ => {}
@@ -695,12 +994,23 @@ impl AiPromptShield {
     ///    Testing the key and value as separate tokens never reconstructs that
     ///    context, so without this pass those patterns regress to no-match.
     ///
-    /// Unioning the two only ever *adds* detections, so this strictly hardens
-    /// all-mode coverage: escaped-value PII (pass 1) and cross-token/contextual
-    /// patterns plus dropped scalars (pass 2) are both caught. Both passes feed
-    /// the reject/warn decision; the redact path additionally re-scans the
-    /// rewritten body so any detection a token rewrite cannot remove fails
-    /// closed rather than forwarding PII while claiming redaction succeeded.
+    /// 3. Logical-message boundary pass
+    ///    (`mark_logical_message_boundary_hits`): the same traversal Content
+    ///    mode uses, so a value split across two adjacent text parts of one
+    ///    message is caught here too. Neither of the first two passes can see
+    ///    it — the decoded walker visits each part as a separate token, and the
+    ///    raw serialization carries JSON punctuation between them — yet the
+    ///    provider concatenates the parts into one prompt. All-mode scans every
+    ///    value regardless of role, so this pass runs with NO role exclusions;
+    ///    it can only ever be broader than the token pass it supplements.
+    ///
+    /// Unioning the passes only ever *adds* detections, so this strictly hardens
+    /// all-mode coverage: escaped-value PII (pass 1), cross-token/contextual
+    /// patterns plus dropped scalars (pass 2), and cross-part values (pass 3)
+    /// are all caught. Every pass feeds the reject/warn decision; the redact
+    /// path additionally re-scans the rewritten body so any detection a token
+    /// rewrite cannot remove fails closed rather than forwarding PII while
+    /// claiming redaction succeeded.
     fn detect_pii_all_mode(&self, json: &Value, raw: &str) -> Vec<String> {
         if self.patterns.is_empty() {
             return Vec::new();
@@ -740,6 +1050,11 @@ impl AiPromptShield {
                 hit[idx] = true;
             }
         }
+        // Pass 3: logical-message boundaries. All-mode applies no role
+        // exclusions, so an empty set is passed rather than `self.exclude_roles`
+        // (`HashSet::new()` does not allocate).
+        let no_role_exclusions: HashSet<String> = HashSet::new();
+        self.mark_logical_message_boundary_hits(json, &mut hit, &no_role_exclusions);
         hit.iter()
             .enumerate()
             .filter_map(|(idx, &h)| {
@@ -857,7 +1172,9 @@ impl AiPromptShield {
     /// is over `max_scan_bytes`, or contains no PII to redact (so callers don't
     /// waste serialization on a no-op); `Redacted` when PII was detected and
     /// fully removed; `Incomplete` when PII was detected but some could not be
-    /// rewritten in place.
+    /// rewritten in place; `BudgetExceeded` when rewriting could not complete
+    /// inside this request's aggregate output/work allowance, in which case NO
+    /// document is returned at all.
     ///
     /// Shared between `before_proxy` (which uses this to update
     /// `ctx.metadata["request_body"]` so downstream `before_proxy` plugins
@@ -872,6 +1189,12 @@ impl AiPromptShield {
         let Ok(mut json) = serde_json::from_str::<Value>(body) else {
             return RedactionOutcome::NoChange;
         };
+
+        // One aggregate output/work allowance for this whole pass. Every
+        // rewritten string is charged against it, so an expanding policy cannot
+        // turn a bounded body into an unbounded rewrite (see
+        // [`RedactionBudget::for_body`]).
+        let budget = RedactionBudget::for_body(body.len());
 
         if self.scan_mode == ScanMode::All {
             // Gate on the same union detection used for reject/warn so the
@@ -903,9 +1226,16 @@ impl AiPromptShield {
                 .and_then(|m| m.as_array())
                 .is_some_and(|arr| !arr.is_empty());
             if has_known_messages {
-                self.redact_body(&mut json);
+                self.redact_body(&mut json, &budget);
             }
-            redact_json_strings(&mut json, &self.patterns, true);
+            redact_json_strings(&mut json, &self.patterns, true, &budget);
+
+            // Redaction ran out of its output/work allowance (or hit a
+            // zero-width match). The document in hand is partially rewritten,
+            // so it is discarded rather than forwarded.
+            if budget.is_exhausted() {
+                return RedactionOutcome::BudgetExceeded;
+            }
 
             // Fail closed when redaction provably could not remove the PII:
             //   1. A raw-only contextual match in the original (no rewritable
@@ -926,7 +1256,10 @@ impl AiPromptShield {
         if self.detect_pii_content_mode(&json).is_empty() {
             return RedactionOutcome::NoChange;
         }
-        self.redact_body(&mut json);
+        self.redact_body(&mut json, &budget);
+        if budget.is_exhausted() {
+            return RedactionOutcome::BudgetExceeded;
+        }
         // Adjacent text-part matches can span two independently rewritable JSON
         // strings. Redacting either fragment in isolation may be ambiguous or a
         // no-op, so re-run the boundary-aware detector and fail closed if any
@@ -974,8 +1307,9 @@ impl AiPromptShield {
         !self.detect_pii_all_mode(&check, &serialized).is_empty()
     }
 
-    /// Apply redaction to message content fields in the JSON body.
-    fn redact_body(&self, json: &mut Value) {
+    /// Apply redaction to message content fields in the JSON body, charging
+    /// every rewrite against the caller's aggregate output allowance.
+    fn redact_body(&self, json: &mut Value, budget: &RedactionBudget) {
         if let Some(messages) = json.get_mut("messages").and_then(|v| v.as_array_mut()) {
             for msg in messages.iter_mut() {
                 // Skip excluded roles (O(1) HashSet lookup)
@@ -987,7 +1321,7 @@ impl AiPromptShield {
 
                 // String content
                 if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                    let redacted = self.redact_text(content);
+                    let redacted = self.redact_text(content, budget);
                     if redacted != content {
                         msg["content"] = Value::String(redacted);
                     }
@@ -999,9 +1333,10 @@ impl AiPromptShield {
                 // fall-through to the nested tool-result / guarded text a
                 // non-text block can still carry.
                 if let Some(parts) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
+                    let redact = |text: &str| self.redact_text(text, budget);
                     for part in parts.iter_mut() {
-                        if !redact_content_part_text(part, &|text| self.redact_text(text)) {
-                            redact_content_block_nested_text(part, &|text| self.redact_text(text));
+                        if !redact_content_part_text(part, &redact) {
+                            redact_content_block_nested_text(part, &redact);
                         }
                     }
                 }
@@ -1017,35 +1352,40 @@ impl AiPromptShield {
                 continue;
             }
             if let Some(value) = json.get_mut(field) {
-                redact_field_text(value, &self.exclude_roles, &|text| self.redact_text(text));
+                redact_field_text(value, &self.exclude_roles, &|text| {
+                    self.redact_text(text, budget)
+                });
             }
         }
         // Same symmetry contract for the Gemini turns and system instruction
         // scanned by `collect_gemini_prompt_text`.
-        redact_gemini_prompt_text(json, &self.exclude_roles, &|text| self.redact_text(text));
+        redact_gemini_prompt_text(json, &self.exclude_roles, &|text| {
+            self.redact_text(text, budget)
+        });
         // Keep redaction symmetric with detection: `extract_scan_text` scans
         // Azure "On Your Data" `role_information`, so redact it here too —
         // otherwise Redact mode would report the PII removed while forwarding it
         // unredacted (a fail-open bypass).
-        redact_azure_role_information(json, &|text| self.redact_text(text));
+        redact_azure_role_information(json, &|text| self.redact_text(text, budget));
         // Same symmetry contract for the Cohere history and Vertex legacy
         // `predict` instances scanned above.
-        redact_cohere_chat_history_text(json, &self.exclude_roles, &|text| self.redact_text(text));
-        redact_vertex_instance_prompts(json, &self.exclude_roles, &|text| self.redact_text(text));
+        redact_cohere_chat_history_text(json, &self.exclude_roles, &|text| {
+            self.redact_text(text, budget)
+        });
+        redact_vertex_instance_prompts(json, &self.exclude_roles, &|text| {
+            self.redact_text(text, budget)
+        });
     }
 
-    /// Replace all PII pattern matches in the text with the redaction placeholder.
-    /// Placeholders are pre-rendered at construction time so each call is one
-    /// `replace_all` per pattern, with no template formatting on the hot path.
-    fn redact_text(&self, text: &str) -> String {
-        let mut result = text.to_string();
-        for pattern in &self.patterns {
-            result = pattern
-                .regex
-                .replace_all(&result, NoExpand(pattern.placeholder.as_str()))
-                .to_string();
-        }
-        result
+    /// Replace all PII pattern matches in the text with the redaction
+    /// placeholder, charged against `budget`.
+    ///
+    /// Placeholders are pre-rendered at construction time so each call does no
+    /// template formatting on the hot path, and a pattern with no match in this
+    /// string allocates nothing at all. See [`redact_text_bounded`] for the
+    /// literal-replacement and budget contracts.
+    fn redact_text(&self, text: &str, budget: &RedactionBudget) -> String {
+        redact_text_bounded(text, &self.patterns, budget)
     }
 
     /// Enforce the configured scan ceiling without silently bypassing reject or
@@ -1080,6 +1420,74 @@ impl AiPromptShield {
                     body: serde_json::json!({
                         "error": "Request body exceeds AI prompt shield scan limit",
                         "message": "Request blocked because the prompt body is too large to inspect safely."
+                    })
+                    .to_string(),
+                    headers: HashMap::new(),
+                }
+            }
+        }
+    }
+
+    /// Apply the configured action to detections taken over the FINAL
+    /// backend-visible body.
+    ///
+    /// `redact` cannot rewrite wire bytes from the final hook, so PII that is
+    /// still present at dispatch time is an unfulfilled redaction obligation and
+    /// fails the request closed — whether it survived a compressed deferral or
+    /// was reintroduced by a later body transform.
+    fn decide_final_request_body(
+        &self,
+        ctx: &mut RequestContext,
+        detected: Vec<String>,
+    ) -> PluginResult {
+        if detected.is_empty() {
+            return PluginResult::Continue;
+        }
+        match self.action {
+            ShieldAction::Reject => {
+                debug!(
+                    "ai_prompt_shield: PII detected in the final request body (types: {:?}), rejecting request",
+                    detected
+                );
+                ctx.metadata
+                    .insert("ai_shield_rejected".to_string(), detected.join(","));
+                PluginResult::Reject {
+                    status_code: 400,
+                    body: serde_json::json!({
+                        "error": "PII detected in request",
+                        "detected_types": detected,
+                        "message": "Request blocked: potential PII detected. Remove sensitive data before sending to AI provider."
+                    })
+                    .to_string(),
+                    headers: HashMap::new(),
+                }
+            }
+            ShieldAction::Warn => {
+                warn!(
+                    "ai_prompt_shield: PII detected in the final request body (types: {:?}), passing through (warn mode)",
+                    detected
+                );
+                ctx.metadata
+                    .insert("ai_shield_warnings".to_string(), detected.join(","));
+                PluginResult::Continue
+            }
+            ShieldAction::Redact => {
+                // This hook can reject but cannot replace the final wire bytes.
+                // Forwarding would leak the plaintext body, so redaction policy
+                // fails closed on any PII still present in the dispatched
+                // representation.
+                warn!(
+                    "ai_prompt_shield: PII detected in the final request body (types: {:?}) but that body cannot be rewritten, rejecting request",
+                    detected
+                );
+                ctx.metadata
+                    .insert("ai_shield_rejected".to_string(), detected.join(","));
+                PluginResult::Reject {
+                    status_code: 400,
+                    body: serde_json::json!({
+                        "error": "PII detected in request",
+                        "detected_types": detected,
+                        "message": "Request blocked: sensitive data reached the backend-visible body and could not be redacted safely."
                     })
                     .to_string(),
                     headers: HashMap::new(),
@@ -1194,8 +1602,17 @@ impl Plugin for AiPromptShield {
             return PluginResult::Continue;
         }
 
-        // Decompression occurs later in request-body transforms. Mark this
-        // instance for final-body inspection instead of parsing compressed bytes
+        // This instance owns the request from here on. Carry that scope into
+        // `on_final_request_body` so a later body transform cannot change
+        // policy-relevant content after this hook decided (see the
+        // "final backend-visible body is authoritative" note above). The marker
+        // is instance-private, so co-located shield instances never consume each
+        // other's final check.
+        ctx.metadata
+            .insert(self.final_inspection_marker.clone(), "true".to_string());
+
+        // Decompression may occur later in request-body transforms. Mark this
+        // instance for deferred inspection instead of parsing compressed bytes
         // and silently allowing the request.
         if has_non_identity_content_encoding(headers) {
             ctx.metadata
@@ -1351,6 +1768,30 @@ impl Plugin for AiPromptShield {
                             headers: HashMap::new(),
                         }
                     }
+                    RedactionOutcome::BudgetExceeded => {
+                        // The configured policy would expand this body past its
+                        // aggregate redaction allowance (or produced a
+                        // zero-width match). Nothing partially rewritten is
+                        // forwarded; the request is refused as un-redactable at
+                        // this size, matching the scan-ceiling disposition.
+                        warn!(
+                            body_size = original_body.len(),
+                            "ai_prompt_shield: redaction exceeded the request output budget, rejecting request"
+                        );
+                        ctx.metadata.insert(
+                            "ai_shield_rejected".to_string(),
+                            "redaction_budget_exceeded".to_string(),
+                        );
+                        PluginResult::Reject {
+                            status_code: 413,
+                            body: serde_json::json!({
+                                "error": "Request body exceeds AI prompt shield redaction limit",
+                                "message": "Request blocked because redacting the prompt body would exceed the safe rewrite budget."
+                            })
+                            .to_string(),
+                            headers: HashMap::new(),
+                        }
+                    }
                     RedactionOutcome::NoChange => {
                         // `detected` is non-empty (checked above) yet redaction
                         // found nothing to change. This should not happen for a
@@ -1382,19 +1823,78 @@ impl Plugin for AiPromptShield {
         self.requires_request_body
     }
 
-    /// Inspect a compressed request after all request-body transforms. This is
-    /// the authoritative policy decision for the backend-visible plaintext body.
+    /// Claim the finalized backend-visible representation for an enforcing
+    /// instance, so the shared request representation gate reduces a content
+    /// coding to plaintext before the hook below reads it — or fails the request
+    /// closed when it cannot (`GHSA-3973-47g5-4mcx`).
+    ///
+    /// The claim is decided from configuration and request state only, never by
+    /// decoding `body`. `warn` never claims: it cannot refuse anything, so a
+    /// body it merely fails to observe must not become a `400`. Requests outside
+    /// the documented JSON `POST` scope are not claimed either, so an ordinary
+    /// compressed upload on an unrelated route is unaffected.
+    fn enforces_final_request_body_policy(
+        &self,
+        ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> bool {
+        if !self.requires_request_body || self.action == ShieldAction::Warn {
+            return false;
+        }
+        if ctx.method != "POST" {
+            return false;
+        }
+        let Some(content_type) = headers.get("content-type") else {
+            return false;
+        };
+        is_json_content_type(content_type) && !is_framed_grpc_content_type(content_type)
+    }
+
+    /// The authoritative policy decision over the exact backend-visible request
+    /// body, after every `transform_request_body` hook has run.
+    ///
+    /// Two request classes reach substantive inspection here:
+    ///
+    /// * **Revalidation.** `before_proxy` already decided an ordinary plaintext
+    ///   body, but later body transforms can put policy-relevant content back
+    ///   into it. Re-running detection over the dispatched bytes is what keeps
+    ///   the shield's verdict a statement about what the backend receives rather
+    ///   than about a pre-transform approximation. `redact` fails closed here:
+    ///   this hook can refuse a request but cannot rewrite wire bytes, so PII
+    ///   surviving to this point is an unfulfilled redaction obligation.
+    /// * **Deferred compressed bodies.** The body was still encoded during
+    ///   `before_proxy` and was never inspected, so an unreadable representation
+    ///   is itself a fail-closed condition for enforcing actions.
+    ///
+    /// The two classes differ only in how an UNREADABLE body is treated. A
+    /// deferred body that cannot be reduced to plaintext JSON was never
+    /// inspected at all and fails closed; a revalidated body reuses exactly the
+    /// disposition `before_proxy` applied to the same condition, so this hook
+    /// can never invent a rejection class the early hook would have waved
+    /// through.
     async fn on_final_request_body_with_context(
         &self,
         ctx: &mut RequestContext,
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if ctx
+        // Both markers are instance-private and are CONSUMED here: a
+        // re-finalization that skips the transform pass must not re-decide a
+        // body this instance already governed.
+        let deferred = ctx
             .metadata
             .remove(&self.deferred_compressed_marker)
-            .is_none()
-        {
+            .is_some();
+        let in_scope = ctx.metadata.remove(&self.final_inspection_marker).is_some();
+        if !deferred && !in_scope {
+            return PluginResult::Continue;
+        }
+
+        // The markers can only be set by `before_proxy` on a POST. Keep the
+        // method check defensive for direct hook callers and future runner
+        // changes.
+        if ctx.method != "POST" {
             return PluginResult::Continue;
         }
 
@@ -1406,19 +1906,51 @@ impl Plugin for AiPromptShield {
             return PluginResult::Continue;
         }
 
-        if has_non_identity_content_encoding(headers) {
-            return self.handle_uninspectable_deferred_body(ctx, "compressed_body");
-        }
+        // Read through the shared gate: when a content coding is present on a
+        // claimed request the gate has already staged the decoded plaintext, and
+        // scanning the encoded octets instead would find nothing.
+        let decoded_view = ctx.inspectable_final_request_body_owned();
+        let body: &[u8] = match decoded_view.as_deref() {
+            Some(plaintext) => plaintext,
+            None => {
+                if has_non_identity_content_encoding(headers) {
+                    // Nothing reduced this body to plaintext — no `compression`
+                    // instance decoded it and (for `warn`, which never claims)
+                    // the gate did not either.
+                    return self.handle_uninspectable_deferred_body(ctx, "compressed_body");
+                }
+                body
+            }
+        };
 
         if body.len() > self.max_scan_bytes {
             return self.handle_oversize_body(ctx, body.len());
         }
 
         let Ok(body_text) = std::str::from_utf8(body) else {
-            return self.handle_uninspectable_deferred_body(ctx, "non_utf8_body");
+            if deferred {
+                return self.handle_uninspectable_deferred_body(ctx, "non_utf8_body");
+            }
+            // `before_proxy` reads the UTF-8 `request_body` metadata view, which
+            // the proxy does not publish for non-UTF-8 bytes, so it continued on
+            // exactly this condition. Mirror it rather than inventing a new
+            // rejection class on revalidation.
+            return PluginResult::Continue;
         };
-        let Ok(json) = serde_json::from_str::<Value>(body_text) else {
-            return self.handle_uninspectable_deferred_body(ctx, "malformed_json");
+        let json = match serde_json::from_str::<Value>(body_text) {
+            Ok(json) => json,
+            Err(_) => {
+                if deferred {
+                    return self.handle_uninspectable_deferred_body(ctx, "malformed_json");
+                }
+                // Same mirroring: `ScanMode::All` falls back to a raw-body scan
+                // for non-redact actions, and Content mode continues.
+                let detected = match self.scan_mode {
+                    ScanMode::All => self.detect_pii_raw_fallback(body_text),
+                    ScanMode::Content => Vec::new(),
+                };
+                return self.decide_final_request_body(ctx, detected);
+            }
         };
 
         if json.get("stream").and_then(Value::as_bool) == Some(true) {
@@ -1430,62 +1962,18 @@ impl Plugin for AiPromptShield {
             ScanMode::All => self.detect_pii_all_mode(&json, body_text),
             ScanMode::Content => self.detect_pii_content_mode(&json),
         };
-        if detected.is_empty() {
-            return PluginResult::Continue;
-        }
-
-        match self.action {
-            ShieldAction::Reject => {
-                debug!(
-                    "ai_prompt_shield: PII detected after request decompression (types: {:?}), rejecting request",
-                    detected
-                );
-                ctx.metadata
-                    .insert("ai_shield_rejected".to_string(), detected.join(","));
-                PluginResult::Reject {
-                    status_code: 400,
-                    body: serde_json::json!({
-                        "error": "PII detected in request",
-                        "detected_types": detected,
-                        "message": "Request blocked: potential PII detected. Remove sensitive data before sending to AI provider."
-                    })
-                    .to_string(),
-                    headers: HashMap::new(),
-                }
-            }
-            ShieldAction::Warn => {
-                warn!(
-                    "ai_prompt_shield: PII detected after request decompression (types: {:?}), passing through (warn mode)",
-                    detected
-                );
-                ctx.metadata
-                    .insert("ai_shield_warnings".to_string(), detected.join(","));
-                PluginResult::Continue
-            }
-            ShieldAction::Redact => {
-                // This hook can reject but cannot replace the final wire bytes.
-                // Forwarding would leak the plaintext body, so redaction policy
-                // must fail closed on a compressed request containing PII.
-                warn!(
-                    "ai_prompt_shield: PII detected after request decompression (types: {:?}) but final body cannot be rewritten, rejecting request",
-                    detected
-                );
-                ctx.metadata
-                    .insert("ai_shield_rejected".to_string(), detected.join(","));
-                PluginResult::Reject {
-                    status_code: 400,
-                    body: serde_json::json!({
-                        "error": "PII detected in request",
-                        "detected_types": detected,
-                        "message": "Request blocked: compressed sensitive data could not be redacted safely."
-                    })
-                    .to_string(),
-                    headers: HashMap::new(),
-                }
-            }
-        }
+        self.decide_final_request_body(ctx, detected)
     }
 
+    /// Rewrite the wire body for a `redact` instance.
+    ///
+    /// Method scope is decided here, from `ctx.method`, and NOT from
+    /// `should_buffer_request_body`: another body plugin can force a request
+    /// onto the buffered path, and the shared transform loop then visits every
+    /// `modifies_request_body` plugin regardless of which one asked for the
+    /// buffer. Without this check, adding an unrelated body rule to a route
+    /// would silently extend the shield's rewrites to methods the same
+    /// configuration otherwise leaves untouched.
     async fn transform_request_body_with_context(
         &self,
         ctx: &mut RequestContext,
@@ -1493,6 +1981,9 @@ impl Plugin for AiPromptShield {
         content_type: Option<&str>,
         request_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
+        if ctx.method != "POST" {
+            return None;
+        }
         // A later compression plugin may already have stripped the encoding
         // header in `before_proxy` even though its body transform has not run
         // yet. The instance marker is therefore the authoritative signal that
@@ -1500,8 +1991,7 @@ impl Plugin for AiPromptShield {
         if ctx.metadata.contains_key(&self.deferred_compressed_marker) {
             return None;
         }
-        self.transform_request_body(body, content_type, request_headers)
-            .await
+        self.redact_wire_body(body, content_type, request_headers)
     }
 
     async fn transform_request_body(
@@ -1509,6 +1999,30 @@ impl Plugin for AiPromptShield {
         body: &[u8],
         content_type: Option<&str>,
         request_headers: &std::collections::HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        // No `RequestContext` here. Require the explicit method marker the
+        // context-free body-transform callers supply, so this compatibility
+        // variant applies exactly the same JSON `POST` scope as the
+        // context-aware one above rather than guessing it. Production HTTP
+        // paths use the context-aware variant.
+        if !request_headers
+            .get(":method")
+            .is_some_and(|method| method.eq_ignore_ascii_case("POST"))
+        {
+            return None;
+        }
+        self.redact_wire_body(body, content_type, request_headers)
+    }
+}
+
+impl AiPromptShield {
+    /// Shared body-rewrite path for both `transform_request_body` variants,
+    /// entered only once the caller has proven the documented JSON `POST` scope.
+    fn redact_wire_body(
+        &self,
+        body: &[u8],
+        content_type: Option<&str>,
+        request_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         if self.action != ShieldAction::Redact {
             return None;
@@ -1540,6 +2054,12 @@ impl Plugin for AiPromptShield {
             RedactionOutcome::Redacted(json) | RedactionOutcome::Incomplete(json) => {
                 serde_json::to_vec(&json).ok()
             }
+            // Redaction could not complete inside its output/work allowance. The
+            // partially rewritten document is discarded rather than forwarded;
+            // the wire bytes are left alone so `on_final_request_body` sees the
+            // same unredacted PII and rejects before dispatch. `before_proxy`
+            // already refused this request in the ordinary flow.
+            RedactionOutcome::BudgetExceeded => None,
             // No PII to redact (or body not parseable / over the size cap):
             // leave the wire body unchanged.
             RedactionOutcome::NoChange => None,
@@ -1594,19 +2114,78 @@ fn optional_string_array(
         .map(|values| values.map(|values| values.into_iter().collect()))
 }
 
+/// Render one pattern's redaction placeholder from the configured template and
+/// bound the RESULT, not the template: a template may repeat `{type}`, so the
+/// rendered replacement — the string every match re-emits — is what has to stay
+/// bounded (`MAX_REDACTION_PLACEHOLDER_BYTES`).
+fn render_placeholder(template: &str, name: &str) -> Result<String, String> {
+    let placeholder = template.replace("{type}", name);
+    if placeholder.len() > MAX_REDACTION_PLACEHOLDER_BYTES {
+        return Err(format!(
+            "ai_prompt_shield: 'redaction_placeholder' rendered for pattern '{name}' must be <= {MAX_REDACTION_PLACEHOLDER_BYTES} UTF-8 bytes"
+        ));
+    }
+    Ok(placeholder)
+}
+
+/// Inclusive upper bound of the supported numeric domain for published
+/// `integer` config fields: 2^53 − 1.
+///
+/// The bound is not `u64::MAX` on purpose. JSON Schema treats a mathematically
+/// integral number as an integer however it is spelled, and a JSON number that
+/// does not fit an unsigned 64-bit slot is carried as an `f64` — where
+/// `u64::MAX` and 2^64 round to the SAME value. A `u64::MAX` ceiling would
+/// therefore be a bound the published component cannot actually enforce, which
+/// is the schema/runtime disagreement this domain exists to remove. Every
+/// integer at or below 2^53 − 1 is exact in every JSON number representation,
+/// so schema validation and admission reach the same verdict for every input.
+/// As a body-scan ceiling it is ~8 PiB — far beyond any request.
+const MAX_CONFIG_INTEGER: u64 = 9_007_199_254_740_991;
+
+/// Parse a published `integer` config value that must be greater than zero and
+/// within [`MAX_CONFIG_INTEGER`].
+///
+/// A mathematically integral number is the same published integer however it is
+/// spelled, so `1024` and `1024.0` are both accepted. A fractional, negative,
+/// non-finite, or out-of-range number is not an integer under that contract and
+/// is rejected rather than silently truncated by a lossy cast.
 fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option<usize>, String> {
     let Some(value) = config.get(field) else {
         return Ok(None);
     };
-    let Some(value) = value.as_u64() else {
-        return Err(format!(
-            "ai_prompt_shield: '{field}' must be an integer greater than zero"
-        ));
+    let type_error = format!(
+        "ai_prompt_shield: '{field}' must be an integer between 1 and {MAX_CONFIG_INTEGER}"
+    );
+    let Value::Number(number) = value else {
+        return Err(type_error);
+    };
+    let value = match number.as_u64() {
+        Some(value) => value,
+        None => {
+            // Not held as an unsigned integer: accept only a mathematically
+            // integral, in-range decimal spelling. `MAX_CONFIG_INTEGER as f64`
+            // is exact, so this comparison — and the cast after it — lose
+            // nothing.
+            match number.as_f64() {
+                Some(float)
+                    if float.is_finite()
+                        && float.fract() == 0.0
+                        && float >= 0.0
+                        && float <= MAX_CONFIG_INTEGER as f64 =>
+                {
+                    float as u64
+                }
+                _ => return Err(type_error),
+            }
+        }
     };
     if value == 0 {
         return Err(format!(
             "ai_prompt_shield: '{field}' must be greater than zero"
         ));
+    }
+    if value > MAX_CONFIG_INTEGER {
+        return Err(type_error);
     }
     usize::try_from(value)
         .map(Some)
@@ -2148,12 +2727,43 @@ fn redact_object_string_field(
     }
 }
 
+/// The model-visible payload of an OpenAI Responses function-result input item,
+/// or `None` for anything else.
+///
+/// The Responses API supplies a tool's result as a top-level `input` item of
+/// type `function_call_output` whose text lives under `output`, not `content`:
+/// no other branch of the walkers reaches it, so the model read that text
+/// verbatim while the shield never saw it. `output` is a JSON-encoded string in
+/// the documented shape and an array of content items in the structured
+/// spelling; both are handled by the shared tool-result traversal, which is
+/// bounded to one level. The item carries no `role`, so `exclude_roles` does not
+/// suppress it — third-party tool output is exactly where a smuggled value
+/// hides, and there is no operator-authored role to exempt.
+///
+/// Any other `output` shape (an object, a number) contributes no text and is
+/// left untouched by both the detector and the redactor, keeping them
+/// symmetric.
+fn function_call_output_payload(object: &serde_json::Map<String, Value>) -> Option<&Value> {
+    if !is_function_call_output_item(object) {
+        return None;
+    }
+    object.get("output")
+}
+
+/// Whether this object is an OpenAI Responses function-result input item. The
+/// mutating walkers test the discriminator and then take `output` separately,
+/// so the redactor never holds a borrow across the branch its read decided.
+fn is_function_call_output_item(object: &serde_json::Map<String, Value>) -> bool {
+    object.get("type").and_then(Value::as_str) == Some("function_call_output")
+}
+
 /// Collect scannable text from a top-level LLM content field
 /// (`prompt`/`input`/`instructions`/`system`/`inputText`). Handles a plain
 /// string, an array of strings, an array of content parts (see
-/// [`text_content_part_text`]), and the structured OpenAI Responses `input`
+/// [`text_content_part_text`]), the structured OpenAI Responses `input`
 /// shape — an array of message objects `{role, content: <string | array of
-/// parts>}` — by recursing into each message's `content`.
+/// parts>}` — by recursing into each message's `content`, and the Responses
+/// function-result item (see [`function_call_output_payload`]).
 fn collect_field_text<'a>(
     value: &'a Value,
     exclude_roles: &HashSet<String>,
@@ -2168,6 +2778,10 @@ fn collect_field_text<'a>(
                     Value::Object(obj) => {
                         if let Some(text) = text_content_part_text(item) {
                             texts.push(text);
+                        } else if let Some(output) = function_call_output_payload(obj) {
+                            // Responses function-result item: model-visible text
+                            // lives under `output`.
+                            collect_tool_result_content_text(Some(output), texts);
                         } else if let Some(content) = obj.get("content") {
                             if obj
                                 .get("role")
@@ -2185,8 +2799,13 @@ fn collect_field_text<'a>(
                 }
             }
         }
-        // A field that is itself a single message object `{role, content}`.
+        // A field that is itself a single message object `{role, content}`, or
+        // a single Responses function-result item.
         Value::Object(obj) => {
+            if let Some(output) = function_call_output_payload(obj) {
+                collect_tool_result_content_text(Some(output), texts);
+                return;
+            }
             if let Some(content) = obj.get("content") {
                 if obj
                     .get("role")
@@ -2241,6 +2860,13 @@ fn redact_field_text(
                 let Some(obj) = item.as_object_mut() else {
                     continue;
                 };
+                // Mirrors `collect_field_text`: the Responses function-result
+                // item is matched before the role filter, exactly as the
+                // detector does, so the two cannot drift.
+                if is_function_call_output_item(obj) {
+                    redact_tool_result_content_text(obj.get_mut("output"), redact);
+                    continue;
+                }
                 if obj
                     .get("role")
                     .and_then(|r| r.as_str())
@@ -2254,6 +2880,10 @@ fn redact_field_text(
             }
         }
         Value::Object(obj) => {
+            if is_function_call_output_item(obj) {
+                redact_tool_result_content_text(obj.get_mut("output"), redact);
+                return;
+            }
             let excluded = obj
                 .get("role")
                 .and_then(|r| r.as_str())
@@ -2586,16 +3216,18 @@ fn redact_vertex_instance_prompts(
 /// because of attacker-controlled JSON structure.
 ///
 /// `top_level` is true only for the root object's direct fields.
-fn redact_json_strings(value: &mut Value, patterns: &[PiiPattern], top_level: bool) {
+fn redact_json_strings(
+    value: &mut Value,
+    patterns: &[PiiPattern],
+    top_level: bool,
+    budget: &RedactionBudget,
+) {
+    if budget.is_exhausted() {
+        return;
+    }
     match value {
         Value::String(s) => {
-            let mut result = s.clone();
-            for pattern in patterns {
-                result = pattern
-                    .regex
-                    .replace_all(&result, NoExpand(pattern.placeholder.as_str()))
-                    .to_string();
-            }
+            let result = redact_text_bounded(s.as_str(), patterns, budget);
             if result != *s {
                 *s = result;
             }
@@ -2615,12 +3247,18 @@ fn redact_json_strings(value: &mut Value, patterns: &[PiiPattern], top_level: bo
         Value::Number(n) => {
             let rendered = n.to_string();
             if let Some(pattern) = patterns.iter().find(|p| p.regex.is_match(&rendered)) {
+                // Replacing a scalar can grow the document just like rewriting
+                // a string, so charge the same aggregate allowance.
+                let growth = pattern.placeholder.len().saturating_sub(rendered.len());
+                if growth > 0 && !budget.charge_growth(growth) {
+                    return;
+                }
                 *value = Value::String(pattern.placeholder.clone());
             }
         }
         Value::Array(arr) => {
             for item in arr.iter_mut() {
-                redact_json_strings(item, patterns, false);
+                redact_json_strings(item, patterns, false, budget);
             }
         }
         Value::Object(map) => {
@@ -2635,7 +3273,7 @@ fn redact_json_strings(value: &mut Value, patterns: &[PiiPattern], top_level: bo
                 if top_level && should_preserve_top_level_scalar(k, val) {
                     continue;
                 }
-                redact_json_strings(val, patterns, false);
+                redact_json_strings(val, patterns, false, budget);
             }
         }
         // PII carried in an object KEY name (e.g. `{"a@b.com":"x"}`) cannot be
