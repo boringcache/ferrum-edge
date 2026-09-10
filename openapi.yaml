@@ -29254,6 +29254,13 @@ components:
           description: Boolean shorthand. true enables the pack with Ferrum defaults; false disables it.
         - type: object
           additionalProperties: false
+          if:
+            required: [examples_mode]
+            properties:
+              examples_mode:
+                const: replace
+          then:
+            required: [examples]
           properties:
             enabled:
               type: boolean
@@ -29263,15 +29270,182 @@ components:
               type: string
               enum: [append, replace]
               default: append
-              description: Append customer examples to Ferrum defaults or replace the semantic example set for this pack.
+              description: Append customer examples to Ferrum defaults or replace the semantic example set for this pack. replace requires examples.
             examples:
               type: array
               minItems: 1
               items:
                 type: string
-              description: Customer semantic examples for this built-in pack.
-          description: Object form for tuning a built-in AI semantic firewall pack.
+                minLength: 1
+                pattern: "\\S"
+              description: Customer semantic examples for this built-in pack. Each entry must contain a non-whitespace character; surrounding whitespace is trimmed. Required when examples_mode is replace.
+          description: Object form for tuning a built-in AI semantic firewall pack. The pack keeps its built-in rule id, pack metadata, and compiled-in matching behavior either way.
       description: Built-in pack toggle or tuning object.
+
+    AiSemanticFirewallEnabledBuiltinPack:
+      description: >-
+        Matches a builtins.<pack> value that leaves the pack ACTIVE: the boolean
+        shorthand true, or the object form without enabled: false. Used only by
+        the ai_semantic_firewall active-policy conditionals.
+      anyOf:
+        - const: true
+        - type: object
+          not:
+            required: [enabled]
+            properties:
+              enabled:
+                const: false
+
+    AiSemanticFirewallActivePolicy:
+      description: >-
+        At least one ai_semantic_firewall rule source is active: any built-in
+        pack (omitting builtins enables all seven), an allow topic, a deny
+        topic, or a custom rule. An enabled instance with no active rule source
+        is rejected by the constructor.
+      anyOf:
+        - not:
+            required: [builtins]
+        - required: [builtins]
+          properties:
+            builtins:
+              anyOf:
+                - required: [prompt_injection]
+                  properties:
+                    prompt_injection:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [jailbreak]
+                  properties:
+                    jailbreak:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [system_prompt_exfiltration]
+                  properties:
+                    system_prompt_exfiltration:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [data_exfiltration]
+                  properties:
+                    data_exfiltration:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [indirect_prompt_injection]
+                  properties:
+                    indirect_prompt_injection:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [tool_abuse]
+                  properties:
+                    tool_abuse:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [response_leakage]
+                  properties:
+                    response_leakage:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+        - required: [allow_topics]
+          properties:
+            allow_topics:
+              minItems: 1
+        - required: [deny_topics]
+          properties:
+            deny_topics:
+              minItems: 1
+        - required: [custom_rules]
+          properties:
+            custom_rules:
+              minItems: 1
+
+    AiSemanticFirewallActiveRequestPolicy:
+      description: >-
+        At least one REQUEST-direction ai_semantic_firewall rule is active: any
+        built-in pack except the response-only response_leakage (omitting
+        builtins enables all of them), an allow topic (request-side only), a
+        deny topic (bidirectional), or a custom rule whose direction is not
+        response.
+      anyOf:
+        - not:
+            required: [builtins]
+        - required: [builtins]
+          properties:
+            builtins:
+              anyOf:
+                - required: [prompt_injection]
+                  properties:
+                    prompt_injection:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [jailbreak]
+                  properties:
+                    jailbreak:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [system_prompt_exfiltration]
+                  properties:
+                    system_prompt_exfiltration:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [data_exfiltration]
+                  properties:
+                    data_exfiltration:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [indirect_prompt_injection]
+                  properties:
+                    indirect_prompt_injection:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [tool_abuse]
+                  properties:
+                    tool_abuse:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+        - required: [allow_topics]
+          properties:
+            allow_topics:
+              minItems: 1
+        - required: [deny_topics]
+          properties:
+            deny_topics:
+              minItems: 1
+        - required: [custom_rules]
+          properties:
+            custom_rules:
+              contains:
+                not:
+                  required: [direction]
+                  properties:
+                    direction:
+                      const: response
+
+    AiSemanticFirewallActiveResponsePolicy:
+      description: >-
+        At least one RESPONSE-direction ai_semantic_firewall rule is active: the
+        bidirectional built-ins system_prompt_exfiltration / tool_abuse, the
+        response-direction built-in response_leakage (omitting builtins enables
+        all three), a deny topic (bidirectional), or a custom rule whose
+        direction is not request. Allow topics are request-side only and never
+        satisfy this.
+      anyOf:
+        - not:
+            required: [builtins]
+        - required: [builtins]
+          properties:
+            builtins:
+              anyOf:
+                - required: [system_prompt_exfiltration]
+                  properties:
+                    system_prompt_exfiltration:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [tool_abuse]
+                  properties:
+                    tool_abuse:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+                - required: [response_leakage]
+                  properties:
+                    response_leakage:
+                      $ref: '#/components/schemas/AiSemanticFirewallEnabledBuiltinPack'
+        - required: [deny_topics]
+          properties:
+            deny_topics:
+              minItems: 1
+        - required: [custom_rules]
+          properties:
+            custom_rules:
+              contains:
+                not:
+                  required: [direction]
+                  properties:
+                    direction:
+                      const: request
 
     AiTranscriptAuditConfig:
       type: object
@@ -29738,7 +29912,7 @@ components:
     AiSemanticFirewallConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_semantic_firewall — Semantic LLM guardrails for prompt injection, jailbreaks, system/developer prompt exfiltration, data exfiltration intent, indirect prompt injection, tool abuse, business-topic allow/deny policy, response leakage, dry-run rollout, and audit metadata."
+      description: "Plugin: ai_semantic_firewall — Semantic LLM guardrails for prompt injection, jailbreaks, system/developer prompt exfiltration, data exfiltration intent, indirect prompt injection, tool abuse, business-topic allow/deny policy, response leakage, dry-run rollout, and audit metadata. An enabled instance must carry a provider, at least one active rule source, and rules that apply to the enabled inspection directions; a disabled instance (enabled: false) is exempt from those cross-field requirements but every block it DOES carry is still validated, matching the constructor. Three relationships standard JSON Schema cannot express and ferrum-edge validate still rejects with a field-specific error: streaming.overlap_bytes must be strictly less than streaming.max_window_bytes; streaming.overlap_tokens must be strictly less than streaming.max_window_tokens; and every allow_topics/deny_topics/custom_rules id must be unique across those three lists AND against the ids of the ACTIVE built-in packs (prompt_injection, jailbreak, system_prompt_exfiltration, data_exfiltration, indirect_prompt_injection, tool_abuse, response_leakage). A rule id is an operator-facing label only — naming a custom or deny-topic rule after a disabled built-in pack does not give it that built-in's matching behavior."
       allOf:
         - if:
             required: [enabled]
@@ -29747,7 +29921,90 @@ components:
                 const: false
           then: {}
           else:
-            required: [provider]
+            allOf:
+              - required: [provider]
+              # At least one rule source is active.
+              - $ref: '#/components/schemas/AiSemanticFirewallActivePolicy'
+              # inspect.request and inspect.response cannot both be false.
+              - not:
+                  required: [inspect]
+                  properties:
+                    inspect:
+                      required: [request, response]
+                      properties:
+                        request:
+                          const: false
+                        response:
+                          const: false
+              # Rules must apply to the enabled inspection directions.
+              - if:
+                  required: [inspect]
+                  properties:
+                    inspect:
+                      required: [request]
+                      properties:
+                        request:
+                          const: false
+                then:
+                  $ref: '#/components/schemas/AiSemanticFirewallActiveResponsePolicy'
+              - if:
+                  required: [inspect]
+                  properties:
+                    inspect:
+                      required: [response]
+                      properties:
+                        response:
+                          const: false
+                then:
+                  $ref: '#/components/schemas/AiSemanticFirewallActiveRequestPolicy'
+              # An empty extraction list is only admissible when no rule in that
+              # direction is active.
+              - if:
+                  required: [extraction]
+                  properties:
+                    extraction:
+                      required: [request_json_paths]
+                      properties:
+                        request_json_paths:
+                          maxItems: 0
+                then:
+                  anyOf:
+                    - required: [inspect]
+                      properties:
+                        inspect:
+                          required: [request]
+                          properties:
+                            request:
+                              const: false
+                    - not:
+                        $ref: '#/components/schemas/AiSemanticFirewallActiveRequestPolicy'
+              - if:
+                  required: [extraction]
+                  properties:
+                    extraction:
+                      required: [response_json_paths]
+                      properties:
+                        response_json_paths:
+                          maxItems: 0
+                then:
+                  anyOf:
+                    - required: [inspect]
+                      properties:
+                        inspect:
+                          required: [response]
+                          properties:
+                            response:
+                              const: false
+                    - not:
+                        $ref: '#/components/schemas/AiSemanticFirewallActiveResponsePolicy'
+        # The streaming tuning block is only admissible for streaming_response: inspect.
+        - if:
+            required: [streaming]
+          then:
+            required: [streaming_response]
+            properties:
+              streaming_response:
+                const: inspect
       properties:
         enabled:
           type: boolean
@@ -29767,7 +30024,7 @@ components:
           type: string
           enum: [enforce, dry_run]
           default: enforce
-          description: Dry-run mode never rejects and emits would_action metadata.
+          description: "Dry-run mode never rejects or cuts traffic and emits would_action metadata. This covers every disposition on both the buffered and the windowed streaming paths: a matched rule, an uninspectable body/window, an unmapped governed provider stream, an exhausted streaming.max_inspections budget, a provider error under on_error=reject, and an expired streaming.max_hold_ms hold (including on_hold_timeout=cut) are all recorded and released."
         on_error:
           type: string
           enum: [warn, allow, reject]
@@ -29788,7 +30045,38 @@ components:
         streaming:
           type: object
           additionalProperties: false
-          description: Windowed-inspection tuning. Only valid when streaming_response is inspect.
+          description: "Windowed-inspection tuning. Only valid when streaming_response is inspect. window=tokens requires an explicit tokenizer, and tokenizer / max_window_tokens / overlap_tokens are rejected for every other window kind. on_hold_timeout requires max_hold_ms, and its cut value is rejected with enforcement=detect. Two ordering relationships are not expressible here and are enforced by the constructor: overlap_bytes < max_window_bytes and overlap_tokens < max_window_tokens."
+          allOf:
+            - if:
+                required: [window]
+                properties:
+                  window:
+                    const: tokens
+              then:
+                required: [tokenizer]
+              else:
+                allOf:
+                  - not:
+                      required: [tokenizer]
+                  - not:
+                      required: [max_window_tokens]
+                  - not:
+                      required: [overlap_tokens]
+            - if:
+                required: [on_hold_timeout]
+              then:
+                required: [max_hold_ms]
+            - if:
+                required: [enforcement]
+                properties:
+                  enforcement:
+                    const: detect
+              then:
+                not:
+                  required: [on_hold_timeout]
+                  properties:
+                    on_hold_timeout:
+                      const: cut
           properties:
             window:
               type: string
@@ -29804,10 +30092,11 @@ components:
               format: uint
               minimum: 1
               default: 4096
-              description: Hard aggregate cap for the current window's input and retained raw/frame/reassembled state. Coalesced chunks are expanded event-by-event, and an individual event that cannot fit is uninspectable (fails closed under on_error=reject, forwarded under warn/allow).
+              description: "Hard aggregate cap for the current window's input and retained raw/frame/reassembled state. Coalesced chunks are expanded event-by-event: only one complete event's bytes are taken at a time and a ready window is inspected and released before more events are absorbed, so transport batching never changes a clean completion's disposition. Only an event that cannot fit with nothing else retained is uninspectable (fails closed under on_error=reject, forwarded under warn/allow)."
             overlap_bytes:
               type: integer
               format: uint
+              minimum: 0
               default: 256
               description: Bytes of already-cleared text re-inspected with the next window so a violation phrase split across a boundary is still caught. Prose and tool-call tails split this aggregate budget with a reserved tool-state share. Must be less than max_window_bytes and is included within that aggregate retained-state cap. For window=tokens this remains the hard memory ceiling on retained overlap while overlap_tokens selects the prose token budget.
             max_window_tokens:
@@ -29815,13 +30104,12 @@ components:
               format: uint
               minimum: 1
               maximum: 65536
-              default: 256
-              description: "Only valid when window=tokens. Soft window size in complete tokens under the selected tokenizer. Omit for the default (256). Values above 65536 or 0 are rejected. The hard max_window_bytes cap still forces a window (preferring a complete-token cut) when retained state fills first."
+              description: "Only valid when window=tokens; NO static default is advertised because materializing one on any other window kind turns a valid configuration into one the gateway rejects. Soft window size in complete tokens under the selected tokenizer. Omit to inherit 256. Values above 65536 or 0 are rejected. The hard max_window_bytes cap still forces a window (preferring a complete-token cut) when retained state fills first."
             overlap_tokens:
               type: integer
               format: uint
-              default: 32
-              description: "Only valid when window=tokens. Complete tokens of already-cleared prose re-inspected with the next window; retained overlap tokens count against the next window's max_window_tokens, so a window closes once retained + new tokens reach the budget (at least one new token is always required). Must be strictly less than max_window_tokens. When omitted, defaults to min(32, max_window_tokens-1). Still subject to the overlap_bytes memory ceiling."
+              minimum: 0
+              description: "Only valid when window=tokens; NO static default is advertised because the effective default is CONDITIONAL — min(32, max_window_tokens-1) — so materializing a fixed 32 invalidates every small token window. Complete tokens of already-cleared prose re-inspected with the next window; retained overlap tokens count against the next window's max_window_tokens, so a window closes once retained + new tokens reach the budget (at least one new token is always required). Must be strictly less than max_window_tokens. Still subject to the overlap_bytes memory ceiling."
             max_inspections:
               type: integer
               format: uint
@@ -29842,8 +30130,7 @@ components:
             on_hold_timeout:
               type: string
               enum: [on_error, cut, forward]
-              default: on_error
-              description: "Policy when streaming.max_hold_ms expires before a verdict. on_error inherits the plugin's on_error policy (reject fails closed by cutting, warn/allow fail open by forwarding every byte that caused the hold uninspected — complete events and any un-terminated partial SSE event — then passing the remainder of that partial event through until the next event boundary), matching how a provider error or an exhausted inspection budget is handled. cut always fails closed (discards all held/partial bytes); forward always fails open. Requires streaming.max_hold_ms to be set. cut is rejected with enforcement=detect, whose bytes were already forwarded before the evaluation began — an expired detect hold can only abandon the evaluation and release its admission permit. A cut is client-indistinguishable from a policy cut (same terminal error event), and every expiry folds into the fixed-cardinality ai_semantic_firewall.stream_hold_timeouts count (saturating-summed across active instances) and ai_semantic_firewall.stream_hold_timeout_action (most restrictive of cut > forward > detect_abandoned) transaction metadata; a zero-expiry instance neither synthesizes nor erases those keys."
+              description: "The effective default is on_error, but NO static schema default is advertised: the field is rejected outright unless streaming.max_hold_ms is also set, so tooling that materializes defaults must leave it unset. Policy when streaming.max_hold_ms expires before a verdict. on_error inherits the plugin's on_error policy (reject fails closed by cutting, warn/allow fail open by forwarding every byte that caused the hold uninspected — complete events and any un-terminated partial SSE event — then passing the remainder of that partial event through until the next event boundary), matching how a provider error or an exhausted inspection budget is handled. cut always fails closed (discards all held/partial bytes) in mode=enforce and degrades to forward in mode=dry_run, which never cuts; forward always fails open. Requires streaming.max_hold_ms to be set. cut is rejected with enforcement=detect, whose bytes were already forwarded before the evaluation began — an expired detect hold can only abandon the evaluation and release its admission permit. A cut is client-indistinguishable from a policy cut (same terminal error event), and every expiry folds into the fixed-cardinality ai_semantic_firewall.stream_hold_timeouts count (saturating-summed across active instances) and ai_semantic_firewall.stream_hold_timeout_action (most restrictive of cut > forward > detect_abandoned) transaction metadata; a zero-expiry instance neither synthesizes nor erases those keys."
             enforcement:
               type: string
               enum: [block, detect]
@@ -29857,7 +30144,7 @@ components:
             type:
               type: string
               enum: [openai_compatible_embeddings]
-              description: OpenAI-compatible embeddings provider.
+              description: OpenAI-compatible embeddings provider. Exact spelling only — no aliases and no surrounding whitespace.
             endpoint:
               type: string
               format: uri
@@ -30021,6 +30308,9 @@ components:
             properties:
               id:
                 type: string
+                minLength: 1
+                pattern: "\\S"
+                description: Rule identifier. Must contain a non-whitespace character; surrounding whitespace is trimmed. Ids must be unique across allow_topics, deny_topics, custom_rules, and the ACTIVE built-in pack names.
               description:
                 type: string
               examples:
@@ -30028,6 +30318,8 @@ components:
                 minItems: 1
                 items:
                   type: string
+                  minLength: 1
+                  pattern: "\\S"
               threshold:
                 type: number
                 format: float
@@ -30048,6 +30340,9 @@ components:
             properties:
               id:
                 type: string
+                minLength: 1
+                pattern: "\\S"
+                description: Rule identifier. Must contain a non-whitespace character; surrounding whitespace is trimmed. Ids must be unique across allow_topics, deny_topics, custom_rules, and the ACTIVE built-in pack names.
               description:
                 type: string
               examples:
@@ -30055,6 +30350,8 @@ components:
                 minItems: 1
                 items:
                   type: string
+                  minLength: 1
+                  pattern: "\\S"
               threshold:
                 type: number
                 format: float
@@ -30064,8 +30361,8 @@ components:
               action:
                 type: string
                 enum: [reject, warn]
-                default: reject
-          description: Customer-defined request/response semantic deny topics.
+                description: "Omit to INHERIT the plugin's default_action (reject unless default_action is warn); no static default is advertised because materializing reject would turn an inherited warn into a rejection. allow is not accepted here — use allow_topics for allowlist semantics."
+          description: Customer-defined request/response semantic deny topics. Deny topics are bidirectional and apply to both inspection directions.
         custom_rules:
           type: array
           items:
@@ -30075,6 +30372,9 @@ components:
             properties:
               id:
                 type: string
+                minLength: 1
+                pattern: "\\S"
+                description: Rule identifier. Must contain a non-whitespace character; surrounding whitespace is trimmed. Ids must be unique across allow_topics, deny_topics, custom_rules, and the ACTIVE built-in pack names.
               description:
                 type: string
               direction:
@@ -30088,13 +30388,14 @@ components:
               action:
                 type: string
                 enum: [warn, reject]
-                default: reject
-                description: Custom rules can warn or reject. Use allow_topics for allowlist semantics.
+                description: "Custom rules can warn or reject; use allow_topics for allowlist semantics. Omit to INHERIT the plugin's default_action (reject unless default_action is warn); no static default is advertised because materializing reject would turn an inherited warn into a rejection."
               examples:
                 type: array
                 minItems: 1
                 items:
                   type: string
+                  minLength: 1
+                  pattern: "\\S"
               threshold:
                 type: number
                 format: float
