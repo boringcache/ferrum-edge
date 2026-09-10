@@ -1635,7 +1635,9 @@ fn validate_wildcard_origin(origin: &str) -> Result<String, String> {
                 || label.len() > 63
                 || label.starts_with('-')
                 || label.ends_with('-')
-                || !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                || !label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         })
     {
         return Err(format!(

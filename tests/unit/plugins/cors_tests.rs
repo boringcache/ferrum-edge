@@ -2697,10 +2697,8 @@ async fn composed_preflight(
             {
                 status = status_code;
                 headers = local_headers;
-                ctx.metadata.insert(
-                    "ferrum:rejection_response".to_string(),
-                    "true".to_string(),
-                );
+                ctx.metadata
+                    .insert("ferrum:rejection_response".to_string(), "true".to_string());
                 break;
             }
         }
@@ -2810,7 +2808,12 @@ async fn header_wildcards_intersect_with_explicit_names_and_authorization() {
             Some("x-custom"),
         ),
         (json!(["*"]), json!(["*"]), "x-custom", Some("*")),
-        (json!(["*"]), json!(["Authorization"]), "authorization", None),
+        (
+            json!(["*"]),
+            json!(["Authorization"]),
+            "authorization",
+            None,
+        ),
         (
             json!(["*", "Authorization"]),
             json!(["AUTHORIZATION"]),
@@ -2832,9 +2835,7 @@ async fn header_wildcards_intersect_with_explicit_names_and_authorization() {
             let (status, headers) = composed_preflight(&policies, "PUT", Some(requested)).await;
             if let Some(expected) = expected {
                 assert_eq!(status, 204);
-                assert!(
-                    headers["access-control-allow-headers"].eq_ignore_ascii_case(expected)
-                );
+                assert!(headers["access-control-allow-headers"].eq_ignore_ascii_case(expected));
             } else {
                 assert_eq!(status, 403);
             }
@@ -2860,7 +2861,9 @@ async fn wildcard_composition_preserves_empty_lists_and_credential_restrictions(
             vec![empty, wildcard.clone()],
         ] {
             assert_eq!(
-                composed_preflight(&policies, "PUT", Some("x-custom")).await.0,
+                composed_preflight(&policies, "PUT", Some("x-custom"))
+                    .await
+                    .0,
                 403
             );
         }
@@ -2870,7 +2873,9 @@ async fn wildcard_composition_preserves_empty_lists_and_credential_restrictions(
         let mut policies = vec![wildcard, credentialed];
         for _ in 0..2 {
             assert_eq!(
-                composed_preflight(&policies, "PUT", Some("x-custom")).await.0,
+                composed_preflight(&policies, "PUT", Some("x-custom"))
+                    .await
+                    .0,
                 403
             );
             policies.reverse();
@@ -2910,26 +2915,16 @@ async fn wildcard_suffixes_normalize_idna_without_changing_literal_matchers() {
         "*.xn--bcher-kva.example",
     ] {
         let plugin = CorsPlugin::new(&json!({"allowed_origins": [suffix]})).unwrap();
-        assert!(
-            plugin_allows_origin(&plugin, "https://shop.xn--bcher-kva.example").await
-        );
-        assert!(
-            plugin_allows_origin(&plugin, "http://deep.shop.xn--bcher-kva.example:8080").await
-        );
-        assert!(
-            !plugin_allows_origin(&plugin, "https://xn--bcher-kva.example").await
-        );
-        assert!(
-            !plugin_allows_origin(&plugin, "https://shop.xn--bcher-kva.example.net").await
-        );
+        assert!(plugin_allows_origin(&plugin, "https://shop.xn--bcher-kva.example").await);
+        assert!(plugin_allows_origin(&plugin, "http://deep.shop.xn--bcher-kva.example:8080").await);
+        assert!(!plugin_allows_origin(&plugin, "https://xn--bcher-kva.example").await);
+        assert!(!plugin_allows_origin(&plugin, "https://shop.xn--bcher-kva.example.net").await);
     }
     let literal = CorsPlugin::new(&json!({
         "allowed_origins": [{"exact": "*.bücher.example"}]
     }))
     .unwrap();
-    assert!(
-        !plugin_allows_origin(&literal, "https://shop.xn--bcher-kva.example").await
-    );
+    assert!(!plugin_allows_origin(&literal, "https://shop.xn--bcher-kva.example").await);
     assert!(plugin_allows_origin(&literal, "*.bücher.example").await);
 }
 
@@ -2951,17 +2946,13 @@ fn wildcard_suffixes_reject_invalid_hostnames() {
         "*.example\\com",
         "*.example\u{0000}.com",
     ] {
-        assert!(
-            CorsPlugin::new(&json!({"allowed_origins": [suffix]})).is_err()
-        );
+        assert!(CorsPlugin::new(&json!({"allowed_origins": [suffix]})).is_err());
     }
     for suffix in [
         format!("*.{}.example", "a".repeat(64)),
         format!("*.{}a", "aaa.".repeat(64)),
     ] {
-        assert!(
-            CorsPlugin::new(&json!({"allowed_origins": [suffix]})).is_err()
-        );
+        assert!(CorsPlugin::new(&json!({"allowed_origins": [suffix]})).is_err());
     }
 }
 
@@ -2990,7 +2981,10 @@ async fn originless_and_unmatched_cache_variants_remain_distinct_from_allowed_or
             let result = plugin.on_request_received(&mut ctx).await;
             assert!(matches!(result, PluginResult::Continue));
             let mut headers = permissive_backend_cors_headers();
-            headers.insert("cache-control".to_string(), "public, max-age=60".to_string());
+            headers.insert(
+                "cache-control".to_string(),
+                "public, max-age=60".to_string(),
+            );
             if let Some(vary) = vary {
                 headers.insert("vary".to_string(), vary.to_string());
             }
@@ -3001,7 +2995,9 @@ async fn originless_and_unmatched_cache_variants_remain_distinct_from_allowed_or
             let mut allowed = make_cors_ctx("GET", "https://app.example");
             plugin.on_request_received(&mut allowed).await;
             let mut allowed_headers = HashMap::new();
-            plugin.after_proxy(&mut allowed, 200, &mut allowed_headers).await;
+            plugin
+                .after_proxy(&mut allowed, 200, &mut allowed_headers)
+                .await;
             assert_eq!(
                 allowed_headers["access-control-allow-origin"],
                 "https://app.example"
@@ -3055,9 +3051,15 @@ fn cors_schema_enforces_native_origin_and_max_age_bounds() {
             false,
         ),
         (json!({"allowed_origins": ["*.bücher.example"]}), true),
-        (json!({"allowed_origins": ["*.xn--bcher-kva.example"]}), true),
+        (
+            json!({"allowed_origins": ["*.xn--bcher-kva.example"]}),
+            true,
+        ),
         (json!({"allowed_origins": ["*.example.com?query"]}), false),
-        (json!({"allowed_origins": ["*.example.com#fragment"]}), false),
+        (
+            json!({"allowed_origins": ["*.example.com#fragment"]}),
+            false,
+        ),
         (json!({"allowed_origins": ["*.bad@host.example"]}), false),
         (json!({"allowed_origins": ["*.foo..example"]}), false),
     ] {
