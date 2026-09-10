@@ -1289,6 +1289,21 @@ rules:
     action: allow
 ```
 
+**The authorization grammar is closed, and `action` is required.** Every level
+of the policy document — the policy, each rule, and each `from` /
+`to` / `when` / `source_negation` matcher — rejects unknown members at
+admission, on the native/file mesh document and on a direct `mesh_authz`
+plugin config alike. This is not tidiness: every misspelling in this grammar
+*removes* a restriction the operator wrote. `not_paths` typed `not_path` would
+deserialize as an unconstrained rule, and an `action` key typed `actoin` used
+to fall back to the `Allow` default and convert a DENY into a grant, with no
+diagnostic anywhere. `action` therefore has no default on the wire — write it
+on every rule. Omitted optional matchers keep their documented empty defaults
+(an omitted `to` still means "any request"), and an explicitly empty
+`rules: []` remains a valid scaffold; only an *unrecognized* member or a
+missing `action` is refused. Kubernetes and xDS translation build these values
+programmatically and are unaffected.
+
 ### ServiceEntry
 
 External service registration for DNS resolution and egress materialization.
@@ -1793,9 +1808,14 @@ an operator's authorizer ever saw a request the scope it protects applied to
 **Bounds.** `timeout` is capped at 30s (default 1s), `includeRequestBodyInCheck.maxRequestBytes`
 at 1 MiB, provider response reads at 64 KiB, each header list at 32 exact
 entries (case-insensitively unique), and the admitted provider set at 16 per
-mesh generation. In-flight checks are capped process-wide and are **refused
-immediately** at the ceiling rather than queued, so provider slowness cannot
-become unbounded gateway latency or memory growth.
+mesh generation. In-flight checks are capped at **128 process-wide** and are
+**refused immediately** at the ceiling rather than queued, so provider slowness
+cannot become unbounded gateway latency or memory growth. That budget is ONE
+shared pool, not one per plugin instance: every enabled `mesh_authz` instance
+and every overlapping reload generation draws from it, and a check that started
+on a retiring generation stays charged until it finishes, because the permit
+follows the request rather than the config version. There is no per-provider or
+per-instance concurrency knob.
 
 **Nothing is retried.** The check is dispatched through a dedicated
 single-attempt seam on the shared plugin HTTP client, so it keeps that client's
@@ -1844,13 +1864,29 @@ denial status has arrived, that status remains authoritative even if its
 discarded body is oversized or cannot be drained; `failOpen` therefore cannot
 convert a provider denial into an allow through a body-framing failure.
 
-A provider name this generation does not carry, a generation with no executor,
-an unavailable request body for a body-inspecting provider, a concurrency
-refusal, and task cancellation are all failed checks and therefore also honour
+An unavailable request body for a body-inspecting provider and a concurrency
+refusal are failed checks and therefore honour the selected provider's
 `failOpen`. **Three** refusals are decided **without** contacting a provider and
 are therefore **not** subject to `failOpen`: a provider conflict (above), a
 matched delegation on a connection with no HTTP request to check, and a request
 body over the selected provider's `maxRequestBytes` (below).
+
+**Two more refusals never consult `failOpen` either, because there is no
+provider to consult.** A CUSTOM rule naming a provider this generation does not
+carry, and a matched CUSTOM rule in a generation with no executor at all (no
+outbound HTTP client, e.g. a direct `mesh_policies` config, which carries no
+provider source), are **unconditional fixed `403` refusals**. Neither has a
+provider whose `failOpen` or `statusOnError` could be honoured, so a `failOpen:
+true` provider elsewhere in the generation does not admit them; both count once
+as `provider_unbound` and as a fail-closed check. Configure the provider, or
+delete the CUSTOM policy — a delegation that cannot be executed is never
+allowed to fall through to the ALLOW/DENY tiers.
+
+**Task cancellation ends the request; it never synthesizes an allow.** The check
+runs under the ordinary request deadline, so when the request is cancelled the
+check future is dropped mid-flight. Nothing is recorded, no `failOpen` decision
+is made, and the client sees the cancellation — `failOpen` cannot turn a
+cancelled request into an admitted one.
 
 **Request body.** `includeRequestBodyInCheck.maxRequestBytes` is folded into
 the proxy's pre-`authorize` body ceiling, so an over-cap request is refused with
@@ -1919,17 +1955,45 @@ generation, so the previous valid one keeps serving.
 `ferrum_mesh_ext_authz_check_failures_total{disposition}` are fixed-cardinality:
 the labels are closed enums plus the gateway namespace, never a provider,
 policy, route, host, principal, or status string. `mesh_authz.ext_authz_outcome`
-request metadata carries the same closed reason token. Every matched
-delegation is counted **exactly once**, including the outcomes decided without
-contacting a provider (`provider_unbound` when no executor or no binding,
-`provider_conflict`, `unexecutable` for an L4 session), so a fail-closed
-denial is never invisible. `outcome` values are `allowed`, `denied_by_provider`,
-`provider_unbound`, `provider_error`, `provider_conflict`, `unexecutable`,
-`timeout`, `transport_error`, `response_refused`, `body_unavailable`,
-`body_too_large`, and `concurrency_exhausted`. `body_unavailable` (a failed
-check `failOpen` may admit) and `body_too_large` (the unconditional over-cap
-refusal) are deliberately separate series. No request body, credential header
-value, provider secret, or resolved provider URL is ever logged.
+request metadata carries a closed reason token from a RELATED but FINER
+vocabulary — see the two tables below. Every matched delegation is counted
+**exactly once**, including the outcomes decided without contacting a provider
+(`provider_unbound` when no executor or no binding, `provider_conflict`,
+`unexecutable` for an L4 session), so a fail-closed denial is never invisible.
+No request body, credential header value, provider secret, or resolved provider
+URL is ever logged.
+
+The metric's `outcome` label has **twelve** values. Ten map one-to-one to a
+reason token; two pairs of reasons are deliberately folded, because the
+distinction inside each pair is a diagnostic detail rather than an operational
+one:
+
+| `outcome` label | `mesh_authz.ext_authz_outcome` reason token(s) | Meaning |
+| --- | --- | --- |
+| `allowed` | `allowed` | The provider answered `200`. |
+| `denied_by_provider` | `denied_by_provider` | An explicit provider denial, carrying its own status. |
+| `provider_unbound` | `provider_unbound` | The named provider does not bind, or the generation has no executor. Fixed `403`; never `failOpen`. |
+| `provider_error` | `provider_error` | The provider answered `5xx` — it could not decide. |
+| `provider_conflict` | `provider_conflict` | Two different extension providers applied to one request. Never `failOpen`. |
+| `unexecutable` | `unexecutable` | A matched delegation on a connection with no HTTP request to check. Never `failOpen`. |
+| `timeout` | `timeout` | The check exceeded the provider's `timeout`. |
+| `transport_error` | `transport_error`, `request_build_failed` | The check could not be completed on the wire, or could not be built at all. |
+| `response_refused` | `response_too_large`, `response_read_failed` | An allow response larger than the 64 KiB read bound, or one that could not be read. |
+| `body_unavailable` | `body_unavailable` | A body-inspecting provider had no body to inspect. A failed check `failOpen` may admit. |
+| `body_too_large` | `body_too_large` | The body exceeded the SELECTED provider's `maxRequestBytes`. The unconditional over-cap refusal. |
+| `concurrency_exhausted` | `concurrency_exhausted` | The process-wide in-flight budget was full; refused immediately, never queued. |
+
+`body_unavailable` and `body_too_large` stay separate series on purpose:
+folding them would hide which of the two an operator is seeing, and only the
+first honours `failOpen`. `ferrum_mesh_ext_authz_check_failures_total`
+`{disposition}` splits the failed checks — every outcome except `allowed`,
+`denied_by_provider`, `provider_conflict`, `unexecutable`, and `body_too_large`
+— into `fail_closed` and `fail_open`.
+
+When alerting, use the `outcome` label values above; the finer reason tokens
+(`response_too_large`, `response_read_failed`, `request_build_failed`) appear
+only in per-request `mesh_authz.ext_authz_outcome` metadata and never as a
+metric label.
 
 ### Rule Matching
 
@@ -1938,7 +2002,8 @@ Each `MeshRule` checks the following dimensions (all must match — a conjunctio
 - **Principal matching** (`from`): Istio source-principal patterns (`<trust-domain>/ns/<namespace>/sa/<service-account>`, glob), `serviceAccounts`, namespace patterns (glob), and trust-domain patterns. Full `spiffe://...` patterns are also accepted in direct `MeshPolicy` config. Multiple `from[]` source entries are ORed.
 - **Request principal matching**: `request_principals` glob patterns matched against the `{issuer}/{subject}` composite extracted by `jwks_auth`. On an HTTP-family path, when `request_principals` is non-empty and no JWT is present, the rule does not match (Istio semantics: anonymous requests fail the principal check). An empty `request_principals` list matches any request including unauthenticated ones, on every protocol. `requestPrincipals` is a JWT-derived **HTTP-only** field, so on a Layer-4 session (raw TCP, TLS passthrough, UDP, DTLS) it follows the same Istio non-HTTP-port model as the HTTP-only `to.operation` fields and `when: request.auth.*` conditions: a `DENY` (or `CUSTOM`) rule ignores it and still matches on its remaining constraints, while an `ALLOW`/`AUDIT` rule can never match on it.
 - **Source negation / IP blocks** (per-source, ANDed with the positive `from`): Istio `notPrincipals`, `notServiceAccounts`, `notNamespaces`, `notTrustDomains`, `notRequestPrincipals`, `ipBlocks`, `notIpBlocks`, `remoteIpBlocks`, `notRemoteIpBlocks`. These are **conjunctive** with the positive matchers. Negative identity matchers fail the rule only when the corresponding source/JWT identity is present and matches an excluded pattern; if the identity is absent, the negative matcher succeeds, so `DENY notPrincipals: ["*"]` and `DENY notRequestPrincipals: ["*"]` catch anonymous traffic. That absent-identity rule applies to `notRequestPrincipals` only where a JWT could have been observed: on a Layer-4 session the field is unevaluable, not absent, so it resolves through the same non-HTTP-port model as its positive sibling — ignored by `DENY`/`CUSTOM`, never matched by `ALLOW`/`AUDIT`. A `from:`-only `ALLOW` carrying `notRequestPrincipals` therefore does not grant a raw TCP/UDP/TLS-passthrough session. IP block matchers fail closed when the IP they test is absent, so a positive `ipBlocks`/`remoteIpBlocks` constraint with no resolved IP does not match. `ipBlocks`/`notIpBlocks` match the direct connection peer IP (`source.ip`); `remoteIpBlocks`/`notRemoteIpBlocks` match the gateway-resolved client IP (`remote.ip`, XFF-derived when trusted proxies are configured). Unsupported source fields fail the resource closed at translation time (mirroring the `to.operation` side); a malformed CIDR rejects the resource or direct plugin config.
-- **Request matching** (`to`): methods, paths (glob), hosts (normalized, case-insensitive), ports (exact + glob patterns), headers (case-insensitive keys, normalized at config load). The negative `to.operation` matchers (`notMethods`/`notPaths`/`notHosts`/`notPorts`) are conjunctive; `notPorts` accepts the same bounded Istio port grammar as positive `ports` (`"*"`, `"<digits>*"`, `"*<digits>"` that can match an ordinary decimal port in `1..=65535`, plus literal `1`-`65535`) and evaluates through pre-normalized `not_ports` / `not_port_patterns` without per-request allocation. ALLOW/AUDIT rules fail closed when the corresponding request attribute is absent (including an unresolved destination/listener port for `notPorts`); DENY rules follow Istio and treat missing HTTP-only operation attributes as matches, so port scoping is recommended for DENY rules that mention HTTP fields and can see TCP traffic.
+- **Request matching** (`to`): methods, paths (glob), hosts (normalized, case-insensitive), ports (exact + glob patterns), headers (case-insensitive keys, normalized at config load). The negative `to.operation` matchers (`notMethods`/`notPaths`/`notHosts`/`notPorts`) are conjunctive; `notPorts` accepts the same bounded Istio port grammar as positive `ports` (`"*"`, `"<digits>*"`, `"*<digits>"` that can match an ordinary decimal port in `1..=65535`, plus literal `1`-`65535`) and evaluates through pre-normalized `not_ports` / `not_port_patterns` without per-request allocation. ALLOW/AUDIT rules fail closed when the corresponding request attribute is absent (including an unresolved destination/listener port for `notPorts`); DENY (and `CUSTOM`) rules follow Istio and treat **unsourceable** HTTP-only operation attributes as matches, so port scoping is recommended for DENY rules that mention HTTP fields and can see TCP traffic.
+  **"Unsourceable" is not the same as "absent", and `headers` is where the difference is observable.** On a Layer-4 session (raw TCP, TLS passthrough, UDP, DTLS) there is no header map at all, so a `to.headers` predicate is unevaluable and a DENY/`CUSTOM` rule ignores it and still matches on its remaining constraints. On an HTTP-family request Ferrum HAS parsed the header map, so a header the client simply did not send is genuinely **absent** and fails a positive `to.headers` predicate for **every** action, DENY and `CUSTOM` included — matching Envoy's `HeaderMatcher`, where a missing field never satisfies an exact non-empty value, and matching the sibling `when: request.headers[...]` condition, which has always drawn this distinction. A DENY carrying `headers: {x-mode: blocked}` therefore refuses an HTTP request that carries `x-mode: blocked` and lets an HTTP request with no `x-mode` header through to the remaining tiers; to refuse the header-less request as well, add a second rule with no header predicate. `methods`, `paths`, `hosts` and `ports` are unaffected in practice: an HTTP-family request always carries a method and a canonical path, and a request with no resolvable authority or port has nothing for the matcher to read.
   `hosts` and `notHosts` match the literal requested hostname/authority after case, trailing-dot, and decimal-port normalization; they do not identify a service or expand its aliases. For example, one service may be reachable as `svc`, `svc.ferrum`, `svc.ferrum.svc`, and `svc.ferrum.svc.cluster.local`. A DENY naming only the FQDN does not cover the short-name aliases. To cover a destination, use an appropriately scoped policy with `to.ports`, enumerate every admitted alias, or choose a host wildcard whose breadth you intend (for example, `svc*` also covers other names beginning with `svc`). A host pattern without a port also matches that hostname with a port; explicit decimal ports are compared numerically (`svc:080` and `svc:80` are equivalent), `:*` remains a wildcard, and signed request ports are invalid. Host matching describes what the client asked for, not which service ultimately receives it.
 
 - **Condition matching** (`when`): attribute-based with `values` (the attribute must be present and equal one of the values) and `not_values` (the attribute must not equal any value; an absent attribute satisfies a `not_values`-only condition, matching Istio's compiled `not_rule` semantics). Values follow Istio's `StringMatcherWithPrefix` grammar for most keys: `*` is a presence check, a trailing `*` is a prefix match, a leading `*` is a suffix match, and anything else — including a mid-string `*` — is an exact match on the literal text. **Three keys have their own Istio grammar and do not use that matcher** — `source.ip` / `remote.ip` / `destination.ip` are CIDR blocks, `source.serviceAccount` is an exact namespace-relative match, and `source.namespace` accepts a `*` at any position (see [Value grammars](#value-grammars-per-key) below). **Ferrum represents the complete documented Istio condition-key set** (see [Condition keys](#condition-keys) below): `source.principal` (Istio form without the `spiffe://` scheme), `source.namespace`, `source.serviceAccount`, and `source.trustDomain` (all from the resolved peer SPIFFE ID), `source.ip`, `remote.ip`, `destination.ip`, `destination.port`, `connection.sni`, `request.auth.principal`, `request.auth.presenter` (JWT `azp`), `request.auth.audiences`, `request.auth.claims[<name>]` and nested `request.auth.claims[<name>][<nested>]` string or string-list leaf values (from the validated JWT via the mesh `RequestAuthentication` plugin), `request.headers[<name>]`, and `experimental.envoy.filters.<filter>[<key>]`. Dynamic header/claim keys follow Istio's loose `validateMapKey` framing: the first `[` and final `]` delimit a non-empty interior, without an extra HTTP-header-name parse at policy admission. Known HTTP pseudo-headers (`:authority`, `:method`, `:path`, `:scheme`) come from typed request facts; unusual admitted interiors that no request or validated claim can materialize remain absent. Keys outside the documented prefixes are **rejected** at translation/config validation time with a field-specific diagnostic, so a DENY condition on an unmodelled attribute cannot silently fail open. Only the attribute keys some loaded policy references are materialized per request, so a policy set with no `when:` conditions adds no hot-path cost.

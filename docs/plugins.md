@@ -3113,6 +3113,7 @@ As a runtime backstop for every other transform (including custom plugins), an i
 | `username_token.created_clock_skew_seconds` | u64 | `300` | Clock skew tolerance for the UsernameToken `Created` window (`0`–`3600`) |
 | `username_token.created_max_timestamp_divergence_seconds` | u64 | `60` | Maximum permitted `\|UsernameToken.Created − Timestamp.Created\|` (`0`–`3600`) |
 | `username_token.require_timestamp_binding` | bool | `true` | Require an outer `wsu:Timestamp` with a valid `Created` for PasswordDigest, so the binding cannot be dropped by omitting the element |
+| `username_token.remove_credential` | bool | `false` | Delete the verified `wsse:UsernameToken` (or the whole `wsse:Security` header when it holds only the credential) from the **backend-visible** message. Requires `enabled: true` and an explicit `password_type: PasswordText`; refused alongside an enabled `x509_signature` / `saml` or an explicit `content_type.allow_mtom: true` — see [Removing the credential before the backend](#removing-the-credential-before-the-backend) |
 | `x509_signature.enabled` | bool | `false` | Enable X.509 signature verification |
 | `x509_signature.trusted_certs` | String[] | `[]` | PEM file paths of trusted signing certificates |
 | `x509_signature.allowed_algorithms` | String[] | `["rsa-sha256"]` | Allowed signature algorithms (`rsa-sha256`, `rsa-sha1`) |
@@ -3157,7 +3158,7 @@ On top of that ordering:
 
 - Duplicate Reference URIs are rejected. The X.509 Reference ceiling is **8**; SAML accepts exactly one Reference, targeting the enclosing assertion's own id.
 - One bounded id index is built per message after the structure is settled, replacing a full-envelope scan per Reference. The independent raw start-tag scan is likewise a single pass covering every referenced id at once.
-- Every canonicalization is charged against an aggregate per-message byte budget of `2 × decoded body length` (floor 64 KiB), counting both the source subtree walked and the canonical bytes emitted. An over-budget message is refused before the work is done.
+- Every canonicalization is charged against an aggregate per-message byte budget of `2 × decoded body length` (floor 64 KiB), counting both the source subtree walked and the canonical bytes emitted. The source subtree is charged before it is walked, and the canonical writer charges **before each run it appends** — namespace declarations and `&amp;`-style escaping expand the output independently of the input's byte count, so charging the finished string would have bounded what the gateway *accepted* while the complete over-budget representation was already built and paid for. An over-budget message stops at the first append that would cross the ceiling, and the writer never reserves more capacity than the budget still admits.
 - Element nesting is bounded to **256 levels**, screened over the raw envelope bytes before the document reaches `roxmltree`, whose tokenizer recurses once per open element: the 65 536-node parser budget bounds a *wide* document but cannot stop a deeply nested one from exhausting the worker stack inside the parser itself. An over-depth envelope is refused as malformed XML with a fixed diagnostic that echoes no envelope bytes. The separate 256-level canonicalization budget still bounds the post-parse walk.
 
 #### X.509 must protect the backend-visible Body
@@ -3210,12 +3211,100 @@ reading of an element in this plugin:
   value element are rejected the same way.
 - Whatever text does survive is read by concatenating **every** text child in
   document order — the same order and content canonicalization emits.
+- The concatenated value is used **unchanged**. Surrounding whitespace decides
+  only whether an otherwise-required element is blank; it is never stripped from
+  the value the gateway acts on. Returning a trimmed copy was the same
+  verify-here/act-on-that split in a smaller form — the signature covers the
+  character data exactly as it appears — and it also meant a configured
+  PasswordText credential with significant leading or trailing spaces could
+  never authenticate, because configuration preserved the spaces and the reader
+  removed them. Only a field whose XML Schema datatype carries
+  `whiteSpace = "collapse"` is normalized: `xsd:dateTime` instants (`wsu:Created`,
+  `wsu:Expires`) and `xsd:base64Binary` payloads (`wsse:Nonce`,
+  `ds:SignatureValue`, `ds:DigestValue`, `wsse:BinarySecurityToken`,
+  `ds:X509Certificate`). `NameID`, `Issuer`, `Audience`, `Username`, and a
+  PasswordText `Password` are opaque strings and are matched byte for byte.
 
 This applies to `NameID`, `Issuer`, `Audience`, `Username`, `Password`, `Nonce`,
 `Created`, `Expires`, `SignatureValue`, `DigestValue`, `BinarySecurityToken`, and
 `X509Certificate`. Comments **between** elements are ordinary markup and are
 still accepted — only comments *inside* a value are refused. The rejection body
 names the reason and never echoes the element's content.
+
+#### Removing the credential before the backend
+
+A verified PasswordText credential is a reusable secret, and validating it does
+not stop the envelope that carries it from reaching the backend — so every
+system behind the gateway ends up trusted with a password it usually has no use
+for. `username_token.remove_credential: true` deletes the verified
+`wsse:UsernameToken` from the message the backend receives, or the whole
+`wsse:Security` header when the credential is the only thing that header
+carries. The authenticated identity is published exactly as before
+(`authenticated_identity`, a namespace-correct `identified_consumer`, and
+`ctx.metadata["soap_ws_username"]`), so authorization, consumer rate limiting,
+logging, and chargeback are unaffected; only the reusable secret is gone.
+
+It is **off by default**. A backend may legitimately read the token, and a
+gateway must not silently change a message a deployment already relies on.
+
+**Every composition it could not sanitize honestly is refused, not degraded.**
+At admission:
+
+- `username_token.enabled` must be `true` and `password_type` must be explicitly
+  `PasswordText`. A PasswordDigest token carries no reusable plaintext secret,
+  and deleting it would also remove the `Nonce` and `Created` a backend may
+  still read.
+- An enabled `x509_signature` or `saml` is refused. Rewriting the envelope would
+  invalidate content a signature covers, so the composition fails admission
+  instead of breaking a signature at runtime.
+- An explicit `content_type.allow_mtom: true` is refused, the same way it is
+  alongside an enabled `x509_signature`: an MTOM package cannot be re-framed
+  around a shortened root part.
+
+At request time, on a governed message:
+
+| Shape | Outcome |
+|---|---|
+| Plain UTF-8 XML envelope (BOM optional), no `ds:Signature` | Credential removed; backend receives the application body and the authenticated identity |
+| Envelope carrying an XMLDSIG `Signature` anywhere | `400` — the gateway did not verify that signature and will not silently invalidate it |
+| UTF-16 body, or MTOM `multipart/related` | `415` — the bytes cannot be spliced without transcoding or re-framing |
+
+Neither refusal forwards the credential. An operator who turned this on asked
+for a security property, and quietly declining to apply it is the defect, not
+the remedy.
+
+**The integrity proof binds the sanitized message.** The identity-establishing
+final-body guard normally refuses to dispatch a body whose bytes changed after
+validation. Under credential removal it records the SHA-256 of the *sanitized*
+representation instead, and the removal itself is re-derived from a recorded
+byte range and applied only when the result reproduces that digest. So the
+plugin's own rewrite is admitted, and every other post-validation mutation —
+including one that lands before the removal and makes it inapplicable — still
+fails closed with `500`.
+
+Because this instance now declares a request-body transform, the shared
+composition rules that refuse a body transformer apply to it: combining it with
+`request_deduplication` or `response_caching` on the same proxy is rejected at
+admission, and pairing it with another request-body transformer will make the
+final-body guard refuse the dispatch. Gateway-internal views of the request
+(access logs that capture bodies, `request_mirror`) may still observe the
+original buffered body; the option governs what the **backend** receives.
+
+```yaml
+plugin_name: soap_ws_security
+config:
+  timestamp:
+    require: true
+  content_type:
+    allow_mtom: false
+  username_token:
+    enabled: true
+    password_type: PasswordText
+    remove_credential: true
+    credentials:
+      - username: partner-a
+        password: "${PARTNER_A_PASSWORD}"
+```
 
 #### UsernameToken — PasswordDigest
 
@@ -3422,7 +3511,11 @@ config:
     require: true
 ```
 
-`trusted_issuers`, `trusted_signing_certs`, `audience`, `recipient`, and `nonce.replay_scope` are all required when `saml.enabled: true`. A missing or unreadable signing cert is a fatal startup error. Rotating an IdP signing cert requires updating `trusted_signing_certs` and restarting the gateway (no live reload). `allowed_signature_algorithms` and `allowed_digest_algorithms` are independent — the defaults reject SHA-1 in either position; add `rsa-sha1` / `sha1` only to interoperate with legacy IdPs.
+`trusted_issuers`, `trusted_signing_certs`, `audience`, `recipient`, and `nonce.replay_scope` are all required when `saml.enabled: true`. A missing or unreadable signing cert is a fatal startup error. `allowed_signature_algorithms` and `allowed_digest_algorithms` are independent — the defaults reject SHA-1 in either position; add `rsa-sha1` / `sha1` only to interoperate with legacy IdPs.
+
+**Rotating an IdP signing cert does not require a restart.** The trust list is read when the plugin *generation* is constructed, and every configuration reload builds a new generation: change `trusted_signing_certs` and apply a reload — file-mode `SIGHUP`, a database or CP configuration change, a DP push — and the new signer is admitted while the retired one is refused, from the first request the new generation serves. The process, its listeners, and its in-flight connections are untouched.
+
+What is *not* detected is replacing a PEM's **contents** at an unchanged path: nothing watches the file, and an unchanged configuration produces no new material to read. Rotate by publishing the new certificate at a new path and changing the list (add the new path, reload, then remove the retired path and reload again for an overlap window), not by overwriting the file in place. A path that cannot be read, decoded, or parsed fails the reload, and the last known good generation keeps serving.
 
 #### Combined Configuration
 
@@ -4419,7 +4512,7 @@ Returns configurable mock responses without proxying to the backend. Supports ma
 
 **Priority:** 3030 | **Phase:** `before_proxy` | **Protocols:** HTTP and WebSocket handshake (native gRPC unsupported)
 
-Configuration must be a top-level object. Unknown top-level and per-rule keys are rejected instead of falling back to defaults (typos such as `passthrough_on_no_mach` or `status_cod` fail construction). The free-form `headers` map accepts ordinary string-valued response headers but **rejects protocol-managed hop-by-hop and framing names** (`Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, `Content-Length`, including case variants). The gateway derives `Content-Length` from the mock body/status/method and strips connection/framing fields at the final H1/H2/H3 response boundary after every mutable hook. When supplied, `method` must be a non-empty HTTP method token, `path` must be non-empty, and `status_code` must be a final status `200–599` or `101` (synthetic WebSocket handshake only). Other informational statuses (`100`, `102`–`199`) are rejected — a mock cannot emit a 1xx as a body-bearing final response. A configured `101` that matches an ordinary HTTP request fails closed with `500`; only a request already classified as a WebSocket handshake may receive it. Runtime construction and request-flavor enforcement are the authoritative final boundaries.
+Configuration must be a top-level object. Unknown top-level and per-rule keys are rejected instead of falling back to defaults (typos such as `passthrough_on_no_mach` or `status_cod` fail construction). Omitted or explicit `null` on `method`, `status_code`, `headers`, `body`, `delay_ms`, and `passthrough_on_no_match` selects the documented default. The free-form `headers` map accepts ordinary string-valued response headers but **rejects protocol-managed hop-by-hop and framing names** (`Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, `Content-Length`, including case variants). The gateway derives `Content-Length` from the mock body/status/method and strips connection/framing fields at the final H1/H2/H3 response boundary after every mutable hook. When supplied, `method` must be a non-empty HTTP method token, `path` must be non-empty, and `status_code` must be a final status `200–599` or `101` (synthetic WebSocket handshake only). Other informational statuses (`100`, `102`–`199`) are rejected — a mock cannot emit a 1xx as a body-bearing final response. `delay_ms` is an unsigned integer `0`–`3600000` (1 hour); omit or `null` selects `0`. A configured `101` that matches an ordinary HTTP request fails closed with `500`; only a request already classified as a WebSocket handshake may receive it. Runtime construction and request-flavor enforcement are the authoritative final boundaries.
 
 **Status / body wire semantics (H1, H2, and H3):** A configured `body` is the representation the mock would return for a GET. Shared synthetic-response finalization then aligns every frontend:
 
@@ -4451,7 +4544,7 @@ config:
       headers:
         content-type: application/json
       body: '{"users": []}'
-      delay_ms: 50                       # optional simulated latency (ms)
+      delay_ms: 50                       # optional; omit/null = 0, max 3600000 ms
     - path: "~/users/[0-9]+"             # regex path (~ prefix, auto-anchored)
       status_code: 200                   # matches /api/v1/users/42
       body: '{"id": 1, "name": "Mock User"}'
@@ -4480,17 +4573,17 @@ Exposes API specification documents (OpenAPI, Swagger, WSDL, WADL) on a canonica
 
 Useful for providing a common, discoverable pattern for API specifications across enterprise-wide APIs.
 
-**Priority:** 210 | **Phase:** `on_request_received` | **Protocols:** HTTP only
+**Priority:** 210 | **Phase:** `on_request_received`, reject-path `after_proxy` (HEAD body suppression) | **Protocols:** HTTP only
 
 **Only works with prefix-based `listen_path` proxies.** Regex (`~`) and exact (`=`) listen paths are skipped — the plugin continues without intercepting. Host-only or port-only routing is not supported. A trailing separator is normalized when composing the resource: both `/api` and `/api/` expose `/api/specz`. The double-slash alias `/api//specz`, encoded separators, and extra path segments are deliberately not intercepted. Query strings do not change the canonical match.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `spec_url` | String | _(required)_ | Full URL to fetch the API specification document (e.g., `https://internal-service/docs/openapi.yaml`). Must use `http` or `https`; URL userinfo is rejected. Paths and queries may route or authorize the origin request, but diagnostics include only the credential-free origin. |
-| `content_type` | String or null | _(upstream)_ | Trusted response `Content-Type` override, not restricted by the upstream allow-list. When omitted or null, only the supported spec media types listed below are preserved; other or missing upstream values fall back to `application/octet-stream`. |
+| `spec_url` | String | _(required)_ | Full URL to fetch the API specification document (e.g., `https://internal-service/docs/openapi.yaml`). Must use `http` or `https` with a nonempty hostname or IP; surrounding whitespace is trimmed. URL userinfo is rejected. Paths and queries may route or authorize the origin request, but diagnostics include only the credential-free origin. Remaining URL parse details are runtime-only. |
+| `content_type` | String or null | _(upstream)_ | Trusted response `Content-Type` override, not restricted by the upstream allow-list. When set it must be nonempty after trim and a valid HTTP header value. When omitted or null, only the supported spec media types listed below are preserved; other or missing upstream values fall back to `application/octet-stream`. |
 | `tls_no_verify` | bool or null | `FERRUM_TLS_NO_VERIFY` | Skip TLS certificate verification when fetching the spec. Omitted or null uses the gateway's global setting. When verification is enabled and a custom gateway CA bundle is configured, failure to load or parse it rejects the plugin generation rather than widening trust to public roots. |
-| `cache_ttl_seconds` | u64 or null | `300` | TTL for the in-process positive spec cache. Omitted or null uses 300 seconds. `0` disables durable positive caching, but callers admitted before an in-flight fetch completes still share that fetch regardless of scheduling delay. Failed fetches are negatively cached with bounded exponential backoff for every TTL setting. |
-| `max_response_body_bytes` | u64 or null | `26214400` | Maximum upstream spec response body size to buffer and cache. Omitted or null uses 25 MiB. The body is streamed with this cap, so oversized responses are rejected before they can grow memory without bound. |
+| `cache_ttl_seconds` | u64 or null | `300` | TTL for the in-process positive spec cache. Omitted or null uses 300 seconds. Must fit in unsigned 64-bit. `0` disables durable positive caching, but callers admitted before an in-flight fetch completes still share that fetch regardless of scheduling delay. Failed fetches are negatively cached with bounded exponential backoff for every TTL setting. |
+| `max_response_body_bytes` | u64 or null | `26214400` | Maximum upstream spec response body size to buffer, decode, and cache. Omitted or null uses 25 MiB. Must be greater than zero. The coded origin body is streamed with this cap, then decoded to identity under the same bound, so oversized responses are rejected before they can grow memory without bound. |
 
 ```yaml
 # Example: Expose an OpenAPI spec for an API behind /my/api/v1
@@ -4516,9 +4609,9 @@ config:
 
 **Content-Type handling:** Without an explicit override, the media type (case-insensitive, before any `;` parameters) must be one of `application/json`, `application/openapi+json`, `application/openapi+yaml`, `application/vnd.oai.openapi`, `application/vnd.oai.openapi+json`, `application/yaml`, `application/x-yaml`, `application/wsdl+xml`, `application/vnd.sun.wadl+xml`, `application/xml`, `text/yaml`, `text/xml`, or `text/plain`. Matching values are preserved verbatim, including parameters; all other or missing values become `application/octet-stream`. An explicit `content_type` is operator-trusted and bypasses this upstream allow-list. Every successful response includes `X-Content-Type-Options: nosniff`.
 
-**Error handling and admission:** If the upstream spec URL is unreachable, oversized, unreadable, or returns a non-2xx status, the plugin returns a `502` JSON error with `Retry-After`. One outbound fetch is active per plugin instance, failed completions are negatively cached with exponential backoff from 1 to 30 seconds, and cached failures report the whole seconds remaining in that window. At most 32 cache-miss callers (including the fetcher) are admitted. Excess callers receive `503` with `Retry-After` immediately rather than accumulating behind the fetch. The `spec_url` hostname is pre-warmed via DNS; logs include only its credential-free origin, never the configured path, query, fragment, or URL userinfo.
+**Error handling and admission:** If the upstream spec URL is unreachable, oversized, unreadable, returns a non-2xx status, or uses an unsupported/malformed `Content-Encoding`, the plugin returns a `502` JSON error with `Retry-After`. One outbound fetch is active per plugin instance, failed completions are negatively cached with exponential backoff from 1 to 30 seconds, and cached failures report the whole seconds remaining in that window. At most 32 cache-miss callers (including the fetcher) are admitted. Excess callers receive `503` with `Retry-After` immediately rather than accumulating behind the fetch. The `spec_url` hostname is pre-warmed via DNS; logs include only its credential-free origin, never the configured path, query, fragment, or URL userinfo.
 
-**Caching:** Successful fetches are cached in-process with `cache_ttl_seconds` (default 5 min) and capped by `max_response_body_bytes` (default 25 MiB). This protects the upstream document store from request floods on `/specz` and removes the per-request fetch cost from the hot path. The cache is per-plugin-instance and lives in the gateway's address space — restarting or reloading the plugin clears it. There is no manual invalidation; if you need to push a new spec, either wait for the TTL to expire or reload the gateway. With a zero TTL, there is no durable positive cache: callers admitted before a fetch completes share that completion by generation, while a later request immediately starts a new fetch.
+**Caching:** Successful fetches are decoded to identity (supported origin codings: `gzip` / `x-gzip`, `br`, `identity`) then cached in-process with `cache_ttl_seconds` (default 5 min) and capped by `max_response_body_bytes` (default 25 MiB) on both the coded wire body and the decoded document. `/specz` never forwards origin `Content-Encoding`. This protects the upstream document store from request floods on `/specz` and removes the per-request fetch cost from the hot path. The cache is per-plugin-instance and lives in the gateway's address space — restarting or reloading the plugin clears it. There is no manual invalidation; if you need to push a new spec, either wait for the TTL to expire or reload the gateway. With a zero TTL, there is no durable positive cache: callers admitted before a fetch completes share that completion by generation, while a later request immediately starts a new fetch.
 
 **Interaction with other plugins:** The plugin runs at priority 210 — after CORS (100), IP restriction (150), and bot detection (200), but before all authentication plugins (950+). This means blocked IPs and bots cannot access `/specz`, CORS preflight responses work correctly for browser-based spec consumers, and all authentication and authorization plugins are skipped for `/specz` requests.
 
@@ -4772,12 +4865,12 @@ On-the-fly response compression and request decompression. Negotiates the best a
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `algorithms` | String[] | `["gzip", "br"]` | Enabled algorithms in server preference order (used to break q-value ties). Accepts `"gzip"`, `"br"`, or `"brotli"` (alias for `"br"`). Unknown values, non-string entries, or non-array configs are rejected at plugin load — typos surface immediately rather than producing a partially-functional plugin. An empty array is also rejected |
-| `min_content_length` | u64 | `256` | Skip compression for bodies smaller than this (bytes). Only enforced when Content-Length is known at `after_proxy` time — chunked / streamed bodies that bypass the size gate are still compressed once `Content-Encoding` is committed (returning uncompressed bytes with a compressed-encoding header would be malformed) |
-| `content_types` | String[] | 10 defaults | Content-type whitelist (see below) |
-| `remove_accept_encoding` | bool | `true` | Strip `Accept-Encoding` from the backend request so the backend sends uncompressed |
-| `gzip_level` | u64 | `6` | Gzip compression level (0=no compression, emits gzip framing only; 1=fastest, 9=best) |
-| `brotli_quality` | u64 | `4` | Brotli quality (0=fastest, 11=best) |
+| `algorithms` | String[] or null | `["gzip", "br"]` | Enabled algorithms in server preference order (used to break q-value ties). Accepts `"gzip"`, `"br"`, or `"brotli"` (alias for `"br"`). Unknown values, non-string entries, or non-array configs are rejected at plugin load — typos surface immediately rather than producing a partially-functional plugin. An empty array is also rejected, as is an array left with no usable codec after the process-wide gates. Explicit `null` selects the default |
+| `min_content_length` | u64 or null | `256` | Skip compression for bodies smaller than this (bytes). Must be an unsigned 64-bit integer that also fits `usize`. Only enforced when Content-Length is known at `after_proxy` time — chunked / streamed bodies that bypass the size gate are still compressed once `Content-Encoding` is committed (returning uncompressed bytes with a compressed-encoding header would be malformed). A known Content-Length below this value also keeps the response off the compression buffered path entirely, so it streams. Explicit `null` selects the default |
+| `content_types` | String[] | 10 defaults | Content-type whitelist (see below). Every entry must be a bare ASCII `type/subtype` media type: an empty array, an empty entry, a non-ASCII entry, a whitespace-bearing entry, and a parameter-bearing entry (`application/json; charset=utf-8`) are all rejected at construction with an indexed diagnostic, because the matcher compares against the response's trimmed, parameter-stripped token and could never equal such a rule. Unlike the other optional fields, explicit `null` is rejected — omit the key for the defaults |
+| `remove_accept_encoding` | bool or null | `true` | Strip `Accept-Encoding` from the backend request so the backend sends uncompressed. Explicit `null` selects the default |
+| `gzip_level` | u64 or null | `6` | Gzip compression level (0=no compression, emits gzip framing only; 1=fastest, 9=best). Values above 9 are rejected; explicit `null` selects the default |
+| `brotli_quality` | u64 or null | `4` | Brotli quality (0=fastest, 11=best). Values above 11 are rejected; explicit `null` selects the default |
 
 The process-wide `FERRUM_COMPRESSION_GZIP_ENABLED` and `FERRUM_COMPRESSION_BROTLI_ENABLED` settings default to `true` and intersect with every instance's `algorithms` list. A codec disabled globally cannot be re-enabled by file, database, Admin API, or CP/DP plugin configuration. The same gate also disables that codec for opt-in request decompression. After those gates are applied, an instance with no remaining usable algorithm fails admission (it is not left live while still stripping `Accept-Encoding`). This gives operators a node-wide emergency/performance switch while preserving per-proxy policy.
 
@@ -4785,16 +4878,20 @@ The process-wide `FERRUM_COMPRESSION_GZIP_ENABLED` and `FERRUM_COMPRESSION_BROTL
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `decompress_request` | bool | `false` | Enable decompression of gzip/brotli request bodies |
-| `max_decompressed_request_size` | u64 | `10485760` | Zip bomb protection: max decompressed size in bytes (10 MB). Hard-capped at 32 MiB (`33554432`); when request decompression is enabled, it must also be ≤ `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` if that wire limit is set. Per-layer and cumulative decode work share this ceiling, and raw-to-decoded amplification above 1024:1 fails closed |
+| `decompress_request` | bool or null | `false` | Enable decompression of gzip/brotli request bodies. Explicit `null` selects the default |
+| `max_decompressed_request_size` | u64 or null | `10485760` | Zip bomb protection: max decompressed size in bytes (10 MB). Must be greater than zero and hard-capped at 32 MiB (`33554432`); when request decompression is enabled, it must also be ≤ `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` if that wire limit is set. Per-layer and cumulative decode work share this ceiling, and raw-to-decoded amplification above 1024:1 fails closed. Explicit `null` selects the default |
 
-When `decompress_request` is enabled, `Content-Encoding` is parsed as an ordered `#content-coding` list (RFC 9110 §8.4) with OWS trimming. Supported chains (`gzip` / `x-gzip`, `br`) decode in reverse application order under the shared content-coding decoder; `identity`-only lists strip the header without rewriting bytes. Malformed members, parameters, unsupported codings, mixed `identity`, trailing/concatenated members, and limit/amplification overruns fail closed with `400`. Codec worker saturation fails closed with `503`.
+When `decompress_request` is enabled, `Content-Encoding` is parsed as an ordered `#content-coding` list (RFC 9110 §8.4) with OWS trimming. Supported chains (`gzip` / `x-gzip`, `br`) decode in reverse application order under the shared **strict, budget-charged** content-coding decoder; `identity`-only lists strip the header without rewriting bytes. Malformed members, parameters, unsupported codings, mixed `identity`, trailing/concatenated members, and limit/amplification overruns fail closed with `400`. Codec worker saturation fails closed with `503`.
+
+That decoder is the same one the request/response representation gates use, for the same reason: an upload's coding is chosen by the client, so the decode's own memory must be bounded before it is allocated. `br` is decoded with Large Window Brotli refused (RFC 7932 caps the `br` window at 24 bits, and a peer that named `br` negotiated nothing larger), which is what makes the decoder heap ceiling a provable bound rather than a guess. The complete working set — the active decoder's heap reserved *before the decoder is constructed*, every growth of the output buffer reserved before it is allocated, and on a stacked list the previous pass's still-resident buffer charged concurrently with the next pass's output — is reserved against the process-wide `FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES` budget. A budget refusal is the gateway's own transient capacity terminal (`503` with the fixed request-inspection-capacity body), never a `400`, and the encoded body is never forwarded. The charge is released when the decode returns; the surviving plaintext stays bounded per request by `max_decompressed_request_size` and the effective wire body limit. A `max_decompressed_request_size` larger than the aggregate budget can therefore be refused for capacity under load — the aggregate cap is deliberately not widened to fit one large decode.
+
+Normalization happens **exactly once per request on every frontend**. `compression` declares `needs_final_request_body_context`, so the H1/H2 dispatch ladder hands its request-body transform the same ownership context native HTTP/3 always passed; the context-free compatibility transform is inert. Without that, a chain whose only body plugin is `compression` fell back to the context-free hook, which could not see the decode owner or the "already normalized" marker and decoded the normalized body a second time — uploading a gzip **file** under `Content-Encoding: gzip` delivered the file's contents to the backend instead of the file.
 
 Gzip and Brotli codec CPU (request decode and response encode) runs on a bounded `spawn_blocking` pool (32 concurrent jobs process-wide). Response compression reserves a **separate** 32-slot response-buffer permit in `before_proxy`, ahead of the response-buffer decision: a request that negotiates a supported coding but cannot obtain a buffer slot streams identity (or `406` when identity is unacceptable) instead of pinning a body onto the compression-only buffered path. The codec permit is acquired only immediately before `spawn_blocking`, so slow backend requests holding buffer slots cannot starve request decompression or active codec work. Compression also requires `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` to be non-zero and no greater than the fixed 32 MiB compression safety ceiling; an unlimited or larger gateway response limit streams identity (or returns `406` when identity is unacceptable), ensuring every compression-induced full-body collection has an absolute per-response bound. The response-buffer permit stays with the request for as long as the collected body remains a compression-pipeline resident: on hard-skip (no-body / already-coded / `HEAD`), terminal `406`, cancellation, or once the encode finishes; when one instance declines to encode an already-admitted body (content-type / size / range / `no-transform` / strong `ETag`) it relinquishes ownership but leaves the slot on the context so a later sibling can take it without a gap. Authenticated `/metrics` exports `ferrum_compression_codec_{admitted,saturated,join_failures,worker_failures}_total` plus `ferrum_compression_response_buffer_{admitted,saturated}_total`. If encoding fails after `Content-Encoding` was committed (worker error, admission saturation, or join failure), shared H1/H2/H3 buffered transform loops atomically restore an identity response with matching headers/length when identity remains acceptable, or replace it with `406` when the client explicitly excluded identity; plaintext is never emitted under a coded header or against `identity;q=0`. Rare buffered request-decode fallback paths that strip encoding headers without a mutable body view stage the validated plaintext onto the request context so the later transform emits those bytes without a second codec admission.
 
 **Default content types:** `application/json`, `application/javascript`, `application/xml`, `application/xhtml+xml`, `text/html`, `text/plain`, `text/css`, `text/xml`, `text/javascript`, `image/svg+xml`
 
-**Content-type matching:** The whitelist is matched as an exact media-type token: the response `Content-Type` is split on the first semicolon, the token is trimmed, and compared ASCII case-insensitively against each configured entry. Parameters (e.g. `; charset=utf-8`) are ignored, so `application/json; charset=utf-8` matches `application/json`. Substring matching is intentionally avoided, so lexical near-misses such as `application/jsonp` or `application/json-patch-binary` do **not** match `application/json`, and parameter-only occurrences such as `application/octet-stream; profile="application/json"` do **not** match `application/json`. An empty or malformed media-type token fails closed (no match).
+**Content-type matching:** Configured entries are admitted only as bare `type/subtype` media types (both halves non-empty RFC 9110 §5.6.2 tokens), so a whitespace-only, whitespace-padded, or parameter-bearing rule is rejected at construction with an indexed diagnostic instead of being accepted and silently unmatchable. The whitelist is then matched as an exact media-type token: the response `Content-Type` is split on the first semicolon, the token is trimmed, and compared ASCII case-insensitively against each configured entry. Parameters (e.g. `; charset=utf-8`) are ignored, so `application/json; charset=utf-8` matches `application/json`. Substring matching is intentionally avoided, so lexical near-misses such as `application/jsonp` or `application/json-patch-binary` do **not** match `application/json`, and parameter-only occurrences such as `application/octet-stream; profile="application/json"` do **not** match `application/json`. An empty or malformed media-type token fails closed (no match).
 
 **Response compression skip conditions** (checked in order):
 1. Response status is `204`, `205`, or `304`, or the request method is `HEAD` (no compressible wire body; HEAD preserves valid backend representation metadata rather than inventing an encoded-empty `Content-Length`)
@@ -4807,14 +4904,14 @@ Gzip and Brotli codec CPU (request decode and response encode) runs on a bounded
 8. Response `Content-Length` is below `min_content_length`
 9. Client did not send `Accept-Encoding` with a supported algorithm, or the `identity` (uncoded) representation is the most preferred acceptable one
 
-**Content negotiation (RFC 9110 §12.5.3):** The gateway compares every representation it can produce — each configured and globally enabled algorithm and the uncoded (`identity`) representation — and serves the most preferred acceptable one. `gzip` and its legacy `x-gzip` token select the same gzip representation; the response always emits the canonical `Content-Encoding: gzip`. Identity is acceptable by default (q=1) unless the client refuses it with `identity;q=0` or with `*;q=0` without a more-specific `identity` entry; a nonzero wildcard (`*;q=0.3`) does **not** lower that default identity quality — the wildcard assigns quality only to unlisted configured algorithms. Explicit algorithm and `identity` entries take precedence over the wildcard, and the `algorithms` server preference order breaks ties (so an algorithm tied with identity still compresses). Quality weights are parsed with the RFC 9110 qvalue grammar; a malformed weighted member is ignored and cannot enable or forbid a representation. When the client refuses identity and no acceptable coded representation is available — including when a configured algorithm would otherwise win but the response cannot be encoded because of content-type / `min_content_length` eligibility, `no-transform`, a strong `ETag`, or because the response is an identity range/delta (`206`/`226`, `Content-Range`, or the internal range marker) — the plugin rejects with `406 Not Acceptable` (`Vary: Accept-Encoding`) and does not commit compression headers or body transforms. Identity range/delta responses are non-transformable (forwarded unchanged when identity is acceptable) rather than protocol hard skips. No-body statuses (`204`/`205`/`304`), `HEAD` requests, and responses that already carry `Content-Encoding` remain protocol hard skips and are left unchanged. On the synthetic reject path, fail-closed 406 replacement is scoped to `response_caching` HITs of identity variants (including legacy identity responses that omit `Vary: Accept-Encoding` per #2355) so a cache hit cannot bypass negotiation; unrelated auth/policy rejection statuses are not replaced.
+**Content negotiation (RFC 9110 §12.5.3):** The gateway compares every representation it can produce — each configured and globally enabled algorithm and the uncoded (`identity`) representation — and serves the most preferred acceptable one. `gzip` and its legacy `x-gzip` token select the same gzip representation; the response always emits the canonical `Content-Encoding: gzip`. Identity is acceptable by default (q=1) unless the client refuses it with `identity;q=0` or with `*;q=0` without a more-specific `identity` entry; a nonzero wildcard (`*;q=0.3`) does **not** lower that default identity quality — the wildcard assigns quality only to unlisted configured algorithms. Explicit algorithm and `identity` entries take precedence over the wildcard, and the `algorithms` server preference order breaks ties (so an algorithm tied with identity still compresses). Quality weights are parsed with the RFC 9110 qvalue grammar; a malformed weighted member is ignored and cannot enable or forbid a representation. When the client refuses identity and no acceptable coded representation is available — including when a configured algorithm would otherwise win but the response cannot be encoded because of content-type / `min_content_length` eligibility, `no-transform`, a strong `ETag`, or because the response is an identity range/delta (`206`/`226`, `Content-Range`, or the internal range marker) — the plugin rejects with `406 Not Acceptable` (`Vary: Accept-Encoding`) and does not commit compression headers or body transforms. That refusal is a decision about the whole configured chain, so it is taken only by the **last** effective instance to decide: an earlier instance whose `algorithms` or `content_types` cannot serve this response continues instead of refusing on a later sibling's behalf, and no instance may turn a coding another instance already committed back into a `406`. Reordering otherwise-equivalent instances therefore cannot change a successful compressed response into a negotiation failure. Identity range/delta responses are non-transformable (forwarded unchanged when identity is acceptable) rather than protocol hard skips. No-body statuses (`204`/`205`/`304`), `HEAD` requests, and responses that already carry `Content-Encoding` remain protocol hard skips and are left unchanged. On the synthetic reject path, fail-closed 406 replacement is scoped to `response_caching` HITs of identity variants (including legacy identity responses that omit `Vary: Accept-Encoding` per #2355) so a cache hit cannot bypass negotiation; unrelated auth/policy rejection statuses are not replaced.
 
 **Behavior:**
 - Strips `Accept-Encoding` from backend requests (configurable) so the backend sends uncompressed responses for the gateway to compress
 - Adds `Vary: Accept-Encoding` to eligible identity/default responses as well as gzip/Brotli responses whenever `Accept-Encoding` can select a different representation, so shared caches (including `response_caching`) do not replay an unvaried identity body for a later client that prefers or requires a coded variant. Existing `Vary` members are preserved and case-insensitively de-duplicated; an existing `Vary: *` is left unchanged. Permanently ineligible statuses/content/transforms (for example `204`/`205`/`304`, `HEAD`, non-whitelisted `Content-Type`, below `min_content_length`, `no-transform`, strong `ETag`, or identity range/delta) do not nominate the field
 - Removes `Content-Length` after compression (the gateway recalculates it from the compressed body)
 - After an actual compression body transform, the shared body-transform lifecycle removes representation-integrity metadata that described the uncompressed origin bytes — `Content-Digest`, `Repr-Digest`, legacy `Digest`, and `Content-MD5` (case-insensitive), along with other content-bound validators such as weak `ETag` / `Last-Modified`. Those fields are preserved when compression is skipped, negotiation declines, the body is ineligible, or the transform returns `None`. Gateway `Content-Encoding` and `Vary: Accept-Encoding` remain. On buffered H1/H2/H3 paths, trailer integrity fields are handled the same way as other stale application trailers after a rewrite: native H3 drops backend trailers once the body is rewritten, and buffered gRPC retires application trailers (including digests) while preserving reserved terminal status metadata
-- Forces response body buffering on proxies where this plugin is enabled
+- Collects the response body only when this instance could actually encode it. The buffering refinement applies the same knowable exclusions `after_proxy` uses — no-body statuses and `HEAD`, range/delta representations, request/response `no-transform`, strong `ETag`, a non-whitelisted `Content-Type`, an already-encoded origin response, and a known `Content-Length` below `min_content_length` — so those responses stream with prompt headers instead of being fully collected for a transform that will decline. The shared refinement still keeps the body whenever another effective plugin needs it, and once the gateway has committed its own `Content-Encoding` these two header-derived exclusions no longer apply (the committed coding must be produced from the collected body)
 - When `decompress_request` is enabled, supported gzip/brotli request coding lists are decoded in the shared pre-`before_proxy` normalization phase (H1/H2 and native H3) so `before_proxy` body consumers inspect validated plaintext (an identity-establishing `soap_ws_security` instance authenticates earlier still, in the `authenticate` phase, and composing the two on one proxy is rejected at admission); the same plaintext is what later request-body hooks and the backend receive, and the forwarded request has `Content-Encoding` and `Content-Length` removed only after successful decode. OWS-tolerant ordered lists decode in reverse application order; malformed/unsupported members fail closed. On the rare buffered fallback that validates without a mutable body view, validated plaintext is staged on the request context before headers are stripped so the later transform cannot forward compressed bytes without encoding metadata
 - `remove_accept_encoding` only mutates the backend request when the instance still has at least one usable response codec after process-wide gates
 - Request `Cache-Control: no-transform` skips gateway response compression but does not disable configured request decompression; client-controlled `no-transform` is not honored as an opt-out from upload normalization or body-inspection hooks
@@ -4823,8 +4920,8 @@ Gzip and Brotli codec CPU (request decode and response encode) runs on a bounded
 
 **Multiple instances:** A proxy may carry several `compression` configs (for example two proxy-scoped instances after a same-named global is shadowed, or distinct `priority_override` values). Request decompression and response compression are not idempotent, so each one-shot coding decision is tied to exactly one effective instance in configured order:
 
-- **Request decode.** The first instance with `decompress_request: true` that recognizes a supported `Content-Encoding` claims request-scoped ownership during pre-`before_proxy` normalization when the body is buffered, strips public `Content-Encoding`/`Content-Length` only after successful decode, replaces the buffered body with plaintext exactly once, and leaves later transforms as a no-op for that request. Sibling instances must not delete the owner's internal saved-encoding marker or strip encoding metadata without owning the decode. Missing owner staging fails closed (no second claim, no speculative strip). On a transport path that cannot provide a rejectable buffered body (notably HBONE CONNECT), compression does not claim ownership or strip representation headers; the encoded body and headers pass through together instead of risking encoded bytes mislabeled as plaintext.
-- **Response encode.** The first instance that commits a gateway `Content-Encoding` owns the single coding layer and is the only instance whose response-body transform may compress. Later instances see the committed encoding as a protocol hard skip and return `None` from the transform. An earlier instance that only nominates identity/`Vary` does not block a later instance from compressing, so differing `algorithms` preferences compose as a configured-order union with at most one coding layer.
+- **Request decode.** The first instance with `decompress_request: true` that recognizes a supported `Content-Encoding` claims request-scoped ownership during pre-`before_proxy` normalization when the body is buffered, strips public `Content-Encoding`/`Content-Length` only after successful decode, replaces the buffered body with plaintext exactly once, and leaves later transforms as a no-op for that request. Because every effective instance declares `needs_final_request_body_context`, sibling transforms observe that ownership on H1/H2 exactly as they do on native HTTP/3 — neither a sibling nor the owner can decode a second time. Sibling instances must not delete the owner's internal saved-encoding marker or strip encoding metadata without owning the decode. That marker (`x-ferrum-original-content-encoding`) is gateway-internal and is removed at every backend request boundary — the H1/H2 builders, the native HTTP/3 backend builder, and the HTTP/3 cross-protocol bridge all apply the same canonical strip inventory, so origin-visible request metadata does not depend on the frontend protocol. Missing owner staging fails closed (no second claim, no speculative strip). On a transport path that cannot provide a rejectable buffered body (notably HBONE CONNECT), compression does not claim ownership or strip representation headers; the encoded body and headers pass through together instead of risking encoded bytes mislabeled as plaintext.
+- **Response encode.** The first instance that commits a gateway `Content-Encoding` owns the single coding layer and is the only instance whose response-body transform may compress. Later instances see the committed encoding as a protocol hard skip and return `None` from the transform. An earlier instance that only nominates identity/`Vary` — or that declines because of its own `algorithms`, `content_types`, or `min_content_length` — does not block a later instance from compressing, so differing preferences compose as a configured-order union with at most one coding layer. The fixed negotiation `406` is deferred to the last instance to decide, so the union is what the client is judged against rather than whichever instance happened to run first.
 - **Reload.** Plugin-cache rebuild/reload remains atomic: an in-flight request sees one plugin generation end-to-end on H1, H2, and native H3 (all share the same sequential transform loops).
 
 ```yaml
@@ -6019,14 +6116,38 @@ See the dedicated
 complete schema, fail-closed behavior, examples, observability contract, and
 documented lifecycle limitations.
 
-**Provider coverage.** Tool definitions and tool calls are read in the OpenAI
-(Chat Completions and Responses), Anthropic Messages, Google Gemini, Cohere v2,
-and Amazon Bedrock Converse shapes, on both the buffered and streaming paths.
+**Provider coverage.** The buffered and streaming paths cover **different**
+provider sets, so read them separately.
+
+| Path | Provider shapes read |
+| --- | --- |
+| Buffered request tool definitions | OpenAI `tools[].function.name` and legacy `functions[].name`, Anthropic `tools[].name`, Google `tools[].functionDeclarations[].name`, Bedrock `toolConfig.tools[].toolSpec.name` |
+| Buffered response tool calls | OpenAI Chat Completions `choices[].message.tool_calls[]` and legacy `function_call`, OpenAI Responses `output[]` `type: "function_call"` items, Anthropic `content[]` `tool_use` blocks, Google `candidates[].content.parts[].functionCall`, Cohere v2 `message.tool_calls[]`, Bedrock Converse `output.message.content[].toolUse` |
+| Streaming SSE tool-call deltas | OpenAI Chat Completions `choices[].delta.tool_calls` and legacy `delta.function_call`, Anthropic `content_block_start` / `input_json_delta`, Cohere v2 `tool-call-start` / `tool-call-delta`, Google `candidates[].content.parts[].functionCall` — **these four only** |
+
+**OpenAI Responses streaming events and Amazon Bedrock streaming are not
+accumulated.** There is no Responses event state machine and no
+`application/vnd.amazon.eventstream` parser in this plugin. A Responses SSE
+frame that carries a tool-call marker is not a silent allow — it is an
+unreadable shape and takes the `unknown_shape_action` posture below. Bedrock's
+binary event stream is never parsed as SSE at all; Bedrock Converse delivered
+as a buffered JSON body is governed normally. See the guide's
+[limitations](plugins/ai_tool_governor.md#limitations-mvp) for the exact
+handling of each.
 
 **Mode semantics.** `mode: enforce` is the only mode that rejects or cuts; it
-fails closed on anything it cannot policy-check. `mode: dry_run` never rejects —
-it evaluates, records `ai_tool_governor.decision=dry_run`, and forwards — so it
-is the safe rollout/observe posture. A payload carrying a tool-call marker the
+fails closed on anything it cannot policy-check. `mode: dry_run` never rejects
+and never calls the approval webhook — it evaluates policy, records what
+enforce *would* have done, and forwards — so it is the safe rollout/observe
+posture. Global dry-run **preserves the would-be policy label** rather than
+relabelling it: an ordinary denied call is recorded as
+`ai_tool_governor.mode=dry_run` with `ai_tool_governor.decision=deny`, and an
+approval-gated call with `decision=require_approval`. `decision=dry_run` is
+reserved for the distinct per-tool `action: dry_run` policy and for the
+dry-run duplicate-key (`uninspectable_reason=ambiguous_json`) observation. Find
+global dry-run findings by querying `mode`, not `decision`.
+
+**Unreadable shapes.** A payload carrying a tool-call marker the
 plugin cannot read is an **extraction failure, not an allow**:
 `unknown_shape_action` (default `deny`) makes enforce fail closed on it, while
 the documented `allow` opt-out forwards it. Both settings record the fixed
@@ -7905,6 +8026,72 @@ config:
 ## Mesh and Alert Plugins
 
 These plugins are registered built-ins even when they are most often generated or auto-injected by mesh mode.
+
+### `mesh_authz`
+
+Applies Istio-style mesh authorization (`MeshPolicy` ALLOW / DENY / AUDIT / CUSTOM) to the SPIFFE identity established by the `spiffe_identity` plugin or carried in the HBONE baggage of an ambient mTLS stream. It runs in the `authorize` phase at priority **2075** (after authentication, after `access_control`, before `opa`) and in `on_stream_connect` for Layer-4 sessions, so it covers every protocol family in the matrix: HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, raw TCP/TLS, and UDP/DTLS. Its failure policy is `FailClosed`.
+
+Mesh mode auto-injects it as the reserved global `__mesh_authz` on every applicable topology, carrying a `mesh_slice`. Operators can also configure it directly on a non-mesh gateway with a flat `mesh_policies` list; that is the form documented here. An operator-managed global of the same type overrides the mesh-injected instance.
+
+**Evaluation order.** DENY rules are evaluated first and the first match wins. `CUSTOM` delegations run before the DENY/ALLOW tiers. If any ALLOW rule is loaded and none matches, the request is denied by the implicit-deny floor (`mesh_authz.deny_policy=implicit-deny`). A configuration with no policies at all evaluates nothing and allows every request — an empty `mesh_policies: []` is a valid scaffold, not a lockdown.
+
+**Configuration.** Unknown top-level keys are rejected at construction, and a non-object, non-null `config` (a string, number, or array) is rejected too — a misspelled `mesh_policies` or a malformed root would otherwise build a policy-free instance whose implicit-deny floor never engages, allowing every request. The eleven accepted keys:
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `mesh_policies` | Array of `MeshPolicy` | `[]` | Operator-facing policy list, used when no slice is available. See [MeshPolicy](mesh.md#meshpolicy) for the document shape and [Rule Matching](mesh.md#rule-matching) for the matcher semantics. A `CUSTOM` rule here always denies: a flat list carries no `extensionProviders` source. |
+| `namespace` | String | `""` | This proxy workload's namespace, used by the construction-time `PolicyScope` filter. Overrides any namespace embedded in `mesh_slice`. Must be a string. |
+| `labels` | Object of string → string | `{}` | This proxy workload's labels, used by the scope filter for `WorkloadSelector`-scoped policies. Overrides any labels embedded in `mesh_slice`, and clears the slice's shared-SPIFFE ambiguity marker — supplying it asserts these are the workload's authoritative labels. |
+| `trust_domain_aliases` | Array of trust-domain strings, or `null` | `[]` | Additional SPIFFE trust domains accepted as equivalent to the peer certificate's own when authorizing HBONE baggage `source.principal`. Empty (the default) means strict same-trust-domain match. Each entry must be a valid trust domain; `null` is treated as absent. |
+| `trusted_hbone_assertors` | Array of strings or objects, or `null` | `["ztunnel", "waypoint"]` | Identity-asserting infrastructure whose HBONE baggage may rewrite the authz principal. Absent or `null` restores the built-in defaults; an explicit `[]` disables baggage rewriting entirely. Matching a peer is necessary but **not** sufficient — see [Trusted HBONE Assertors](mesh.md#trusted-hbone-assertors) for the per-entry grant contract. |
+| `per_pod_policy_scoping` | Boolean | `false` | Skips the construction-time scope filter and resolves policy scope per connection from the pod-scoped cache instead. Auto-set by mesh injection on `NodeWaypoint` topology, where one listener serves many pods. Must be a real boolean; a string or number is rejected rather than read as `false`. |
+| `mesh_slice` | Object | — | **Injection-only.** The embedded mesh slice: the filtered policy set plus the workload identity, ext-authz providers, and destination inventory. Operator-managed instances pass `mesh_policies` instead. |
+| `ambient_udp_source_scoping` | Boolean | `false` | **Injection-only.** Enables node-waypoint ambient UDP source-policy scoping. Same strict boolean admission as `per_pod_policy_scoping`. |
+| `cluster_domain` | String | `cluster.local` | **Injection-only.** Primary Kubernetes cluster domain, used for node-waypoint service-host matching. |
+| `cluster_domains` | Array of strings | `[]` | **Injection-only.** Deduplicated cluster-domain aliases for the same host matching. |
+| `node_waypoint_route_upstreams` | Array of objects | `[]` | **Injection-only.** Mesh-generated route upstream metadata used to precompute destination policy scopes for node-waypoint dispatch. |
+
+The six injection-only keys are populated by mesh mode and are documented here only so an operator reading a live `/plugins` response can identify them; do not hand-author them.
+
+**Direct policy example.** A namespace-scoped policy that denies `/admin` outright and otherwise allows only one service account:
+
+```yaml
+plugins:
+  - name: mesh_authz
+    config:
+      namespace: "default"
+      labels:
+        app: "payments"
+      mesh_policies:
+        - name: "deny-admin"
+          namespace: "default"
+          scope:
+            kind: namespace
+            namespace: "default"
+          rules:
+            - action: deny
+              to:
+                - paths: ["/admin/*"]
+        - name: "allow-checkout"
+          namespace: "default"
+          scope:
+            kind: namespace
+            namespace: "default"
+          rules:
+            - action: allow
+              from:
+                - spiffe_id_pattern: "spiffe://cluster.local/ns/default/sa/checkout"
+```
+
+**Strict configuration admission.** The policy grammar is closed at every level — the policy, each rule, and each `from` / `to` / `when` / `source_negation` matcher reject unknown members — and `action` is **required** on every rule. Every misspelling in this grammar removes a restriction rather than adding one: `not_paths` typed `not_path` would deserialize as an unconstrained rule, and `action` typed `actoin` would fall back to the `Allow` default and turn a DENY into a grant. Both now fail admission with a field-specific diagnostic instead.
+
+**Trusted identity is required.** `mesh_authz` authorizes the identity another plugin established; it does not authenticate. Without the `spiffe_identity` plugin (or an authenticated HBONE peer), `source_principal` is absent, so every `from` matcher fails, every ALLOW rule misses, and a policy set containing any ALLOW rule denies everything. Deploy it behind mesh mTLS, not on a plaintext listener.
+
+**Layer-4 sessions.** A raw TCP/TLS/UDP/DTLS session carries no HTTP request, so HTTP-only fields (`to.operation` methods/paths/hosts/headers, `request_principals`, `when: request.*`) are unsourceable there. Following Istio, a `DENY` or `CUSTOM` rule ignores an unsourceable field and still matches on its remaining constraints, while an `ALLOW` or `AUDIT` rule can never match on it. Scope such rules with `to.ports` when the workload also serves non-HTTP ports. On an HTTP-family request a header the client simply did not send is **absent**, not unsourceable, and fails a positive `to.headers` predicate for every action — see [Rule Matching](mesh.md#rule-matching).
+
+**CUSTOM delegation.** `action: {custom: {provider: <name>}}` delegates the decision to a `meshConfig.extensionProviders` entry carried on the mesh slice. A provider that does not bind, and a generation with no executor at all (which includes every direct `mesh_policies` config), refuse with a fixed `403` that no provider's `failOpen` can admit. See [AuthorizationPolicy `action: CUSTOM`](mesh.md#authorizationpolicy-action-custom-issue-3235) in the mesh guide for the outcome vocabulary, the failure table, and the process-wide in-flight budget.
+
+See [Authorization](mesh.md#authorization), [MeshPolicy](mesh.md#meshpolicy), [Trusted HBONE Assertors](mesh.md#trusted-hbone-assertors), and [plugin execution order](plugin_execution_order.md#why-this-order-matters).
 
 ### `mesh_route_dispatch`
 

@@ -96,6 +96,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -103,7 +104,7 @@ use http::header::{HeaderName, HeaderValue};
 use tokio::sync::Semaphore;
 
 use crate::modes::mesh::config::{
-    MESH_EXT_AUTHZ_DEFAULT_CONCURRENT_CALLS, MESH_EXT_AUTHZ_MAX_RESPONSE_BYTES,
+    MESH_EXT_AUTHZ_MAX_RESPONSE_BYTES, MESH_EXT_AUTHZ_PROCESS_CONCURRENT_CALLS,
     MeshExtAuthzBodyCheck, MeshExtAuthzProvider,
 };
 use crate::plugins::PluginHttpClient;
@@ -524,11 +525,30 @@ pub struct MeshExtAuthzCheckRequest<'a> {
     pub body_proven_empty: bool,
 }
 
+/// The PROCESS-WIDE in-flight CUSTOM check budget.
+///
+/// Deliberately NOT owned by an executor generation. `docs/mesh.md` advertises
+/// this ceiling as process-wide, and it is a resource bound — every permit
+/// holder occupies one socket, one buffered check body, and one task for the
+/// duration of a provider round trip. A per-executor pool made the real
+/// ceiling `(enabled mesh_authz instances + overlapping reload generations) ×
+/// the constant`: N namespaces each opened their own budget, and a reload
+/// published a replacement with a FULL pool while the retiring generation's
+/// in-flight checks were still running on their own.
+///
+/// Sharing the pool also makes reload accounting exact for free: a check that
+/// started on the previous generation keeps its permit until it finishes,
+/// because the permit follows the REQUEST, not the config version.
+static MESH_EXT_AUTHZ_PERMITS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MESH_EXT_AUTHZ_PROCESS_CONCURRENT_CALLS)));
+
 /// Executes CUSTOM authorization checks for one plugin generation.
 ///
-/// Built once per accepted mesh slice. Providers, clients, and the concurrency
-/// permit pool are owned here, so retiring a generation drops them — there is
-/// no background task and no detached queue to leak.
+/// Built once per accepted mesh slice. Providers and clients are owned here, so
+/// retiring a generation drops them — there is no background task and no
+/// detached queue to leak. The concurrency permit pool is the deliberate
+/// exception: it is the process-wide [`MESH_EXT_AUTHZ_PERMITS`] every executor
+/// shares.
 pub struct MeshExtAuthzExecutor {
     http_client: PluginHttpClient,
     providers: HashMap<String, PreparedProvider>,
@@ -554,8 +574,20 @@ impl MeshExtAuthzExecutor {
         Ok(Self {
             http_client,
             providers: prepared,
-            permits: Arc::new(Semaphore::new(MESH_EXT_AUTHZ_DEFAULT_CONCURRENT_CALLS)),
+            permits: Arc::clone(&MESH_EXT_AUTHZ_PERMITS),
         })
+    }
+
+    /// The process-wide in-flight check budget this executor draws from.
+    ///
+    /// Every executor — every enabled `mesh_authz` instance and every reload
+    /// generation — returns the SAME `Arc`. Exposed so tests can prove that
+    /// aggregate contract, and observe the ceiling, without opening the whole
+    /// budget's worth of live provider connections. Production code touches
+    /// the pool only inside [`Self::check`].
+    #[allow(dead_code)] // external integration-test seam; unused in the binary target
+    pub fn check_budget(&self) -> &Arc<Semaphore> {
+        &self.permits
     }
 
     /// Whether any provider in this generation asks for the request body.

@@ -21591,8 +21591,365 @@ components:
       additionalProperties: false
       properties: {}
 
-    MeshAuthzConfig:
+    MeshAuthzPolicy:
       type: object
+      description: |
+        One `MeshPolicy` document, as accepted by the `mesh_authz` plugin's
+        `mesh_policies` list and by the native/file mesh document. Mirrors
+        Istio `AuthorizationPolicy`.
+
+        The grammar is CLOSED at every level below: an unrecognized member is
+        rejected at admission rather than dropped, because every misspelling in
+        an authorization grammar removes a restriction. See `docs/mesh.md` →
+        "MeshPolicy" and "Rule Matching".
+      required: [name, namespace, scope]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          description: Policy name, used in deny diagnostics and metadata.
+        namespace:
+          type: string
+          description: |
+            The namespace that declared this policy. Load-bearing beyond
+            identification: a bare `source.serviceAccount` value in a `when`
+            condition is resolved against it.
+        scope:
+          $ref: "#/components/schemas/MeshAuthzPolicyScope"
+        rules:
+          type: array
+          default: []
+          description: |
+            Rules are additive. DENY rules are evaluated first and the first
+            match wins; if any ALLOW rule is loaded and none matches, the
+            implicit-deny floor refuses the request. An explicitly empty list
+            is a valid scaffold that matches nothing.
+          items:
+            $ref: "#/components/schemas/MeshAuthzRule"
+    MeshAuthzPolicyScope:
+      type: object
+      description: |
+        Which workloads this policy applies to, discriminated by `kind`.
+        Resolved by the shared `policy_scope_applies_to_workload` predicate at
+        plugin construction — except in node-waypoint topology, where one
+        listener serves many pods and the filter runs per request against the
+        pod-scoped cache.
+
+        Unlike the rest of the grammar this object does not reject unknown
+        members: the runtime deserializes it as an internally tagged enum whose
+        variant fields are all required, so an unrecognized sibling key cannot
+        remove a constraint. The nested `selector` IS closed.
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [mesh_wide, namespace, workload_selector, target_refs]
+      oneOf:
+        - title: mesh_wide
+          properties:
+            kind:
+              const: mesh_wide
+        - title: namespace
+          required: [kind, namespace]
+          properties:
+            kind:
+              const: namespace
+            namespace:
+              type: string
+              description: Applies to workloads in exactly this namespace.
+        - title: workload_selector
+          required: [kind, selector]
+          properties:
+            kind:
+              const: workload_selector
+            selector:
+              type: object
+              additionalProperties: false
+              description: |
+                Label/namespace selector. An empty selector matches EVERY
+                workload, which is why unknown members are rejected here: a
+                misspelled `labels` key would widen a targeted policy onto the
+                whole mesh instead of failing admission.
+              properties:
+                labels:
+                  type: object
+                  additionalProperties:
+                    type: string
+                namespace:
+                  type: [string, "null"]
+        - title: target_refs
+          required: [kind, attachments]
+          properties:
+            kind:
+              const: target_refs
+            attachments:
+              type: array
+              maxItems: 16
+              description: |
+                Istio `spec.targetRefs` attachments. A policy matches when ANY
+                attachment applies (OR), and retention alone proves nothing —
+                every runtime consumer re-checks the exact attachment against
+                its own authoritative evidence. Waypoint-only.
+              items:
+                type: object
+                required: [kind]
+                properties:
+                  kind:
+                    type: string
+                    enum: [service, gateway, gateway_class]
+                  namespace:
+                    type: string
+                    maxLength: 253
+                  name:
+                    type: string
+                    maxLength: 253
+    MeshAuthzRule:
+      type: object
+      description: |
+        One authorization rule. Every populated dimension must match (a
+        conjunction); within a dimension the entries are ORed.
+      required: [action]
+      additionalProperties: false
+      properties:
+        action:
+          $ref: "#/components/schemas/MeshAuthzAction"
+        from:
+          type: array
+          description: ORed source-identity matchers.
+          items:
+            $ref: "#/components/schemas/MeshAuthzPrincipalMatch"
+        to:
+          type: array
+          description: ORed request matchers.
+          items:
+            $ref: "#/components/schemas/MeshAuthzRequestMatch"
+        when:
+          type: array
+          maxItems: 64
+          description: Conjunctive attribute conditions.
+          items:
+            $ref: "#/components/schemas/MeshAuthzConditionMatch"
+        request_principals:
+          type: array
+          items:
+            type: string
+          description: |
+            Glob patterns over the JWT-derived `{issuer}/{subject}` request
+            principal. HTTP-only: on a Layer-4 session a DENY/`custom` rule
+            ignores it and an ALLOW/AUDIT rule can never match on it.
+        not_request_principals:
+          type: array
+          items:
+            type: string
+          description: |
+            Conjunctive negative match over the request principal. An absent
+            principal SATISFIES it, which is how `["*"]` catches anonymous
+            HTTP traffic.
+        source_negation:
+          $ref: "#/components/schemas/MeshAuthzSourceNegation"
+        never_matches:
+          type: boolean
+          default: false
+          description: |
+            Synthetic marker for a rule that must affect policy accounting but
+            never match traffic — Istio's ALLOW-without-rules "allow nothing".
+            Set by translation; hand-authoring it is not useful.
+    MeshAuthzAction:
+      description: |
+        Istio `spec.action`, required on every rule. There is deliberately NO
+        default: a rule whose action failed to deserialize used to fall back to
+        `allow`, turning an operator's DENY into a grant with no diagnostic.
+
+        `custom` delegates to a `meshConfig.extensionProviders` entry carried on
+        the mesh slice. A provider name that does not bind — and every `custom`
+        rule in a flat `mesh_policies` config, which has no provider source at
+        all — refuses with a fixed `403` that no provider's `failOpen` admits.
+      oneOf:
+        - type: string
+          enum: [allow, deny, audit]
+        - type: object
+          required: [custom]
+          additionalProperties: false
+          properties:
+            custom:
+              type: object
+              required: [provider]
+              additionalProperties: false
+              properties:
+                provider:
+                  type: string
+                  minLength: 1
+                  maxLength: 253
+    MeshAuthzPrincipalMatch:
+      type: object
+      description: |
+        One source identity matcher. Every populated field must match. A source
+        with no verified peer identity never matches.
+      additionalProperties: false
+      properties:
+        spiffe_id_pattern:
+          type: [string, "null"]
+          description: |
+            Glob over the Istio source principal
+            (`<trust-domain>/ns/<ns>/sa/<sa>`); a full `spiffe://…` pattern is
+            also accepted in direct config.
+        namespace_pattern:
+          type: [string, "null"]
+          description: Glob over the source workload namespace.
+        trust_domain:
+          type: [string, "null"]
+          minLength: 1
+          maxLength: 240
+          pattern: "^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$"
+          description: Exact source trust domain.
+        trust_domain_pattern:
+          type: [string, "null"]
+          description: Glob over the source trust domain.
+    MeshAuthzRequestMatch:
+      type: object
+      description: |
+        One request matcher (Istio `to[].operation`). Positive and negative
+        fields in the SAME matcher are conjunctive — never split a negative
+        field into a separate rule.
+
+        ALLOW/AUDIT rules fail closed when the attribute is absent. DENY and
+        `custom` rules treat an UNSOURCEABLE attribute as a match (Istio's
+        non-HTTP-port model), but an HTTP-family request whose header map was
+        parsed and simply lacks the named header is ABSENT, not unsourceable,
+        and fails a positive `headers` predicate for every action.
+      additionalProperties: false
+      properties:
+        methods:
+          type: array
+          items:
+            type: string
+        not_methods:
+          type: array
+          items:
+            type: string
+        paths:
+          type: array
+          items:
+            type: string
+          description: Glob patterns, matched against the canonical policy path.
+        not_paths:
+          type: array
+          items:
+            type: string
+        hosts:
+          type: array
+          items:
+            type: string
+          description: |
+            Glob patterns over the normalized literal request authority. These
+            do NOT expand service aliases.
+        not_hosts:
+          type: array
+          items:
+            type: string
+        ports:
+          type: array
+          items:
+            type: integer
+            format: uint16
+            minimum: 0
+            maximum: 65535
+        not_ports:
+          type: array
+          items:
+            type: integer
+            format: uint16
+            minimum: 0
+            maximum: 65535
+        port_patterns:
+          type: array
+          items:
+            type: string
+          description: Istio string-match ports such as `"*"` or `"8*"`.
+        not_port_patterns:
+          type: array
+          items:
+            type: string
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Header name (case-insensitive, lowercased at config load) to glob
+            value pattern.
+    MeshAuthzConditionMatch:
+      type: object
+      description: |
+        One Istio `when[]` condition. At least one of `values` / `not_values`
+        must be non-empty; a condition with neither never matches and is
+        rejected at admission. Keys outside the documented Istio set are
+        rejected with a field-specific diagnostic so a DENY condition on an
+        unmodelled attribute cannot silently fail open. See `docs/mesh.md` →
+        "Condition keys" for the key set and the per-key value grammars.
+      required: [key]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+          minLength: 1
+          maxLength: 256
+        values:
+          type: array
+          maxItems: 256
+          items:
+            type: string
+            maxLength: 512
+        not_values:
+          type: array
+          maxItems: 256
+          items:
+            type: string
+            maxLength: 512
+    MeshAuthzSourceNegation:
+      type: object
+      description: |
+        Conjunctive negative-identity and IP-block matchers for one Istio
+        `from[].source`. These AND with the ORed positive `from` list; placing
+        them in `from` would let traffic through whenever a single negative-only
+        entry matched.
+
+        Negative identity matchers succeed when the identity is ABSENT, which is
+        how `not_spiffe_id_patterns: ["*"]` catches anonymous traffic. IP-block
+        matchers fail CLOSED when the IP they test is absent.
+      additionalProperties: false
+      properties:
+        not_spiffe_id_patterns:
+          type: array
+          items:
+            type: string
+        not_namespace_patterns:
+          type: array
+          items:
+            type: string
+        not_trust_domain_patterns:
+          type: array
+          items:
+            type: string
+        ip_blocks:
+          type: array
+          items:
+            type: string
+          description: CIDR or bare IP (host route); matched against `source.ip`.
+        not_ip_blocks:
+          type: array
+          items:
+            type: string
+        remote_ip_blocks:
+          type: array
+          items:
+            type: string
+          description: CIDR or bare IP; matched against XFF-derived `remote.ip`.
+        not_remote_ip_blocks:
+          type: array
+          items:
+            type: string
+    MeshAuthzConfig:
+      type: [object, "null"]
       description: |
         Plugin: mesh_authz — Layer 2 mesh authorization evaluator. Applies
         Istio-style `MeshPolicy` (ALLOW / DENY / AUDIT) rules to the SPIFFE
@@ -21676,6 +22033,13 @@ components:
         exact destination Service and waypoint Gateway/GatewayClass identity — construction-time
         retention is OR over the attachment list and never widens a targeted
         policy onto another destination. See `docs/mesh.md`.
+
+        Root-shape admission: an object, or `null` (how an omitted `config:`
+        block deserializes for every plugin, meaning "no configuration
+        supplied"). A scalar or array root is REJECTED at construction rather
+        than degraded into a default instance — a policy-free `mesh_authz`
+        never raises the implicit-deny floor and therefore allows every
+        request. Unknown root keys are rejected for the same reason.
       additionalProperties: false
       properties:
         mesh_slice:
@@ -21683,17 +22047,34 @@ components:
           description: |
             Embedded mesh slice — supplied by mesh-mode auto-injection.
             Carries the filtered policy set plus the workload's
-            `namespace`/`labels` used for slice-level scope filtering. Not
-            intended for direct operator configuration; operator-managed
+            `namespace`/`labels` used for slice-level scope filtering, the
+            admitted `ext_authz_providers` set, and the destination inventory.
+            Not intended for direct operator configuration; operator-managed
             instances pass `mesh_policies` instead.
+
+            Deliberately left unmodelled here. The slice is a machine-authored
+            document produced by the same Ferrum build that consumes it, its
+            shape tracks every mesh resource family, and a partial schema for
+            it would drift into rejecting valid injected configuration. It is
+            admitted by the runtime deserializer instead, which fails the whole
+            plugin generation on a malformed slice so the previous valid
+            generation keeps serving. Its `mesh_policies` member follows the
+            same closed policy grammar modelled below.
         mesh_policies:
           type: array
-          items:
-            type: object
-            description: A single `MeshPolicy` document. See `docs/mesh.md`.
           description: |
-            Standalone-mode policy list. Used by direct configuration / tests
-            when no slice is available.
+            Standalone-mode policy list. Used by direct configuration when no
+            slice is available. Rules with `action: custom` in this form always
+            DENY: a flat list carries no `extensionProviders` source, and a
+            delegation that cannot be executed is never allowed to fall through
+            to the ALLOW/DENY tiers.
+
+            The grammar is CLOSED at every level and `action` is REQUIRED on
+            every rule: each misspelling here removes a restriction the
+            operator wrote, so an unrecognized member fails admission rather
+            than silently widening the effective policy.
+          items:
+            $ref: "#/components/schemas/MeshAuthzPolicy"
         namespace:
           type: string
           description: |
@@ -21709,14 +22090,20 @@ components:
             `WorkloadSelector`-scoped policies. Overrides any labels embedded
             in `mesh_slice`.
         trust_domain_aliases:
-          type: array
+          type: [array, "null"]
           items:
             type: string
+            minLength: 1
+            maxLength: 240
+            pattern: "^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$"
           description: |
             Additional SPIFFE trust domains accepted as equivalent to the
             peer cert's trust domain when authorising HBONE baggage
             `source.principal`. Empty (default) means strict same-trust-domain
-            match.
+            match. `null` is accepted and treated as absent. Each entry must be
+            a valid SPIFFE trust domain: lowercase, at most 240 bytes, letters
+            / digits / `.` / `-` / `_` only, no `/`, and never starting or
+            ending with `.`, `-`, or `_`.
         per_pod_policy_scoping:
           type: boolean
           default: false
@@ -21785,6 +22172,8 @@ components:
                     port:
                       type: integer
                       format: uint16
+                      minimum: 0
+                      maximum: 65535
                     service_namespace:
                       type: [string, "null"]
                     service_name:
@@ -21792,31 +22181,37 @@ components:
                     service_port:
                       type: [integer, "null"]
                       format: uint16
+                      minimum: 0
+                      maximum: 65535
         trusted_hbone_assertors:
-          type: array
+          type: [array, "null"]
           items:
             oneOf:
               - type: string
+                minLength: 1
               - type: object
                 required: [assertor]
                 properties:
                   assertor:
                     type: string
+                    minLength: 1
                     description: |
                       Bare service-account name or full `spiffe://` SPIFFE ID
-                      identifying the peer this entry admits.
+                      identifying the peer this entry admits. Surrounding
+                      whitespace is trimmed before matching.
                   asserts:
-                    type: array
+                    type: [array, "null"]
                     items:
                       type: string
+                      minLength: 1
                     description: |
                       Exact SPIFFE IDs this assertor may assert and nothing
                       else — the inventory of workloads it actually fronts. An
-                      empty array authorizes nothing. Mutually exclusive with
-                      `scope`.
+                      empty array authorizes nothing. `null` is treated as
+                      absent. Mutually exclusive with `scope`.
                   scope:
-                    type: string
-                    enum: [same_namespace, mesh_wide]
+                    type: [string, "null"]
+                    pattern: "^[ \t]*(same_namespace|mesh_wide)[ \t]*$"
                     description: |
                       Explicit grant contract. `same_namespace` (the default
                       for every entry) permits only identities in the
@@ -21824,8 +22219,32 @@ components:
                       `assertor` to be a full, exactly matched `spiffe://` ID,
                       permits any identity that clears the trust-domain gate,
                       and logs a warning at construction. Mutually exclusive
-                      with `asserts`.
+                      with `asserts`. `null` is treated as absent. Surrounding
+                      spaces and tabs are trimmed before the value is compared,
+                      matching the `assertor` field's normalization; the
+                      pattern rather than an `enum` is what expresses that.
                 additionalProperties: false
+                allOf:
+                  # `asserts` and `scope` are mutually exclusive: the
+                  # constructor refuses an entry that sets both rather than
+                  # letting one silently win.
+                  - not:
+                      required: [asserts, scope]
+                  # `scope: mesh_wide` demands an exact `spiffe://` assertor.
+                  # A bare service-account matcher is namespace-blind, so
+                  # pairing it with a mesh-wide grant would admit any peer
+                  # whose SPIFFE path ends with that service-account name,
+                  # in any namespace, asserting any identity.
+                  - if:
+                      required: [scope]
+                      properties:
+                        scope:
+                          type: string
+                          pattern: "^[ \t]*mesh_wide[ \t]*$"
+                    then:
+                      properties:
+                        assertor:
+                          pattern: "^[ \t]*spiffe://"
           default: ["ztunnel", "waypoint"]
           description: |
             Allow-list of identity-asserting infrastructure components whose
@@ -22842,9 +23261,145 @@ components:
 
     SoapWsSecurityConfig:
       type: object
-      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Malformed XML returns HTTP 400 with a fixed parser category; document names, positions, and raw parser details are never returned or logged. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation, timestamp freshness, and nonce/assertion replay protection. Media types are parsed STRUCTURALLY (type/subtype plus parameters) and matched by exact essence, never substring-matched; content_type.mode defaults to 'strict', under which every request on the proxy is governed and a missing/unsupported/malformed representation is rejected (415/415/400) before backend dispatch, while 'mixed_route' is the explicit pass-through opt-out. Recognized representations are text/xml, application/soap+xml, application/xml, application/xop+xml, and MTOM/XOP multipart/related (root part validated, attachments never decoded). MTOM package framing is strict and line-anchored: delimiter lines only at body start or immediately after CRLF with exact CRLF framing, exactly one close-delimiter with a boundary-free epilogue, strict US-ASCII unfolded part headers with unique Content-Type/Content-ID/Content-Transfer-Encoding, package-unique nonblank Content-IDs, exactly one part matching `start`, and root selection only after the whole package is framed — every other shape fails closed under bounded part/header/candidate ceilings. Because Ferrum implements no WS-Security attachment-signature transform, an enabled x509_signature refuses both MTOM multipart/related and bare application/xop+xml with 415 (and an explicit content_type.allow_mtom=true alongside it is refused at admission); username_token and saml keep accepting MTOM/XOP because they authenticate identity and never claimed attachment integrity. Buffers governed bodies as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. A configuration that establishes a principal (username_token, x509_signature, or saml) is an AUTH PLUGIN: it buffers the body before the authenticate phase, validates there, and publishes authenticated_identity plus a namespace-correct identified_consumer so access_control, consumer rate limiting, logging, retries, and chargeback all observe one SOAP identity. A timestamp-only configuration establishes no principal and keeps validating in before_proxy; the two phases never both run. Composition admission requires an identity-establishing instance to be the proxy's sole authentication mechanism in either auth mode, rejects it alongside compression decompress_request, and rejects an explicit content_type.allow_mtom=true alongside an enabled x509_signature; for that identity-establishing form on_final_request_body refuses to dispatch a message whose bytes changed after validation (a timestamp-only policy authenticates nobody, claims no integrity over the Body, and therefore does not bind the representation). Because an identity-establishing instance is the proxy's sole authentication mechanism, a request the SOAP policy passes through — a non-SOAP media type under mixed_route, or a governed envelope with no wsse:Security header under reject_missing_security_header=false — reaches the authentication chain with no identity and is answered 401 rather than forwarded anonymously; pair those options with a timestamp-only instance or separate the proxies. At least one security feature must be enabled. Both signature paths settle TRUST FIRST: certificate fingerprint match and SignatureValue-over-SignedInfo verify before any attacker-selected Reference is resolved, canonicalized, or digested. Duplicate Reference URIs are rejected, the X.509 Reference ceiling is 8, one bounded id index is built per message, and every canonicalization is charged against an aggregate per-message byte budget. Structural selection is namespace-qualified and positional: one SOAP Envelope, at most one Header and exactly one Body as its direct children in the same envelope namespace, and one wsse:Security header targeting this receiver as a direct child of that Header; duplicates or misplaced elements fail closed. X.509 success additionally requires a Reference resolving uniquely to the backend-visible Body, and require_signed_timestamp rejects a missing Timestamp (pairing it with timestamp.require=false is refused at admission). SAML requires a mandatory bounded Conditions window, the configured service audience on every AudienceRestriction, a supported SubjectConfirmation naming the configured recipient with its own bounded NotOnOrAfter and no InResponseTo, exactly one namespace-correct nonblank Subject NameID resolved BEFORE the single-use claim (so an assertion that authenticates nobody fails closed with 401 without consuming replay state), and a single-use claim on the assertion id — so nonce.replay_scope is required when saml is enabled. Both signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported). On a governed representation, malformed XML, unsupported/ambiguous envelope structure, and XML parsing-budget failures reject with 400 regardless of reject_missing_security_header, which governs an absent header only. Configuration admission is strict and fail-closed: the root object and every nested fixed-shape object reject unknown keys and wrong-typed values (including explicit JSON null — omit a field to use its default) before defaults apply, malformed credential / cert / issuer / algorithm entries are rejected rather than silently dropped, and every duration and cache control must fall inside its documented inclusive range. Invalid password_type and algorithm-enum diagnostics name only the field and accepted choices, never the rejected value. Fixed-shape properties are non-nullable in this schema. There is no nonce_replay_protection alias — nonce.* is the only canonical shape. Nonce replay entry/byte caps are exact under concurrent PasswordDigest claims. PasswordDigest additionally validates the UsernameToken's own wsu:Created against a bounded freshness window and binds it to the independently validated outer wsu:Timestamp, and requires an explicit nonce.replay_scope ('process' for a declared single-replica deployment, or 'shared' with sync_mode=redis for cross-replica atomic claims). A shared-backend outage fails closed."
+      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Malformed XML returns HTTP 400 with a fixed parser category; document names, positions, and raw parser details are never returned or logged. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation, timestamp freshness, and nonce/assertion replay protection. Media types are parsed STRUCTURALLY (type/subtype plus parameters) and matched by exact essence, never substring-matched; content_type.mode defaults to 'strict', under which every request on the proxy is governed and a missing/unsupported/malformed representation is rejected (415/415/400) before backend dispatch, while 'mixed_route' is the explicit pass-through opt-out. Recognized representations are text/xml, application/soap+xml, application/xml, application/xop+xml, and MTOM/XOP multipart/related (root part validated, attachments never decoded). MTOM package framing is strict and line-anchored: delimiter lines only at body start or immediately after CRLF with exact CRLF framing, exactly one close-delimiter with a boundary-free epilogue, strict US-ASCII unfolded part headers with unique Content-Type/Content-ID/Content-Transfer-Encoding, package-unique nonblank Content-IDs, exactly one part matching `start`, and root selection only after the whole package is framed — every other shape fails closed under bounded part/header/candidate ceilings. Because Ferrum implements no WS-Security attachment-signature transform, an enabled x509_signature refuses both MTOM multipart/related and bare application/xop+xml with 415 (and an explicit content_type.allow_mtom=true alongside it is refused at admission); username_token and saml keep accepting MTOM/XOP because they authenticate identity and never claimed attachment integrity. Buffers governed bodies as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. A configuration that establishes a principal (username_token, x509_signature, or saml) is an AUTH PLUGIN: it buffers the body before the authenticate phase, validates there, and publishes authenticated_identity plus a namespace-correct identified_consumer so access_control, consumer rate limiting, logging, retries, and chargeback all observe one SOAP identity. A timestamp-only configuration establishes no principal and keeps validating in before_proxy; the two phases never both run. Composition admission requires an identity-establishing instance to be the proxy's sole authentication mechanism in either auth mode, rejects it alongside compression decompress_request, and rejects an explicit content_type.allow_mtom=true alongside an enabled x509_signature; for that identity-establishing form on_final_request_body refuses to dispatch a message whose bytes changed after validation (a timestamp-only policy authenticates nobody, claims no integrity over the Body, and therefore does not bind the representation). Because an identity-establishing instance is the proxy's sole authentication mechanism, a request the SOAP policy passes through — a non-SOAP media type under mixed_route, or a governed envelope with no wsse:Security header under reject_missing_security_header=false — reaches the authentication chain with no identity and is answered 401 rather than forwarded anonymously; pair those options with a timestamp-only instance or separate the proxies. At least one security feature must be enabled. Both signature paths settle TRUST FIRST: certificate fingerprint match and SignatureValue-over-SignedInfo verify before any attacker-selected Reference is resolved, canonicalized, or digested. Duplicate Reference URIs are rejected, the X.509 Reference ceiling is 8, one bounded id index is built per message, and every canonicalization is charged against an aggregate per-message byte budget. Structural selection is namespace-qualified and positional: one SOAP Envelope, at most one Header and exactly one Body as its direct children in the same envelope namespace, and one wsse:Security header targeting this receiver as a direct child of that Header; duplicates or misplaced elements fail closed. X.509 success additionally requires a Reference resolving uniquely to the backend-visible Body, and require_signed_timestamp rejects a missing Timestamp (pairing it with timestamp.require=false is refused at admission). SAML requires a mandatory bounded Conditions window, the configured service audience on every AudienceRestriction, a supported SubjectConfirmation naming the configured recipient with its own bounded NotOnOrAfter and no InResponseTo, exactly one namespace-correct nonblank Subject NameID resolved BEFORE the single-use claim (so an assertion that authenticates nobody fails closed with 401 without consuming replay state), and a single-use claim on the assertion id — so nonce.replay_scope is required when saml is enabled. Both signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported). On a governed representation, malformed XML, unsupported/ambiguous envelope structure, and XML parsing-budget failures reject with 400 regardless of reject_missing_security_header, which governs an absent header only. Configuration admission is strict and fail-closed: the root object and every nested fixed-shape object reject unknown keys and wrong-typed values (including explicit JSON null — omit a field to use its default) before defaults apply, malformed credential / cert / issuer / algorithm entries are rejected rather than silently dropped, and every duration and cache control must fall inside its documented inclusive range. Invalid password_type and algorithm-enum diagnostics name only the field and accepted choices, never the rejected value. Fixed-shape properties are non-nullable in this schema. There is no nonce_replay_protection alias — nonce.* is the only canonical shape. Nonce replay entry/byte caps are exact under concurrent PasswordDigest claims. PasswordDigest additionally validates the UsernameToken's own wsu:Created against a bounded freshness window and binds it to the independently validated outer wsu:Timestamp, and requires an explicit nonce.replay_scope ('process' for a declared single-replica deployment, or 'shared' with sync_mode=redis for cross-replica atomic claims). A shared-backend outage fails closed. Every element value the gateway acts on is read once and returned UNCHANGED: only xsd:dateTime instants and xsd:base64Binary payloads are whitespace-collapsed, so a NameID, Issuer, Audience, Username, or PasswordText value with significant leading/trailing spaces is matched byte for byte against the bytes the signature covered and against configuration. Canonicalization charges the per-message work budget BEFORE each emitted run, so a refused canonical form is never fully allocated. username_token.remove_credential (default false) deletes the verified UsernameToken — or the whole wsse:Security header when it holds only the credential — from the backend-visible message; it is admitted only for an enabled PasswordText policy with no enabled x509_signature or saml and no explicit content_type.allow_mtom=true, its final-body proof binds the sanitized representation, and a signed envelope (400) or an unspliceable UTF-16/MTOM representation (415) is refused rather than forwarded with the credential intact. The schema's conditionals mirror those admission rules, so a configuration this component accepts is one the constructor accepts."
       additionalProperties: false
       allOf:
+        # At least one security feature must be enabled. timestamp.require
+        # defaults to true, so this only bites when it is explicitly false and
+        # no mechanism is enabled.
+        - if:
+            allOf:
+              - properties:
+                  timestamp:
+                    properties:
+                      require:
+                        const: false
+                    required: [require]
+                required: [timestamp]
+              - not:
+                  properties:
+                    username_token:
+                      properties:
+                        enabled:
+                          const: true
+                      required: [enabled]
+                  required: [username_token]
+              - not:
+                  properties:
+                    x509_signature:
+                      properties:
+                        enabled:
+                          const: true
+                      required: [enabled]
+                  required: [x509_signature]
+              - not:
+                  properties:
+                    saml:
+                      properties:
+                        enabled:
+                          const: true
+                      required: [enabled]
+                  required: [saml]
+          then: false
+        # Enabled UsernameToken requires at least one credential pair.
+        - if:
+            properties:
+              username_token:
+                properties:
+                  enabled:
+                    const: true
+                required: [enabled]
+            required: [username_token]
+          then:
+            required: [username_token]
+            properties:
+              username_token:
+                required: [credentials]
+                properties:
+                  credentials:
+                    minItems: 1
+        # Enabled X.509 requires trust material and a non-empty algorithm set.
+        - if:
+            properties:
+              x509_signature:
+                properties:
+                  enabled:
+                    const: true
+                required: [enabled]
+            required: [x509_signature]
+          then:
+            required: [x509_signature]
+            properties:
+              x509_signature:
+                required: [trusted_certs]
+                properties:
+                  trusted_certs:
+                    minItems: 1
+        # An explicit content_type.allow_mtom: true alongside an enabled
+        # x509_signature is refused at admission: Ferrum implements no
+        # WS-Security attachment-signature transform.
+        - if:
+            properties:
+              x509_signature:
+                properties:
+                  enabled:
+                    const: true
+                required: [enabled]
+            required: [x509_signature]
+          then:
+            not:
+              properties:
+                content_type:
+                  properties:
+                    allow_mtom:
+                      const: true
+                  required: [allow_mtom]
+              required: [content_type]
+        # Credential removal is admitted only for an unsigned PasswordText
+        # policy on a route that does not explicitly accept MTOM.
+        - if:
+            properties:
+              username_token:
+                properties:
+                  remove_credential:
+                    const: true
+                required: [remove_credential]
+            required: [username_token]
+          then:
+            allOf:
+              - required: [username_token]
+                properties:
+                  username_token:
+                    required: [enabled, password_type]
+                    properties:
+                      enabled:
+                        const: true
+                      password_type:
+                        const: PasswordText
+              - not:
+                  properties:
+                    x509_signature:
+                      properties:
+                        enabled:
+                          const: true
+                      required: [enabled]
+                  required: [x509_signature]
+              - not:
+                  properties:
+                    saml:
+                      properties:
+                        enabled:
+                          const: true
+                      required: [enabled]
+                  required: [saml]
+              - not:
+                  properties:
+                    content_type:
+                      properties:
+                        allow_mtom:
+                          const: true
+                      required: [allow_mtom]
+                  required: [content_type]
         - if:
             properties:
               username_token:
@@ -22883,6 +23438,11 @@ components:
               saml:
                 type: object
                 required: [audience, recipient, trusted_issuers, trusted_signing_certs]
+                properties:
+                  trusted_issuers:
+                    minItems: 1
+                  trusted_signing_certs:
+                    minItems: 1
         - if:
             properties:
               x509_signature:
@@ -23117,10 +23677,12 @@ components:
                   username:
                     type: string
                     minLength: 1
+                    pattern: '\S'
                   password:
                     type: string
                     minLength: 1
-              description: Allowed username/password pairs for UsernameToken authentication. Every entry must be an object with non-empty username and password; a malformed entry is rejected rather than dropped, and duplicate usernames are rejected because credential selection is first-wins.
+                    pattern: '\S'
+              description: Allowed username/password pairs for UsernameToken authentication. Every entry must be an object with a username and password that each contain at least one non-whitespace character; a malformed entry is rejected rather than dropped, and duplicate usernames are rejected because credential selection is first-wins. Values are matched EXACTLY, including any leading or trailing spaces — the gateway compares the credential the client sent byte for byte and never trims it. Required and non-empty when `enabled` is true.
             created_max_age_seconds:
               type: integer
               format: uint64
@@ -23146,6 +23708,36 @@ components:
               type: boolean
               default: true
               description: Require an outer wsu:Timestamp carrying a valid Created for PasswordDigest requests, so the Timestamp binding cannot be dropped by omitting the element. The outer Timestamp is validated on every request in which it appears — including when timestamp.require is false — so the instant bound against is always an independently validated one.
+            remove_credential:
+              type: boolean
+              default: false
+              description: |
+                Delete the verified `wsse:UsernameToken` — or the whole
+                `wsse:Security` header, when the credential is all it carries —
+                from the message the BACKEND receives, so a reusable PasswordText
+                secret is not handed to every system behind the gateway. The
+                authenticated identity is still published normally
+                (`authenticated_identity`, `identified_consumer`,
+                `ctx.metadata["soap_ws_username"]`).
+
+                Off by default, because a backend may legitimately read the
+                token. Admission requires `enabled: true` and an explicit
+                `password_type: PasswordText`, and refuses the option alongside
+                an enabled `x509_signature` or `saml` or an explicit
+                `content_type.allow_mtom: true` — rewriting an envelope whose
+                content a signature covers, or re-framing an MTOM package, is
+                refused rather than done silently.
+
+                At request time a governed envelope that carries an XMLDSIG
+                `Signature` is rejected with 400, and a representation whose
+                bytes cannot be spliced (a UTF-16 body, an MTOM package) is
+                rejected with 415. Neither is forwarded with the credential
+                intact. The final-body integrity proof binds the SANITIZED
+                representation, so this plugin's own removal is admitted while
+                every other post-validation body mutation still fails closed
+                with 500. Gateway-internal views (access logs, mirrors) may
+                still observe the original buffered body; the option governs the
+                backend-visible request.
         x509_signature:
           type: object
           description: X.509 certificate signature verification
@@ -23160,7 +23752,8 @@ components:
               items:
                 type: string
                 minLength: 1
-              description: PEM file paths of trusted signing certificates (matched by SHA-256 fingerprint). Non-string or empty entries are rejected rather than dropped.
+                pattern: '\S'
+              description: PEM file paths of trusted signing certificates (matched by SHA-256 fingerprint). Non-string or blank entries are rejected rather than dropped. Required and non-empty when `enabled` is true.
             allowed_algorithms:
               type: array
               minItems: 1
@@ -23251,21 +23844,36 @@ components:
               items:
                 type: string
                 minLength: 1
+                pattern: '\S'
               description: |
                 SAML Issuer URIs that are accepted as the source of an assertion.
-                Required when `enabled` is true. The Issuer string inside the
-                signed assertion must match one of these values exactly.
+                Required and non-empty when `enabled` is true. The Issuer string
+                inside the signed assertion must match one of these values
+                exactly, including any surrounding whitespace — the gateway acts
+                on the character data the signature covered and never trims it.
             trusted_signing_certs:
               type: array
               items:
                 type: string
                 minLength: 1
+                pattern: '\S'
               description: |
                 PEM file paths of IdP X.509 signing certificates. The cert
                 presented inside the assertion's `KeyInfo` must match one of
-                these by SHA-256 fingerprint of the full DER. Required when
-                `enabled` is true. Rotating an IdP signing cert requires
-                updating this list and restarting (no live reload).
+                these by SHA-256 fingerprint of the full DER. Required and
+                non-empty when `enabled` is true.
+
+                Rotating an IdP signing cert does NOT require a gateway restart:
+                the trust list is read when the plugin generation is
+                constructed, so changing this list and applying a configuration
+                reload (file-mode SIGHUP, a database/CP change, a DP push)
+                installs the new trust material in place — the retired signer is
+                refused from the first request served by the new generation, and
+                the process, its listeners, and its connections are untouched.
+                What is NOT detected is replacing a PEM's CONTENTS at an
+                unchanged path: nothing watches the file, so the reload must
+                change the configuration (typically the path list) for the new
+                material to be read.
             allowed_signature_algorithms:
               type: array
               minItems: 1
@@ -23294,6 +23902,7 @@ components:
             audience:
               type: string
               minLength: 1
+              pattern: '\S'
               description: |
                 Required when `enabled` is true. Every
                 `Conditions/AudienceRestriction` in the assertion must name this
@@ -23303,6 +23912,7 @@ components:
             recipient:
               type: string
               minLength: 1
+              pattern: '\S'
               description: |
                 Required when `enabled` is true. Matched against
                 `Subject/SubjectConfirmation/SubjectConfirmationData/@Recipient`
@@ -23324,6 +23934,7 @@ components:
               minItems: 1
               items:
                 type: string
+                enum: ["urn:oasis:names:tc:SAML:2.0:cm:bearer"]
               default: ["urn:oasis:names:tc:SAML:2.0:cm:bearer"]
               description: |
                 Accepted SubjectConfirmation @Method URIs. Only
@@ -25044,52 +25655,58 @@ components:
     CompressionConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: compression — On-the-fly HTTP/1.1, HTTP/2, and HTTP/3 response compression (gzip, Brotli) and optional request decompression. Process-wide FERRUM_COMPRESSION_GZIP_ENABLED and FERRUM_COMPRESSION_BROTLI_ENABLED gates intersect with every instance and default to true; an instance with no remaining usable algorithm after those gates fails admission. Gzip/Brotli codec CPU is offloaded via a bounded spawn_blocking admission pool acquired only immediately before the blocking worker, while response buffering for compression is admitted by an independent bounded response-buffer semaphore reserved in before_proxy and held across the encode (with ineligible owners leaving the slot on the context for sibling handoff), so a slow backend cannot starve request decompression; authenticated /metrics exports ferrum_compression_codec_{admitted,saturated,join_failures,worker_failures}_total and ferrum_compression_response_buffer_{admitted,saturated}_total. Encode abort after a committed Content-Encoding restores identity headers on shared buffered H1/H2/H3 paths when identity remains acceptable, or replaces the response with 406 when the client excluded identity, rather than emitting mislabeled or explicitly refused plaintext. Optional request decompression parses Content-Encoding as an ordered coding list (OWS-tolerant), decodes supported chains in reverse order under hard-capped size/amplification limits, and fails closed on malformed/unsupported members. Content negotiation follows RFC 9110 §12.5.3, treats x-gzip as the gzip compatibility token, strictly parses qvalues, and includes the identity coding: an uncoded response is acceptable by default at q=1 unless refused with `identity;q=0` or `*;q=0` without a more-specific identity entry (a nonzero wildcard does not lower identity quality), the most preferred acceptable representation wins (server preference order breaks ties toward compression), and the response is rejected with 406 when identity is unacceptable and no acceptable coded representation can be produced — including size/content-type ineligibility, identity range/delta responses (206/226, Content-Range, or the internal range marker), and `response_caching` HIT paths. Identity range/delta responses are non-transformable (forwarded unchanged when identity is acceptable); no-body statuses and already-encoded upstream responses remain protocol hard skips. Reject-path 406 replacement is scoped to cache HITs so auth/policy rejection statuses are not masked. Honors request/response Cache-Control: no-transform and strong ETag validators by skipping compression (still 406 when that leaves no acceptable representation). Unknown top-level keys are rejected at construction (for example `min_content_lenght` or `gzip_leveel`); the removed `disable_on_etag` key still reports an explicit migration error. Invalid generations fail file/admin/database/CP-DP admission while KeepLastKnownGood retains the prior published instance. Multiple effective instances compose with first-wins ownership: the first instance that claims a supported request Content-Encoding owns strip+decode exactly once; the first instance that commits a gateway response Content-Encoding owns the single coding layer. Siblings must not delete the owner's request marker or compress again. An earlier identity/Vary-only decision does not block a later compress. H1/H2 and native H3 share the same sequential transform loops; reload snapshots remain atomic. WebSocket, gRPC message compression, and raw stream compression are separate protocol mechanisms."
+      description: "Plugin: compression — On-the-fly HTTP/1.1, HTTP/2, and HTTP/3 response compression (gzip, Brotli) and optional request decompression. Process-wide FERRUM_COMPRESSION_GZIP_ENABLED and FERRUM_COMPRESSION_BROTLI_ENABLED gates intersect with every instance and default to true; an instance with no remaining usable algorithm after those gates fails admission. Gzip/Brotli codec CPU is offloaded via a bounded spawn_blocking admission pool acquired only immediately before the blocking worker, while response buffering for compression is admitted by an independent bounded response-buffer semaphore reserved in before_proxy and held across the encode (with ineligible owners leaving the slot on the context for sibling handoff), so a slow backend cannot starve request decompression; authenticated /metrics exports ferrum_compression_codec_{admitted,saturated,join_failures,worker_failures}_total and ferrum_compression_response_buffer_{admitted,saturated}_total. Encode abort after a committed Content-Encoding restores identity headers on shared buffered H1/H2/H3 paths when identity remains acceptable, or replaces the response with 406 when the client excluded identity, rather than emitting mislabeled or explicitly refused plaintext. Optional request decompression parses Content-Encoding as an ordered coding list (OWS-tolerant), decodes supported chains in reverse order under hard-capped size/amplification limits, and fails closed on malformed/unsupported members. That decode runs on the shared strict, budget-charged decoder: br refuses Large Window Brotli, and the decoder's own heap plus every output growth (and, on a stacked chain, the previous pass's still-resident buffer) is reserved against FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES before allocation, so an aggregate-budget refusal is a gateway 503 rather than a client 400. Normalization happens exactly once per request on every frontend: H1/H2 dispatch now receives the ownership context the native H3 path always had, so an already-normalized upload is never decoded a second time. Content negotiation follows RFC 9110 §12.5.3, treats x-gzip as the gzip compatibility token, strictly parses qvalues, and includes the identity coding: an uncoded response is acceptable by default at q=1 unless refused with `identity;q=0` or `*;q=0` without a more-specific identity entry (a nonzero wildcard does not lower identity quality), the most preferred acceptable representation wins (server preference order breaks ties toward compression), and the response is rejected with 406 when identity is unacceptable and no acceptable coded representation can be produced — including size/content-type ineligibility, identity range/delta responses (206/226, Content-Range, or the internal range marker), and `response_caching` HIT paths. That refusal is taken only after every effective instance in the chain has declined, so an earlier instance whose algorithms or content_types cannot serve this response never pre-empts a later sibling that can, and a committed coding is never turned back into a 406. Identity range/delta responses are non-transformable (forwarded unchanged when identity is acceptable); no-body statuses and already-encoded upstream responses remain protocol hard skips. Reject-path 406 replacement is scoped to cache HITs so auth/policy rejection statuses are not masked. Honors request/response Cache-Control: no-transform and strong ETag validators by skipping compression (still 406 when that leaves no acceptable representation). Unknown top-level keys are rejected at construction (for example `min_content_lenght` or `gzip_leveel`); the removed `disable_on_etag` key still reports an explicit migration error. Invalid generations fail file/admin/database/CP-DP admission while KeepLastKnownGood retains the prior published instance. Response buffering is only forced for responses this instance could actually encode: already-encoded origin responses and responses whose known Content-Length is below min_content_length stream instead of being collected. Multiple effective instances compose with first-wins ownership: the first instance that claims a supported request Content-Encoding owns strip+decode exactly once; the first instance that commits a gateway response Content-Encoding owns the single coding layer. Siblings must not delete the owner's request marker or compress again. An earlier identity/Vary-only decision does not block a later compress. H1/H2 and native H3 share the same sequential transform loops; reload snapshots remain atomic. WebSocket, gRPC message compression, and raw stream compression are separate protocol mechanisms."
       properties:
         algorithms:
-          type: array
+          type: [array, "null"]
+          minItems: 1
           items:
             type: string
             enum: [gzip, br, brotli]
           default: [gzip, br]
-          description: "Enabled compression algorithms in server preference order"
+          description: "Enabled compression algorithms in server preference order. An empty array is rejected at construction, as is an array left with no usable codec after the process-wide FERRUM_COMPRESSION_* gates. Null selects the default."
         min_content_length:
-          type: integer
+          type: [integer, "null"]
           format: uint64
+          minimum: 0
+          maximum: 18446744073709551615
           default: 256
-          description: "Skip compression for bodies smaller than this (bytes)"
+          description: "Skip compression for bodies smaller than this (bytes). Must be an unsigned 64-bit integer that also fits usize on this host. Null selects the default."
         content_types:
           type: array
+          minItems: 1
           items:
             type: string
-          description: "Content-type whitelist. Defaults to 10 common text/application types. Matched as an exact media-type token (before the first semicolon, ASCII case-insensitive); parameters like ; charset=utf-8 are ignored. Substring matching is not used, so application/jsonp does not match application/json."
+            minLength: 1
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+/[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+          description: "Content-type whitelist. Defaults to 10 common text/application types. Every entry must be a bare ASCII type/subtype media type with no surrounding whitespace and no parameters; an empty array, an empty entry, a non-ASCII entry, and a parameter-bearing or whitespace-only entry are all rejected at construction, because the matcher could never equal such a rule. Explicit null is rejected (unlike the other optional fields) — omit the key for the defaults. Matched as an exact media-type token (before the first semicolon, ASCII case-insensitive); response parameters like ; charset=utf-8 are ignored. Substring matching is not used, so application/jsonp does not match application/json."
         max_decompressed_request_size:
-          type: integer
+          type: [integer, "null"]
           format: uint64
           minimum: 1
           maximum: 33554432
           default: 10485760
-          description: "Zip bomb protection: max decompressed request body size in bytes (default 10 MiB). Hard-capped at 32 MiB; when request decompression is enabled, it must also be ≤ FERRUM_MAX_REQUEST_BODY_SIZE_BYTES if that wire limit is set. Per-layer/cumulative decode ceilings and a 1024:1 raw-to-decoded amplification bound apply."
+          description: "Zip bomb protection: max decompressed request body size in bytes (default 10 MiB). Hard-capped at 32 MiB; when request decompression is enabled, it must also be ≤ FERRUM_MAX_REQUEST_BODY_SIZE_BYTES if that wire limit is set. Per-layer/cumulative decode ceilings and a 1024:1 raw-to-decoded amplification bound apply, and the decode's complete working set (strict decoder heap plus output capacity) is charged to FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES before allocation — a budget refusal is the gateway capacity terminal (503), not a 400. Null selects the default."
         remove_accept_encoding:
-          type: boolean
+          type: [boolean, "null"]
           default: true
-          description: "Strip Accept-Encoding from backend request so backend sends uncompressed. Only applied when the instance still has at least one usable response codec after process-wide FERRUM_COMPRESSION_* gates."
+          description: "Strip Accept-Encoding from backend request so backend sends uncompressed. Only applied when the instance still has at least one usable response codec after process-wide FERRUM_COMPRESSION_* gates. Null selects the default."
         gzip_level:
-          type: integer
+          type: [integer, "null"]
           minimum: 0
           maximum: 9
           default: 6
-          description: "Gzip compression level (0=no compression, emits gzip framing only; 1=fastest, 9=best)"
+          description: "Gzip compression level (0=no compression, emits gzip framing only; 1=fastest, 9=best). Null selects the default."
         brotli_quality:
-          type: integer
+          type: [integer, "null"]
           minimum: 0
           maximum: 11
           default: 4
-          description: "Brotli quality (0=fastest, 11=best)"
+          description: "Brotli quality (0=fastest, 11=best). Null selects the default."
         decompress_request:
-          type: boolean
+          type: [boolean, "null"]
           default: false
-          description: "Enable decompression of gzip/brotli request Content-Encoding lists (OWS-tolerant ordered chains; malformed/unsupported members fail closed)"
+          description: "Enable decompression of gzip/brotli request Content-Encoding lists (OWS-tolerant ordered chains; malformed/unsupported members fail closed). Null selects the default."
 
     SseConfig:
       type: object
@@ -27286,14 +27903,15 @@ components:
               - path
             properties:
               method:
-                type: string
+                type: [string, "null"]
                 minLength: 1
+                pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
                 description: >-
-                  HTTP method token to match (omit to match all methods). When
-                  supplied it must be non-empty and parse as an HTTP method
-                  token (runtime validates via http::Method). The configured
-                  method is normalized to uppercase and compared exactly with
-                  the request method.
+                  HTTP method token to match (omit or null to match all methods).
+                  When supplied it must be a non-empty HTTP method token (runtime
+                  validates via http::Method). The configured method is
+                  normalized to uppercase and compared exactly with the request
+                  method.
               path:
                 type: string
                 minLength: 1
@@ -27302,11 +27920,8 @@ components:
                   (e.g., /users for listen_path /api/v1). For exact (`=`),
                   regex (`~`), root (`/`), and host-only proxies, use the full
                   request path. Regex rule paths use a ~ prefix (auto-anchored).
+                  Full Rust regex compilation remains a runtime-only check.
               status_code:
-                type: integer
-                format: uint16
-                minimum: 100
-                maximum: 599
                 description: >-
                   HTTP status code to return (default 200). Must be a final
                   status 200–599, or 101 for a synthetic WebSocket handshake
@@ -27316,49 +27931,79 @@ components:
                   a success-like 200 on HTTP/2 / HTTP/3 Extended CONNECT, is
                   still only a synthetic HTTP handshake response; it does not
                   create an upgraded frame stream. A 101 rule that matches an
-                  ordinary HTTP request fails closed with status 500.
+                  ordinary HTTP request fails closed with status 500. Omitted
+                  or null selects 200.
+                default: 200
+                oneOf:
+                  - type: "null"
+                  - type: integer
+                    const: 101
+                  - type: integer
+                    minimum: 200
+                    maximum: 599
               headers:
-                type: object
+                type: [object, "null"]
+                propertyNames:
+                  type: string
+                  minLength: 1
+                  pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+                  not:
+                    pattern: "^([Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Ee]|[Tt][Rr][Aa][Ii][Ll][Ee][Rr]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee])$"
                 additionalProperties:
                   type: string
+                  pattern: '^[\u0009\u0020-\u007E]*$'
                 description: >-
                   Response headers (default content-type application/json).
-                  Protocol-managed hop-by-hop and framing names (`connection`,
-                  `content-length`, `keep-alive`, `proxy-authenticate`,
-                  `proxy-connection`, `te`, `trailer`, `transfer-encoding`,
-                  `upgrade`) are rejected at construction.
+                  Omitted or null selects that default. Names must be HTTP
+                  field-name tokens. Protocol-managed hop-by-hop and framing
+                  names (`connection`, `content-length`, `keep-alive`,
+                  `proxy-authenticate`, `proxy-connection`, `te`, `trailer`,
+                  `transfer-encoding`, `upgrade`) are rejected at construction,
+                  including case variants. Values must be valid HTTP header
+                  values (HTAB and printable ASCII).
               body:
-                type: string
+                type: [string, "null"]
                 description: >-
-                  Response body string (default empty). On the wire, HEAD
-                  responses omit content bytes while keeping representation
-                  Content-Length. Statuses 204, 205, and 304 omit both the body
-                  and Content-Length even when this field is non-empty. Shared
-                  synthetic-response finalization keeps H1, H2, and H3 aligned.
+                  Response body string (default empty). Omitted or null
+                  selects empty. On the wire, HEAD responses omit content bytes
+                  while keeping representation Content-Length. Statuses 204, 205,
+                  and 304 omit both the body and Content-Length even when this
+                  field is non-empty. Shared synthetic-response finalization
+                  keeps H1, H2, and H3 aligned.
               delay_ms:
-                type: integer
+                type: [integer, "null"]
                 format: uint64
+                minimum: 0
                 maximum: 3600000
-                description: "Simulated latency in milliseconds (default 0). Capped at 3600000 (1 hour); larger values are rejected at config validation."
+                default: 0
+                description: >-
+                  Simulated latency in milliseconds (default 0). Omitted or
+                  null selects 0. Must be an unsigned integer 0–3600000
+                  (1 hour); negative values and values above the cap are
+                  rejected at config validation.
         passthrough_on_no_match:
-          type: boolean
+          type: [boolean, "null"]
+          default: false
           description: >-
             If true, unmatched requests (including WebSocket upgrades) continue
-            to the backend. If false (default), returns 404.
+            to the backend. If false (default), returns 404. Omitted or null
+            selects false.
 
     SpecExposeConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: spec_expose — Exposes API specification documents (OpenAPI, WSDL, WADL) for GET and HEAD on the canonical /specz sub-path. HEAD retains the GET representation through response-body policy, then returns the final status and representation headers without a wire body. Unauthenticated. Only works with prefix-based listen_path proxies (HTTP only). Successful upstream fetches are capped by max_response_body_bytes and cached in-process for cache_ttl_seconds (default 300s). Failed fetches are coalesced and negatively cached with bounded exponential backoff; excess cache-miss waiters receive HTTP 503 with Retry-After."
+      description: "Plugin: spec_expose — Exposes API specification documents (OpenAPI, WSDL, WADL) for GET and HEAD on the canonical /specz sub-path. HEAD retains the GET representation through response-body policy, then returns the final status and representation headers without a wire body. Unauthenticated. Only works with prefix-based listen_path proxies (HTTP only). Successful upstream fetches are capped by max_response_body_bytes, decoded from origin Content-Encoding (gzip, x-gzip, br, identity) to identity bytes before cache and /specz, and cached in-process for cache_ttl_seconds (default 300s). Unsupported or malformed origin coding is HTTP 502. Failed fetches are coalesced and negatively cached with bounded exponential backoff; excess cache-miss waiters receive HTTP 503 with Retry-After."
       required:
         - spec_url
       properties:
         spec_url:
           type: string
-          description: "Full URL (http or https only) to fetch the API specification document (e.g., https://internal-service/docs/openapi.yaml). URL userinfo is rejected. Paths and queries may be used for origin routing or signed access, but are omitted from gateway diagnostics."
+          pattern: '^\s*https?://[^/@?#]+(?:[/?#].*)?\s*$'
+          description: "Full URL (http or https only) to fetch the API specification document (e.g., https://internal-service/docs/openapi.yaml). Surrounding whitespace is trimmed. The authority must be nonempty and must not contain userinfo ('@'). Paths and queries may be used for origin routing or signed access, but are omitted from gateway diagnostics. Remaining URL parse details (IPv6 literals, IDNA, percent-encoding) are runtime-only."
         content_type:
           type: [string, "null"]
-          description: "Trusted response Content-Type override; it is not restricted by the upstream allow-list. When omitted or null, only supported spec media types are preserved from upstream (case-insensitive media-type comparison, with original parameters retained); every other or missing value falls back to application/octet-stream."
+          pattern: '^[\u0009\u0020-\u007E]*[!-~][\u0009\u0020-\u007E]*$'
+          description: "Trusted response Content-Type override; it is not restricted by the upstream allow-list. When set it must be nonempty after trim and a valid HTTP header value (HTAB and printable ASCII). When omitted or null, only supported spec media types are preserved from upstream (case-insensitive media-type comparison, with original parameters retained); every other or missing value falls back to application/octet-stream."
         tls_no_verify:
           type: [boolean, "null"]
           description: "Skip TLS certificate verification when fetching the spec. Omitted or null defaults to the gateway's FERRUM_TLS_NO_VERIFY setting. When verification is enabled and a gateway CA bundle is configured, load or parse failure rejects plugin construction instead of widening trust."
@@ -27366,14 +28011,16 @@ components:
           type: [integer, "null"]
           format: uint64
           minimum: 0
+          maximum: 18446744073709551615
           default: 300
-          description: "Time-to-live for the in-process spec body cache (seconds). Omitted or null defaults to 300. The first /specz request fetches the spec from spec_url and stores it; subsequent requests within the TTL window return the cached copy without re-fetching. Set to 0 to disable durable positive caching; callers admitted before an in-flight fetch completes still share that fetch regardless of scheduling delay, while later requests immediately re-fetch. Failed fetches use bounded negative-cache backoff regardless of this value."
+          description: "Time-to-live for the in-process spec body cache (seconds). Omitted or null defaults to 300. The first /specz request fetches the spec from spec_url and stores the identity document; subsequent requests within the TTL window return the cached copy without re-fetching. Set to 0 to disable durable positive caching; callers admitted before an in-flight fetch completes still share that fetch regardless of scheduling delay, while later requests immediately re-fetch. Failed fetches use bounded negative-cache backoff regardless of this value."
         max_response_body_bytes:
           type: [integer, "null"]
           format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           default: 26214400
-          description: "Maximum upstream spec response body size to buffer and cache. Omitted or null defaults to 26214400. The body is streamed with this cap so oversized responses are rejected with HTTP 502 before unbounded memory growth."
+          description: "Maximum upstream spec response body size to buffer, decode, and cache. Omitted or null defaults to 26214400. Must be greater than zero. The coded origin body is streamed with this cap, then decoded to identity under the same bound, so oversized or explosively compressed responses are rejected with HTTP 502 before unbounded memory growth."
 
     LoadTestingConfig:
       type: object
@@ -30346,7 +30993,16 @@ components:
                 const: false
           then:
             # Disabled drafts may carry ignored policy fields of any value, but
-            # only the known property names — typos still fail closed.
+            # only the known property names — typos still fail closed. Runtime
+            # admission runs validate_config_keys BEFORE the enabled:false short
+            # circuit and rejects unknown names at every fixed-shape layer,
+            # nested layers included, so each nested closure below is mirrored
+            # here. Every closure is conditional on the value actually being an
+            # object (an array, for blocked_arg_patterns), matching the
+            # runtime's as_object()/as_array() guards: an ignored scalar such as
+            # mode: 7, tools: null, or inspect: "off" stays admissible. The
+            # free-form tools tool-name map and per-tool json_schema document
+            # stay open in both branches.
             type: object
             additionalProperties: false
             properties:
@@ -30355,11 +31011,73 @@ components:
               mode: true
               default_action: true
               unknown_shape_action: true
-              inspect: true
-              tools: true
-              approval: true
-              response: true
-              observability: true
+              inspect:
+                if:
+                  type: object
+                then:
+                  additionalProperties: false
+                  properties:
+                    request_tool_definitions: true
+                    response_tool_calls: true
+                    streaming_response_tool_calls: true
+                    mcp_tool_calls: true
+                    a2a_methods: true
+              tools:
+                if:
+                  type: object
+                then:
+                  additionalProperties:
+                    if:
+                      type: object
+                    then:
+                      additionalProperties: false
+                      properties:
+                        action: true
+                        risk: true
+                        max_arg_bytes: true
+                        required_args: true
+                        json_schema: true
+                        blocked_arg_patterns:
+                          if:
+                            type: array
+                          then:
+                            items:
+                              if:
+                                type: object
+                              then:
+                                additionalProperties: false
+                                properties:
+                                  name: true
+                                  regex: true
+              approval:
+                if:
+                  type: object
+                then:
+                  additionalProperties: false
+                  properties:
+                    endpoint_url: true
+                    timeout_ms: true
+                    cache_ttl_seconds: true
+                    fail_on_error: true
+                    include_arguments: true
+              response:
+                if:
+                  type: object
+                then:
+                  additionalProperties: false
+                  properties:
+                    deny_status_code: true
+                    redaction_placeholder: true
+                    streaming_deny_event: true
+              observability:
+                if:
+                  type: object
+                then:
+                  additionalProperties: false
+                  properties:
+                    emit_metadata: true
+                    hash_arguments: true
+                    max_argument_log_bytes: true
           else:
             $ref: "#/components/schemas/AiToolGovernorEnabledConfig"
 
@@ -30563,8 +31281,8 @@ components:
               type: string
               minLength: 1
               format: uri
-              pattern: '^https?://(?:[^/?#]*@)?(?:\[[^\]]+\]|[^/?#:@]+)(?::[0-9]+)?(?:[/?#]|$)'
-              description: "http/https URL POSTed with request_id, consumer, proxy, model, provider, tool_name, arguments_hash, risk (and raw arguments only when include_arguments=true). Response: {\"decision\":\"allow|deny\"} or {\"allow\":true|false}, optional approval_id. Response bodies are capped at 64 KiB."
+              pattern: '^[Hh][Tt][Tt][Pp][Ss]?://(?:[^/?#]*@)?(?:\[[^\]]+\]|[^/?#:@]+)(?::[0-9]+)?(?:[/?#]|$)'
+              description: "http/https URL POSTed with request_id, consumer, proxy, model, provider, tool_name, arguments_hash, risk (and raw arguments only when include_arguments=true). The URI scheme is case-insensitive (runtime parsing normalizes it before the http/https check), so HTTPS://host/path is admitted exactly like https://host/path. Response: {\"decision\":\"allow|deny\"} or {\"allow\":true|false}, optional approval_id. Response bodies are capped at 64 KiB."
             timeout_ms:
               type: integer
               minimum: 1

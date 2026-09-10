@@ -7211,6 +7211,81 @@ async fn compression_schema_matches_strict_runtime_config_contract() {
             "runtime accepted OpenAPI-invalid compression config: {config}"
         );
     }
+
+    // Constructor admission is the source of truth; the schema previously
+    // ACCEPTED each of these while `validate` exited 1 (issue #5095), and
+    // accepted content-type rules the matcher can never equal (issue #5096).
+    for config in [
+        json!({"algorithms": []}),
+        json!({"content_types": []}),
+        json!({"content_types": [""]}),
+        json!({"content_types": ["\u{e9}"]}),
+        json!({"content_types": [" "]}),
+        json!({"content_types": ["application/json; charset=utf-8"]}),
+        json!({"content_types": ["application/json "]}),
+        json!({"content_types": null}),
+        json!({"min_content_length": -1}),
+        json!({"max_decompressed_request_size": 0}),
+        json!({"max_decompressed_request_size": 33_554_433}),
+        json!({"brotli_quality": 12}),
+    ] {
+        assert_component_validity(&spec, "CompressionConfig", &config, false);
+        assert!(
+            CompressionPlugin::new(&config).is_err(),
+            "runtime accepted a config the schema now rejects: {config}"
+        );
+    }
+
+    // A `min_content_length` past `u64::MAX` is runtime-rejected (it is not an
+    // unsigned integer any more). The schema's `maximum` cannot bind it: the
+    // value only survives JSON parsing as an `f64`, and `u64::MAX` rounds to the
+    // same `f64`, so this stays a runtime-only assertion rather than a parity
+    // case that would silently depend on float behaviour.
+    let past_u64: serde_json::Value =
+        serde_json::from_str(r#"{"min_content_length": 18446744073709551616}"#)
+            .expect("oversized literal parses");
+    assert!(
+        CompressionPlugin::new(&past_u64).is_err(),
+        "runtime must reject a min_content_length past u64::MAX"
+    );
+
+    // Explicit null is "omitted" for every optional field the constructor reads
+    // through its `optional_*` helpers. `content_types` is deliberately NOT one
+    // of them, and is covered above.
+    for field in [
+        "algorithms",
+        "min_content_length",
+        "max_decompressed_request_size",
+        "gzip_level",
+        "brotli_quality",
+        "remove_accept_encoding",
+        "decompress_request",
+    ] {
+        let mut object = serde_json::Map::new();
+        object.insert(field.to_string(), serde_json::Value::Null);
+        let config = serde_json::Value::Object(object);
+        assert_component_validity(&spec, "CompressionConfig", &config, true);
+        assert!(
+            CompressionPlugin::new(&config).is_ok(),
+            "runtime must treat an explicit null {field} as omitted"
+        );
+    }
+
+    // Values both surfaces must keep accepting, so the tightened bounds did not
+    // over-constrain the documented shapes.
+    for config in [
+        json!({"content_types": ["application/vnd.api+json", "text/csv"]}),
+        json!({"min_content_length": 0}),
+        json!({"max_decompressed_request_size": 1}),
+        json!({"max_decompressed_request_size": 33_554_432}),
+        json!({"brotli_quality": 11}),
+    ] {
+        assert_component_validity(&spec, "CompressionConfig", &config, true);
+        assert!(
+            CompressionPlugin::new(&config).is_ok(),
+            "runtime rejected a schema-valid compression config: {config}"
+        );
+    }
 }
 
 #[test]
@@ -11169,6 +11244,9 @@ fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract()
 
 #[test]
 fn spec_expose_schema_matches_strict_runtime_null_contract() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::spec_expose::SpecExpose;
+
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
     let schema = spec
@@ -11177,6 +11255,22 @@ fn spec_expose_schema_matches_strict_runtime_null_contract() {
 
     assert_eq!(schema["additionalProperties"], false);
     assert_eq!(schema["required"], json!(["spec_url"]));
+    assert_eq!(
+        schema["properties"]["spec_url"]["pattern"],
+        r"^\s*https?://[^/@?#]+(?:[/?#].*)?\s*$"
+    );
+    assert_eq!(
+        schema["properties"]["content_type"]["pattern"],
+        r"^[\u0009\u0020-\u007E]*[!-~][\u0009\u0020-\u007E]*$"
+    );
+    assert_eq!(
+        schema["properties"]["cache_ttl_seconds"]["maximum"],
+        json!(u64::MAX)
+    );
+    assert_eq!(
+        schema["properties"]["max_response_body_bytes"]["maximum"],
+        json!(u64::MAX)
+    );
     for (field, scalar_type) in [
         ("content_type", "string"),
         ("tls_no_verify", "boolean"),
@@ -11202,15 +11296,48 @@ fn spec_expose_schema_matches_strict_runtime_null_contract() {
         }),
         true,
     );
+    assert_component_validity(
+        &spec,
+        "SpecExposeConfig",
+        &json!({ "spec_url": " https://example.com/spec " }),
+        true,
+    );
+    SpecExpose::new(
+        &json!({ "spec_url": " https://example.com/spec " }),
+        PluginHttpClient::default(),
+    )
+    .expect("trimmed spec_url must remain accepted");
+
     for invalid in [
         json!({"spec_url": "https://example.com/openapi.yaml", "tls_no_verfy": true}),
         json!({"spec_url": "https://example.com/openapi.yaml", "content_type": 7}),
         json!({"spec_url": "https://example.com/openapi.yaml", "tls_no_verify": "false"}),
         json!({"spec_url": "https://example.com/openapi.yaml", "cache_ttl_seconds": -1}),
+        json!({"spec_url": "https://example.com/openapi.yaml", "cache_ttl_seconds": 1e20}),
         json!({"spec_url": "https://example.com/openapi.yaml", "max_response_body_bytes": 0}),
+        json!({"spec_url": "https://example.com/openapi.yaml", "max_response_body_bytes": 1e20}),
+        json!({"spec_url": "https://example.com/openapi.yaml", "content_type": "   "}),
+        json!({
+            "spec_url": "https://example.com/openapi.yaml",
+            "content_type": "application/yaml\r\nx-bad: yes"
+        }),
+        json!({"spec_url": "ftp://example.com/openapi.yaml"}),
+        json!({"spec_url": "https:///openapi.yaml"}),
+        json!({"spec_url": "https://user:pass@example.com/openapi.yaml"}),
+        json!({"spec_url": "not a url"}),
     ] {
         assert_component_validity(&spec, "SpecExposeConfig", &invalid, false);
+        assert!(
+            SpecExpose::new(&invalid, PluginHttpClient::default()).is_err(),
+            "schema-invalid spec_expose config unexpectedly passed runtime: {invalid}"
+        );
     }
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    assert!(plugin_docs.contains("must be nonempty after trim"));
+    assert!(plugin_docs.contains("Must be greater than zero"));
+    assert!(plugin_docs.contains("decoded to identity"));
+    assert!(plugin_docs.contains("reject-path `after_proxy`"));
 }
 
 #[test]
@@ -11953,11 +12080,53 @@ fn response_mock_schema_matches_strict_runtime_contract() {
 
     assert_eq!(rule["properties"]["path"]["minLength"], 1);
     assert_eq!(rule["properties"]["method"]["minLength"], 1);
-    assert_eq!(rule["properties"]["status_code"]["minimum"], 100);
-    assert_eq!(rule["properties"]["status_code"]["maximum"], 599);
+    assert_eq!(
+        rule["properties"]["method"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        rule["properties"]["method"]["pattern"],
+        "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+    );
+    let status_one_of = rule["properties"]["status_code"]["oneOf"]
+        .as_array()
+        .expect("status_code oneOf");
+    assert_eq!(status_one_of.len(), 3);
+    assert_eq!(status_one_of[0]["type"], "null");
+    assert_eq!(status_one_of[1]["const"], 101);
+    assert_eq!(status_one_of[2]["minimum"], 200);
+    assert_eq!(status_one_of[2]["maximum"], 599);
+    assert_eq!(
+        rule["properties"]["headers"]["type"],
+        json!(["object", "null"])
+    );
+    assert_eq!(
+        rule["properties"]["headers"]["propertyNames"]["pattern"],
+        "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+    );
+    assert!(
+        rule["properties"]["headers"]["propertyNames"]["not"]["pattern"]
+            .as_str()
+            .expect("protocol-managed header exclusion")
+            .contains("[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]")
+    );
     assert_eq!(
         rule["properties"]["headers"]["additionalProperties"]["type"],
         "string"
+    );
+    assert_eq!(
+        rule["properties"]["body"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        rule["properties"]["delay_ms"]["type"],
+        json!(["integer", "null"])
+    );
+    assert_eq!(rule["properties"]["delay_ms"]["minimum"], 0);
+    assert_eq!(rule["properties"]["delay_ms"]["maximum"], 3600000);
+    assert_eq!(
+        schema["properties"]["passthrough_on_no_match"]["type"],
+        json!(["boolean", "null"])
     );
 
     let description = schema["description"].as_str().expect("description");
@@ -12027,6 +12196,17 @@ fn response_mock_schema_matches_strict_runtime_contract() {
             }]
         }),
         json!({
+            "passthrough_on_no_match": null,
+            "rules": [{
+                "method": null,
+                "path": "/",
+                "status_code": null,
+                "headers": null,
+                "body": null,
+                "delay_ms": null
+            }]
+        }),
+        json!({
             "rules": [{
                 "path": "/api/v1",
                 "status_code": 599,
@@ -12040,6 +12220,7 @@ fn response_mock_schema_matches_strict_runtime_contract() {
                 "body": "must-not-be-sent"
             }]
         }),
+        json!({"rules": [{"path": "/", "delay_ms": 3600000}]}),
     ] {
         assert_component_validity(&spec, "ResponseMockConfig", &valid, true);
         assert!(
@@ -12058,10 +12239,14 @@ fn response_mock_schema_matches_strict_runtime_contract() {
         }),
         json!({"rules": [{"path": "", "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "method": "", "body": "ok"}]}),
+        json!({"rules": [{"path": "/health", "method": "BAD METHOD", "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "status_code": 99, "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "status_code": 100, "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "status_code": 103, "body": "ok"}]}),
+        json!({"rules": [{"path": "/health", "status_code": 199, "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "status_code": 600, "body": "ok"}]}),
+        json!({"rules": [{"path": "/", "delay_ms": -1}]}),
+        json!({"rules": [{"path": "/", "delay_ms": 3600001}]}),
         json!({"rules": [{"body": "missing-path"}]}),
         json!({"rules": []}),
         json!({}),
@@ -12071,24 +12256,22 @@ fn response_mock_schema_matches_strict_runtime_contract() {
                 "headers": {"x-mock": 42}
             }]
         }),
+        json!({
+            "rules": [{
+                "path": "/",
+                "headers": {"Content-Length": "3"}
+            }]
+        }),
+        json!({
+            "rules": [{
+                "path": "/",
+                "headers": {"connection": "close"}
+            }]
+        }),
     ] {
-        // OpenAPI keeps minimum 100 / maximum 599; runtime rejects unsupported
-        // informational statuses (100, 102–199) as the authoritative boundary.
-        let runtime_err = ResponseMock::new(&invalid).is_err();
-        if invalid
-            .pointer("/rules/0/status_code")
-            .and_then(|v| v.as_u64())
-            .is_some_and(|code| matches!(code, 100 | 103))
-        {
-            assert!(
-                runtime_err,
-                "informational status must fail runtime: {invalid}"
-            );
-            continue;
-        }
         assert_component_validity(&spec, "ResponseMockConfig", &invalid, false);
         assert!(
-            runtime_err,
+            ResponseMock::new(&invalid).is_err(),
             "schema-invalid config unexpectedly passed runtime: {invalid}"
         );
     }
@@ -12099,10 +12282,22 @@ fn response_mock_schema_matches_strict_runtime_contract() {
     assert!(guide.contains("WebSocket handshake contract"));
     assert!(guide.contains("never establishes an upgraded frame stream"));
     assert!(guide.contains("Unknown top-level and per-rule keys are rejected"));
+    assert!(guide.contains("Omitted or explicit `null`"));
+    assert!(guide.contains("0`–`3600000"));
     assert!(guide.contains("Status / body wire semantics"));
     assert!(guide.contains("informational statuses"));
     assert!(guide.contains("Native gRPC exclusion"));
     assert!(guide.contains("native gRPC unsupported"));
+
+    let features = include_str!("../../FEATURES.md");
+    assert!(
+        features.contains("relative only for prefix"),
+        "FEATURES.md must qualify prefix-only relative mock paths"
+    );
+    assert!(
+        features.contains("host-only"),
+        "FEATURES.md must mention host-only full-path matching"
+    );
 
     let matrix = include_str!("../../docs/plugin_execution_order.md");
     assert!(
@@ -13863,4 +14058,244 @@ fn opa_schema_and_constructor_admit_the_same_configs() {
             constructed.err()
         );
     }
+}
+
+/// The `MeshAuthzConfig` component must agree with what the plugin constructor
+/// actually admits — both directions. A schema that accepts a document the
+/// gateway rejects sends operators into a failed reload; one that rejects a
+/// supported document blocks a valid policy. The cases below are the ones the
+/// audit found disagreeing (issue #5066).
+#[test]
+fn mesh_authz_component_matches_runtime_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let policy = |rules: serde_json::Value| {
+        json!({
+            "name": "deny-admin",
+            "namespace": "default",
+            "scope": {"kind": "mesh_wide"},
+            "rules": rules,
+        })
+    };
+    let deny_admin = json!([{"action": "deny", "to": [{"paths": ["/admin/*"]}]}]);
+    let custom = json!([{"action": {"custom": {"provider": "ext"}}}]);
+    let no_action = json!([{"to": [{"paths": ["/admin/*"]}]}]);
+    let rule_typo = json!([{"action": "deny", "not_path": ["/a"]}]);
+    let match_typo = json!([{"action": "deny", "to": [{"not_path": ["/a"]}]}]);
+
+    for valid in [
+        // An omitted `config:` block deserializes to null for every plugin.
+        serde_json::Value::Null,
+        json!({}),
+        json!({"trust_domain_aliases": null}),
+        json!({"trust_domain_aliases": ["cluster.local"]}),
+        json!({"trusted_hbone_assertors": null}),
+        json!({"trusted_hbone_assertors": []}),
+        json!({"trusted_hbone_assertors": ["ztunnel", "waypoint"]}),
+        json!({"trusted_hbone_assertors": [{"assertor": "waypoint", "scope": null}]}),
+        // The constructor trims the scope value, exactly as it trims the
+        // assertor; the schema expresses that with a pattern, not an enum.
+        json!({"trusted_hbone_assertors": [{"assertor": "waypoint", "scope": " same_namespace "}]}),
+        json!({"trusted_hbone_assertors": [
+            {"assertor": "spiffe://cluster.local/ns/istio-system/sa/ztunnel", "scope": "mesh_wide"}
+        ]}),
+        json!({"mesh_policies": []}),
+        json!({"mesh_policies": [policy(deny_admin)]}),
+        json!({"mesh_policies": [policy(custom)]}),
+        json!({"mesh_policies": [{
+            "name": "scoped", "namespace": "default",
+            "scope": {"kind": "workload_selector", "selector": {"labels": {"app": "api"}}},
+        }]}),
+        json!({"node_waypoint_route_upstreams": [
+            {"id": "u", "namespace": "default", "targets": [{"host": "h", "port": 8080}]}
+        ]}),
+    ] {
+        assert_component_validity(&spec, "MeshAuthzConfig", &valid, true);
+    }
+
+    for invalid in [
+        // A non-object root builds a policy-free instance that allows
+        // everything, so it is refused rather than degraded.
+        json!(7),
+        json!("mesh_policies"),
+        json!([]),
+        // Unknown root key (the #4525 contract, kept).
+        json!({"mesh_policy": []}),
+        // A policy document with no identity or scope.
+        json!({"mesh_policies": [{}]}),
+        // `action` is required on every rule.
+        json!({"mesh_policies": [policy(no_action)]}),
+        // Closed grammar at each nesting level.
+        json!({"mesh_policies": [policy(rule_typo)]}),
+        json!({"mesh_policies": [policy(match_typo)]}),
+        json!({"mesh_policies": [{
+            "name": "scoped", "namespace": "default",
+            "scope": {"kind": "workload_selector", "selector": {"labelz": {}}},
+        }]}),
+        // Wrong-typed scoping flag: silently reading it as false would
+        // re-enable the construction-time scope filter on a node waypoint.
+        json!({"per_pod_policy_scoping": "true"}),
+        json!({"ambient_udp_source_scoping": 1}),
+        // Grant exclusivity and the exact-SPIFFE requirement for mesh_wide.
+        json!({"trusted_hbone_assertors": [
+            {"assertor": "waypoint", "asserts": [], "scope": "same_namespace"}
+        ]}),
+        json!({"trusted_hbone_assertors": [{"assertor": "waypoint", "scope": "mesh_wide"}]}),
+        // Trust-domain grammar.
+        json!({"trust_domain_aliases": ["not/a/domain"]}),
+        // uint16 has a numeric ceiling, not just a format hint.
+        json!({"node_waypoint_route_upstreams": [
+            {"id": "u", "namespace": "default", "targets": [{"host": "h", "port": 65536}]}
+        ]}),
+    ] {
+        assert_component_validity(&spec, "MeshAuthzConfig", &invalid, false);
+    }
+}
+
+/// `mesh_authz` is a public built-in that appears in `/plugins`, the execution
+/// order table, and the protocol matrix, so the public guide must carry its
+/// configuration and behavior reference (issue #5065).
+#[test]
+fn mesh_authz_public_guide_documents_its_configuration_contract() {
+    let guide = include_str!("../../docs/plugins.md");
+    assert!(
+        guide.contains("### `mesh_authz`"),
+        "docs/plugins.md must carry a mesh_authz section"
+    );
+
+    let section = guide
+        .split("### `mesh_authz`")
+        .nth(1)
+        .expect("mesh_authz section")
+        .split("\n### ")
+        .next()
+        .expect("mesh_authz section body");
+
+    // Every accepted root key, including the injection-only ones an operator
+    // will see echoed back by `GET /plugins`.
+    for key in [
+        "mesh_slice",
+        "mesh_policies",
+        "namespace",
+        "labels",
+        "per_pod_policy_scoping",
+        "ambient_udp_source_scoping",
+        "trust_domain_aliases",
+        "trusted_hbone_assertors",
+        "cluster_domain",
+        "cluster_domains",
+        "node_waypoint_route_upstreams",
+    ] {
+        assert!(
+            section.contains(&format!("`{key}`")),
+            "docs/plugins.md mesh_authz section must document `{key}`"
+        );
+    }
+
+    for contract in [
+        "2075",
+        "FailClosed",
+        "implicit-deny",
+        "**Strict configuration admission.**",
+        "**Trusted identity is required.**",
+    ] {
+        assert!(
+            section.contains(contract),
+            "docs/plugins.md mesh_authz section must state: {contract}"
+        );
+    }
+}
+
+/// The CUSTOM outcome vocabulary in `docs/mesh.md` must stay in lock-step with
+/// the closed reason enum (issue #5068). The exhaustive match makes a NEW
+/// reason a compile error here rather than a silently undocumented label, and
+/// the assertions pin BOTH the metric labels and the finer per-request reason
+/// tokens the metric folds into them.
+#[test]
+fn mesh_custom_authorization_outcome_documentation_matches_the_reason_enum() {
+    use ferrum_edge::plugins::mesh::ext_authz::MeshExtAuthzReason as Reason;
+
+    // The `outcome` metric label `record()` folds each reason into.
+    let metric_outcome = |reason: Reason| -> &'static str {
+        match reason {
+            Reason::Allowed => "allowed",
+            Reason::DeniedByProvider => "denied_by_provider",
+            Reason::ProviderUnbound => "provider_unbound",
+            Reason::ProviderError => "provider_error",
+            Reason::ProviderConflict => "provider_conflict",
+            Reason::Unexecutable => "unexecutable",
+            Reason::Timeout => "timeout",
+            Reason::TransportError | Reason::RequestBuildFailed => "transport_error",
+            Reason::ResponseTooLarge | Reason::ResponseReadFailed => "response_refused",
+            Reason::BodyUnavailable => "body_unavailable",
+            Reason::BodyTooLarge => "body_too_large",
+            Reason::ConcurrencyExhausted => "concurrency_exhausted",
+        }
+    };
+
+    let reasons = [
+        Reason::Allowed,
+        Reason::DeniedByProvider,
+        Reason::ProviderUnbound,
+        Reason::ProviderError,
+        Reason::ProviderConflict,
+        Reason::Unexecutable,
+        Reason::Timeout,
+        Reason::TransportError,
+        Reason::RequestBuildFailed,
+        Reason::ResponseTooLarge,
+        Reason::ResponseReadFailed,
+        Reason::BodyUnavailable,
+        Reason::BodyTooLarge,
+        Reason::ConcurrencyExhausted,
+    ];
+
+    let mesh_docs = include_str!("../../docs/mesh.md");
+    let mut outcomes: BTreeSet<&'static str> = BTreeSet::new();
+    for reason in reasons {
+        let token = reason.as_str();
+        assert!(
+            mesh_docs.contains(&format!("`{token}`")),
+            "docs/mesh.md must document the reason token `{token}`"
+        );
+        outcomes.insert(metric_outcome(reason));
+    }
+
+    assert_eq!(outcomes.len(), 12, "the outcome label set is twelve values");
+    for outcome in &outcomes {
+        assert!(
+            mesh_docs.contains(&format!("| `{outcome}` |")),
+            "docs/mesh.md outcome table must carry a row for `{outcome}`"
+        );
+    }
+    assert!(
+        !mesh_docs.contains("`response_refused`, `body_unavailable`"),
+        "docs/mesh.md must not restate the outcome set as a prose list that can drift"
+    );
+}
+
+/// The CUSTOM failure reference must not promise `failOpen` for the refusals
+/// that are decided without a provider, and must not describe cancellation as
+/// producing an allow (issue #5069).
+#[test]
+fn mesh_custom_authorization_failure_documentation_matches_the_runtime() {
+    let mesh_docs = include_str!("../../docs/mesh.md");
+
+    assert!(
+        mesh_docs.contains("**unconditional fixed `403` refusals**"),
+        "docs/mesh.md must document the unbound-provider / absent-executor refusal"
+    );
+    assert!(
+        mesh_docs.contains("it never synthesizes an allow"),
+        "docs/mesh.md must describe cancellation as ending the request"
+    );
+    assert!(
+        !mesh_docs.contains("and task cancellation are all failed checks"),
+        "docs/mesh.md must not restate the corrected fail-open claim"
+    );
+    assert!(
+        mesh_docs.contains("capped at **128 process-wide**"),
+        "docs/mesh.md must state the shared process-wide check budget"
+    );
 }
