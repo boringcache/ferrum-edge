@@ -18827,16 +18827,39 @@ components:
         Plugin: proxy_alerts — in-gateway anomaly notifications for proxy
         traffic. Observes HTTP/gRPC transaction summaries, TCP/UDP stream
         disconnect summaries, and WebSocket disconnect summaries, then sends
-        Trigger/Resolve notifications to Slack, Microsoft Teams, Discord, or
-        generic HTTP webhooks. See docs/proxy_alerts.md.
+        Trigger/Resolve notifications to Slack, Microsoft Teams, Discord,
+        generic HTTP webhooks, or SMTP email. See docs/proxy_alerts.md.
 
         Unknown top-level keys are rejected. Present values must match their
         declared types (`enabled` boolean, `quiet_hours_utc` array,
-        `max_concurrent_dispatches` integer >= 1, `max_delivery_retries`
+        `max_concurrent_dispatches` integer 1..=4294967295, `max_delivery_retries`
         integer 0..=8, `delivery_retry_base_ms` / `delivery_retry_max_ms`
-        integers in [10, 60000]). The `channels` map remains
+        integers in [10, 60000]). The constructor additionally requires
+        `delivery_retry_max_ms >= delivery_retry_base_ms`; standard JSON Schema
+        cannot compare those sibling numbers, so this schema does not claim
+        complete admission equivalence for that pair. The `channels` map remains
         open for arbitrary channel names; each channel/rule variant is closed
         to its selected shape. Rules may also be `enabled: false` drafts.
+        Webhook `method` is case-insensitive (constructor normalizes to
+        POST / PUT / PATCH). Channel URL and `*_env` strings must be nonempty;
+        HTTP webhook URLs must be HTTP(S) with a host and no userinfo.
+
+        Email `subject_template` / `body_template` reject empty strings.
+        Schema `maxLength` on those fields is a character ceiling for tooling;
+        the constructor enforces UTF-8 byte bounds (1024 / 65536) and balanced
+        `${` template syntax. SMTP `username` / `username_env` must be paired
+        with `password` / `password_env` and vice versa. `from` / `to` use the
+        constructor's ASCII addr-spec grammar (not annotation-only `format: email`).
+
+        Registration is OptionalFailOpen. Admin create/update performs strict
+        construction and returns HTTP 400 for an invalid enabled config before
+        storing it. During file-mode load, `ferrum-edge validate`, pre-existing
+        DB/CP snapshot application, or cache rebuild, invalid enabled configs
+        produce a validation/construction warning and omit this instance from
+        the published plugin cache rather than rejecting the surrounding
+        snapshot. `ferrum-edge validate` can therefore exit 0 with optional
+        plugin warnings; inspect those warnings to confirm the alert instance
+        is active.
       additionalProperties: false
       required: [channels, rules]
       properties:
@@ -18875,8 +18898,9 @@ components:
           type: integer
           format: uint32
           minimum: 1
+          maximum: 4294967295
           default: 8
-          description: Maximum concurrent outbound notification requests. Excess alerts are dropped, not queued.
+          description: Maximum concurrent outbound notification requests. Excess alerts are dropped, not queued. Values above uint32 (`4294967295`) are rejected.
         max_delivery_retries:
           type: integer
           format: uint32
@@ -18901,7 +18925,11 @@ components:
           minimum: 10
           maximum: 60000
           default: 2000
-          description: Upper bound for exponential jittered backoff between transient delivery retries. Must be >= delivery_retry_base_ms.
+          description: |
+            Upper bound for exponential jittered backoff between transient
+            delivery retries. The constructor requires this to be
+            `>= delivery_retry_base_ms`. That sibling comparison is
+            constructor-only; this schema cannot assert it.
         quiet_hours_utc:
           type: array
           default: []
@@ -18993,6 +19021,37 @@ components:
             minimum: 0
             maximum: 6
 
+    ProxyAlertsHttpUrl:
+      type: string
+      minLength: 1
+      format: uri
+      pattern: '^[hH][tT][tT][pP][sS]?://(?![^/?#]*@)(?:\[[^\]\s]+\]|[^/?#:\s]+)(?::[0-9]+)?(?:[/?#]\S*)?$'
+      description: |
+        HTTP or HTTPS URL with a host and no `user:pass@` userinfo. Empty
+        strings are rejected. `format: uri` is a Draft 2020-12 annotation;
+        this pattern is the enforceable constructor approximation
+        (constructor also parses the URL and rejects a missing host).
+
+    ProxyAlertsEnvName:
+      type: string
+      minLength: 1
+      description: |
+        Environment variable name resolved at construction. Empty names are
+        rejected. The named variable must also be set and nonempty at
+        construction; that process-environment check is constructor-only.
+
+    ProxyAlertsEmailAddress:
+      type: string
+      minLength: 1
+      maxLength: 254
+      format: email
+      pattern: '^[A-Za-z0-9!#$%&''*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&''*+/=?^_`{|}~-]+)*@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$'
+      description: |
+        ASCII addr-spec as enforced by the constructor (no quoted local parts,
+        comments, or address literals; local-part dots cannot start, end, or
+        repeat). `format: email` is an annotation; this pattern is the
+        enforceable grammar. Constructor also caps the local part at 64 bytes.
+
     ProxyAlertsChannel:
       oneOf:
         - $ref: "#/components/schemas/ProxyAlertsSlackChannel"
@@ -19021,11 +19080,10 @@ components:
           type: string
           enum: [slack]
         webhook_url:
-          type: string
-          format: uri
+          $ref: "#/components/schemas/ProxyAlertsHttpUrl"
           description: Slack incoming webhook URL. Prefer `webhook_url_env` for secrets.
         webhook_url_env:
-          type: string
+          $ref: "#/components/schemas/ProxyAlertsEnvName"
           description: Environment variable containing the Slack incoming webhook URL.
         channel_override:
           type: string
@@ -19049,11 +19107,10 @@ components:
           type: string
           enum: [teams]
         webhook_url:
-          type: string
-          format: uri
+          $ref: "#/components/schemas/ProxyAlertsHttpUrl"
           description: Microsoft Teams incoming webhook URL. Prefer `webhook_url_env` for secrets.
         webhook_url_env:
-          type: string
+          $ref: "#/components/schemas/ProxyAlertsEnvName"
           description: Environment variable containing the Teams incoming webhook URL.
 
     ProxyAlertsDiscordChannel:
@@ -19068,11 +19125,10 @@ components:
           type: string
           enum: [discord]
         webhook_url:
-          type: string
-          format: uri
+          $ref: "#/components/schemas/ProxyAlertsHttpUrl"
           description: Discord-compatible webhook URL. Prefer `webhook_url_env` for secrets.
         webhook_url_env:
-          type: string
+          $ref: "#/components/schemas/ProxyAlertsEnvName"
           description: Environment variable containing the Discord webhook URL.
         username:
           type: string
@@ -19090,16 +19146,18 @@ components:
           type: string
           enum: [webhook]
         url:
-          type: string
-          format: uri
+          $ref: "#/components/schemas/ProxyAlertsHttpUrl"
           description: HTTP(S) endpoint URL. Prefer `url_env` for secrets.
         url_env:
-          type: string
+          $ref: "#/components/schemas/ProxyAlertsEnvName"
           description: Environment variable containing the HTTP(S) endpoint URL.
         method:
           type: string
-          enum: [POST, PUT, PATCH]
+          pattern: '^[Pp][Oo][Ss][Tt]$|^[Pp][Uu][Tt]$|^[Pp][Aa][Tt][Cc][Hh]$'
           default: POST
+          description: |
+            HTTP method. Case-insensitive; the constructor normalizes to POST,
+            PUT, or PATCH. Spellings such as `post` and `pAtCh` are accepted.
         headers:
           type: object
           additionalProperties:
@@ -19109,7 +19167,13 @@ components:
           description: Headers sent with the webhook request. JSON content types JSON-escape template substitutions.
         body_template:
           type: string
-          description: Template body. Supports generic notification variables plus proxy_alerts variables such as `${rule_name}`, `${proxy_name}`, `${observed}`, `${threshold}`, `${sample_count}`, `${window_seconds}`, and `${reason}`.
+          description: |
+            Template body. Supports generic notification variables plus
+            proxy_alerts variables such as `${rule_name}`, `${proxy_name}`,
+            `${observed}`, `${threshold}`, `${sample_count}`, `${window_seconds}`,
+            and `${reason}`. Empty strings are allowed. Unbalanced `${`
+            placeholders are rejected at construction; JSON Schema cannot
+            express balanced-placeholder syntax.
 
     ProxyAlertsEmailChannel:
       type: object
@@ -19122,12 +19186,37 @@ components:
         offered, `AUTH` is never sent before the handshake completes, and
         certificate verification is always enforced (this channel does not honor
         `FERRUM_TLS_NO_VERIFY`; use `FERRUM_TLS_CA_BUNDLE_PATH` for private CAs).
+        Username and password (inline or `*_env`) must be paired: either both
+        sides are set or neither is.
+      allOf:
+        - if:
+            anyOf:
+              - required: [username]
+              - required: [username_env]
+          then:
+            anyOf:
+              - required: [password]
+              - required: [password_env]
+        - if:
+            anyOf:
+              - required: [password]
+              - required: [password_env]
+          then:
+            anyOf:
+              - required: [username]
+              - required: [username_env]
       properties:
         type:
           type: string
           enum: [email]
         smtp_host:
           type: string
+          minLength: 1
+          not:
+            anyOf:
+              - pattern: "://"
+              - pattern: "[/?#@\\s]"
+              - pattern: "^[^\\[\\]:]+:[^:]+$"
           description: SMTP relay hostname or IP literal. No scheme, port, path, or credentials.
         smtp_port:
           type: integer
@@ -19141,43 +19230,56 @@ components:
           description: TLS posture for the session. Both values complete a verified handshake before any credential or message data is written.
         tls_server_name:
           type: string
+          minLength: 1
           description: Verified TLS identity override. Defaults to `smtp_host`.
         username:
           type: string
-          description: SMTP AUTH username. Prefer `username_env`.
+          minLength: 1
+          description: SMTP AUTH username. Prefer `username_env`. Must be paired with `password` or `password_env`.
         username_env:
-          type: string
+          $ref: "#/components/schemas/ProxyAlertsEnvName"
           description: Environment variable containing the SMTP AUTH username.
         password:
           type: string
-          description: SMTP AUTH password. Prefer `password_env`. Redacted from lower-privilege plugin projections and audit records; full-admin reads remain raw by repository policy.
+          minLength: 1
+          description: SMTP AUTH password. Prefer `password_env`. Redacted from lower-privilege plugin projections and audit records; full-admin reads remain raw by repository policy. Must be paired with `username` or `username_env`.
         password_env:
-          type: string
+          $ref: "#/components/schemas/ProxyAlertsEnvName"
           description: Environment variable containing the SMTP AUTH password.
         from:
-          type: string
-          format: email
+          $ref: "#/components/schemas/ProxyAlertsEmailAddress"
           description: Envelope and header sender address (max 254 bytes, ASCII addr-spec).
         to:
           type: array
           minItems: 1
           maxItems: 32
           items:
-            type: string
-            format: email
+            $ref: "#/components/schemas/ProxyAlertsEmailAddress"
           description: Recipient addresses. Duplicates are collapsed.
         subject_template:
           type: string
+          minLength: 1
           maxLength: 1024
           default: "[${severity}] ${title}"
-          description: Subject template. Supports the generic notification variables plus the proxy_alerts variables; control characters in substituted values are folded to spaces.
+          description: |
+            Subject template. Schema `maxLength` is a character ceiling for
+            tooling. The constructor enforces a 1024-byte UTF-8 bound (a
+            600-character string of `é` is 1200 bytes and is rejected), rejects
+            empty strings, and rejects unbalanced `${` placeholders.
         body_template:
           type: string
+          minLength: 1
           maxLength: 65536
           default: "${body}\n\n${fields}"
-          description: "Plain-text body template. Adds `${fields}`, the notification's key/value rows rendered as `Name: value` lines."
+          description: |
+            Plain-text body template. Adds `${fields}`, the notification's
+            key/value rows rendered as `Name: value` lines. Schema `maxLength`
+            is a character ceiling; the constructor enforces a 65536-byte UTF-8
+            bound, rejects empty strings, and rejects unbalanced `${`
+            placeholders.
         helo_name:
           type: string
+          minLength: 1
           description: EHLO identity. Defaults to the domain of `from`.
         connect_timeout_ms:
           type: integer
