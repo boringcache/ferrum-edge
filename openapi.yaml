@@ -2073,7 +2073,9 @@ paths:
         process totals include retired workers and survive reload/removal. Per-event
         pending rows are memory exposure, not a persistence guarantee. Requires a valid admin
         JWT because sink status can expose billing topology and ClickHouse
-        endpoint metadata. Credentials and URL user-info are never returned.
+        endpoint metadata. Credentials, URL user-info, and the ClickHouse URL
+        path are never returned: `instances[].clickhouse.endpoint` is the
+        structural `scheme://host:port/redacted` form.
       tags: [Metrics]
       responses:
         "200":
@@ -30478,27 +30480,37 @@ components:
 
         OpenAPI encodes material cross-field invariants that JSON Schema can
         represent accurately: `clickhouse` (with runtime-mandatory `url`) is
-        required; snapshot mode requires `spool.enabled=true`; nonempty
+        required; snapshot mode forbids `spool.enabled=false`; nonempty
         `clickhouse.password_ref` requires `https://` and forbids disabled TLS
         certificate/hostname verification; `clickhouse.url` must be http(s)
-        without user-info; batch/spool/snapshot numeric bounds match the
-        constructor.
+        without user-info; `clickhouse.tls.client_cert_file` and
+        `client_key_file` must be set together; `pricing_tiers[].status_codes`
+        entries are unique within a tier; and batch/spool/snapshot numeric,
+        length, and character bounds match the constructor. Settings the
+        constructor ignores while `spool.enabled` is false (`dir`, `max_bytes`,
+        `replay_interval_secs`, `delivery_queue_capacity`) are constrained only
+        while spooling is enabled, which is the default.
 
-        Runtime admission layer (not safely expressible as OpenAPI 3.1
-        comparisons or input-independent checks):
-        `retry.max_delay_ms >= retry.initial_delay_ms`;
+        Cold constructor validation (`validate`, Admin, file mode, and CP-DP all
+        share it) adds the checks that need no I/O but that OpenAPI 3.1 cannot
+        express safely: `retry.max_delay_ms >= retry.initial_delay_ms`;
         worst-case cumulative inter-attempt delay
         (`retry.max_attempts` / `retry.initial_delay_ms` / `retry.max_delay_ms`)
         must not exceed 600000 ms;
-        `snapshot.stale_entry_ttl_secs >= snapshot.interval_secs`;
-        nonempty `password_ref` must name a set `FERRUM_*` process environment
-        variable; spool directory privacy/permissions
-        (`ensure_private_dir`); ClickHouse URL egress IP screening;
-        `wait_for_async_insert` falsy values require
-        `clickhouse.allow_lossy_async_insert=true`; and
-        whitespace-only trimming for `currency` / `pricing_version` /
-        `password_ref`. File, Admin, and CP-DP admission all invoke the same
-        plugin constructor validation path.
+        `snapshot.stale_entry_ttl_secs >= snapshot.interval_secs`; ClickHouse
+        URL egress IP screening; whitespace-only trimming for `currency` /
+        `pricing_version` / `password_ref`; that a nonempty `password_ref` *is
+        spelled* `FERRUM_*`; and UTF-8 byte bounds where `maxLength` above
+        counts characters instead.
+
+        Activation (serving startup) adds the checks that require local files,
+        the process environment, or the filesystem, and therefore do NOT run
+        under `ferrum-edge validate`: resolving `password_ref` to a set
+        environment variable, reading/parsing the TLS CA and client
+        certificate/key files, and creating the spool tree with private
+        permissions (`ensure_private_dir`). A configuration accepted by
+        `validate` can still abort serving startup on a node missing those
+        files or variables.
       allOf:
         - anyOf:
             - required: [pricing_tiers]
@@ -30539,14 +30551,67 @@ components:
               mode:
                 const: snapshot
           then:
-            required: [spool]
+            not:
+              required: [spool]
+              properties:
+                spool:
+                  type: object
+                  required: [enabled]
+                  properties:
+                    enabled:
+                      const: false
+        - not:
+            required: [clickhouse]
+            properties:
+              clickhouse:
+                type: object
+                required: [tls]
+                properties:
+                  tls:
+                    type: object
+                    oneOf:
+                      - required: [client_cert_file]
+                        properties:
+                          client_cert_file:
+                            type: string
+                          client_key_file:
+                            type: "null"
+                      - required: [client_key_file]
+                        properties:
+                          client_key_file:
+                            type: string
+                          client_cert_file:
+                            type: "null"
+        - if:
+            not:
+              required: [spool]
+              properties:
+                spool:
+                  type: object
+                  required: [enabled]
+                  properties:
+                    enabled:
+                      const: false
+          then:
             properties:
               spool:
                 type: object
-                required: [enabled]
                 properties:
-                  enabled:
-                    const: true
+                  dir:
+                    type: string
+                    minLength: 1
+                    not:
+                      pattern: '[\x00]'
+                  max_bytes:
+                    type: integer
+                    minimum: 1
+                  replay_interval_secs:
+                    type: integer
+                    minimum: 1
+                  delivery_queue_capacity:
+                    type: integer
+                    minimum: 1
+                    maximum: 1000000
         - not:
             allOf:
               - required: [clickhouse]
@@ -30613,15 +30678,29 @@ components:
         currency:
           type: string
           minLength: 1
+          maxLength: 512
           pattern: '\S'
           default: "USD"
-          description: Currency label written to each charge event. Runtime also rejects whitespace-only values after trim.
+          description: >-
+            Currency label written to each charge event. Runtime also rejects
+            whitespace-only values after trim, and bounds the label at 512
+            UTF-8 bytes: it is copied verbatim into every exported row and
+            counts against the bounded charge-event budget, so a longer label
+            would make every per-event export fail admission. `maxLength`
+            counts characters, so the runtime byte bound is the stricter of the
+            two for non-ASCII labels.
         pricing_version:
           type: string
           minLength: 1
+          maxLength: 512
           pattern: '\S'
           default: default
-          description: Operator-controlled pricing/version label written to each event. Runtime also rejects whitespace-only values after trim.
+          description: >-
+            Operator-controlled pricing/version label written to each event.
+            Runtime also rejects whitespace-only values after trim, and bounds
+            the label at 512 UTF-8 bytes for the same reason as `currency`.
+            `maxLength` counts characters, so the runtime byte bound is the
+            stricter of the two for non-ASCII labels.
         include_request_id:
           type: boolean
           default: true
@@ -30641,6 +30720,7 @@ components:
               status_codes:
                 type: array
                 minItems: 1
+                uniqueItems: true
                 items:
                   type: integer
                   minimum: 100
@@ -30703,10 +30783,10 @@ components:
               default: charges_raw
               description: ClickHouse table identifier interpolated into INSERT. ASCII letters, digits, underscore, and dot only.
             username:
-              type: string
-              description: Optional ClickHouse HTTP Basic username.
+              type: [string, "null"]
+              description: Optional ClickHouse HTTP Basic username. `null` is accepted and means unset.
             password_ref:
-              type: string
+              type: [string, "null"]
               pattern: '^\s*(?:FERRUM_.*)?\s*$'
               description: |
                 FERRUM_* environment variable containing the ClickHouse password,
@@ -30726,10 +30806,16 @@ components:
                   description: PEM CA bundle for this ClickHouse endpoint.
                 client_cert_file:
                   type: [string, "null"]
-                  description: PEM client certificate for ClickHouse mTLS.
+                  description: >-
+                    PEM client certificate for ClickHouse mTLS. Must be set
+                    together with `client_key_file`; the constructor rejects an
+                    incomplete pair during file/Admin/CP-DP admission rather
+                    than only when the TLS client is built.
                 client_key_file:
                   type: [string, "null"]
-                  description: PEM client private key for ClickHouse mTLS.
+                  description: >-
+                    PEM client private key for ClickHouse mTLS. Must be set
+                    together with `client_cert_file`.
                 verify_hostname:
                   type: boolean
                   default: true
@@ -30740,8 +30826,21 @@ components:
                   description: Disable certificate verification for this ClickHouse endpoint. Logs a warning and cannot be used with password_ref. Testing only.
             insert_query_params:
               type: object
+              propertyNames:
+                minLength: 1
+                maxLength: 128
+                allOf:
+                  - not:
+                      pattern: '[\x00-\x1f\x7f-\x9f]'
+                  - not:
+                      pattern: '[Aa][Pp][Ii][Kk][Ee][Yy]|[Aa][Pp][Ii]_[Kk][Ee][Yy]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll]|[Pp][Aa][Ss][Ss][Ww][Dd]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Tt][Oo][Kk][Ee][Nn]'
+                  - not:
+                      pattern: '^[Uu][Ss][Ee][Rr]$|^[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]$|^[Ss][Ee][Ss][Ss][Ii][Oo][Nn]_[Ii][Dd]$'
               additionalProperties:
                 type: string
+                maxLength: 512
+                not:
+                  pattern: '[\x00-\x1f\x7f-\x9f]'
               default: {}
               description: |
                 Extra query parameters appended to the ClickHouse INSERT request.
@@ -30765,6 +30864,11 @@ components:
                 string in any diagnostic; failures report a structurally
                 redacted `scheme://host:port/redacted` endpoint. Admin audit
                 projections redact every value in this map.
+
+                Names are 1-128 bytes and values at most 512 bytes, and neither
+                may contain a Unicode control character. The `maxLength`
+                keywords above count characters, so for non-ASCII names or
+                values the runtime UTF-8 byte bound is the stricter of the two.
             allow_lossy_async_insert:
               type: boolean
               default: false
@@ -30861,11 +30965,15 @@ components:
               default: true
             dir:
               type: string
-              minLength: 1
               default: /var/lib/ferrum/chargeback-spool
+              description: >-
+                Spool root. Constrained only while spooling is enabled (the
+                default): the constructor requires a nonempty, NUL-free path,
+                and ignores `dir`, `max_bytes`, `replay_interval_secs`, and
+                `delivery_queue_capacity` entirely when `enabled` is false.
             max_bytes:
               type: integer
-              minimum: 1
+              minimum: 0
               default: 10737418240
               description: |
                 Hard ceiling on total encoded on-disk bytes owned by this sink under
@@ -30897,12 +31005,11 @@ components:
                 being read or expanded without bound.
             replay_interval_secs:
               type: integer
-              minimum: 1
+              minimum: 0
               default: 60
             delivery_queue_capacity:
               type: integer
-              minimum: 1
-              maximum: 1000000
+              minimum: 0
               default: 4096
               description: >-
                 Bounded async handoff queue for overflow and failed-batch spool
@@ -30956,7 +31063,7 @@ components:
                 increments the explicit cardinality-rejection counter.
             max_retained_bytes:
               type: integer
-              minimum: 1
+              minimum: 9440
               maximum: 268435456
               default: 67108864
               description: |
@@ -31407,7 +31514,14 @@ components:
           properties:
             endpoint:
               type: string
-              description: ClickHouse endpoint with user-info, query, and fragment stripped.
+              description: >-
+                Structurally redacted ClickHouse endpoint,
+                `scheme://host:port/redacted`. User-info, path, query, and
+                fragment are never rendered, so this surface cannot disclose a
+                credential embedded in the configured URL that the admin
+                plugin-config read path already withholds from non-admin roles.
+                The durable spool owner still binds the full sanitized endpoint,
+                so redaction here does not move artifact ownership.
             database:
               type: string
             table:

@@ -13512,3 +13512,663 @@ async fn large_spool_status_and_prometheus_use_cached_gauges_without_inventory()
     );
     drop(plugin);
 }
+
+/// Owned `.ndjson` spool artifacts under a test spool root, in ULID order.
+fn owned_spool_artifacts(spool_dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![spool_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) == Some("ndjson") {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Total decoded JSONEachRow rows across every owned artifact.
+fn spool_row_count(spool_dir: &Path) -> usize {
+    owned_spool_artifacts(spool_dir)
+        .iter()
+        .map(|path| {
+            decode_spool_file_for_tests(path)
+                .expect("owned spool artifact decodes")
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+        })
+        .sum()
+}
+
+/// Cumulative process-wide ClickHouse export failures.
+fn export_failures_total() -> u64 {
+    let status: Value = serde_json::from_str(&render_status_json()).expect("status json");
+    status["totals"]["export"]["failures_total"]
+        .as_u64()
+        .unwrap_or(0)
+}
+
+/// `(received_total, persisted_total, dropped_total, pending)` process ledger.
+fn per_event_ledger() -> (u64, u64, u64, u64) {
+    let status: Value = serde_json::from_str(&render_status_json()).expect("status json");
+    let ledger = &status["totals"]["per_event"];
+    (
+        ledger["received_total"].as_u64().unwrap_or(0),
+        ledger["persisted_total"].as_u64().unwrap_or(0),
+        ledger["dropped_total"].as_u64().unwrap_or(0),
+        ledger["pending"].as_u64().unwrap_or(0),
+    )
+}
+
+/// Issue #5264: `snapshot.max_entries` admits up to 1,000,000 identities while
+/// one spool artifact holds at most 10,000 rows, so a single-artifact handoff
+/// refused every emission from a large accumulator forever. Recovery must split
+/// the batch into bounded artifacts instead.
+#[test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+fn compact_snapshot_recovery_chunks_more_rows_than_one_artifact_admits() {
+    const ROWS: usize = 10_001;
+    let ceiling = leaked_chargeback_test_ceiling(64 * 1024 * 1024);
+    let temp = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 64 * 1024 * 1024);
+    let spool = SpoolManager::for_tests_with_ceiling(settings, "node-a", ceiling).unwrap();
+    let events: Vec<ChargeEvent> = (0..ROWS)
+        .map(|index| sample_event(&format!("chunked-{index:06}")))
+        .collect();
+    let recovery = compact_recovery_probe_for_tests(ceiling, events, spool)
+        .expect("compact recovery must fit below the test ceiling");
+
+    assert!(
+        recovery.try_spool_for_tests(),
+        "a snapshot above the per-artifact row bound must still reach the spool"
+    );
+    assert_eq!(recovery.pending_len_for_tests(), 0);
+    let artifacts = owned_spool_artifacts(temp.path());
+    assert_eq!(
+        artifacts.len(),
+        2,
+        "{ROWS} rows must split into two bounded artifacts: {artifacts:?}"
+    );
+    assert_eq!(spool_row_count(temp.path()), ROWS);
+    drop(recovery);
+    assert_eq!(ceiling.used(), 0);
+}
+
+/// Issue #5264: when one artifact of a chunked handoff is refused, the durable
+/// prefix must be released and only the undelivered remainder retried, so a
+/// partial failure neither loses nor re-charges a billing row.
+#[test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+fn compact_snapshot_recovery_retains_only_rows_no_artifact_accepted() {
+    const DURABLE_ROWS: usize = 10_000;
+    let ceiling = leaked_chargeback_test_ceiling(64 * 1024 * 1024);
+    let temp = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 64 * 1024 * 1024);
+    let spool = SpoolManager::for_tests_with_ceiling(settings, "node-a", ceiling).unwrap();
+    let mut events: Vec<ChargeEvent> = (0..DURABLE_ROWS)
+        .map(|index| sample_event(&format!("prefix-{index:06}")))
+        .collect();
+    // The second artifact holds exactly one row whose conservative JSON bound
+    // exceeds the hard per-row limit, so that chunk is refused after the first
+    // one has already landed.
+    let mut refused = sample_event("refused-row");
+    refused.consumer_id = "c".repeat(400_000);
+    events.push(refused);
+    let recovery = compact_recovery_probe_for_tests(ceiling, events, spool)
+        .expect("compact recovery must fit below the test ceiling");
+
+    assert!(
+        !recovery.try_spool_for_tests(),
+        "a refused chunk must report the handoff as incomplete"
+    );
+    assert_eq!(
+        recovery.pending_len_for_tests(),
+        1,
+        "only the row no artifact accepted may stay pending"
+    );
+    assert_eq!(owned_spool_artifacts(temp.path()).len(), 1);
+    assert_eq!(spool_row_count(temp.path()), DURABLE_ROWS);
+    drop(recovery);
+    assert_eq!(ceiling.used(), 0);
+}
+
+/// Issue #5264: the periodic snapshot tick itself must chunk. With a healthy
+/// filesystem and 10,001 dirty identities the previous single-artifact write
+/// failed permanently, stranding billing data in memory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn snapshot_tick_above_the_artifact_row_bound_reaches_the_spool() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_emit_snapshot_tick_for_test,
+        api_chargeback_sink_snapshot_accumulator_for_test,
+    };
+
+    const IDENTITIES: usize = 10_001;
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("chunked-tick-spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let mut config = valid_config(&spool_dir);
+    config["mode"] = json!("snapshot");
+    config["spool"]["max_bytes"] = json!(64u64 * 1024 * 1024);
+    config["snapshot"] = json!({
+        "interval_secs": 3600,
+        "cleanup_interval_secs": 3600,
+        "stale_entry_ttl_secs": 7200,
+        "max_entries": 20_000,
+        "max_retained_bytes": 33_554_432
+    });
+
+    let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+        .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+    plugin.commit_background_tasks();
+    let accumulator =
+        api_chargeback_sink_snapshot_accumulator_for_test(&plugin).expect("snapshot accumulator");
+    for index in 0..IDENTITIES {
+        accumulator.record_for_test(
+            "ferrum",
+            &format!("consumer-{index:06}"),
+            "proxy-a",
+            "Payments",
+            200,
+            "http",
+            unit_call_charge(0.01),
+        );
+    }
+
+    assert_eq!(
+        api_chargeback_sink_emit_snapshot_tick_for_test(&plugin),
+        Some(Ok(IDENTITIES)),
+        "every dirty identity must reach the durable spool"
+    );
+    assert_eq!(owned_spool_artifacts(&spool_dir).len(), 2);
+    assert_eq!(spool_row_count(&spool_dir), IDENTITIES);
+    // The baseline advanced with the durable write, so the next tick has
+    // nothing left to emit and cannot double-charge the same identities.
+    assert_eq!(
+        api_chargeback_sink_emit_snapshot_tick_for_test(&plugin),
+        Some(Ok(0))
+    );
+    drop(plugin);
+}
+
+/// Issue #5266: a snapshot row is durable before its optional low-latency
+/// delivery is attempted, so a failed delivery must never report billing loss
+/// for a row the spool still owns and can replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn durably_spooled_snapshot_rows_are_never_counted_as_dropped() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_emit_snapshot_tick_for_test,
+        api_chargeback_sink_snapshot_accumulator_for_test,
+    };
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("false-loss-spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let mut config = valid_config(&spool_dir);
+    config["mode"] = json!("snapshot");
+    config["clickhouse"]["url"] = json!(server.uri());
+    config["batch"]["size"] = json!(1);
+    config["batch"]["flush_interval_ms"] = json!(50);
+
+    let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+        .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+    plugin.commit_background_tasks();
+
+    let before = per_event_ledger();
+    let failures_before = export_failures_total();
+    let accumulator =
+        api_chargeback_sink_snapshot_accumulator_for_test(&plugin).expect("snapshot accumulator");
+    accumulator.record_for_test(
+        "ferrum",
+        "alice",
+        "proxy-a",
+        "Payments",
+        200,
+        "http",
+        unit_call_charge(0.01),
+    );
+    assert_eq!(
+        api_chargeback_sink_emit_snapshot_tick_for_test(&plugin),
+        Some(Ok(1))
+    );
+
+    let settled = per_event_ledger();
+    assert_eq!(settled.0 - before.0, 1, "one row entered the ledger");
+    assert_eq!(
+        settled.1 - before.1,
+        1,
+        "the durable spool write settles the row"
+    );
+    assert_eq!(settled.2, before.2, "a spooled row is not a loss");
+
+    // Drive the delivery attempt to its terminal failure, which drops the
+    // accounting owner the snapshot handed to the queue.
+    wait_for_requests(&server, 1).await;
+    let mut failures = export_failures_total();
+    for _ in 0..200 {
+        if failures > failures_before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        failures = export_failures_total();
+    }
+    assert!(
+        failures > failures_before,
+        "the ClickHouse delivery attempt must reach a terminal failure"
+    );
+    // Keep sampling past the failure: the owner is released only after the
+    // snapshot hook declines to re-own an already durable batch.
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let observed = per_event_ledger();
+        assert_eq!(
+            observed.2, before.2,
+            "failed delivery of an already durable row must not report loss: {observed:?}"
+        );
+    }
+    assert!(
+        spool_row_count(&spool_dir) >= 1,
+        "the charge must remain durable and replayable"
+    );
+    drop(plugin);
+}
+
+/// GHSA-wq9r-g773-7c4q: the JWT-authenticated status surface must not hand any
+/// role the ClickHouse URL path — the admin plugin-config projection already
+/// withholds it from non-admin readers. The durable spool owner keeps binding
+/// that path, so the redaction cannot orphan existing artifacts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn status_redacts_the_clickhouse_endpoint_path_without_moving_spool_ownership() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_emit_snapshot_tick_for_test,
+        api_chargeback_sink_snapshot_accumulator_for_test,
+    };
+
+    fn spool_one_snapshot_row(plugin: &ApiChargebackSink) {
+        let accumulator = api_chargeback_sink_snapshot_accumulator_for_test(plugin)
+            .expect("snapshot accumulator");
+        accumulator.record_for_test(
+            "ferrum",
+            "alice",
+            "proxy-a",
+            "Payments",
+            200,
+            "http",
+            unit_call_charge(0.01),
+        );
+        assert_eq!(
+            api_chargeback_sink_emit_snapshot_tick_for_test(plugin),
+            Some(Ok(1))
+        );
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("marked-endpoint-spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let mut config = valid_config(&spool_dir);
+    config["mode"] = json!("snapshot");
+    config["clickhouse"]["url"] = json!("http://127.0.0.1:8123/path-credential-marker");
+    let plugin = ApiChargebackSink::new_with_config_id(
+        &config,
+        PluginHttpClient::default(),
+        "ferrum",
+        Some("endpoint-redaction"),
+    )
+    .expect("construct sink");
+    plugin.start_background_tasks().expect("start sink");
+    plugin.commit_background_tasks();
+    spool_one_snapshot_row(&plugin);
+
+    let status = render_status_json();
+    assert!(
+        !status.contains("path-credential-marker"),
+        "status must not disclose the ClickHouse URL path: {status}"
+    );
+    let parsed: Value = serde_json::from_str(&status).expect("status json");
+    let instance = parsed["instances"]
+        .as_array()
+        .expect("instances array")
+        .iter()
+        .find(|entry| entry["plugin_config_id"] == json!("endpoint-redaction"))
+        .expect("published sink instance");
+    assert_eq!(
+        instance["clickhouse"]["endpoint"],
+        json!("http://127.0.0.1:8123/redacted"),
+        "status must render the structural endpoint form: {instance}"
+    );
+    let owner_root = find_spool_namespace_root(&spool_dir).expect("owner namespace root");
+    let owner_name = owner_root
+        .file_name()
+        .expect("owner directory")
+        .to_string_lossy()
+        .into_owned();
+    drop(plugin);
+
+    // A different ClickHouse path must still be a different durable owner.
+    let other_dir = temp.path().join("other-endpoint-spool");
+    fs::create_dir_all(&other_dir).unwrap();
+    let mut other_config = valid_config(&other_dir);
+    other_config["mode"] = json!("snapshot");
+    other_config["clickhouse"]["url"] = json!("http://127.0.0.1:8123/other-path");
+    let other = ApiChargebackSink::new_with_config_id(
+        &other_config,
+        PluginHttpClient::default(),
+        "ferrum",
+        Some("endpoint-redaction"),
+    )
+    .expect("construct sink");
+    other.start_background_tasks().expect("start sink");
+    other.commit_background_tasks();
+    spool_one_snapshot_row(&other);
+    let other_root = find_spool_namespace_root(&other_dir).expect("owner namespace root");
+    let other_name = other_root
+        .file_name()
+        .expect("owner directory")
+        .to_string_lossy()
+        .into_owned();
+    assert_ne!(
+        owner_name, other_name,
+        "the durable spool owner must keep binding the ClickHouse URL path"
+    );
+    drop(other);
+}
+
+/// Issue #5265: a label longer than the bounded charge-event budget used to
+/// pass admission and then make every per-event export fail after the request
+/// had already succeeded, silently disabling billing export.
+#[tokio::test]
+async fn oversized_billing_labels_are_refused_at_admission() {
+    let temp = tempfile::tempdir().unwrap();
+    for field in ["currency", "pricing_version"] {
+        let mut rejected = valid_config(temp.path());
+        rejected[field] = json!("a".repeat(513));
+        let error = ApiChargebackSink::new(&rejected, PluginHttpClient::default(), "ferrum")
+            .expect_err("an unexportable label must be refused");
+        assert!(
+            error.contains(&format!("{field} must be at most 512 UTF-8 bytes")),
+            "unexpected error for {field}: {error}"
+        );
+
+        let mut accepted = valid_config(temp.path());
+        accepted[field] = json!("a".repeat(512));
+        ApiChargebackSink::new(&accepted, PluginHttpClient::default(), "ferrum")
+            .expect("a label at the bound stays admissible");
+    }
+}
+
+/// Issue #5265: every admitted label combination must still export an ordinary
+/// billable event, including both labels at their combined maximum.
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn maximum_length_billing_labels_still_export_per_event_charges() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!(server.uri());
+    config["batch"]["size"] = json!(1);
+    config["currency"] = json!("c".repeat(512));
+    config["pricing_version"] = json!("v".repeat(512));
+
+    let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+        .expect("maximum-length labels stay admissible");
+    plugin.start_background_tasks().expect("start sink");
+    plugin.commit_background_tasks();
+    plugin.log(&grpc_summary("proxy-a", "0")).await;
+
+    let requests = wait_for_requests(&server, 1).await;
+    let event: Value = requests[0].body_json().expect("charge event JSON");
+    assert_eq!(event["currency"], json!("c".repeat(512)));
+    assert_eq!(event["pricing_version"], json!("v".repeat(512)));
+    drop(plugin);
+}
+
+/// Issue #5268: an incomplete ClickHouse client certificate pair is a pure
+/// configuration shape, so cold admission must reject it instead of letting a
+/// deterministic pairing error abort serving startup later.
+#[tokio::test]
+async fn cold_admission_rejects_an_incomplete_clickhouse_client_certificate_pair() {
+    let temp = tempfile::tempdir().unwrap();
+    for field in ["client_cert_file", "client_key_file"] {
+        let mut config = valid_config(temp.path());
+        config["clickhouse"]["tls"] = json!({});
+        config["clickhouse"]["tls"][field] = json!("/nonexistent/ferrum-audit-identity");
+        let error = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+            .expect_err("an unpaired client identity must be refused");
+        assert!(
+            error.contains("client_cert_file and client_key_file must be set together"),
+            "unexpected error for {field}: {error}"
+        );
+        assert!(
+            !error.contains("failed to read"),
+            "cold admission must stay free of filesystem side effects: {error}"
+        );
+    }
+
+    let mut paired = valid_config(temp.path());
+    paired["clickhouse"]["tls"] = json!({
+        "client_cert_file": "/nonexistent/ferrum-audit.pem",
+        "client_key_file": "/nonexistent/ferrum-audit.key"
+    });
+    ApiChargebackSink::new(&paired, PluginHttpClient::default(), "ferrum")
+        .expect("a complete pair defers file reads to activation");
+
+    let mut neither = valid_config(temp.path());
+    neither["clickhouse"]["tls"] = json!({ "verify_hostname": true });
+    ApiChargebackSink::new(&neither, PluginHttpClient::default(), "ferrum")
+        .expect("no client identity at all stays valid");
+}
+
+/// Issue #5269: the component must represent constructor acceptance for runtime
+/// defaults, nullable optionals, spool settings that are unused while spooling
+/// is disabled, and every field bound JSON Schema can express.
+#[tokio::test]
+async fn openapi_component_matches_constructor_defaults_and_field_bounds() {
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    let spec: Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
+    let sink_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/ApiChargebackSinkConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&sink_schema)
+        .expect("ApiChargebackSinkConfig schema compiles");
+    let tiers = || json!([{"status_codes": [200], "price_per_call": 0.01}]);
+    let url = "https://clickhouse.example:8443";
+    let nul_dir = format!("/var/lib/ferrum{}spool", char::from(0u8));
+    let long_query_params = {
+        let mut params = serde_json::Map::new();
+        params.insert("a".repeat(129), json!("1"));
+        Value::Object(params)
+    };
+
+    let accepted = [
+        (
+            "snapshot relying on the enabled-spool default",
+            json!({"mode": "snapshot", "clickhouse": {"url": url}, "pricing_tiers": tiers()}),
+        ),
+        (
+            "snapshot with an empty spool object",
+            json!({
+                "mode": "snapshot",
+                "spool": {},
+                "clickhouse": {"url": url},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "null optional ClickHouse credentials",
+            json!({
+                "clickhouse": {"url": url, "username": null, "password_ref": null},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "snapshot byte budget at the runtime minimum",
+            json!({
+                "clickhouse": {"url": url},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers(),
+                "snapshot": {"max_retained_bytes": 9440}
+            }),
+        ),
+        (
+            "settings unused while the spool is disabled",
+            json!({
+                "clickhouse": {"url": url},
+                "spool": {
+                    "enabled": false,
+                    "dir": "",
+                    "max_bytes": 0,
+                    "replay_interval_secs": 0,
+                    "delivery_queue_capacity": 0
+                },
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "complete ClickHouse client identity",
+            json!({
+                "clickhouse": {
+                    "url": url,
+                    "tls": {
+                        "client_cert_file": "/nonexistent/c.pem",
+                        "client_key_file": "/nonexistent/c.key"
+                    }
+                },
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+    ];
+    for (label, config) in &accepted {
+        assert!(
+            validator.validate(config).is_ok(),
+            "{label} must be schema-valid: {config}"
+        );
+        assert!(
+            validate_plugin_config("api_chargeback_sink", config).is_ok(),
+            "{label} must pass runtime admission: {config}"
+        );
+    }
+
+    let rejected = [
+        (
+            "snapshot byte budget below the runtime minimum",
+            json!({
+                "clickhouse": {"url": url},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers(),
+                "snapshot": {"max_retained_bytes": 9439}
+            }),
+        ),
+        (
+            "duplicate status codes within one tier",
+            json!({
+                "clickhouse": {"url": url},
+                "spool": {"enabled": false},
+                "pricing_tiers": [{"status_codes": [200, 200], "price_per_call": 0.01}]
+            }),
+        ),
+        (
+            "client certificate without its key",
+            json!({
+                "clickhouse": {"url": url, "tls": {"client_cert_file": "/nonexistent/c.pem"}},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "client key without its certificate",
+            json!({
+                "clickhouse": {"url": url, "tls": {"client_key_file": "/nonexistent/c.key"}},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "currency above the label bound",
+            json!({
+                "clickhouse": {"url": url},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers(),
+                "currency": "a".repeat(513)
+            }),
+        ),
+        (
+            "pricing_version above the label bound",
+            json!({
+                "clickhouse": {"url": url},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers(),
+                "pricing_version": "a".repeat(513)
+            }),
+        ),
+        (
+            "credential-bearing insert query parameter",
+            json!({
+                "clickhouse": {"url": url, "insert_query_params": {"password": "x"}},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "insert query parameter name above the bound",
+            json!({
+                "clickhouse": {"url": url, "insert_query_params": long_query_params},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "NUL byte in an enabled spool directory",
+            json!({
+                "clickhouse": {"url": url},
+                "spool": {"enabled": true, "dir": nul_dir},
+                "pricing_tiers": tiers()
+            }),
+        ),
+    ];
+    for (label, config) in &rejected {
+        assert!(
+            validator.validate(config).is_err(),
+            "{label} must be schema-invalid: {config}"
+        );
+        assert!(
+            validate_plugin_config("api_chargeback_sink", config).is_err(),
+            "{label} must be runtime-rejected: {config}"
+        );
+    }
+}
