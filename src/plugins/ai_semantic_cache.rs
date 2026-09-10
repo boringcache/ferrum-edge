@@ -5567,10 +5567,11 @@ fn parse_semantic_config(
     let timeout_ms =
         optional_positive_u64(config, "semantic_embedding_timeout_ms")?.unwrap_or(5_000);
 
-    let auth_header = reqwest::header::HeaderName::from_bytes(auth_header.as_bytes()).map_err(|_| {
-        "ai_semantic_cache: 'semantic_embedding_auth_header' must be a valid HTTP header name"
-            .to_string()
-    })?;
+    let auth_header =
+        reqwest::header::HeaderName::from_bytes(auth_header.as_bytes()).map_err(|_| {
+            "ai_semantic_cache: 'semantic_embedding_auth_header' must be a valid HTTP header name"
+                .to_string()
+        })?;
     reqwest::header::HeaderValue::from_str(&auth_scheme).map_err(|_| {
         "ai_semantic_cache: 'semantic_embedding_auth_scheme' must be a valid HTTP header value"
             .to_string()

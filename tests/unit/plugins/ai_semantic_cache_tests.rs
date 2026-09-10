@@ -375,7 +375,10 @@ fn semantic_cache_schema_matches_constructor_admission() {
         (json!({"sync_mode": " LOCAL "}), false),
         (json!({"anonymous_caller_scope": null}), false),
         (json!({"anonymous_caller_scope": " Caller-Address "}), true),
-        (json!({"anonymous_caller_scope": "\u{85}SHARED\u{85}"}), true),
+        (
+            json!({"anonymous_caller_scope": "\u{85}SHARED\u{85}"}),
+            true,
+        ),
         (json!({"cache_multimodal": " Include-Fingerprints "}), true),
         (json!({"semantic_embedding_provider": " OpenAI "}), true),
         (json!({"semantic_embedding_provider": "VERTEX-AI"}), true),
@@ -386,9 +389,15 @@ fn semantic_cache_schema_matches_constructor_admission() {
         (json!({"semantic_vector_max_candidates": 1025}), false),
         (json!({"max_entry_size_bytes": 16777217}), false),
         (json!({"max_total_size_bytes": 1073741825}), false),
-        (json!({"semantic_embedding_auth_header": "bad header"}), false),
+        (
+            json!({"semantic_embedding_auth_header": "bad header"}),
+            false,
+        ),
         (json!({"semantic_embedding_auth_header": "x-key\n"}), false),
-        (json!({"semantic_embedding_auth_header": "X-Embedding-Key"}), true),
+        (
+            json!({"semantic_embedding_auth_header": "X-Embedding-Key"}),
+            true,
+        ),
         (json!({"semantic_embedding_auth_scheme": ""}), true),
         (json!({"semantic_embedding_auth_scheme": "Bearer\n"}), false),
         (json!({"semantic_embedding_api_key": "fixture\nkey"}), false),
@@ -480,9 +489,7 @@ fn semantic_cache_schema_bounds_redis_database_selectors() {
         "/+1/",
         "/-0",
     ] {
-        assert!(
-            validator.is_valid(&json!(format!("redis://localhost{selector}")))
-        );
+        assert!(validator.is_valid(&json!(format!("redis://localhost{selector}"))));
     }
     for selector in [
         "/banana",
@@ -492,9 +499,7 @@ fn semantic_cache_schema_bounds_redis_database_selectors() {
         "/99999999999",
         "/1#insecure",
     ] {
-        assert!(
-            !validator.is_valid(&json!(format!("redis://localhost{selector}")))
-        );
+        assert!(!validator.is_valid(&json!(format!("redis://localhost{selector}"))));
     }
 }
 
@@ -518,9 +523,7 @@ async fn embedding_authorization_supports_raw_and_prefixed_values() {
         let plugin = make_plugin(config);
         let (ctx, result) = run_lookup(&plugin, &semantic_request_body().to_string(), None).await;
         assert!(matches!(result, PluginResult::Continue));
-        assert!(
-            ai_semantic_cache_embedding(&ctx, instance_id(&plugin)).is_some()
-        );
+        assert!(ai_semantic_cache_embedding(&ctx, instance_id(&plugin)).is_some());
     }
 }
 
@@ -7828,9 +7831,7 @@ async fn semantic_cache_replay_preserves_body_and_runs_current_response_policy()
             assert_eq!(parsed["origin_id"], "origin-id");
             assert_eq!(parsed["id"], "client-id");
             if action == Some("redact") {
-                assert!(
-                    !String::from_utf8_lossy(&body).contains("user@example.com")
-                );
+                assert!(!String::from_utf8_lossy(&body).contains("user@example.com"));
             } else {
                 assert_eq!(body.as_ref(), retained.as_slice());
             }
