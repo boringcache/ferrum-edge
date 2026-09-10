@@ -30,7 +30,7 @@ use prost_reflect::{
 };
 use regex::{NoExpand, Regex, RegexSet};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
+use crate::fips::approved::Sha256;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read as _, Write as _};
@@ -4098,7 +4098,7 @@ impl AiResponseGuard {
         digest.update((content_type.len() as u64).to_be_bytes());
         digest.update(content_type.as_bytes());
         digest.update(body);
-        digest.finalize().into()
+        digest.finalize()
     }
 
     fn record_verified_redaction(
