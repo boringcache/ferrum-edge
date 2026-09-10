@@ -1813,7 +1813,10 @@ Request transformers run after authentication and authorization, so they only mo
 
 ### Compression runs after response transformation (4050)
 
-Decoded `ai_semantic_cache` hits defer the compression `after_proxy` hook and
+Decoded `ai_semantic_cache` hits preserve the finalized application body, skipping
+ordinary body rewrites already reflected in the entry. Body inspection and
+mandatory policy rewrites still run under private replay provenance; live header
+rules remain active. Hits defer the compression `after_proxy` hook and
 transport transform until after the synthetic reject-path header chain and
 its final plaintext body-policy recheck. The hook is invoked once in this late
 phase, so live header rules (including `no-transform` and strong `ETag`) govern
