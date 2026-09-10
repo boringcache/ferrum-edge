@@ -1199,7 +1199,9 @@ fn minimum_http_summary() -> TransactionSummary {
 
 fn minimum_grpc_summary() -> TransactionSummary {
     let mut summary = minimum_http_summary();
-    summary.metadata.insert("grpc_status".to_string(), "0".to_string());
+    summary
+        .metadata
+        .insert("grpc_status".to_string(), "0".to_string());
     summary
 }
 

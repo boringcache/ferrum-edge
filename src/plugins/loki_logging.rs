@@ -1492,7 +1492,11 @@ enum LokiAttemptOutcome {
 /// batching logger does not start a second retry loop. Count every lost
 /// record here; `Ok(())` is otherwise treated as a successful flush.
 fn record_loki_batch_discard(entry_count: usize) {
-    sink_loss::record_dropped(LOKI_PLUGIN_NAME, SinkLossReason::BatchDiscard, entry_count as u64);
+    sink_loss::record_dropped(
+        LOKI_PLUGIN_NAME,
+        SinkLossReason::BatchDiscard,
+        entry_count as u64,
+    );
 }
 
 fn loki_drain_diagnostic(drain: HttpBatchDrainOutcome) -> String {
