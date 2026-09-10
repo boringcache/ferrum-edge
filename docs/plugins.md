@@ -2430,8 +2430,8 @@ Logout expires the browser cookie and, with an authentic session cookie, sends `
 | `session.encryption_secret_previous` | String (optional) | Previous secret accepted for session and pending-flow cookie rotation |
 | `session.store` | String | Session backend; only `cookie` is implemented |
 | `session.cookie_name` | String (optional) | Explicit name opts out of automatic naming; default is context-derived and prefixed `__Host-` (secure, no domain, root path), `__Secure-` (secure, otherwise), or unprefixed when `session.secure` is false |
-| `session.ttl_secs` | u64 | Absolute session lifetime (default: `3600`) |
-| `session.idle_ttl_secs` | u64 | Idle timeout (default: `1800`) |
+| `session.ttl_secs` | u64 | Absolute session lifetime (default: `3600`; `1`–`31536000`) |
+| `session.idle_ttl_secs` | u64 | Idle timeout (default: `1800`; `1`–`31536000`) |
 | `session.max_cookie_bytes` | u64 | Maximum sealed session and pending-flow cookie size (default: `8000`) |
 | `session.domain` | String (optional) | Durable session Domain only; correlation cookies are host-only and scoped to `callback_path` |
 | `session.secure` | Boolean | Default `true`; when false, generated cookie names carry no `__Host-`/`__Secure-` prefix because a prefixed cookie without `Secure` is rejected by browsers |

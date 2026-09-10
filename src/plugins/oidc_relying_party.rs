@@ -54,6 +54,20 @@ const DEFAULT_REFRESH_SKEW_SECS: u64 = 30;
 const DEFAULT_CHALLENGE_HTML_STATUS: u64 = 302;
 const DEFAULT_CHALLENGE_API_STATUS: u64 = 401;
 const MAX_STATE_TTL_SECS: u64 = 3600;
+/// Upper bound on every configured session lifetime (`session.ttl_secs`,
+/// `session.idle_ttl_secs`) and on a provider-supplied `expires_in`, in
+/// seconds (365 days).
+///
+/// The request path adds these to a Unix timestamp. Without a finite bound an
+/// operator-supplied `u64` near `i64::MAX` (or a hostile provider `expires_in`)
+/// makes ordinary authenticated requests overflow that addition, and larger
+/// unsigned values wrap at the `i64` cast (issue #5028). No real deployment
+/// needs a longer gateway session than a year.
+const MAX_SESSION_TTL_SECS: u64 = 365 * 24 * 60 * 60;
+/// Upper bound on `provider[0].id_token_clock_skew_secs`, in seconds (1 hour).
+/// The value is leeway added to every claims-expiry comparison; anything larger
+/// is a broken clock, not a tolerance.
+const MAX_ID_TOKEN_CLOCK_SKEW_SECS: u64 = 3600;
 const STATE_EXPIRY_BUCKET_SECS: u64 = 1;
 const SESSION_PAYLOAD_VERSION: u8 = 2;
 const PENDING_FLOW_PAYLOAD_VERSION: u8 = 1;
@@ -878,6 +892,17 @@ impl OidcRelyingParty {
             .unwrap_or_else(|| "/oauth/logout".to_string());
         validate_path_only(&logout_path, "logout_path")?;
 
+        let id_token_clock_skew_secs = optional_u64(
+            provider_obj,
+            "id_token_clock_skew_secs",
+            DEFAULT_ID_TOKEN_CLOCK_SKEW_SECS,
+        )?;
+        if id_token_clock_skew_secs > MAX_ID_TOKEN_CLOCK_SKEW_SECS {
+            return Err(format!(
+                "oidc_relying_party: provider[0].id_token_clock_skew_secs must be <= {MAX_ID_TOKEN_CLOCK_SKEW_SECS}"
+            ));
+        }
+
         let discovery_doc = if let (Some(auth), Some(token), Some(jwks)) = (
             authorization_endpoint.clone(),
             token_endpoint.clone(),
@@ -933,6 +958,21 @@ impl OidcRelyingParty {
         let ttl_secs = optional_u64(session_obj, "ttl_secs", DEFAULT_SESSION_TTL_SECS)?;
         let idle_ttl_secs =
             optional_u64(session_obj, "idle_ttl_secs", DEFAULT_SESSION_IDLE_TTL_SECS)?;
+        // Both lifetimes are added to a Unix timestamp on every authenticated
+        // request. Reject values that cannot take part in that arithmetic here
+        // rather than panicking (or wrapping) once a browser holds a session.
+        for (field, value) in [("ttl_secs", ttl_secs), ("idle_ttl_secs", idle_ttl_secs)] {
+            if value == 0 {
+                return Err(format!(
+                    "oidc_relying_party: session.{field} must be greater than zero"
+                ));
+            }
+            if value > MAX_SESSION_TTL_SECS {
+                return Err(format!(
+                    "oidc_relying_party: session.{field} must be <= {MAX_SESSION_TTL_SECS}"
+                ));
+            }
+        }
         let max_cookie_bytes = optional_u64(
             session_obj,
             "max_cookie_bytes",
@@ -1159,11 +1199,7 @@ impl OidcRelyingParty {
                 .unwrap_or_else(|| "scope".to_string()),
             role_claim: optional_string(provider_obj, "role_claim", "provider[0]")?
                 .unwrap_or_else(|| "roles".to_string()),
-            id_token_clock_skew: Duration::from_secs(optional_u64(
-                provider_obj,
-                "id_token_clock_skew_secs",
-                DEFAULT_ID_TOKEN_CLOCK_SKEW_SECS,
-            )?),
+            id_token_clock_skew: Duration::from_secs(id_token_clock_skew_secs),
             http_client,
             warmup_hostnames: discovery_url
                 .and_then(|url| hostname_from_url(&url))
@@ -1268,10 +1304,7 @@ impl OidcRelyingParty {
             claims
         };
         let now = chrono::Utc::now().timestamp();
-        let expires_at = now
-            + token
-                .expires_in
-                .unwrap_or(self.session.ttl.as_secs() as i64);
+        let expires_at = expires_at_from_expires_in(token.expires_in, now, self.session.ttl);
         let claims_expires_at = claim_expiry(&merged_claims).unwrap_or(expires_at);
         let Ok(sub) = required_subject(&merged_claims, "ID token") else {
             return self.callback_reject(
@@ -1521,8 +1554,8 @@ impl OidcRelyingParty {
             return self.challenge(ctx, true);
         };
         let now = chrono::Utc::now().timestamp();
-        if now > payload.issued_at_unix + self.session.ttl.as_secs() as i64
-            || now > payload.last_touch_unix + self.session.idle_ttl.as_secs() as i64
+        if now > payload.issued_at_unix.saturating_add(self.session.ttl.as_secs() as i64)
+            || now > payload.last_touch_unix.saturating_add(self.session.idle_ttl.as_secs() as i64)
         {
             return self.challenge(ctx, true);
         }
@@ -3542,11 +3575,26 @@ fn encoded_session_cookie_len(plaintext_len: usize) -> usize {
 /// a provider issues very short-lived access tokens or ID-token claims (so
 /// `expires_at - refresh_skew` would already be in the past).
 fn next_refresh_after(expires_at_unix: i64, now: i64, refresh_skew_secs: i64) -> i64 {
-    (expires_at_unix - refresh_skew_secs).max(now + REFRESH_RETRY_BACKOFF_SECS)
+    expires_at_unix
+        .saturating_sub(refresh_skew_secs)
+        .max(now.saturating_add(REFRESH_RETRY_BACKOFF_SECS))
 }
 
 fn expires_at_for_token(token: &RefreshTokenResponse, now: i64, session_ttl: Duration) -> i64 {
-    now + token.expires_in.unwrap_or(session_ttl.as_secs() as i64)
+    expires_at_from_expires_in(token.expires_in, now, session_ttl)
+}
+
+/// Resolve a provider-supplied `expires_in` (seconds) into an absolute expiry.
+///
+/// Token responses are untrusted input: `expires_in` is a bare JSON number, so
+/// an absent, negative, or absurd value must never reach an unchecked timestamp
+/// addition on the request path. A missing value falls back to the configured
+/// session lifetime (itself bounded by `MAX_SESSION_TTL_SECS` at admission), and
+/// the result is clamped to `[now, now + MAX_SESSION_TTL_SECS]` so a negative
+/// duration fails closed as already expired instead of moving expiry backwards.
+fn expires_at_from_expires_in(expires_in: Option<i64>, now: i64, session_ttl: Duration) -> i64 {
+    let lifetime = expires_in.unwrap_or(session_ttl.as_secs() as i64);
+    now.saturating_add(lifetime.clamp(0, MAX_SESSION_TTL_SECS as i64))
 }
 
 fn claim_expiry(claims: &Value) -> Option<i64> {

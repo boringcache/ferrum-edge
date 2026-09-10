@@ -3389,3 +3389,95 @@ fn cli_config_validation_admits_oidc_without_a_tokio_runtime() {
         );
     }
 }
+
+/// Session lifetimes are added to a Unix timestamp on every authenticated
+/// request, so an unrepresentable `u64` must be refused at admission rather
+/// than overflowing that addition later (issue #5028).
+#[test]
+fn new_rejects_session_lifetimes_that_cannot_take_part_in_timestamp_arithmetic() {
+    const MAX_SESSION_TTL_SECS: u64 = 365 * 24 * 60 * 60;
+    for field in ["ttl_secs", "idle_ttl_secs"] {
+        for value in [json!(0), json!(MAX_SESSION_TTL_SECS + 1), json!(u64::MAX)] {
+            let mut config = base_config();
+            config["session"][field] = value.clone();
+            let error = OidcRelyingParty::new(&config, PluginHttpClient::default())
+                .err()
+                .unwrap_or_else(|| panic!("session.{field}={value} must be rejected"));
+            assert!(
+                error.contains(&format!("session.{field}")),
+                "unexpected error for session.{field}={value}: {error}"
+            );
+        }
+
+        // The largest representable value is still accepted.
+        let mut config = base_config();
+        config["session"][field] = json!(MAX_SESSION_TTL_SECS);
+        config["behavior"]["refresh_skew_secs"] = json!(1);
+        assert!(
+            validate_plugin_config("oidc_relying_party", &config).is_ok(),
+            "session.{field}={MAX_SESSION_TTL_SECS} must remain accepted"
+        );
+    }
+}
+
+/// `id_token_clock_skew_secs` is leeway added to every claims-expiry
+/// comparison; an unbounded value has the same overflow reach (issue #5028).
+#[test]
+fn new_rejects_unbounded_id_token_clock_skew() {
+    let mut config = base_config();
+    config["providers"][0]["id_token_clock_skew_secs"] = json!(3601);
+    let error = OidcRelyingParty::new(&config, PluginHttpClient::default())
+        .err()
+        .expect("an hour-plus clock skew must be rejected");
+    assert!(
+        error.contains("id_token_clock_skew_secs"),
+        "unexpected error: {error}"
+    );
+
+    let mut config = base_config();
+    config["providers"][0]["id_token_clock_skew_secs"] = json!(3600);
+    assert!(validate_plugin_config("oidc_relying_party", &config).is_ok());
+}
+
+/// A hostile or buggy provider controls `expires_in` outright. Neither an
+/// absurd nor a negative duration may reach the unchecked timestamp addition
+/// that used to panic the request path (issue #5028).
+#[tokio::test]
+async fn unrepresentable_provider_expires_in_does_not_panic_the_session_path() {
+    for expires_in in [json!(i64::MAX), json!(-1)] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "rotated-access-token",
+                "token_type": "Bearer",
+                "refresh_token": "rotated-refresh-token",
+                "expires_in": expires_in
+            })))
+            .mount(&server)
+            .await;
+
+        let plugin = OidcRelyingParty::new(
+            &refresh_config(&format!("{}/token", server.uri())),
+            PluginHttpClient::default(),
+        )
+        .expect("refresh plugin");
+        let now = chrono::Utc::now().timestamp();
+        let cookie = oidc_sealed_due_refresh_session_cookie_for_test(
+            &plugin,
+            json!({
+                "sub": "oidc-subject",
+                "email": "alice@example.test",
+                "exp": now + 3600
+            }),
+            "original-refresh-token",
+        )
+        .expect("session seals");
+        let mut ctx = ctx_with_session_cookie(&cookie);
+
+        // Completing the request at all is the assertion: the unchecked
+        // addition used to abort the worker with "attempt to add with overflow".
+        let consumers = ConsumerIndex::new(&[]);
+        assert_continue(plugin.authenticate(&mut ctx, &consumers).await);
+    }
+}

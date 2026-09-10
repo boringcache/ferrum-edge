@@ -64,6 +64,8 @@ When the provider issues a refresh token (typically by adding the `offline_acces
 
 Both a sliding update and a refresh re-issue the session cookie on the proxied response via `Set-Cookie`, preserving any cookie the backend also set.
 
+Both lifetimes are bounded at admission to `1`–`31536000` seconds (one year), and `provider[0].id_token_clock_skew_secs` to at most `3600`. These values are added to a Unix timestamp on every authenticated request, so a value that cannot take part in that arithmetic is rejected before startup instead of failing on a live request. A provider-supplied `expires_in` is clamped the same way: a missing value falls back to `session.ttl_secs`, a negative one is treated as already expired, and an absurd one is capped at one year.
+
 ### Concurrent refreshes and spent refresh tokens
 
 A browser routinely sends several requests carrying the same refresh-due cookie at once (parallel tabs, a page plus its asset fetches). Providers that rotate refresh tokens accept the token exactly once, so each such burst must submit it exactly once:
