@@ -2852,7 +2852,10 @@ fn ai_rate_limiter_schema_matches_constructor_admission() {
         schema["properties"]["redis_key_prefix"]["minLength"],
         json!(1)
     );
-    for duration in ["redis_connect_timeout_seconds", "redis_health_check_interval_seconds"] {
+    for duration in [
+        "redis_connect_timeout_seconds",
+        "redis_health_check_interval_seconds",
+    ] {
         assert_eq!(
             schema["properties"][duration]["minimum"],
             json!(1),
@@ -14856,7 +14859,15 @@ fn ai_rate_limiter_provider_enum_matches_runtime() {
             .unwrap_or_else(|err| panic!("runtime must accept provider '{normalized}': {err}"));
     }
 
-    for rejected in &["gemini", "vertex", "openai_compatible", "gpt", "", " ", "open ai"] {
+    for rejected in &[
+        "gemini",
+        "vertex",
+        "openai_compatible",
+        "gpt",
+        "",
+        " ",
+        "open ai",
+    ] {
         let config = json!({ "token_limit": 100000, "provider": rejected });
         assert!(
             validator.validate(&config).is_err(),
