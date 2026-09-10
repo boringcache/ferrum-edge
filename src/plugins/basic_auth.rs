@@ -312,7 +312,8 @@ fn authorization_value_is_basic(value: &str) -> bool {
 /// a `Bearer` (or any other) scheme survives untouched.
 fn strip_basic_authorization(headers: &mut std::collections::HashMap<String, String>) {
     headers.retain(|name, value| {
-        !(name.eq_ignore_ascii_case("authorization") && authorization_value_is_basic(value))
+        !(name.eq_ignore_ascii_case("authorization")
+            && authorization_value_is_basic(value.as_str()))
     });
 }
 

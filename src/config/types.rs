@@ -8378,7 +8378,8 @@ impl Consumer {
         // remain valid, and a consumer without Basic credentials is unaffected.
         if self.username.contains(':') && self.has_credential("basicauth") {
             errors.push(
-                "username must not contain ':' when the consumer has basicauth credentials —                  RFC 7617 Basic authentication cannot represent a colon in the user-id"
+                "username must not contain ':' when the consumer has basicauth credentials \
+                 — RFC 7617 Basic authentication cannot represent a colon in the user-id"
                     .to_string(),
             );
         }
