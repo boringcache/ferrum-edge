@@ -3110,8 +3110,41 @@ async fn test_content_mode_detection_and_redaction_cover_the_same_fields() {
             }]}),
         ),
         (
+            "messages[].content[].toolUse.input (bedrock converse)",
+            json!({"messages": [{
+                "role": "assistant",
+                "content": [{"toolUse": {
+                    "toolUseId": "tooluse_1",
+                    "name": "lookup_account",
+                    "input": {"note": format!("ssn {PII}")}
+                }}]
+            }]}),
+        ),
+        (
+            "messages[].content[].toolUse.input nested leaf (bedrock converse)",
+            json!({"messages": [{
+                "role": "assistant",
+                "content": [{"toolUse": {
+                    "toolUseId": "tooluse_1",
+                    "name": "lookup_account",
+                    "input": {"filters": [{"value": format!("ssn {PII}")}]}
+                }}]
+            }]}),
+        ),
+        (
             "message (cohere v1 current turn)",
             json!({"message": format!("ssn {PII}")}),
+        ),
+        (
+            "documents[] arbitrary map member (cohere v1)",
+            json!({"documents": [
+                {"id": "doc-1", "title": "clean"},
+                {"id": "doc-2", "snippet": format!("ssn {PII}")}
+            ]}),
+        ),
+        (
+            "documents[] recognized text member (cohere v1)",
+            json!({"documents": [{"id": "doc-1", "text": format!("ssn {PII}")}]}),
         ),
         (
             "preamble (cohere v1 system prompt)",
@@ -3168,6 +3201,151 @@ async fn test_content_mode_detection_and_redaction_cover_the_same_fields() {
             "`{label}` produced no redaction placeholder: {redacted}"
         );
     }
+}
+
+// ─── Bedrock Converse tool arguments / Cohere document maps ─────────────
+
+#[tokio::test]
+async fn test_content_mode_tool_use_scan_is_scoped_to_the_arguments_object() {
+    // `toolUse` carries call plumbing beside its arguments. Only `input` is
+    // model-visible prose, so an identifier or a tool name that incidentally
+    // matches a pattern must survive redaction untouched — rewriting either
+    // would corrupt the call the provider receives.
+    let plugin =
+        AiPromptShield::new(&json!({"action": "redact", "patterns": ["credit_card"]})).unwrap();
+    let body = json!({"messages": [{
+        "role": "assistant",
+        "content": [{"toolUse": {
+            "toolUseId": "4111111111111111",
+            "name": "4012888888881881",
+            "input": {"card": "4111111111111111"}
+        }}]
+    }]});
+
+    let raw = serde_json::to_vec(&body).unwrap();
+    let redacted = plugin
+        .transform_request_body(&raw, Some("application/json"), &make_transform_headers())
+        .await
+        .expect("tool arguments carrying PII must be rewritten");
+    let redacted: serde_json::Value = serde_json::from_slice(&redacted).unwrap();
+    let tool_use = &redacted["messages"][0]["content"][0]["toolUse"];
+
+    assert_eq!(tool_use["input"]["card"], json!("[REDACTED:credit_card]"));
+    assert_eq!(tool_use["toolUseId"], json!("4111111111111111"));
+    assert_eq!(tool_use["name"], json!("4012888888881881"));
+}
+
+#[tokio::test]
+async fn test_content_mode_tool_use_arguments_are_depth_bounded() {
+    // Arguments follow the tool's own JSON Schema, so the walk is the one
+    // shape here that descends. It stops at a fixed ceiling: a value nested
+    // past it is neither scanned nor rewritten, which keeps a hostile body
+    // from driving unbounded request-path work. Detection and redaction share
+    // the ceiling, so neither can report what the other did not do.
+    let mut deep = json!("ssn 123-45-6789");
+    for _ in 0..24 {
+        deep = json!({"next": deep});
+    }
+    let body = json!({"messages": [{
+        "role": "assistant",
+        "content": [{"toolUse": {"toolUseId": "tooluse_1", "input": deep}}]
+    }]});
+
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+    let mut ctx = make_post_ctx(&body);
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "arguments nested past the ceiling must not be scanned, got {result:?}"
+    );
+
+    let redactor = AiPromptShield::new(&json!({"action": "redact", "patterns": ["ssn"]})).unwrap();
+    let raw = serde_json::to_vec(&body).unwrap();
+    assert!(
+        redactor
+            .transform_request_body(&raw, Some("application/json"), &make_transform_headers())
+            .await
+            .is_none(),
+        "redaction must visit exactly what detection visited"
+    );
+}
+
+#[tokio::test]
+async fn test_content_mode_cohere_documents_skip_provider_hidden_members() {
+    // Cohere keeps the citation `id`, the `_excludes` control, and every
+    // member that control names out of the model-visible rendering, so they
+    // are not prompt text: scanning them would reject on bookkeeping the model
+    // never reads, and redacting them would corrupt citation retrieval.
+    let body = json!({"documents": [{
+        "id": "123-45-6789",
+        "_excludes": ["internal"],
+        "internal": "ssn 123-45-6789",
+        "snippet": "clean"
+    }]});
+
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+    let mut ctx = make_post_ctx(&body);
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "provider-hidden document members must stay outside Content mode, got {result:?}"
+    );
+
+    let redactor = AiPromptShield::new(&json!({"action": "redact", "patterns": ["ssn"]})).unwrap();
+    let raw = serde_json::to_vec(&body).unwrap();
+    assert!(
+        redactor
+            .transform_request_body(&raw, Some("application/json"), &make_transform_headers())
+            .await
+            .is_none(),
+        "redaction must leave provider-hidden document members untouched"
+    );
+}
+
+#[tokio::test]
+async fn test_content_mode_cohere_document_excludes_accept_the_single_value_spelling() {
+    // The control is documented as a list, but the single-string spelling
+    // reaches the provider too, and the detector and the redactor have to
+    // agree on it or one of them would act on a member the other skipped.
+    let body = json!({"documents": [{"_excludes": "internal", "internal": "ssn 123-45-6789"}]});
+
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+    let mut ctx = make_post_ctx(&body);
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a single-value `_excludes` must hide its member, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_content_mode_cohere_document_content_part_keeps_the_text_gate() {
+    // An entry carrying a `type` discriminator is a content part, not a
+    // document map, so it keeps the ordinary text-part gate: a text part is
+    // scanned and a non-text one is not, instead of every sibling string in
+    // the part being read as document prose.
+    let text_part = json!({"documents": [{"type": "text", "text": "ssn 123-45-6789"}]});
+    let image_part = json!({"documents": [{"type": "image_url", "url": "ssn 123-45-6789"}]});
+
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+    let mut ctx = make_post_ctx(&text_part);
+    let mut headers = make_post_headers();
+    let scanned = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(scanned, PluginResult::Reject { .. }),
+        "a text content part must still be scanned, got {scanned:?}"
+    );
+
+    let mut ctx = make_post_ctx(&image_part);
+    let mut headers = make_post_headers();
+    let skipped = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(skipped, PluginResult::Continue),
+        "a non-text content part must stay outside Content mode, got {skipped:?}"
+    );
 }
 
 // ─── Closed nested configuration ────────────────────────────────────────

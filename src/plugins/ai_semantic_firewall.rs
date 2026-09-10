@@ -5734,15 +5734,7 @@ fn extract_known_path(
             Some(prefixed_json_path(prefix, "$.context".to_string())),
             segments,
         ),
-        "$.documents[*].text" => extract_array_field(
-            json.get("documents"),
-            direction,
-            SegmentKind::Document,
-            "text",
-            "$.documents",
-            prefix,
-            segments,
-        ),
+        "$.documents[*].text" => extract_cohere_documents(json, direction, prefix, segments),
         "$.retrieved_context[*].content" => extract_array_field(
             json.get("retrieved_context"),
             direction,
@@ -6626,6 +6618,112 @@ fn extract_array_prose_field(
     }
 }
 
+/// Cohere document-map member holding the citation identifier. It is
+/// bookkeeping for citation retrieval rather than prompt prose, so it is not
+/// inspected.
+const DOCUMENT_ID_MEMBER: &str = "id";
+
+/// Cohere document-map member naming the document members the provider keeps
+/// out of the model-visible rendering. Neither the control list nor the members
+/// it names reach the model, so neither is inspected.
+const DOCUMENT_EXCLUDES_MEMBER: &str = "_excludes";
+
+/// Whether a Cohere document-map member is bookkeeping the provider keeps out
+/// of what the model reads: the citation [`DOCUMENT_ID_MEMBER`], the
+/// [`DOCUMENT_EXCLUDES_MEMBER`] control itself, or a member that control names.
+///
+/// The control list is scanned in place rather than collected into a set: both
+/// it and a document's member list are a handful of entries, and this runs on
+/// the request path.
+fn document_member_is_hidden(member: &str, excludes: Option<&Value>) -> bool {
+    if member == DOCUMENT_ID_MEMBER || member == DOCUMENT_EXCLUDES_MEMBER {
+        return true;
+    }
+    match excludes {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|excluded| excluded == member),
+        // Tolerate the single-value spelling of the same control.
+        Some(Value::String(excluded)) => excluded == member,
+        _ => false,
+    }
+}
+
+/// Cohere v1 `documents[]` RAG entries, read MEMBER-WISE rather than through a
+/// single recognized `text` member.
+///
+/// A Cohere v1 document is an arbitrary string-to-string map and the provider
+/// serializes its eligible members into the prompt the model reads, so
+/// inspecting only `text` leaves `title`, `snippet`, `url`, and every
+/// operator-chosen key uninspected while the model still sees them — and
+/// yields nothing at all for a document with no recognized member, which then
+/// looked like an uninspectable body rather than a poisoned one. Mirrors the
+/// member-wise reading the sibling `ai_request_guard` counts and the
+/// `ai_prompt_shield` scan (issue #4792); [`DOCUMENT_ID_MEMBER`] and
+/// [`DOCUMENT_EXCLUDES_MEMBER`] (plus every member the latter names) are
+/// skipped because the provider keeps them out of the model-visible rendering.
+///
+/// Every value is read through [`extract_prose_value`], so an OBJECT member
+/// yields no segment: `documents` is an ordinary word in unrelated JSON, and
+/// stringifying an arbitrary business object into one segment would ship it to
+/// the embedding provider. A body whose only `documents` content is objects is
+/// then treated as uninspectable and routed through
+/// `fail_on_uninspectable_body`, which is the fail-closed direction. An entry
+/// carrying a `type` discriminator is a content *part*, not a document map, so
+/// it keeps the recognized-`text` reading.
+///
+/// Bounded like every other extractor here: one level per member, no recursion.
+fn extract_cohere_documents(
+    json: &Value,
+    direction: Direction,
+    prefix: Option<&str>,
+    segments: &mut Vec<TextSegment>,
+) {
+    let Some(documents) = json.get("documents").and_then(Value::as_array) else {
+        return;
+    };
+    for (index, document) in documents.iter().enumerate() {
+        let document_path = || prefixed_json_path(prefix, format!("$.documents[{index}]"));
+        let Some(object) = document.as_object() else {
+            extract_prose_value(
+                Some(document),
+                direction,
+                SegmentKind::Document,
+                None,
+                Some(document_path()),
+                segments,
+            );
+            continue;
+        };
+        if object.contains_key("type") {
+            extract_prose_value(
+                object.get("text"),
+                direction,
+                SegmentKind::Document,
+                None,
+                Some(format!("{}.text", document_path())),
+                segments,
+            );
+            continue;
+        }
+        let excludes = object.get(DOCUMENT_EXCLUDES_MEMBER);
+        for (member, value) in object {
+            if document_member_is_hidden(member, excludes) {
+                continue;
+            }
+            extract_prose_value(
+                Some(value),
+                direction,
+                SegmentKind::Document,
+                None,
+                Some(format!("{}.{member}", document_path())),
+                segments,
+            );
+        }
+    }
+}
+
 /// Cohere v1 `/chat` history: `chat_history[].message`, attributed from the
 /// entry's `role` (`USER` / `CHATBOT` / `SYSTEM` / `TOOL`, matched
 /// case-insensitively because both casings reach the model).
@@ -6835,6 +6933,29 @@ fn extract_text_value(
                                 kind,
                                 role.clone(),
                                 child_path.as_deref(),
+                                segments,
+                            );
+                        } else if let Some(input) = object
+                            .get("toolUse")
+                            .and_then(|tool_use| tool_use.get("input"))
+                        {
+                            // Bedrock Converse tool call: the untyped union
+                            // spelling, which no `type` arm above matches and
+                            // which exposes no `text`/`content` member of its
+                            // own. Its `input` arguments are replayed to the
+                            // model on the next turn and are often the largest
+                            // text in it, so a prompt smuggled there is
+                            // inspected — attributed `ToolArguments`, matching
+                            // the Anthropic `$.content[*].input` path, rather
+                            // than as the enclosing message's own prose. Only
+                            // `input` is read: the sibling `toolUseId`/`name`
+                            // fields are call plumbing.
+                            extract_text_value(
+                                Some(input),
+                                direction,
+                                SegmentKind::ToolArguments,
+                                role.clone(),
+                                child_path.map(|path| format!("{path}.toolUse.input")),
                                 segments,
                             );
                         } else if let Some(content) = object.get("content") {

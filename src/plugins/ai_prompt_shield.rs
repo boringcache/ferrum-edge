@@ -720,6 +720,10 @@ impl AiPromptShield {
                 // `chat_history[].message`, which no [`CONTENT_SCAN_FIELDS`]
                 // entry reaches. See `collect_cohere_chat_history_text`.
                 collect_cohere_chat_history_text(json, &self.exclude_roles, &mut texts);
+                // Cohere v1 `/chat` RAG documents are arbitrary maps whose
+                // eligible members all reach the model, so they are read
+                // member-wise. See `collect_cohere_document_text`.
+                collect_cohere_document_text(json, &mut texts);
                 // Google Vertex legacy `predict` carries its prompt in
                 // `instances[].prompt`. See
                 // `collect_vertex_instance_prompts`.
@@ -1374,6 +1378,7 @@ impl AiPromptShield {
         redact_cohere_chat_history_text(json, &self.exclude_roles, &|text| {
             self.redact_text(text, budget)
         });
+        redact_cohere_document_text(json, &|text| self.redact_text(text, budget));
         redact_vertex_instance_prompts(json, &self.exclude_roles, &|text| {
             self.redact_text(text, budget)
         });
@@ -2599,6 +2604,13 @@ fn redact_content_part_text(part: &mut Value, redact: &impl Fn(&str) -> String) 
 /// * Amazon Bedrock Converse `{"guardContent": {"text": {"text": "..."}}}`,
 ///   and the flat `{"guardContent": {"text": "..."}}` spelling — either
 ///   reaches the model, so reading only one leaves the other unscanned.
+/// * Amazon Bedrock Converse `{"toolUse": {"toolUseId", "name", "input"}}` —
+///   the untyped union spelling of a tool call, whose `input` arguments are
+///   replayed to the model on the next turn and are often the largest text in
+///   it. Only `input` is scanned: the sibling `toolUseId`/`name` fields are
+///   call plumbing, not prose. The Anthropic `type: "tool_use"` spelling is
+///   deliberately NOT read here — a declared non-text block type stays outside
+///   Content-mode scanning, as `text_content_part_text` and its tests record.
 ///
 /// Tool-result content is text the model reads verbatim from a third party,
 /// which is exactly where a smuggled payload hides; the sibling
@@ -2610,8 +2622,10 @@ fn redact_content_part_text(part: &mut Value, redact: &impl Fn(&str) -> String) 
 ///
 /// Bounded to one level below the block: an array element contributes its own
 /// string or `text`, and nothing recurses, so a chained tool result cannot
-/// drive unbounded work. The mutating counterpart is
-/// [`redact_content_block_nested_text`].
+/// drive unbounded work. Tool arguments are the one shape read deeper, because
+/// an arguments object is arbitrary operator/model-shaped JSON with no fixed
+/// member; that traversal is bounded by [`collect_tool_argument_text`]. The
+/// mutating counterpart is [`redact_content_block_nested_text`].
 fn collect_content_block_nested_text<'a>(block: &'a Value, texts: &mut Vec<&'a str>) {
     if let Some(tool_result) = block.get("toolResult") {
         collect_tool_result_content_text(tool_result.get("content"), texts);
@@ -2619,13 +2633,70 @@ fn collect_content_block_nested_text<'a>(block: &'a Value, texts: &mut Vec<&'a s
         collect_tool_result_content_text(block.get("content"), texts);
     } else if let Some(text) = block.get("guardContent").and_then(guard_content_text) {
         texts.push(text);
+    } else if let Some(input) = block
+        .get("toolUse")
+        .and_then(|tool_use| tool_use.get("input"))
+    {
+        collect_tool_argument_text(input, texts, 0);
+    }
+}
+
+/// How deep [`collect_tool_argument_text`] descends into a tool-arguments
+/// value. Arguments follow the tool's own JSON Schema, so unlike every other
+/// block shape here they have no fixed member to read; a fixed ceiling keeps
+/// the request-path cost bounded without letting a shallow nest hide prose.
+/// Provider argument schemas are flat to a handful of levels, so 8 is well
+/// clear of real traffic while a hostile body cannot drive unbounded work.
+const MAX_TOOL_ARGUMENT_DEPTH: usize = 8;
+
+/// Every string leaf of a tool-arguments value, down to
+/// [`MAX_TOOL_ARGUMENT_DEPTH`].
+///
+/// Member *names* are not scanned: they are the tool's schema, not
+/// operator-supplied prose, and the redactor cannot rewrite a key without
+/// changing the arguments the provider receives. The mutating counterpart is
+/// [`redact_tool_argument_text`], which walks the identical shape at the
+/// identical depth so detection and redaction cannot drift.
+fn collect_tool_argument_text<'a>(value: &'a Value, texts: &mut Vec<&'a str>, depth: usize) {
+    match value {
+        Value::String(text) => texts.push(text.as_str()),
+        Value::Array(items) if depth < MAX_TOOL_ARGUMENT_DEPTH => {
+            for item in items {
+                collect_tool_argument_text(item, texts, depth + 1);
+            }
+        }
+        Value::Object(object) if depth < MAX_TOOL_ARGUMENT_DEPTH => {
+            for member in object.values() {
+                collect_tool_argument_text(member, texts, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Mutable mirror of [`collect_tool_argument_text`], rewriting exactly the same
+/// string leaves at the same depth.
+fn redact_tool_argument_text(value: &mut Value, redact: &impl Fn(&str) -> String, depth: usize) {
+    match value {
+        Value::String(text) => redact_string_in_place(text, redact),
+        Value::Array(items) if depth < MAX_TOOL_ARGUMENT_DEPTH => {
+            for item in items.iter_mut() {
+                redact_tool_argument_text(item, redact, depth + 1);
+            }
+        }
+        Value::Object(object) if depth < MAX_TOOL_ARGUMENT_DEPTH => {
+            for member in object.values_mut() {
+                redact_tool_argument_text(member, redact, depth + 1);
+            }
+        }
+        _ => {}
     }
 }
 
 /// Redact every string [`collect_content_block_nested_text`] scans, so
-/// Content-mode detection and redaction cannot drift on tool-result or
-/// guarded text (an asymmetry there is a fail-open bypass: the PII reported
-/// removed while the provider receives the original block).
+/// Content-mode detection and redaction cannot drift on tool-result, guarded,
+/// or tool-argument text (an asymmetry there is a fail-open bypass: the PII
+/// reported removed while the provider receives the original block).
 fn redact_content_block_nested_text(block: &mut Value, redact: &impl Fn(&str) -> String) {
     if let Some(tool_result) = block.get_mut("toolResult") {
         redact_tool_result_content_text(tool_result.get_mut("content"), redact);
@@ -2637,6 +2708,13 @@ fn redact_content_block_nested_text(block: &mut Value, redact: &impl Fn(&str) ->
     }
     if let Some(guard_content) = block.get_mut("guardContent") {
         redact_guard_content_text(guard_content, redact);
+        return;
+    }
+    if let Some(input) = block
+        .get_mut("toolUse")
+        .and_then(|tool_use| tool_use.get_mut("input"))
+    {
+        redact_tool_argument_text(input, redact, 0);
     }
 }
 
@@ -3155,6 +3233,123 @@ fn redact_cohere_chat_history_text(
         }
         if let Some(message) = turn.get_mut("message") {
             redact_field_text(message, exclude_roles, redact);
+        }
+    }
+}
+
+/// Cohere document-map member holding the citation identifier. It is
+/// bookkeeping for citation retrieval rather than prompt prose, so it is not
+/// scanned or rewritten.
+const DOCUMENT_ID_MEMBER: &str = "id";
+
+/// Cohere document-map member naming the document members the provider keeps
+/// out of the model-visible rendering. Neither the control list nor the members
+/// it names reach the model, so neither is scanned or rewritten.
+const DOCUMENT_EXCLUDES_MEMBER: &str = "_excludes";
+
+/// Whether a Cohere document-map member is bookkeeping the provider keeps out
+/// of what the model reads: the citation [`DOCUMENT_ID_MEMBER`], the
+/// [`DOCUMENT_EXCLUDES_MEMBER`] control itself, or a member that control names.
+///
+/// Shared by the detector and the redactor — passing the control value in
+/// rather than the whole map is what lets the redactor apply the identical
+/// predicate while it holds the map borrowed mutably, so the two cannot drift.
+///
+/// The control list is scanned in place rather than collected into a set: both
+/// it and a document's member list are a handful of entries, and this runs on
+/// the request path.
+fn document_member_is_hidden(member: &str, excludes: Option<&Value>) -> bool {
+    if member == DOCUMENT_ID_MEMBER || member == DOCUMENT_EXCLUDES_MEMBER {
+        return true;
+    }
+    match excludes {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|excluded| excluded == member),
+        // Tolerate the single-value spelling of the same control.
+        Some(Value::String(excluded)) => excluded == member,
+        _ => false,
+    }
+}
+
+/// Collect Cohere v1 `/chat` RAG document text for Content-mode scanning:
+/// every eligible member of each top-level `documents[]` entry.
+///
+/// A Cohere v1 document is an arbitrary string-to-string map and the provider
+/// serializes its eligible members into the prompt the model reads, so a
+/// reader that stops at a recognized `text` member leaves `title`, `snippet`,
+/// `url`, and every operator-chosen key unscanned while the model still sees
+/// them — and contributes nothing at all for a document with no recognized
+/// member. Documents are therefore read member-wise, minus the members
+/// [`document_member_is_hidden`] excludes. Member *names* are not scanned:
+/// they are structure rather than operator-supplied prose, and the redactor
+/// cannot rewrite a key without changing the document the provider receives.
+///
+/// Mirrors the member-wise reading the sibling `ai_request_guard` counts, so a
+/// shape one plugin reads is not silently invisible to the other (issue
+/// #4792).
+///
+/// An entry that carries a `type` discriminator is a content *part*, not a
+/// document map, so it keeps the ordinary [`text_content_part_text`] gate and
+/// non-text multimodal parts stay out. A bare-string entry contributes itself.
+/// Each retained member value is read through the same bounded one-level
+/// traversal a tool-result payload gets ([`collect_tool_result_content_text`]),
+/// so a document that nests content parts is still read and nothing recurses.
+fn collect_cohere_document_text<'a>(json: &'a Value, texts: &mut Vec<&'a str>) {
+    let Some(documents) = json.get("documents").and_then(Value::as_array) else {
+        return;
+    };
+    for document in documents {
+        let Some(object) = document.as_object() else {
+            collect_tool_result_content_text(Some(document), texts);
+            continue;
+        };
+        if object.contains_key("type") {
+            if let Some(text) = text_content_part_text(document) {
+                texts.push(text);
+            }
+            continue;
+        }
+        let excludes = object.get(DOCUMENT_EXCLUDES_MEMBER);
+        for (member, value) in object {
+            if document_member_is_hidden(member, excludes) {
+                continue;
+            }
+            collect_tool_result_content_text(Some(value), texts);
+        }
+    }
+}
+
+/// Redact every Cohere document member scanned by
+/// [`collect_cohere_document_text`], keeping Content-mode detection and
+/// redaction symmetric.
+///
+/// The `_excludes` control is cloned before the map is borrowed mutably, and
+/// only for a document that actually carries one, so the redactor applies the
+/// same [`document_member_is_hidden`] predicate the detector did.
+fn redact_cohere_document_text(json: &mut Value, redact: &impl Fn(&str) -> String) {
+    let Some(documents) = json.get_mut("documents").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for document in documents.iter_mut() {
+        if !document.is_object() {
+            redact_tool_result_content_text(Some(document), redact);
+            continue;
+        }
+        if document.get("type").is_some() {
+            redact_content_part_text(document, redact);
+            continue;
+        }
+        let excludes = document.get(DOCUMENT_EXCLUDES_MEMBER).cloned();
+        let Some(object) = document.as_object_mut() else {
+            continue;
+        };
+        for (member, value) in object.iter_mut() {
+            if document_member_is_hidden(member, excludes.as_ref()) {
+                continue;
+            }
+            redact_tool_result_content_text(Some(value), redact);
         }
     }
 }
