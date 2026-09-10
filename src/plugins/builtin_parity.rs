@@ -156,7 +156,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "spec_expose",
         classification: BuiltinPluginClassification::Public,
         priority: 210,
-        active_phases: "on_request_received",
+        active_phases: "on_request_received, after_proxy",
         matrix_protocols: HTTP_ONLY_PROTOCOLS,
         protocol_rationale: "HTTP-only; requires prefix listen_path",
     },

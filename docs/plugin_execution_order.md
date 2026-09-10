@@ -1597,7 +1597,7 @@ Given all built-in plugins enabled, the execution order is:
 | 6 | `ip_restriction` | 150 | on_request_received, on_stream_connect |
 | 7 | `geo_restriction` | 175 | on_request_received, on_stream_connect |
 | 8 | `bot_detection` | 200 | on_request_received |
-| 9 | `spec_expose` | 210 | on_request_received |
+| 9 | `spec_expose` | 210 | on_request_received, after_proxy |
 | 10 | `sse` | 250 | on_request_received, before_proxy, after_proxy, transform_response_body |
 | 11 | `grpc_web` | 260 | on_request_received, before_proxy, transform_request_body, on_final_request_body, after_proxy, transform_response_body |
 | 12 | `grpc_method_router` | 275 | on_request_received, on_backend_path_resolved |
@@ -1728,7 +1728,7 @@ chain.
 
 ### Spec expose runs after IP restriction and bot detection (priority 210)
 
-`spec_expose` intercepts `GET` and `HEAD` at the canonical `{listen_path}/specz` resource and returns the API specification without proxying. `HEAD` retains the GET representation until response-body transforms and guards establish the final status and headers, then suppresses the wire body. It runs at priority 210 — after IP restriction (150) and bot detection (200) so blocked IPs and bots cannot access spec endpoints, but before all authentication plugins (950+). This makes the `/specz` endpoint unauthenticated by design, allowing legitimate API consumers to discover contracts without credentials while still enforcing network-level security policies. Route-level `allowed_methods` admission still runs before the plugin.
+`spec_expose` intercepts `GET` and `HEAD` at the canonical `{listen_path}/specz` resource and returns the API specification without proxying. `HEAD` retains the GET representation until response-body transforms and guards establish the final status and headers, then the reject-path `after_proxy` hook suppresses the wire body after synthetic body policy. It runs at priority 210 — after IP restriction (150) and bot detection (200) so blocked IPs and bots cannot access spec endpoints, but before all authentication plugins (950+). This makes the `/specz` endpoint unauthenticated by design, allowing legitimate API consumers to discover contracts without credentials while still enforcing network-level security policies. Route-level `allowed_methods` admission still runs before the plugin.
 
 ### Authentication before authorization (1000s before 2000s)
 

@@ -27286,14 +27286,15 @@ components:
               - path
             properties:
               method:
-                type: string
+                type: [string, "null"]
                 minLength: 1
+                pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
                 description: >-
-                  HTTP method token to match (omit to match all methods). When
-                  supplied it must be non-empty and parse as an HTTP method
-                  token (runtime validates via http::Method). The configured
-                  method is normalized to uppercase and compared exactly with
-                  the request method.
+                  HTTP method token to match (omit or null to match all methods).
+                  When supplied it must be a non-empty HTTP method token (runtime
+                  validates via http::Method). The configured method is
+                  normalized to uppercase and compared exactly with the request
+                  method.
               path:
                 type: string
                 minLength: 1
@@ -27302,11 +27303,8 @@ components:
                   (e.g., /users for listen_path /api/v1). For exact (`=`),
                   regex (`~`), root (`/`), and host-only proxies, use the full
                   request path. Regex rule paths use a ~ prefix (auto-anchored).
+                  Full Rust regex compilation remains a runtime-only check.
               status_code:
-                type: integer
-                format: uint16
-                minimum: 100
-                maximum: 599
                 description: >-
                   HTTP status code to return (default 200). Must be a final
                   status 200–599, or 101 for a synthetic WebSocket handshake
@@ -27316,49 +27314,79 @@ components:
                   a success-like 200 on HTTP/2 / HTTP/3 Extended CONNECT, is
                   still only a synthetic HTTP handshake response; it does not
                   create an upgraded frame stream. A 101 rule that matches an
-                  ordinary HTTP request fails closed with status 500.
+                  ordinary HTTP request fails closed with status 500. Omitted
+                  or null selects 200.
+                default: 200
+                oneOf:
+                  - type: "null"
+                  - type: integer
+                    const: 101
+                  - type: integer
+                    minimum: 200
+                    maximum: 599
               headers:
-                type: object
+                type: [object, "null"]
+                propertyNames:
+                  type: string
+                  minLength: 1
+                  pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+                  not:
+                    pattern: "^([Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Ee]|[Tt][Rr][Aa][Ii][Ll][Ee][Rr]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee])$"
                 additionalProperties:
                   type: string
+                  pattern: '^[\u0009\u0020-\u007E]*$'
                 description: >-
                   Response headers (default content-type application/json).
-                  Protocol-managed hop-by-hop and framing names (`connection`,
-                  `content-length`, `keep-alive`, `proxy-authenticate`,
-                  `proxy-connection`, `te`, `trailer`, `transfer-encoding`,
-                  `upgrade`) are rejected at construction.
+                  Omitted or null selects that default. Names must be HTTP
+                  field-name tokens. Protocol-managed hop-by-hop and framing
+                  names (`connection`, `content-length`, `keep-alive`,
+                  `proxy-authenticate`, `proxy-connection`, `te`, `trailer`,
+                  `transfer-encoding`, `upgrade`) are rejected at construction,
+                  including case variants. Values must be valid HTTP header
+                  values (HTAB and printable ASCII).
               body:
-                type: string
+                type: [string, "null"]
                 description: >-
-                  Response body string (default empty). On the wire, HEAD
-                  responses omit content bytes while keeping representation
-                  Content-Length. Statuses 204, 205, and 304 omit both the body
-                  and Content-Length even when this field is non-empty. Shared
-                  synthetic-response finalization keeps H1, H2, and H3 aligned.
+                  Response body string (default empty). Omitted or null
+                  selects empty. On the wire, HEAD responses omit content bytes
+                  while keeping representation Content-Length. Statuses 204, 205,
+                  and 304 omit both the body and Content-Length even when this
+                  field is non-empty. Shared synthetic-response finalization
+                  keeps H1, H2, and H3 aligned.
               delay_ms:
-                type: integer
+                type: [integer, "null"]
                 format: uint64
+                minimum: 0
                 maximum: 3600000
-                description: "Simulated latency in milliseconds (default 0). Capped at 3600000 (1 hour); larger values are rejected at config validation."
+                default: 0
+                description: >-
+                  Simulated latency in milliseconds (default 0). Omitted or
+                  null selects 0. Must be an unsigned integer 0–3600000
+                  (1 hour); negative values and values above the cap are
+                  rejected at config validation.
         passthrough_on_no_match:
-          type: boolean
+          type: [boolean, "null"]
+          default: false
           description: >-
             If true, unmatched requests (including WebSocket upgrades) continue
-            to the backend. If false (default), returns 404.
+            to the backend. If false (default), returns 404. Omitted or null
+            selects false.
 
     SpecExposeConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: spec_expose — Exposes API specification documents (OpenAPI, WSDL, WADL) for GET and HEAD on the canonical /specz sub-path. HEAD retains the GET representation through response-body policy, then returns the final status and representation headers without a wire body. Unauthenticated. Only works with prefix-based listen_path proxies (HTTP only). Successful upstream fetches are capped by max_response_body_bytes and cached in-process for cache_ttl_seconds (default 300s). Failed fetches are coalesced and negatively cached with bounded exponential backoff; excess cache-miss waiters receive HTTP 503 with Retry-After."
+      description: "Plugin: spec_expose — Exposes API specification documents (OpenAPI, WSDL, WADL) for GET and HEAD on the canonical /specz sub-path. HEAD retains the GET representation through response-body policy, then returns the final status and representation headers without a wire body. Unauthenticated. Only works with prefix-based listen_path proxies (HTTP only). Successful upstream fetches are capped by max_response_body_bytes, decoded from origin Content-Encoding (gzip, x-gzip, br, identity) to identity bytes before cache and /specz, and cached in-process for cache_ttl_seconds (default 300s). Unsupported or malformed origin coding is HTTP 502. Failed fetches are coalesced and negatively cached with bounded exponential backoff; excess cache-miss waiters receive HTTP 503 with Retry-After."
       required:
         - spec_url
       properties:
         spec_url:
           type: string
-          description: "Full URL (http or https only) to fetch the API specification document (e.g., https://internal-service/docs/openapi.yaml). URL userinfo is rejected. Paths and queries may be used for origin routing or signed access, but are omitted from gateway diagnostics."
+          pattern: '^\s*https?://[^/@?#]+(?:[/?#].*)?\s*$'
+          description: "Full URL (http or https only) to fetch the API specification document (e.g., https://internal-service/docs/openapi.yaml). Surrounding whitespace is trimmed. The authority must be nonempty and must not contain userinfo ('@'). Paths and queries may be used for origin routing or signed access, but are omitted from gateway diagnostics. Remaining URL parse details (IPv6 literals, IDNA, percent-encoding) are runtime-only."
         content_type:
           type: [string, "null"]
-          description: "Trusted response Content-Type override; it is not restricted by the upstream allow-list. When omitted or null, only supported spec media types are preserved from upstream (case-insensitive media-type comparison, with original parameters retained); every other or missing value falls back to application/octet-stream."
+          pattern: '^[\u0009\u0020-\u007E]*[!-~][\u0009\u0020-\u007E]*$'
+          description: "Trusted response Content-Type override; it is not restricted by the upstream allow-list. When set it must be nonempty after trim and a valid HTTP header value (HTAB and printable ASCII). When omitted or null, only supported spec media types are preserved from upstream (case-insensitive media-type comparison, with original parameters retained); every other or missing value falls back to application/octet-stream."
         tls_no_verify:
           type: [boolean, "null"]
           description: "Skip TLS certificate verification when fetching the spec. Omitted or null defaults to the gateway's FERRUM_TLS_NO_VERIFY setting. When verification is enabled and a gateway CA bundle is configured, load or parse failure rejects plugin construction instead of widening trust."
@@ -27366,14 +27394,16 @@ components:
           type: [integer, "null"]
           format: uint64
           minimum: 0
+          maximum: 18446744073709551615
           default: 300
-          description: "Time-to-live for the in-process spec body cache (seconds). Omitted or null defaults to 300. The first /specz request fetches the spec from spec_url and stores it; subsequent requests within the TTL window return the cached copy without re-fetching. Set to 0 to disable durable positive caching; callers admitted before an in-flight fetch completes still share that fetch regardless of scheduling delay, while later requests immediately re-fetch. Failed fetches use bounded negative-cache backoff regardless of this value."
+          description: "Time-to-live for the in-process spec body cache (seconds). Omitted or null defaults to 300. The first /specz request fetches the spec from spec_url and stores the identity document; subsequent requests within the TTL window return the cached copy without re-fetching. Set to 0 to disable durable positive caching; callers admitted before an in-flight fetch completes still share that fetch regardless of scheduling delay, while later requests immediately re-fetch. Failed fetches use bounded negative-cache backoff regardless of this value."
         max_response_body_bytes:
           type: [integer, "null"]
           format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           default: 26214400
-          description: "Maximum upstream spec response body size to buffer and cache. Omitted or null defaults to 26214400. The body is streamed with this cap so oversized responses are rejected with HTTP 502 before unbounded memory growth."
+          description: "Maximum upstream spec response body size to buffer, decode, and cache. Omitted or null defaults to 26214400. Must be greater than zero. The coded origin body is streamed with this cap, then decoded to identity under the same bound, so oversized or explosively compressed responses are rejected with HTTP 502 before unbounded memory growth."
 
     LoadTestingConfig:
       type: object

@@ -11169,6 +11169,9 @@ fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract()
 
 #[test]
 fn spec_expose_schema_matches_strict_runtime_null_contract() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::spec_expose::SpecExpose;
+
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
     let schema = spec
@@ -11177,6 +11180,22 @@ fn spec_expose_schema_matches_strict_runtime_null_contract() {
 
     assert_eq!(schema["additionalProperties"], false);
     assert_eq!(schema["required"], json!(["spec_url"]));
+    assert_eq!(
+        schema["properties"]["spec_url"]["pattern"],
+        r"^\s*https?://[^/@?#]+(?:[/?#].*)?\s*$"
+    );
+    assert_eq!(
+        schema["properties"]["content_type"]["pattern"],
+        r"^[\u0009\u0020-\u007E]*[!-~][\u0009\u0020-\u007E]*$"
+    );
+    assert_eq!(
+        schema["properties"]["cache_ttl_seconds"]["maximum"],
+        json!(u64::MAX)
+    );
+    assert_eq!(
+        schema["properties"]["max_response_body_bytes"]["maximum"],
+        json!(u64::MAX)
+    );
     for (field, scalar_type) in [
         ("content_type", "string"),
         ("tls_no_verify", "boolean"),
@@ -11202,15 +11221,48 @@ fn spec_expose_schema_matches_strict_runtime_null_contract() {
         }),
         true,
     );
+    assert_component_validity(
+        &spec,
+        "SpecExposeConfig",
+        &json!({ "spec_url": " https://example.com/spec " }),
+        true,
+    );
+    SpecExpose::new(
+        &json!({ "spec_url": " https://example.com/spec " }),
+        PluginHttpClient::default(),
+    )
+    .expect("trimmed spec_url must remain accepted");
+
     for invalid in [
         json!({"spec_url": "https://example.com/openapi.yaml", "tls_no_verfy": true}),
         json!({"spec_url": "https://example.com/openapi.yaml", "content_type": 7}),
         json!({"spec_url": "https://example.com/openapi.yaml", "tls_no_verify": "false"}),
         json!({"spec_url": "https://example.com/openapi.yaml", "cache_ttl_seconds": -1}),
+        json!({"spec_url": "https://example.com/openapi.yaml", "cache_ttl_seconds": 1e20}),
         json!({"spec_url": "https://example.com/openapi.yaml", "max_response_body_bytes": 0}),
+        json!({"spec_url": "https://example.com/openapi.yaml", "max_response_body_bytes": 1e20}),
+        json!({"spec_url": "https://example.com/openapi.yaml", "content_type": "   "}),
+        json!({
+            "spec_url": "https://example.com/openapi.yaml",
+            "content_type": "application/yaml\r\nx-bad: yes"
+        }),
+        json!({"spec_url": "ftp://example.com/openapi.yaml"}),
+        json!({"spec_url": "https:///openapi.yaml"}),
+        json!({"spec_url": "https://user:pass@example.com/openapi.yaml"}),
+        json!({"spec_url": "not a url"}),
     ] {
         assert_component_validity(&spec, "SpecExposeConfig", &invalid, false);
+        assert!(
+            SpecExpose::new(&invalid, PluginHttpClient::default()).is_err(),
+            "schema-invalid spec_expose config unexpectedly passed runtime: {invalid}"
+        );
     }
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    assert!(plugin_docs.contains("must be nonempty after trim"));
+    assert!(plugin_docs.contains("Must be greater than zero"));
+    assert!(plugin_docs.contains("decoded to identity"));
+    assert!(plugin_docs.contains("reject-path `after_proxy`"));
 }
 
 #[test]
@@ -11953,11 +12005,53 @@ fn response_mock_schema_matches_strict_runtime_contract() {
 
     assert_eq!(rule["properties"]["path"]["minLength"], 1);
     assert_eq!(rule["properties"]["method"]["minLength"], 1);
-    assert_eq!(rule["properties"]["status_code"]["minimum"], 100);
-    assert_eq!(rule["properties"]["status_code"]["maximum"], 599);
+    assert_eq!(
+        rule["properties"]["method"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        rule["properties"]["method"]["pattern"],
+        "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+    );
+    let status_one_of = rule["properties"]["status_code"]["oneOf"]
+        .as_array()
+        .expect("status_code oneOf");
+    assert_eq!(status_one_of.len(), 3);
+    assert_eq!(status_one_of[0]["type"], "null");
+    assert_eq!(status_one_of[1]["const"], 101);
+    assert_eq!(status_one_of[2]["minimum"], 200);
+    assert_eq!(status_one_of[2]["maximum"], 599);
+    assert_eq!(
+        rule["properties"]["headers"]["type"],
+        json!(["object", "null"])
+    );
+    assert_eq!(
+        rule["properties"]["headers"]["propertyNames"]["pattern"],
+        "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+    );
+    assert!(
+        rule["properties"]["headers"]["propertyNames"]["not"]["pattern"]
+            .as_str()
+            .expect("protocol-managed header exclusion")
+            .contains("[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]")
+    );
     assert_eq!(
         rule["properties"]["headers"]["additionalProperties"]["type"],
         "string"
+    );
+    assert_eq!(
+        rule["properties"]["body"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        rule["properties"]["delay_ms"]["type"],
+        json!(["integer", "null"])
+    );
+    assert_eq!(rule["properties"]["delay_ms"]["minimum"], 0);
+    assert_eq!(rule["properties"]["delay_ms"]["maximum"], 3600000);
+    assert_eq!(
+        schema["properties"]["passthrough_on_no_match"]["type"],
+        json!(["boolean", "null"])
     );
 
     let description = schema["description"].as_str().expect("description");
@@ -12027,6 +12121,17 @@ fn response_mock_schema_matches_strict_runtime_contract() {
             }]
         }),
         json!({
+            "passthrough_on_no_match": null,
+            "rules": [{
+                "method": null,
+                "path": "/",
+                "status_code": null,
+                "headers": null,
+                "body": null,
+                "delay_ms": null
+            }]
+        }),
+        json!({
             "rules": [{
                 "path": "/api/v1",
                 "status_code": 599,
@@ -12040,6 +12145,7 @@ fn response_mock_schema_matches_strict_runtime_contract() {
                 "body": "must-not-be-sent"
             }]
         }),
+        json!({"rules": [{"path": "/", "delay_ms": 3600000}]}),
     ] {
         assert_component_validity(&spec, "ResponseMockConfig", &valid, true);
         assert!(
@@ -12058,10 +12164,14 @@ fn response_mock_schema_matches_strict_runtime_contract() {
         }),
         json!({"rules": [{"path": "", "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "method": "", "body": "ok"}]}),
+        json!({"rules": [{"path": "/health", "method": "BAD METHOD", "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "status_code": 99, "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "status_code": 100, "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "status_code": 103, "body": "ok"}]}),
+        json!({"rules": [{"path": "/health", "status_code": 199, "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "status_code": 600, "body": "ok"}]}),
+        json!({"rules": [{"path": "/", "delay_ms": -1}]}),
+        json!({"rules": [{"path": "/", "delay_ms": 3600001}]}),
         json!({"rules": [{"body": "missing-path"}]}),
         json!({"rules": []}),
         json!({}),
@@ -12071,24 +12181,22 @@ fn response_mock_schema_matches_strict_runtime_contract() {
                 "headers": {"x-mock": 42}
             }]
         }),
+        json!({
+            "rules": [{
+                "path": "/",
+                "headers": {"Content-Length": "3"}
+            }]
+        }),
+        json!({
+            "rules": [{
+                "path": "/",
+                "headers": {"connection": "close"}
+            }]
+        }),
     ] {
-        // OpenAPI keeps minimum 100 / maximum 599; runtime rejects unsupported
-        // informational statuses (100, 102–199) as the authoritative boundary.
-        let runtime_err = ResponseMock::new(&invalid).is_err();
-        if invalid
-            .pointer("/rules/0/status_code")
-            .and_then(|v| v.as_u64())
-            .is_some_and(|code| matches!(code, 100 | 103))
-        {
-            assert!(
-                runtime_err,
-                "informational status must fail runtime: {invalid}"
-            );
-            continue;
-        }
         assert_component_validity(&spec, "ResponseMockConfig", &invalid, false);
         assert!(
-            runtime_err,
+            ResponseMock::new(&invalid).is_err(),
             "schema-invalid config unexpectedly passed runtime: {invalid}"
         );
     }
@@ -12099,10 +12207,22 @@ fn response_mock_schema_matches_strict_runtime_contract() {
     assert!(guide.contains("WebSocket handshake contract"));
     assert!(guide.contains("never establishes an upgraded frame stream"));
     assert!(guide.contains("Unknown top-level and per-rule keys are rejected"));
+    assert!(guide.contains("Omitted or explicit `null`"));
+    assert!(guide.contains("0`–`3600000"));
     assert!(guide.contains("Status / body wire semantics"));
     assert!(guide.contains("informational statuses"));
     assert!(guide.contains("Native gRPC exclusion"));
     assert!(guide.contains("native gRPC unsupported"));
+
+    let features = include_str!("../../FEATURES.md");
+    assert!(
+        features.contains("relative only for prefix"),
+        "FEATURES.md must qualify prefix-only relative mock paths"
+    );
+    assert!(
+        features.contains("host-only"),
+        "FEATURES.md must mention host-only full-path matching"
+    );
 
     let matrix = include_str!("../../docs/plugin_execution_order.md");
     assert!(
