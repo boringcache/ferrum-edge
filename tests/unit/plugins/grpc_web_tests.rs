@@ -4482,7 +4482,10 @@ fn comma_coalesced_binary_metadata_still_rejects_invalid_members() {
         ("empty trailing member", "x-bin: YQ==,\r\n"),
         ("empty leading member", "x-bin: ,YQ==\r\n"),
         ("empty interior member", "x-bin: YQ==,,Yg==\r\n"),
-        ("whitespace-only interior member", "x-bin: YQ==,   ,Yg==\r\n"),
+        (
+            "whitespace-only interior member",
+            "x-bin: YQ==,   ,Yg==\r\n",
+        ),
         ("non-base64 member", "x-bin: YQ==,not base64!\r\n"),
     ] {
         let mut body = message.clone();
@@ -4644,7 +4647,11 @@ async fn framed_backend_bodies_are_still_forwarded() {
         ("ok mislabelled", 200, Some("text/plain")),
         // A backend that genuinely framed its error keeps its frames.
         ("framed error", 503, Some("application/grpc")),
-        ("framed error with suffix", 503, Some("application/grpc+json")),
+        (
+            "framed error with suffix",
+            503,
+            Some("application/grpc+json"),
+        ),
     ] {
         let output =
             grpc_web_buffered_response_body("application/grpc-web", status, backend_ct, &framed)
@@ -4693,7 +4700,11 @@ async fn streaming_non_grpc_error_entity_is_drained_not_framed() {
         .expect("terminal frame readable");
     let data = frame.data_ref().expect("terminal status rides DATA");
     let frames = parse_grpc_frames(data);
-    assert_eq!(frames.len(), 1, "only the terminal frame reaches the client");
+    assert_eq!(
+        frames.len(),
+        1,
+        "only the terminal frame reaches the client"
+    );
     assert_eq!(frames[0].0, GRPC_FRAME_TRAILER);
     assert!(
         frames[0]
