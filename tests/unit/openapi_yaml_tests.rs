@@ -11162,3 +11162,150 @@ fn ai_semantic_firewall_extraction_paths_match_openapi_and_docs() {
         );
     }
 }
+
+/// Issue #5022: `JwtAuthConfig` must reject exactly what `JwtAuth::new` rejects.
+/// Schema-driven tooling previously approved configurations `ferrum-edge
+/// validate` and the admin API refuse.
+#[test]
+fn jwt_auth_schema_matches_runtime_admission() {
+    use ferrum_edge::plugins::jwt_auth::JwtAuth;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let accepted = [
+        json!({}),
+        json!({"token_lookup": "header:Authorization"}),
+        json!({"token_lookup": "header:X-Token"}),
+        json!({"token_lookup": "query:token"}),
+        json!({"consumer_claim_field": "client_id"}),
+        json!({"expected_issuer": "https://issuer.example"}),
+        json!({"expected_issuers": ["https://issuer.example"]}),
+        json!({"audiences": ["payments-api"]}),
+        json!({"leeway_secs": 300}),
+        json!({"require_exp": false, "require_nbf": true}),
+    ];
+    for config in &accepted {
+        assert_component_validity(&spec, "JwtAuthConfig", config, true);
+        assert!(
+            JwtAuth::new(config).is_ok(),
+            "runtime should accept schema-valid config: {config}"
+        );
+    }
+
+    let rejected = [
+        json!({"token_lookup": "foo"}),
+        json!({"token_lookup": "header:   "}),
+        json!({"token_lookup": "header:x bad"}),
+        json!({"token_lookup": " header:Authorization"}),
+        json!({"token_lookup": "query:a b"}),
+        json!({"token_lookup": ""}),
+        json!({"consumer_claim_field": ""}),
+        json!({"expected_issuer": ""}),
+        json!({"expected_issuer": "https://a", "expected_issuers": ["https://b"]}),
+        json!({"expected_issuers": [""]}),
+        json!({"audiences": [""]}),
+        json!({"leeway_secs": -1}),
+        json!({"leeway_secs": 301}),
+        json!({"audience": ["payments-api"]}),
+    ];
+    for config in &rejected {
+        assert_component_validity(&spec, "JwtAuthConfig", config, false);
+        assert!(
+            JwtAuth::new(config).is_err(),
+            "runtime should reject schema-invalid config: {config}"
+        );
+    }
+}
+
+/// Issue #5023: `JwksAuthConfig` must encode the constructor's structural and
+/// cross-field admission rules. The two rules JSON Schema cannot practically
+/// express — the closed reserved-destination list for `output_claim_headers`
+/// and `jwks_refresh_interval_secs` <= the effective `jwks_max_stale_seconds` —
+/// are stated in the property descriptions instead and are deliberately absent
+/// from the rejected set below.
+#[test]
+fn jwks_auth_schema_matches_runtime_admission() {
+    const JWKS_URI: &str = "https://idp.example.com/jwks";
+    const DISCOVERY_URL: &str = "https://idp.example.com/.well-known/openid-configuration";
+    const ISSUER: &str = "https://idp.example.com";
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let inline = || json!({"keys": []});
+    // One remote provider plus the supplied per-provider overrides.
+    let remote = |extra: serde_json::Value| {
+        let mut provider = json!({"jwks_uri": JWKS_URI});
+        merge_into_object(&mut provider, &extra);
+        json!({"providers": [provider]})
+    };
+    // One inline provider plus the supplied per-provider overrides.
+    let local = |extra: serde_json::Value| {
+        let mut provider = json!({"jwks": inline()});
+        merge_into_object(&mut provider, &extra);
+        json!({"providers": [provider]})
+    };
+
+    let accepted = [
+        remote(json!({})),
+        remote(json!({"issuer": ISSUER})),
+        remote(json!({"from_headers": [{"name": "x-token", "prefix": null}]})),
+        remote(json!({"from_headers": [{"name": "x-token", "prefix": "Token "}]})),
+        remote(json!({"from_params": ["token"]})),
+        remote(json!({"required_scopes": ["admin"], "scope_claim": "realm.scope"})),
+        remote(json!({"jwks_max_stale_seconds": 600})),
+        remote(json!({"output_claim_headers": [{"header": "x-claim", "claim": "sub"}]})),
+        local(json!({})),
+        json!({"providers": [{"discovery_url": DISCOVERY_URL}]}),
+        json!({"providers": [{"jwks_uri": "http://127.0.0.1:9000/jwks"}]}),
+        json!({"providers": [{"jwks_uri": "http://localhost:9000/jwks"}]}),
+        local(json!({
+            "issuer": ISSUER,
+            "require_dpop": true,
+            "dpop_replay_scope": "process"
+        })),
+    ];
+    for config in &accepted {
+        assert_component_validity(&spec, "JwksAuthConfig", config, true);
+    }
+
+    let rejected = [
+        json!({"providers": []}),
+        json!({"providers": [{}]}),
+        remote(json!({"scope_claim": "a..b"})),
+        remote(json!({"role_claim": ".roles"})),
+        remote(json!({"claim_headers_separator": ""})),
+        remote(json!({"required_scopes": [""]})),
+        remote(json!({"from_headers": [{"name": "x token"}]})),
+        remote(json!({"output_claim_headers": [{"header": "x bad", "claim": "sub"}]})),
+        remote(json!({"discovery_url": DISCOVERY_URL})),
+        remote(json!({"jwks": inline()})),
+        json!({"providers": [{"jwks_uri": "not a url"}]}),
+        json!({"providers": [{"jwks_uri": "http://idp.example.com/jwks"}]}),
+        json!({"providers": [{"jwks_uri": "https://u:p@idp.example.com/jwks"}]}),
+        local(json!({"jwks_max_stale_seconds": 600})),
+        local(json!({"require_dpop": true})),
+        local(json!({"issuer": ISSUER, "require_dpop": true})),
+        local(json!({"dpop_replay_scope": "process"})),
+        json!({"providers": [{"jwks_uri": JWKS_URI}], "scope_claim": "a..b"}),
+        json!({"providers": [{"jwks_uri": JWKS_URI}], "claim_headers_separator": ""}),
+    ];
+    for config in &rejected {
+        assert_component_validity(&spec, "JwksAuthConfig", config, false);
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("jwks_auth", config).is_err(),
+            "runtime should reject schema-invalid config: {config}"
+        );
+    }
+}
+
+/// Shallow-merge every member of `extra` into the `target` JSON object.
+fn merge_into_object(target: &mut serde_json::Value, extra: &serde_json::Value) {
+    let (Some(target), Some(extra)) = (target.as_object_mut(), extra.as_object()) else {
+        panic!("merge_into_object expects two JSON objects");
+    };
+    for (key, value) in extra {
+        target.insert(key.clone(), value.clone());
+    }
+}
