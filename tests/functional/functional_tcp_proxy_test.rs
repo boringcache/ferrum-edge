@@ -1118,7 +1118,7 @@ plugin_configs: []
 
     #[cfg(unix)]
     {
-        let pid = gateway.id();
+        let pid = gateway.id().expect("the guard still owns the child");
         let _ = std::process::Command::new("kill")
             .args(["-HUP", &pid.to_string()])
             .output();
