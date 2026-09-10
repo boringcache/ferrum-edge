@@ -404,7 +404,10 @@ impl WorkloadMetrics {
             "service_name",
             "deployment_environment",
         ] {
-            if config.get(key).is_some_and(|value| !value.is_string()) {
+            if config
+                .get(key)
+                .is_some_and(|value| !value.is_null() && !value.is_string())
+            {
                 return Err(format!("workload_metrics: {key} must be a string"));
             }
         }
@@ -413,7 +416,10 @@ impl WorkloadMetrics {
             "disable_span_reporting",
             "disableSpanReporting",
         ] {
-            if config.get(key).is_some_and(|value| !value.is_boolean()) {
+            if config
+                .get(key)
+                .is_some_and(|value| !value.is_null() && !value.is_boolean())
+            {
                 return Err(format!("workload_metrics: {key} must be a boolean"));
             }
         }
@@ -427,7 +433,7 @@ impl WorkloadMetrics {
         ] {
             if config
                 .get(key)
-                .is_some_and(|value| value.as_u64().is_none())
+                .is_some_and(|value| !value.is_null() && value.as_u64().is_none())
             {
                 return Err(format!(
                     "workload_metrics: {key} must be a non-negative integer"
@@ -1449,7 +1455,7 @@ fn string_config(config: &Value, key: &str) -> Option<String> {
 }
 
 fn string_map_config(config: &Value, key: &str) -> Result<HashMap<String, String>, String> {
-    let Some(value) = config.get(key) else {
+    let Some(value) = config.get(key).filter(|value| !value.is_null()) else {
         return Ok(HashMap::new());
     };
     let object = value
