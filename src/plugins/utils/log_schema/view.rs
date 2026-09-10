@@ -186,9 +186,7 @@ impl<'a, T: SchemaSerializable> Serialize for SchemaView<'a, T> {
                     //
                     // A non-capability schema reserved every native key at
                     // compile time, so only the capability case reserves here.
-                    if track_emitted
-                        && schema.capability_scoped
-                        && self.summary.owns_native(source)
+                    if track_emitted && schema.capability_scoped && self.summary.owns_native(source)
                     {
                         emitted.reserve(out_key);
                     }

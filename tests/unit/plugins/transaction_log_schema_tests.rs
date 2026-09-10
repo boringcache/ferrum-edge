@@ -645,7 +645,10 @@ fn test_every_published_cookbook_schema_passes_admission() {
         }
 
         // Referring form: `schema_ref` must name a schema the cookbook defines.
-        if let Some(name) = doc.get("config").and_then(|config| config.get("schema_ref")) {
+        if let Some(name) = doc
+            .get("config")
+            .and_then(|config| config.get("schema_ref"))
+        {
             let name = name.as_str().expect("schema_ref is a string");
             assert!(
                 LOG_SCHEMA_DOC.contains(&format!("    {name}:")),
@@ -653,5 +656,8 @@ fn test_every_published_cookbook_schema_passes_admission() {
             );
         }
     }
-    assert!(compiled_any, "no cookbook block carried a schema definition");
+    assert!(
+        compiled_any,
+        "no cookbook block carried a schema definition"
+    );
 }
