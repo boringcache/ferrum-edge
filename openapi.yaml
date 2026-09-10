@@ -31505,11 +31505,21 @@ components:
       additionalProperties: false
       description: "Plugin: ai_rate_limiter — HTTP-only token-aware rate limiting for LLM APIs. Native gRPC is unsupported (not registered for the Grpc protocol view): protobuf message frames have no supported usage schema, so an attachment there would never charge the budget. Framed gRPC-Web bodies are likewise never classified as JSON AI traffic and are never charged as zero usage. Pre-dispatch prompt estimates walk the request JSON once, counting billable string values, visited object member names (including tool/function schema property names), and JSON scalar literals at serialized width so a present recognized field cannot suppress unknown billed text; exclusions are path/context aware (unsigned numeric output caps only at the exact paths also read for completion-budget reservation — negative/fractional values count fail-closed; multimodal URL/base64/file leaves only inside matching provider content-part family and part type — member names and unrelated textual siblings still count; wrong-family/malformed parts and ordinary strings including data: URLs in instructions/schemas always count). The estimate is a conservative chars/4 heuristic, not provider tokenizer parity. Supports centralized Redis-backed mode for cross-instance token budget coordination. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported. When Redis is unavailable at terminal reconciliation, actual usage is charged locally within the existing identity cap and the reservation lifecycle is finalized, including zero-token reservations and committed streams. Successful fallback sets instance-scoped ai_ratelimit_locally_accounted=true. Local usage is not replayed to Redis. Process counters ferrum_ai_rate_limit_local_accounting_tokens_total and ferrum_ai_rate_limit_unaccounted_tokens_total expose fallback charges and capacity-limited accounting gaps. Admission remains fail closed; buffered/federated successful responses still receive 503 and committed streams retain their response."
       required: [token_limit]
+      allOf:
+        - if:
+            required: [sync_mode]
+            properties:
+              sync_mode:
+                pattern: "^[rR][eE][dD][iI][sS]$"
+          then:
+            required: [redis_url]
       properties:
         token_limit:
           type: integer
+          format: uint64
           minimum: 1
-          description: Required maximum tokens allowed per window. Omission is rejected at construction; there is no default.
+          maximum: 18446744073709551615
+          description: Required maximum tokens allowed per window. Must be a positive unsigned 64-bit integer. Omission is rejected at construction; there is no default.
         window_seconds:
           type: integer
           minimum: 1
@@ -31537,17 +31547,25 @@ components:
             responses, usage and remaining reflect the bucket after provider-usage
             reconciliation (not the admission estimate). Limit and window stay
             coherent with the configured budget. Unmetered charge_estimate keeps
-            the reservation; warn releases and refreshes; reject returns 502
-            without these headers. Non-2xx and gateway-rejection releases refresh
-            to the post-release bucket. Federation reconciles before header copy
-            on the rejection-path after_proxy.
+            the reservation; warn releases and refreshes; reject substitutes a
+            502 that still carries all four headers, describing the retained
+            reservation, because the rejection-path after_proxy publishes this
+            instance's telemetry onto the final response. Only the centralized
+            enforcement-unavailable 503 carries no rate-limit headers, because
+            no authoritative counter could be consulted. Non-2xx and
+            gateway-rejection releases refresh to the post-release bucket.
+            Federation reconciles before header copy on the rejection-path
+            after_proxy.
         provider:
           type: string
-          enum: [auto, openai, anthropic, google, cohere, mistral, bedrock, tgi]
+          pattern: "^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*(?:[Aa][Uu][Tt][Oo]|[Oo][Pp][Ee][Nn][Aa][Ii]|[Aa][Nn][Tt][Hh][Rr][Oo][Pp][Ii][Cc]|[Gg][Oo][Oo][Gg][Ll][Ee]|[Cc][Oo][Hh][Ee][Rr][Ee]|[Mm][Ii][Ss][Tt][Rr][Aa][Ll]|[Bb][Ee][Dd][Rr][Oo][Cc][Kk]|[Tt][Gg][Ii])[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$"
           default: auto
           description: >-
             LLM provider format for token extraction. Accepted values: auto,
-            openai, anthropic, google, cohere, mistral, bedrock, tgi.
+            openai, anthropic, google, cohere, mistral, bedrock, tgi. The
+            constructor trims surrounding Unicode whitespace and lower-cases the
+            value, so `" OpenAI "` is accepted and normalizes to `openai`; the
+            pattern above admits exactly those spellings and no others.
             Gemini/Vertex payloads use `google`; Hugging Face TGI native
             `/generate` and `/generate_stream` shapes use `tgi`, whose
             authoritative counter is `details.generated_tokens` (TGI's
@@ -31559,16 +31577,17 @@ components:
           description: >-
             Action for successful responses without usage metadata.
             charge_estimate keeps the pre-request reservation, reject returns a
-            502 and keeps the reservation, warn logs and releases the
+            502 and keeps the reservation (the 502 carries the x-ai-ratelimit-*
+            headers when expose_headers is on), warn logs and releases the
             reservation. On a STREAMED response the headers are already
             committed, so reject cannot substitute a 502; it degrades to its
             fail-closed accounting half (the reservation stays charged) and logs
             the violation.
         sync_mode:
           type: string
-          enum: [local, redis]
+          pattern: "^([lL][oO][cC][aA][lL]|[rR][eE][dD][iI][sS])$"
           default: local
-          description: "Token budget storage: 'local' (in-memory) or 'redis' (centralized). Database-backed counters are unsupported. Any RESP-compatible server works."
+          description: "Token budget storage: 'local' (in-memory) or 'redis' (centralized), parsed case-insensitively (`LOCAL`, `Redis`). `redis` additionally requires `redis_url`. Database-backed counters are unsupported. Any RESP-compatible server works."
         redis_url:
           type: string
           minLength: 1
@@ -31588,6 +31607,7 @@ components:
           description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
+          minLength: 1
           default: "{FERRUM_NAMESPACE}:ai_rate_limiter:{plugin-config-id}"
           description: >-
             Key prefix for all Redis keys. Defaults to
@@ -31622,12 +31642,18 @@ components:
             meaningful with sync_mode=redis, but validated in either mode.
         redis_connect_timeout_seconds:
           type: integer
+          format: uint64
+          minimum: 1
+          maximum: 18446744073709551615
           default: 5
-          description: Redis connection timeout in seconds
+          description: Redis connection timeout in seconds. Must be a positive unsigned 64-bit integer.
         redis_health_check_interval_seconds:
           type: integer
+          format: uint64
+          minimum: 1
+          maximum: 18446744073709551615
           default: 5
-          description: Health check ping interval when Redis is unavailable
+          description: Health check ping interval when Redis is unavailable. Must be a positive unsigned 64-bit integer.
 
     AiPromptShieldConfig:
       type: object
