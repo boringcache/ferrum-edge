@@ -5452,9 +5452,9 @@ Request buffering is only enabled when at least one GraphQL policy is configured
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_depth` | u32 (optional) | — | Maximum allowed query nesting depth |
-| `max_complexity` | u32 (optional) | — | Maximum allowed field count |
-| `max_aliases` | u32 (optional) | — | Maximum allowed alias count |
+| `max_depth` | u32 (optional) | — | Maximum allowed query nesting depth. Inclusive range `0..=4294967295`; negative values and values above `4294967295` are rejected at plugin load time |
+| `max_complexity` | u32 (optional) | — | Maximum allowed field count. Inclusive range `0..=4294967295`; negative values and values above `4294967295` are rejected at plugin load time |
+| `max_aliases` | u32 (optional) | — | Maximum allowed alias count. Inclusive range `0..=4294967295`; negative values and values above `4294967295` are rejected at plugin load time |
 | `introspection_allowed` | bool | `true` | Whether introspection queries are permitted. Only `false` counts as an effective protection rule; the default `true` does not. |
 | `limit_by` | String | `ip` | Rate limit key: exact lowercase `ip` or `consumer`. Other values are rejected at plugin load time. |
 | `type_rate_limits` | Object | `{}` | Rate limits by operation type. Only exact lowercase `query`, `mutation`, and `subscription` keys are accepted; unknown keys are rejected. |
@@ -5470,7 +5470,7 @@ Request buffering is only enabled when at least one GraphQL policy is configured
 | `redis_password` | String (optional) | — | Redis password |
 | `redis_failure_policy` | String | `fail_closed` | Behavior when the centralized store cannot be consulted (outage, egress/DNS screen failure, or an endpoint rejected as Redis Cluster). `fail_closed` refuses with `503`; `local_fallback` explicitly opts into per-process budgets for availability. Only meaningful when `sync_mode: "redis"`, but validated in either mode |
 
-Each rate limit entry: `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive integer JSON values (`2`, not `2.0`) — missing, zero, or unknown keys are rejected at plugin load time so a typo cannot silently disable a rate limit. The same integer-encoding rule applies to the top-level numeric limits and Redis pool/timeout settings.
+Each rate limit entry: `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive integer JSON values (`2`, not `2.0`) — missing, zero, or unknown keys are rejected at plugin load time so a typo cannot silently disable a rate limit. Both fields are also bounded above by the shared rate-limit maxima, and both bounds apply identically to `type_rate_limits` and `operation_rate_limits` entries: `max_requests` accepts the inclusive range `1..=1000000` (an operational budget ceiling) and `window_seconds` the inclusive range `1..=2678400` (31 days, so the window stays representable as a monotonic duration and a signed Redis TTL). The same integer-encoding rule applies to the top-level numeric limits and Redis pool/timeout settings.
 
 The plugin requires at least one effective rule (`max_depth`, `max_complexity`, `max_aliases`, `introspection_allowed: false`, a non-empty `type_rate_limits`, or a non-empty `operation_rate_limits`) — an empty or no-op config is rejected. Unknown top-level keys are rejected so misspelled introspection, identity, rate-map, or Redis synchronization fields cannot silently fall back to defaults.
 

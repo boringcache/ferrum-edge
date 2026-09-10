@@ -26915,15 +26915,27 @@ components:
         max_depth:
           type: integer
           format: uint32
-          description: Maximum allowed query nesting depth
+          minimum: 0
+          maximum: 4294967295
+          description: >-
+            Maximum allowed query nesting depth. Admission requires an unsigned
+            integer that fits in 32 bits, so the inclusive range is 0-4294967295.
         max_complexity:
           type: integer
           format: uint32
-          description: Maximum allowed field count
+          minimum: 0
+          maximum: 4294967295
+          description: >-
+            Maximum allowed field count. Admission requires an unsigned integer
+            that fits in 32 bits, so the inclusive range is 0-4294967295.
         max_aliases:
           type: integer
           format: uint32
-          description: Maximum allowed alias count
+          minimum: 0
+          maximum: 4294967295
+          description: >-
+            Maximum allowed alias count. Admission requires an unsigned integer
+            that fits in 32 bits, so the inclusive range is 0-4294967295.
         introspection_allowed:
           type: boolean
           default: true
