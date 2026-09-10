@@ -3980,7 +3980,8 @@ async fn an_unusable_gateway_session_cookie_is_hidden_too() {
         "ferrum_session=not-a-sealed-value; theme=dark".to_string(),
     );
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
-    assert_eq!(headers.get("cookie").map(String::as_str), Some("theme=dark"));
+    let forwarded = headers.get("cookie").map(String::as_str);
+    assert_eq!(forwarded, Some("theme=dark"));
 }
 
 /// Passthrough remains available, but only as an explicit opt-in
@@ -4156,6 +4157,10 @@ fn the_config_component_agrees_with_constructor_admission() {
     same_site_none_insecure["session"]["secure"] = json!(false);
     let mut null_behavior = base_config();
     null_behavior["behavior"] = json!(null);
+    let fragment_redirect = provider(
+        "redirect_uri",
+        json!("https://app.example.com/oauth/callback#x"),
+    );
     let mut redirect_param_without_hosts = base_config();
     redirect_param_without_hosts["behavior"]
         .as_object_mut()
@@ -4191,11 +4196,7 @@ fn the_config_component_agrees_with_constructor_admission() {
         provider("client_auth", json!({"method": 9, "client_secret": "s"})),
         false,
     );
-    case(
-        "redirect_uri with a fragment",
-        provider("redirect_uri", json!("https://app.example.com/oauth/callback#x")),
-        false,
-    );
+    case("redirect_uri with a fragment", fragment_redirect, false);
     case(
         "clock skew above the bound",
         provider("id_token_clock_skew_secs", json!(3601)),

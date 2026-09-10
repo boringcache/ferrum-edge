@@ -1108,7 +1108,8 @@ impl OidcRelyingParty {
             context_id: session_context_id,
             correlation_cookie_name_prefix,
             correlation_cookie_attrs: build_correlation_cookie_attrs(secure, &callback_path),
-            hide_session_cookie: optional_bool(session_obj, "hide_session_cookie")?.unwrap_or(true),
+            hide_session_cookie: optional_bool(session_obj, "hide_session_cookie")?
+                .unwrap_or(true),
             max_cookie_bytes: max_cookie_bytes as usize,
             ttl: Duration::from_secs(ttl_secs),
             idle_ttl: Duration::from_secs(idle_ttl_secs),
@@ -2431,11 +2432,7 @@ impl OidcRelyingParty {
     fn strip_plugin_cookies(&self, headers: &mut HashMap<String, String>) {
         let mut emptied: Vec<String> = Vec::new();
         for (name, value) in headers.iter_mut() {
-            if !name.eq_ignore_ascii_case("cookie")
-                || !value
-                    .split(';')
-                    .any(|segment| self.owns_cookie_segment(segment))
-            {
+            if !name.eq_ignore_ascii_case("cookie") || !self.owns_any_cookie(value) {
                 continue;
             }
             let mut retained = String::with_capacity(value.len());
@@ -2458,6 +2455,13 @@ impl OidcRelyingParty {
         for name in emptied {
             headers.remove(&name);
         }
+    }
+
+    /// Whether a `Cookie` header value carries any cookie this plugin owns.
+    fn owns_any_cookie(&self, header_value: &str) -> bool {
+        header_value
+            .split(';')
+            .any(|segment| self.owns_cookie_segment(segment))
     }
 
     /// Whether one `Cookie` header segment names a cookie this plugin instance
@@ -3767,10 +3771,11 @@ fn normalized_route_path(path: &str) -> String {
 /// refused: neither belongs in a cookie path, and both are the delimiters a
 /// header-folding parser would split on.
 fn is_cookie_path_value(value: &str) -> bool {
-    value.is_ascii()
-        && !value
-            .chars()
-            .any(|c| c.is_ascii_control() || matches!(c, ';' | ',' | ' '))
+    value.is_ascii() && value.chars().all(is_cookie_path_char)
+}
+
+fn is_cookie_path_char(character: char) -> bool {
+    !character.is_ascii_control() && !matches!(character, ';' | ',' | ' ')
 }
 
 /// Whether `c` is an RFC 9110 `token` character, i.e. legal in an RFC 6265
@@ -3801,6 +3806,18 @@ fn validate_cookie_path(path: &str, field: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn is_cookie_domain_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label.bytes().all(is_cookie_domain_byte)
+}
+
+fn is_cookie_domain_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'-'
+}
+
 /// Validate an RFC 6265 §4.1.1 `domain-value`: a DNS name, optionally with the
 /// legacy leading dot. A scheme, port, path, or attribute delimiter here would
 /// be emitted straight into `Set-Cookie`.
@@ -3809,15 +3826,7 @@ fn validate_cookie_domain(domain: &str) -> Result<(), String> {
     let valid = !candidate.is_empty()
         && candidate.len() <= 253
         && !candidate.ends_with('.')
-        && candidate.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-')
-        });
+        && candidate.split('.').all(is_cookie_domain_label);
     if !valid {
         return Err(
             "oidc_relying_party: session.domain must be a bare DNS name (no scheme, port, path, or attribute delimiters)"
