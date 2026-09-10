@@ -20643,7 +20643,11 @@ components:
         retry is therefore a replay and is rejected; safe retries send a fresh
         nonce with a recomputed signature. HBONE CONNECT and
         request-body-transformer compositions fail closed. The
-        pre-authentication body path has a 10 MiB hard ceiling.
+        pre-authentication body path has a 10 MiB hard ceiling. A WebSocket
+        handshake (HTTP/1.1 Upgrade, HTTP/2 and HTTP/3 Extended CONNECT) is
+        signed over the EMPTY body: tunnel DATA is never drained as a request
+        body, so the transport proves the handshake's empty representation from
+        its own wire framing, and a handshake that declares a body is rejected.
       properties:
         clock_skew_seconds:
           type: integer

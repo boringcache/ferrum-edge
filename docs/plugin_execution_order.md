@@ -1983,7 +1983,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `key_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers or query parameters |
 | `ldap_auth` | ✓ | ✓ | ✓ | | | Requires HTTP Basic auth header; authenticates against LDAP directory |
 | `basic_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
-| `hmac_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers and a buffered request body; HBONE CONNECT fails closed as incompatible |
+| `hmac_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers and a buffered request body; a WebSocket handshake is signed over the empty body and tunnel DATA is never drained; HBONE CONNECT fails closed as incompatible |
 | `soap_ws_security` | ✓ | | | | | SOAP XML body parsing (text/xml, application/soap+xml, application/xml, application/xop+xml, MTOM multipart/related) |
 | `access_control` | ✓ | ✓ | ✓ | ✓ | ✓ | Needs authenticated identity from an auth plugin; supports consumer username and ACL group allow/deny lists |
 | `tcp_connection_throttle` | | | | ✓ | | Tracks process-local active TCP/TCP+TLS connections per Consumer or canonical client IP; each replica enforces independently |

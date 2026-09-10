@@ -4306,6 +4306,57 @@ fn client_request_body_proven_empty(client_request_body: &ClientRequestBody) -> 
     }
 }
 
+/// Publish the transport's proof that a WebSocket HANDSHAKE carries no request
+/// body, so integrity-verifying authentication plugins can verify a signature
+/// over the empty body (issue #5000).
+///
+/// WebSocket streams are categorically excluded from request-body collection:
+/// after the upgrade, DATA is tunnel payload rather than an HTTP request body,
+/// and draining it would break the relay. That left `hmac_auth` with absent
+/// digest snapshots on every WebSocket route, and absent snapshots MUST fail
+/// closed — so a correctly signed handshake was answered `401` with a digest
+/// mismatch even though the plugin declares WebSocket support.
+///
+/// The handshake itself is an ordinary HTTP request whose body the transport can
+/// prove empty from wire framing alone, without reading a single tunnel byte.
+/// This publishes exactly that proof and nothing else:
+///
+/// * Only for the WebSocket flavor. HBONE CONNECT and `connect-udp` tunnels
+///   keep their absent snapshots and their documented fail-closed behavior.
+/// * Only when [`inbound_request_declares_body`] — which fails closed on any
+///   `Transfer-Encoding` and on any `Content-Length` that is not provably zero —
+///   says the handshake declared no body. A handshake that did declare one keeps
+///   the absent snapshots and is still rejected.
+/// * Only when a configured plugin actually asked for body digests, so an
+///   ordinary WebSocket route does no hashing at all.
+///
+/// This is never a global substitution of the empty digest for "the body was not
+/// collected": the empty representation here is a transport fact about the
+/// handshake, not an assumption about an uncollected body. Only the digest
+/// snapshots are published — no buffered-body metadata, text view, or byte view
+/// is synthesized, so nothing else can mistake a handshake for a collected body.
+pub(crate) fn publish_websocket_handshake_body_digests(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+) {
+    use crate::fips::approved::{Sha256, Sha512};
+
+    if ctx.request_body_sha256.is_some() || ctx.request_body_sha512.is_some() {
+        return;
+    }
+    if inbound_request_declares_body(ctx) {
+        return;
+    }
+    if !plugins
+        .iter()
+        .any(|plugin| plugin.needs_request_body_digests())
+    {
+        return;
+    }
+    ctx.request_body_sha256 = Some(Sha256::digest(b""));
+    ctx.request_body_sha512 = Some(Sha512::digest(b""));
+}
+
 /// Whether a `Content-Length` field-line value provably declares a zero-length
 /// body. Anything that is not a parseable zero — a non-UTF-8 field line, a
 /// malformed number, a value out of `u64` range — answers `false` so the
@@ -31164,6 +31215,14 @@ async fn handle_proxy_request_inner(
     } else {
         RequestBodyPhaseRequirements::default()
     };
+    // A WebSocket handshake declares no body on the wire, so the transport can
+    // prove the empty representation an integrity-verifying auth plugin has to
+    // sign over without touching a tunnel byte (issue #5000).
+    if matches!(flavor, HttpFlavor::WebSocket)
+        && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
+    {
+        publish_websocket_handshake_body_digests(&plugins, &mut ctx);
+    }
 
     if authenticate_body_requirements.required {
         client_request_body = match client_request_body {

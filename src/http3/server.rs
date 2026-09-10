@@ -3531,6 +3531,14 @@ async fn handle_h3_request(
     } else {
         crate::proxy::RequestBodyPhaseRequirements::default()
     };
+    // Extended CONNECT carries no request body: the DATA stream is the tunnel.
+    // Publish that transport proof so an integrity-verifying auth plugin can
+    // verify a signature over the empty handshake body (issue #5000).
+    if matches!(http_flavor, HttpFlavor::WebSocket)
+        && capabilities.has(crate::plugin_cache::PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
+    {
+        crate::proxy::publish_websocket_handshake_body_digests(&plugins, &mut ctx);
+    }
 
     let mut prebuffered_body_data: Option<Vec<u8>> = if authenticate_body_requirements.required {
         let protocol_max_body = if matches!(http_flavor, HttpFlavor::Grpc) {
