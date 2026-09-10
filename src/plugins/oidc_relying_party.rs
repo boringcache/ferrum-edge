@@ -5646,6 +5646,8 @@ mod tests {
             fetch_discovery(
                 &PluginHttpClient::default(),
                 &format!("{}/.well-known/openid-configuration", server.uri()),
+                false,
+                false,
             )
             .await
             .is_err()
