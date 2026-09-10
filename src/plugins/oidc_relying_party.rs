@@ -47,6 +47,16 @@ const DEFAULT_ID_TOKEN_CLOCK_SKEW_SECS: u64 = 60;
 const DEFAULT_SESSION_TTL_SECS: u64 = 3600;
 const DEFAULT_SESSION_IDLE_TTL_SECS: u64 = 1800;
 const DEFAULT_SESSION_MAX_COOKIE_BYTES: u64 = 8000;
+/// Smallest usable `session.max_cookie_bytes`.
+///
+/// Every sealed pending authorization flow carries a 43-character context id, a
+/// 43-character `state`, an 86-character PKCE verifier, a 43-character nonce,
+/// and an expiry, so its encoded size has a hard floor near 500 bytes before a
+/// single byte of original URL. A smaller cap admits a fail-closed
+/// authentication plugin whose browser challenge can never seal even that
+/// minimum: every login answers 503 instead of the configuration being refused
+/// (issue #5029).
+const MIN_SESSION_MAX_COOKIE_BYTES: u64 = 1024;
 const DEFAULT_STATE_TTL_SECS: u64 = 600;
 const DEFAULT_STATE_CACHE_MAX_ENTRIES: usize = 10_000;
 const DEFAULT_STATE_CACHE_MAX_ENTRIES_PER_SOURCE: usize = 32;
@@ -1012,6 +1022,11 @@ impl OidcRelyingParty {
         )?;
         if max_cookie_bytes > DEFAULT_SESSION_MAX_COOKIE_BYTES {
             return Err("oidc_relying_party: session.max_cookie_bytes must be <= 8000".to_string());
+        }
+        if max_cookie_bytes < MIN_SESSION_MAX_COOKIE_BYTES {
+            return Err(format!(
+                "oidc_relying_party: session.max_cookie_bytes must be >= {MIN_SESSION_MAX_COOKIE_BYTES}"
+            ));
         }
         let http_only = optional_bool(session_obj, "http_only")?.unwrap_or(true);
         let same_site = optional_string(session_obj, "same_site", "session")?

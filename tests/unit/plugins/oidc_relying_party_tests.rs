@@ -3682,3 +3682,53 @@ fn new_rejects_callback_and_logout_paths_that_are_not_cookie_paths() {
         assert!(error.contains(field), "unexpected error: {error}");
     }
 }
+
+/// `session.max_cookie_bytes` had an upper bound but no usable lower bound, so
+/// `0` started a fail-closed authentication plugin whose browser challenge can
+/// never seal even its own pending flow: every login answered 503 (issue #5029).
+#[test]
+fn new_rejects_cookie_size_caps_that_cannot_seal_a_pending_flow() {
+    for value in [json!(0), json!(1), json!(1023)] {
+        let mut config = base_config();
+        config["session"]["max_cookie_bytes"] = value.clone();
+        let error = validate_plugin_config("oidc_relying_party", &config)
+            .err()
+            .unwrap_or_else(|| panic!("max_cookie_bytes={value} must be rejected"));
+        assert!(
+            error.contains("max_cookie_bytes"),
+            "unexpected error for max_cookie_bytes={value}: {error}"
+        );
+    }
+
+    for value in [json!(1024), json!(8000)] {
+        let mut config = base_config();
+        config["session"]["max_cookie_bytes"] = value.clone();
+        assert!(
+            validate_plugin_config("oidc_relying_party", &config).is_ok(),
+            "max_cookie_bytes={value} must remain accepted"
+        );
+    }
+}
+
+/// The documented minimum must actually be able to start a login, not merely
+/// pass admission (issue #5029).
+#[tokio::test]
+async fn minimum_cookie_size_cap_can_still_seal_a_browser_challenge() {
+    let mut config = base_config();
+    config["session"]["max_cookie_bytes"] = json!(1024);
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default())
+        .expect("the documented minimum must be accepted");
+    let mut ctx = html_ctx();
+    let PluginResult::Reject {
+        status_code,
+        headers,
+        ..
+    } = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await
+    else {
+        panic!("a browser request without a session must be challenged");
+    };
+    assert_eq!(status_code, 302, "headers: {headers:?}");
+    assert!(headers.contains_key("set-cookie"));
+}
