@@ -15,6 +15,7 @@ pub mod body_transform;
 pub mod byte_budget;
 pub mod cache_headers;
 pub mod cert_hash;
+pub mod cert_validity;
 pub mod claim_header_fanout;
 pub mod claim_resolver;
 pub mod content_encoding;

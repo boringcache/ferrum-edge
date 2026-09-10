@@ -203,12 +203,43 @@ fn make_summary_with_status(status: u16) -> TransactionSummary {
     }
 }
 
+/// The fixture request context every direct-dispatch case here builds.
+///
+/// Building one also opens observability delivery for this process, because
+/// each of those cases hands terminal work to the process-global delivery
+/// lifecycle without ever starting a serving cycle. Another test in this binary
+/// may already have run an in-process gateway through `modes::file::serve`, and
+/// that fixture's shutdown drains and permanently CLOSES the delivery
+/// generation it was serving on. A closed generation admits nothing: the
+/// dispatch is dropped and a fixture waiting on the resulting notification waits
+/// forever (issue #4987).
+///
+/// This is `begin_serving_cycle`, not a reset: an open generation is reused
+/// untouched, and a fresh one is installed only when the current one is already
+/// draining or closed — exactly the start -> drain -> start transition an
+/// in-process embedder performs, and never a generation another serving cycle
+/// still owns.
 fn make_ctx() -> RequestContext {
+    ferrum_edge::observability_delivery::begin_serving_cycle();
     RequestContext::new(
         "10.0.0.1".to_string(),
         "GET".to_string(),
         "/things/42".to_string(),
     )
+}
+
+/// Longest a fixture here waits for a signal produced by detached delivery work.
+const FIXTURE_SIGNAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Await a fixture notification under a bound.
+///
+/// A dropped dispatch produces no signal at all, and an unbounded `notified()`
+/// would then park the whole test binary instead of failing one test. Bounding
+/// the wait turns that into an assertion naming what never arrived.
+async fn notified_within(notify: &tokio::sync::Notify, what: &str) {
+    tokio::time::timeout(FIXTURE_SIGNAL_TIMEOUT, notify.notified())
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
 }
 
 /// Wait until the spawned `log_with_mirror` task has run and pushed a summary
@@ -242,6 +273,33 @@ async fn wait_for_events(
     events.lock().unwrap().clone()
 }
 
+/// The dropped-dispatch shape from issue #4987, stated as an assertion.
+///
+/// Terminal dispatch here is admitted through the process-global observability
+/// delivery lifecycle, and an in-process gateway fixture elsewhere in this
+/// binary permanently closes that lifecycle when it shuts down. Nothing in
+/// libtest lets a fixture control which of those runs first, so this pins the
+/// property the whole module depends on instead: after the fixture context is
+/// built, a terminal summary handed to detached delivery actually reaches the
+/// log sinks. Without the reopen in `make_ctx` this fails with a delivered
+/// count of zero once a serving fixture has run in the same process.
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_terminal_dispatch_reaches_log_sinks() {
+    let (capturing, captured) = CapturingPlugin::new();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(capturing)];
+    let ctx = make_ctx();
+
+    spawn_bounded_terminal_summary_log(&plugins, make_summary_with_status(200), &ctx);
+
+    let delivered = wait_for_captures(&captured, 1).await;
+    assert_eq!(
+        delivered.len(),
+        1,
+        "detached terminal delivery must be admitted for a fixture that opened it"
+    );
+    assert_eq!(delivered[0].response_status_code, 200);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn buffered_logging_without_deadline_awaits_plugins_sequentially() {
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -267,7 +325,7 @@ async fn buffered_logging_without_deadline_awaits_plugins_sequentially() {
     let log_task = tokio::spawn(async move {
         log_with_mirror_before_buffered_response(&plugins, summary, &ctx).await;
     });
-    started.notified().await;
+    notified_within(&started, "the first buffered log hook to start").await;
 
     assert!(
         !log_task.is_finished(),
@@ -305,7 +363,7 @@ async fn deadline_buffered_logging_does_not_await_a_blocked_sink() {
     .await
     .expect("deadline-bearing response must not await the blocked log sink");
 
-    started.notified().await;
+    notified_within(&started, "the detached deadline log hook to start").await;
     assert_eq!(events.lock().unwrap().as_slice(), ["deadline-log-started"]);
     release.notify_one();
     assert_eq!(
@@ -358,7 +416,7 @@ async fn the_authenticated_buffered_terminal_summary_is_delivered_once_and_never
 
     // Configured plugin order is preserved inside the detached task: the second
     // sink does not run until the blocked one finishes.
-    started.notified().await;
+    notified_within(&started, "the detached terminal summary hook to start").await;
     assert_eq!(events.lock().unwrap().as_slice(), ["blocked-sink"]);
     assert!(captured.lock().unwrap().is_empty());
 
@@ -392,7 +450,7 @@ async fn streamed_terminal_logging_is_spawned_after_body_completion() {
     );
 
     logger.fire(BodyOutcome::success(64));
-    started.notified().await;
+    notified_within(&started, "the streamed terminal log hook to start").await;
     assert_eq!(events.lock().unwrap().as_slice(), ["stream-log-started"]);
 
     release.notify_one();

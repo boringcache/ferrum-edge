@@ -6985,16 +6985,29 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
         }
     };
 
-    let risk = match obj.get("risk").and_then(Value::as_str) {
+    // A present `risk` must be a string before enum matching. A number,
+    // boolean, `null`, array, or object is an operator mistake, not an
+    // omission, and must never fall through to the `low` default.
+    let risk = match obj.get("risk") {
         None => RiskLevel::Low,
-        Some("low") => RiskLevel::Low,
-        Some("medium") => RiskLevel::Medium,
-        Some("high") => RiskLevel::High,
-        Some("critical") => RiskLevel::Critical,
-        Some(other) => {
-            return Err(format!(
-                "ai_tool_governor: tool '{name}' has invalid risk {other:?} (expected low, medium, high, or critical)"
-            ));
+        Some(value) => {
+            let spelled = value.as_str().ok_or_else(|| {
+                let kind = json_kind(value);
+                format!(
+                    "ai_tool_governor: tool '{name}' 'risk' must be a string (expected low, medium, high, or critical), got {kind}"
+                )
+            })?;
+            match spelled {
+                "low" => RiskLevel::Low,
+                "medium" => RiskLevel::Medium,
+                "high" => RiskLevel::High,
+                "critical" => RiskLevel::Critical,
+                other => {
+                    return Err(format!(
+                        "ai_tool_governor: tool '{name}' has invalid risk {other:?} (expected low, medium, high, or critical)"
+                    ));
+                }
+            }
         }
     };
 
@@ -7198,14 +7211,27 @@ fn parse_approval(
         ));
     }
 
-    let fail_on_error = match obj.get("fail_on_error").and_then(Value::as_str) {
-        None | Some("reject") => FailOnError::Reject,
-        Some("warn") => FailOnError::Warn,
-        Some("allow") => FailOnError::Allow,
-        Some(other) => {
-            return Err(format!(
-                "ai_tool_governor: 'approval.fail_on_error' must be one of 'reject', 'warn', or 'allow', got {other:?}"
-            ));
+    // As with `tools.<name>.risk`, a present non-string value is a mistake and
+    // must not silently resolve to the fail-closed `reject` default.
+    let fail_on_error = match obj.get("fail_on_error") {
+        None => FailOnError::Reject,
+        Some(value) => {
+            let spelled = value.as_str().ok_or_else(|| {
+                let kind = json_kind(value);
+                format!(
+                    "ai_tool_governor: 'approval.fail_on_error' must be a string (expected 'reject', 'warn', or 'allow'), got {kind}"
+                )
+            })?;
+            match spelled {
+                "reject" => FailOnError::Reject,
+                "warn" => FailOnError::Warn,
+                "allow" => FailOnError::Allow,
+                other => {
+                    return Err(format!(
+                        "ai_tool_governor: 'approval.fail_on_error' must be one of 'reject', 'warn', or 'allow', got {other:?}"
+                    ));
+                }
+            }
         }
     };
 
@@ -7339,6 +7365,19 @@ fn parse_observability(config: &Value) -> Result<ObservabilityConfig, String> {
 // ---------------------------------------------------------------------------
 // Small config accessors
 // ---------------------------------------------------------------------------
+
+/// Fixed JSON kind name for admission diagnostics. Only the kind is named — a
+/// rejected configuration value is never echoed into the error text.
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
 
 fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
     match config.get(field) {
