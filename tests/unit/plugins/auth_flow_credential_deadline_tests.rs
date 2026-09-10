@@ -189,7 +189,7 @@ async fn jwt_auth_admits_a_far_future_exp_without_a_credential_deadline() {
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_continue(result);
-    assert!(ctx.is_authenticated());
+    assert!(ctx.identified_consumer.is_some() || ctx.authenticated_identity.is_some());
     assert_eq!(
         request_credential_deadline_at(&ctx),
         None,
