@@ -811,6 +811,19 @@ pub mod _test_support {
         ctx.set_request_headers_to_redact(Arc::new(headers));
     }
 
+    /// Model proxy core's typed backend-dispatch provenance for direct plugin
+    /// lifecycle tests that never enter an HTTP dispatch path. `error_class:
+    /// None` records an authoritative backend response; a class with
+    /// `request_on_wire: false` records a pre-wire refusal, and with `true` an
+    /// ambiguous post-wire failure.
+    pub fn record_backend_dispatch_outcome_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        error_class: Option<crate::retry::ErrorClass>,
+        request_on_wire: bool,
+    ) {
+        ctx.record_backend_dispatch_outcome(error_class, request_on_wire);
+    }
+
     /// Model the transport-owned empty-body proof for direct plugin lifecycle
     /// tests that do not enter through an HTTP proxy body-drain path.
     pub fn set_replay_request_body_empty_proven_for_test(
@@ -3192,9 +3205,53 @@ pub mod _test_support {
         })
     }
 
+    /// Whether the trace exporter retries `status` for the named payload kind
+    /// (`"otlp"`, `"zipkin"`, `"datadog"`). `None` for an unknown kind.
+    pub fn otel_tracing_status_is_retryable_for_test(provider: &str, status: u16) -> Option<bool> {
+        crate::plugins::otel_tracing::trace_status_is_retryable_for_test(provider, status)
+    }
+
+    /// Parse a collector `Retry-After` value against a fixed clock, in
+    /// milliseconds. `None` when the value is absent or unparseable.
+    pub fn otel_tracing_parse_retry_after_for_test(value: &str, now_unix_secs: u64) -> Option<u64> {
+        crate::plugins::otel_tracing::parse_retry_after_for_test(value, now_unix_secs)
+    }
+
+    /// The exporter's delay in milliseconds before the retry following
+    /// `attempt` (`1` = the first retry), for fixed jitter entropy.
+    pub fn otel_tracing_retry_delay_ms_for_test(
+        base_ms: u64,
+        attempt: u32,
+        retry_after_ms: Option<u64>,
+        entropy: u64,
+    ) -> u64 {
+        crate::plugins::otel_tracing::trace_retry_delay_ms_for_test(
+            base_ms,
+            attempt,
+            retry_after_ms,
+            entropy,
+        )
+    }
+
     // ── plugins/soap_ws_security ────────────────────────────────────────────
     pub fn soap_count_wsu_id_occurrences_for_test(xml: &str, id: &str) -> Result<usize, String> {
         crate::plugins::soap_ws_security::count_wsu_id_occurrences(xml, id)
+    }
+
+    pub fn soap_exclusive_canonicalize_with_budget_for_test(
+        xml: &str,
+        local_name: &str,
+        budget_bytes: usize,
+    ) -> (Result<String, String>, usize) {
+        crate::plugins::soap_ws_security::exclusive_canonicalize_with_budget_for_test(
+            xml,
+            local_name,
+            budget_bytes,
+        )
+    }
+
+    pub fn soap_canonicalization_source_len_for_test(xml: &str, local_name: &str) -> Option<usize> {
+        crate::plugins::soap_ws_security::canonicalization_source_len_for_test(xml, local_name)
     }
 
     pub fn soap_exclusive_canonicalize_element_for_test(
@@ -11319,6 +11376,35 @@ pub mod _test_support {
         crate::plugins::udp_logging::local_record_drops_for_test()
     }
 
+    /// Lost-record total for injected split-batch retry sequences.
+    ///
+    /// Each inner slice is one attempt. Labels: `"reject"` (deterministic
+    /// local size rejection), `"ok"` (delivered), `"transport"` (transport
+    /// error). Matches production: local rejects count only on a completed
+    /// attempt; exhausting retries counts the original batch once.
+    pub fn udp_logging_split_retry_lost_record_count_for_test(attempts: &[&[&str]]) -> u64 {
+        use crate::plugins::udp_logging::SplitEntryOutcome;
+        let parsed: Vec<Vec<SplitEntryOutcome>> = attempts
+            .iter()
+            .map(|attempt| {
+                attempt
+                    .iter()
+                    .map(|label| match *label {
+                        "reject" => SplitEntryOutcome::LocalReject,
+                        "ok" => SplitEntryOutcome::Delivered,
+                        "transport" => SplitEntryOutcome::TransportError,
+                        other => panic!(
+                            "udp_logging split-retry fixture label must be \
+                             reject/ok/transport, got {other}"
+                        ),
+                    })
+                    .collect()
+            })
+            .collect();
+        let refs: Vec<&[SplitEntryOutcome]> = parsed.iter().map(Vec::as_slice).collect();
+        crate::plugins::udp_logging::split_retry_lost_record_count(&refs)
+    }
+
     pub fn udp_logging_classify_serialized_summaries_for_test(
         summaries: &[crate::plugins::TransactionSummary],
         max_datagram_bytes: usize,
@@ -12068,6 +12154,66 @@ pub mod _test_support {
                 .try_reserve_request_permit(bytes)
                 .map(RequestBufferPermitProbe)
         }
+    }
+
+    /// What the shared charged content-coding chain decoder — the one
+    /// `compression`'s opt-in `decompress_request` normalizer now runs
+    /// (`GHSA-q76p-952x-7c3v`) — decided for one coding list, projected so
+    /// external tests can assert on it without reaching into the crate-private
+    /// error type.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum ChargedCodingChainOutcome {
+        /// Decoded under every bound, with the working-set charge released.
+        Decoded(Vec<u8>),
+        /// A coding token the strict decoder does not implement.
+        Unsupported,
+        /// Malformed, truncated, Large-Window Brotli, or trailing data.
+        Malformed,
+        /// Over a per-layer, cumulative, or amplification bound.
+        TooLarge,
+        /// The aggregate budget could not admit the decode's working set. The
+        /// GATEWAY-local capacity terminal, deliberately not a byte fault.
+        CapacityRefused,
+    }
+
+    /// Decode one canonical coding list through the PRODUCTION charged decoder,
+    /// charged against an ISOLATED budget so a parallel test binary can observe
+    /// admission and release deterministically.
+    ///
+    /// `codings` are lowercase tokens in APPLICATION order, exactly as
+    /// `compression` hands them over after classification.
+    pub fn decode_charged_coding_chain_in(
+        probe: &ResponseBufferBudgetProbe,
+        codings: &[String],
+        body: &[u8],
+        max_decoded_bytes: usize,
+        max_cumulative_bytes: usize,
+        max_amplification_ratio: u32,
+    ) -> ChargedCodingChainOutcome {
+        use crate::plugins::charged_decode::{
+            ChargedDecodeError, decode_charged_content_coding_chain,
+        };
+        let limits = crate::plugins::utils::content_encoding::DecodeLimits {
+            max_decoded_bytes,
+            max_cumulative_bytes,
+            // The caller bounds the layer COUNT before classification; this
+            // decoder is handed an already-bounded list.
+            max_codings: codings.len().max(1),
+            max_amplification_ratio,
+        };
+        match decode_charged_content_coding_chain(codings, body, limits, probe.0.handle()) {
+            Ok(plaintext) => ChargedCodingChainOutcome::Decoded(plaintext),
+            Err(ChargedDecodeError::Unsupported) => ChargedCodingChainOutcome::Unsupported,
+            Err(ChargedDecodeError::Malformed) => ChargedCodingChainOutcome::Malformed,
+            Err(ChargedDecodeError::TooLarge) => ChargedCodingChainOutcome::TooLarge,
+            Err(ChargedDecodeError::CapacityRefused) => ChargedCodingChainOutcome::CapacityRefused,
+        }
+    }
+
+    /// The exact backend-request header filter the H3 cross-protocol bridge
+    /// applies to both its plain and gRPC builders (issue #5110).
+    pub fn cross_protocol_backend_header_is_stripped_for_test(name: &str) -> bool {
+        crate::http3::cross_protocol::should_skip_cross_protocol_backend_header(name)
     }
 
     /// Whether an error class is neutral to circuit-breaker, passive-health, and

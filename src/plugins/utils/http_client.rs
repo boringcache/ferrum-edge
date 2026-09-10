@@ -65,6 +65,7 @@
 //! }
 //! ```
 
+use super::log_helpers::redacted_endpoint_url;
 use crate::config::{BackendEgressPolicy, PoolConfig};
 use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::retry::{ErrorClass, classify_reqwest_error};
@@ -115,11 +116,50 @@ fn unavailable_plugin_http_failure() -> PluginHttpFailure {
 /// construction already emits one diagnostic; traffic must not turn that
 /// condition into repeated fallible builders or a warning storm.
 fn unavailable_reqwest_execute_result() -> Result<reqwest::Response, reqwest::Error> {
+    Ok(unavailable_response())
+}
+
+/// The inert local 502 every execution helper substitutes when no shared client
+/// could be constructed.
+fn unavailable_response() -> reqwest::Response {
     let mut denied = http::Response::new(reqwest::Body::from(
         r#"{"error":"plugin HTTP client unavailable"}"#,
     ));
     *denied.status_mut() = http::StatusCode::BAD_GATEWAY;
-    Ok(reqwest::Response::from(denied))
+    reqwest::Response::from(denied)
+}
+
+/// Inert local 502 returned when the backend egress policy refuses to dial a
+/// literal-IP endpoint. The destination is never contacted.
+fn egress_denied_response() -> reqwest::Response {
+    let mut denied = http::Response::new(reqwest::Body::from(
+        r#"{"error":"endpoint blocked by backend egress policy"}"#,
+    ));
+    *denied.status_mut() = http::StatusCode::BAD_GATEWAY;
+    reqwest::Response::from(denied)
+}
+
+/// Diagnostic-safe rendering of the destination for every warning this client
+/// emits (literal-IP egress denial, transport retry, slow call).
+///
+/// A caller-supplied redacted label wins. Otherwise the request URL is reduced
+/// STRUCTURALLY to `scheme://host[:port]/redacted` by
+/// [`redacted_endpoint_url`]: nothing from the userinfo, path, query, or
+/// fragment is copied into the result.
+///
+/// Configured plugin endpoints routinely carry a credential in exactly those
+/// components — a `?api_key=` discovery URL, a webhook path token, a
+/// `user:pass@` authority — and these warnings land in ordinary process logs
+/// that a lower-privileged reader can see, while the Admin API deliberately
+/// redacts the same values (GHSA-4ghp-v85j-5hvq). The origin still identifies
+/// which external endpoint is slow or denied, and the `plugin` field
+/// identifies the caller that dialed it. Callers needing more detail must pass
+/// their own redacted label; the raw URL is never a default.
+fn diagnostic_url(request: &reqwest::Request, log_url_override: Option<&str>) -> String {
+    match log_url_override {
+        Some(redacted) => redacted.to_string(),
+        None => redacted_endpoint_url(request.url()),
+    }
 }
 
 /// Whether one execution may use the shared `FERRUM_PLUGIN_HTTP_MAX_RETRIES`
@@ -1179,8 +1219,13 @@ impl PluginHttpClient {
     /// Safe/idempotent requests (`GET`, `HEAD`, `OPTIONS`) are retried on
     /// transport-level failures when `FERRUM_PLUGIN_HTTP_MAX_RETRIES` is set.
     ///
-    /// The destination URL is extracted from the request and included in the
-    /// slow-call warning so operators can identify which external endpoint is slow.
+    /// Diagnostics record only the destination ORIGIN
+    /// (`scheme://host[:port]/redacted`), never the request URL's userinfo,
+    /// path, or query — see [`diagnostic_url`]. Callers whose endpoint carries
+    /// a credential should still prefer [`execute_redacted`], which also
+    /// sanitizes the returned error: `reqwest::Error`'s `Display` prints the
+    /// complete request URL, so the typed error this method returns must never
+    /// be rendered into a log line.
     pub async fn execute(
         &self,
         request: reqwest::RequestBuilder,
@@ -1322,6 +1367,83 @@ impl PluginHttpClient {
             })
     }
 
+    /// Execute a request and consume its response body inside ONE measured
+    /// network span, logging only `redacted_url`.
+    ///
+    /// [`execute_redacted_tracked`] stops accounting when response headers
+    /// arrive, which is the wrong boundary for a caller whose result is not
+    /// decided until the complete body has been read. An OPA policy service
+    /// that flushes headers immediately and its decision document 180 ms later
+    /// contributes ~0 ms to `latency_plugin_external_io_ms` and never crosses
+    /// the slow-call threshold under the header-only boundary, even though it
+    /// dominates authorization latency (issue #5059).
+    ///
+    /// `consume` receives the response and must perform ONLY the body read:
+    /// the time it spends is charged to `accumulator` and to the slow-call
+    /// threshold as network I/O. Parsing or evaluating the decoded document
+    /// belongs after this call so CPU time is never reported as external I/O.
+    /// Header time is charged once, by the attempt loop, and is not counted a
+    /// second time here.
+    pub async fn execute_redacted_tracked_through_body<T, F, Fut>(
+        &self,
+        request: reqwest::RequestBuilder,
+        label: &str,
+        redacted_url: &str,
+        accumulator: &AtomicU64,
+        consume: F,
+    ) -> Result<T, String>
+    where
+        F: FnOnce(reqwest::Response) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let request = request.build().map_err(|error| {
+            let error_class = classify_reqwest_error(&error);
+            format!("{error_class} building request to {redacted_url}")
+        })?;
+        // Same inert-502 substitutions as the rest of the execute family, so a
+        // caller's non-success handling is identical whether the refusal came
+        // from terminal client construction, from the egress policy, or from
+        // the endpoint itself.
+        let Some(client) = self.client.as_ref() else {
+            return Ok(consume(unavailable_response()).await);
+        };
+        if let Some(reason) = self.denied_literal_ip_reason(&request) {
+            tracing::warn!(
+                plugin = label,
+                url = %redacted_url,
+                reason,
+                "Plugin egress policy denied literal-IP endpoint; not dialing"
+            );
+            return Ok(consume(egress_denied_response()).await);
+        }
+
+        let total_start = std::time::Instant::now();
+        let result = self
+            .run_request_attempts(
+                client,
+                request,
+                label,
+                Some(accumulator),
+                redacted_url,
+                RetryDisposition::SharedPolicy,
+            )
+            .await;
+        let response = match result {
+            Ok(response) => response,
+            Err(error) => {
+                self.log_slow_call(label, redacted_url, total_start.elapsed());
+                let error_class = classify_reqwest_error(&error);
+                return Err(format!("{error_class} calling {redacted_url}"));
+            }
+        };
+
+        let body_start = std::time::Instant::now();
+        let consumed = consume(response).await;
+        accumulator.fetch_add(body_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.log_slow_call(label, redacted_url, total_start.elapsed());
+        Ok(consumed)
+    }
+
     /// Send a redacted, latency-tracked request while retaining a replay-safety
     /// classification for non-idempotent callers.
     pub async fn execute_redacted_tracked_classified(
@@ -1441,9 +1563,7 @@ impl PluginHttpClient {
         log_url_override: Option<&str>,
         retry_disposition: RetryDisposition,
     ) -> Result<reqwest::Response, reqwest::Error> {
-        let url = request.url().to_string();
-        let log_url = log_url_override.unwrap_or(&url).to_string();
-        let method = request.method().clone();
+        let log_url = diagnostic_url(&request, log_url_override);
 
         // reqwest skips the custom `DnsCacheResolver` for an IP-literal host
         // (there is nothing to resolve), so a denied literal endpoint
@@ -1458,14 +1578,41 @@ impl PluginHttpClient {
                 reason,
                 "Plugin egress policy denied literal-IP endpoint; not dialing"
             );
-            let mut denied = http::Response::new(reqwest::Body::from(
-                r#"{"error":"endpoint blocked by backend egress policy"}"#,
-            ));
-            *denied.status_mut() = http::StatusCode::BAD_GATEWAY;
-            return Ok(reqwest::Response::from(denied));
+            return Ok(egress_denied_response());
         }
 
         let total_start = std::time::Instant::now();
+        let result = self
+            .run_request_attempts(
+                client,
+                request,
+                label,
+                accumulator,
+                &log_url,
+                retry_disposition,
+            )
+            .await;
+        self.log_slow_call(label, &log_url, total_start.elapsed());
+        result
+    }
+
+    /// Attempt loop shared by every execution helper.
+    ///
+    /// Charges each attempt's round-trip to `accumulator` and applies the
+    /// transport-retry policy. It deliberately does NOT emit the slow-call
+    /// warning: the caller owns that boundary, so a helper that also waits for
+    /// the response body can report one span covering the whole network call
+    /// instead of only its headers.
+    async fn run_request_attempts(
+        &self,
+        client: &reqwest::Client,
+        request: reqwest::Request,
+        label: &str,
+        accumulator: Option<&AtomicU64>,
+        log_url: &str,
+        retry_disposition: RetryDisposition,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let method = request.method().clone();
         let retry_template = request.try_clone();
         let can_retry = retry_disposition == RetryDisposition::SharedPolicy
             && self.max_retries > 0
@@ -1507,17 +1654,17 @@ impl PluginHttpClient {
                 tokio::time::sleep(self.retry_delay).await;
 
                 let Some(template) = retry_template.as_ref() else {
-                    return self.finish_request(result, label, &log_url, total_start);
+                    return result;
                 };
                 let Some(next_request) = template.try_clone() else {
-                    return self.finish_request(result, label, &log_url, total_start);
+                    return result;
                 };
                 current_request = next_request;
                 attempt += 1;
                 continue;
             }
 
-            return self.finish_request(result, label, &log_url, total_start);
+            return result;
         }
     }
 
@@ -1530,14 +1677,11 @@ impl PluginHttpClient {
         literal_ip.and_then(|ip| self.backend_allow_ips.deny_reason(&ip))
     }
 
-    fn finish_request(
-        &self,
-        result: Result<reqwest::Response, reqwest::Error>,
-        label: &str,
-        url: &str,
-        start: std::time::Instant,
-    ) -> Result<reqwest::Response, reqwest::Error> {
-        let elapsed = start.elapsed();
+    /// Emit the slow-call warning when one measured network span exceeded
+    /// `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS`.
+    ///
+    /// `url` is always a diagnostic-safe rendering — see [`diagnostic_url`].
+    fn log_slow_call(&self, label: &str, url: &str, elapsed: Duration) {
         if elapsed > self.slow_threshold {
             tracing::warn!(
                 plugin = label,
@@ -1547,7 +1691,6 @@ impl PluginHttpClient {
                 "Slow plugin HTTP call"
             );
         }
-        result
     }
 
     /// Safe-method transport retry list. Independent of
