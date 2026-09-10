@@ -8835,10 +8835,12 @@ fn canonical_writer_charges_the_budget_as_it_writes() {
     // on the first append and then stops.
     let (outcome, remaining) = c14n_with_budget(source_len + 1);
     let error = outcome.expect_err("one byte of output allowance is not enough");
-    assert!(error.contains("canonicalization work budget"), "got: {error}");
+    assert!(
+        error.contains("canonicalization work budget"),
+        "got: {error}"
+    );
     assert_eq!(
-        remaining,
-        0,
+        remaining, 0,
         "the writer must stop at the ceiling with the output allowance spent, not build the \
          whole over-budget result and charge for it afterwards"
     );
@@ -8849,7 +8851,11 @@ fn canonical_writer_refuses_an_over_budget_subtree_before_walking_it() {
     let source_len = c14n_source_len();
     let (outcome, remaining) = c14n_with_budget(source_len - 1);
     assert!(outcome.is_err(), "an over-budget subtree is refused");
-    assert_eq!(remaining, source_len - 1, "refusing before the walk charges nothing");
+    assert_eq!(
+        remaining,
+        source_len - 1,
+        "refusing before the walk charges nothing"
+    );
 }
 
 // ── Credential removal (GHSA-xg9v-wc29-fc29) ────────────────────────────────
@@ -9004,7 +9010,10 @@ async fn test_remove_credential_strips_a_security_header_that_holds_only_the_tok
     // The final-body proof binds the sanitized representation: it admits the
     // rewritten bytes and still refuses the ones that were validated.
     let accepted = final_body_decision(&plugin, &mut ctx, &headers, &transformed).await;
-    assert!(matches!(accepted, PluginResult::Continue), "got {accepted:?}");
+    assert!(
+        matches!(accepted, PluginResult::Continue),
+        "got {accepted:?}"
+    );
     let refused = final_body_decision(&plugin, &mut ctx, &headers, body.as_bytes()).await;
     assert_eq!(reject_status(&refused), 500);
 }
@@ -9053,7 +9062,10 @@ async fn test_remove_credential_refuses_a_signed_envelope() {
         reject_body(&result)
     );
     let strip_key = "soap_ws_security.credential_strip_range";
-    assert!(!ctx.metadata.contains_key(strip_key), "no removal is recorded");
+    assert!(
+        !ctx.metadata.contains_key(strip_key),
+        "no removal is recorded"
+    );
 }
 
 #[tokio::test]
@@ -9118,13 +9130,19 @@ async fn test_saml_signing_cert_rotation_takes_effect_in_a_new_generation() {
     };
 
     let accepted = run_saml_generation(&generation_before, &assertion("_rot-1", false)).await;
-    assert!(matches!(accepted, PluginResult::Continue), "got {accepted:?}");
+    assert!(
+        matches!(accepted, PluginResult::Continue),
+        "got {accepted:?}"
+    );
     let refused = run_saml_generation(&generation_before, &assertion("_rot-2", true)).await;
     assert_eq!(reject_status(&refused), 401);
 
     // Same process, same fixtures — only the constructed generation changed.
     let accepted = run_saml_generation(&generation_after, &assertion("_rot-3", true)).await;
-    assert!(matches!(accepted, PluginResult::Continue), "got {accepted:?}");
+    assert!(
+        matches!(accepted, PluginResult::Continue),
+        "got {accepted:?}"
+    );
     let refused = run_saml_generation(&generation_after, &assertion("_rot-4", false)).await;
     assert_eq!(
         reject_status(&refused),
@@ -9170,7 +9188,10 @@ fn openapi_soap_ws_security_component_matches_constructor_admission() {
     let cases: Vec<(&str, serde_json::Value)> = vec![
         ("empty object", json!({})),
         ("timestamp only", json!({"timestamp": {"require": true}})),
-        ("no active feature", json!({"timestamp": {"require": false}})),
+        (
+            "no active feature",
+            json!({"timestamp": {"require": false}}),
+        ),
         (
             "username_token without credentials",
             json!({"username_token": {"enabled": true, "password_type": "PasswordText"}}),
