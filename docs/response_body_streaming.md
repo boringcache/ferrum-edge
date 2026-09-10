@@ -373,7 +373,12 @@ Three properties are load-bearing:
   `Pending` poll to drive an idle check) is still bounded.
 - **There is no unbounded configuration.** A credential admitted without an
   authoritative expiry — `key_auth`, `basic_auth`, `hmac_auth`, LDAP — is
-  bounded by the fallback maximum alone. `0` is rejected in every mode.
+  bounded by the fallback maximum alone. A validated `exp` further out than the
+  host's monotonic clock can represent lands in the same place: whether that
+  conversion overflows is a property of the platform clock, never of the
+  credential, so the credential stays admitted and simply publishes no bound of
+  its own instead of being treated as already expired. `0` is rejected in every
+  mode.
 - **Unauthenticated streams are untouched.** No principal was admitted, so
   there is no authorization lifetime to enforce. A public SSE endpoint behaves
   exactly as before.
