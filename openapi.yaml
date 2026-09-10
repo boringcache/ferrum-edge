@@ -29338,7 +29338,16 @@ components:
                 const: false
           then:
             # Disabled drafts may carry ignored policy fields of any value, but
-            # only the known property names — typos still fail closed.
+            # only the known property names — typos still fail closed. Runtime
+            # admission runs validate_config_keys BEFORE the enabled:false short
+            # circuit and rejects unknown names at every fixed-shape layer,
+            # nested layers included, so each nested closure below is mirrored
+            # here. Every closure is conditional on the value actually being an
+            # object (an array, for blocked_arg_patterns), matching the
+            # runtime's as_object()/as_array() guards: an ignored scalar such as
+            # mode: 7, tools: null, or inspect: "off" stays admissible. The
+            # free-form tools tool-name map and per-tool json_schema document
+            # stay open in both branches.
             type: object
             additionalProperties: false
             properties:
@@ -29347,11 +29356,73 @@ components:
               mode: true
               default_action: true
               unknown_shape_action: true
-              inspect: true
-              tools: true
-              approval: true
-              response: true
-              observability: true
+              inspect:
+                if:
+                  type: object
+                then:
+                  additionalProperties: false
+                  properties:
+                    request_tool_definitions: true
+                    response_tool_calls: true
+                    streaming_response_tool_calls: true
+                    mcp_tool_calls: true
+                    a2a_methods: true
+              tools:
+                if:
+                  type: object
+                then:
+                  additionalProperties:
+                    if:
+                      type: object
+                    then:
+                      additionalProperties: false
+                      properties:
+                        action: true
+                        risk: true
+                        max_arg_bytes: true
+                        required_args: true
+                        json_schema: true
+                        blocked_arg_patterns:
+                          if:
+                            type: array
+                          then:
+                            items:
+                              if:
+                                type: object
+                              then:
+                                additionalProperties: false
+                                properties:
+                                  name: true
+                                  regex: true
+              approval:
+                if:
+                  type: object
+                then:
+                  additionalProperties: false
+                  properties:
+                    endpoint_url: true
+                    timeout_ms: true
+                    cache_ttl_seconds: true
+                    fail_on_error: true
+                    include_arguments: true
+              response:
+                if:
+                  type: object
+                then:
+                  additionalProperties: false
+                  properties:
+                    deny_status_code: true
+                    redaction_placeholder: true
+                    streaming_deny_event: true
+              observability:
+                if:
+                  type: object
+                then:
+                  additionalProperties: false
+                  properties:
+                    emit_metadata: true
+                    hash_arguments: true
+                    max_argument_log_bytes: true
           else:
             $ref: "#/components/schemas/AiToolGovernorEnabledConfig"
 
@@ -29555,8 +29626,8 @@ components:
               type: string
               minLength: 1
               format: uri
-              pattern: '^https?://(?:[^/?#]*@)?(?:\[[^\]]+\]|[^/?#:@]+)(?::[0-9]+)?(?:[/?#]|$)'
-              description: "http/https URL POSTed with request_id, consumer, proxy, model, provider, tool_name, arguments_hash, risk (and raw arguments only when include_arguments=true). Response: {\"decision\":\"allow|deny\"} or {\"allow\":true|false}, optional approval_id. Response bodies are capped at 64 KiB."
+              pattern: '^[Hh][Tt][Tt][Pp][Ss]?://(?:[^/?#]*@)?(?:\[[^\]]+\]|[^/?#:@]+)(?::[0-9]+)?(?:[/?#]|$)'
+              description: "http/https URL POSTed with request_id, consumer, proxy, model, provider, tool_name, arguments_hash, risk (and raw arguments only when include_arguments=true). The URI scheme is case-insensitive (runtime parsing normalizes it before the http/https check), so HTTPS://host/path is admitted exactly like https://host/path. Response: {\"decision\":\"allow|deny\"} or {\"allow\":true|false}, optional approval_id. Response bodies are capped at 64 KiB."
             timeout_ms:
               type: integer
               minimum: 1
