@@ -10923,6 +10923,7 @@ components:
               plugin_name:
                 const: hmac_auth
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/HmacAuthConfig"
@@ -20557,9 +20558,28 @@ components:
             legacy backend explicitly requires the reusable credential.
 
     BasicAuthConfig:
-      type: object
-      description: "Plugin: basic_auth — HTTP Basic credentials verified against HMAC-SHA256 password hashes."
-      properties: {}
+      type: [object, "null"]
+      additionalProperties: false
+      description: >-
+        Plugin: basic_auth — HTTP Basic credentials verified against
+        HMAC-SHA256 password hashes. The property set is CLOSED: `null` and an
+        empty object both select the defaults, and no other key is accepted.
+        (The enclosing PluginConfig `config` property is independently
+        restricted to objects, so `null` is only reachable when this component
+        is validated on its own.)
+      properties:
+        hide_credentials:
+          type: boolean
+          default: true
+          description: >-
+            Remove the `Authorization` field carrying the RFC 7617 `Basic`
+            scheme before forwarding an authenticated request upstream,
+            including when another mechanism wins a multi-auth chain and this
+            credential merely rode along. Basic encodes a reusable password in
+            reversible Base64, so it is removed by default. Only the `Basic`
+            scheme is removed; a `Bearer` or other scheme another policy needs
+            is left in place. Disable only when a legacy backend explicitly
+            requires the reusable credential.
 
     LdapAuthConfig:
       type: object
@@ -20768,7 +20788,11 @@ components:
         retry is therefore a replay and is rejected; safe retries send a fresh
         nonce with a recomputed signature. HBONE CONNECT and
         request-body-transformer compositions fail closed. The
-        pre-authentication body path has a 10 MiB hard ceiling.
+        pre-authentication body path has a 10 MiB hard ceiling. A WebSocket
+        handshake (HTTP/1.1 Upgrade, HTTP/2 and HTTP/3 Extended CONNECT) is
+        signed over the EMPTY body: tunnel DATA is never drained as a request
+        body, so the transport proves the handshake's empty representation from
+        its own wire framing, and a handshake that declares a body is rejected.
       properties:
         clock_skew_seconds:
           type: integer
@@ -20820,7 +20844,9 @@ components:
             request instead of falling back to freshness-only acceptance.
         replay_max_entries:
           type: integer
+          format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           default: 100000
           description: >-
             Capacity this process-scoped authority enforces against the shared
@@ -20879,6 +20905,59 @@ components:
         redis_password:
           type: string
           description: Redis password
+      allOf:
+        # The constructor's profile/scope/backend admission, expressed exactly.
+        # An omitted `signing_profile` means `ferrum-hmac-v2`, so the v2 rules
+        # live in the `else` branch rather than in a second `if`.
+        - if:
+            required: [signing_profile]
+            properties:
+              signing_profile:
+                const: ferrum-hmac-v1
+          then:
+            # v1 has no replay state at all: it demands the unsafe
+            # acknowledgement and refuses every replay knob.
+            required: [allow_unsafe_replayable_v1]
+            properties:
+              allow_unsafe_replayable_v1:
+                const: true
+              sync_mode:
+                const: local
+            not:
+              required: [replay_scope]
+          else:
+            # ferrum-hmac-v2 (the default) has no default replay scope, and the
+            # unsafe acknowledgement is only meaningful with v1.
+            required: [replay_scope]
+            properties:
+              allow_unsafe_replayable_v1:
+                const: false
+        - if:
+            required: [replay_scope]
+            properties:
+              replay_scope:
+                const: shared
+          then:
+            required: [sync_mode, redis_url]
+            properties:
+              sync_mode:
+                const: redis
+        - if:
+            required: [replay_scope]
+            properties:
+              replay_scope:
+                const: process
+          then:
+            properties:
+              sync_mode:
+                const: local
+        - if:
+            required: [sync_mode]
+            properties:
+              sync_mode:
+                const: redis
+          then:
+            required: [redis_url]
 
     # ── Mesh / Service-Mesh Plugins ─────────────────────────────────
     # These plugins are primarily auto-injected by mesh mode (sidecar / ambient /

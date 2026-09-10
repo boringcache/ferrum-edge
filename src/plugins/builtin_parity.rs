@@ -252,7 +252,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "basic_auth",
         classification: BuiltinPluginClassification::Public,
         priority: 1300,
-        active_phases: "authenticate",
+        active_phases: "authenticate, before_proxy",
         matrix_protocols: HTTP_FAMILY_PROTOCOLS,
         protocol_rationale: "Requires HTTP headers",
     },
@@ -262,7 +262,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         priority: 1400,
         active_phases: "authenticate",
         matrix_protocols: HTTP_FAMILY_PROTOCOLS,
-        protocol_rationale: "Requires HTTP headers and a buffered request body; HBONE CONNECT fails closed as incompatible",
+        protocol_rationale: "Requires HTTP headers and a buffered request body; a WebSocket handshake is signed over the empty body and tunnel DATA is never drained; HBONE CONNECT fails closed as incompatible",
     },
     BuiltinPluginParityMeta {
         name: "soap_ws_security",

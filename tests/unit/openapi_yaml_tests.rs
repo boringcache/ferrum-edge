@@ -3373,6 +3373,127 @@ fn hmac_auth_config_root_is_closed_and_matches_openapi() {
     );
 }
 
+/// Issue #5001: key-set parity is not acceptance parity. `HmacAuthConfig` had
+/// no conditional constraints at all, so schema-based tooling approved
+/// deployments the gateway refuses to start with — an empty configuration,
+/// unsafe v1 without its acknowledgement, v2 without a replay scope, and every
+/// impossible Redis/scope pairing. This is the real schema-vs-runtime
+/// acceptance matrix.
+#[test]
+fn hmac_auth_schema_acceptance_matches_runtime_admission() {
+    use ferrum_edge::plugins::create_plugin;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let validator_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/HmacAuthConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&validator_schema)
+        .expect("HmacAuthConfig schema compiles");
+
+    let redis_url = "redis://127.0.0.1:6379/0";
+    let accepted = [
+        json!({"replay_scope": "process"}),
+        json!({"replay_scope": "process", "clock_skew_seconds": 60}),
+        json!({"replay_scope": "process", "replay_max_entries": 1}),
+        json!({"replay_scope": "process", "sync_mode": "local"}),
+        json!({"signing_profile": "ferrum-hmac-v2", "replay_scope": "process"}),
+        json!({
+            "signing_profile": "ferrum-hmac-v2",
+            "replay_scope": "process",
+            "allow_unsafe_replayable_v1": false
+        }),
+        json!({"signing_profile": "ferrum-hmac-v1", "allow_unsafe_replayable_v1": true}),
+        json!({
+            "replay_scope": "shared",
+            "sync_mode": "redis",
+            "redis_url": redis_url
+        }),
+    ];
+    for config in &accepted {
+        assert!(
+            validator.validate(config).is_ok(),
+            "config should be schema-valid: {config}"
+        );
+        assert!(
+            create_plugin("hmac_auth", config).is_ok(),
+            "config should be runtime-valid: {config}"
+        );
+    }
+
+    let rejected = [
+        // Profile / acknowledgement / scope admission (the #5001 matrix).
+        json!({}),
+        json!({"clock_skew_seconds": 60}),
+        json!({"signing_profile": "ferrum-hmac-v1"}),
+        json!({"signing_profile": "ferrum-hmac-v1", "allow_unsafe_replayable_v1": false}),
+        json!({
+            "signing_profile": "ferrum-hmac-v1",
+            "allow_unsafe_replayable_v1": true,
+            "replay_scope": "process"
+        }),
+        json!({"replay_scope": "process", "allow_unsafe_replayable_v1": true}),
+        json!({"replay_scope": "shared"}),
+        json!({"replay_scope": "shared", "sync_mode": "redis"}),
+        json!({"replay_scope": "process", "sync_mode": "redis", "redis_url": redis_url}),
+        json!({
+            "signing_profile": "ferrum-hmac-v1",
+            "allow_unsafe_replayable_v1": true,
+            "sync_mode": "redis",
+            "redis_url": redis_url
+        }),
+        // Scalar spellings: the enums are exact on both surfaces.
+        json!({"replay_scope": " PROCESS "}),
+        json!({"replay_scope": "Process"}),
+        json!({"replay_scope": "process", "signing_profile": " ferrum-hmac-v2 "}),
+        json!({"replay_scope": "process", "signing_profile": "FERRUM-HMAC-V2"}),
+        json!({
+            "replay_scope": "shared",
+            "sync_mode": "REDIS",
+            "redis_url": redis_url
+        }),
+        // Types, bounds, and the closed key set.
+        json!({"replay_scope": "process", "replay_max_entries": 0}),
+        json!({"replay_scope": "process", "clock_skew_seconds": 0}),
+        json!({"replay_scope": "process", "clock_skew_seconds": 301}),
+        json!({"replay_scope": true}),
+        json!({"replay_scope": "process", "replay_scop": "shared"}),
+        json!({"replay_scope": "process", "require_digest": true}),
+    ];
+    for config in &rejected {
+        assert!(
+            validator.validate(config).is_err(),
+            "config should be schema-invalid: {config}"
+        );
+        assert!(
+            create_plugin("hmac_auth", config).is_err(),
+            "config should be runtime-invalid: {config}"
+        );
+    }
+}
+
+/// The enclosing `PluginConfig` branch must demand `config` too: an omitted
+/// `config` defaults to null and `HmacAuth::build` refuses a non-object.
+#[test]
+fn hmac_auth_plugin_config_branch_requires_a_config_object() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let branch = spec
+        .pointer("/components/schemas/PluginConfig/allOf")
+        .and_then(serde_json::Value::as_array)
+        .expect("PluginConfig allOf")
+        .iter()
+        .find(|entry| {
+            entry.pointer("/if/properties/plugin_name/const") == Some(&json!("hmac_auth"))
+        })
+        .expect("hmac_auth PluginConfig branch");
+
+    assert_eq!(branch.pointer("/then/required"), Some(&json!(["config"])));
+}
+
 #[test]
 fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
     let spec: serde_json::Value =

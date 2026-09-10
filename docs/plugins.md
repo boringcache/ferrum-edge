@@ -2607,7 +2607,13 @@ Authenticates using HTTP Basic credentials. Every HTTP 401 response advertises `
 
 **Priority:** 1300
 
-**Config**: The plugin object is empty. `FERRUM_BASIC_AUTH_HMAC_SECRET` is mandatory whenever the plugin is enabled and must contain at least 32 bytes of unique random material. There is no default. Rotating the secret invalidates all existing hashes, so replace the hashes in the same rollout.
+**Config**: The property set is closed — `null`, an empty object, and an object carrying only `hide_credentials` are the accepted forms. `FERRUM_BASIC_AUTH_HMAC_SECRET` is mandatory whenever the plugin is enabled and must contain at least 32 bytes of unique random material. There is no default. Rotating the secret invalidates all existing hashes, so replace the hashes in the same rollout.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `hide_credentials` | Boolean | `true` | Remove the `Authorization` field carrying the `Basic` scheme before proxying an authenticated request, including when another mechanism wins a multi-auth chain. Set to `false` only for a legacy backend that explicitly requires the reusable password. |
+
+Basic encodes a **reusable** username and password in reversible Base64: an upstream that receives the field recovers the password and can replay it on any other gateway route that consumer can reach. The credential is therefore removed by default on every HTTP/1.1, HTTP/2, HTTP/3, gRPC, gRPC-Web, and WebSocket handshake path, and it is removed even when a different mechanism authenticated the request — a mixed chain must not forward Alice's password to a backend the gateway is telling `x-consumer-username: bob`. Only the `Basic` scheme is removed; a `Bearer` or other `Authorization` scheme another policy needs is left in place. Consumer identity injection and the `401` challenge are unchanged.
 
 Admin API writes may supply exactly one of `password` or `password_hash`; plaintext passwords are hashed and removed before persistence. File-mode configuration must supply only `password_hash` so plaintext credentials never enter observable runtime configuration.
 
@@ -2622,6 +2628,14 @@ credentials:
     - password_hash: "hmac_sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     - password_hash: "hmac_sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 ```
+
+A consumer that carries `basicauth` credentials must not have a `:` in its
+`username`. RFC 7617 §2 splits the decoded `user-id ":" password` at the FIRST
+colon, so no `Authorization: Basic` value can represent such a user-id and the
+consumer could never authenticate. Admission rejects the combination (admin
+API, file, database, and CP alike) instead of accepting a login that always
+returns 401. Colons inside the **password** stay valid, and a consumer with only
+other credential types is unaffected.
 
 ### `hmac_auth`
 
@@ -2639,7 +2653,7 @@ Authenticates requests using Ferrum's versioned HMAC authorization scheme with m
 | `sync_mode` | String | `local` | `redis` is required by, and only valid with, `replay_scope: shared` |
 | `redis_url`, `redis_tls`, `redis_key_prefix`, `redis_pool_size`, `redis_connect_timeout_seconds`, `redis_health_check_interval_seconds`, `redis_username`, `redis_password` | — | — | Shared Redis connectivity for the replay authority. Same semantics as every other Redis-backed plugin. The default key prefix is `{FERRUM_NAMESPACE}:hmac_auth:{plugin-config-id}` |
 
-The root key set is closed: a misspelled `replay_scope` or `signing_profile` fails admission rather than leaving the policy on a weaker posture than the operator wrote.
+The root key set is closed: a misspelled `replay_scope` or `signing_profile` fails admission rather than leaving the policy on a weaker posture than the operator wrote. The enumerated values are matched **exactly** — `signing_profile`, `replay_scope`, and `sync_mode` accept only the canonical lowercase spellings listed above, with no surrounding whitespace — so the published OpenAPI schema and the gateway admit exactly the same configurations. `replay_scope` is required with `ferrum-hmac-v2` and rejected with `ferrum-hmac-v1`; `allow_unsafe_replayable_v1: true` is required with v1 and rejected with v2; `sync_mode: redis` is required by, and only valid with, `replay_scope: shared`, and needs a `redis_url`.
 
 Expected `Authorization` header format (`ferrum-hmac-v2`):
 
@@ -2671,6 +2685,8 @@ Send **exactly one** body-integrity field:
 - or legacy RFC 3230 `Digest`, for example `sha-256=<standard-base64-of-sha256-of-body>` with no colon wrapping
 
 Do not send both headers. Mixed RFC 9530 / legacy spellings on one field, duplicate algorithm keys, empty members, unsupported algorithms (`md5`, `sha-1`), and non-standard Base64 fail closed. When both `sha-256` and `sha-512` are present, **both** must match. Ferrum hashes the exact client bytes from the single forwarding buffer after a valid signature admits collection; it never invents an empty-body digest when the body was not collected. `{DIGEST_HEADER_VALUE}` is that field's literal header value, not a canonicalized rewrite.
+
+**WebSocket handshakes.** A WebSocket upgrade (HTTP/1.1 `Upgrade`, HTTP/2 and HTTP/3 Extended CONNECT) is signed like any other request, over the **empty** body: sign `sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:` and send it as `Content-Digest` (or the legacy `Digest` spelling) with the usual `Date` and `Authorization: hmac` fields. The gateway never drains WebSocket DATA as a request body — after the upgrade those bytes are the tunnel — so the empty representation here is the transport's own proof from the handshake's wire framing, not a substitution for an uncollected body. A handshake that actually declares a body (`Content-Length` other than a parseable zero, or any `Transfer-Encoding`) keeps the absent snapshots and is rejected. Once the handshake authenticates, frames stream normally; the plugin does not inspect them.
 
 #### Example — RFC 9530 `Content-Digest` + `ferrum-hmac-v2`
 

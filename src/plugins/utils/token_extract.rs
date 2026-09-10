@@ -66,8 +66,8 @@ pub enum TokenLocationExtract {
 
 pub fn extract_authorization_bearer(ctx: &RequestContext) -> ExtractedCredential {
     // `Authorization: Bearer` conveys a base64url token (RFC 6750 §2.1), i.e.
-    // visible ASCII. A present field line that `materialize_headers()` omitted
-    // is malformed credential material, not an absent header.
+    // visible ASCII. A present field line that is not visible ASCII is malformed
+    // credential material, not an absent header.
     match lookup_configured_header(ctx, "authorization", None) {
         ConfiguredHeaderLookup::Absent => ExtractedCredential::Missing,
         ConfiguredHeaderLookup::PresentNonMaterialized => ExtractedCredential::InvalidFormat(
@@ -141,8 +141,8 @@ pub fn extract_from_location(
             ConfiguredHeaderLookup::Absent => TokenLocationExtract::Missing,
             // Bearer/JWT/opaque tokens are ASCII by grammar (RFC 6750 §2.1
             // base64url, JWS compact serialisation, RFC 6749 opaque tokens). A
-            // present field line that `materialize_headers()` omitted is
-            // malformed credential material, not an absent header.
+            // present field line that is not visible ASCII is malformed
+            // credential material, not an absent header.
             ConfiguredHeaderLookup::PresentNonMaterialized => TokenLocationExtract::Credential(
                 ExtractedCredential::InvalidFormat(r#"{"error":"Invalid token"}"#.to_string()),
             ),

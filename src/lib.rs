@@ -100,6 +100,16 @@ pub mod _test_support {
         (path, cloned_offset)
     }
 
+    /// Exercise the WebSocket-handshake body-digest proof (issue #5000) without
+    /// standing up a transport. `plugins` decides whether any configured policy
+    /// asked for digests; `ctx` supplies the handshake's framing headers.
+    pub fn publish_websocket_handshake_body_digests_for_test(
+        plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+    ) {
+        crate::proxy::publish_websocket_handshake_body_digests(plugins, ctx);
+    }
+
     pub fn websocket_backend_path_for_test(
         proxy: &crate::config::types::Proxy,
         path: &str,

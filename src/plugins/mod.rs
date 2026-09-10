@@ -5664,8 +5664,24 @@ impl RequestContext {
     /// Convert the raw `http::HeaderMap` into `self.headers` (`HashMap<String,
     /// String>`). This is a one-time operation — subsequent calls are no-ops.
     /// The raw map is retained so plugins can evaluate multi-value and
-    /// non-UTF-8 field lines. Non-UTF-8 header values are still omitted from
-    /// the materialized map (same as the previous eager path).
+    /// non-UTF-8 field lines.
+    ///
+    /// **Field values are decoded as UTF-8, not as visible ASCII.** RFC 9110
+    /// §5.5 field values may carry obs-text (`0x80`–`0xFF`), and
+    /// `HeaderValue::to_str()` refuses those bytes while
+    /// `HeaderValue::from_str()` accepts them — so decoding with `to_str()`
+    /// silently DELETED every obs-text field value from the backend request
+    /// (issue #5010: an explicitly preserved non-ASCII `key_auth` API key never
+    /// reached the upstream). A `String` holds those bytes losslessly and the
+    /// outbound builders reproduce them byte-for-byte, so valid UTF-8 is
+    /// materialized exactly as received. Values that are not valid UTF-8 are
+    /// still omitted: `String` cannot represent them.
+    ///
+    /// A UTF-8 decode never introduces `CR`, `LF`, or `NUL` that the wire
+    /// parser did not already accept, so this widens no injection surface.
+    /// Credential grammars that are RFC-bound to visible ASCII must keep using
+    /// [`crate::plugins::utils::header_extract::lookup_configured_header`],
+    /// which reads the retained raw map under the stricter policy.
     ///
     /// **This map is the authoritative removal set for outbound merges.**
     /// [`crate::proxy::headers::merge_proxy_headers_preserving_repeated`] drops
@@ -5683,7 +5699,7 @@ impl RequestContext {
         };
         self.headers.reserve(raw.keys_len());
         for (name, value) in raw.iter() {
-            if let Ok(v) = value.to_str() {
+            if let Ok(v) = std::str::from_utf8(value.as_bytes()) {
                 // http::HeaderName stores names in lowercase already (HTTP/2+3
                 // spec), and hyper normalizes HTTP/1.1 header names to
                 // lowercase at parse time. No `to_lowercase()` needed.
