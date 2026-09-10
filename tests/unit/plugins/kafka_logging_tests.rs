@@ -643,7 +643,8 @@ async fn test_kafka_logging_rejects_non_file_gateway_crl_source_for_verified_tls
         }),
         &client,
     )
-    .err().expect("non-file CRL sources cannot be silently omitted for verified Kafka TLS");
+    .err()
+    .expect("non-file CRL sources cannot be silently omitted for verified Kafka TLS");
     assert!(error.contains("file-backed gateway CRL source"));
     assert!(
         !error.contains(source_reference),
@@ -1387,7 +1388,8 @@ fn kafka_bootstrap_grammar_accepts_protocol_prefixes_and_strips_url_paths() {
 fn kafka_bootstrap_grammar_rejects_entries_librdkafka_would_refuse() {
     for broker_list in ["://host:9092", "https://host:9092", "ftp://host"] {
         let error = parse_kafka_bootstrap_servers(broker_list, None)
-            .err().expect("librdkafka would refuse this entry and stop parsing the list");
+            .err()
+            .expect("librdkafka would refuse this entry and stop parsing the list");
         assert!(
             error.contains("protocol"),
             "unexpected error for {broker_list}: {error}"
@@ -1396,7 +1398,8 @@ fn kafka_bootstrap_grammar_rejects_entries_librdkafka_would_refuse() {
     // A protocol prefix that disagrees with security.protocol makes librdkafka
     // drop the entry (and the rest of the list) — reject instead.
     let error = parse_kafka_bootstrap_servers("ssl://broker:9093", Some("plaintext"))
-        .err().expect("protocol mismatch must be rejected");
+        .err()
+        .expect("protocol mismatch must be rejected");
     assert!(
         error.contains("does not match security_protocol"),
         "{error}"
@@ -1413,7 +1416,8 @@ fn kafka_protocol_prefixed_denied_literal_is_rejected_under_restrictive_policy()
         &json!({ "broker_list": "PLAINTEXT://169.254.169.254:9092", "topic": "logs" }),
         &default_production_policy(),
     )
-    .err().expect("protocol-prefixed denied literal must be rejected");
+    .err()
+    .expect("protocol-prefixed denied literal must be rejected");
     assert!(
         error.contains("169.254.169.254") && error.contains("denied by backend egress policy"),
         "{error}"
@@ -1426,7 +1430,8 @@ fn kafka_bracketed_ipv6_denied_literal_is_rejected() {
         &json!({ "broker_list": "ssl://[fd00:ec2::254]:9093", "security_protocol": "ssl" }),
         &default_production_policy(),
     )
-    .err().expect("denied IPv6 literal must be rejected");
+    .err()
+    .expect("denied IPv6 literal must be rejected");
     assert!(error.contains("denied by backend egress policy"), "{error}");
 }
 
@@ -1446,7 +1451,8 @@ fn kafka_logging_fails_closed_under_any_restrictive_egress_policy() {
             &json!({ "broker_list": "broker.example.com:9092", "topic": "logs" }),
             &policy,
         )
-        .err().expect("kafka_logging must fail closed under a restrictive policy");
+        .err()
+        .expect("kafka_logging must fail closed under a restrictive policy");
         assert!(
             error.contains("cannot be admitted"),
             "unexpected error: {error}"
@@ -1475,7 +1481,8 @@ async fn kafka_logging_registry_admission_fails_closed_under_default_policy() {
         &json!({ "broker_list": "broker.example.com:9092", "topic": "logs" }),
         &default_production_policy(),
     )
-    .err().expect("registry admission must apply the same gate");
+    .err()
+    .expect("registry admission must apply the same gate");
     assert!(error.contains("cannot be admitted"), "{error}");
 }
 
@@ -1607,7 +1614,8 @@ async fn kafka_rejects_topic_names_kafka_can_never_create() {
             &json!({"broker_list": "localhost:9092", "topic": topic}),
             &default_http_client(),
         )
-        .err().expect("an invalid Kafka topic name must be refused at admission");
+        .err()
+        .expect("an invalid Kafka topic name must be refused at admission");
         assert!(
             error.contains("topic"),
             "topic rejection must name the field, got: {error}"
@@ -1654,7 +1662,8 @@ async fn kafka_rejects_transactional_producer_configuration() {
         }),
     ] {
         let error = KafkaLogging::new(&config, &default_http_client())
-            .err().expect("transactional.id must be refused before a generation is published");
+            .err()
+            .expect("transactional.id must be refused before a generation is published");
         assert!(
             error.contains("transactional.id") || error.contains("TRANSACTIONAL.ID"),
             "rejection must name the property, got: {error}"
@@ -1710,7 +1719,8 @@ async fn kafka_rejects_unsupported_sasl_credential_shapes_without_rewriting_them
             "sasl_password": password
         });
         let error = KafkaLogging::new(&config, &default_http_client())
-            .err().expect("an unsupported credential shape must be rejected, not rewritten");
+            .err()
+            .expect("an unsupported credential shape must be rejected, not rewritten");
         assert!(
             error.contains("sasl_username") || error.contains("sasl_password"),
             "rejection must name the credential field, got: {error}"
@@ -1835,7 +1845,8 @@ async fn kafka_message_timeout_ms_is_bounded_by_the_documented_range() {
         }),
         &default_http_client(),
     )
-    .err().expect("a message_timeout_ms above librdkafka's range must be rejected");
+    .err()
+    .expect("a message_timeout_ms above librdkafka's range must be rejected");
     assert!(
         error.contains("message_timeout_ms"),
         "the diagnostic must name the field rather than report an opaque client \
