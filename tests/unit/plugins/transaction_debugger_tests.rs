@@ -424,6 +424,11 @@ fn test_transaction_debugger_accepts_bounded_body_capture_options() {
             "log_request_body": true,
             "redacted_body_fields": ["é".repeat(128)]
         }),
+        json!({
+            "log_request_body": true,
+            "redacted_body_fields": [format!(" {} ", "x".repeat(128))]
+        }),
+        json!({"redacted_body_fields": []}),
     ] {
         TransactionDebugger::new(&config).expect("bounded body capture options are supported");
     }

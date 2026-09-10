@@ -1675,24 +1675,24 @@ Capturable media types are `application/json`, `text/json`, any `+json` structur
 
 When both switches are false — the default — the plugin reports no body buffering requirement, allocates nothing on the body path, and emits no capture records.
 
-WebSocket upgrades produce the ordinary HTTP handshake transaction diagnostic and exactly one additional terminal session diagnostic when the upgraded session ends. When `correlation_id` or `otel_tracing` supplied `request_id` or `trace_id` metadata, the terminal records include the same selected value; all selected metadata passes through the central sensitivity classifier. The plugin never dumps the complete metadata map.
+WebSocket upgrades produce the ordinary HTTP handshake transaction diagnostic and exactly one additional terminal session diagnostic when the upgraded session ends. When `correlation_id` or `otel_tracing` supplied `request_id` or `trace_id` metadata, the **default unprojected** terminal records include the same selected value; all selected metadata passes through the central sensitivity classifier. Those default records never dump the complete metadata map. Configuring `schema` or `schema_ref` — including an empty `schema: {}` — projects diagnostics through the shared log-schema compiler, which includes the redacted, `_dedup_*`-stripped metadata map by default (`metadata.mode: nested`). Operators who want selected fields only can drop the map with `metadata: {mode: omit}` (flatten remains available; see [docs/log_schema.md](log_schema.md)).
 
 **Priority:** 9200
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `redacted_headers` | String[] | `[]` | Additional header names to redact beyond the built-in sensitive list |
+| `redacted_headers` | String[] | `[]` | Additional header names to redact beyond the built-in sensitive list. Each name must be a nonempty HTTP header token (RFC 9110 tchar); empty strings and names with spaces are rejected |
 | `log_request_body` | bool | `false` | Enable bounded, redacted capture of the backend-visible request body |
 | `log_response_body` | bool | `false` | Enable bounded, redacted capture of the client-visible response body |
 | `max_request_body_bytes` | Integer | `1024` | Request capture budget in bytes (1–8192). Requires `log_request_body: true` |
 | `max_response_body_bytes` | Integer | `1024` | Response capture budget in bytes (1–8192). Requires `log_response_body: true` |
-| `redacted_body_fields` | String[] | `[]` | Additional body field names (case-insensitive, ≤128 chars) to redact. Requires one of the capture switches |
+| `redacted_body_fields` | String[] | `[]` | Additional body field names (case-insensitive) to redact. Surrounding whitespace is trimmed before the 128-character maximum. A nonempty list requires one of the capture switches; `[]` is valid without a switch |
 | `schema` | Object | *(none)* | Inline projection for the terminal diagnostic records (see [docs/log_schema.md](log_schema.md)); mutually exclusive with `schema_ref` |
 | `schema_ref` | String | *(none)* | Named schema from `transaction_log_schema`; mutually exclusive with `schema` |
 
 **Built-in redacted headers**: `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `api-key`, `x-api-key`, `x-goog-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, `www-authenticate`, `x-forwarded-authorization`
 
-The configuration object is closed: any key outside the table above is rejected. Capture budgets outside `1..=8192` are rejected rather than clamped, `null` is rejected for every field, and a budget or `redacted_body_fields` without its capture switch is rejected as inert configuration.
+The configuration object is closed: any key outside the table above is rejected. Capture budgets outside `1..=8192` are rejected rather than clamped, `null` is rejected for every field, and a budget or nonempty `redacted_body_fields` without its capture switch is rejected as inert configuration. `schema` and `schema_ref` cannot both be set.
 
 `schema` / `schema_ref` project the terminal diagnostic records emitted on the `transaction_debug` target. The field inventory is this plugin's own — `outcome`, `method`, `path`, `status`, `rejection_phase`, `latency_plugin_ms`, `latency_gw_overhead_ms`, `metadata`, and the rest of the names in the default records — not the transaction-summary names, so a summary-only name such as `request_user_agent` is rejected with a field-specific diagnostic. With a schema configured the plugin emits one `record` field carrying the projected JSON document instead of the individual `tracing` fields; with none configured the default records are byte-for-byte unchanged. Body capture samples are never part of the projection. See [docs/log_schema.md](log_schema.md).
 

@@ -18607,12 +18607,50 @@ components:
         omitted. When the transaction_debug DEBUG target is disabled no body is
         buffered for capture. Captured bytes go only to the transaction_debug
         tracing target and are never written into transaction-log metadata.
+      allOf:
+        - if:
+            required: [max_request_body_bytes]
+          then:
+            required: [log_request_body]
+            properties:
+              log_request_body:
+                const: true
+        - if:
+            required: [max_response_body_bytes]
+          then:
+            required: [log_response_body]
+            properties:
+              log_response_body:
+                const: true
+        - if:
+            required: [redacted_body_fields]
+            properties:
+              redacted_body_fields:
+                type: array
+                minItems: 1
+          then:
+            anyOf:
+              - required: [log_request_body]
+                properties:
+                  log_request_body:
+                    const: true
+              - required: [log_response_body]
+                properties:
+                  log_response_body:
+                    const: true
+        - not:
+            required: [schema, schema_ref]
       properties:
         redacted_headers:
           type: array
           items:
             type: string
-          description: Additional header names to redact beyond the built-in sensitive list
+            minLength: 1
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+          description: >-
+            Additional header names to redact beyond the built-in sensitive
+            list. Each entry must be a nonempty HTTP header token (RFC 9110
+            tchar). Empty strings and names with spaces are rejected.
         log_request_body:
           type: boolean
           default: false
@@ -18646,12 +18684,13 @@ components:
           items:
             type: string
             minLength: 1
-            maxLength: 128
-            pattern: '\S'
+            pattern: '^\s*\S(?:[\s\S]{0,126}\S)?\s*$'
           description: >-
             Additional body field names (compared case-insensitively) to redact
-            beyond the built-in credential markers. Requires log_request_body or
-            log_response_body true.
+            beyond the built-in credential markers. Surrounding whitespace is
+            trimmed before the 128-character maximum is applied. Requires
+            log_request_body or log_response_body true when the array is
+            nonempty. An empty array is valid without a capture switch.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
