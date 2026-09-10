@@ -47,7 +47,6 @@ jobs:
           artifact-workspace: ${{ inputs.cli_artifact_workspace }}
           artifact-path: ${{ runner.temp }}/validation-cli
           trust-policy: restore
-          fail-on-cache-error: true
 
       - name: Verify and select the CLI artifact
         if: inputs.cli_artifact_id != ''
