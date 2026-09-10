@@ -296,7 +296,11 @@ endpoint, topic, namespace, policy id, or record content:
 - `queue_full` — the bounded in-memory queue was full and no overflow handoff
   took ownership.
 - `batch_discard` — a whole batch was discarded after its retry budget was
-  exhausted with no durable fallback. Counts records, not batches.
+  exhausted with no durable fallback. Counts records, not batches. It also
+  covers a batch discarded WITHOUT retrying because the collector returned a
+  permanent (non-408/429) 4xx: those records are just as lost, so
+  `ai_transcript_audit` counts them at the classification point rather than
+  letting the shared retry loop see the discard as a delivery.
 - `shutdown` — the flush worker was closed, or had not started yet.
 - `sink_error` — a per-record delivery or serialization failure that retrying
   could not fix.
