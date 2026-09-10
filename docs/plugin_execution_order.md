@@ -1637,7 +1637,7 @@ Given all built-in plugins enabled, the execution order is:
 | 46 | `a2a_gateway` | 2993 | before_proxy, after_proxy, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector |
 | 47 | `mesh_route_dispatch` | 2995 | before_proxy |
 | 48 | `request_transformer` | 3000 | before_proxy, transform_request_body |
-| 49 | `request_deduplication` | 3010 | before_proxy, on_final_response_body, on_response_stream_terminated |
+| 49 | `request_deduplication` | 3010 | before_proxy, on_final_response_body, on_response_stream_terminated, on_response_committed |
 | 50 | `serverless_function` | 3025 | finalized request egress |
 | 51 | `response_mock` | 3030 | before_proxy |
 | 52 | `grpc_deadline` | 3050 | receipt-time deadline preflight, before_proxy |

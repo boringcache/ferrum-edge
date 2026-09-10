@@ -2371,9 +2371,11 @@ fn request_deduplication_schema_matches_runtime_validation() {
         schema["properties"]["applicable_methods"]["minItems"],
         json!(1)
     );
+    // Issue #5070: the runtime trims each method before validating it, so the
+    // published item pattern tolerates exactly that padding.
     assert_eq!(
         schema["properties"]["applicable_methods"]["items"]["pattern"],
-        json!("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+        json!("^\\s*[!#$%&'*+.^_`|~0-9A-Za-z-]+\\s*$")
     );
     assert_eq!(
         schema["properties"]["redis_key_prefix"]["minLength"],
@@ -2393,11 +2395,16 @@ fn request_deduplication_schema_matches_runtime_validation() {
         schema["properties"]["redis_url"]["pattern"],
         json!("^rediss?://[^/?#\\s]+(?:/[^?#\\s]*)?(?:\\?[^\\s#]*)?$")
     );
+    // Issue #5070: the runtime lowercases `sync_mode` before comparing it, so
+    // the conditional selects on the same case-insensitive value rather than a
+    // `const` that would refuse a valid `"REDIS"` deployment's `redis_url`.
     let redis_guard = schema["allOf"]
         .as_array()
         .expect("RequestDeduplicationConfig allOf")
         .iter()
-        .find(|guard| guard["if"]["properties"]["sync_mode"]["const"] == json!("redis"))
+        .find(|guard| {
+            guard["if"]["properties"]["sync_mode"]["pattern"] == json!("^[Rr][Ee][Dd][Ii][Ss]$")
+        })
         .expect("sync_mode=redis conditional guard");
     assert_eq!(redis_guard["if"]["required"], json!(["sync_mode"]));
     assert_eq!(redis_guard["then"]["required"], json!(["redis_url"]));
@@ -2421,6 +2428,49 @@ fn request_deduplication_schema_matches_runtime_validation() {
             redis_guard["else"]["properties"][redis_only],
             json!(false),
             "{redis_only} must be refused outside sync_mode=redis"
+        );
+    }
+
+    // Issue #5070: explicit null is rejected by the constructor
+    // (`'anonymous_caller_scope' must be a string`), so the property is not
+    // nullable, and the enum carries the alias spelling the shared parser
+    // accepts.
+    assert_eq!(
+        schema["properties"]["anonymous_caller_scope"]["type"],
+        json!("string")
+    );
+    assert_eq!(
+        schema["properties"]["anonymous_caller_scope"]["enum"],
+        json!(["caller_address", "caller-address", "shared"])
+    );
+
+    // Issue #5070: every bounded unsigned field publishes the u64 ceiling the
+    // constructor enforces, so an oversized value is refused by both.
+    for bounded in [
+        "ttl_seconds",
+        "inflight_ttl_seconds",
+        "max_entries",
+        "max_entry_size_bytes",
+        "max_total_size_bytes",
+    ] {
+        assert_eq!(schema["properties"][bounded]["minimum"], json!(1));
+        assert_eq!(
+            schema["properties"][bounded]["maximum"].as_f64(),
+            Some(u64::MAX as f64),
+            "{bounded} must publish the unsigned 64-bit ceiling"
+        );
+    }
+
+    // Issue #5070: JSON Schema `enum` cannot express case-insensitivity, so the
+    // two normalized-value properties must SAY so rather than silently
+    // disagreeing with admission.
+    for normalized in ["sync_mode", "anonymous_caller_scope"] {
+        let description = schema["properties"][normalized]["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{normalized} carries a description"));
+        assert!(
+            description.contains("case-insensitiv"),
+            "{normalized} must document the runtime normalization the enum cannot express"
         );
     }
 
@@ -2494,6 +2544,13 @@ fn request_deduplication_schema_matches_runtime_validation() {
             "redis_url": "redis://cache.internal:6379",
             "on_redis_unavailable": "local_only"
         }),
+        // Issue #5070: the constructor trims each method, accepts the hyphen
+        // spelling of the anonymous scope, and requires `redis_url` under a
+        // case-insensitive `sync_mode` — all now expressible in the schema.
+        json!({"applicable_methods": [" POST "]}),
+        json!({"anonymous_caller_scope": "caller_address"}),
+        json!({"anonymous_caller_scope": "caller-address"}),
+        json!({"anonymous_caller_scope": "shared"}),
     ];
     for config in &accepted {
         assert!(
@@ -2556,6 +2613,15 @@ fn request_deduplication_schema_matches_runtime_validation() {
             "redis_url": "redis://host:6379",
             "redis_health_check_interval_seconds": 0
         }),
+        // Issue #5070: explicit null is not "omitted", an unknown scope is
+        // refused, and the bounded unsigned fields refuse zero.
+        json!({"anonymous_caller_scope": null}),
+        json!({"anonymous_caller_scope": "everyone"}),
+        json!({"ttl_seconds": 0}),
+        json!({"inflight_ttl_seconds": 0}),
+        json!({"max_entries": 0}),
+        json!({"max_entry_size_bytes": 0}),
+        json!({"max_total_size_bytes": 0}),
     ];
     for config in &rejected {
         assert!(
@@ -2565,6 +2631,25 @@ fn request_deduplication_schema_matches_runtime_validation() {
         assert!(
             create_plugin("request_deduplication", config).is_err(),
             "config should be runtime-invalid: {config}"
+        );
+    }
+
+    // Issue #5070, documented limitation: JSON Schema cannot express the
+    // runtime's case-insensitive, whitespace-trimming enum parsing. These two
+    // shapes are admitted by the gateway and refused by a strict validator;
+    // both property descriptions say so (asserted above). Pinned here so the
+    // divergence stays a known, described one instead of silent drift.
+    for config in [
+        json!({"sync_mode": "LOCAL"}),
+        json!({"anonymous_caller_scope": " SHARED "}),
+    ] {
+        assert!(
+            create_plugin("request_deduplication", &config).is_ok(),
+            "the gateway normalizes {config}"
+        );
+        assert!(
+            validator.validate(&config).is_err(),
+            "the schema cannot express the normalization for {config}"
         );
     }
 }
