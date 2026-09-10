@@ -9851,9 +9851,9 @@ fn request_termination_schema_matches_strict_runtime_contract() {
     assert_eq!(trigger_fields, runtime_trigger);
 
     let request_termination_branch = spec
-        .pointer("/components/schemas/PluginConfig/allOf")
+        .pointer("/components/schemas/PluginConfigBase/allOf/0/then/allOf")
         .and_then(serde_json::Value::as_array)
-        .expect("PluginConfig allOf")
+        .expect("enabled PluginConfigBase allOf")
         .iter()
         .find(|entry| {
             entry
