@@ -14059,3 +14059,243 @@ fn opa_schema_and_constructor_admit_the_same_configs() {
         );
     }
 }
+
+/// The `MeshAuthzConfig` component must agree with what the plugin constructor
+/// actually admits — both directions. A schema that accepts a document the
+/// gateway rejects sends operators into a failed reload; one that rejects a
+/// supported document blocks a valid policy. The cases below are the ones the
+/// audit found disagreeing (issue #5066).
+#[test]
+fn mesh_authz_component_matches_runtime_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let policy = |rules: serde_json::Value| {
+        json!({
+            "name": "deny-admin",
+            "namespace": "default",
+            "scope": {"kind": "mesh_wide"},
+            "rules": rules,
+        })
+    };
+    let deny_admin = json!([{"action": "deny", "to": [{"paths": ["/admin/*"]}]}]);
+    let custom = json!([{"action": {"custom": {"provider": "ext"}}}]);
+    let no_action = json!([{"to": [{"paths": ["/admin/*"]}]}]);
+    let rule_typo = json!([{"action": "deny", "not_path": ["/a"]}]);
+    let match_typo = json!([{"action": "deny", "to": [{"not_path": ["/a"]}]}]);
+
+    for valid in [
+        // An omitted `config:` block deserializes to null for every plugin.
+        serde_json::Value::Null,
+        json!({}),
+        json!({"trust_domain_aliases": null}),
+        json!({"trust_domain_aliases": ["cluster.local"]}),
+        json!({"trusted_hbone_assertors": null}),
+        json!({"trusted_hbone_assertors": []}),
+        json!({"trusted_hbone_assertors": ["ztunnel", "waypoint"]}),
+        json!({"trusted_hbone_assertors": [{"assertor": "waypoint", "scope": null}]}),
+        // The constructor trims the scope value, exactly as it trims the
+        // assertor; the schema expresses that with a pattern, not an enum.
+        json!({"trusted_hbone_assertors": [{"assertor": "waypoint", "scope": " same_namespace "}]}),
+        json!({"trusted_hbone_assertors": [
+            {"assertor": "spiffe://cluster.local/ns/istio-system/sa/ztunnel", "scope": "mesh_wide"}
+        ]}),
+        json!({"mesh_policies": []}),
+        json!({"mesh_policies": [policy(deny_admin)]}),
+        json!({"mesh_policies": [policy(custom)]}),
+        json!({"mesh_policies": [{
+            "name": "scoped", "namespace": "default",
+            "scope": {"kind": "workload_selector", "selector": {"labels": {"app": "api"}}},
+        }]}),
+        json!({"node_waypoint_route_upstreams": [
+            {"id": "u", "namespace": "default", "targets": [{"host": "h", "port": 8080}]}
+        ]}),
+    ] {
+        assert_component_validity(&spec, "MeshAuthzConfig", &valid, true);
+    }
+
+    for invalid in [
+        // A non-object root builds a policy-free instance that allows
+        // everything, so it is refused rather than degraded.
+        json!(7),
+        json!("mesh_policies"),
+        json!([]),
+        // Unknown root key (the #4525 contract, kept).
+        json!({"mesh_policy": []}),
+        // A policy document with no identity or scope.
+        json!({"mesh_policies": [{}]}),
+        // `action` is required on every rule.
+        json!({"mesh_policies": [policy(no_action)]}),
+        // Closed grammar at each nesting level.
+        json!({"mesh_policies": [policy(rule_typo)]}),
+        json!({"mesh_policies": [policy(match_typo)]}),
+        json!({"mesh_policies": [{
+            "name": "scoped", "namespace": "default",
+            "scope": {"kind": "workload_selector", "selector": {"labelz": {}}},
+        }]}),
+        // Wrong-typed scoping flag: silently reading it as false would
+        // re-enable the construction-time scope filter on a node waypoint.
+        json!({"per_pod_policy_scoping": "true"}),
+        json!({"ambient_udp_source_scoping": 1}),
+        // Grant exclusivity and the exact-SPIFFE requirement for mesh_wide.
+        json!({"trusted_hbone_assertors": [
+            {"assertor": "waypoint", "asserts": [], "scope": "same_namespace"}
+        ]}),
+        json!({"trusted_hbone_assertors": [{"assertor": "waypoint", "scope": "mesh_wide"}]}),
+        // Trust-domain grammar.
+        json!({"trust_domain_aliases": ["not/a/domain"]}),
+        // uint16 has a numeric ceiling, not just a format hint.
+        json!({"node_waypoint_route_upstreams": [
+            {"id": "u", "namespace": "default", "targets": [{"host": "h", "port": 65536}]}
+        ]}),
+    ] {
+        assert_component_validity(&spec, "MeshAuthzConfig", &invalid, false);
+    }
+}
+
+/// `mesh_authz` is a public built-in that appears in `/plugins`, the execution
+/// order table, and the protocol matrix, so the public guide must carry its
+/// configuration and behavior reference (issue #5065).
+#[test]
+fn mesh_authz_public_guide_documents_its_configuration_contract() {
+    let guide = include_str!("../../docs/plugins.md");
+    assert!(
+        guide.contains("### `mesh_authz`"),
+        "docs/plugins.md must carry a mesh_authz section"
+    );
+
+    let section = guide
+        .split("### `mesh_authz`")
+        .nth(1)
+        .expect("mesh_authz section")
+        .split("\n### ")
+        .next()
+        .expect("mesh_authz section body");
+
+    // Every accepted root key, including the injection-only ones an operator
+    // will see echoed back by `GET /plugins`.
+    for key in [
+        "mesh_slice",
+        "mesh_policies",
+        "namespace",
+        "labels",
+        "per_pod_policy_scoping",
+        "ambient_udp_source_scoping",
+        "trust_domain_aliases",
+        "trusted_hbone_assertors",
+        "cluster_domain",
+        "cluster_domains",
+        "node_waypoint_route_upstreams",
+    ] {
+        assert!(
+            section.contains(&format!("`{key}`")),
+            "docs/plugins.md mesh_authz section must document `{key}`"
+        );
+    }
+
+    for contract in [
+        "2075",
+        "FailClosed",
+        "implicit-deny",
+        "**Strict configuration admission.**",
+        "**Trusted identity is required.**",
+    ] {
+        assert!(
+            section.contains(contract),
+            "docs/plugins.md mesh_authz section must state: {contract}"
+        );
+    }
+}
+
+/// The CUSTOM outcome vocabulary in `docs/mesh.md` must stay in lock-step with
+/// the closed reason enum (issue #5068). The exhaustive match makes a NEW
+/// reason a compile error here rather than a silently undocumented label, and
+/// the assertions pin BOTH the metric labels and the finer per-request reason
+/// tokens the metric folds into them.
+#[test]
+fn mesh_custom_authorization_outcome_documentation_matches_the_reason_enum() {
+    use ferrum_edge::plugins::mesh::ext_authz::MeshExtAuthzReason as Reason;
+
+    // The `outcome` metric label `record()` folds each reason into.
+    let metric_outcome = |reason: Reason| -> &'static str {
+        match reason {
+            Reason::Allowed => "allowed",
+            Reason::DeniedByProvider => "denied_by_provider",
+            Reason::ProviderUnbound => "provider_unbound",
+            Reason::ProviderError => "provider_error",
+            Reason::ProviderConflict => "provider_conflict",
+            Reason::Unexecutable => "unexecutable",
+            Reason::Timeout => "timeout",
+            Reason::TransportError | Reason::RequestBuildFailed => "transport_error",
+            Reason::ResponseTooLarge | Reason::ResponseReadFailed => "response_refused",
+            Reason::BodyUnavailable => "body_unavailable",
+            Reason::BodyTooLarge => "body_too_large",
+            Reason::ConcurrencyExhausted => "concurrency_exhausted",
+        }
+    };
+
+    let reasons = [
+        Reason::Allowed,
+        Reason::DeniedByProvider,
+        Reason::ProviderUnbound,
+        Reason::ProviderError,
+        Reason::ProviderConflict,
+        Reason::Unexecutable,
+        Reason::Timeout,
+        Reason::TransportError,
+        Reason::RequestBuildFailed,
+        Reason::ResponseTooLarge,
+        Reason::ResponseReadFailed,
+        Reason::BodyUnavailable,
+        Reason::BodyTooLarge,
+        Reason::ConcurrencyExhausted,
+    ];
+
+    let mesh_docs = include_str!("../../docs/mesh.md");
+    let mut outcomes: BTreeSet<&'static str> = BTreeSet::new();
+    for reason in reasons {
+        let token = reason.as_str();
+        assert!(
+            mesh_docs.contains(&format!("`{token}`")),
+            "docs/mesh.md must document the reason token `{token}`"
+        );
+        outcomes.insert(metric_outcome(reason));
+    }
+
+    assert_eq!(outcomes.len(), 12, "the outcome label set is twelve values");
+    for outcome in &outcomes {
+        assert!(
+            mesh_docs.contains(&format!("| `{outcome}` |")),
+            "docs/mesh.md outcome table must carry a row for `{outcome}`"
+        );
+    }
+    assert!(
+        !mesh_docs.contains("`response_refused`, `body_unavailable`"),
+        "docs/mesh.md must not restate the outcome set as a prose list that can drift"
+    );
+}
+
+/// The CUSTOM failure reference must not promise `failOpen` for the refusals
+/// that are decided without a provider, and must not describe cancellation as
+/// producing an allow (issue #5069).
+#[test]
+fn mesh_custom_authorization_failure_documentation_matches_the_runtime() {
+    let mesh_docs = include_str!("../../docs/mesh.md");
+
+    assert!(
+        mesh_docs.contains("**unconditional fixed `403` refusals**"),
+        "docs/mesh.md must document the unbound-provider / absent-executor refusal"
+    );
+    assert!(
+        mesh_docs.contains("it never synthesizes an allow"),
+        "docs/mesh.md must describe cancellation as ending the request"
+    );
+    assert!(
+        !mesh_docs.contains("and task cancellation are all failed checks"),
+        "docs/mesh.md must not restate the corrected fail-open claim"
+    );
+    assert!(
+        mesh_docs.contains("capped at **128 process-wide**"),
+        "docs/mesh.md must state the shared process-wide check budget"
+    );
+}
