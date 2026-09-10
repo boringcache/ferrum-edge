@@ -79,7 +79,7 @@ use async_trait::async_trait;
 use http::header::HeaderName;
 use serde::ser::SerializeMap;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -91,8 +91,8 @@ use crate::plugins::utils::log_schema::view::{
     MetadataNested, emit_timestamp, extract_host_from_url, serialize_schema_metadata, status_class,
 };
 use crate::plugins::utils::log_schema::{
-    DerivedKind, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView, SummarySchema,
-    TimestampFormat, resolve_schema,
+    DerivedKind, EmittedKeys, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView,
+    SummarySchema, TimestampFormat, resolve_schema,
 };
 use crate::plugins::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metadata_key};
 use crate::proxy::tcp_proxy::StreamIoSide;
@@ -1547,7 +1547,7 @@ impl<'a> SchemaSerializable for DebugHttpRecord<'a> {
     fn serialize_metadata<S>(
         &self,
         policy: &MetadataPolicy,
-        emitted: &mut HashSet<String>,
+        emitted: &EmittedKeys<'_>,
         map: &mut S,
     ) -> Result<(), S::Error>
     where
@@ -1675,7 +1675,7 @@ impl<'a> SchemaSerializable for DebugStreamRecord<'a> {
     fn serialize_metadata<S>(
         &self,
         policy: &MetadataPolicy,
-        emitted: &mut HashSet<String>,
+        emitted: &EmittedKeys<'_>,
         map: &mut S,
     ) -> Result<(), S::Error>
     where
@@ -1790,7 +1790,7 @@ impl<'a> SchemaSerializable for DebugWsRecord<'a> {
     fn serialize_metadata<S>(
         &self,
         policy: &MetadataPolicy,
-        emitted: &mut HashSet<String>,
+        emitted: &EmittedKeys<'_>,
         map: &mut S,
     ) -> Result<(), S::Error>
     where
