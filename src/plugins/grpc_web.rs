@@ -47,6 +47,10 @@
 //! - Lists, parameters, quality values (`q=`), and wildcards (`*/*`,
 //!   `application/*`) are honored with specificity and explicit-over-wildcard
 //!   rules matching RFC 9110 content negotiation.
+//! - Non-`q` media-range parameters still match when type, subtype, and suffix
+//!   match, but they are ignored for precedence/quality and cannot veto an
+//!   unparameterized representation. A range whose type or suffix does not
+//!   match still fails closed with HTTP `406`.
 //! - A present `Accept` that is structurally malformed, or that refuses every
 //!   gRPC-Web representation the gateway can produce, fails closed with HTTP
 //!   `406 Not Acceptable`.
@@ -1432,9 +1436,11 @@ fn parse_q_weight(raw: &[u8]) -> Option<u16> {
 /// Parsed media-range parameters: the effective quality weight, plus whether the
 /// range carried any parameter OTHER than `q`.
 ///
-/// RFC 9110 §12.5.1 makes non-`q` parameters part of the media range itself: a
-/// range that names them applies only to a representation that HAS them. The
-/// weight alone is not enough to decide acceptability, so both are reported.
+/// RFC 9110 §12.5.1 makes non-`q` parameters part of the media range. Ferrum
+/// never emits parameterized gRPC-Web types, so those parameters are not
+/// used for precedence or quality selection and cannot veto a matching
+/// type/subtype/suffix; they are still reported so negotiation can apply that
+/// narrower matching rule.
 #[derive(Clone, Copy, Debug)]
 struct MediaRangeParameters {
     quality: u16,
@@ -1650,13 +1656,12 @@ struct AcceptRange {
     quality: u16,
     specificity: AcceptSpecificity,
     /// The range carried at least one media-range parameter other than `q`
-    /// (`application/grpc-web+proto;version=2`).
+    /// (`application/grpc-web+proto;version=2`, `charset=utf-8`, …).
     ///
-    /// Such a range constrains a representation Ferrum cannot produce: every
-    /// gRPC-Web representation it emits is the bare canonical media type with no
-    /// parameters (see [`canonical_grpc_web_content_type`]). Per RFC 9110
-    /// §12.5.1 the range therefore does not apply to any candidate — it can
-    /// neither accept one nor, at `q=0`, refuse one.
+    /// Type, subtype, and suffix still match the bare canonical media type
+    /// Ferrum emits, so a parameterized range can accept a candidate. It is
+    /// ignored for precedence/quality selection and, at `q=0`, cannot veto an
+    /// unparameterized representation the same list already accepted.
     has_media_parameters: bool,
 }
 
@@ -1797,7 +1802,10 @@ pub fn negotiate_response_media_type(
         },
     ];
     for range in &ranges {
-        if range.has_media_parameters {
+        // A parameterized `q=0` range cannot veto, so it also must not add a
+        // candidate that a wildcard could then select. `q>0` parameterized
+        // ranges still name a type/suffix Ferrum can produce.
+        if range.has_media_parameters && range.quality == 0 {
             continue;
         }
         if let AcceptRangeKind::Exact(mode) = range.kind {
@@ -1825,15 +1833,6 @@ pub fn negotiate_response_media_type(
         // representation has duplicate ranges at equal specificity.
         let mut controlling: Option<(AcceptSpecificity, usize, u16)> = None;
         for (index, range) in ranges.iter().enumerate() {
-            // A range carrying media-range parameters describes a variant that
-            // is not this candidate: Ferrum only ever emits the bare canonical
-            // gRPC-Web media type. It must neither select the candidate nor,
-            // with `q=0`, veto it — that veto is what turned
-            // `application/grpc-web+proto;q=1, application/grpc-web+proto;version=2;q=0`
-            // into a 406 for a representation the client explicitly accepted.
-            if range.has_media_parameters {
-                continue;
-            }
             let matches = match range.kind {
                 AcceptRangeKind::Exact(mode) => {
                     mode == candidate.mode
@@ -1848,11 +1847,24 @@ pub fn negotiate_response_media_type(
             if !matches {
                 continue;
             }
+            // Non-`q` parameters still match type/subtype/suffix (so
+            // `charset=utf-8` cannot 406 a client on its own). They keep their
+            // specificity against wildcards, but they cannot veto (`q=0`)
+            // and cannot overwrite an unparameterized range at equal
+            // specificity — that overwrite is what turned
+            // `application/grpc-web+proto;q=1, application/grpc-web+proto;version=2;q=0`
+            // into a 406 and would let an unrelated range win on stolen quality.
+            if range.has_media_parameters && range.quality == 0 {
+                continue;
+            }
             if controlling
                 .as_ref()
                 .is_none_or(|(specificity, previous_index, _)| {
                     range.specificity > *specificity
-                        || (range.specificity == *specificity && index > *previous_index)
+                        || (range.specificity == *specificity
+                            && index > *previous_index
+                            && (!range.has_media_parameters
+                                || ranges[*previous_index].has_media_parameters))
                 })
             {
                 controlling = Some((range.specificity, index, range.quality));

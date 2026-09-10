@@ -26789,10 +26789,13 @@ components:
         different message-format suffix; malformed or fully refused Accept
         fails closed with HTTP 406;
         translated responses merge Vary: Accept so caches separate variants).
-        A media range carrying parameters other than q (for example
-        application/grpc-web+proto;version=2) describes a variant Ferrum does
-        not produce, so it neither selects nor refuses a response
-        representation.
+        A media range carrying parameters other than q still matches when its
+        type, subtype, and suffix match (so application/grpc-web-text;charset=utf-8
+        is acceptable), but those parameters are ignored for precedence and
+        quality selection and cannot veto an unparameterized representation
+        (application/grpc-web+proto;q=1, application/grpc-web+proto;version=2;q=0
+        is served as application/grpc-web+proto). A range whose type or suffix
+        does not match still yields HTTP 406.
         Config must be a JSON object (not null); `{}` and objects that only set
         `expose_headers` are accepted. Unknown keys are rejected. When a backend
         or intermediary response omits a valid numeric grpc-status, the response

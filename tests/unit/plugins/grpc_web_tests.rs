@@ -4529,19 +4529,93 @@ fn accept_media_range_parameters_do_not_veto_an_accepted_representation() {
 }
 
 #[test]
-fn accept_ranges_naming_only_parameterized_variants_are_not_acceptable() {
+fn accept_parameterized_ranges_match_type_without_vetoing_or_changing_mode() {
     use ferrum_edge::_test_support::negotiate_grpc_web_response_media_type as negotiate;
 
-    // Every representation Ferrum emits is the bare canonical media type, so a
-    // range that requires a media parameter applies to none of them.
+    // Non-`q` parameters still match when type/subtype/suffix match: a client
+    // whose only acceptable ranges carry charset=utf-8 must not be 406'd.
+    for (request, accept, expected) in [
+        (
+            "application/grpc-web+proto",
+            "application/grpc-web-text; charset=utf-8",
+            "application/grpc-web-text+proto",
+        ),
+        (
+            "application/grpc-web+json",
+            "text/html, Application/Grpc-Web-Text+Json; charset=utf-8; Q=0.8",
+            "application/grpc-web-text+json",
+        ),
+        (
+            "application/grpc-web+proto",
+            "application/grpc-web+proto;version=2",
+            "application/grpc-web+proto",
+        ),
+        (
+            "application/grpc-web+proto",
+            "application/grpc-web;charset=utf-8, application/grpc-web-text;charset=utf-8",
+            "application/grpc-web+proto",
+        ),
+        (
+            "application/grpc-web+proto",
+            "*/*;version=2",
+            "application/grpc-web+proto",
+        ),
+    ] {
+        assert_eq!(
+            negotiate(request, Some(accept)).expect("negotiation"),
+            expected,
+            "request={request}, accept={accept}"
+        );
+    }
+
+    // Parameters must not change the selected mode versus the same list without
+    // them, and must not let a parameterized later entry steal quality from an
+    // unparameterized match so an unrelated range can win.
+    let request = "application/grpc-web+proto";
+    assert_eq!(
+        negotiate(request, Some("application/grpc-web;q=1, application/grpc-web-text;charset=utf-8"))
+            .expect("parameterized negotiation"),
+        negotiate(request, Some("application/grpc-web;q=1, application/grpc-web-text"))
+            .expect("unparameterized negotiation"),
+    );
+    assert_eq!(
+        negotiate(request, Some("application/grpc-web;q=1, application/grpc-web-text;charset=utf-8"))
+            .expect("parameterized negotiation"),
+        "application/grpc-web+proto"
+    );
+    assert_eq!(
+        negotiate(request, Some("*/*, application/grpc-web-text;charset=utf-8"))
+            .expect("parameterized exact still beats wildcard"),
+        negotiate(request, Some("*/*, application/grpc-web-text"))
+            .expect("unparameterized exact beats wildcard"),
+    );
+    assert_eq!(
+        negotiate(request, Some("*/*, application/grpc-web-text;charset=utf-8"))
+            .expect("parameterized exact still beats wildcard"),
+        "application/grpc-web-text+proto"
+    );
+    assert_eq!(
+        negotiate(
+            request,
+            Some(
+                "application/grpc-web;q=1, application/grpc-web+proto;version=2;q=0.1, application/grpc-web-text;q=0.5",
+            ),
+        )
+        .expect("parameterized quality must not be selected"),
+        "application/grpc-web+proto",
+    );
+
+    // A range whose type or suffix does not match still yields 406, with or
+    // without parameters.
     for accept in [
-        "application/grpc-web+proto;version=2",
-        "application/grpc-web;charset=utf-8, application/grpc-web-text;charset=utf-8",
-        "*/*;version=2",
+        "text/html",
+        "application/json;charset=utf-8",
+        "application/grpc-web-text+thrift;charset=utf-8",
+        "application/grpc-web-text+json;version=2",
     ] {
         assert!(
             negotiate("application/grpc-web+proto", Some(accept)).is_err(),
-            "must not serve a representation no range applies to: {accept}"
+            "unrelated type or suffix must stay 406: {accept}"
         );
     }
 }
