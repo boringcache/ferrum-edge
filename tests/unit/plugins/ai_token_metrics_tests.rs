@@ -110,9 +110,7 @@ fn assert_usage_and_metrics(
     registry.record(&summary);
     let output = registry.render_uncached();
     // Configuring even an empty namespace emits its label on every AI series.
-    let labels = format!(
-        "proxy_id=\"test-proxy\",provider=\"{provider}\",namespace=\"\""
-    );
+    let labels = format!("proxy_id=\"test-proxy\",provider=\"{provider}\",namespace=\"\"");
     for (metadata_key, metric, value) in [
         ("ai_prompt_tokens", "ferrum_ai_prompt_tokens_total", prompt),
         (
