@@ -11563,6 +11563,15 @@ components:
             properties:
               config:
                 $ref: "#/components/schemas/MeshBpfMetricsConfig"
+            if:
+              required: [enabled]
+              properties:
+                enabled:
+                  const: true
+            then:
+              properties:
+                scope:
+                  const: global
         - if:
             required: [plugin_name]
             properties:
@@ -23415,25 +23424,40 @@ components:
             `trusted_hbone_assertors` / `trust_domain_aliases` instead.
 
     MeshBpfMetricsConfig:
-      type: object
+      type: [object, "null", string, array, number, boolean]
       description: |
         Plugin: __mesh_bpf_metrics - reserved internal mesh NodeWaypoint
         plugin that exposes BPF SOCK_OPS counters and fixed-bucket TCP
-        latency histograms (SRTT / SYN-to-ACK) on the Prometheus scrape
-        surface. Mesh mode auto-injects it when BPF metrics are available;
-        operator-managed plugin configs should not create names prefixed
-        with `__`.
+        latency histograms (SRTT / SYN-to-ACK / accept-to-first-byte)
+        on the Prometheus scrape surface. Mesh mode auto-injects a
+        global instance on NodeWaypoint; operator-managed plugin configs
+        should not create names prefixed with `__`. Enabled instances
+        must use `scope: global` (at most one enabled instance per
+        process). Registration is OptionalFailOpen: Admin create/update
+        still returns HTTP 400 for an invalid enabled config, while
+        file-mode load/`ferrum-edge validate` and plugin-cache rebuild
+        warn and omit the instance.
+
+        Object configs are closed: the only admitted key is `prefix`.
+        A string `prefix` is trimmed before the identifier check.
+        Non-object configs (null, string, array, number, boolean) keep
+        the default prefix `ferrum_mesh_bpf`.
       additionalProperties: false
       properties:
         prefix:
           type: string
-          pattern: "^[A-Za-z_][A-Za-z0-9_]*$"
+          pattern: "^\\s*[A-Za-z_][A-Za-z0-9_]*\\s*$"
           default: ferrum_mesh_bpf
           description: |
-            Prometheus metric name prefix for emitted BPF counters and
-            latency histograms (default families include
-            `{prefix}_srtt_microseconds` and
-            `{prefix}_syn_to_ack_microseconds`).
+            Prometheus metric name prefix for every emitted BPF family
+            (`{prefix}_tcp_events_total`, `{prefix}_drops_total`,
+            `{prefix}_srtt_microseconds`, `{prefix}_syn_to_ack_microseconds`,
+            `{prefix}_accept_to_first_byte_microseconds`, and the ringbuf
+            families). Surrounding whitespace is trimmed before the
+            identifier check; the trimmed value must match
+            `[A-Za-z_][A-Za-z0-9_]*` and must not be empty. There is no
+            declared length limit beyond that grammar. Omit the key to
+            keep `ferrum_mesh_bpf`.
 
     SoapWsSecurityConfig:
       type: object

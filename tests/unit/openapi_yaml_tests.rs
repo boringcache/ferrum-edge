@@ -14160,6 +14160,235 @@ fn mesh_plugin_config_roots_are_closed_and_match_openapi() {
     }
 }
 
+/// Issues #5380–#5383: `__mesh_bpf_metrics` OpenAPI and docs must match
+/// constructor admission. The constructor is the source of truth.
+#[test]
+fn mesh_bpf_metrics_schema_matches_constructor_admission() {
+    use ferrum_edge::plugins::mesh::bpf_metrics::{
+        DEFAULT_METRIC_PREFIX, MESH_BPF_METRICS_CONFIG_KEYS, MeshBpfMetrics,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/MeshBpfMetricsConfig")
+        .expect("MeshBpfMetricsConfig component exists");
+    let description = schema["description"]
+        .as_str()
+        .expect("MeshBpfMetricsConfig description");
+    for contract in [
+        "OptionalFailOpen",
+        "scope: global",
+        "ferrum_mesh_bpf",
+        "Non-object configs",
+        "trimmed",
+    ] {
+        assert!(
+            description.contains(contract),
+            "MeshBpfMetricsConfig description missing `{contract}`"
+        );
+    }
+
+    assert_eq!(
+        schema["type"],
+        json!(["object", "null", "string", "array", "number", "boolean"])
+    );
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(
+        schema["properties"]["prefix"]["pattern"],
+        json!(r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*$")
+    );
+    assert_eq!(
+        schema["properties"]["prefix"]["default"],
+        json!(DEFAULT_METRIC_PREFIX)
+    );
+    assert_eq!(MESH_BPF_METRICS_CONFIG_KEYS, ["prefix"].as_slice());
+
+    let bpf_branch = spec["components"]["schemas"]["PluginConfig"]["allOf"]
+        .as_array()
+        .expect("PluginConfig allOf")
+        .iter()
+        .find(|entry| {
+            entry
+                .pointer("/if/properties/plugin_name/const")
+                .and_then(serde_json::Value::as_str)
+                == Some("__mesh_bpf_metrics")
+        })
+        .expect("__mesh_bpf_metrics PluginConfig branch");
+    assert_eq!(
+        bpf_branch.pointer("/then/if/properties/enabled/const"),
+        Some(&json!(true))
+    );
+    assert_eq!(
+        bpf_branch.pointer("/then/then/properties/scope/const"),
+        Some(&json!("global"))
+    );
+
+    let component_cases = [
+        (json!({}), true),
+        (json!({"prefix": "tenantA_bpf"}), true),
+        (json!({"prefix": " tenantA_bpf "}), true),
+        (json!({"prefix": "\ttenantB_bpf\n"}), true),
+        (json!({"prefix": "_leading_underscore"}), true),
+        (serde_json::Value::Null, true),
+        (json!("ignored"), true),
+        (json!([]), true),
+        (json!(7), true),
+        (json!(false), true),
+        (json!({"prefix": ""}), false),
+        (json!({"prefix": "  "}), false),
+        (json!({"prefix": "1tenant_bpf"}), false),
+        (json!({"prefix": "with spaces"}), false),
+        (json!({"prefix": "tenant-A"}), false),
+        (json!({"prefix": "tenantA.bpf"}), false),
+        (json!({"prefix": 7}), false),
+        (json!({"prefix": null}), false),
+        (json!({"prefix": ["tenantA_bpf"]}), false),
+        (json!({"prefx": "tenantA_bpf"}), false),
+        (json!({"prefix": "tenantA_bpf", "extra": true}), false),
+    ];
+    for (config, expected_valid) in component_cases {
+        assert_component_validity(&spec, "MeshBpfMetricsConfig", &config, expected_valid);
+        let constructed = MeshBpfMetrics::new(&config);
+        assert_eq!(
+            constructed.is_ok(),
+            expected_valid,
+            "constructor disagrees with MeshBpfMetricsConfig for {config}: {:?}",
+            constructed.err()
+        );
+    }
+
+    let wrapper_cases = [
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "global",
+                "enabled": true,
+                "config": {}
+            }),
+            true,
+        ),
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "global",
+                "enabled": true,
+                "config": {"prefix": "tenantA_bpf"}
+            }),
+            true,
+        ),
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "global",
+                "enabled": true,
+                "config": {"prefix": " tenantA_bpf "}
+            }),
+            true,
+        ),
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "proxy",
+                "enabled": true,
+                "proxy_id": "http",
+                "config": {}
+            }),
+            false,
+        ),
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "proxy_group",
+                "enabled": true,
+                "config": {}
+            }),
+            false,
+        ),
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "proxy",
+                "enabled": false,
+                "proxy_id": "http",
+                "config": {}
+            }),
+            true,
+        ),
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "global",
+                "enabled": true,
+                "config": {"prefx": "x"}
+            }),
+            false,
+        ),
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "global",
+                "enabled": true,
+                "config": {"prefix": "  "}
+            }),
+            false,
+        ),
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "global",
+                "enabled": true,
+                "config": null
+            }),
+            false,
+        ),
+    ];
+    for (instance, expected_valid) in wrapper_cases {
+        assert_component_validity(&spec, "PluginConfig", &instance, expected_valid);
+    }
+
+    let plugins_docs = include_str!("../../docs/plugins.md");
+    let section = plugins_docs
+        .split("### `__mesh_bpf_metrics`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .expect("__mesh_bpf_metrics docs section");
+    for needle in [
+        "| `prefix` | String | `ferrum_mesh_bpf` |",
+        "`str::trim`",
+        "[A-Za-z_][A-Za-z0-9_]*",
+        "OptionalFailOpen",
+        "scope: global",
+        "prefix: tenantA_bpf",
+        "no declared length limit",
+    ] {
+        assert!(
+            section.contains(needle),
+            "docs/plugins.md __mesh_bpf_metrics section missing `{needle}`"
+        );
+    }
+
+    let mesh_docs = include_str!("../../docs/mesh.md");
+    for needle in [
+        "capped exponential backoff",
+        "1s, 2s, 4s, 8s, 16s, and 30s",
+        "does not stop the consumer",
+        "never start the consumer task",
+        "`str::trim`",
+        "[A-Za-z_][A-Za-z0-9_]*",
+        "default `ferrum_mesh_bpf`",
+    ] {
+        assert!(
+            mesh_docs.contains(needle),
+            "docs/mesh.md missing `{needle}`"
+        );
+    }
+    assert!(
+        !mesh_docs.contains("the consumer logs one info line at startup and exits"),
+        "docs/mesh.md must not claim a missing pin stops the consumer"
+    );
+}
+
 /// Issues #5111–#5115: size-limiting plugin configs are closed objects whose
 /// integer size fields advertise an enforceable uint64 maximum. `format: uint64`
 /// alone does not constrain Draft 2020-12 validators.

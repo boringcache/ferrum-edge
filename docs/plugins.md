@@ -8252,9 +8252,29 @@ See [Mesh Observability](mesh.md#observability) for metric names, service graph 
 
 ### `__mesh_bpf_metrics`
 
-Reserved internal plugin auto-injected only for mesh `NodeWaypoint` topology. It exposes TCP-layer BPF SOCK_OPS counters and fixed-bucket SRTT, SYN-to-ACK, and captured accept-to-first-application-byte latency histograms on the Prometheus scrape surface. Operator-managed plugin configs should not create names prefixed with `__`. Unknown top-level keys are rejected at construction (for example a misspelled `prefx` cannot silently publish the default metric namespace).
+Reserved internal plugin auto-injected only for mesh `NodeWaypoint` topology as a **global** instance. It exposes TCP-layer BPF SOCK_OPS counters and fixed-bucket SRTT, SYN-to-ACK, and captured accept-to-first-application-byte latency histograms on the Prometheus scrape surface. Operator-managed plugin configs should not create names prefixed with `__`. Mesh injection still uses this constructor: documenting the contract does not recommend creating the plugin by hand.
 
-See [BPF SOCK_OPS observability](mesh.md#bpf-sock_ops-observability-gap-sc3) for emitted counters, histogram bucket bounds, and the node-agent/process split.
+Enabled instances must use `scope: global`. Composition admits at most one enabled instance per process so authenticated `GET /metrics` never double-emits the surface. Disabled rows are not constructed and are ignored by that ownership check.
+
+**Priority:** 9365
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `prefix` | String | `ferrum_mesh_bpf` | Prometheus metric-name prefix applied to every emitted family (`{prefix}_tcp_events_total`, `{prefix}_drops_total`, `{prefix}_srtt_microseconds`, `{prefix}_syn_to_ack_microseconds`, `{prefix}_accept_to_first_byte_microseconds`, and the ringbuf families). Surrounding whitespace is trimmed (`str::trim`) before validation. After trimming the value must be a nonempty ASCII identifier matching `[A-Za-z_][A-Za-z0-9_]*`. There is no declared length limit beyond that grammar. Omit the key, or supply a non-object config, to keep the default. |
+
+The config object is closed: unknown top-level keys are rejected at construction (for example a misspelled `prefx` cannot silently publish the default metric namespace). Non-object configs (`null`, string, array, number, boolean) keep the default prefix. Wrong-typed, empty, blank, or non-identifier `prefix` values fail construction.
+
+Registration is `OptionalFailOpen`: Admin API create/update still returns HTTP 400 for an invalid enabled config. During file-mode load, `ferrum-edge validate`, pre-existing DB/CP snapshot application, or cache rebuild, invalid enabled configs produce a validation/construction warning and omit this plugin instance from the published cache (the scrape surface is absent) while admitting the surrounding snapshot.
+
+```yaml
+plugin_name: __mesh_bpf_metrics
+scope: global
+enabled: true
+config:
+  prefix: tenantA_bpf
+```
+
+See [BPF SOCK_OPS observability](mesh.md#bpf-sock_ops-observability-gap-sc3) for emitted counters, histogram bucket bounds, pin retry behavior, and the node-agent/process split.
 
 ---
 
