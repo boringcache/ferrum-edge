@@ -12336,8 +12336,14 @@ fn non_string_tool_action_is_reported_as_a_type_error_not_a_missing_key() {
             .expect("a present non-string action must fail admission");
         assert!(err.contains("'action'"), "{err}");
         assert!(err.contains("must be a string"), "{err}");
-        assert!(err.contains(kind), "the error must name the JSON kind: {err}");
-        assert!(err.contains("lookup"), "the error must name the tool: {err}");
+        assert!(
+            err.contains(kind),
+            "the error must name the JSON kind: {err}"
+        );
+        assert!(
+            err.contains("lookup"),
+            "the error must name the tool: {err}"
+        );
         assert!(
             !err.contains("missing"),
             "a supplied key must not be reported as missing: {err}"
@@ -12394,7 +12400,10 @@ fn non_string_approval_endpoint_url_is_reported_as_a_type_error_not_a_missing_ke
             .expect("a present non-string endpoint_url must fail admission");
         assert!(err.contains("'approval.endpoint_url'"), "{err}");
         assert!(err.contains("must be a string"), "{err}");
-        assert!(err.contains(kind), "the error must name the JSON kind: {err}");
+        assert!(
+            err.contains(kind),
+            "the error must name the JSON kind: {err}"
+        );
         assert!(
             !err.contains("is required"),
             "a supplied key must not be reported as required: {err}"
