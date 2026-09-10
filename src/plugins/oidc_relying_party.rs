@@ -4153,7 +4153,14 @@ fn spawn_oidc_discovery(
                 );
                 tokio::time::sleep(backoff).await;
             }
-            match fetch_discovery(&http_client, &discovery_url).await {
+            match fetch_discovery(
+                &http_client,
+                &discovery_url,
+                explicit_userinfo_endpoint.is_some(),
+                explicit_end_session_endpoint.is_some(),
+            )
+            .await
+            {
                 Ok(doc) => {
                     let doc = apply_discovery_endpoint_overrides(
                         doc,
@@ -4206,9 +4213,21 @@ fn spawn_oidc_discovery(
     })
 }
 
+/// Fetch and validate a provider discovery document.
+///
+/// `userinfo_overridden` / `end_session_overridden` say whether the operator
+/// configured an explicit value that
+/// [`apply_discovery_endpoint_overrides`] will substitute. An advertised value
+/// this deployment will never call is then not read or validated at all:
+/// validating it first made a valid explicit override unusable, because the
+/// whole discovery fetch failed on an advertisement that was about to be
+/// discarded (issue #5033). Endpoints that are actually selected keep their
+/// fail-closed same-origin validation.
 async fn fetch_discovery(
     http_client: &PluginHttpClient,
     discovery_url: &str,
+    userinfo_overridden: bool,
+    end_session_overridden: bool,
 ) -> Result<DiscoveryDoc, String> {
     let client = http_client
         .get()
@@ -4233,21 +4252,27 @@ async fn fetch_discovery(
         .and_then(Value::as_str)
         .ok_or_else(|| "missing token_endpoint".to_string())
         .and_then(|url| validate_discovered_url(discovery_url, url, "token_endpoint"))?;
-    let userinfo_endpoint = body
-        .get("userinfo_endpoint")
-        .and_then(Value::as_str)
-        .map(|url| validate_discovered_url(discovery_url, url, "userinfo_endpoint"))
-        .transpose()?;
+    let userinfo_endpoint = if userinfo_overridden {
+        None
+    } else {
+        body.get("userinfo_endpoint")
+            .and_then(Value::as_str)
+            .map(|url| validate_discovered_url(discovery_url, url, "userinfo_endpoint"))
+            .transpose()?
+    };
     let jwks_uri = body
         .get("jwks_uri")
         .and_then(Value::as_str)
         .ok_or_else(|| "missing jwks_uri".to_string())
         .and_then(|url| validate_discovered_url(discovery_url, url, "jwks_uri"))?;
-    let end_session_endpoint = body
-        .get("end_session_endpoint")
-        .and_then(Value::as_str)
-        .map(|url| validate_discovered_url(discovery_url, url, "end_session_endpoint"))
-        .transpose()?;
+    let end_session_endpoint = if end_session_overridden {
+        None
+    } else {
+        body.get("end_session_endpoint")
+            .and_then(Value::as_str)
+            .map(|url| validate_discovered_url(discovery_url, url, "end_session_endpoint"))
+            .transpose()?
+    };
     let revocation_endpoint = body
         .get("revocation_endpoint")
         .and_then(Value::as_str)
@@ -4308,7 +4333,13 @@ pub(crate) mod discovery_test_seams {
         explicit_userinfo_endpoint: Option<String>,
         explicit_end_session_endpoint: Option<String>,
     ) -> Result<ResolvedDiscoveryEndpoints, String> {
-        let doc = fetch_discovery(http_client, discovery_url).await?;
+        let doc = fetch_discovery(
+            http_client,
+            discovery_url,
+            explicit_userinfo_endpoint.is_some(),
+            explicit_end_session_endpoint.is_some(),
+        )
+        .await?;
         let doc = apply_discovery_endpoint_overrides(
             doc,
             explicit_userinfo_endpoint,

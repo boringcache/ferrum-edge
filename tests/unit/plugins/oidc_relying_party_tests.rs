@@ -3858,3 +3858,74 @@ fn private_key_jwt_requires_a_key_that_supports_the_selected_algorithm() {
         );
     }
 }
+
+/// An explicit optional endpoint replaces the advertised value outright, so an
+/// advertisement this deployment will never call must not fail the whole
+/// discovery fetch. Validating it first made a valid explicit override unusable
+/// and left every login answering 503 (issue #5033).
+#[tokio::test]
+async fn cross_origin_advertisements_do_not_block_their_explicit_overrides() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/discovery"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "authorization_endpoint": format!("{}/authorize", server.uri()),
+            "token_endpoint": format!("{}/token", server.uri()),
+            "jwks_uri": format!("{}/jwks", server.uri()),
+            // Advertised on a different origin than discovery_url, and never
+            // called because both are explicitly overridden below.
+            "userinfo_endpoint": "https://elsewhere.example.com/userinfo",
+            "end_session_endpoint": "https://elsewhere.example.com/end_session",
+        })))
+        .mount(&server)
+        .await;
+
+    let (userinfo, end_session) = oidc_resolve_discovery_for_test(
+        &PluginHttpClient::default(),
+        &format!("{}/discovery", server.uri()),
+        Some("https://issuer.example.com/userinfo".to_string()),
+        Some("https://issuer.example.com/end_session".to_string()),
+    )
+    .await
+    .expect("a discarded advertisement must not fail discovery");
+    assert_eq!(
+        userinfo.as_deref(),
+        Some("https://issuer.example.com/userinfo")
+    );
+    assert_eq!(
+        end_session.as_deref(),
+        Some("https://issuer.example.com/end_session")
+    );
+}
+
+/// A selected discovered optional endpoint keeps its fail-closed same-origin
+/// validation: only the discarded advertisement is skipped (issue #5033).
+#[tokio::test]
+async fn selected_discovered_optional_endpoints_stay_fail_closed() {
+    for field in ["userinfo_endpoint", "end_session_endpoint"] {
+        let server = MockServer::start().await;
+        let mut document = json!({
+            "authorization_endpoint": format!("{}/authorize", server.uri()),
+            "token_endpoint": format!("{}/token", server.uri()),
+            "jwks_uri": format!("{}/jwks", server.uri()),
+        });
+        document[field] = json!("https://elsewhere.example.com/endpoint");
+        Mock::given(method("GET"))
+            .and(path("/discovery"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(document))
+            .mount(&server)
+            .await;
+
+        assert!(
+            oidc_resolve_discovery_for_test(
+                &PluginHttpClient::default(),
+                &format!("{}/discovery", server.uri()),
+                None,
+                None,
+            )
+            .await
+            .is_err(),
+            "a selected cross-origin {field} must still fail closed"
+        );
+    }
+}

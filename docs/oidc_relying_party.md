@@ -26,7 +26,7 @@ config:
 
 Exactly one provider is supported. Use `discovery_url` for normal OIDC providers, or set `authorization_endpoint`, `token_endpoint`, and `jwks_uri` explicitly for providers without discovery. Provider endpoints must use HTTPS except for `localhost` or literal loopback development endpoints. Discovery-provided endpoints must preserve the discovery URL's host, scheme, and effective port.
 
-`userinfo_endpoint` and `end_session_endpoint` may be set alongside `discovery_url`. When both are configured, the explicitly configured values take precedence over what the discovery document advertises, and they remain in effect even when the discovery document omits either field. `authorization_endpoint`, `token_endpoint`, and `jwks_uri` remain mutually exclusive with `discovery_url`.
+`userinfo_endpoint` and `end_session_endpoint` may be set alongside `discovery_url`. When both are configured, the explicitly configured values take precedence over what the discovery document advertises, and they remain in effect even when the discovery document omits either field. An explicitly overridden optional endpoint is not read from the discovery document at all, so an advertisement this deployment will never call — one on another origin, say — cannot fail discovery. An optional endpoint that is actually selected from discovery keeps its fail-closed same-origin validation. `authorization_endpoint`, `token_endpoint`, and `jwks_uri` remain mutually exclusive with `discovery_url`.
 
 ## Security Behavior
 
