@@ -259,7 +259,7 @@ fn final_request_body_policy_claimed(
 /// no octets, but it is also not provably `identity`, so a governed request
 /// carrying one must reach the fail-closed malformed rejection instead of being
 /// silently scanned as though the field were absent.
-fn requires_decode_judgment(encoding: &str) -> bool {
+pub(crate) fn requires_decode_judgment(encoding: &str) -> bool {
     !encoding
         .split(',')
         .map(str::trim)
