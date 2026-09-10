@@ -4654,6 +4654,10 @@ pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<Strin
     // transaction logs and retain only safe present/length correlation hints.
     crate::plugins::sse::redact_sse_log_metadata(metadata);
     crate::plugins::mcp_gateway::redact_internal_log_metadata(metadata);
+    // gRPC-Web stages the client's COMPLETE request trailer block for dispatch.
+    // It is transport state, not observability metadata, and the application
+    // trailing metadata inside it may carry credentials (GHSA-9f6g-hqpq-v8h7).
+    crate::plugins::grpc_web::redact_internal_log_metadata(metadata);
     // Fail-closed shared contract: request-deduplication lifecycle keys under
     // `_dedup_*` never enter any transaction-log projection. Ownership lives in
     // typed request state; this strips any residual public-metadata copies.
@@ -23706,6 +23710,13 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     response_headers: &mut HashMap<String, String>,
     response_body: &mut Bytes,
 ) -> Option<FinalSyntheticBodyPolicyWitness> {
+    // Semantic-cache entries retain the finalized application body with only
+    // transport encoding removed. Body inspection must see replay provenance
+    // so mandatory policy rewrites still run, while ordinary rewrites do not.
+    // Restore it before live header rules and the late compression phase.
+    let previous_finalized_response_replay = ctx.finalized_response_replay;
+    ctx.finalized_response_replay |= ctx.semantic_cache_response_replay;
+
     // Mark the context for the duration of this body-hook phase so that storing
     // plugins (e.g. `request_deduplication`) can tell this body is a synthetic
     // plugin short-circuit and skip caching/replaying it. Saved/restored so a
@@ -24039,6 +24050,8 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     } else {
         ctx.metadata.remove(SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
     }
+
+    ctx.finalized_response_replay = previous_finalized_response_replay;
 
     // A gateway-authored terminal — a capacity refusal, a body rejection, a
     // failed mandatory replay redaction — is already the answer, and must never
@@ -35874,6 +35887,7 @@ async fn handle_proxy_request_inner(
                         content_type,
                         grpc_streaming.status,
                         grpc_web_streaming_initial_metadata,
+                        crate::plugins::grpc_web::response_entity_is_unframed_backend_error(&ctx),
                     );
                 }
                 if let Some(logger) = deferred_grpc_logger {
@@ -39962,6 +39976,7 @@ async fn handle_proxy_request_inner(
             &content_type,
             response_status,
             Some(initial_terminal_metadata),
+            crate::plugins::grpc_web::response_entity_is_unframed_backend_error(&ctx),
         )
     } else {
         body

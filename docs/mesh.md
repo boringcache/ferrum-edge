@@ -408,7 +408,7 @@ DTLS frontend configuration and reload are **listener- and owner-scoped**. Every
 
 #### BPF SOCK_OPS observability (GAP-SC3)
 
-The `__mesh_bpf_metrics` plugin is auto-injected on `NodeWaypoint` topology only and surfaces TCP-layer counters from `BPF_PROG_TYPE_SOCK_OPS` plus first-data evidence from `BPF_PROG_TYPE_SK_SKB`. The userspace consumer (`src/ebpf/event_consumer.rs::SockOpsConsumer`) drains the per-CPU ringbuf and increments a shared `BpfMetricsState`. Authenticated production `GET /metrics` appends that surface exactly once from the current plugin-cache generation's precomputed exporter (configured `prefix` preserved; absent from the scrape when the plugin is not in the published configuration). Metrics emitted (Prometheus text format):
+The `__mesh_bpf_metrics` plugin is auto-injected on `NodeWaypoint` topology only as a global instance and surfaces TCP-layer counters from `BPF_PROG_TYPE_SOCK_OPS` plus first-data evidence from `BPF_PROG_TYPE_SK_SKB`. The userspace consumer (`src/ebpf/event_consumer.rs::SockOpsConsumer`) drains the per-CPU ringbuf and increments a shared `BpfMetricsState`. Authenticated production `GET /metrics` appends that surface exactly once from the current plugin-cache generation's precomputed exporter (configured `prefix` preserved after `str::trim`; the trimmed value must match `[A-Za-z_][A-Za-z0-9_]*`; default `ferrum_mesh_bpf`; absent from the scrape when the plugin is not in the published configuration). Metrics emitted (Prometheus text format):
 
 - `ferrum_mesh_bpf_tcp_events_total{event="connect"|"accept_established"|"rst"|"fin_sent"|"fin_received"}` — per-TCP-event counts. Operators correlate `accept` vs `connect` rates to spot stuck pods or pre-handshake drops. `event="rst"` counts abnormal `ESTABLISHED→CLOSE` transitions; SOCK_OPS state callbacks cannot distinguish RST-sent from RST-received, so there is no directional `rst_sent` / `rst_received` pair.
 - `ferrum_mesh_bpf_drops_total{reason="bypass_uid_hit"|"exclude_cidr_hit"|"not_in_include_cidr"|"exclude_port_hit"}` — how often each BPF capture-bypass decision fired. Produced by the `connect4`/`connect6` hooks (same ringbuf + dropped-counter contract as SOCK_OPS lifecycle events). Include-CIDR misses and `includeOutboundPorts` misses share `not_in_include_cidr`.
@@ -417,7 +417,7 @@ The `__mesh_bpf_metrics` plugin is auto-injected on `NodeWaypoint` topology only
 
 **Process split**: the node-agent owns the BPF program lifecycle — it loads `ferrum_sock_ops` from the ELF, attaches it to the cgroup root, and pins the event ringbuf, per-CPU drop counter, and accepted-socket SOCKHASH at `/sys/fs/bpf/ferrum/sock_ops_events`, `/sys/fs/bpf/ferrum/sock_ops_stats`, and `/sys/fs/bpf/ferrum/accept_first_byte_sockets`. The mesh-proxy in `NodeWaypoint` topology opens those pinned maps by path, drives a `tokio::io::unix::AsyncFd` poll loop, queues first-data SOCKHASH removal behind a bounded 250 ms grace period, and feeds decoded records through `SockOpsConsumer::handle_event` into the shared `Arc<BpfMetricsState>` that `__mesh_bpf_metrics` reads. The node-agent publishes the ringbuf pin last as the complete-generation marker, so a consumer never adopts it before the matching stats and SOCKHASH pins. There is no cross-process pointer sharing — the pinned-path contract is the entire IPC surface.
 
-When the kernel-side program is not pinned (no node-agent on the host, kernel < 5.7, or a build without the `ebpf` feature), the consumer logs one info line at startup and exits; the plugin keeps emitting a stable Prometheus surface populated by zeros so dashboards do not break. An SK_SKB load/attach failure disables only accept-to-first-byte samples and never changes capture or traffic verdicts. Node-agent reload creates a fresh unpinned correlation-map generation: in-flight evidence is deliberately discarded, while userspace aggregate counters remain attached to the current process state. The ringbuf size is sized at BPF load time by the node-agent from `FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES` (default 4 MiB) — see [docs/configuration.md](configuration.md).
+On Linux `ebpf` builds the userspace consumer retries until the node-agent pins appear: it logs one `info` line on the first miss, then backs off 1s, 2s, 4s, 8s, 16s, and 30s (capped exponential backoff at 30s) until opening the maps succeeds or shutdown fires. A missing pin does not stop the consumer; attaching after the node-agent publishes the maps does not require restarting the mesh-proxy. Builds without the `ebpf` feature or on non-Linux targets never start the consumer task. In every case the plugin keeps emitting a stable Prometheus surface populated by zeros until (and unless) the consumer attaches, so dashboards do not break. An SK_SKB load/attach failure disables only accept-to-first-byte samples and never changes capture or traffic verdicts. Node-agent reload creates a fresh unpinned correlation-map generation: in-flight evidence is deliberately discarded, while userspace aggregate counters remain attached to the current process state. The ringbuf size is sized at BPF load time by the node-agent from `FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES` (default 4 MiB) — see [docs/configuration.md](configuration.md).
 
 ### Service Waypoint
 
@@ -2117,11 +2117,27 @@ A bare `source.serviceAccount` is namespace-relative, so the same policy text me
 
 ### SPIFFE Identity
 
-The [`spiffe_identity`](plugins.md#spiffe_identity) plugin (priority 940) extracts the peer SPIFFE ID from TLS/DTLS client certificates on every inbound request. Configuration, admission, hooks, outputs, and invalid-SVID behavior are documented in that plugin reference. This identity feeds into:
+The [`spiffe_identity`](plugins.md#spiffe_identity) plugin (priority 940) extracts the peer SPIFFE ID from TLS/DTLS client certificates on every inbound request. Configuration, admission, hooks, outputs, trust-domain grammar, and invalid-SVID behavior are documented in that plugin reference. This identity feeds into:
 
 - `mesh_authz` principal matching
 - Workload metrics labels (`source.principal`, `destination.principal`)
 - Transaction summary `auth_method` tracking
+
+**SPIFFE-only chains are lifetime-bounded.** The mesh injection installs
+`spiffe_identity` plus `mesh_authz` and does not require `mtls_auth`, so on those
+chains the SVID alone authorizes the request. `spiffe_identity` therefore admits
+a certificate-derived peer identity as an authenticated principal carrying the
+leaf's `notAfter` as its authorization deadline, on the same protocol-neutral
+contract `mtls_auth` uses for Consumer-mapped certificates. Requests and streams
+authorized only by a peer SVID are re-checked against the leaf's validity window
+on every request and are terminated at SVID expiry (or the finite
+`FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` fallback, whichever is
+earlier) instead of running for the life of the transport connection. A
+pre-stamped kernel-attested (node-waypoint eBPF) or HBONE-asserted
+`peer_spiffe_id` carries no certificate validity window and is deliberately not
+treated as certificate-bounded; explicit trust withdrawal remains the separate
+mechanism described under
+[frontend_tls.md — Expiry is not revocation](frontend_tls.md#expiry-is-not-revocation).
 
 For production deployments, Ferrum delegates SVID issuance and trust-bundle
 distribution to a separately operated [SPIRE](https://spiffe.io/docs/latest/spire-about/)

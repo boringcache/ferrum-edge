@@ -79,7 +79,7 @@ use async_trait::async_trait;
 use http::header::HeaderName;
 use serde::ser::SerializeMap;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -91,8 +91,8 @@ use crate::plugins::utils::log_schema::view::{
     MetadataNested, emit_timestamp, extract_host_from_url, serialize_schema_metadata, status_class,
 };
 use crate::plugins::utils::log_schema::{
-    DerivedKind, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView, SummarySchema,
-    TimestampFormat, resolve_schema,
+    DerivedKind, EmittedKeys, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView,
+    SummarySchema, TimestampFormat, resolve_schema,
 };
 use crate::plugins::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metadata_key};
 use crate::proxy::tcp_proxy::StreamIoSide;
@@ -780,14 +780,28 @@ impl TransactionDebugger {
                     } else if ctx == JsonBodyRedactionContext::Normal
                         && is_azure_data_sources_field(&key)
                     {
-                        if let Value::Array(sources) = entry {
-                            for source in sources.iter_mut() {
-                                self.redact_json_value(
-                                    source,
-                                    depth + 1,
-                                    JsonBodyRedactionContext::DataSourceItem,
-                                );
+                        // The provider's conventional shape is an array of
+                        // data-source items, but a captured body is arbitrary
+                        // JSON and this name proves no type invariant. Every
+                        // other shape is traversed as a single data-source item
+                        // instead of falling out of the branch untouched: a
+                        // recognized container name must never bypass the
+                        // ordinary member-name and credential-string visitor.
+                        match entry {
+                            Value::Array(sources) => {
+                                for source in sources.iter_mut() {
+                                    self.redact_json_value(
+                                        source,
+                                        depth + 1,
+                                        JsonBodyRedactionContext::DataSourceItem,
+                                    );
+                                }
                             }
+                            other => self.redact_json_value(
+                                other,
+                                depth + 1,
+                                JsonBodyRedactionContext::DataSourceItem,
+                            ),
                         }
                     } else {
                         let next_ctx = if ctx == JsonBodyRedactionContext::DataSourceItem {
@@ -1533,7 +1547,7 @@ impl<'a> SchemaSerializable for DebugHttpRecord<'a> {
     fn serialize_metadata<S>(
         &self,
         policy: &MetadataPolicy,
-        emitted: &mut HashSet<String>,
+        emitted: &EmittedKeys<'_>,
         map: &mut S,
     ) -> Result<(), S::Error>
     where
@@ -1661,7 +1675,7 @@ impl<'a> SchemaSerializable for DebugStreamRecord<'a> {
     fn serialize_metadata<S>(
         &self,
         policy: &MetadataPolicy,
-        emitted: &mut HashSet<String>,
+        emitted: &EmittedKeys<'_>,
         map: &mut S,
     ) -> Result<(), S::Error>
     where
@@ -1776,7 +1790,7 @@ impl<'a> SchemaSerializable for DebugWsRecord<'a> {
     fn serialize_metadata<S>(
         &self,
         policy: &MetadataPolicy,
-        emitted: &mut HashSet<String>,
+        emitted: &EmittedKeys<'_>,
         map: &mut S,
     ) -> Result<(), S::Error>
     where
