@@ -5940,14 +5940,38 @@ See the dedicated
 complete schema, fail-closed behavior, examples, observability contract, and
 documented lifecycle limitations.
 
-**Provider coverage.** Tool definitions and tool calls are read in the OpenAI
-(Chat Completions and Responses), Anthropic Messages, Google Gemini, Cohere v2,
-and Amazon Bedrock Converse shapes, on both the buffered and streaming paths.
+**Provider coverage.** The buffered and streaming paths cover **different**
+provider sets, so read them separately.
+
+| Path | Provider shapes read |
+| --- | --- |
+| Buffered request tool definitions | OpenAI `tools[].function.name` and legacy `functions[].name`, Anthropic `tools[].name`, Google `tools[].functionDeclarations[].name`, Bedrock `toolConfig.tools[].toolSpec.name` |
+| Buffered response tool calls | OpenAI Chat Completions `choices[].message.tool_calls[]` and legacy `function_call`, OpenAI Responses `output[]` `type: "function_call"` items, Anthropic `content[]` `tool_use` blocks, Google `candidates[].content.parts[].functionCall`, Cohere v2 `message.tool_calls[]`, Bedrock Converse `output.message.content[].toolUse` |
+| Streaming SSE tool-call deltas | OpenAI Chat Completions `choices[].delta.tool_calls` and legacy `delta.function_call`, Anthropic `content_block_start` / `input_json_delta`, Cohere v2 `tool-call-start` / `tool-call-delta`, Google `candidates[].content.parts[].functionCall` — **these four only** |
+
+**OpenAI Responses streaming events and Amazon Bedrock streaming are not
+accumulated.** There is no Responses event state machine and no
+`application/vnd.amazon.eventstream` parser in this plugin. A Responses SSE
+frame that carries a tool-call marker is not a silent allow — it is an
+unreadable shape and takes the `unknown_shape_action` posture below. Bedrock's
+binary event stream is never parsed as SSE at all; Bedrock Converse delivered
+as a buffered JSON body is governed normally. See the guide's
+[limitations](plugins/ai_tool_governor.md#limitations-mvp) for the exact
+handling of each.
 
 **Mode semantics.** `mode: enforce` is the only mode that rejects or cuts; it
-fails closed on anything it cannot policy-check. `mode: dry_run` never rejects —
-it evaluates, records `ai_tool_governor.decision=dry_run`, and forwards — so it
-is the safe rollout/observe posture. A payload carrying a tool-call marker the
+fails closed on anything it cannot policy-check. `mode: dry_run` never rejects
+and never calls the approval webhook — it evaluates policy, records what
+enforce *would* have done, and forwards — so it is the safe rollout/observe
+posture. Global dry-run **preserves the would-be policy label** rather than
+relabelling it: an ordinary denied call is recorded as
+`ai_tool_governor.mode=dry_run` with `ai_tool_governor.decision=deny`, and an
+approval-gated call with `decision=require_approval`. `decision=dry_run` is
+reserved for the distinct per-tool `action: dry_run` policy and for the
+dry-run duplicate-key (`uninspectable_reason=ambiguous_json`) observation. Find
+global dry-run findings by querying `mode`, not `decision`.
+
+**Unreadable shapes.** A payload carrying a tool-call marker the
 plugin cannot read is an **extraction failure, not an allow**:
 `unknown_shape_action` (default `deny`) makes enforce fail closed on it, while
 the documented `allow` opt-out forwards it. Both settings record the fixed
