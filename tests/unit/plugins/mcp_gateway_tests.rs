@@ -11096,9 +11096,13 @@ async fn mismatched_post_stream_response_is_refused_under_the_request_id() {
     let mut stream = attach_sse_body(&plugin, &session_id).await;
 
     let mut ctx = route_tool_call(&plugin, &session_id, 901).await;
-    let mismatched = br#"{"jsonrpc":"2.0","id":902,"result":{}}"#;
-    let response_headers = known_json_response_headers(mismatched);
-    let refused = final_response_body(&plugin, &mut ctx, 200, &response_headers, mismatched).await;
+    // The body is valid under the pinned `outputSchema`, so the id is its ONLY
+    // defect. A result that also failed `validate_tool_results` would be
+    // refused with `-32012` by the earlier fail-closed enforcement pass and
+    // never reach the delivery decision this test is about.
+    let mismatch = weather_tool_result(902);
+    let response_headers = known_json_response_headers(&mismatch);
+    let refused = final_response_body(&plugin, &mut ctx, 200, &response_headers, &mismatch).await;
     let (status, refused_body, refused_headers) = reject_raw(refused);
     assert_eq!(status, 200);
     assert_eq!(
@@ -11149,7 +11153,9 @@ async fn mismatched_post_stream_refusal_keeps_a_numeric_id_token() {
         .transform_request_body_with_context(&mut ctx, request.as_bytes(), None, &headers)
         .await;
 
-    let mismatched = br#"{"jsonrpc":"2.0","id":18446744073709551616,"result":{}}"#;
+    // Schema-valid, exactly as above: only the id token differs from the one
+    // this request opened its identity under.
+    let mismatched = br#"{"jsonrpc":"2.0","id":18446744073709551616,"result":{"structuredContent":{"temperature":22.5,"conditions":"Partly cloudy"}}}"#;
     let response_headers = known_json_response_headers(mismatched);
     let refused = final_response_body(&plugin, &mut ctx, 200, &response_headers, mismatched).await;
     let (_, refused_body, _) = reject_raw(refused);
