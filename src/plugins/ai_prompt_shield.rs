@@ -288,8 +288,10 @@ impl RedactionBudget {
     fn for_body(body_len: usize) -> Self {
         let limit = body_len
             .saturating_mul(REDACTION_OUTPUT_EXPANSION_FACTOR)
-            .max(MIN_REDACTION_OUTPUT_GROWTH_BYTES)
-            .min(MAX_REDACTION_OUTPUT_GROWTH_BYTES);
+            .clamp(
+                MIN_REDACTION_OUTPUT_GROWTH_BYTES,
+                MAX_REDACTION_OUTPUT_GROWTH_BYTES,
+            );
         Self {
             remaining: Cell::new(limit),
             exhausted: Cell::new(false),

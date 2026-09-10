@@ -3209,7 +3209,8 @@ fn test_custom_pattern_entries_reject_unknown_members() {
             {"name": "second", "regex": "b", "note": "x"}
         ]
     }))
-    .expect_err("nested unknown member must be fatal");
+    .err()
+    .unwrap_or_else(|| panic!("nested unknown member must be fatal"));
     assert!(
         err.contains("custom_patterns[1].note"),
         "error must carry the entry index, got: {err}"
@@ -3569,7 +3570,8 @@ fn test_zero_width_and_oversized_redaction_policies_are_refused_at_construction(
             "patterns": [],
             "custom_patterns": [{"name": "zero_width", "regex": regex}]
         }))
-        .expect_err("a zero-width redaction policy must be refused");
+        .err()
+        .unwrap_or_else(|| panic!("a zero-width redaction policy must be refused"));
         assert!(
             err.contains("must not match the empty string"),
             "unexpected error for {regex:?}: {err}"
