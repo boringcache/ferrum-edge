@@ -1037,7 +1037,8 @@ fn h3_plugin_reject_commit_is_not_deferred_to_send_helpers() {
         .matches("send_h3_plugin_reject_flavor_aware(")
         .count();
     assert_eq!(
-        terminal_dispatch_plugin_sends, terminal_dispatch_boundaries + 1,
+        terminal_dispatch_plugin_sends,
+        terminal_dispatch_boundaries + 1,
         "each terminal-dispatch boundary precedes a plugin-aware send, plus the shared finalizer"
     );
     let effective_plugin_committed_boundaries =
