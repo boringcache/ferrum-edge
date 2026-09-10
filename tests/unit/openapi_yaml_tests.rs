@@ -3596,9 +3596,9 @@ fn hmac_auth_plugin_config_branch_requires_a_config_object() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
     let branch = spec
-        .pointer("/components/schemas/PluginConfig/allOf")
+        .pointer("/components/schemas/PluginConfigBase/allOf/0/then/allOf")
         .and_then(serde_json::Value::as_array)
-        .expect("PluginConfig allOf")
+        .expect("enabled PluginConfigBase allOf")
         .iter()
         .find(|entry| {
             entry.pointer("/if/properties/plugin_name/const") == Some(&json!("hmac_auth"))
