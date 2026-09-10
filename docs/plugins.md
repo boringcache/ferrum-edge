@@ -774,7 +774,7 @@ leave the sink disconnected).
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `endpoint_url` | String | *(required)* | WebSocket URL (`ws://` or `wss://`) to send transaction logs to. Must include a hostname and must not include URL userinfo. Path/query may carry collector tokens when required; operational diagnostics always emit a structurally redacted form (`scheme://host[:port]/redacted`). Malformed or non-WebSocket schemes are rejected at config load time. |
+| `endpoint_url` | String | *(required)* | WebSocket URL (`ws://` or `wss://`) to send transaction logs to. Must include a hostname and must not include URL userinfo. Path/query may carry collector tokens when required; operational diagnostics always emit a structurally redacted form (`scheme://host[:port]/redacted`). Malformed or non-WebSocket schemes are rejected at config load time. The constructor canonicalizes the value (lowercase scheme, percent-encoded path) before the collector handshake so admitted representations match the tungstenite request URI. |
 | `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch (1–10000) |
 | `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (100–600000) |
 | `max_retries` | Integer | `3` | Retry attempts on failed batch delivery (0–10) |
@@ -797,7 +797,7 @@ HTTP/gRPC and TCP/UDP summaries. Disconnect-specific keys such as `event`,
 `timestamp_disconnected`, `direction`, and `io_side` can be renamed, omitted,
 or reordered; see the log-schema reference for the complete field list.
 
-`endpoint_url` must be a valid `ws://` or `wss://` URL with a hostname and no userinfo. Malformed or non-WebSocket URLs reject plugin creation at config load time.
+`endpoint_url` must be a valid `ws://` or `wss://` URL with a hostname and no userinfo. Malformed or non-WebSocket URLs reject plugin creation at config load time. Scheme case and path encoding are normalized to the handshake representation at admission.
 
 ```yaml
 plugin_name: ws_logging
