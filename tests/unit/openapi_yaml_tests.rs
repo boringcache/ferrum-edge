@@ -12179,3 +12179,167 @@ fn merge_into_object(target: &mut serde_json::Value, extra: &serde_json::Value) 
         target.insert(key.clone(), value.clone());
     }
 }
+
+/// Bidirectional parity for `ai_semantic_firewall`: the published component and
+/// the constructor must return the SAME verdict, so a schema-validating client
+/// can preflight a configuration `ferrum-edge validate` will accept.
+#[test]
+fn ai_semantic_firewall_schema_matches_runtime_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    const ENDPOINT: &str = "http://127.0.0.1:1/v1/embeddings";
+    let provider = json!({"type": "openai_compatible_embeddings", "endpoint": ENDPOINT});
+
+    let accepted = [
+        json!({"provider": provider}),
+        json!({"enabled": false}),
+        json!({"provider": provider, "enabled": false}),
+        json!({
+            "provider": provider,
+            "inspect": {"request": false, "response": true},
+            "builtins": {"response_leakage": true}
+        }),
+        // An empty extraction list is fine while no rule in that direction runs.
+        json!({
+            "provider": provider,
+            "inspect": {"request": false, "response": true},
+            "extraction": {"request_json_paths": []}
+        }),
+        // Ids and examples are trimmed, so padded text is admissible.
+        json!({
+            "provider": provider,
+            "custom_rules": [{"id": " a ", "examples": [" reference "]}]
+        }),
+        json!({
+            "provider": provider,
+            "builtins": {"prompt_injection": {"examples_mode": "replace", "examples": ["x"]}}
+        }),
+        json!({"provider": provider, "streaming_response": "inspect", "streaming": {}}),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"window": "tokens", "tokenizer": "chars4", "max_window_tokens": 2}
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"max_hold_ms": 100, "on_hold_timeout": "on_error"}
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"enforcement": "detect", "max_hold_ms": 100, "on_hold_timeout": "forward"}
+        }),
+    ];
+    for config in &accepted {
+        assert_component_validity(&spec, "AiSemanticFirewallConfig", config, true);
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("ai_semantic_firewall", config).is_ok(),
+            "runtime should accept schema-valid config: {config}"
+        );
+    }
+
+    let rejected = [
+        json!({"provider": provider, "inspect": {"request": false, "response": false}}),
+        json!({"provider": provider, "builtins": {}}),
+        // Request-only rules with request inspection disabled.
+        json!({
+            "provider": provider,
+            "inspect": {"request": false, "response": true},
+            "builtins": {"prompt_injection": true}
+        }),
+        json!({"provider": provider, "extraction": {"request_json_paths": []}}),
+        // provider.type is an exact one-value vocabulary: no aliases, no padding.
+        json!({"provider": {"type": "openai_compatible", "endpoint": ENDPOINT}}),
+        json!({"provider": {"type": "openai-compatible", "endpoint": ENDPOINT}}),
+        json!({"provider": {"type": " openai_compatible_embeddings ", "endpoint": ENDPOINT}}),
+        json!({"provider": provider, "custom_rules": [{"id": " ", "examples": ["reference"]}]}),
+        json!({"provider": provider, "custom_rules": [{"id": "a", "examples": [" "]}]}),
+        json!({
+            "provider": provider,
+            "builtins": {"prompt_injection": {"examples_mode": "replace"}}
+        }),
+        json!({"provider": provider, "streaming": {}}),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"window": "tokens"}
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"tokenizer": "chars4"}
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"overlap_bytes": -1}
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"on_hold_timeout": "on_error"}
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"enforcement": "detect", "max_hold_ms": 100, "on_hold_timeout": "cut"}
+        }),
+        // A disabled instance still validates the blocks it carries.
+        json!({"provider": {"type": "bogus"}, "enabled": false}),
+        // Materializing an advertised default must never invalidate a config:
+        // these two token-only fields therefore carry no schema default.
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"max_window_tokens": 256}
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"overlap_tokens": 32}
+        }),
+    ];
+    for config in &rejected {
+        assert_component_validity(&spec, "AiSemanticFirewallConfig", config, false);
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("ai_semantic_firewall", config).is_err(),
+            "runtime should reject schema-invalid config: {config}"
+        );
+    }
+
+    // Cross-field numeric comparisons and id uniqueness are NOT expressible in
+    // standard JSON Schema. The component describes them; the constructor is
+    // the only gate. Keep this list in sync with that description.
+    let constructor_only = [
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {
+                "window": "tokens",
+                "tokenizer": "chars4",
+                "max_window_tokens": 2,
+                "overlap_tokens": 32
+            }
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"max_window_bytes": 64, "overlap_bytes": 128}
+        }),
+        json!({
+            "provider": provider,
+            "custom_rules": [
+                {"id": "dup", "examples": ["a"]},
+                {"id": "dup", "examples": ["b"]}
+            ]
+        }),
+    ];
+    for config in &constructor_only {
+        assert_component_validity(&spec, "AiSemanticFirewallConfig", config, true);
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("ai_semantic_firewall", config).is_err(),
+            "constructor must still reject what the schema cannot express: {config}"
+        );
+    }
+}

@@ -808,6 +808,28 @@ impl AiSemanticFirewall {
             }),
         };
         if !enabled {
+            // A disabled instance still validates every block it DOES carry, so
+            // a typo in a staged config is refused at admission rather than the
+            // moment an operator flips `enabled` to true. Only the cross-field
+            // "a policy must be active" checks below are skipped — exactly the
+            // relaxation the published schema's `enabled: false` conditional
+            // describes, so schema admission and runtime admission agree.
+            validate_extraction_paths(
+                &extraction.request_json_paths,
+                DEFAULT_REQUEST_JSON_PATHS,
+                "extraction.request_json_paths",
+            )?;
+            validate_extraction_paths(
+                &extraction.response_json_paths,
+                DEFAULT_RESPONSE_JSON_PATHS,
+                "extraction.response_json_paths",
+            )?;
+            let mut ids = HashSet::new();
+            build_builtin_rules(config, default_action, &mut ids)?;
+            parse_deny_topics(config, default_action, &mut ids)?;
+            parse_custom_rules(config, default_action, &mut ids)?;
+            parse_allow_topics(config, &mut ids)?;
+            parse_provider_config(config, http_client.backend_allow_ips())?;
             return Ok(Self {
                 instance_id,
                 enabled,
@@ -3139,14 +3161,21 @@ fn parse_provider_config(
     let Some(provider) = optional_object(config, "provider")? else {
         return Ok(None);
     };
-    let provider_type = required_non_empty_string(provider.get("type"), "provider.type")?;
-    match provider_type.as_str() {
-        "openai_compatible_embeddings" | "openai_compatible" | "openai-compatible" => {}
-        other => {
-            return Err(format!(
-                "ai_semantic_firewall: provider.type must be 'openai_compatible_embeddings', got {other:?}"
-            ));
-        }
+    // `provider.type` is a closed one-value vocabulary. Match the exact
+    // canonical spelling: the undocumented `openai_compatible` /
+    // `openai-compatible` aliases and the surrounding-whitespace tolerance were
+    // admitted by the constructor but rejected by the published enum, so a
+    // schema-validating client and `ferrum-edge validate` disagreed on the same
+    // config. Neither alias is documented anywhere, so nothing is preserved.
+    let provider_type = match provider.get("type") {
+        None => return Err("ai_semantic_firewall: provider.type is required".to_string()),
+        Some(Value::String(value)) => value.as_str(),
+        Some(_) => return Err("ai_semantic_firewall: provider.type must be a string".to_string()),
+    };
+    if provider_type != "openai_compatible_embeddings" {
+        return Err(format!(
+            "ai_semantic_firewall: provider.type must be 'openai_compatible_embeddings', got {provider_type:?}"
+        ));
     }
 
     let endpoint = required_non_empty_string(provider.get("endpoint"), "provider.endpoint")?;
