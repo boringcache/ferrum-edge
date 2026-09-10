@@ -94,6 +94,7 @@ fn ai_provider_label(value: &str) -> Option<&'static str> {
         "cohere" => Some("cohere"),
         "mistral" => Some("mistral"),
         "bedrock" | "aws_bedrock" => Some("bedrock"),
+        "tgi" => Some("tgi"),
         _ => None,
     }
 }

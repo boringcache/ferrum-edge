@@ -31351,7 +31351,10 @@ components:
         Plugin: ai_token_metrics — Extracts token usage from HTTP JSON/SSE LLM
         response bodies. Native gRPC protobuf messages are unsupported and the
         plugin is not registered for the Grpc protocol view. Unknown keys are
-        rejected.
+        rejected. SSE accounting requires explicit full-response buffering and
+        disables live delivery. Cohere counts come from usage.tokens,
+        delta.usage.tokens, or meta.tokens, not billed_units; configured cost
+        rates estimate cost from those token counts, not provider billing units.
       properties:
         provider:
           type: string
@@ -31378,17 +31381,17 @@ components:
           default: false
           description: Buffer text/event-stream responses so final SSE usage events can be parsed; disables streaming delivery for those responses
         cost_per_prompt_token:
-          type: number
+          type: [number, "null"]
           format: double
           minimum: 0
           maximum: 18446744073709.55
-          description: Calculate estimated cost per request from prompt tokens; maximum 18446744073709.55
+          description: Calculate estimated cost per request from prompt tokens; range 0 through 18446744073709.55. Omitted or null disables this rate.
         cost_per_completion_token:
-          type: number
+          type: [number, "null"]
           format: double
           minimum: 0
           maximum: 18446744073709.55
-          description: Calculate estimated cost per request from completion tokens; maximum 18446744073709.55
+          description: Calculate estimated cost per request from completion tokens; range 0 through 18446744073709.55. Omitted or null disables this rate.
 
     AiRequestGuardConfig:
       type: object
@@ -31747,7 +31750,7 @@ components:
           type: string
           enum: [auto, chat_completions, text_completions]
           default: auto
-          description: "Request-family gate. 'auto' requires a body shape matching the standard endpoint path suffix (/chat/completions or /completions). A fixed family is an explicit opt-in for compatible custom endpoint paths and still rejects malformed, provider-native, or ambiguous body shapes."
+          description: "Request-family gate. 'auto' requires a body shape matching the standard endpoint path suffix (/chat/completions or /completions). A fixed family is an explicit opt-in for compatible custom endpoint paths; malformed, provider-native, or ambiguous body shapes pass through unchanged. Fixed 'text_completions' requires 'user' in compress_roles (after trimming and case normalization)."
 
     AiResponseGuardConfig:
       type: object

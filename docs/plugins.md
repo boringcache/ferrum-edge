@@ -7304,16 +7304,18 @@ Extracts token usage from LLM HTTP JSON response bodies and writes it to request
 | `include_token_details` | Boolean | `true` | Extract prompt/completion tokens separately |
 | `metadata_prefix` | String | `"ai"` | Prefix for metadata keys (1–64 ASCII letters, digits, `.`, `_`, or `-`) |
 | `buffer_streaming_responses` | Boolean | `false` | Buffer `text/event-stream` responses so final SSE usage events can be parsed; this disables streaming delivery for those responses |
-| `cost_per_prompt_token` | Float | *(none)* | Calculate estimated cost per request (maximum `18446744073709.55`) |
-| `cost_per_completion_token` | Float | *(none)* | Calculate estimated cost per request (maximum `18446744073709.55`) |
+| `cost_per_prompt_token` | Number or null | *(none)* | Prompt-token cost rate, from `0` through `18446744073709.55`; omission or `null` disables this rate |
+| `cost_per_completion_token` | Number or null | *(none)* | Completion-token cost rate, from `0` through `18446744073709.55`; omission or `null` disables this rate |
 
-**Note**: Requires response body buffering for JSON responses. `text/event-stream` responses are not buffered by default so LLM streaming remains live; set `buffer_streaming_responses: true` only when buffered SSE token metrics are more important than streaming delivery.
+**Note**: Requires response body buffering for JSON responses. `text/event-stream` responses are not buffered by default so LLM streaming remains live, including on retry-enabled routes without an `Accept` header: origin SSE headers release this plugin's buffering requirement. Other active body plugins or an explicitly buffered route may still require collection. Set `buffer_streaming_responses: true` only when buffered SSE token metrics are more important than streaming delivery; usage is extracted after the full response is collected.
 
 `provider` must use one exact lowercase enum value: `auto`, `openai`, `anthropic`, `google`, `cohere`, `mistral`, `bedrock`, or `tgi` (Hugging Face TGI native `/generate` shapes, whose counter is `details.generated_tokens`). Surrounding whitespace and alternate casing are rejected. Every unknown root configuration key is rejected at startup with the allowed-key list, so misspellings cannot silently change accounting or cost behavior.
 
 **Status filtering**: Only 2xx responses are inspected for token usage. Error responses (4xx, 5xx) are typically not LLM-shaped JSON and would otherwise pollute token metrics and chargeback accounting.
 
-**Provider and streaming support:** OpenAI Chat Completions and the Responses API (`input_tokens`/`output_tokens`, including `response.completed`) are supported. Anthropic `message_start` and `message_delta` usage is merged without losing an earlier input count. Gemini/Vertex `usageMetadata`, Cohere billed units, Bedrock Converse usage, and Amazon Titan InvokeModel `inputTextTokenCount` plus a single `results[].tokenCount` are supported. AWS binary event-stream frames are not parsed. When `buffer_streaming_responses: true`, cumulative and partial SSE snapshots are merged field-by-field; repeated cumulative terminal events replace their fields instead of being summed, and `response.incomplete`/`response.failed` events are not treated as authoritative usage. Malformed, non-integer, ambiguous, or overflowing usage is ignored rather than saturated or invented. Model name is extracted from the first parseable event. Sets `{prefix}_streaming: true` metadata when processing an SSE response.
+**Provider and streaming support:** OpenAI Chat Completions and the Responses API (`input_tokens`/`output_tokens`, including `response.completed`) are supported. Anthropic `message_start` and `message_delta` usage is merged without losing an earlier input count. Gemini/Vertex `usageMetadata`, Cohere token counts, Bedrock Converse usage, and Amazon Titan InvokeModel `inputTextTokenCount` plus a single `results[].tokenCount` are supported. TGI native JSON and terminal SSE use `details.generated_tokens`; prompt counts are available only with a non-empty `details.prefill` array, and missing prompt counts are not invented. AWS binary event-stream frames are not parsed. When `buffer_streaming_responses: true`, SSE events join multiple `data:` fields with newlines and accept LF, CRLF, or CR line endings; a blank line dispatches each event, and an unterminated final event is ignored. Cumulative and partial snapshots are merged field-by-field; repeated cumulative terminal events replace their fields instead of being summed, and `response.incomplete`/`response.failed` events are not treated as authoritative usage. Malformed, non-integer, ambiguous, or overflowing usage is ignored rather than saturated or invented. Model name is extracted from the first parseable event. Sets `{prefix}_streaming: true` metadata when processing an SSE response.
+
+**Cohere accounting:** Counts come from `usage.tokens` (v2 JSON), `delta.usage.tokens` (v2 terminal SSE), or `meta.tokens` (v1), in that precedence order. Separate `billed_units` objects are not used; a billed-units-only response contributes no usage. Estimated cost multiplies the extracted token counts by the configured rates and does not represent provider billable-unit accounting.
 
 **Origin content encodings:** JSON and opted-in SSE inspection supports case-insensitive `gzip` and `br`, including correctly ordered coding chains. Inspection is bounded to four codings, 4 MiB for every decoded layer, and 8 MiB cumulative decoded work across the chain. Parameterized, unsupported, malformed, truncated, trailing/concatenated, or oversized encodings are skipped safely. Decoding is inspection-only: the original encoded response bytes and headers remain exactly client-visible.
 
@@ -7587,7 +7589,7 @@ config:
 
 ### `ai_prompt_compressor`
 
-Shortens prompt text to cut LLM token usage, cost, and latency using a model-free statistical (extractive) filter — no external models, services, or new dependencies. It rewrites `messages[].content` (for the configured roles) and the legacy top-level `prompt` in OpenAI-shaped chat/completions bodies, replacing long content strings with shorter versions.
+Shortens prompt text to cut LLM token usage, cost, and latency using a model-free statistical (extractive) filter — no external models, services, or new dependencies. It rewrites `messages[].content` (for the configured roles) and the legacy top-level `prompt` in admitted OpenAI Chat/Text Completions bodies, replacing long content strings with shorter versions. The default `request_family: auto` requires the body shape to match a standard operation-path suffix (`/chat/completions` or `/completions`); a fixed family explicitly opts a compatible custom endpoint into compression. Shape validation still applies, and malformed, provider-native, or ambiguous bodies pass through unchanged.
 
 Request buffering is only enabled for matching JSON `POST` requests without a non-`identity` `Content-Encoding`.
 
@@ -7595,11 +7597,12 @@ Request buffering is only enabled for matching JSON `POST` requests without a no
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `compress_roles` | String[] | `["user"]` | Message roles whose `content` is compressed (case-insensitive; non-empty). When it includes `user`, the legacy top-level `prompt` is compressed too. |
+| `compress_roles` | String[] | `["user"]` | Message roles whose `content` is compressed (trimmed and case-insensitive; non-empty array with no blank entries). When it includes `user`, the legacy top-level `prompt` is compressed too. |
 | `target_ratio` | Number | `0.5` | Fraction of word-tokens to keep. `0.5` ≈ 50% reduction; `0.3` is more aggressive. Strictly between 0 and 1. |
-| `min_content_tokens` | Integer | `200` | Estimated-token floor per content string; shorter content is passed through unchanged. |
-| `max_scan_bytes` | Integer | `1048576` | Skip statistical compression when the request body exceeds this size; configured marker sanitation remains active through the hard 1 MiB body/output bound. |
-| `preserve_tag` | String | _(unset)_ | Optional marker name; text in `<TAG>…</TAG>` string values is kept verbatim and the markers are stripped. Object member names are never sanitized. At most 64 ASCII letters, digits, `-`, `_`. |
+| `min_content_tokens` | Integer | `200` | Estimated-token floor per content string, from `0` through `131072`; shorter content is passed through unchanged. |
+| `max_scan_bytes` | Integer | `1048576` | From `1` through `1048576` bytes. Skip statistical compression when the request body exceeds this size; configured marker sanitation remains active through the hard 1 MiB body/output bound. |
+| `preserve_tag` | String | _(unset)_ | Optional marker name; text in `<TAG>…</TAG>` string values is kept verbatim and the markers are stripped. Object member names are never sanitized. Name must be 1–64 ASCII letters, digits, `-`, `_`. |
+| `request_family` | String | `"auto"` | `auto`, `chat_completions`, or `text_completions`. Fixed families opt compatible custom endpoint paths into compression; fixed `text_completions` requires `user` in `compress_roles` after trimming and case normalization. |
 
 The filter scores each word by stop-word membership, length, in-document rarity, and a proper-noun signal, then drops the lowest-scoring words until `target_ratio` is met. Fenced code blocks, inline code, URLs, numbers, `snake_case`/identifier tokens, uppercase acronyms, and negations (`not`, `never`, `cannot`, …) are always preserved. Token counts are estimated (~4 characters per token); no model tokenizer is embedded.
 
