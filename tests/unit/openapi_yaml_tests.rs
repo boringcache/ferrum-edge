@@ -8776,9 +8776,8 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
         }),
     ] {
         assert_component_validity(&spec, "TransactionDebuggerConfig", &valid, true);
-        TransactionDebugger::new(&valid).unwrap_or_else(|error| {
-            panic!("schema-valid config {valid} failed runtime: {error}")
-        });
+        TransactionDebugger::new(&valid)
+            .unwrap_or_else(|error| panic!("schema-valid config {valid} failed runtime: {error}"));
     }
     // Named-schema existence is config-graph validation, not this component.
     assert_component_validity(
