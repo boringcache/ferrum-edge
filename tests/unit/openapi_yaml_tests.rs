@@ -485,7 +485,8 @@ fn api_chargeback_sink_schema_matches_constructor_admission() {
         .iter()
         .map(|field| field.as_str().expect("field name"))
         .collect();
-    let runtime_fields: BTreeSet<&str> = CHARGE_EVENT_FIELDS.iter().map(|field| field.name).collect();
+    let runtime_fields: BTreeSet<&str> =
+        CHARGE_EVENT_FIELDS.iter().map(|field| field.name).collect();
     assert_eq!(documented_fields, runtime_fields);
     for field in runtime_fields {
         for projection in [
