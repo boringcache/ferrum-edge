@@ -336,7 +336,12 @@ async fn secondary_loopback_address() -> Option<Ipv4Addr> {
 }
 
 /// `(healthy, failing, failing_ip, shared_port)`.
-type DualLoopbackListeners = (tokio::net::TcpListener, tokio::net::TcpListener, Ipv4Addr, u16);
+type DualLoopbackListeners = (
+    tokio::net::TcpListener,
+    tokio::net::TcpListener,
+    Ipv4Addr,
+    u16,
+);
 
 /// Two listeners sharing one port on two distinct IPv4 loopback addresses, or
 /// `None` when this host assigns only `127.0.0.1`.
