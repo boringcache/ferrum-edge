@@ -9972,7 +9972,10 @@ fn response_mock_schema_matches_strict_runtime_contract() {
         rule["properties"]["headers"]["additionalProperties"]["type"],
         "string"
     );
-    assert_eq!(rule["properties"]["body"]["type"], json!(["string", "null"]));
+    assert_eq!(
+        rule["properties"]["body"]["type"],
+        json!(["string", "null"])
+    );
     assert_eq!(
         rule["properties"]["delay_ms"]["type"],
         json!(["integer", "null"])
