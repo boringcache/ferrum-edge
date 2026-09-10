@@ -29504,21 +29504,54 @@ components:
         order and reload generations. Unknown root, semantic-policy, and Redis
         sync keys are rejected at admission with path-qualified diagnostics
         (registration policy KeepLastKnownGood). There are no intentionally
-        open maps.
+        open maps. All numeric retention/time bounds must be positive. The
+        constructor additionally enforces max_entry_size_bytes <=
+        max_total_size_bytes (including omitted defaults), the 32 UTF-8 byte
+        redis_integrity_key minimum, platform-sized integer limits, URL parsing,
+        and the deployment backend egress policy. These residual checks are not
+        fully expressible in this schema. Provider-managed Responses conversations
+        and Gemini retained contexts bypass replay; other unmodeled root context
+        is canonically bound to exact and semantic identities. Cohere SYSTEM
+        history is retained as exact instruction state in semantic scopes.
+        Cache hits preserve finalized application bodies while current response
+        enforcement, live header rules, and negotiated compression still run.
+      allOf:
+        - if:
+            required: [semantic_similarity_enabled]
+            properties:
+              semantic_similarity_enabled:
+                const: true
+          then:
+            required: [semantic_embedding_endpoint]
+            properties:
+              semantic_embedding_endpoint:
+                pattern: '^[hH][tT][tT][pP][sS]?://[^/?#@\s]+(?:[/?#][\s\S]*)?(?![\s\S])'
+        - if:
+            required: [sync_mode]
+            properties:
+              sync_mode:
+                pattern: '^[rR][eE][dD][iI][sS](?![\s\S])'
+          then:
+            required: [redis_url, redis_integrity_key]
       properties:
         ttl_seconds:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 18446744073709551615
           default: 300
           description: Time-to-live for cached entries in seconds
         max_entries:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 18446744073709551615
           default: 10000
           description: Maximum number of cached entries (local mode). In semantic mode, HNSW snapshot memory scales with this count and is charged against max_total_size_bytes.
         max_entry_size_bytes:
           type: integer
           format: uint64
+          minimum: 1
           default: 1048576
           maximum: 16777216
           description: >-
@@ -29528,6 +29561,7 @@ components:
         max_total_size_bytes:
           type: integer
           format: uint64
+          minimum: 1
           default: 104857600
           maximum: 1073741824
           description: >-
@@ -29552,47 +29586,56 @@ components:
           default: true
           description: Additionally include the authenticated consumer's display identity in the cache key. Caller isolation no longer depends on this flag — every exact and semantic key binds a mandatory caller-authorization partition (authentication mechanism, resolved identity/consumer, peer SPIFFE identity, and SHA-256 digests of every credential header presented), so two credentials resolving to one display subject with different scopes can never share a retained completion. Setting `false` no longer lets distinct callers share entries.
         anonymous_caller_scope:
-          type: [string, "null"]
-          enum: ["caller_address", "shared", null]
+          type: string
+          pattern: '^[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*(?:[cC][aA][lL][lL][eE][rR]_[aA][dD][dD][rR][eE][sS][sS]|[cC][aA][lL][lL][eE][rR]-[aA][dD][dD][rR][eE][sS][sS]|[sS][hH][aA][rR][eE][dD])[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*(?![\s\S])'
           default: "caller_address"
           description: "How anonymous callers (no gateway identity, no credential header, no peer SPIFFE identity) are partitioned. caller_address (default) binds the gateway-resolved canonical peer address, which the origin observes through Ferrum's regenerated X-Forwarded-For; a request whose canonical address cannot be parsed is refused rather than keyed incompletely. shared is an explicit operator attestation that the origin does not vary its result by caller address on this route — only set it when that is known-safe, because it re-opens cross-caller replay for address-sensitive origins. It applies to anonymous callers only: an authenticated caller always binds its canonical peer address, because the backend receives Ferrum's regenerated forwarding identity for that caller too and may vary policy or content by it."
         cache_multimodal:
           type: string
-          enum: [reject, exact_only, exact-only, include_fingerprints, include-fingerprints]
+          pattern: '^[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*(?:[rR][eE][jJ][eE][cC][tT]|[eE][xX][aA][cC][tT]_[oO][nN][lL][yY]|[eE][xX][aA][cC][tT]-[oO][nN][lL][yY]|[iI][nN][cC][lL][uU][dD][eE]_[fF][iI][nN][gG][eE][rR][pP][rR][iI][nN][tT][sS]|[iI][nN][cC][lL][uU][dD][eE]-[fF][iI][nN][gG][eE][rR][pP][rR][iI][nN][tT][sS])[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*(?![\s\S])'
           default: exact_only
-          description: Multimodal request caching mode for non-text content parts. `reject` bypasses cache lookup/store, `exact_only` uses hashed fingerprints for exact matches and disables semantic hits, and `include_fingerprints` also includes those fingerprints in semantic scope keys. The runtime parser trims surrounding whitespace and is case-insensitive (e.g. `"Reject"`, `" exact_only "` are accepted), and `_`/`-` aliases are interchangeable; admin-API config validation runs through this lenient parser, not the schema `enum`. The `enum` lists only canonical/alias forms because JSON Schema cannot express case-insensitivity — strict schema validators may reject mixed-case or padded inputs the gateway itself accepts.
+          description: Multimodal request caching mode for non-text content parts. `reject` bypasses cache lookup/store, `exact_only` uses hashed fingerprints for exact matches and disables semantic hits, and `include_fingerprints` also includes those fingerprints in semantic scope keys. The parser and schema accept surrounding whitespace, ASCII case variants, and the listed underscore/hyphen aliases.
         semantic_similarity_enabled:
           type: boolean
           default: false
           description: Enable embedding-based semantic lookup after exact Redis/local misses. Exact matching remains active when this is disabled or enabled.
         semantic_embedding_provider:
           type: string
-          enum: [openai, openai_compatible, openai-compatible, azure, azure_openai, azure-openai, mistral, voyage, voyageai, voyage_ai, anthropic, claude, cohere, google, google_gemini, google-gemini, gemini, google_vertex, google-vertex, vertex, vertex_ai, vertex-ai, bedrock_titan, bedrock-titan, amazon_titan, amazon-titan, bedrock_cohere, bedrock-cohere, cohere_bedrock, cohere-bedrock]
+          pattern: '^[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*(?:[oO][pP][eE][nN][aA][iI]|[oO][pP][eE][nN][aA][iI]_[cC][oO][mM][pP][aA][tT][iI][bB][lL][eE]|[oO][pP][eE][nN][aA][iI]-[cC][oO][mM][pP][aA][tT][iI][bB][lL][eE]|[aA][zZ][uU][rR][eE]|[aA][zZ][uU][rR][eE]_[oO][pP][eE][nN][aA][iI]|[aA][zZ][uU][rR][eE]-[oO][pP][eE][nN][aA][iI]|[mM][iI][sS][tT][rR][aA][lL]|[vV][oO][yY][aA][gG][eE]|[vV][oO][yY][aA][gG][eE][aA][iI]|[vV][oO][yY][aA][gG][eE]_[aA][iI]|[aA][nN][tT][hH][rR][oO][pP][iI][cC]|[cC][lL][aA][uU][dD][eE]|[cC][oO][hH][eE][rR][eE]|[gG][oO][oO][gG][lL][eE]|[gG][oO][oO][gG][lL][eE]_[gG][eE][mM][iI][nN][iI]|[gG][oO][oO][gG][lL][eE]-[gG][eE][mM][iI][nN][iI]|[gG][eE][mM][iI][nN][iI]|[gG][oO][oO][gG][lL][eE]_[vV][eE][rR][tT][eE][xX]|[gG][oO][oO][gG][lL][eE]-[vV][eE][rR][tT][eE][xX]|[vV][eE][rR][tT][eE][xX]|[vV][eE][rR][tT][eE][xX]_[aA][iI]|[vV][eE][rR][tT][eE][xX]-[aA][iI]|[bB][eE][dD][rR][oO][cC][kK]_[tT][iI][tT][aA][nN]|[bB][eE][dD][rR][oO][cC][kK]-[tT][iI][tT][aA][nN]|[aA][mM][aA][zZ][oO][nN]_[tT][iI][tT][aA][nN]|[aA][mM][aA][zZ][oO][nN]-[tT][iI][tT][aA][nN]|[bB][eE][dD][rR][oO][cC][kK]_[cC][oO][hH][eE][rR][eE]|[bB][eE][dD][rR][oO][cC][kK]-[cC][oO][hH][eE][rR][eE]|[cC][oO][hH][eE][rR][eE]_[bB][eE][dD][rR][oO][cC][kK]|[cC][oO][hH][eE][rR][eE]-[bB][eE][dD][rR][oO][cC][kK])[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*(?![\s\S])'
           default: openai
-          description: Embedding provider request/response format. Compatibility aliases mirror the plugin parser; anthropic and claude are aliases for Voyage-compatible embeddings because Claude does not expose a native embedding model.
+          description: Embedding provider request/response format. Values are trimmed and ASCII case-insensitive. Aliases include openai_compatible/openai-compatible, azure/azure-openai, voyageai/voyage_ai/anthropic/claude, google/gemini/google-gemini, vertex/vertex_ai/vertex-ai/google-vertex, amazon_titan/amazon-titan/bedrock-titan, and cohere_bedrock/cohere-bedrock/bedrock-cohere; anthropic and claude are aliases for Voyage-compatible embeddings because Claude does not expose a native embedding model.
         semantic_embedding_endpoint:
           type: string
-          format: uri
-          description: Embedding endpoint URL. Required when semantic_similarity_enabled is true. Must not include URL userinfo; use semantic_embedding_api_key for credentials. Query parameters and path tokens required by signed or credential-bearing endpoints are preserved on the outbound request but stripped from logs and error diagnostics (canonical redacted form uses scheme/host/port plus /...). OpenAI-compatible endpoints use input/model JSON; other providers send native embedding JSON.
+          pattern: '[^\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]'
+          description: Nonblank embedding endpoint. Required and validated as an HTTP(S) URL when semantic_similarity_enabled is true; disabled semantic mode only checks that the supplied string is nonblank. Must not include URL userinfo; use semantic_embedding_api_key for credentials. Query parameters and path tokens required by signed or credential-bearing endpoints are preserved on the outbound request but stripped from logs and error diagnostics (canonical redacted form uses scheme/host/port plus /...). OpenAI-compatible endpoints use input/model JSON; other providers send native embedding JSON.
         semantic_embedding_model:
           type: string
+          pattern: '[^\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]'
           description: Model name sent in the embedding request body. Omit for local endpoints that do not require a model field.
         semantic_embedding_input_type:
           type: string
+          pattern: '[^\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]'
           description: Provider-specific input or task type, such as query/document for Voyage, search_query/search_document for Cohere, SEMANTIC_SIMILARITY for Gemini, or Vertex task_type.
         semantic_embedding_output_dimension:
           type: integer
           format: uint64
-          description: Provider-specific reduced embedding dimension when supported.
+          minimum: 1
+          maximum: 16384
+          description: Provider-specific reduced embedding dimension from 1 to 16384 when supported. Mistral uses output_dimension; OpenAI and Azure OpenAI use dimensions.
         semantic_embedding_api_key:
           type: string
+          pattern: '[^\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]'
           format: password
-          description: API key for the embedding endpoint. Sent in semantic_embedding_auth_header with semantic_embedding_auth_scheme when configured.
+          allOf:
+            - pattern: '^[^\u0000-\u0008\u000a-\u001f\u007f]*(?![\s\S])'
+          description: Nonblank API key; the final header value is validated at admission and retained as sensitive. Invalid header characters in the key or scheme are rejected without echoing values. Sent in semantic_embedding_auth_header with semantic_embedding_auth_scheme when configured.
         semantic_embedding_auth_header:
           type: string
+          pattern: '^[!#$%&''*+.^_`|~0-9A-Za-z-]+(?![\s\S])'
           description: HTTP header used for semantic_embedding_api_key. Defaults to Authorization, except Azure OpenAI uses api-key and Google Gemini uses x-goog-api-key.
         semantic_embedding_auth_scheme:
           type: string
+          pattern: '^[^\u0000-\u0008\u000a-\u001f\u007f]*(?![\s\S])'
           description: Prefix for the API key header value. Defaults to Bearer, except Azure OpenAI and Google Gemini send the raw key. Set to an empty string to send the raw key.
         semantic_similarity_threshold:
           type: number
@@ -29615,20 +29658,26 @@ components:
         semantic_embedding_timeout_ms:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 18446744073709551615
           default: 5000
           description: Per-request timeout for embedding calls in milliseconds. Embedding failures fall back to a normal exact-cache miss.
         sync_mode:
           type: string
-          enum: [local, redis]
+          pattern: '^(?:[lL][oO][cC][aA][lL]|[rR][eE][dD][iI][sS])(?![\s\S])'
           default: local
-          description: "Storage backend: 'local' (in-memory DashMap) or 'redis' (centralized Redis)"
+          description: "Storage backend: local or redis, ASCII case-insensitive without whitespace trimming. Redis requires redis_url and redis_integrity_key."
         redis_url:
           type: string
           minLength: 1
-          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
+          pattern: '^[rR][eE][dD][iI][sS][sS]?://[^/?#\s]+(?:/+(?:(?:\+?0*(?:[0-9]{1,9}|[0-1][0-9]{9}|20[0-9]{8}|21[0-3][0-9]{7}|214[0-6][0-9]{6}|2147[0-3][0-9]{5}|21474[0-7][0-9]{4}|214748[0-2][0-9]{3}|2147483[0-5][0-9]{2}|21474836[0-3][0-9]|214748364[0-6]|2147483647)|-0+))?/*)?(?:\?[^\s#]*)?(?![\s\S])'
           description: >-
             Redis connection URL (required when sync_mode is redis). Must not
-            carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY.
+            carry a URL fragment. The database path selects an integer from 0 to
+            2147483647; surrounding slashes, leading zeros, a leading plus, and
+            negative zero match the shared parser. URL port validity and server
+            database availability remain constructor/server checks. TLS skip-verify
+            is only FERRUM_TLS_NO_VERIFY.
             URL-embedded userinfo is accepted but never disclosed:
             connection/health-check logs and non-admin/audit projections keep
             only the scheme, host, port, and database, replace the userinfo, and
@@ -29639,6 +29688,7 @@ components:
           description: Enable TLS for Redis connection
         redis_key_prefix:
           type: string
+          minLength: 1
           description: >-
             Redis key namespace prefix. When omitted, the runtime derives
             `{FERRUM_NAMESPACE}:ai_cache` (for example `ferrum:ai_cache` when
@@ -29654,11 +29704,15 @@ components:
         redis_connect_timeout_seconds:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 18446744073709551615
           default: 5
           description: Redis connection timeout in seconds
         redis_health_check_interval_seconds:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 18446744073709551615
           default: 5
           description: Interval for background health check pings when Redis is unavailable
         redis_username:
@@ -29669,11 +29723,11 @@ components:
           description: Redis password
         redis_integrity_key:
           type: string
-          minLength: 32
           description: >-
             Narrowly scoped HMAC-SHA256 secret that authenticates Redis cache
             envelopes. Required when sync_mode is redis (fail closed if omitted).
-            Minimum 32 bytes. Bound to the full status/header/body envelope and
+            Minimum 32 UTF-8 bytes, checked by the constructor (JSON Schema string
+            length counts characters). Bound to the full status/header/body envelope and
             the Redis namespace/key context. Compared in constant time; never
             logged, and replaced by [REDACTED] in admin audit diffs and in
             viewer/operator plugin-config reads (full admin reads stay raw so

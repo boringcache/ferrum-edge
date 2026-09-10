@@ -23706,6 +23706,13 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     response_headers: &mut HashMap<String, String>,
     response_body: &mut Bytes,
 ) -> Option<FinalSyntheticBodyPolicyWitness> {
+    // Semantic-cache entries retain the finalized application body with only
+    // transport encoding removed. Body inspection must see replay provenance
+    // so mandatory policy rewrites still run, while ordinary rewrites do not.
+    // Restore it before live header rules and the late compression phase.
+    let previous_finalized_response_replay = ctx.finalized_response_replay;
+    ctx.finalized_response_replay |= ctx.semantic_cache_response_replay;
+
     // Mark the context for the duration of this body-hook phase so that storing
     // plugins (e.g. `request_deduplication`) can tell this body is a synthetic
     // plugin short-circuit and skip caching/replaying it. Saved/restored so a
@@ -24039,6 +24046,8 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     } else {
         ctx.metadata.remove(SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
     }
+
+    ctx.finalized_response_replay = previous_finalized_response_replay;
 
     // A gateway-authored terminal — a capacity refusal, a body rejection, a
     // failed mandatory replay redaction — is already the answer, and must never
