@@ -88,12 +88,12 @@ fn test_constructor_rejects_invalid_header_name_chars() {
 
 #[test]
 fn test_constructor_trims_rust_unicode_whitespace_but_not_bom() {
-    let nel = format!("\u{0085}X-Audit\u{0085}");
+    let nel = "\u{0085}X-Audit\u{0085}".to_string();
     let plugin = CorrelationId::new(&json!({ "header_name": nel }))
         .expect("U+0085 is Rust White_Space and must be trimmed");
     assert_eq!(plugin.correlation_id_header_name(), Some("x-audit"));
 
-    let bom = format!("\u{feff}x-audit\u{feff}");
+    let bom = "\u{feff}x-audit\u{feff}".to_string();
     let err = CorrelationId::new(&json!({ "header_name": bom }))
         .err()
         .expect("U+FEFF is not Rust White_Space and must not be trimmed");
