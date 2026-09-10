@@ -3939,7 +3939,8 @@ impl<S: FrameSource> Coalescing<S> {
         if data.is_empty() {
             return;
         }
-        self.buffer.push(data, self.buffer_capacity, &mut self.spare);
+        self.buffer
+            .push(data, self.buffer_capacity, &mut self.spare);
         if self.flush_after.is_some() && !self.flush_timer_armed {
             self.arm_flush_timer();
         }
