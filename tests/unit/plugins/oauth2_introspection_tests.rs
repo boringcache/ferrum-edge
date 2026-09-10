@@ -19,7 +19,8 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::plugin_utils::{
-    assert_continue, assert_reject_body, context_with_materialized_raw_header, create_test_consumer,
+    assert_continue, assert_no_effective_credential_deadline, assert_reject_body,
+    context_with_materialized_raw_header, create_test_consumer,
 };
 
 struct InvalidSecondaryAuth;
@@ -368,10 +369,14 @@ async fn active_token_sets_authenticated_identity_when_no_consumer_match() {
 }
 
 #[tokio::test]
-async fn active_token_with_a_far_future_exp_publishes_no_credential_deadline() {
-    // Issue #5420: an introspection `exp` further out than a monotonic
+async fn active_token_with_a_far_future_exp_is_admitted_without_an_effective_deadline() {
+    // Issue #5420: an introspection `exp` beyond what this platform's monotonic
     // `Instant` can express describes a valid long-lived grant. It must admit
-    // with NO bound rather than with one that has already elapsed.
+    // with NO bound rather than with one that has already elapsed. On a
+    // `timespec`-backed clock the same `exp` stays representable and publishes
+    // an astronomically distant bound instead; both are admissions, and the
+    // conversion's unbounded branch itself is proven at an injected clock in
+    // `auth_flow_credential_deadline_tests`.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/introspect"))
@@ -392,12 +397,7 @@ async fn active_token_with_a_far_future_exp_publishes_no_credential_deadline() {
 
     assert_continue(result);
     assert_eq!(ctx.authenticated_identity.as_deref(), Some("external-user"));
-    assert_eq!(
-        request_credential_deadline_at(&ctx),
-        None,
-        "a far-future introspection `exp` must publish no monotonic bound \
-         rather than one that already elapsed"
-    );
+    assert_no_effective_credential_deadline(&ctx);
 }
 
 #[tokio::test]

@@ -10,8 +10,15 @@
 //!
 //! Where the monotonic clock runs out is platform dependent by construction, so
 //! the boundary cases are driven through the `_test_support` conversion hooks
-//! with an injected `now_mono`, and the two claim-driven plugins are then
-//! exercised end to end.
+//! with an injected `now_mono` anchored at the platform maximum — that is the
+//! only way to reach the unbounded branch deterministically on a
+//! `timespec`-backed `Instant`, which holds `i64` seconds and therefore
+//! represents even an `i64::MAX` expiry.
+//!
+//! The two claim-driven plugins are then exercised end to end against the
+//! property that actually matters and holds on either clock: the far-future
+//! credential is ADMITTED, with either no deadline or one far beyond any real
+//! session, never one that already elapsed.
 
 use ferrum_edge::_test_support::{
     credential_deadline_from_claims_at_for_test, credential_deadline_from_unix_seconds_at_for_test,
@@ -23,7 +30,9 @@ use serde_json::json;
 use std::time::Duration;
 
 use super::jwks_auth_support::{build_rsa_jwks_from_pem, create_rs256_token_exact, default_client};
-use super::plugin_utils::{assert_continue, create_test_consumer};
+use super::plugin_utils::{
+    assert_continue, assert_no_effective_credential_deadline, create_test_consumer,
+};
 
 fn make_ctx() -> RequestContext {
     RequestContext::new(
@@ -86,17 +95,25 @@ fn a_representable_expiry_keeps_its_exact_bound() {
 fn an_expiry_beyond_the_representable_range_publishes_no_deadline() {
     // Issue #5420: this is the case that used to arrive as `now`, i.e. as an
     // already-expired credential the JWT layer had just validated as live.
+    //
+    // WHICH far-future expiry outruns the clock is platform dependent, so the
+    // two reasons are separated. `exp + leeway` overflowing is pure `i64`
+    // arithmetic and holds everywhere; the monotonic range running out is
+    // anchored at the platform maximum so it holds everywhere too, rather than
+    // only on a clock narrow enough to saturate on its own.
     let now = tokio::time::Instant::now();
-    assert_eq!(
-        credential_deadline_from_unix_seconds_at_for_test(i64::MAX, 0, 1_000, now),
-        None,
-        "an expiry that outruns the monotonic clock is a long-lived credential, \
-         not an expired one"
-    );
     assert_eq!(
         credential_deadline_from_unix_seconds_at_for_test(i64::MAX, 1, 1_000, now),
         None,
         "an overflowing expiry+leeway is far future, not an unusable interval"
+    );
+
+    let anchored = largest_representable_instant(now);
+    assert_eq!(
+        credential_deadline_from_unix_seconds_at_for_test(i64::MAX, 0, 1_000, anchored),
+        None,
+        "an expiry that outruns the monotonic clock is a long-lived credential, \
+         not an expired one"
     );
 }
 
@@ -136,11 +153,20 @@ fn an_unusable_interval_still_fails_closed() {
 #[test]
 fn a_claims_expiry_beyond_the_representable_range_publishes_no_deadline() {
     let now = tokio::time::Instant::now();
+    let anchored = largest_representable_instant(now);
+
+    // Same split as the seconds-taking conversion above: the `i64` overflow is
+    // platform independent, the exhausted monotonic range is anchored.
     let far_future = json!({"sub": "alice", "exp": i64::MAX});
     assert_eq!(
-        credential_deadline_from_claims_at_for_test(&far_future, 0, 1_000, now),
+        credential_deadline_from_claims_at_for_test(&far_future, 1, 1_000, now),
         None,
         "the claim-driven conversion must admit without a bound too"
+    );
+    assert_eq!(
+        credential_deadline_from_claims_at_for_test(&far_future, 0, 1_000, anchored),
+        None,
+        "a claim expiry that outruns the monotonic clock publishes no bound"
     );
 
     let representable = json!({"sub": "alice", "exp": 1_060});
@@ -148,12 +174,10 @@ fn a_claims_expiry_beyond_the_representable_range_publishes_no_deadline() {
         credential_deadline_from_claims_at_for_test(&representable, 0, 1_000, now),
         Some(now + Duration::from_secs(60))
     );
-
-    let anchored = largest_representable_instant(now);
     assert_eq!(
         credential_deadline_from_claims_at_for_test(&representable, 0, 1_000, anchored),
         None,
-        "a claim expiry the clock cannot express publishes no bound"
+        "an ordinary claim expiry the clock cannot express publishes no bound either"
     );
 }
 
@@ -176,7 +200,7 @@ fn claims_without_a_usable_numeric_expiry_publish_no_deadline() {
 }
 
 #[tokio::test]
-async fn jwt_auth_admits_a_far_future_exp_without_a_credential_deadline() {
+async fn jwt_auth_admits_a_far_future_exp_without_an_effective_deadline() {
     let plugin = JwtAuth::new(&json!({})).expect("default jwt_auth config");
     let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
     let token = create_hs256_token(
@@ -190,12 +214,7 @@ async fn jwt_auth_admits_a_far_future_exp_without_a_credential_deadline() {
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_continue(result);
     assert!(ctx.identified_consumer.is_some() || ctx.authenticated_identity.is_some());
-    assert_eq!(
-        request_credential_deadline_at(&ctx),
-        None,
-        "a validated far-future `exp` must publish no monotonic bound rather \
-         than one that already elapsed"
-    );
+    assert_no_effective_credential_deadline(&ctx);
 }
 
 #[tokio::test]
@@ -219,7 +238,7 @@ async fn jwt_auth_still_publishes_a_representable_exp_as_a_deadline() {
 }
 
 #[tokio::test]
-async fn jwks_auth_admits_a_far_future_exp_without_a_credential_deadline() {
+async fn jwks_auth_admits_a_far_future_exp_without_an_effective_deadline() {
     let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
     let inline_jwks = build_rsa_jwks_from_pem(public_key_pem).to_string();
@@ -255,12 +274,7 @@ async fn jwks_auth_admits_a_far_future_exp_without_a_credential_deadline() {
         ctx.authenticated_identity.as_deref(),
         Some("far-future-user")
     );
-    assert_eq!(
-        request_credential_deadline_at(&ctx),
-        None,
-        "a validated far-future `exp` must publish no monotonic bound rather \
-         than one that already elapsed"
-    );
+    assert_no_effective_credential_deadline(&ctx);
 }
 
 #[tokio::test]
