@@ -914,7 +914,12 @@ async fn grpc_web_accept_negotiates_h1_h2_success_and_rejection_paths() {
                 Method::POST,
                 "/grpc-accept/my.Service/Unary",
                 "application/grpc-web+json",
-                Some("text/html, Application/Grpc-Web-Text+Json; charset=utf-8; Q=0.8"),
+                // Media-range parameters ahead of `q` are part of the range
+                // (RFC 9110 §12.5.1) and Ferrum emits no parameterized
+                // representation, so this list deliberately carries only the
+                // accept-ext form: `charset=utf-8` here would describe a
+                // variant the gateway cannot produce (issue #5137).
+                Some("text/html, Application/Grpc-Web-Text+Json; Q=0.8; charset=utf-8"),
             )
             .await
             .unwrap_or_else(|error| panic!("{version:?} text-negotiated request failed: {error}"));
@@ -943,6 +948,30 @@ async fn grpc_web_accept_negotiates_h1_h2_success_and_rejection_paths() {
              (last status={last_text_status}, content-type={last_text_ct:?}, \
              vary={last_text_vary:?}, {} body bytes)",
             last_text_body_len
+        );
+
+        // Issue #5137: a `q=0` refusal aimed at a parameterized variant must
+        // not suppress the unparameterized representation the same list
+        // explicitly accepted.
+        let (status, headers, _body) = send_http_request_with_accept(
+            gateway_addr,
+            version,
+            Method::POST,
+            "/grpc-accept/my.Service/Unary",
+            "application/grpc-web+proto",
+            Some("application/grpc-web+proto;q=1, application/grpc-web+proto;version=2;q=0"),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("{version:?} parameterized-refusal request failed: {error}")
+        });
+        assert_ne!(
+            status, 406,
+            "{version:?} a parameterized refusal must not veto an accepted representation"
+        );
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("application/grpc-web+proto")
         );
 
         let text_request = BASE64.encode([0u8, 0, 0, 0, 0]);
@@ -986,7 +1015,14 @@ async fn grpc_web_accept_negotiates_h1_h2_success_and_rejection_paths() {
             last_binary_body_len
         );
 
-        for accept in ["text/html", "application/grpc-web;q=broken"] {
+        for accept in [
+            "text/html",
+            "application/grpc-web;q=broken",
+            // Issue #5137: a range that requires a media parameter applies to
+            // no representation Ferrum emits, so an Accept naming only such
+            // ranges is Not Acceptable rather than silently served.
+            "application/grpc-web+proto;version=2",
+        ] {
             let (status, headers, body) = send_http_request_with_accept(
                 gateway_addr,
                 version,

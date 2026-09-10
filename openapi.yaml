@@ -26777,7 +26777,11 @@ components:
         and native gRPC (HTTP/2) wire formats. Supports binary
         (application/grpc-web) and text (application/grpc-web-text) encoding,
         including message-format suffixes such as +proto, +json, +thrift, and
-        other valid +subtype values. Request-body decoding follows request
+        other valid +subtype values. The request message-format suffix is
+        preserved on the native backend Content-Type (application/grpc-web-text+json
+        dispatches as application/grpc+json); a bare type and +proto both
+        dispatch as the canonical bare application/grpc. Request-body decoding
+        follows request
         Content-Type; response encoding and Content-Type follow Accept
         negotiation (absent Accept defaults to the request Content-Type mode
         and suffix; lists, q-values, and */* / application/* wildcards are
@@ -26785,13 +26789,21 @@ components:
         different message-format suffix; malformed or fully refused Accept
         fails closed with HTTP 406;
         translated responses merge Vary: Accept so caches separate variants).
+        A media range carrying parameters other than q (for example
+        application/grpc-web+proto;version=2) describes a variant Ferrum does
+        not produce, so it neither selects nor refuses a response
+        representation.
         Config must be a JSON object (not null); `{}` and objects that only set
         `expose_headers` are accepted. Unknown keys are rejected. When a backend
         or intermediary response omits a valid numeric grpc-status, the response
         trailer frame synthesizes status from the official HTTP-to-gRPC client
         mapping (400→13, 401→16, 403→7, 404→12, 429/502/503/504→14, others→2);
         a valid supplied grpc-status remains authoritative. The client-visible
-        HTTP status is not rewritten to 200 on this path. The body trailer frame
+        HTTP status is not rewritten to 200 on this path. When such a non-200
+        response carries a non-gRPC entity (for example a text/plain or
+        text/html error document), that entity is dropped rather than framed:
+        the client receives a terminal-only gRPC-Web body carrying the mapped
+        status, on both the streaming and buffered paths. The body trailer frame
         preserves backend `grpc-status` / `grpc-message`, binary `*-bin`
         metadata, and valid ASCII custom trailing metadata while excluding
         hop-by-hop, forbidden, pseudo, connection-listed, and invalid
@@ -26801,14 +26813,23 @@ components:
         only.
       properties:
         expose_headers:
-          type: array
+          type: [array, "null"]
           items:
             type: string
+            minLength: 1
+            pattern: "^[ \\t]*[!#$%&'*+\\-.^_`|~0-9A-Za-z]+[ \\t]*$"
           description: >-
             Additional response headers to include in
             Access-Control-Expose-Headers for browser CORS compatibility.
             grpc-status and grpc-message are always exposed. Multiple grpc_web
-            instances union their lists in configured order.
+            instances union their lists in configured order. Explicit null is
+            accepted at this field and means the empty list (unlike the plugin
+            config object itself, where null is rejected). Each item is trimmed
+            of surrounding spaces/tabs and must then be a non-empty HTTP field
+            name (token characters only); empty, whitespace-only, and names
+            containing an internal space or a colon are rejected. Accepted names
+            are lowercased and de-duplicated in first-seen order, so entries
+            differing only in case collapse to one.
 
     GrpcDeadlineConfig:
       type: object

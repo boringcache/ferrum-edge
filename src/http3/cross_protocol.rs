@@ -5734,6 +5734,11 @@ where
         .as_deref()
         .filter(|_| crate::plugins::response_body_rewrite_allowed(streaming.status))
         .map(crate::plugins::grpc_web::is_grpc_web_text);
+    // `after_proxy` above judged the PRISTINE backend labelling. A non-gRPC
+    // HTTP error document is drained instead of being framed as gRPC-Web
+    // message bytes, so the terminal frame stays parseable at byte 0.
+    let grpc_web_suppress_backend_entity =
+        crate::plugins::grpc_web::response_entity_is_unframed_backend_error(ctx);
     if grpc_web_translation_mode.is_some() {
         // Match the shared H1/H2 boundary: policies cannot manufacture or
         // replace terminal status in initial headers. Restore only a pristine
@@ -5881,6 +5886,7 @@ where
             response_read_timeout_ms: streaming.response_read_timeout_ms,
             grpc_deadline_at: streaming.grpc_deadline_at,
             grpc_web_translation_mode,
+            grpc_web_suppress_backend_entity,
             grpc_response_messages: &ctx.grpc_response_messages_observed,
             // Authorization lifetime for this admitted stream (issue #3815),
             // captured from the accepted context before the relay borrows it
@@ -9121,6 +9127,11 @@ struct StreamHyperIncomingOpts<'a> {
     response_read_timeout_ms: u64,
     grpc_deadline_at: Option<tokio::time::Instant>,
     grpc_web_translation_mode: Option<bool>,
+    /// The backend answered with an HTTP error whose entity is not a gRPC
+    /// message stream, so those bytes are drained rather than framed as
+    /// gRPC-Web DATA. The synthesized terminal frame still carries the mapped
+    /// status; see `grpc_web::response_entity_is_unframed_backend_error`.
+    grpc_web_suppress_backend_entity: bool,
     grpc_response_messages: &'a AtomicU64,
     /// Absolute authorization lifetime for this admitted stream (issue #3815),
     /// captured once from the accepted `RequestContext` before the relay took
@@ -9162,6 +9173,7 @@ where
         response_read_timeout_ms,
         grpc_deadline_at,
         grpc_web_translation_mode,
+        grpc_web_suppress_backend_entity,
         grpc_response_messages,
         auth_deadline,
         auth_latch,
@@ -9418,6 +9430,12 @@ where
                                     body_error_class = Some(ErrorClass::ResponseBodyTooLarge);
                                     break 'outer;
                                 }
+                            }
+                            // A non-gRPC HTTP error entity is drained, never
+                            // framed as gRPC-Web message bytes: the terminal
+                            // frame carries the mapped status on its own.
+                            if grpc_web_suppress_backend_entity {
+                                continue;
                             }
                             let data_len = data.len();
                             if crate::http3::config::should_direct_send_response_chunk(
