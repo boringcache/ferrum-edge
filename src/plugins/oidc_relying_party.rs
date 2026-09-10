@@ -131,6 +131,7 @@ const SESSION_FIELDS: &[&str] = &[
     "same_site",
     "domain",
     "path",
+    "hide_session_cookie",
 ];
 const BEHAVIOR_FIELDS: &[&str] = &[
     "state_ttl_secs",
@@ -269,6 +270,11 @@ struct SessionRuntime {
     context_id: String,
     correlation_cookie_name_prefix: String,
     correlation_cookie_attrs: String,
+    /// Remove this plugin's own cookies from the `Cookie` header forwarded to
+    /// the selected backend. On by default: the sealed session cookie is a
+    /// complete, replayable gateway credential, and the upstream already
+    /// receives the verified identity and claim headers.
+    hide_session_cookie: bool,
     max_cookie_bytes: usize,
     ttl: Duration,
     idle_ttl: Duration,
@@ -1102,6 +1108,7 @@ impl OidcRelyingParty {
             context_id: session_context_id,
             correlation_cookie_name_prefix,
             correlation_cookie_attrs: build_correlation_cookie_attrs(secure, &callback_path),
+            hide_session_cookie: optional_bool(session_obj, "hide_session_cookie")?.unwrap_or(true),
             max_cookie_bytes: max_cookie_bytes as usize,
             ttl: Duration::from_secs(ttl_secs),
             idle_ttl: Duration::from_secs(idle_ttl_secs),
@@ -2412,6 +2419,59 @@ impl OidcRelyingParty {
         )
     }
 
+    /// Remove this plugin's own cookies from the backend-visible `Cookie`
+    /// header, leaving every unrelated application cookie intact.
+    ///
+    /// Encryption protects the session cookie's contents but not its replay: a
+    /// less-trusted or compromised backend that captures the sealed value can
+    /// present it to any other route governed by the same OIDC policy and be
+    /// authenticated as that user, without the encryption key and without the
+    /// user ever authenticating to it. Runs in `before_proxy`, so authentication
+    /// has already read whatever it needed from the original request.
+    fn strip_plugin_cookies(&self, headers: &mut HashMap<String, String>) {
+        let mut emptied: Vec<String> = Vec::new();
+        for (name, value) in headers.iter_mut() {
+            if !name.eq_ignore_ascii_case("cookie")
+                || !value
+                    .split(';')
+                    .any(|segment| self.owns_cookie_segment(segment))
+            {
+                continue;
+            }
+            let mut retained = String::with_capacity(value.len());
+            for segment in value.split(';') {
+                let segment = segment.trim();
+                if segment.is_empty() || self.owns_cookie_segment(segment) {
+                    continue;
+                }
+                if !retained.is_empty() {
+                    retained.push_str("; ");
+                }
+                retained.push_str(segment);
+            }
+            if retained.is_empty() {
+                emptied.push(name.clone());
+            } else {
+                *value = retained;
+            }
+        }
+        for name in emptied {
+            headers.remove(&name);
+        }
+    }
+
+    /// Whether one `Cookie` header segment names a cookie this plugin instance
+    /// owns: its gateway session cookie, or one of its sealed pending-flow
+    /// correlation cookies (whose names all share an instance-specific prefix).
+    fn owns_cookie_segment(&self, segment: &str) -> bool {
+        let segment = segment.trim();
+        let name = segment.split_once('=').map_or(segment, |(name, _)| name);
+        name == self.session.cookie_name
+            || name
+                .strip_prefix(self.session.correlation_cookie_name_prefix.as_str())
+                .is_some_and(|suffix| suffix.starts_with('_'))
+    }
+
     fn correlation_cookie_name(&self, state: &str) -> String {
         let state_hash: [u8; 32] = Sha256::digest(state.as_bytes());
         derived_cookie_name(&self.session.correlation_cookie_name_prefix, &state_hash)
@@ -2579,13 +2639,19 @@ impl super::Plugin for OidcRelyingParty {
         self.run_session_auth(ctx, consumer_index).await
     }
     fn modifies_request_headers(&self) -> bool {
-        !self.provider.claim_headers.is_empty()
+        self.session.hide_session_cookie || !self.provider.claim_headers.is_empty()
     }
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        // Every HTTP-family dispatcher — H1/H2, the H3 cross-protocol bridge,
+        // gRPC, and the WebSocket handshake — builds its backend request from
+        // the header map this phase produces, so one strip covers them all.
+        if self.session.hide_session_cookie {
+            self.strip_plugin_cookies(headers);
+        }
         apply_claim_headers_from_context(ctx, headers, &self.provider.claim_header_destinations);
         PluginResult::Continue
     }

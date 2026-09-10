@@ -3929,3 +3929,105 @@ async fn selected_discovered_optional_endpoints_stay_fail_closed() {
         );
     }
 }
+
+/// The sealed gateway session cookie is a complete, replayable credential.
+/// Encryption hides its contents from a backend but does nothing to stop that
+/// backend from presenting the captured value to any other route governed by
+/// the same OIDC policy. It must not reach the upstream at all, while unrelated
+/// application cookies are preserved untouched (GHSA-75w5-f79c-7697).
+#[tokio::test]
+async fn the_gateway_session_cookie_is_hidden_from_the_backend_by_default() {
+    let plugin = OidcRelyingParty::new(&base_config(), PluginHttpClient::default())
+        .expect("valid oidc config");
+    let challenge = issue_browser_challenge(&plugin).await;
+    let correlation_pair = cookie_pair(&challenge.cookie);
+    let sealed = oidc_sealed_session_cookie_for_test(&plugin, json!({"sub": "alice"}), false)
+        .expect("session seals");
+    let session_pair = cookie_pair(&sealed);
+
+    for header_name in ["cookie", "Cookie"] {
+        let mut ctx = html_ctx();
+        let mut headers = HashMap::new();
+        headers.insert(
+            header_name.to_string(),
+            format!("theme=dark; {session_pair}; {correlation_pair}; cart=7"),
+        );
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        let forwarded = headers
+            .get(header_name)
+            .expect("unrelated cookies must survive");
+        assert_eq!(forwarded, "theme=dark; cart=7");
+    }
+
+    // A header that carried only this plugin's cookies is removed outright
+    // rather than forwarded empty.
+    let mut ctx = html_ctx();
+    let mut headers = HashMap::new();
+    headers.insert("cookie".to_string(), session_pair.to_string());
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(!headers.contains_key("cookie"));
+}
+
+/// The strip does not depend on the credential having been accepted: a
+/// tampered, expired, or wrong-context cookie is still a value the backend must
+/// not receive (GHSA-75w5-f79c-7697).
+#[tokio::test]
+async fn an_unusable_gateway_session_cookie_is_hidden_too() {
+    let plugin = OidcRelyingParty::new(&base_config(), PluginHttpClient::default())
+        .expect("valid oidc config");
+    let mut ctx = html_ctx();
+    let mut headers = HashMap::new();
+    headers.insert(
+        "cookie".to_string(),
+        "ferrum_session=not-a-sealed-value; theme=dark".to_string(),
+    );
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(headers.get("cookie").map(String::as_str), Some("theme=dark"));
+}
+
+/// Passthrough remains available, but only as an explicit opt-in
+/// (GHSA-75w5-f79c-7697).
+#[tokio::test]
+async fn session_cookie_passthrough_requires_an_explicit_opt_in() {
+    let mut config = base_config();
+    config["session"]["hide_session_cookie"] = json!(false);
+    let plugin =
+        OidcRelyingParty::new(&config, PluginHttpClient::default()).expect("valid oidc config");
+    let sealed = oidc_sealed_session_cookie_for_test(&plugin, json!({"sub": "alice"}), false)
+        .expect("session seals");
+    let session_pair = cookie_pair(&sealed);
+
+    let forwarded = format!("theme=dark; {session_pair}");
+    let mut ctx = html_ctx();
+    let mut headers = HashMap::new();
+    headers.insert("cookie".to_string(), forwarded.clone());
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(headers.get("cookie"), Some(&forwarded));
+}
+
+/// Hiding the credential must not disturb the verified identity and claim
+/// headers the upstream actually relies on (GHSA-75w5-f79c-7697).
+#[tokio::test]
+async fn hiding_the_session_cookie_preserves_claim_header_fan_out() {
+    let mut config = base_config();
+    config["providers"][0]["claim_headers"] = json!({"email": "X-Authenticated-Email"});
+    let plugin =
+        OidcRelyingParty::new(&config, PluginHttpClient::default()).expect("valid oidc config");
+    let sealed = oidc_sealed_session_cookie_for_test(
+        &plugin,
+        json!({"sub": "alice", "email": "alice@example.test"}),
+        false,
+    )
+    .expect("session seals");
+    let mut ctx = session_ctx(&sealed);
+    let consumers = ConsumerIndex::new(&[]);
+    assert_continue(plugin.authenticate(&mut ctx, &consumers).await);
+
+    let mut headers = ctx.headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(!headers.contains_key("cookie"));
+    assert_eq!(
+        headers.get("x-authenticated-email").map(String::as_str),
+        Some("alice@example.test")
+    );
+}

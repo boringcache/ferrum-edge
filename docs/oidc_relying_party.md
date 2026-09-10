@@ -43,6 +43,7 @@ Exactly one provider is supported. Use `discovery_url` for normal OIDC providers
 - `behavior.trusted_redirect_hosts` gates post-login redirects. If no trusted redirect is available, the plugin uses `behavior.post_login_default_path`.
 - UserInfo `sub` must match the ID token `sub`, and UserInfo cannot override protected ID token claims.
 - Claim header mappings reject reserved headers, including `Authorization`, `Host`, hop-by-hop headers, and Ferrum consumer identity headers.
+- The gateway session cookie and the sealed pending-flow correlation cookies are removed from the `Cookie` header forwarded to the selected backend, on every protocol this plugin serves (HTTP/1.1, HTTP/2, the HTTP/3 cross-protocol bridge, gRPC, and the WebSocket handshake). Unrelated application cookies are preserved exactly, and the strip runs after authentication so it never changes an authentication decision. Encryption keeps a backend from *reading* the session, but not from replaying it: the sealed value is a complete gateway credential that any other route under the same OIDC policy would accept. The upstream already receives the verified identity and `claim_headers` values, so it does not need the credential itself. Set `session.hide_session_cookie: false` to opt back into passthrough when a backend genuinely requires the raw cookie.
 
 ## Multi-replica deployments
 

@@ -20299,6 +20299,10 @@ components:
             path:
               type: string
               default: /
+            hide_session_cookie:
+              type: boolean
+              default: true
+              description: Remove this plugin's own session and pending-flow correlation cookies from the Cookie header forwarded to the selected backend, leaving unrelated application cookies intact. The sealed session cookie is a complete replayable gateway credential and the upstream already receives the verified identity and claim headers, so passthrough must be an explicit opt-in.
         behavior:
           type: object
           additionalProperties: false

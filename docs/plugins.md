@@ -2435,6 +2435,7 @@ Logout expires the browser cookie and, with an authentic session cookie, sends `
 | `session.max_cookie_bytes` | u64 | Maximum sealed session and pending-flow cookie size (default: `8000`; `1024`–`8000`) |
 | `session.domain` | String (optional) | Bare DNS name (optional leading dot); durable session Domain only; correlation cookies are host-only and scoped to `callback_path` |
 | `session.secure` | Boolean | Default `true`; when false, generated cookie names carry no `__Host-`/`__Secure-` prefix because a prefixed cookie without `Secure` is rejected by browsers |
+| `session.hide_session_cookie` | Boolean | Default `true`; strip this plugin's session and correlation cookies from the `Cookie` header forwarded upstream, leaving unrelated cookies intact |
 | `behavior.rp_initiated_logout` | Boolean | Default `true`; send the sealed session ID token as a logout hint and attempt discovered refresh-token revocation (five-second bound) |
 | `behavior.state_cache_max_entries` | u64 | Per-instance maximum pending login starts (default: `10000`); does not block cross-replica callbacks |
 | `behavior.state_cache_max_entries_per_source` | u64 | Per-instance per-client-IP pending login start cap (default: `32`) |
