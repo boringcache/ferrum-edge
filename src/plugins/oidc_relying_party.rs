@@ -1415,8 +1415,13 @@ impl OidcRelyingParty {
             .timeout(Duration::from_secs(10));
         match &self.provider.client_auth {
             OidcClientAuth::Basic { client_secret } => {
-                request =
-                    request.basic_auth(&self.provider.client_id, Some(client_secret.expose()));
+                request = request.header(
+                    reqwest::header::AUTHORIZATION,
+                    oauth_basic_authorization_header(
+                        &self.provider.client_id,
+                        client_secret.expose(),
+                    )?,
+                );
             }
             OidcClientAuth::Post { client_secret } => {
                 params.push((
@@ -2972,6 +2977,48 @@ fn build_client_assertion(
         key,
     )
     .map_err(|e| format!("oidc_relying_party: client assertion failed: {e}"))
+}
+
+/// Build the RFC 6749 §2.3.1 `client_secret_basic` `Authorization` header.
+///
+/// The client identifier and secret are `application/x-www-form-urlencoded` FIRST
+/// and only then joined with `:` and base64-encoded. Feeding the raw values to a
+/// generic HTTP Basic encoder makes a legitimate credential containing `:`, `+`,
+/// a space, or a non-ASCII character decode to the wrong pair at a conforming
+/// provider, so every token, refresh, and revocation POST failed (issue #5026).
+fn oauth_basic_authorization_header(
+    client_id: &str,
+    client_secret: &str,
+) -> Result<reqwest::header::HeaderValue, String> {
+    let encoded_client_id = oauth_form_encode_component(client_id)?;
+    let encoded_client_secret = oauth_form_encode_component(client_secret)?;
+    let mut credential = String::with_capacity(
+        encoded_client_id
+            .len()
+            .saturating_add(encoded_client_secret.len())
+            .saturating_add(1),
+    );
+    credential.push_str(&encoded_client_id);
+    credential.push(':');
+    credential.push_str(&encoded_client_secret);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(credential.as_bytes());
+    let mut value = String::with_capacity("Basic ".len().saturating_add(encoded.len()));
+    value.push_str("Basic ");
+    value.push_str(&encoded);
+    let mut header = reqwest::header::HeaderValue::from_bytes(value.as_bytes())
+        .map_err(|_| r#"{"error":"Token endpoint request failed"}"#.to_string())?;
+    header.set_sensitive(true);
+    Ok(header)
+}
+
+fn oauth_form_encode_component(value: &str) -> Result<String, String> {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("value", value);
+    serializer
+        .finish()
+        .strip_prefix("value=")
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| r#"{"error":"Token endpoint request failed"}"#.to_string())
 }
 
 fn with_form_body(

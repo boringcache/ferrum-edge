@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use url::Url;
-use wiremock::matchers::{basic_auth, body_string_contains, method, path};
+use wiremock::matchers::{basic_auth, body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use super::jwks_auth_support::{
@@ -3533,4 +3533,60 @@ async fn spent_refresh_token_suppresses_the_rolling_idle_cookie() {
         "a cached spent-credential follower must not publish a cookie either"
     );
     assert_eq!(server.received_requests().await.expect("requests").len(), 1);
+}
+
+/// RFC 6749 §2.3.1 requires `client_secret_basic` to form-url-encode the client
+/// identifier and secret BEFORE the HTTP Basic encoding. Feeding the raw values
+/// to a generic Basic encoder made every token, refresh, and revocation POST
+/// fail against a conforming provider whenever a credential contained `:`, `+`,
+/// a space, or a non-ASCII character (issue #5026).
+#[tokio::test]
+async fn client_secret_basic_form_encodes_credentials_before_basic_encoding() {
+    // base64("audit%3Aclient+%2B:p%2Bss%3Aword+%2F") — the RFC 6749 §2.3.1 form.
+    const EXPECTED: &str = "Basic YXVkaXQlM0FjbGllbnQrJTJCOnAlMkJzcyUzQXdvcmQrJTJG";
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(header("authorization", EXPECTED))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "rotated-access-token",
+            "token_type": "Bearer",
+            "refresh_token": "rotated-refresh-token",
+            "expires_in": 3600
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut config = refresh_config(&format!("{}/token", server.uri()));
+    config["providers"][0]["client_id"] = json!("audit:client +");
+    config["providers"][0]["client_auth"] = json!({
+        "method": "client_secret_basic",
+        "client_secret": "p+ss:word /"
+    });
+    let plugin =
+        OidcRelyingParty::new(&config, PluginHttpClient::default()).expect("valid refresh config");
+    let now = chrono::Utc::now().timestamp();
+    let cookie = oidc_sealed_due_refresh_session_cookie_for_test(
+        &plugin,
+        json!({
+            "sub": "oidc-subject",
+            "email": "alice@example.test",
+            "exp": now + 3600
+        }),
+        "original-refresh-token",
+    )
+    .expect("session seals");
+    let mut ctx = session_ctx(&cookie);
+
+    let consumers = ConsumerIndex::new(&[]);
+    assert_continue(plugin.authenticate(&mut ctx, &consumers).await);
+    let set_cookie = rolling_cookie(&plugin, &mut ctx)
+        .await
+        .expect("a punctuation-bearing client secret must still authenticate the grant");
+    let state = oidc_session_state_from_set_cookie_for_test(&plugin, &set_cookie)
+        .expect("rotated session cookie must open");
+    assert_eq!(state.access_token, "rotated-access-token");
+    server.verify().await;
 }
