@@ -953,7 +953,7 @@ Captured Sidecar/Ambient raw-TCP and UDP **egress** bypasses the generic stream 
 | `loki_logging` | | ✓ | Sends stream connection logs to Grafana Loki |
 | `udp_logging` | | ✓ | Sends stream connection logs to UDP/DTLS endpoint |
 | `ws_logging` | | ✓ | Sends stream connection logs to WebSocket endpoint |
-| `prometheus_metrics` | | ✓ | Records `ferrum_stream_connections_total` counter and `ferrum_stream_duration_ms` histogram |
+| `prometheus_metrics` | ✓ | ✓ | Marks mesh TCP observation eligibility on connect; records `ferrum_stream_connections_total` and `ferrum_stream_duration_ms` on disconnect |
 | `api_chargeback_sink` | | ✓ | Exports durable stream charge events or snapshot deltas to ClickHouse |
 | `workload_metrics` | ✓ | ✓ | Adds direction-aware mesh source/destination labels to stream metadata and emits mesh spans when Telemetry providers are configured |
 | `transaction_debugger` | | ✓ | Prints typed terminal diagnostics for stream connections |
@@ -1665,7 +1665,7 @@ Given all built-in plugins enabled, the execution order is:
 | 74 | `ws_logging` | 9175 | log, on_stream_disconnect |
 | 75 | `transaction_debugger` | 9200 | on_request_received, before_proxy, on_final_request_body, after_proxy, on_final_response_body, log, on_stream_disconnect, on_ws_disconnect |
 | 76 | `proxy_alerts` | 9250 | log, on_stream_disconnect, on_ws_disconnect |
-| 77 | `prometheus_metrics` | 9300 | log, on_stream_disconnect, on_ws_disconnect |
+| 77 | `prometheus_metrics` | 9300 | on_request_received, on_stream_connect, log, on_stream_disconnect, on_ws_disconnect |
 | 78 | `api_chargeback` | 9350 | log, on_stream_disconnect, on_ws_disconnect |
 | 79 | `api_chargeback_sink` | 9351 | log, on_stream_disconnect, on_ws_disconnect |
 | 80 | `workload_metrics` | 9360 | on_request_received, before_proxy, after_proxy, log, on_stream_connect, on_stream_disconnect |

@@ -21,7 +21,7 @@ Dynamic families (AI token counters, mesh BPF prefix overrides, request_mirror l
 
 Scrape rendering stays allocation-light: the inventory is a documentation/CI contract only and is **not** scanned on the `/metrics` hot path.
 
-Ferrum accepts exactly one enabled, process-global `prometheus_metrics` plugin. Mesh mode auto-injects `workload_metrics` only to supply identity labels and Telemetry policy; mesh RED/lifecycle registry updates and gRPC message scanners activate only after the Prometheus plugin's request/stream hook observes the transaction. Without that exporter, the mesh metric families remain silent. The raw TCP lifecycle families cover stream-plugin paths; Ambient destination HBONE CONNECT relays use the HTTP request/response families and `ferrum_mesh_hbone_relay_failures_total` instead.
+Ferrum accepts exactly one enabled, process-global `prometheus_metrics` plugin. Mesh mode auto-injects `workload_metrics` only to supply identity labels and Telemetry policy; mesh RED/lifecycle registry updates and gRPC message scanners activate only after the Prometheus plugin's `on_request_received` / `on_stream_connect` hooks observe the transaction (counters complete later in `log` / `on_stream_disconnect`). Without that exporter, the mesh metric families remain silent. The raw TCP lifecycle families cover stream-plugin paths; Ambient destination HBONE CONNECT relays use the HTTP request/response families and `ferrum_mesh_hbone_relay_failures_total` instead.
 
 ## Operator runbooks for newly documented families
 

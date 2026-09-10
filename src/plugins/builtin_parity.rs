@@ -701,7 +701,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "prometheus_metrics",
         classification: BuiltinPluginClassification::Public,
         priority: 9300,
-        active_phases: "log, on_stream_disconnect, on_ws_disconnect",
+        active_phases: "on_request_received, on_stream_connect, log, on_stream_disconnect, on_ws_disconnect",
         matrix_protocols: ALL_PROTOCOLS,
         protocol_rationale: "Metrics for all protocols",
     },
