@@ -22991,12 +22991,11 @@ components:
                 properties:
                   upstream_id:
                     type: [string, "null"]
-                    minLength: 1
                   backend_host:
                     type: [string, "null"]
                     minLength: 1
                     maxLength: 255
-                    pattern: '^(?:\[[0-9A-Fa-f:.]+\]|[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*|[^\s/?#@:\[\]]+)$'
+                    pattern: '^\s*(?:\[[0-9A-Fa-f:.]+\]|[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*|[^\s/?#@:\[\]]+)\s*$'
                     description: |
                       Direct-backend host. This is a BARE host — a DNS name,
                       an IPv4 literal, or an IPv6 literal in either `::1` or
@@ -23005,12 +23004,15 @@ components:
                       resolution, so an embedded authority port, scheme, path,
                       query, fragment, or userinfo resolves to nothing and is
                       rejected at config load rather than answering 502 on
-                      every matching request. The pattern is a conservative
-                      approximation: the runtime additionally parses the
-                      IPv6 forms, so a colon-bearing value that is not a valid
-                      IPv6 literal (`1:2:3`) passes this schema and is still
-                      refused at admission. Leading / trailing whitespace is
-                      trimmed and the value is ASCII-lowercased at load.
+                      every matching request. Leading / trailing whitespace is
+                      trimmed and the value is ASCII-lowercased at load, so
+                      the length bound applies to the TRIMMED value at
+                      runtime while `maxLength` here counts the raw string.
+                      The pattern is likewise a conservative approximation:
+                      the runtime additionally parses the IPv6 forms, so a
+                      colon-bearing value that is not a valid IPv6 literal
+                      (`1:2:3`) passes this schema and is still refused at
+                      admission.
                   backend_port:
                     type: [integer, "null"]
                     format: uint16

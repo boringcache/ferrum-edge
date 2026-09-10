@@ -299,7 +299,7 @@ fn validate_route_backend_host(rule_idx: usize, host: &str) -> Result<(), String
     };
     if let Some(rest) = host.strip_prefix('[') {
         let Some(inner) = rest.strip_suffix(']') else {
-            return reject("a bracketed IPv6 literal must end with `]` and carry no port");
+            return reject("a bracketed IPv6 literal must not carry a port");
         };
         if inner.parse::<Ipv6Addr>().is_err() {
             return reject("the bracketed value is not a valid IPv6 literal");
@@ -319,7 +319,7 @@ fn validate_route_backend_host(rule_idx: usize, host: &str) -> Result<(), String
         return reject("it must not contain userinfo");
     }
     if host.contains(']') {
-        return reject("`]` is only valid when it closes a bracketed IPv6 literal");
+        return reject("a `]` must close a bracketed IPv6 literal");
     }
     if host.contains(':') && host.parse::<Ipv6Addr>().is_err() {
         return reject("it must not contain a port");

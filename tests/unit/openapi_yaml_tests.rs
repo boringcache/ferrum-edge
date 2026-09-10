@@ -11635,7 +11635,7 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
         json!({"rules": [rule]})
     }
 
-    let corpus: Vec<(&str, serde_json::Value, bool)> = vec![
+    for (label, config, accepted) in [
         (
             "methods_no_operator",
             parity_rule(json!({"match": {"methods": [{}]}})),
@@ -11706,9 +11706,21 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
             parity_rule(json!({"match": {"methods": ["GET"], "ignore_uri_case": true}})),
             false,
         ),
-        ("fault_null", parity_rule(json!({"fault": null})), true),
-        ("rewrite_null", parity_rule(json!({"rewrite": null})), true),
-        ("redirect_null", parity_rule(json!({"redirect": null})), true),
+        (
+            "rule_fault_null_is_accepted",
+            parity_rule(json!({"fault": null})),
+            true,
+        ),
+        (
+            "rule_rewrite_null_is_accepted",
+            parity_rule(json!({"rewrite": null})),
+            true,
+        ),
+        (
+            "rule_redirect_null_is_accepted",
+            parity_rule(json!({"redirect": null})),
+            true,
+        ),
         (
             "fault_delay_null_with_abort",
             parity_rule(json!({"fault": {
@@ -11801,7 +11813,11 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
             parity_rule(json!({"timeout_ms": -1})),
             false,
         ),
-        ("timeout_ms_zero", parity_rule(json!({"timeout_ms": 0})), true),
+        (
+            "timeout_ms_zero_is_no_timeout",
+            parity_rule(json!({"timeout_ms": 0})),
+            true,
+        ),
         (
             "retry_max_retries_over_bound",
             parity_rule(json!({"retry": {"max_retries": 999}})),
@@ -11841,7 +11857,7 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
             false,
         ),
         (
-            "minimal_redirect",
+            "minimal_redirect_rule",
             json!({"rules": [{"redirect": {}}]}),
             true,
         ),
@@ -11859,8 +11875,7 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
             }]}),
             true,
         ),
-    ];
-    for (label, config, accepted) in corpus {
+    ] {
         assert_component_validity(&spec, "MeshRouteDispatchConfig", &config, accepted);
         assert_eq!(
             MeshRouteDispatch::new(&config).is_ok(),

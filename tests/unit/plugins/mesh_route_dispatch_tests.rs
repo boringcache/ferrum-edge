@@ -2345,7 +2345,8 @@ fn header_match_names_must_be_http_tokens() {
 fn header_match_names_still_normalize_to_lowercase() {
     let config = config_with_match(json!({"headers": {"X-Canary": {"prefix": "v"}}}));
     let plugin = MeshRouteDispatch::new(&config).expect("mixed-case name is admitted");
-    assert!(plugin.rules()[0].match_.headers.contains_key("x-canary"));
+    let headers = &plugin.rules()[0].match_.headers;
+    assert!(headers.contains_key("x-canary"));
 }
 
 #[test]
