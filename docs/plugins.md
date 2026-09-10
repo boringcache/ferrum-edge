@@ -632,19 +632,19 @@ Sends transaction metrics to a StatsD-compatible server (StatsD, Datadog DogStat
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `host` | String | *(required)* | StatsD server hostname or IP address |
+| `host` | String | *(required)* | StatsD server hostname or IP address (non-empty; no scheme, path, query, fragment, credentials, or `host:port`) |
 | `port` | Integer | `8125` | StatsD server UDP port (1–65535) |
-| `prefix` | String | `FERRUM_NAMESPACE` | Metric name prefix (e.g., `ferrum.request.count`). Defaults to the gateway's `FERRUM_NAMESPACE` value (default: `"ferrum"`). Sanitized for line-protocol safety; max 256 bytes after sanitization. |
+| `prefix` | String | `FERRUM_NAMESPACE` | Metric name prefix (e.g., `ferrum.request.count`). Defaults to the gateway's `FERRUM_NAMESPACE` value (default: `"ferrum"`). Leading/trailing whitespace is trimmed; empty after trim is rejected. Sanitized for line-protocol safety; max 256 bytes after sanitization. |
 | `global_tags` | Object | *(none)* | Extra DogStatsD tags appended to every metric. Keys cannot override reserved runtime tags (`namespace`, `method`, `status`, `status_class`, `grpc_status`, `proxy`, `protocol`, `error`, `cause`, `direction`, `body_outcome`, `body_error`, `result`, `io_side`, `error_class`) or any effective key introduced by a schema rename. Encoded `global_tags` + authoritative `namespace` tag are capped at 400 bytes. |
 | `flush_interval_ms` | Integer | `500` | Max milliseconds before flushing buffered metrics (50–600000) |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full (1–1000000) |
 | `max_batch_lines` | Integer | `50` | Max metric entries to batch before flushing (1–10000) |
-| `max_entry_bytes` | Integer | `65536` | Maximum rendered StatsD line-protocol size of one admitted transaction (1024–1048576). Oversized renders are dropped before enqueue. |
+| `max_entry_bytes` | Integer | `65536` | Maximum rendered StatsD line-protocol size of one admitted transaction (1024–1048576). Construction rejects a prefix / global-tags / schema combination that cannot hold a minimum ordinary HTTP, gRPC, stream, and WebSocket record. Request-shaped fields can still overflow at runtime and are dropped before enqueue. |
 | `buffer_max_bytes` | Integer | `16777216` | Aggregate retained rendered-content budget across queued entries, one MTU-bounded datagram buffer, and retries (must be ≥ `2 * (max_entry_bytes + 1)`; hard max 268435456). Admission reserves before rendering. |
 | `max_retries` | Integer | `0` | Retry attempts after the initial UDP send fails (0–10; shared batching logger) |
 | `retry_delay_ms` | Integer | `0` | Delay in milliseconds between retry attempts (0–60000) |
-| `schema` | Object | *(none)* | Inline summary schema; only `rename` / `omit` / `summary_type` affect StatsD tags. Rename targets must pass the same tag-key grammar and must not collide with reserved tags. |
-| `schema_ref` | String | *(none)* | Named schema from `transaction_log_schema`; mutually exclusive with `schema` |
+| `schema` | Object | *(none)* | Inline summary schema; only `rename` / `omit` / `summary_type` affect StatsD tags. Rename targets must pass the same tag-key grammar and must not collide with reserved tags. Mutually exclusive with `schema_ref`. |
+| `schema_ref` | String | *(none)* | Non-empty named schema from `transaction_log_schema`; mutually exclusive with `schema` |
 
 Metrics are flushed when `max_batch_lines` is reached **or** `flush_interval_ms` elapses, whichever comes first. Hot-path admission reserves a queue slot and a provisional `max_entry_bytes` lease before rendering attacker-shaped summary fields into StatsD line protocol, then shrinks that lease to the exact retained size. Batches are packed into UDP datagrams that never exceed a **1452-byte** conservative IPv4/IPv6 payload ceiling; delivery retains the admitted batch plus at most one datagram buffer (it does not materialize every datagram copy up front). Multi-line batches split only on newline boundaries; an individual metric line larger than the ceiling is dropped and warned (it is never fragmented mid-line, and sibling valid lines in the same batch are still sent).
 
@@ -1604,9 +1604,9 @@ Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `endpoint_url` | string | (required) | HTTP(S) Loki push API URL; URL user information is rejected |
+| `endpoint_url` | string | (required) | HTTP(S) Loki push API URL; URL user information is rejected; leading/trailing whitespace is ignored; ports must be 0–65535 |
 | `authorization_header` | string | (none) | `Authorization` header value (Bearer/Basic); leading/trailing whitespace is rejected |
-| `custom_headers` | object | `{}` | Extra HTTP headers (e.g., `X-Scope-OrgID`); names use HTTP token syntax and are at most 65,535 bytes |
+| `custom_headers` | object | `{}` | Extra HTTP headers (e.g., `X-Scope-OrgID`); names use HTTP token syntax and are at most 65,535 bytes; values may be UTF-8 (`café`) but cannot contain NUL/CR/LF |
 | `labels` | object | `{"service":"ferrum-edge"}` | Static labels; names beginning `__` and reserved `ferrum_emitter` are rejected; names are at most 1,024 characters and values at most 2,048 characters |
 | `include_proxy_id_label` | bool | `true` | Add `proxy_id` as a label |
 | `include_status_class_label` | bool | `true` | Add `status_class` (2xx/3xx/4xx/5xx) as a label |
@@ -1615,11 +1615,11 @@ Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push
 | `flush_interval_ms` | integer | `1000` | Flush timer interval (100–600000) |
 | `buffer_capacity` | integer | `10000` | Channel buffer capacity (1–1,000,000) |
 | `max_entry_bytes` | integer | `65536` | Maximum retained bytes for one JSON line plus labels (1,024–1,048,576); the configured serializer's minimum HTTP and stream lines plus static, reserved, and worst-case dynamic label values must fit |
-| `buffer_max_bytes` | integer | `16777216` | Per-plugin retained-content budget across queued, batched, and retrying entries (1,024–268,435,456; at least `max_entry_bytes`) |
+| `buffer_max_bytes` | integer | `16777216` | Per-plugin retained-content budget across queued, batched, and retrying entries (1,024–268,435,456; at least `max_entry_bytes`; when `max_entry_bytes` is omitted the default 65,536 ceiling applies) |
 | `max_retries` | integer | `3` | Retries after the initial attempt (0–10) |
 | `retry_delay_ms` | integer | `1000` | Initial exponential-backoff delay (1–60,000 ms) |
-| `schema` | object | (none) | Inline transaction-log schema |
-| `schema_ref` | string | (none) | Named `transaction_log_schema` reference; mutually exclusive with `schema` |
+| `schema` | object | (none) | Inline transaction-log schema; mutually exclusive with `schema_ref` |
+| `schema_ref` | string | (none) | Non-empty named `transaction_log_schema` reference; mutually exclusive with `schema` |
 
 HTTP **204 No Content** is Loki's canonical delivery success. A received 204 is treated as committed even if the best-effort response drain is incomplete, because retrying after the sink accepted the batch can duplicate entries. Other 2xx responses from Loki-compatible receivers or intermediaries are accepted only when their response drains completely and is empty. Loki's blocked-ingestion status **260**, non-empty or anomalously drained compatible-success responses, 3xx, and non-retryable 4xx responses are terminal; transport failures, 408, 429, and 5xx retry with capped exponential backoff and full jitter. Response bodies are never logged or retained: they are discarded with a 1 MiB cap and a one-second timeout, and diagnostics contain only status and bounded size/drain classifications.
 

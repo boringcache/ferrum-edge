@@ -18254,6 +18254,16 @@ components:
     LokiLoggingConfig:
       type: object
       additionalProperties: false
+      not:
+        required: [schema, schema_ref]
+      allOf:
+        - if:
+            not:
+              required: [max_entry_bytes]
+          then:
+            properties:
+              buffer_max_bytes:
+                minimum: 65536
       description: >-
         Plugin: loki_logging — Ships transaction logs to Grafana Loki via the
         push API in bounded, label-grouped streams. HTTP 204 is the canonical
@@ -18262,20 +18272,25 @@ components:
         non-empty/anomalous compatible-success responses, and every other
         non-retryable response are terminal; 408, 429, and 5xx responses use
         bounded exponential backoff with jitter. Explicit nulls and unknown
-        top-level fields are rejected.
+        top-level fields are rejected. `schema` and `schema_ref` are
+        structurally exclusive. When `max_entry_bytes` is omitted, OpenAPI
+        requires `buffer_max_bytes` to be at least the default per-entry
+        ceiling (65536); a sibling comparison against an explicit
+        `max_entry_bytes` is enforced only at construction. Named-schema
+        existence is runtime-only.
       required:
         - endpoint_url
       properties:
         endpoint_url:
           type: string
-          format: uri
-          pattern: '^[hH][tT][tT][pP][sS]?://(?![^/?#]*@)(?:\[[^\]\s]+\]|[^/?#:\s]+)(?::[0-9]+)?(?:[/?#]\S*)?$'
+          pattern: '^\s*[hH][tT][tT][pP][sS]?://(?![^/?#]*@)(?:\[[^\]\s]+\]|[^/?#:\s]+)(?::(?:[0-9]{1,4}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?(?:[/?#]\S*)?\s*$'
           description: >-
             Loki push API URL (for example,
-            http://loki:3100/loki/api/v1/push). URL user information is
+            http://loki:3100/loki/api/v1/push). Leading and trailing whitespace
+            is ignored by runtime URL parsing. URL user information is
             rejected; use authorization_header or custom_headers instead.
-            Path and query components are redacted from operational and
-            non-admin diagnostics.
+            Ports must be 0–65535. Path and query components are redacted from
+            operational and non-admin diagnostics.
         authorization_header:
           type: string
           minLength: 1
@@ -18292,12 +18307,13 @@ components:
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           additionalProperties:
             type: string
-            pattern: '^[\u0009\u0020-\u007E]*$'
+            pattern: '^[^\u0000\r\n]*$'
           description: >-
             Extra HTTP headers (for example, X-Scope-OrgID for multi-tenant
             Loki). Names use HTTP token syntax and are at most 65,535 ASCII
-            bytes. All values are redacted from audit records and non-admin
-            config reads.
+            bytes. Values may contain UTF-8 (HeaderValue obs-text); NUL, CR,
+            and LF are rejected. All values are redacted from audit records and
+            non-admin config reads.
         labels:
           type: object
           propertyNames:
@@ -18381,20 +18397,35 @@ components:
           description: >-
             Per-plugin retained-content byte budget across queued, batched,
             and retrying entries. Must be at least max_entry_bytes; entries
-            are dropped non-blockingly when the budget is exhausted.
+            are dropped non-blockingly when the budget is exhausted. When
+            max_entry_bytes is omitted, this field must be at least 65536
+            (the default per-entry ceiling). An arbitrary sibling comparison
+            against an explicit max_entry_bytes is runtime-only.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
           type: string
+          minLength: 1
           description: >-
             Name of a schema registered by a `transaction_log_schema` plugin.
             Mutually exclusive with `schema`. Note: Loki labels
             (`build_http_labels` / `build_stream_labels`) read typed summary
             fields and are NOT affected by `rename:`. See docs/log_schema.md.
+            Existence of the named schema is resolved at construction.
 
     StatsdLoggingConfig:
       type: object
       additionalProperties: false
+      not:
+        required: [schema, schema_ref]
+      allOf:
+        - if:
+            not:
+              required: [max_entry_bytes]
+          then:
+            properties:
+              buffer_max_bytes:
+                minimum: 131074
       description: >-
         Plugin: statsd_logging — Sends transaction metrics to a StatsD-compatible
         server over UDP. Unknown top-level keys are rejected at construction /
@@ -18405,7 +18436,14 @@ components:
         body_error, result, io_side, error_class). The authoritative namespace
         tag is always appended and preserves the full validated Ferrum namespace
         (up to 254 bytes). Metric prefixes are sanitized and capped at 256
-        bytes; encoded global_tags (+ namespace) are capped at 400 bytes.
+        UTF-8 bytes after trim; encoded global_tags (+ namespace) are capped at
+        400 bytes. `schema` and `schema_ref` are structurally exclusive. When
+        `max_entry_bytes` is omitted, OpenAPI requires `buffer_max_bytes` to
+        be at least 131074 (`2 * (65536 + 1)`); a sibling comparison against an
+        explicit `max_entry_bytes` is enforced only at construction. Named-schema
+        existence is runtime-only. Construction also rejects a prefix/tag/schema
+        combination whose minimum ordinary HTTP, gRPC, stream, and WebSocket
+        record cannot fit `max_entry_bytes`.
         UDP datagrams never exceed a 1452-byte conservative IPv4/IPv6 payload
         ceiling; indivisible oversized lines are dropped rather than fragmented.
         Hot-path admission reserves a queue slot and a provisional max_entry_bytes
@@ -18426,7 +18464,16 @@ components:
       properties:
         host:
           type: string
-          description: StatsD server hostname or IP address
+          minLength: 1
+          not:
+            anyOf:
+              - pattern: "://"
+              - pattern: "[/?#@\\s]"
+              - pattern: "^[^\\[\\]:]+:[^:]+$"
+          description: >-
+            StatsD server hostname or IP address. Must be a bare hostname or IP
+            without scheme, path, query, fragment, credentials, or port
+            (bracketed and unbracketed IPv6 literals are allowed).
         port:
           type: integer
           default: 8125
@@ -18436,24 +18483,26 @@ components:
         prefix:
           type: string
           default: "ferrum"
-          maxLength: 256
+          minLength: 1
           description: >-
-            Metric name prefix (e.g., ferrum.request.count). Sanitized for
-            StatsD line-protocol safety. OpenAPI `maxLength` counts Unicode
-            characters; runtime admission separately enforces at most 256
-            UTF-8 bytes after sanitization, so multibyte prefixes may be
-            rejected below 256 characters.
+            Metric name prefix (e.g., ferrum.request.count). Leading and
+            trailing whitespace is trimmed before sanitization; empty after
+            trim is rejected. Runtime admission enforces at most 256 UTF-8
+            bytes after sanitization, so a longer raw string may still be
+            refused. Construction also requires max_entry_bytes to fit a
+            minimum ordinary record under this prefix.
         global_tags:
           type: object
           propertyNames:
             type: string
             minLength: 1
             maxLength: 64
-            pattern: '^[A-Za-z_][A-Za-z0-9_.-]*$'
+            pattern: '^(?!(namespace|method|status_class|status|grpc_status|proxy|protocol|error_class|error|cause|direction|body_outcome|body_error|result|io_side)$)[A-Za-z_][A-Za-z0-9_.-]*$'
             description: >-
               Tag keys are restricted to the ASCII grammar
               `[A-Za-z_][A-Za-z0-9_.-]*`, so OpenAPI `maxLength: 64`
-              matches the runtime 64-byte key ceiling.
+              matches the runtime 64-byte key ceiling. Reserved runtime tag
+              names are excluded case-insensitively.
           additionalProperties:
             type: string
           description: >-
@@ -18488,7 +18537,11 @@ components:
           maximum: 1048576
           description: >-
             Maximum rendered StatsD line-protocol bytes for one admitted
-            transaction. Oversized renders are dropped before enqueue.
+            transaction. Configuration is rejected unless a minimum ordinary
+            HTTP, gRPC, stream, and WebSocket record with the resolved prefix,
+            global tags, and schema fits this budget. Request-shaped fields
+            can still make an individual render exceed the budget; those
+            oversized entries are dropped before enqueue.
         buffer_max_bytes:
           type: integer
           default: 16777216
@@ -18499,6 +18552,9 @@ components:
             one MTU-bounded datagram buffer, and retries. Admission reserves
             two copies plus framing before rendering and shrinks that lease to
             the exact retained size. Must be at least 2 * (max_entry_bytes + 1).
+            When max_entry_bytes is omitted, this field must be at least 131074
+            (the default-dependent bound). An arbitrary sibling comparison against
+            an explicit max_entry_bytes is runtime-only.
         max_retries:
           type: integer
           default: 0
@@ -18531,9 +18587,11 @@ components:
             no-ops for statsd (line protocol, not JSON). See docs/log_schema.md.
         schema_ref:
           type: string
+          minLength: 1
           description: >-
             Name of a schema registered by a `transaction_log_schema` plugin.
             Mutually exclusive with `schema`. Same statsd caveats as above.
+            Existence of the named schema is resolved at construction.
 
     TransactionLogSchemaConfig:
       type: object
