@@ -18,6 +18,16 @@ on:
         required: false
         type: string
         default: ""
+      baseline_cli_artifact_id:
+        description: Optional baseline CLI artifact for a same-runner comparison
+        required: false
+        type: string
+        default: ""
+      candidate_first:
+        description: Restore the candidate before the optional baseline
+        required: false
+        type: boolean
+        default: false
       transfer_http2:
         description: Enable HTTP/2 negotiation for the storage comparison
         required: false
@@ -58,6 +68,20 @@ jobs:
           artifact-path: ${{ runner.temp }}/validation-cli
           trust-policy: restore
 
+      - name: Download the baseline CLI artifact
+        if: inputs.baseline_cli_artifact_id != ''
+        uses: boringcache/one@404b744a2053da4cf963f13f615f7fafe94f3cf7 # v1.30.1
+        env:
+          BORINGCACHE_RESTORE_TOKEN: ${{ secrets.BORINGCACHE_CLI_ARTIFACT_RESTORE_TOKEN }}
+        with:
+          cli-version: v1.30.1
+          mode: artifact
+          artifact-command: pull
+          artifact-id: ${{ inputs.baseline_cli_artifact_id }}
+          artifact-workspace: ${{ inputs.cli_artifact_workspace }}
+          artifact-path: ${{ runner.temp }}/baseline-cli
+          trust-policy: restore
+
       - name: Verify and select the CLI artifact
         if: inputs.cli_artifact_id != ''
         run: |
@@ -67,6 +91,12 @@ jobs:
           chmod +x boringcache
           echo "${RUNNER_TEMP}/validation-cli" >> "$GITHUB_PATH"
           ./boringcache --version
+          if [[ -d "${RUNNER_TEMP}/baseline-cli" ]]; then
+            cd "${RUNNER_TEMP}/baseline-cli"
+            sha256sum --check boringcache.sha256
+            chmod +x boringcache
+            ./boringcache --version
+          fi
 
       - name: Set up BoringCache
         uses: boringcache/one@404b744a2053da4cf963f13f615f7fafe94f3cf7 # v1.30.1
@@ -82,6 +112,8 @@ jobs:
           RUST_LOG: error,boring_cache_cli::storage_transfer=info
           BORINGCACHE_TRANSFER_HTTP2: ${{ inputs.transfer_http2 }}
           COMPARE_HTTP1: ${{ inputs.compare_http1 }}
+          BASELINE_ARTIFACT_ID: ${{ inputs.baseline_cli_artifact_id }}
+          CANDIDATE_FIRST: ${{ inputs.candidate_first }}
         run: |
           set -euo pipefail
           boringcache --version
@@ -89,20 +121,33 @@ jobs:
           if [[ "$COMPARE_HTTP1" == "true" && "$BORINGCACHE_TRANSFER_HTTP2" == "true" ]]; then
             protocols+=("false")
           fi
-          pass=0
-          for protocol in "${protocols[@]}"; do
-            if (( pass > 0 )); then
-              # Recreate this validation restore so both passes write the complete target.
-              rm -rf -- fuzz/target
+          variants=(candidate)
+          if [[ -n "$BASELINE_ARTIFACT_ID" ]]; then
+            variants=(baseline candidate)
+            if [[ "$CANDIDATE_FIRST" == "true" ]]; then
+              variants=(candidate baseline)
             fi
-            export BORINGCACHE_TRANSFER_HTTP2="$protocol"
-            export BORINGCACHE_OBSERVABILITY_JSONL_PATH="${RUNNER_TEMP}/restore-observability-${protocol}.jsonl"
-            echo "Storage HTTP/2 negotiation: ${protocol}"
-            df -h .
-            boringcache restore boringcache/ferrum-edge \
-              --entry fuzz-target-toolchain-e3b99108dfccdd33-graph-551e4f3879e93b22-branch-boringcache-validation-ubuntu-24-x86_64:fuzz/target \
-              --no-git --no-platform --fail-on-cache-miss --fail-on-cache-error
-            pass=$((pass + 1))
+          fi
+          pass=0
+          for variant in "${variants[@]}"; do
+            cli="$(command -v boringcache)"
+            if [[ "$variant" == "baseline" ]]; then
+              cli="${RUNNER_TEMP}/baseline-cli/boringcache"
+            fi
+            for protocol in "${protocols[@]}"; do
+              if (( pass > 0 )); then
+                # Each pass writes the complete target from a fresh restore.
+                rm -rf -- fuzz/target
+              fi
+              export BORINGCACHE_TRANSFER_HTTP2="$protocol"
+              export BORINGCACHE_OBSERVABILITY_JSONL_PATH="${RUNNER_TEMP}/restore-observability-${variant}-${protocol}.jsonl"
+              echo "Restore variant: ${variant}; storage HTTP/2 negotiation: ${protocol}"
+              df -h .
+              "$cli" restore boringcache/ferrum-edge \
+                --entry fuzz-target-toolchain-e3b99108dfccdd33-graph-551e4f3879e93b22-branch-boringcache-validation-ubuntu-24-x86_64:fuzz/target \
+                --no-git --no-platform --fail-on-cache-miss --fail-on-cache-error
+              pass=$((pass + 1))
+            done
           done
 
       - name: Record archive phase resources
