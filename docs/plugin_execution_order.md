@@ -1608,7 +1608,7 @@ Given all built-in plugins enabled, the execution order is:
 | 17 | `oidc_relying_party` | 1075 | authenticate, before_proxy |
 | 18 | `jwt_auth` | 1100 | authenticate |
 | 19 | `key_auth` | 1200 | authenticate, before_proxy |
-| 20 | `ldap_auth` | 1250 | authenticate |
+| 20 | `ldap_auth` | 1250 | authenticate, before_proxy |
 | 21 | `basic_auth` | 1300 | authenticate, before_proxy |
 | 22 | `hmac_auth` | 1400 | authenticate |
 | 23 | `soap_ws_security` | 1500 | authenticate, before_proxy, on_final_request_body |

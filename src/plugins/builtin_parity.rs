@@ -244,7 +244,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "ldap_auth",
         classification: BuiltinPluginClassification::Public,
         priority: 1250,
-        active_phases: "authenticate",
+        active_phases: "authenticate, before_proxy",
         matrix_protocols: HTTP_FAMILY_PROTOCOLS,
         protocol_rationale: "Requires HTTP Basic auth header; authenticates against LDAP directory",
     },

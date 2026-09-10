@@ -2933,6 +2933,108 @@ fn ldap_auth_schema_matches_runtime_invariants() {
 }
 
 #[test]
+fn ldap_auth_value_constraints_match_runtime_admission() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::ldap_auth::LdapAuth;
+
+    fn merge(base: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
+        let mut config = base;
+        let object = config.as_object_mut().expect("config object");
+        for (key, value) in extra.as_object().expect("extra object") {
+            object.insert(key.clone(), value.clone());
+        }
+        config
+    }
+
+    fn direct_bind(extra: serde_json::Value) -> serde_json::Value {
+        let base = json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
+        });
+        merge(base, extra)
+    }
+
+    fn search_bind(extra: serde_json::Value) -> serde_json::Value {
+        let base = json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "search_base_dn": "ou=users,dc=example,dc=com",
+            "search_filter": "(uid={username})",
+            "canonical_identity_attribute": "uid",
+            "service_account_dn": "cn=admin,dc=example,dc=com",
+            "service_account_password": "service-secret"
+        });
+        merge(base, extra)
+    }
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/LdapAuthConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("LdapAuthConfig schema compiles");
+
+    // Value-level admission probed in issue #5038. RFC 4515 filter syntax is
+    // deliberately absent from this table: the grammar is not expressible as a
+    // `pattern`, so filter syntax stays an admission-only rule.
+    let admitted = vec![
+        // A password is opaque: it is taken verbatim, never trimmed.
+        search_bind(json!({"service_account_password": "  padded  "})),
+        direct_bind(json!({"max_cache_entries": 1_000_000})),
+        // An empty userinfo carries no credential.
+        direct_bind(json!({"ldap_url": "ldaps://@localhost"})),
+        direct_bind(json!({"ldap_url": "ldaps://[2001:db8::50]:636"})),
+        direct_bind(json!({"hide_credentials": false})),
+    ];
+    let refused = vec![
+        // Whitespace-only identifiers trim to empty.
+        direct_bind(json!({"canonical_identity_attribute": "  "})),
+        direct_bind(json!({"group_attribute": "  "})),
+        direct_bind(json!({"group_filter": "  "})),
+        search_bind(json!({"service_account_dn": "  "})),
+        search_bind(json!({"search_base_dn": "  "})),
+        direct_bind(json!({"group_base_dn": "  ", "required_groups": ["a"]})),
+        direct_bind(json!({"group_base_dn": "ou=g,dc=e", "required_groups": ["  "]})),
+        search_bind(json!({"service_account_password": ""})),
+        // Every resource knob is bounded.
+        direct_bind(json!({"max_cache_entries": 1_000_001})),
+        // A hostname is required and an explicit port must fit in 16 bits.
+        direct_bind(json!({"ldap_url": "ldaps://"})),
+        direct_bind(json!({"ldap_url": "ldaps://localhost:65536"})),
+        // The scheme is case-sensitive and the value is never trimmed.
+        direct_bind(json!({"ldap_url": "  ldap://127.0.0.1:389  "})),
+        direct_bind(json!({"ldap_url": "LDAP://127.0.0.1:389"})),
+        direct_bind(json!({"ldap_url": "ldaps://admin:secret@localhost"})),
+        direct_bind(json!({"hide_credentials": "yes"})),
+    ];
+
+    for config in admitted {
+        assert!(
+            validator.validate(&config).is_ok(),
+            "OpenAPI must admit {config}"
+        );
+        assert!(
+            LdapAuth::new(&config, PluginHttpClient::default()).is_ok(),
+            "runtime must admit {config}"
+        );
+    }
+    for config in refused {
+        assert!(
+            validator.validate(&config).is_err(),
+            "OpenAPI must refuse {config}"
+        );
+        assert!(
+            LdapAuth::new(&config, PluginHttpClient::default()).is_err(),
+            "runtime must refuse {config}"
+        );
+    }
+}
+
+#[test]
 fn ai_federation_schema_publishes_security_fields_and_rejects_unknown_keys() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -3193,11 +3295,15 @@ fn ldap_cache_documentation_and_openapi_defaults_match_runtime_constants() {
         schema["max_cache_entries"]["default"],
         json!(ferrum_edge::plugins::ldap_auth::LDAP_AUTH_DEFAULT_MAX_CACHE_ENTRIES)
     );
+    assert_eq!(
+        schema["max_cache_entries"]["maximum"],
+        json!(ferrum_edge::plugins::ldap_auth::LDAP_AUTH_MAX_CACHE_ENTRIES_LIMIT)
+    );
 
     let guide = include_str!("../../docs/cache_management.md");
     assert!(guide.contains("**Default limit:** 10,000 entries. Caching is disabled by default."));
     assert!(guide.contains("`cache_ttl_seconds` (default `0`, disabled; maximum `86,400`"));
-    assert!(guide.contains("`max_cache_entries` (default `10,000`)"));
+    assert!(guide.contains("`max_cache_entries` (default `10,000`; maximum `1,000,000`)"));
     assert!(guide.contains("| `ldap_auth` | `max_cache_entries` | `10000` |"));
     assert!(guide.contains("| `ldap_auth` | `cache_ttl_seconds` | `0` |"));
 }
