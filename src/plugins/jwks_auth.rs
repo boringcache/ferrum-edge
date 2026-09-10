@@ -1147,8 +1147,8 @@ impl JwksAuth {
         }
 
         // RFC 9449 DPoP proofs are compact JWTs (base64url), visible ASCII. A
-        // present `dpop` field line that `materialize_headers()` omitted is
-        // malformed proof material, not a missing proof.
+        // present `dpop` field line that is not visible ASCII is malformed proof
+        // material, not a missing proof.
         let proof = match lookup_configured_header(ctx, "dpop", None) {
             ConfiguredHeaderLookup::Absent => {
                 return Err((401, r#"{"error":"DPoP proof required"}"#.to_string()));

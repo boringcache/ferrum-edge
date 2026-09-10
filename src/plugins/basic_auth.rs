@@ -202,9 +202,8 @@ impl AuthMechanism for BasicAuth {
 
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
         // RFC 7617 `Authorization: Basic` credentials are base64 (visible ASCII).
-        // A present field line that `materialize_headers()` omitted is malformed,
-        // not absent — report invalid so operators are not pointed at a missing
-        // credential.
+        // A present field line that is not visible ASCII is malformed, not absent
+        // — report invalid so operators are not pointed at a missing credential.
         let auth_header = match lookup_configured_header(ctx, "authorization", None) {
             ConfiguredHeaderLookup::Absent => return ExtractedCredential::Missing,
             ConfiguredHeaderLookup::PresentNonMaterialized => {
