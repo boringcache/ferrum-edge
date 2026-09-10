@@ -801,7 +801,7 @@ async fn test_gzip_origin_document_is_decoded_to_identity_before_cache_and_specz
         Some(GZIP_SPEC_JSON.len())
     );
     assert!(
-        headers.get("content-encoding").is_none(),
+        !headers.contains_key("content-encoding"),
         "identity /specz must not forward origin Content-Encoding: {headers:?}"
     );
     assert_eq!(
@@ -814,7 +814,7 @@ async fn test_gzip_origin_document_is_decoded_to_identity_before_cache_and_specz
         reject_parts(plugin.on_request_received(&mut cached).await);
     assert_eq!(cached_status, 200);
     assert_eq!(cached_body, GZIP_SPEC_JSON);
-    assert!(cached_headers.get("content-encoding").is_none());
+    assert!(cached_!headers.contains_key("content-encoding"));
 }
 
 #[tokio::test]
@@ -856,7 +856,7 @@ async fn test_gzip_origin_head_uses_decoded_representation_without_wire_body() {
             .and_then(|value| value.parse::<usize>().ok()),
         Some(GZIP_SPEC_JSON.len())
     );
-    assert!(head_headers.get("content-encoding").is_none());
+    assert!(head_!headers.contains_key("content-encoding"));
 
     let (suppressed_status, suppressed_body, suppressed_headers) = reject_parts(
         plugin
@@ -899,7 +899,7 @@ async fn test_identity_content_encoding_is_served_as_identity() {
     let (status, body, headers) = reject_parts(plugin.on_request_received(&mut ctx).await);
     assert_eq!(status, 200);
     assert_eq!(body, b"openapi: 3.0.0\n");
-    assert!(headers.get("content-encoding").is_none());
+    assert!(!headers.contains_key("content-encoding"));
 }
 
 #[tokio::test]
