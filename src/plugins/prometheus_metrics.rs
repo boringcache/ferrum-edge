@@ -359,9 +359,7 @@ fn websocket_termination_reason_label(ctx: &WsDisconnectContext) -> &'static str
         .and_then(ws_termination_reason_from_label)
     {
         Some(reason) => reason.as_str(),
-        None if ctx.error_class.is_some() => {
-            crate::proxy::WsTerminationReason::RelayError.as_str()
-        }
+        None if ctx.error_class.is_some() => crate::proxy::WsTerminationReason::RelayError.as_str(),
         None => crate::proxy::WsTerminationReason::NormalPeerClose.as_str(),
     }
 }
@@ -2453,7 +2451,9 @@ impl MetricsRegistry {
     #[doc(hidden)]
     #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn cache_invalidation_min_age_ms_for_test(&self) -> u64 {
-        self.cache_invalidation_min_age_nanos.load(Ordering::Relaxed) / 1_000_000
+        self.cache_invalidation_min_age_nanos
+            .load(Ordering::Relaxed)
+            / 1_000_000
     }
 
     /// Live admitted series for one mesh family (exact reservation count).

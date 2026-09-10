@@ -18,13 +18,13 @@ use ferrum_edge::plugins::{
     ai_token_metrics::AiTokenMetrics, builtin_plugin_parity_meta, validate_plugin_config,
 };
 use ferrum_edge::proxy::tcp_proxy::StreamIoSide;
+use ferrum_edge::proxy::tcp_proxy::StreamIoSide;
 use ferrum_edge::retry::{
     ErrorClass, HTTP_METRICS_ERROR_CLASS_BOUND, HTTP_METRICS_GATEWAY_ERROR_CLASSES,
     HTTP_OBSERVABILITY_ERROR_CLASSES, OBS_CIRCUIT_BREAKER_OPEN, OBS_CONCURRENCY_LIMIT,
     OBS_CONFIG_STALE, OBS_OVERLOAD, intern_http_metrics_error_class,
     intern_http_observability_error_class,
 };
-use ferrum_edge::proxy::tcp_proxy::StreamIoSide;
 use ferrum_edge::retry::{
     ErrorClass, HTTP_METRICS_ERROR_CLASS_BOUND, HTTP_METRICS_GATEWAY_ERROR_CLASSES,
     HTTP_OBSERVABILITY_ERROR_CLASSES, OBS_CIRCUIT_BREAKER_OPEN, OBS_CONCURRENCY_LIMIT,
@@ -3187,7 +3187,9 @@ fn test_rejected_plugin_cache_rebuild_leaves_registry_policy_untouched() {
     assert_eq!(registry.namespace_label_fragment(), ",namespace=\"ferrum\"");
 
     let accepted = prometheus_gateway_config(vec![prometheus_plugin_config(60, 500, 2500)]);
-    cache.rebuild(&accepted).expect("accepted reload must still publish new tunables");
+    cache
+        .rebuild(&accepted)
+        .expect("accepted reload must still publish new tunables");
     assert_eq!(registry.render_cache_ttl_secs_for_test(), 60);
     assert_eq!(registry.cache_invalidation_min_age_ms_for_test(), 500);
     assert_eq!(registry.mesh_series_budget_per_family_for_test(), 2500);
