@@ -162,6 +162,8 @@ pub mod unix_backend;
 pub mod unix_backend_pool;
 pub mod upload_pump;
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
@@ -6010,7 +6012,9 @@ pub(crate) async fn run_final_request_body_hooks_with_provenance_in(
                 // the `UNAVAILABLE` a bare `503` would otherwise map to, which
                 // would claim the backend is down.
                 use crate::proxy::response_buffer_budget as budget;
-                warn!("Governed request body decode refused: request-decode budget exhausted");
+                warn_sampled!(
+                    "Governed request body decode refused: request-decode budget exhausted"
+                );
                 // The SAME gateway-capacity terminal state the retained-response
                 // refusal uses. Without it this fixed `503` is an ordinary
                 // rejection with no provenance, and the response-side finalizer
@@ -6043,7 +6047,7 @@ pub(crate) async fn run_final_request_body_hooks_with_provenance_in(
             FinalRequestBodyPosture::Reject(rejection) => {
                 // Fixed-cardinality reason only: no coding token, no header
                 // value, and no body byte reaches the log or the client.
-                warn!(
+                warn_sampled!(
                     reason = rejection.reason(),
                     "Governed request body could not be reduced to plaintext; failing closed"
                 );
@@ -19514,7 +19518,7 @@ where
                             let error_class = if let Some((close, limit_kind, size, max_size)) =
                                 size_limits_ctb.plugin_close_for_error(&e)
                             {
-                                warn!(
+                                warn_sampled!(
                                     plugin = "ws_message_size_limiting",
                                     proxy_id = %proxy_id_ctb,
                                     connection_id,
@@ -19536,7 +19540,7 @@ where
                             } else if let Some((close, limit_kind, size, max_size)) =
                                 EffectiveWsSizeLimits::global_capacity_close_for_error(&e)
                             {
-                                warn!(
+                                warn_sampled!(
                                     proxy_id = %proxy_id_ctb,
                                     connection_id,
                                     direction = "client->backend",
@@ -19555,7 +19559,7 @@ where
                             } else if let Some((close, limit_kind)) =
                                 ws_fragment_policy_close_for_error(&e)
                             {
-                                warn!(
+                                warn_sampled!(
                                     proxy_id = %proxy_id_ctb,
                                     connection_id,
                                     direction = "client->backend",
@@ -19840,7 +19844,7 @@ where
                             let error_class = if let Some((close, limit_kind, size, max_size)) =
                                 size_limits_btc.plugin_close_for_error(&e)
                             {
-                                warn!(
+                                warn_sampled!(
                                     plugin = "ws_message_size_limiting",
                                     proxy_id = %proxy_id_btc,
                                     connection_id,
@@ -19860,7 +19864,7 @@ where
                             } else if let Some((close, limit_kind, size, max_size)) =
                                 EffectiveWsSizeLimits::global_capacity_close_for_error(&e)
                             {
-                                warn!(
+                                warn_sampled!(
                                     proxy_id = %proxy_id_btc,
                                     connection_id,
                                     direction = "backend->client",
@@ -19879,7 +19883,7 @@ where
                             } else if let Some((close, limit_kind)) =
                                 ws_fragment_policy_close_for_error(&e)
                             {
-                                warn!(
+                                warn_sampled!(
                                     proxy_id = %proxy_id_btc,
                                     connection_id,
                                     direction = "backend->client",
@@ -22875,7 +22879,7 @@ async fn run_after_proxy_hooks_on_rejection(
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {
-                    warn!(
+                    warn_sampled!(
                         rejecting_plugin = plugin.name(),
                         "after_proxy rejection could not be normalized"
                     );
@@ -22944,7 +22948,7 @@ async fn run_after_proxy_hooks_on_rejection(
                         ctx.mark_final_body_policy_terminal_replacement();
                     }
                     if plugin.warn_on_rejection_response_replacement() {
-                        warn!(
+                        warn_sampled!(
                             rejecting_plugin = plugin.name(),
                             replacement_status = *status_code,
                             replaced_status,
@@ -22969,7 +22973,7 @@ async fn run_after_proxy_hooks_on_rejection(
                 // short-circuit — a federated 2xx missing usage metadata is still
                 // returned to the client. See docs/plugins.md (ai_rate_limiter
                 // federation limitation).
-                warn!(
+                warn_sampled!(
                     rejecting_plugin = plugin.name(),
                     attempted_reject_status = reject_status,
                     committed_status = *status_code,
@@ -23449,7 +23453,7 @@ async fn evaluate_final_synthetic_client_visible_response_body_policy(
             }
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let reject = plugin_result_into_reject_parts(reject).unwrap_or_else(|| {
-                    warn!(
+                    warn_sampled!(
                         plugin = plugin.name(),
                         "Final client-visible response policy re-decision could not be \
                          converted; failing closed"
@@ -23650,7 +23654,7 @@ async fn reenforce_final_synthetic_client_visible_response_body_policy(
                 if final_response_body_policy_scope(response_headers)
                     != gateway_authored_rejection_body_policy_scope()
                 {
-                    warn!(
+                    warn_sampled!(
                         "Final client-visible response body policy rejection rebuilt an unexpected \
                          representation; collapsing to the fixed gateway terminal"
                     );
@@ -24558,7 +24562,7 @@ pub(crate) async fn run_after_proxy_hooks(
                     mut headers,
                 } = plugin_result_into_reject_parts(reject)
                     .expect("reject result should convert to rejection parts");
-                warn!(
+                warn_sampled!(
                     "after_proxy plugin '{}' rejected response before downstream commit (status {})",
                     plugin.name(),
                     status_code,
@@ -26165,7 +26169,7 @@ pub(crate) fn install_pending_buffered_response_capacity_refusal(
     }
     if let Some(produced_bytes) = produced_bytes {
         ctx.mark_response_transform_size_refusal_selected();
-        warn!(
+        warn_sampled!(
             proxy_id = ctx.matched_proxy.as_ref().map(|proxy| proxy.id.as_str()),
             plugin = "response_transformer",
             produced_bytes_at_least = produced_bytes,
@@ -26303,7 +26307,7 @@ async fn replace_buffered_response_with_representation_error(
     initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
     apply_reject_after_proxy_hooks: bool,
 ) {
-    warn!(
+    warn_sampled!(
         reason = rejection.reason(),
         "Buffered response rejected: configured response body policy could not be enforced"
     );
@@ -26481,7 +26485,9 @@ pub(crate) async fn admit_buffered_response_body_transforms(
             // passive health, and adaptive concurrency, rather than the `502`
             // representation error that would blame the upstream
             // (GHSA-pwcm-6rh8-f2gh).
-            warn!("Response representation decode refused: retained-response budget exhausted");
+            warn_sampled!(
+                "Response representation decode refused: retained-response budget exhausted"
+            );
             replace_buffered_response_with_capacity_refusal_with_policy_source(
                 ctx,
                 response_status,
@@ -26501,7 +26507,7 @@ pub(crate) async fn admit_buffered_response_body_transforms(
                 // decode above does — never a forward of the claimed encoded
                 // bytes (GHSA-pwcm-6rh8-f2gh).
                 if !install_decoded_response_body(ctx, response_headers, response_body, decoded) {
-                    warn!(
+                    warn_sampled!(
                         "Response representation decode refused: retained-response budget exhausted"
                     );
                     replace_buffered_response_with_capacity_refusal_with_policy_source(
@@ -26635,7 +26641,7 @@ async fn run_final_client_visible_response_body_policy(
                     // body a policy just refused — so substitute the fixed,
                     // non-sensitive gateway terminal rather than continuing.
                     None => {
-                        warn!(
+                        warn_sampled!(
                             plugin = plugin.name(),
                             "Final client-visible response policy rejection could not be \
                              converted; failing closed"
@@ -27111,7 +27117,7 @@ async fn enforce_final_client_visible_response_header_policy(
             );
             return true;
         }
-        warn!(
+        warn_sampled!(
             "Final client-visible response header policy still refused the rebuilt rejection; \
              collapsing to the fixed gateway terminal"
         );
@@ -27217,7 +27223,7 @@ pub(crate) async fn enforce_buffered_final_client_visible_response_header_policy
             .await;
             return true;
         }
-        warn!(
+        warn_sampled!(
             "Final client-visible response header policy still refused the buffered rejection; \
              collapsing to the fixed protocol terminal"
         );
@@ -27413,7 +27419,9 @@ async fn transform_buffered_response_body_with_deadline_inner(
         match response_buffer_budget::ResponseTransformWindow::open(ceiling) {
             Some(window) => Some(window),
             None => {
-                warn!("Response body transform refused: retained-response budget exhausted");
+                warn_sampled!(
+                    "Response body transform refused: retained-response budget exhausted"
+                );
                 replace_buffered_response_with_capacity_refusal(
                     ctx,
                     response_status,
@@ -27454,7 +27462,7 @@ async fn transform_buffered_response_body_with_deadline_inner(
                 plugin.response_body_production(),
                 window.as_mut(),
             ) {
-                warn!(
+                warn_sampled!(
                     plugin = plugin.name(),
                     reason, "Response body transform refused before invoking the producer"
                 );
@@ -27547,7 +27555,7 @@ async fn transform_buffered_response_body_with_deadline_inner(
                 // refused rather than installed uncharged.
                 let transformed_len = transformed.len();
                 let Some(charged) = window.as_mut().and_then(|w| w.charge(transformed)) else {
-                    warn!(
+                    warn_sampled!(
                         plugin = plugin.name(),
                         replacement_bytes = transformed_len,
                         "Response body transform refused: replacement body is not covered by a \
@@ -41335,7 +41343,7 @@ pub(crate) async fn proxy_to_backend_retry(
                 &resp_headers,
                 effective_max_response_body_size_bytes,
             ) {
-                warn!(
+                warn_sampled!(
                     "Backend response body ({} bytes) exceeds limit ({} bytes)",
                     len, effective_max_response_body_size_bytes
                 );
@@ -42521,7 +42529,7 @@ fn buffered_backend_response_from_eager_collect(
             // Size POLICY, not process capacity: the origin sent more than the
             // operator allows to be retained. Kept separate from the aggregate
             // refusal above so telemetry and health accounting stay honest.
-            warn!(
+            warn_sampled!(
                 proxy_id = %proxy.id,
                 transport,
                 max_response_body_size_bytes = ceiling,
@@ -45154,7 +45162,7 @@ async fn proxy_to_backend(
             // contractual 413. Mirror the `Err`-branch check so the outcome is
             // deterministic across both arms of the race.
             if body_size_exceeded.load(Ordering::Acquire) {
-                warn!(
+                warn_sampled!(
                     proxy_id = %proxy.id,
                     backend_url = %strip_query_params(backend_url),
                     max_body_size = effective_max_request_body_size_bytes,
@@ -45215,7 +45223,7 @@ async fn proxy_to_backend(
                     &resp_headers,
                     effective_max_response_body_size_bytes,
                 ) {
-                    warn!(
+                    warn_sampled!(
                         "Backend response body ({} bytes) exceeds limit ({} bytes)",
                         len, effective_max_response_body_size_bytes
                     );
@@ -45532,7 +45540,7 @@ async fn proxy_to_backend(
             // Check if the error was caused by the streaming body exceeding
             // the size limit. If so, return 413 instead of generic 502.
             if body_size_exceeded.load(Ordering::Acquire) {
-                warn!(
+                warn_sampled!(
                     proxy_id = %proxy.id,
                     backend_url = %strip_query_params(backend_url),
                     max_body_size = effective_max_request_body_size_bytes,
@@ -45773,14 +45781,16 @@ fn buffered_collect_retain_failure(
 ) -> BufferedCollectFailure {
     match rejection {
         response_buffer_budget::RetainRejection::TooLarge => {
-            warn!(
+            warn_sampled!(
                 "Backend response truncated: exceeded {} byte limit",
                 max_size
             );
             BufferedCollectFailure::too_large()
         }
         response_buffer_budget::RetainRejection::BudgetExhausted => {
-            warn!("Response buffering refused: aggregate retained-response budget exhausted");
+            warn_sampled!(
+                "Response buffering refused: aggregate retained-response budget exhausted"
+            );
             BufferedCollectFailure::budget_exhausted()
         }
     }
@@ -47391,7 +47401,9 @@ fn hyper_collect_retain_error(
     match rejection {
         response_buffer_budget::RetainRejection::TooLarge => HyperBodyCollectError::TooLarge,
         response_buffer_budget::RetainRejection::BudgetExhausted => {
-            warn!("Response buffering refused: aggregate retained-response budget exhausted");
+            warn_sampled!(
+                "Response buffering refused: aggregate retained-response budget exhausted"
+            );
             HyperBodyCollectError::BudgetExhausted
         }
     }
@@ -47423,7 +47435,7 @@ fn response_buffer_capacity_response(
     resolved_ip: Option<String>,
     transport: &'static str,
 ) -> retry::BackendResponse {
-    warn!(
+    warn_sampled!(
         proxy_id = %proxy.id,
         transport = transport,
         "Response buffering refused: aggregate retained-response budget exhausted"
@@ -47452,7 +47464,7 @@ fn mesh_grpc_response_buffer_capacity_response(
     proxy: &Proxy,
     resolved_ip: Option<String>,
 ) -> retry::BackendResponse {
-    warn!(
+    warn_sampled!(
         proxy_id = %proxy.id,
         transport = "mesh-mtls-grpc",
         "gRPC response buffering refused: aggregate retained-response budget exhausted"
@@ -47582,7 +47594,9 @@ fn grpc_web_reframe_capacity_terminal(
     response_headers: &mut HashMap<String, String>,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) {
-    warn!("gRPC-Web trailer reframing refused: retained-response capacity unavailable");
+    warn_sampled!(
+        "gRPC-Web trailer reframing refused: retained-response capacity unavailable"
+    );
     replace_buffered_response_with_capacity_refusal(
         ctx,
         response_status,
@@ -47605,14 +47619,14 @@ fn mesh_transport_response_body_too_large_response(
     max_size: usize,
 ) -> retry::BackendResponse {
     match observed_size {
-        Some(size) => warn!(
+        Some(size) => warn_sampled!(
             proxy_id = %proxy.id,
             response_body_bytes = size,
             max_response_body_size_bytes = max_size,
             "{} backend response body exceeds configured size limit",
             transport.log_noun()
         ),
-        None => warn!(
+        None => warn_sampled!(
             proxy_id = %proxy.id,
             max_response_body_size_bytes = max_size,
             "{} backend response body exceeded configured size limit while buffering",
@@ -47644,14 +47658,14 @@ fn mesh_transport_request_body_too_large_response(
     max_size: usize,
 ) -> retry::BackendResponse {
     match observed_size {
-        Some(size) => warn!(
+        Some(size) => warn_sampled!(
             proxy_id = %proxy.id,
             request_body_bytes = size,
             max_request_body_size_bytes = max_size,
             "{} request body exceeds configured size limit",
             transport.log_noun()
         ),
-        None => warn!(
+        None => warn_sampled!(
             proxy_id = %proxy.id,
             max_request_body_size_bytes = max_size,
             "{} streaming request body exceeded configured size limit",
@@ -48726,13 +48740,13 @@ fn mesh_grpc_response_body_too_large_response(
     max_size: usize,
 ) -> retry::BackendResponse {
     match observed_size {
-        Some(size) => warn!(
+        Some(size) => warn_sampled!(
             proxy_id = %proxy.id,
             response_body_bytes = size,
             max_response_body_size_bytes = max_size,
             "sidecar mTLS gRPC backend response body exceeds configured size limit"
         ),
-        None => warn!(
+        None => warn_sampled!(
             proxy_id = %proxy.id,
             max_response_body_size_bytes = max_size,
             "sidecar mTLS gRPC backend response body exceeded configured size limit while buffering"
@@ -50689,7 +50703,7 @@ fn unix_request_body_too_large_response(
     resolved_ip: Option<String>,
     max_size: usize,
 ) -> retry::BackendResponse {
-    warn!(
+    warn_sampled!(
         proxy_id = %proxy.id,
         max_request_body_size_bytes = max_size,
         "Unix backend streaming request body exceeded configured size limit"
@@ -50714,13 +50728,13 @@ fn unix_response_body_too_large_response(
     max_size: usize,
 ) -> retry::BackendResponse {
     match observed_size {
-        Some(size) => warn!(
+        Some(size) => warn_sampled!(
             proxy_id = %proxy.id,
             response_body_bytes = size,
             max_response_body_size_bytes = max_size,
             "Unix backend response body exceeds configured size limit"
         ),
-        None => warn!(
+        None => warn_sampled!(
             proxy_id = %proxy.id,
             max_response_body_size_bytes = max_size,
             "Unix backend response body exceeded configured size limit while buffering"
@@ -53159,7 +53173,7 @@ async fn proxy_to_backend_http2(
         &resp_headers,
         effective_max_response_body_size_bytes,
     ) {
-        warn!(
+        warn_sampled!(
             proxy_id = %proxy.id,
             response_body_bytes = len,
             max_response_body_size_bytes = effective_max_response_body_size_bytes,
@@ -53244,7 +53258,7 @@ async fn proxy_to_backend_http2(
         let body_bytes = match collect_result {
             Ok(collected) => collected,
             Err(HyperBodyCollectError::TooLarge) => {
-                warn!(
+                warn_sampled!(
                     proxy_id = %proxy.id,
                     max_response_body_size_bytes = effective_max_response_body_size_bytes,
                     "HTTP/2 buffered body collection exceeded configured size limit"
@@ -54579,13 +54593,13 @@ fn h3_response_body_too_large_response(
     max_size: usize,
 ) -> retry::BackendResponse {
     match observed_size {
-        Some(size) => warn!(
+        Some(size) => warn_sampled!(
             proxy_id = %proxy.id,
             response_body_bytes = size,
             max_response_body_size_bytes = max_size,
             "HTTP/3 backend response body exceeds configured size limit"
         ),
-        None => warn!(
+        None => warn_sampled!(
             proxy_id = %proxy.id,
             max_response_body_size_bytes = max_size,
             "HTTP/3 backend response body exceeded configured size limit while streaming"
@@ -54936,7 +54950,7 @@ async fn proxy_to_backend_http3_retry(
             if effective_max_response_body_size_bytes > 0
                 && response.body.len() > effective_max_response_body_size_bytes
             {
-                warn!(
+                warn_sampled!(
                     "Backend response body ({} bytes) exceeds limit ({} bytes)",
                     response.body.len(),
                     effective_max_response_body_size_bytes

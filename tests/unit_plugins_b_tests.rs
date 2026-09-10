@@ -27,6 +27,7 @@ mod unit {
         mod key_auth_tests;
         mod ldap_auth_tests;
         mod load_testing_tests;
+        mod log_sampling_tests;
         mod logging_sink_lifecycle_tests;
         mod loki_logging_tests;
         mod mcp_aggregate_sse_tests;

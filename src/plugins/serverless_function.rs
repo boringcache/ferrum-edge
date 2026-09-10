@@ -69,6 +69,8 @@
 //! }
 //! ```
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
@@ -77,7 +79,7 @@ use http::header::{HeaderName, HeaderValue};
 use percent_encoding::percent_decode_str;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use url::{Host, Url};
 
 use super::utils::aws_sigv4;
@@ -892,7 +894,7 @@ impl ServerlessFunction {
     }
 
     fn failure_result(&self, ctx: &mut RequestContext, failure: InvocationFailure) -> PluginResult {
-        warn!(
+        warn_sampled!(
             error_class = failure.code,
             destination = %self.function_display_url,
             detail = %failure.operator_detail,
@@ -2829,7 +2831,7 @@ impl Plugin for ServerlessFunction {
         // is owned by the grpc_web plugin, and RejectBinary normalization cannot
         // synthesize a correct browser-facing response from the unary contract.
         if self.mode == InvocationMode::Terminate && is_grpc_web_terminate_request(headers, ctx) {
-            warn!(
+            warn_sampled!(
                 "serverless_function: terminate mode does not support gRPC-Web requests — \
                  use native application/grpc or HTTP terminate"
             );

@@ -5,6 +5,8 @@
 //! prompt injection, jailbreaks, prompt/system leakage, data exfiltration
 //! intent, indirect prompt injection, tool abuse, and business-topic policy.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use crate::fips::approved::Sha256;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -1756,7 +1758,7 @@ impl FirewallEngine {
             .filter_map(|m| m.snippet_hash.as_deref())
             .collect();
         if cut {
-            tracing::warn!(
+            warn_sampled!(
                 target: "ai_semantic_firewall",
                 direction = "response",
                 enforcement = "block",
@@ -1766,7 +1768,7 @@ impl FirewallEngine {
                 "streaming block: response window blocked by semantic firewall policy; stream cut"
             );
         } else {
-            tracing::warn!(
+            warn_sampled!(
                 target: "ai_semantic_firewall",
                 direction = "response",
                 enforcement = "detect",
@@ -1786,7 +1788,7 @@ impl FirewallEngine {
             return;
         }
         let provider_error = sanitize_provider_error(error);
-        tracing::warn!(
+        warn_sampled!(
             target: "ai_semantic_firewall",
             direction = "response",
             enforcement = "detect",
@@ -4970,7 +4972,7 @@ impl StreamInspector {
             StreamEnforcement::Block => "block",
             StreamEnforcement::Detect => "detect",
         };
-        tracing::warn!(
+        warn_sampled!(
             target: "ai_semantic_firewall",
             direction = "response",
             mode = self.engine.mode.as_str(),
@@ -5055,7 +5057,7 @@ impl StreamInspector {
             return;
         }
         self.degraded_logged = true;
-        tracing::warn!(
+        warn_sampled!(
             target: "ai_semantic_firewall",
             direction = "response",
             enforcement = "block",
@@ -5072,7 +5074,7 @@ impl StreamInspector {
             return;
         }
         self.dry_run_would_cut_logged = true;
-        tracing::warn!(
+        warn_sampled!(
             target: "ai_semantic_firewall",
             direction = "response",
             mode = "dry_run",
@@ -5296,7 +5298,7 @@ impl StreamInspector {
                         if !hold_timeout_logged.swap(true, Ordering::Relaxed) {
                             let max_hold_ms = budget.as_millis() as u64;
                             tracing::dispatcher::with_default(&dispatch, || {
-                                tracing::warn!(
+                                warn_sampled!(
                                     target: "ai_semantic_firewall",
                                     direction = "response",
                                     enforcement = "detect",

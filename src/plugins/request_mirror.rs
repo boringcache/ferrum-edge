@@ -268,6 +268,8 @@
 //! update, so integer wraparound of an unbounded counter cannot occur, cannot
 //! panic, and cannot bias a complete sampling cycle.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use percent_encoding::percent_decode_str;
@@ -2644,7 +2646,7 @@ impl Plugin for RequestMirror {
                 // Refused before the body was collected. The primary request
                 // was unaffected and stayed streaming; publish the attributable
                 // failure now that the target URL is known.
-                warn!(
+                warn_sampled!(
                     "request_mirror: dropped mirror request for {} {} at pre-buffer admission: {}",
                     method, mirror_url_for_log, reason
                 );
@@ -2664,7 +2666,7 @@ impl Plugin for RequestMirror {
                 Ok(permit) => (permit, None),
                 Err(_) => {
                     self.metrics.bump_concurrency_drop();
-                    warn!(
+                    warn_sampled!(
                         "request_mirror: dropping mirror request for {} {} because max_in_flight limit was reached",
                         method, mirror_url_for_log
                     );
@@ -2725,7 +2727,7 @@ impl Plugin for RequestMirror {
             Ok(lease) => lease,
             Err(reason) => {
                 self.metrics.bump_budget_drop();
-                warn!(
+                warn_sampled!(
                     "request_mirror: dropped mirror request for {} {} after body collection: {}",
                     method, mirror_url_for_log, reason
                 );
@@ -2808,7 +2810,7 @@ impl Plugin for RequestMirror {
                 Ok(client) => client,
                 Err(_) => {
                     task_guard.settle(MirrorTaskOutcome::RequestFailure);
-                    warn!(
+                    warn_sampled!(
                         "request_mirror: plugin HTTP client unavailable; failing closed for {}",
                         mirror_url_for_log
                     );
@@ -2900,7 +2902,7 @@ impl Plugin for RequestMirror {
                         }
                         MirrorDrainOutcome::Truncated { observed } => {
                             task_guard.settle(MirrorTaskOutcome::DrainTruncation);
-                            warn!(
+                            warn_sampled!(
                                 "request_mirror: response from {} truncated at {} bytes \
                                      (max_response_body_bytes = {}; advertised = {:?})",
                                 mirror_url_for_log, observed, max_response_body_bytes, advertised
@@ -2909,7 +2911,7 @@ impl Plugin for RequestMirror {
                         }
                         MirrorDrainOutcome::Timeout => {
                             task_guard.settle(MirrorTaskOutcome::DrainTimeout);
-                            warn!(
+                            warn_sampled!(
                                 "request_mirror: response body drain timed out for {}",
                                 mirror_url_for_log
                             );
@@ -2935,7 +2937,7 @@ impl Plugin for RequestMirror {
                     } else {
                         task_guard.settle(MirrorTaskOutcome::RequestFailure);
                     }
-                    warn!(
+                    warn_sampled!(
                         "request_mirror: failed to mirror {} {} → {}",
                         method, mirror_url_for_log, err
                     );

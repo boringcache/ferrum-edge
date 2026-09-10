@@ -4,6 +4,8 @@
 //! Agent-to-Agent protocol traffic over HTTP JSON-RPC, HTTP+JSON/REST, and
 //! gRPC. The plugin does not own A2A task state or route between agents in V1.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
@@ -12,7 +14,6 @@ use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::warn;
 use url::Url;
 
 use super::utils::policy_digest;
@@ -655,7 +656,7 @@ impl A2aGateway {
         if self.detection.max_request_body_size > 0
             && body.len() as u64 > self.detection.max_request_body_size
         {
-            warn!(
+            warn_sampled!(
                 body_size = body.len(),
                 max_request_body_size = self.detection.max_request_body_size,
                 "Skipping A2A JSON-RPC detection because request body exceeds plugin detection limit"
@@ -1087,7 +1088,7 @@ impl A2aGateway {
                     ctx.metadata
                         .insert("a2a.error".to_string(), diagnostic.to_string());
                 }
-                warn!(
+                warn_sampled!(
                     error = diagnostic,
                     "Failing closed on unrewritable gRPC Agent Card response"
                 );
@@ -1777,7 +1778,7 @@ impl Plugin for A2aGateway {
         };
         match self.jsonrpc_policy_terminal(ctx, &detection) {
             Some(terminal) => {
-                warn!(
+                warn_sampled!(
                     method = %detection.method,
                     "Refusing A2A request on the final backend-visible body"
                 );
@@ -1865,7 +1866,7 @@ impl Plugin for A2aGateway {
             ctx.metadata
                 .insert("a2a.error".to_string(), diagnostic.to_string());
         }
-        warn!(
+        warn_sampled!(
             error = diagnostic,
             "Failing closed on Agent Card rewrite failure after the producing phase"
         );

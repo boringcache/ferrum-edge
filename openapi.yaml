@@ -26312,6 +26312,11 @@ components:
         log_to_stdout:
           type: [boolean, "null"]
           default: false
+          description: >-
+            Emit structured WAF hit diagnostics. Warnings are sampled once per
+            source site per 10 seconds across instances, with suppressed-event
+            counts. Every hit remains available at debug level; transaction
+            metadata is controlled separately by log_to_metadata.
         scan_budget_ms:
           type: [integer, "null"]
           format: uint64

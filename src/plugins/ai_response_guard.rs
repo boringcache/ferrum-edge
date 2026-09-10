@@ -20,6 +20,8 @@
 //! closed for enforcing actions. Methods that were never enrolled are never
 //! inspected opportunistically and never forced onto the buffered path.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use flate2::bufread::GzDecoder;
 use flate2::write::GzEncoder;
@@ -1407,7 +1409,7 @@ impl AiResponseGuard {
                 }
             }
             GuardAction::Warn => {
-                warn!(
+                warn_sampled!(
                     "ai_response_guard: content detected (types: {:?}), passing through (warn mode)",
                     detected
                 );
@@ -3932,7 +3934,7 @@ impl Plugin for AiResponseGuard {
             .ai_response_guard_pending_redactions
             .remove(&self.instance_id)
         {
-            warn!(
+            warn_sampled!(
                 "ai_response_guard: detected content was not redacted before delivery (types: {}), rejecting response",
                 detected
             );
@@ -3958,7 +3960,7 @@ impl Plugin for AiResponseGuard {
         else {
             return PluginResult::Continue;
         };
-        warn!(
+        warn_sampled!(
             "ai_response_guard: detected content is still present in the final client-visible response (types: {}), rejecting response",
             detected
         );

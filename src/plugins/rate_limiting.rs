@@ -1,11 +1,12 @@
 //! General request rate limiting with optional Redis-backed failover.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tracing::warn;
 
 use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, ENFORCEMENT_UNAVAILABLE_BODY,
@@ -544,7 +545,7 @@ impl RateLimiting {
             // username, authenticated identity, SPIFFE ID, or client IP), so it
             // is never logged. Enforcement outcomes are attributed through the
             // transaction summary, which applies metadata redaction.
-            warn!(plugin = "rate_limiting", "Rate limit exceeded");
+            warn_sampled!(plugin = "rate_limiting", "Rate limit exceeded");
             return self.reject(&outcome);
         }
 
@@ -574,7 +575,7 @@ impl RateLimiting {
             }
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
             // Identity-bearing key deliberately omitted (see `check_rate`).
-            warn!(plugin = "rate_limiting", "Rate limit exceeded (stream)");
+            warn_sampled!(plugin = "rate_limiting", "Rate limit exceeded (stream)");
             return self.reject(&outcome);
         }
 

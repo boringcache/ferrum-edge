@@ -585,10 +585,23 @@ pub fn ensure_basic_auth_test_secret() {
 /// thread the subscriber is installed for.
 #[allow(dead_code)]
 pub fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+    capture_logs_at_level(tracing::Level::INFO)
+}
+
+/// Capture every event when a diagnostic's warning is shared and sampled.
+#[allow(dead_code)]
+pub fn capture_debug_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+    capture_logs_at_level(tracing::Level::DEBUG)
+}
+
+fn capture_logs_at_level(
+    level: tracing::Level,
+) -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
     install_interest_floor();
     let writer = CapturedLogs::default();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
+        .with_max_level(level)
         .with_target(false)
         .without_time()
         .with_writer(writer.clone())

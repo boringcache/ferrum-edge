@@ -6,6 +6,8 @@
 //! sensitive client headers and query credentials before forwarding request
 //! context to OPA.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -15,7 +17,7 @@ use http::header::{CONTENT_TYPE, HeaderName, HeaderValue};
 use serde::Serialize;
 use serde::ser::SerializeMap;
 use serde_json::{Map, Value};
-use tracing::{info, warn};
+use tracing::info;
 use url::{Host, Url};
 
 use crate::retry::classify_reqwest_error;
@@ -503,7 +505,7 @@ impl Opa {
     }
 
     fn on_error(&self, reason: &'static str, detail: String) -> PluginResult {
-        warn!(
+        warn_sampled!(
             plugin = "opa",
             reason = reason,
             detail = %detail,
@@ -562,7 +564,7 @@ impl Plugin for Opa {
             // The reason is a fixed-cardinality token; query bytes are
             // attacker-controlled and may carry credentials, so they are never
             // logged here.
-            warn!(
+            warn_sampled!(
                 plugin = "opa",
                 reason = "ambiguous_query",
                 ambiguity = ambiguity.reason(),

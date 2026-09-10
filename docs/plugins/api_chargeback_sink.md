@@ -661,6 +661,10 @@ handoff actually accepts the job; a saturated or closed delivery queue is
 counted by `chargeback_sink_spool_jobs_lost_total` /
 `chargeback_sink_spool_events_lost_total` instead (with rate-limited warnings)
 and must not be reported as a successful diversion or enqueue.
+Async spool-write failures and exhausted exports with spooling disabled use the
+shared warning sampler: one warning per source site per 10 seconds across
+instances, with `suppressed_events` counts. Every failure remains at debug level;
+delivery and loss counters retain their existing accounting.
 `events_enqueued_total` / `chargeback_sink_events_enqueued_total` counts channel
 admission or an overflow handoff that actually succeeded. Request and body
 terminal hooks only enqueue to that worker; compression, directory scans,

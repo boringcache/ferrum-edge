@@ -53,6 +53,8 @@
 //! fields will ignore them, so operators must upgrade DPs before relying on
 //! collapsed routes that clear inherited retry or timeout policy.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,7 +63,6 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::warn;
 
 use crate::config::types::{
     BackendTlsConfig, BackoffStrategy, MAX_BACKEND_HOST_LENGTH,
@@ -1904,7 +1905,7 @@ impl Plugin for MeshRouteDispatch {
             if let Some(ambiguity) = query.first_ambiguity() {
                 // Fixed-cardinality reason only — the query is
                 // attacker-controlled and may carry credentials.
-                warn!(
+                warn_sampled!(
                     plugin = "mesh_route_dispatch",
                     reason = "ambiguous_query",
                     ambiguity = ambiguity.reason(),

@@ -18,6 +18,8 @@
 //!
 //! gRPC metadata maps to HTTP/2 headers, so existing auth plugins work unchanged.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -2320,13 +2322,13 @@ pub fn grpc_request_body_too_large_backend_response(
     max_size: usize,
 ) -> crate::retry::BackendResponse {
     match observed_size {
-        Some(size) => warn!(
+        Some(size) => warn_sampled!(
             proxy_id = %proxy_id,
             request_body_bytes = size,
             max_grpc_recv_size_bytes = max_size,
             "gRPC request body exceeds configured receive limit on mesh dispatch"
         ),
-        None => warn!(
+        None => warn_sampled!(
             proxy_id = %proxy_id,
             max_grpc_recv_size_bytes = max_size,
             "gRPC streaming request body exceeded configured receive limit on mesh dispatch"
@@ -4505,7 +4507,9 @@ async fn proxy_grpc_streaming_dispatch(
             tokio::time::timeout_at(deadline, send_fut)
                 .await
                 .map_err(|_| {
-                    warn!("gRPC deadline exceeded waiting for streaming RPC response headers");
+                    warn_sampled!(
+                        "gRPC deadline exceeded waiting for streaming RPC response headers"
+                    );
                     GrpcProxyError::ClientDeadlineExceeded(
                         "gRPC deadline exceeded waiting for streaming RPC response headers"
                             .to_string(),
@@ -4515,7 +4519,7 @@ async fn proxy_grpc_streaming_dispatch(
             tokio::time::timeout(Duration::from_millis(timeout_ms), send_fut)
                 .await
                 .map_err(|_| {
-                    warn!(
+                    warn_sampled!(
                         "gRPC: timeout ({}ms) waiting for streaming RPC completion",
                         timeout_ms
                     );
@@ -4565,7 +4569,7 @@ async fn proxy_grpc_streaming_dispatch(
                         max_grpc_recv_size_bytes
                     )));
                 }
-                warn!(
+                warn_sampled!(
                     watermark_ms = proxy.backend_write_timeout_ms,
                     "gRPC backend write watermark expired before response headers"
                 );
@@ -4994,13 +4998,15 @@ pub(crate) async fn proxy_grpc_request_core(
                 .await
                 .map_err(|_| {
                     if response_deadline_is_client {
-                        warn!("gRPC client deadline exceeded waiting for backend response headers");
+                        warn_sampled!(
+                            "gRPC client deadline exceeded waiting for backend response headers"
+                        );
                         GrpcProxyError::ClientDeadlineExceeded(
                             "gRPC deadline exceeded waiting for backend response headers"
                                 .to_string(),
                         )
                     } else {
-                        warn!(
+                        warn_sampled!(
                             "gRPC: read timeout ({}ms, end-to-end) waiting for backend response",
                             timeout_ms
                         );
@@ -5015,7 +5021,7 @@ pub(crate) async fn proxy_grpc_request_core(
             tokio::time::timeout(Duration::from_millis(timeout_ms), send_fut)
                 .await
                 .map_err(|_| {
-                    warn!(
+                    warn_sampled!(
                         "gRPC: read timeout ({}ms) waiting for backend response",
                         timeout_ms
                     );
@@ -5042,7 +5048,7 @@ pub(crate) async fn proxy_grpc_request_core(
                 if let Some(pump) = upload_pump.take() {
                     pump.cancel_and_join().await;
                 }
-                warn!(
+                warn_sampled!(
                     watermark_ms = proxy.backend_write_timeout_ms,
                     "gRPC buffered backend write watermark expired before response headers"
                 );
@@ -5177,7 +5183,7 @@ pub(crate) async fn proxy_grpc_request_core(
                     // circuit-breaker/admission SUCCESS for a failed exchange.
                     // h2 trailers are the final frame, so an error here always
                     // means the response never completed.
-                    warn!("gRPC: error reading backend response frame: {}", e);
+                    warn_sampled!("gRPC: error reading backend response frame: {}", e);
                     return Err(GrpcProxyError::backend_unavailable_with_source(
                         GrpcBackendUnavailableKind::BackendRequest,
                         format!("Error reading backend response body: {}", e),
@@ -5197,12 +5203,14 @@ pub(crate) async fn proxy_grpc_request_core(
             .await
             .map_err(|_| {
                 if response_deadline_is_client {
-                    warn!("gRPC client deadline exceeded while collecting response body");
+                    warn_sampled!(
+                        "gRPC client deadline exceeded while collecting response body"
+                    );
                     GrpcProxyError::ClientDeadlineExceeded(
                         "gRPC deadline exceeded while collecting response body".to_string(),
                     )
                 } else {
-                    warn!(
+                    warn_sampled!(
                         "gRPC: read timeout ({}ms, end-to-end) while collecting response body",
                         timeout_ms
                     );
@@ -5220,7 +5228,7 @@ pub(crate) async fn proxy_grpc_request_core(
         tokio::time::timeout(Duration::from_millis(timeout_ms), body_collection)
             .await
             .map_err(|_| {
-                warn!(
+                warn_sampled!(
                     "gRPC: read timeout ({}ms) while collecting response body",
                     timeout_ms
                 );
