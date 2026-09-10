@@ -1692,12 +1692,31 @@ async fn test_dtls_connection_send_rejects_oversized_plaintext() {
         .expect_err("oversized plaintext must fail");
     assert!(err.to_string().contains("max_plaintext"), "got: {err}");
 
-    // Exact in-limit boundary must complete successfully.
-    let exact = vec![b'y'; max];
+    // An in-limit payload must actually reach the wire. Sized under the
+    // smallest default UDP datagram ceiling among supported hosts — Darwin's
+    // `net.inet.udp.maxdgram` is 9216, where the ~16 KiB record the plaintext
+    // ceiling admits is rejected by the socket with EMSGSIZE (issue #4983).
+    // That is a host property, not a DTLS one, so proving transport and
+    // proving the size gate are two separate assertions.
+    const PORTABLE_IN_LIMIT_BYTES: usize = 8 * 1024;
+    let in_limit = vec![b'z'; PORTABLE_IN_LIMIT_BYTES.min(max)];
     client
-        .send(&exact)
+        .send(&in_limit)
         .await
-        .expect("exact max_plaintext send must succeed");
+        .expect("an in-limit send within every host's datagram ceiling must succeed");
+
+    // The exact ceiling is admitted by the size gate on every host. Where the
+    // host can carry the resulting datagram it also completes; where it cannot,
+    // the failure must come from the socket, never from `max_plaintext`. A
+    // connected-socket send error is per-datagram and retains the association,
+    // so the close assertions below still hold either way.
+    let exact = vec![b'y'; max];
+    if let Err(error) = client.send(&exact).await {
+        assert!(
+            !error.to_string().contains("max_plaintext"),
+            "the exact ceiling must not be rejected by the plaintext size gate: {error}"
+        );
+    }
 
     // Connection close must propagate as a send failure (not hang).
     server_conn.close().await;

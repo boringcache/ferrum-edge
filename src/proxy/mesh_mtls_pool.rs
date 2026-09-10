@@ -32,7 +32,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 use tracing::debug;
 
@@ -40,6 +39,7 @@ use crate::config::PoolConfig;
 use crate::config::types::{Proxy, UpstreamTarget};
 use crate::dns::DnsCache;
 use crate::identity::{SharedSvidBundle, SpiffeId, SvidBundle, TrustDomain};
+use crate::pool::{SharedCreationRole, SharedCreationSlot};
 use crate::proxy::body::{ReplayableRequestBody, SizeLimitedIncoming};
 use crate::proxy::mesh_trust_registry::{
     MESH_TRUST_WITHDRAWN_MESSAGE, MeshTransportGate, MeshTransportKind, MeshTransportRegistration,
@@ -586,9 +586,19 @@ const MAX_RETIRED_SVID_GENERATIONS: usize = 16;
 /// must not grow unbounded either.
 const MAX_RETIRED_FINGERPRINTS_PER_GENERATION: usize = 8;
 
+/// Per-key coalesced-creation slot for the sidecar mesh-mTLS pool (issue
+/// #5046). Same shape as the HBONE pool's slot: the serialization mutex the
+/// pool has always used, plus a generation-scoped broadcast of the creator's
+/// own typed [`HbonePoolError`] (shared behind an `Arc`, rebuilt per waiter
+/// with [`HbonePoolError::clone_for_broadcast`]).
+pub(crate) type MeshMtlsCreationSlot = SharedCreationSlot<Arc<HbonePoolError>>;
+
 pub struct MeshMtlsConnectionPool {
     entries: DashMap<String, Vec<MeshMtlsPoolEntry>>,
-    creation_locks: DashMap<String, Arc<Mutex<()>>>,
+    /// Per-key creation slots: the serialization mutex plus the failure
+    /// broadcast that releases every caller queued behind a failed dial
+    /// instead of letting each repeat it (issue #5046).
+    creation_locks: DashMap<String, Arc<MeshMtlsCreationSlot>>,
     gateway_svid: SharedSvidBundle,
     crls: crate::tls::SharedCrlList,
     svid_identity_cache: ArcSwap<Option<MeshMtlsSvidIdentityCache>>,
@@ -1378,21 +1388,39 @@ impl MeshMtlsConnectionPool {
             .unwrap_or(proxy.backend_connect_timeout_ms);
         let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
         let creation_started = Instant::now();
-        let creation_lock = self
+        let creation_slot = self
             .creation_locks
             .entry(key.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .or_insert_with(|| Arc::new(MeshMtlsCreationSlot::new()))
             .clone();
-        let _creation_guard = tokio::time::timeout(connect_timeout, creation_lock.lock())
-            .await
-            .map_err(|_| HbonePoolError::ConnectTimeout {
-                addr: format!("{target_host}:{mtls_port}"),
-                timeout_ms: effective_connect_timeout_ms,
-            })?;
+        // Join the cohort BEFORE awaiting the lock: subscribing is what scopes
+        // this caller to the attempt that is in flight right now, so it can be
+        // released by that attempt's failure instead of repeating the dial
+        // (issue #5046). Every waiter keeps its OWN `connect_timeout` here.
+        let cohort = creation_slot.join();
+        let joined = tokio::time::timeout(connect_timeout, cohort.wait()).await;
+        let mut creation_lease = match joined {
+            Ok(SharedCreationRole::Creator(lease)) => lease,
+            Ok(SharedCreationRole::Failed(shared)) => return Err(shared.clone_for_broadcast()),
+            Err(_) => {
+                return Err(HbonePoolError::ConnectTimeout {
+                    addr: format!("{target_host}:{mtls_port}"),
+                    timeout_ms: effective_connect_timeout_ms,
+                });
+            }
+        };
         // Double-check under the creation lock: a coalesced waiter may find the
         // winner's connection already inserted.
         if let Some(transport) = self.cached_sender(key, max_entries) {
             return Ok(transport);
+        }
+        // A concurrent creator for this key failed while this caller was queued
+        // for the creation lock: adopt that cohort's typed outcome instead of
+        // repeating the same dial (issue #5046). Checked AFTER the cache
+        // re-check so a usable connection always wins over a shared failure,
+        // and before any budget is spent on a dial.
+        if let Some(shared) = creation_lease.take_broadcast_failure() {
+            return Err(shared.clone_for_broadcast());
         }
 
         let remaining = crate::pool::remaining_connect_timeout(creation_started, connect_timeout)
@@ -1443,11 +1471,26 @@ impl MeshMtlsConnectionPool {
             Ok(Err(err)) => {
                 crate::runtime_metrics::global_ref()
                     .record_pool_failure(crate::runtime_metrics::PoolKind::MeshMtls);
+                // Release the whole cohort on this one physical dial: every
+                // caller that joined while it was in flight gets the same typed
+                // outcome rather than taking the lock and repeating it (issue
+                // #5046). Published while the lock is still held, so no waiter
+                // can slip past the broadcast. `record_pool_failure` stays on
+                // the creator alone — one physical dial, one pool failure —
+                // while each waiter still reports its own logical outcome.
+                creation_lease.publish_failure(Arc::new(err.clone_for_broadcast()));
                 return Err(err);
             }
             Err(_) => {
                 crate::runtime_metrics::global_ref()
                     .record_pool_failure(crate::runtime_metrics::PoolKind::MeshMtls);
+                // Deliberately NOT broadcast: this is the CREATOR's own connect
+                // budget expiring, not evidence about the peer. A waiter may
+                // have a longer deadline (per-port `connect_timeout_ms`
+                // overrides are not part of the pool key), and #5046 requires
+                // each waiter's original deadline to survive — so the lease
+                // drops without publishing and the next waiter is elected as a
+                // fresh creator with its own remaining budget.
                 return Err(HbonePoolError::ConnectTimeout {
                     addr: format!("{target_host}:{mtls_port}"),
                     timeout_ms: effective_connect_timeout_ms,
@@ -2508,7 +2551,7 @@ mod tests {
     fn insert_empty_entry(pool: &MeshMtlsConnectionPool, key: &str) {
         pool.entries.insert(key.to_string(), Vec::new());
         pool.creation_locks
-            .insert(key.to_string(), Arc::new(Mutex::new(())));
+            .insert(key.to_string(), Arc::new(MeshMtlsCreationSlot::new()));
     }
 
     #[test]
