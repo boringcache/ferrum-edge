@@ -662,6 +662,52 @@ async fn test_otel_tracing_exports_stream_disconnect_span() {
 }
 
 #[tokio::test]
+async fn test_workload_metrics_exporters_preserve_composed_custom_tags() {
+    let first_server = wiremock::MockServer::start().await;
+    let second_server = wiremock::MockServer::start().await;
+    let mut plugins = Vec::new();
+    for (server, tag) in [(&first_server, "first"), (&second_server, "second")] {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(server)
+            .await;
+        plugins.push(
+            WorkloadMetrics::new(&json!({
+                "sampling_percentage": 100,
+                "custom_tags": {tag: tag},
+                "batch_size": 1,
+                "tracing_provider": {
+                    "kind": "opentelemetry",
+                    "config": {"endpoint": format!("{}/v1/traces", server.uri())}
+                }
+            }))
+            .unwrap(),
+        );
+    }
+    plugins.push(WorkloadMetrics::new(&json!({"custom_tags": {"third": "metrics-only"}})).unwrap());
+    let mut ctx = make_ctx();
+    let mut headers = HashMap::new();
+    for plugin in &plugins {
+        plugin.on_request_received(&mut ctx).await;
+    }
+    for plugin in &plugins {
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+    }
+    let summary = make_summary(ctx.metadata);
+    for plugin in &plugins {
+        plugin.log(&summary).await;
+    }
+    for server in [&first_server, &second_server] {
+        let payload = received_json(server).await;
+        let span = &payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(otlp_string_attr(span, "first"), Some("first"));
+        assert_eq!(otlp_string_attr(span, "second"), Some("second"));
+        assert_eq!(otlp_string_attr(span, "third"), Some("metrics-only"));
+    }
+}
+
+#[tokio::test]
 async fn test_workload_metrics_opentelemetry_exporter_payload() {
     let mock_server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))

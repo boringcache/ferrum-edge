@@ -3677,6 +3677,18 @@ Each section (tracing, metrics, access logging) is merged independently. Within 
 
 **Tracing configuration**:
 
+For direct plugin configuration outside Istio translation, see the complete
+[`workload_metrics` standalone reference](plugins.md#standalone-configuration),
+including provider envelopes, disable aliases, sampling omission, resource-name
+defaults, and exporter queue/retry ranges. Malformed recognized field types
+are constructor errors; OptionalFailOpen warns and omits the invalid instance.
+Across multiple effective instances, custom tag names compose within a shared
+32-name admission bound; later stamped values take precedence. A skipped or
+empty instance does not erase earlier tag names. The HTTP-family service graph
+records one observation per terminal client transaction regardless of instance
+count, honors memoized triggers, and counts nonzero final gRPC status as an
+error (including native and translated gRPC-Web outcomes).
+
 - `sampling_percentage`: 0.0--100.0. New root traces use a probabilistic PRNG decision; valid upstream W3C `traceparent` and B3 sampling decisions are inherited unchanged.
 - `custom_tags`: literal key-value tags injected into every span. Tags merge by key across matching Telemetry scopes; a more-specific scope overrides only keys it names. A source change for a named tag is exclusive: literal, header, or environment replaces the less-specific source and its fallback rather than leaving both active.
 - `custom_header_tags`: tags resolved from request headers at runtime. Header tags merge by key with the same more-specific-overrides behavior as literal tags. Credential-bearing source headers (`Authorization`, cookies, API/auth/CSRF tokens, and operator-configured sensitive metadata names) are rejected. Custom tag names cannot collide with `mesh.*`, `mesh_authz.*`, trace identity/sampling controls, or other reserved telemetry keys. A workload-metrics instance accepts at most 32 custom tags, 128-byte names, and 1024-byte values; an oversized runtime header value is omitted.

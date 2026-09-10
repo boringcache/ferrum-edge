@@ -22475,7 +22475,56 @@ components:
         `custom_tags`, `custom_header_tags`, and `custom_env_tags` combined. The
         individual `maxProperties: 32` bounds remain for generated clients, but
         the cross-property combined total cannot be expressed mechanically.
+        The same 32-name union bound applies across every effective instance
+        on a proxy, including potentially triggered instances. Names compose;
+        later instances win for values they stamp. Invalid root/field types
+        are construction errors; OptionalFailOpen warns and omits the instance.
       additionalProperties: false
+      allOf:
+        - if:
+            allOf:
+              - not:
+                  anyOf:
+                    - required: [span_reporting_disabled]
+                      properties:
+                        span_reporting_disabled: {const: true}
+                    - required: [disable_span_reporting]
+                      not: {required: [span_reporting_disabled]}
+                      properties:
+                        disable_span_reporting: {const: true}
+                    - required: [disableSpanReporting]
+                      not:
+                        anyOf:
+                          - required: [span_reporting_disabled]
+                          - required: [disable_span_reporting]
+                      properties:
+                        disableSpanReporting: {const: true}
+              - anyOf:
+                  - required: [tracing_providers]
+                    properties:
+                      tracing_providers: {type: array, minItems: 1}
+                  - required: [tracing_provider]
+                    not: {required: [tracing_providers]}
+                    properties:
+                      tracing_provider: {type: object}
+          then:
+            properties:
+              service_name: {pattern: '\S'}
+              deployment_environment: {pattern: '\S'}
+              batch_size: {minimum: 1, maximum: 10000}
+              flush_interval_ms: {minimum: 100, maximum: 600000}
+              buffer_capacity: {minimum: 1, maximum: 100000}
+              buffer_max_bytes: {minimum: 65536, maximum: 268435456}
+              max_retries: {minimum: 0, maximum: 10}
+              retry_delay_ms: {minimum: 0, maximum: 60000}
+        - if:
+            not: {required: [tracing_providers]}
+          then:
+            properties:
+              tracing_provider:
+                anyOf:
+                  - type: "null"
+                  - $ref: '#/components/schemas/WorkloadMetricsConfig/$defs/provider'
       properties:
         node_id:
           type: string
@@ -22493,14 +22542,20 @@ components:
           type: object
           additionalProperties:
             type: string
-          description: Static workload labels to inject as `mesh.*` metadata keys on every transaction.
+          description: |
+            Workload label hints, not arbitrary metadata injection. Workload
+            selects the first nonblank canonical-name, app.kubernetes.io/name,
+            app, k8s-app, or workload label, then the SPIFFE service account.
+            App selects app.kubernetes.io/name, app, or k8s-app; service selects
+            service.istio.io/canonical-name, service, or app. Both fall back to
+            workload, whose final fallback is unknown.
         trust_domain_aliases:
-          type: array
+          type: [array, "null"]
           items:
             type: string
           description: Additional SPIFFE trust domains accepted as equivalent to the workload's trust domain.
         trusted_hbone_assertors:
-          type: array
+          type: [array, "null"]
           items:
             oneOf:
               - type: string
@@ -22510,17 +22565,23 @@ components:
                   assertor:
                     type: string
                   asserts:
-                    type: array
+                    type: [array, "null"]
                     items:
                       type: string
                   scope:
-                    type: string
-                    enum: [same_namespace, mesh_wide]
+                    type: [string, "null"]
+                    pattern: '^\s*(same_namespace|mesh_wide)\s*$'
                     description: |
                       `mesh_wide` requires `assertor` to be a full, exactly
                       matched `spiffe://` ID; bare service-account matchers are
                       rejected.
                 additionalProperties: false
+                allOf:
+                  - not:
+                      required: [asserts, scope]
+                      properties:
+                        asserts: {type: array}
+                        scope: {type: string}
           default: ["ztunnel", "waypoint"]
           description: |
             Allow-list of identity-asserting infrastructure components whose
@@ -22528,7 +22589,8 @@ components:
             metrics source attribution. Bare service-account names match any
             peer whose SPIFFE path ends with `/sa/<name>`; full SPIFFE IDs
             match exactly. Default is `["ztunnel", "waypoint"]`. Explicit
-            empty array disables baggage-derived source attribution.
+            empty array disables baggage-derived source attribution. Null
+            selects the default, as does omission.
 
             Identical schema and identical semantics to the `mesh_authz` field
             of the same name — the two plugins share ONE relation, so telemetry
@@ -22550,9 +22612,13 @@ components:
             baseline arrives over native/file/xDS mesh config rather than the
             CRD watcher. Non-numeric or out-of-range ProxyConfig / Telemetry
             sampling values fail closed at Kubernetes translation.
+            Direct standalone omission leaves new roots unsampled; a valid
+            upstream W3C or B3 sampling decision is still inherited.
         custom_tags:
           type: object
           maxProperties: 32
+          propertyNames:
+            $ref: '#/components/schemas/WorkloadMetricsConfig/$defs/customTagName'
           additionalProperties:
             type: string
             maxLength: 1024
@@ -22567,8 +22633,12 @@ components:
         custom_header_tags:
           type: object
           maxProperties: 32
+          propertyNames:
+            $ref: '#/components/schemas/WorkloadMetricsConfig/$defs/customTagName'
           additionalProperties:
             type: string
+            minLength: 1
+            pattern: '^[!#$%&''*+.^_`|~0-9A-Za-z-]+$'
           description: |
             Custom tags populated from request headers (`tag_name ->
             header_name`). Credential-bearing source headers and reserved or
@@ -22578,6 +22648,8 @@ components:
         custom_env_tags:
           type: object
           maxProperties: 32
+          propertyNames:
+            $ref: '#/components/schemas/WorkloadMetricsConfig/$defs/customTagName'
           additionalProperties:
             type: string
             maxLength: 256
@@ -22613,7 +22685,7 @@ components:
                 required: [name, operation]
                 properties:
                   metric:
-                    type: string
+                    type: [string, "null"]
                     description: |
                       Metric family targeted by this override. Supported values
                       are `REQUEST_COUNT`, `REQUEST_DURATION`, `REQUEST_SIZE`,
@@ -22622,10 +22694,9 @@ components:
                       `TCP_RECEIVED_BYTES`, `GRPC_REQUEST_MESSAGES`,
                       `GRPC_RESPONSE_MESSAGES`, their matching `ferrum_mesh_*`
                       metric names, and `ALL_METRICS`; omitted means all
-                      metrics. Recognized Istio standard families Ferrum does
-                      not emit are accepted and ignored with a bounded
-                      construction-time warning; unknown families remain
-                      configuration errors.
+                      metrics, as does null. Other names fail direct plugin
+                      construction. Istio translation separately warns and
+                      omits recognized families Ferrum does not emit.
                   name:
                     type: string
                     description: |
@@ -22634,6 +22705,24 @@ components:
                   operation:
                     type: object
                     required: [type]
+                    allOf:
+                      - if:
+                          properties:
+                            type: {const: rename}
+                        then:
+                          required: [new_name]
+                      - if:
+                          properties:
+                            type: {const: set}
+                        then:
+                          required: [value]
+                      - if:
+                          properties:
+                            type: {const: set_expr}
+                        then:
+                          anyOf:
+                            - required: [expression]
+                            - required: [cel]
                     description: |
                       One of `{"type": "remove"}`,
                       `{"type": "rename", "new_name": "..."}`,
@@ -22692,7 +22781,7 @@ components:
                           so a multibyte expression can be rejected
                           below 512 characters.
                       expression:
-                        type: object
+                        $ref: '#/components/schemas/WorkloadMetricsConfig/$defs/celExpression'
                         description: |
                           Precompiled CEL AST produced by Telemetry translation
                           / materialization (`op`: `literal`, `attribute`,
@@ -22713,22 +22802,22 @@ components:
                 `TCP_CLOSED_CONNECTIONS`, `TCP_SENT_BYTES`,
                 `TCP_RECEIVED_BYTES`, `GRPC_REQUEST_MESSAGES`,
                 `GRPC_RESPONSE_MESSAGES`, their matching `ferrum_mesh_*` metric
-                names, and `ALL_METRICS`. Recognized Istio standard families
-                Ferrum does not emit are accepted and ignored with a bounded
-                construction-time warning; unknown families remain errors.
+                names, and `ALL_METRICS`. Other names fail direct construction;
+                Istio translation separately warns and omits recognized
+                families Ferrum does not emit.
         tracing_providers:
-          type: array
+          type: [array, "null"]
           items:
-            type: object
+            $ref: '#/components/schemas/WorkloadMetricsConfig/$defs/provider'
           description: |
             Per-provider tracing exporters surfaced from the Istio Telemetry
             CRD via the mesh slice. Also enables trace-context propagation
-            when span reporting is disabled.
+            when span reporting is disabled. Present null or [] disables
+            exporters and overrides the singular fallback.
         tracing_provider:
-          type: object
           description: |
             Singular tracing exporter fallback. Ignored when
-            `tracing_providers` is present.
+            `tracing_providers` is present. Omitted/null means no provider.
         span_reporting_disabled:
           type: boolean
           default: false
@@ -22738,8 +22827,9 @@ components:
         service_name:
           type: string
           description: |
-            Service name attached to exported spans. Defaults to the
-            workload's service when omitted.
+            Service name attached to exported spans. Defaults to
+            ferrum-edge-mesh-<namespace> for a nonblank namespace, otherwise
+            ferrum-edge-mesh. Must be nonblank when exporters are active.
         deployment_environment:
           type: string
           description: |
@@ -22748,31 +22838,49 @@ components:
             root config object.
         batch_size:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          default: 50
           description: |
             Span export batch size. Read by the shared OTel exporter options
             off this same root config object.
         flush_interval_ms:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          default: 5000
           description: |
             Span export flush interval in milliseconds. Read by the shared
             OTel exporter options off this same root config object.
         buffer_capacity:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          default: 10000
           description: |
             Maximum buffered spans awaiting export. Read by the shared OTel
             exporter options off this same root config object.
         buffer_max_bytes:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          default: 16777216
           description: |
             Maximum retained bytes of buffered spans. Read by the shared OTel
             exporter options off this same root config object.
         max_retries:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          default: 2
           description: |
             Span export retry attempts. Read by the shared OTel exporter
             options off this same root config object.
         retry_delay_ms:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          default: 1000
           description: |
             Delay between span export retries, in milliseconds. Read by the
             shared OTel exporter options off this same root config object.
@@ -22789,35 +22897,151 @@ components:
             with the Istio Telemetry CRD field name. Ignored when either
             snake_case spelling is present.
         direction_emit:
-          type: object
-          additionalProperties: false
+          type: [object, "null"]
           properties:
             server:
               type: boolean
+              default: true
             client:
               type: boolean
+              default: false
           description: |
             Which traffic directions emit telemetry, translated from
-            `Telemetry.tracing[].match.mode`. Defaults to server-only.
+            `Telemetry.tracing[].match.mode`. Omitted/null defaults to
+            server-only. Unknown nested fields are ignored.
         _effective_mesh_authz_baggage_gates:
           type: array
+          minItems: 1
+          maxItems: 16
           items:
             type: object
             additionalProperties: false
             properties:
               trusted_hbone_assertors:
-                type: array
-                items:
-                  type: object
+                $ref: '#/components/schemas/WorkloadMetricsConfig/properties/trusted_hbone_assertors'
               trust_domain_aliases:
-                type: array
-                items:
-                  type: string
+                $ref: '#/components/schemas/WorkloadMetricsConfig/properties/trust_domain_aliases'
           description: |
             Internal mesh-injection field: an exact copy of every enabled
             global `mesh_authz` baggage gate, evaluated as a fail-closed
             conjunction. Not operator-facing; direct instances configure
             `trusted_hbone_assertors` / `trust_domain_aliases` instead.
+      $defs:
+        customTagName:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[A-Za-z0-9_.-]+$'
+          description: |
+            Runtime additionally rejects reserved telemetry names and sensitive
+            names, including operator-configured classifiers. String/label
+            byte limits and cross-map/cross-instance unions are checked at
+            admission; JSON Schema maxLength counts Unicode characters.
+        provider:
+          type: object
+          required: [kind, config]
+          discriminator:
+            propertyName: kind
+          oneOf:
+            - properties:
+                kind: {const: opentelemetry}
+                config:
+                  type: object
+                  required: [endpoint]
+                  properties:
+                    endpoint: {type: string}
+            - properties:
+                kind: {const: zipkin}
+                config:
+                  type: object
+                  required: [url]
+                  properties:
+                    url: {type: string}
+            - properties:
+                kind: {const: datadog}
+                config:
+                  type: object
+                  required: [agent_url]
+                  properties:
+                    agent_url: {type: string}
+                    service: {type: [string, "null"]}
+            - properties:
+                kind: {const: lightstep}
+                config:
+                  type: object
+                  anyOf:
+                    - required: [collector_url, access_token_env]
+                    - required: [collector_url, accessTokenEnv]
+                  not: {required: [access_token_env, accessTokenEnv]}
+                  properties:
+                    collector_url: {type: string}
+                    access_token_env: {type: string}
+                    accessTokenEnv: {type: string}
+          description: |
+            Direct provider envelope; name-only references belong to Istio
+            translation. Unknown fields are ignored by serde. Active exporters
+            require an absolute HTTP(S) endpoint with a host and no embedded
+            credentials. Lightstep reads its bearer token from the named local
+            environment variable at construction. URL/header/token validation
+            and local environment availability are runtime checks. Exporter
+            ranges in the parent conditional apply only with at least one
+            selected provider and reporting enabled; inactive numeric options
+            still require unsigned integer types.
+        celStringAttribute:
+          type: string
+          enum:
+            - source_workload
+            - source_namespace
+            - source_principal
+            - source_app
+            - source_service
+            - destination_workload
+            - destination_namespace
+            - destination_principal
+            - destination_app
+            - destination_service
+            - request_protocol
+            - response_flags
+            - connection_security_policy
+            - request_method
+            - request_host
+        celExpression:
+          type: object
+          description: |
+            Compiled AST uses snake_case attribute names, unlike CEL source.
+            Runtime enforces depth <= 8, total nodes <= 24, literal values <=
+            256 UTF-8 bytes, and family-specific attribute availability.
+            Recursive shape is modeled here; aggregate node/depth and encoded
+            plan-byte budgets remain runtime admission checks.
+          oneOf:
+            - required: [op, value]
+              additionalProperties: false
+              properties:
+                op: {const: literal}
+                value: {type: string, maxLength: 256}
+            - required: [op, name]
+              additionalProperties: false
+              properties:
+                op: {const: attribute}
+                name:
+                  $ref: '#/components/schemas/WorkloadMetricsConfig/$defs/celStringAttribute'
+            - required: [op, attribute]
+              additionalProperties: false
+              properties:
+                op: {const: string_of_int}
+                attribute:
+                  type: string
+                  enum: [response_code, destination_port]
+            - required: [op, attribute, then_expr, else_expr]
+              additionalProperties: false
+              properties:
+                op: {const: has_then_else}
+                attribute:
+                  $ref: '#/components/schemas/WorkloadMetricsConfig/$defs/celStringAttribute'
+                then_expr:
+                  $ref: '#/components/schemas/WorkloadMetricsConfig/$defs/celExpression'
+                else_expr:
+                  $ref: '#/components/schemas/WorkloadMetricsConfig/$defs/celExpression'
 
     MeshBpfMetricsConfig:
       type: object
