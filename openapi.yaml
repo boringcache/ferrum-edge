@@ -31393,7 +31393,20 @@ components:
     AiRequestGuardConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_request_guard — Validates and constrains AI/LLM API requests."
+      description: >-
+        Plugin: ai_request_guard — Validates and constrains AI/LLM API
+        requests. All four numeric limits (`max_tokens_limit`,
+        `default_max_tokens`, `max_messages`, `max_prompt_characters`) are
+        unsigned 64-bit integers: negative, fractional, and above-`uint64`
+        values are rejected at plugin construction, and `0` is a valid,
+        maximally strict setting rather than "unset" (omit the field to leave
+        the policy unconfigured). Two relationships between sibling values are
+        also enforced at construction and are **not** expressible in JSON
+        Schema 2020-12, so a schema-valid configuration can still be refused
+        by `ferrum-edge validate` and at startup; operator tooling must apply
+        them as supplemental validation: `default_max_tokens` must be `<=`
+        `max_tokens_limit` when both are set, and `temperature_range[0]` must
+        be `<=` `temperature_range[1]`.
       anyOf:
         - required: [max_tokens_limit]
         - required: [default_max_tokens]
@@ -31427,7 +31440,16 @@ components:
       properties:
         max_tokens_limit:
           type: integer
-          description: Maximum allowed output-token request value across OpenAI and provider-native token fields
+          format: uint64
+          minimum: 0
+          maximum: 18446744073709551615
+          description: >-
+            Maximum allowed output-token request value across OpenAI and
+            provider-native token fields. Unsigned 64-bit integer; `0` is
+            accepted and refuses any request that asks for a positive number of
+            tokens. When `default_max_tokens` is also set it must not exceed
+            this value — a construction-time relationship JSON Schema cannot
+            express (see the component description).
         enforce_max_tokens:
           type: string
           enum: [reject, clamp]
@@ -31435,7 +31457,10 @@ components:
           description: Reject (400 error) or clamp (silently cap) max_tokens
         default_max_tokens:
           type: integer
-          description: Inject a default output-token limit if no supported token field is present; top-level-shaped bodies keep a family-correct top-level fallback (max_output_tokens for Responses, else max_tokens) so a spoofed provider marker or stray cross-provider alias cannot uncap them, while unambiguously provider-native bodies receive only their native cap (including TGI parameters.max_new_tokens)
+          format: uint64
+          minimum: 0
+          maximum: 18446744073709551615
+          description: Unsigned 64-bit integer (`0` accepted), and must be <= max_tokens_limit when that limit is also configured — a construction-time relationship JSON Schema cannot express (see the component description). Inject a default output-token limit if no supported token field is present; top-level-shaped bodies keep a family-correct top-level fallback (max_output_tokens for Responses, else max_tokens) so a spoofed provider marker or stray cross-provider alias cannot uncap them, while unambiguously provider-native bodies receive only their native cap (including TGI parameters.max_new_tokens)
         supported_schema:
           type: string
           enum: [chat_completions, responses, provider_native, auto]
@@ -31467,10 +31492,20 @@ components:
           description: Require user field in request body
         max_messages:
           type: integer
-          description: Maximum message entries across messages, Responses input, Gemini contents, and Cohere chat_history arrays
+          format: uint64
+          minimum: 0
+          maximum: 18446744073709551615
+          description: >-
+            Maximum message entries across messages, Responses input, Gemini
+            contents, and Cohere chat_history arrays. Unsigned 64-bit integer;
+            `0` is accepted and refuses any request that carries a counted
+            message entry.
         max_prompt_characters:
           type: integer
-          description: Maximum total prompt characters across prompt/input/system fields, message text, text multimodal parts, Bedrock Converse messages[].content[].toolResult content and guardContent text, tools, tool arguments, document/RAG fields (including Anthropic text document source.data), Google Vertex legacy predict instances[].prompt, and Azure "On Your Data" data_sources[]/dataSources[].parameters.role_information/roleInformation
+          format: uint64
+          minimum: 0
+          maximum: 18446744073709551615
+          description: Maximum total prompt characters (Unicode scalar values; `0` is accepted and refuses any request carrying counted text) across prompt/input/system fields, message text, text multimodal parts, Bedrock Converse messages[].content[].toolResult content and guardContent text, tools, tool arguments (including Bedrock Converse messages[].content[].toolUse.input), document/RAG fields (including Anthropic text document source.data and every eligible member value of a Cohere documents[] map, minus its id and _excludes-named members), Google Vertex legacy predict instances[].prompt, and Azure "On Your Data" data_sources[]/dataSources[].parameters.role_information/roleInformation
         temperature_range:
           type: array
           items:
@@ -31478,7 +31513,7 @@ components:
             format: double
           minItems: 2
           maxItems: 2
-          description: "Allowed [min, max] range for top-level temperature plus Gemini generationConfig.temperature and Bedrock inferenceConfig.temperature; conflicting aliases are rejected"
+          description: "Allowed [min, max] range for top-level temperature plus Gemini generationConfig.temperature and Bedrock inferenceConfig.temperature; conflicting aliases are rejected. Both bounds must be finite and temperature_range[0] must be <= temperature_range[1] — a construction-time relationship JSON Schema cannot express (see the component description)"
         block_system_prompts:
           type: boolean
           default: false
