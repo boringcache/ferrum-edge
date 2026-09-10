@@ -132,11 +132,12 @@ use crate::proxy::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER, GrpcResponseKind, proxy_grpc_request_from_bytes,
 };
 use crate::proxy::headers::{
-    ClientResponseFraming, PrePolicyResponseHeaders, RejectBodyDisposition,
-    ResponseTrailerGovernance, TrailerSectionKind, apply_response_headers,
-    is_backend_response_strip_header, is_untrusted_real_ip_header, parse_connection_listed_headers,
-    reconcile_streaming_backend_trailers, sanitize_backend_request_trailers,
-    sanitize_client_response_headers_for_wire, strip_response_hop_by_hop_trailers,
+    BACKEND_REQUEST_STRIP_HEADER_NAMES, ClientResponseFraming, PrePolicyResponseHeaders,
+    RejectBodyDisposition, ResponseTrailerGovernance, TrailerSectionKind, apply_response_headers,
+    is_backend_request_strip_header, is_backend_response_strip_header, is_untrusted_real_ip_header,
+    parse_connection_listed_headers, reconcile_streaming_backend_trailers,
+    sanitize_backend_request_trailers, sanitize_client_response_headers_for_wire,
+    strip_response_hop_by_hop_trailers,
 };
 use crate::proxy::{
     BufferedUploadReplay, absolute_response_header_read_bound, await_upload_write_watermark_first,
@@ -10902,18 +10903,11 @@ fn parse_reqwest_method(method: &str) -> Option<reqwest::Method> {
     }
 }
 
-/// Closed inventory backing [`should_skip_cross_protocol_backend_header`].
-/// Lowercase; the predicate below matches these ASCII case-insensitively.
+/// The forwarding-identity names this bridge strips IN ADDITION to the canonical
+/// backend request inventory ([`BACKEND_REQUEST_STRIP_HEADER_NAMES`]).
+/// Lowercase; the predicate below matches both inventories ASCII
+/// case-insensitively.
 const CROSS_PROTOCOL_BACKEND_SKIP_NAMES: &[&str] = &[
-    "connection",
-    "content-length",
-    "transfer-encoding",
-    "keep-alive",
-    "te",
-    "trailer",
-    "proxy-authorization",
-    "proxy-connection",
-    "upgrade",
     "x-forwarded-for",
     "x-forwarded-proto",
     "x-forwarded-host",
@@ -10925,42 +10919,44 @@ const CROSS_PROTOCOL_BACKEND_SKIP_NAMES: &[&str] = &[
 /// backends. This is the shared filter for both the plain and gRPC
 /// bridge paths so the two cannot drift.
 ///
-/// The forwarding-identity names here (`x-forwarded-*`, `via`, `forwarded`)
-/// are the cross-protocol half of the ownership contract enforced on primary
-/// dispatch by `proxy::headers::is_proxy_owned_forwarding_header`: the bridge
-/// always strips them, then regenerates the gateway-owned values below.
-/// Matching is ASCII case-insensitive for the same reason that predicate is —
-/// H3 wire names are lowercase, but a plugin-synthesised mixed-case key in the
-/// materialised `HashMap<String, String>` would otherwise bypass the strip, and
-/// the plain builder's `reqwest::RequestBuilder::header` APPENDS, so a spoofed
+/// It is the union of two inventories:
+///
+/// * the CANONICAL backend request strip set
+///   ([`is_backend_request_strip_header`]) — RFC 9110 §7.6.1 hop-by-hop names,
+///   transport-managed framing, `expect`, and the gateway's own internal
+///   markers. Delegating rather than restating it is what keeps this bridge from
+///   drifting away from the H1/H2 and native-H3 backend builders, which both
+///   call that predicate: the bridge used to keep its own hand-written list and
+///   consequently forwarded `x-ferrum-original-content-encoding` to the origin
+///   after normalizing an upload, making an internal compression handoff marker
+///   visible to backends on H3 alone (issue #5110);
+/// * the forwarding-identity names (`x-forwarded-*`, `via`, `forwarded`), which
+///   are the cross-protocol half of the ownership contract enforced on primary
+///   dispatch by `proxy::headers::is_proxy_owned_forwarding_header`: the bridge
+///   always strips them, then regenerates the gateway-owned values below.
+///
+/// Matching is ASCII case-insensitive because H3 wire names are lowercase but a
+/// plugin-synthesised mixed-case key in the materialised
+/// `HashMap<String, String>` would otherwise bypass the strip, and the plain
+/// builder's `reqwest::RequestBuilder::header` APPENDS, so a spoofed
 /// `Forwarded` would precede the gateway-owned element on the wire.
 ///
-/// Hot path: the lowercase `matches!` arm answers every real request with no
+/// Hot path: the two lowercase `matches!` arms answer every real request with no
 /// scan. The case-insensitive sweep is only reached for a name that actually
 /// carries an uppercase ASCII byte, and it allocates nothing.
-fn should_skip_cross_protocol_backend_header(name: &str) -> bool {
-    if matches!(
-        name,
-        "connection"
-            | "content-length"
-            | "transfer-encoding"
-            | "keep-alive"
-            | "te"
-            | "trailer"
-            | "proxy-authorization"
-            | "proxy-connection"
-            | "upgrade"
-            | "x-forwarded-for"
-            | "x-forwarded-proto"
-            | "x-forwarded-host"
-            | "via"
-            | "forwarded"
-    ) {
+pub(crate) fn should_skip_cross_protocol_backend_header(name: &str) -> bool {
+    if is_backend_request_strip_header(name)
+        || matches!(
+            name,
+            "x-forwarded-for" | "x-forwarded-proto" | "x-forwarded-host" | "via" | "forwarded"
+        )
+    {
         return true;
     }
     name.bytes().any(|b| b.is_ascii_uppercase())
-        && CROSS_PROTOCOL_BACKEND_SKIP_NAMES
+        && BACKEND_REQUEST_STRIP_HEADER_NAMES
             .iter()
+            .chain(CROSS_PROTOCOL_BACKEND_SKIP_NAMES.iter())
             .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
