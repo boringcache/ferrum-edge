@@ -558,7 +558,11 @@ fn classify_http_batch_response(
         // Returning Ok keeps the no-retry policy. Count the terminal loss here
         // because BatchingLogger only records BatchDiscard on Err after retries.
         if SINK_PLUGINS.contains(&plugin_name) {
-            record_dropped(plugin_name, SinkLossReason::BatchDiscard, entry_count as u64);
+            record_dropped(
+                plugin_name,
+                SinkLossReason::BatchDiscard,
+                entry_count as u64,
+            );
         }
         return Ok(());
     }

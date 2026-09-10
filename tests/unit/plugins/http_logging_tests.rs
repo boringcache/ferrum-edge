@@ -920,9 +920,7 @@ async fn http_logging_permanent_4xx_counts_records_once_and_survives_reload() {
     }
     wait_for_count(&requests, 1).await;
     for _ in 0..100 {
-        if dropped_total("http_logging", SinkLossReason::BatchDiscard)
-            >= dropped_before + 3
-        {
+        if dropped_total("http_logging", SinkLossReason::BatchDiscard) >= dropped_before + 3 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
