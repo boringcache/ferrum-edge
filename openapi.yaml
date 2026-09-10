@@ -24204,8 +24204,8 @@ components:
         closing the connection with RFC 6455 code 1008.
       properties:
         mode:
-          type: string
-          enum: [enforce, monitor, disabled]
+          type: [string, "null"]
+          enum: [enforce, monitor, disabled, null]
           default: enforce
           description: >-
             Global WAF mode. enforce is rejected at construction when no
@@ -24213,13 +24213,17 @@ components:
             rule_modes, rule_overrides, disabled rules, paranoia filtering,
             and inspection-surface toggles. Built-in rules are monitor-only
             unless opted in. Anomaly scoring, stream.tcp_require_tls,
-            enforce-action stream.signatures, and on_body_too_large: block
+            enforce-action stream.signatures that some runtime hook can apply
+            (inspect_tcp or inspect_udp), and on_body_too_large: block
             (when a body inspection hook can run) each satisfy admission
             without per-rule action: enforce. monitor with zero enforcing
-            rules remains valid.
+            rules remains valid. Every optional property of this schema also
+            accepts an explicit null, which the runtime treats exactly as an
+            omitted key and replaces with the documented default.
         default_rule_action:
-          type: string
-          enum: [enforce, monitor, disabled]
+          type: [string, "null"]
+          enum:
+            [enforce, block, reject, monitor, log, warn, disabled, disable, "off", null]
           description: >-
             Bulk action applied to built-in rules that inherit it. Unset leaves
             the pack monitor-only; per-rule rule_modes entries still take
@@ -24227,43 +24231,57 @@ components:
             FE-ENCODING-002) stay monitor under bulk enforce until an explicit
             rule_modes or rule_overrides.action entry promotes them. Combine
             with paranoia_level to enforce only the low-false-positive core of
-            the rule pack.
+            the rule pack. block/reject are accepted aliases of enforce,
+            log/warn of monitor, and disable/off of disabled.
         paranoia_level:
-          type: integer
+          type: [integer, "null"]
           minimum: 1
           maximum: 4
           default: 1
         request_inspection:
-          type: boolean
+          type: [boolean, "null"]
           default: true
         request_body_inspection:
-          type: boolean
+          type: [boolean, "null"]
           default: true
         response_inspection:
-          type: boolean
+          type: [boolean, "null"]
           default: false
         response_body_inspection:
-          type: boolean
+          type: [boolean, "null"]
           default: false
         log_to_metadata:
-          type: boolean
+          type: [boolean, "null"]
           default: true
         log_to_stdout:
-          type: boolean
+          type: [boolean, "null"]
           default: false
         scan_budget_ms:
-          type: integer
+          type: [integer, "null"]
+          format: uint64
+          minimum: 0
+          maximum: 18446744073709551615
           default: 50
+          description: >-
+            Post-hoc scan deadline in milliseconds; 0 disables the timeout
+            wrapper. Parsed as an unsigned 64-bit integer, so a negative or
+            above-u64 value is rejected at construction.
         max_scan_bytes:
-          type: integer
+          type: [integer, "null"]
+          format: uint64
+          minimum: 1
+          maximum: 18446744073709551615
           default: 1048576
+          description: >-
+            Maximum bytes scanned from each governed body. Must be greater than
+            zero — construction rejects 0.
         on_scan_timeout:
-          type: string
-          enum: [allow, block, log_and_allow]
+          type: [string, "null"]
+          enum: [allow, block, log_and_allow, null]
           default: log_and_allow
         on_body_too_large:
-          type: string
-          enum: [fail_closed, scan_truncated, skip, block]
+          type: [string, "null"]
+          enum: [fail_closed, scan_truncated, skip, block, null]
           default: fail_closed
           description: >-
             Behavior when a governed body exceeds max_scan_bytes. fail_closed
@@ -24278,23 +24296,31 @@ components:
             governed body while mode is enforce, otherwise scans the prefix.
             Under mode: enforce, block is itself a reachable admission
             enforcement path when a body inspection hook can run (HTTP bodies
-            and WebSocket application messages share this setting). fail_closed,
-            scan_truncated, and skip do not satisfy that gate.
+            and WebSocket application messages share this setting), and it is a
+            blocking disposition for the buffered-representation claim on BOTH
+            directions, so an origin-encoded body is decoded before the cap is
+            measured. fail_closed, scan_truncated, and skip do not satisfy that
+            admission gate.
         include_default_rules:
-          type: boolean
+          type: [boolean, "null"]
           default: true
         disabled_default_rules:
-          type: array
+          type: [array, "null"]
           items:
             type: string
+            minLength: 1
           default: []
         rule_modes:
-          type: object
+          type: [object, "null"]
           additionalProperties:
             type: string
-            enum: [enforce, monitor, disabled]
+            enum:
+              [enforce, block, reject, monitor, log, warn, disabled, disable, "off"]
+          description: >-
+            Per-rule action overrides keyed by rule id. Values accept the same
+            aliases as default_rule_action.
         rule_overrides:
-          type: object
+          type: [object, "null"]
           description: >-
             Per-rule tuning by rule id (built-in or custom): attach fp_filters,
             scope via conditions, raise/lower paranoia_min, change severity, or
@@ -24305,28 +24331,32 @@ components:
             additionalProperties: false
             properties:
               action:
-                type: string
-                enum: [enforce, monitor, disabled]
+                type: [string, "null"]
+                enum:
+                  [enforce, block, reject, monitor, log, warn, disabled, disable, "off", null]
               paranoia_min:
-                type: integer
+                type: [integer, "null"]
                 minimum: 1
                 maximum: 4
               severity:
-                type: string
-                enum: [info, low, medium, high, critical]
+                type: [string, "null"]
+                enum: [info, low, medium, high, critical, null]
               score:
-                type: integer
+                type: [integer, "null"]
+                format: uint32
                 minimum: 0
+                maximum: 4294967295
               fp_filters:
-                type: array
+                type: [array, "null"]
                 items:
                   type: string
+                  minLength: 1
               conditions:
-                type: object
+                type: [object, "null"]
                 additionalProperties: false
                 properties:
                   paths:
-                    type: array
+                    type: [array, "null"]
                     description: >-
                       Exact paths by default. A trailing `*` means prefix match,
                       and a leading `~` means an operator-authored regex matched
@@ -24334,25 +24364,28 @@ components:
                       in the path unless the pattern itself is anchored.
                     items:
                       type: string
+                      minLength: 1
                   methods:
-                    type: array
+                    type: [array, "null"]
                     items:
                       type: string
+                      minLength: 1
                   headers:
-                    type: object
+                    type: [object, "null"]
                     additionalProperties:
                       type: [string, "null"]
                   consumers:
-                    type: array
+                    type: [array, "null"]
                     items:
                       type: string
+                      minLength: 1
         custom_rules:
-          type: array
+          type: [array, "null"]
           items:
             $ref: "#/components/schemas/WafRule"
           default: []
         scoring:
-          type: object
+          type: [object, "null"]
           additionalProperties: false
           description: >-
             Anomaly scoring. When enabled, every matched rule contributes its
@@ -24364,45 +24397,74 @@ components:
             waf.instances.<plugin-config-id>.score; waf.score is emitted only
             when a single scoring instance contributed, otherwise
             waf.instance_scores carries a deterministic sorted id=score list.
+            enabled: false short-circuits parsing, so the remaining members are
+            not validated in that case — block_threshold must be at least 1 only
+            when scoring is actually enabled.
           properties:
             enabled:
-              type: boolean
+              type: [boolean, "null"]
               default: true
             block_threshold:
-              type: integer
-              minimum: 1
+              type: [integer, "null"]
+              format: uint32
+              minimum: 0
+              maximum: 4294967295
               default: 7
             weights:
-              type: object
+              type: [object, "null"]
               description: Per-severity weights; defaults info=0 low=2 medium=3 high=5 critical=10.
               additionalProperties: false
               properties:
                 info:
                   type: integer
+                  format: uint32
                   minimum: 0
+                  maximum: 4294967295
                 low:
                   type: integer
+                  format: uint32
                   minimum: 0
+                  maximum: 4294967295
                 medium:
                   type: integer
+                  format: uint32
                   minimum: 0
+                  maximum: 4294967295
                 high:
                   type: integer
+                  format: uint32
                   minimum: 0
+                  maximum: 4294967295
                 critical:
                   type: integer
+                  format: uint32
                   minimum: 0
+                  maximum: 4294967295
+          allOf:
+            - if:
+                properties:
+                  enabled:
+                    const: false
+                required: [enabled]
+              else:
+                properties:
+                  block_threshold:
+                    minimum: 1
         global_exemptions:
-          $ref: "#/components/schemas/WafExemptions"
+          oneOf:
+            - $ref: "#/components/schemas/WafExemptions"
+            - type: "null"
         body_methods:
-          type: array
+          type: [array, "null"]
           items:
             type: string
+            minLength: 1
           default: [POST, PUT, PATCH]
         body_content_types:
-          type: array
+          type: [array, "null"]
           items:
             type: string
+            minLength: 1
           description: >-
             Base media types whose request/response bodies are eligible for
             inspection. Matching is on the lowercased base type with parameters
@@ -24424,29 +24486,34 @@ components:
             - text/plain
             - text/html
         inspect_multipart:
-          type: boolean
+          type: [boolean, "null"]
           default: false
         inspect_binary_body:
-          type: boolean
+          type: [boolean, "null"]
           default: false
         disallowed_methods:
-          type: array
+          type: [array, "null"]
           items:
             type: string
+            minLength: 1
           default: []
         reject_status_code:
-          type: integer
+          type: [integer, "null"]
           minimum: 400
           maximum: 599
           default: 403
         reject_content_type:
-          type: string
+          type: [string, "null"]
+          minLength: 1
           default: application/json
         reject_body:
-          type: string
+          type: [string, "null"]
+          minLength: 1
           default: '{"error":"Forbidden"}'
         stream:
-          $ref: "#/components/schemas/WafStreamConfig"
+          oneOf:
+            - $ref: "#/components/schemas/WafStreamConfig"
+            - type: "null"
 
     WafStreamConfig:
       type: object
@@ -24456,28 +24523,39 @@ components:
         stream proxies. L7 signature scanning runs over plaintext application
         bytes (plain TCP opening segment, decrypted TLS/DTLS payloads); encrypted
         passthrough traffic is never L7-scanned. Governed by the global `mode`.
+        A block carrying neither signatures nor tcp_require_tls is treated as
+        absent, and the plugin stays HTTP-family only. Every optional property
+        also accepts an explicit null, treated as an omitted key.
       properties:
         tcp_require_tls:
-          type: boolean
+          type: [boolean, "null"]
           default: false
           description: >
             Reject a TCP connection whose opening bytes are not a TLS/DTLS
             ClientHello. Applies to plain/passthrough proxies; a no-op once TLS
             is terminated.
         inspect_tcp:
-          type: boolean
+          type: [boolean, "null"]
           default: true
-          description: Run signatures over the opening bytes of TCP streams.
+          description: >
+            Run signatures over the opening bytes of TCP streams. TCP frontends
+            only: a UDP or DTLS session carries no TCP first bytes and is never
+            judged by this switch.
         inspect_udp:
-          type: boolean
+          type: [boolean, "null"]
           default: true
           description: Run signatures over UDP/DTLS datagram payloads.
         inspect_response:
-          type: boolean
+          type: [boolean, "null"]
           default: false
-          description: Also scan backend→client datagrams (client→backend only by default).
+          description: >
+            Also scan backend→client datagrams (client→backend only by default).
+            A direction switch INSIDE UDP inspection, read after inspect_udp has
+            admitted the datagram hook — it is not an independent surface, so it
+            inspects nothing while inspect_udp is false and does not by itself
+            satisfy mode: enforce admission.
         signatures:
-          type: array
+          type: [array, "null"]
           items:
             $ref: "#/components/schemas/WafStreamSignature"
           default: []
@@ -24489,35 +24567,80 @@ components:
       properties:
         id:
           type: string
-          description: Stable identifier, surfaced in logs and `waf.rule_hits`.
+          minLength: 1
+          description: >-
+            Stable identifier, surfaced in logs and `waf.rule_hits`. Must be
+            unique within this stream block.
         pattern:
           type: string
+          minLength: 1
           description: Byte regex matched against the stream/datagram payload.
         severity:
-          type: string
-          enum: [info, low, medium, high, critical]
+          type: [string, "null"]
+          enum: [info, low, medium, high, critical, null]
           default: medium
         action:
-          type: string
-          enum: [enforce, monitor, disabled]
+          type: [string, "null"]
+          enum:
+            [enforce, block, reject, monitor, log, warn, disabled, disable, "off", null]
           default: enforce
+          description: >-
+            Signature action; block/reject alias enforce, log/warn alias
+            monitor, and disable/off alias disabled. A disabled signature is
+            dropped from the active set entirely.
 
     WafRule:
       type: object
       additionalProperties: false
       required: [id, category, target]
+      description: >-
+        A custom WAF rule. `pattern` is required for every match_kind except
+        `luhn`, and `luhn` is only supported on body targets (`body_text` /
+        `request_body`, `body_json_path`, `response_body`); both conditions are
+        modeled below and enforced at construction. Optional properties also
+        accept an explicit null, treated as an omitted key.
+      allOf:
+        - if:
+            required: [match_kind]
+            properties:
+              match_kind:
+                const: luhn
+          else:
+            required: [pattern]
+            properties:
+              pattern:
+                type: string
+        - if:
+            required: [match_kind]
+            properties:
+              match_kind:
+                const: luhn
+          then:
+            properties:
+              target:
+                anyOf:
+                  - enum: [body_text, request_body, response_body]
+                  - type: object
+                    required: [type]
+                    properties:
+                      type:
+                        enum:
+                          [body_text, request_body, body_json_path, response_body]
       properties:
         id:
           type: string
+          minLength: 1
           example: FE-SQLI-001
         name:
-          type: string
+          type: [string, "null"]
+          minLength: 1
         category:
           type: string
+          minLength: 1
           example: sqli
         severity:
-          type: string
-          enum: [info, low, medium, high, critical]
+          type: [string, "null"]
+          enum: [info, low, medium, high, critical, null]
           default: medium
         target:
           description: >-
@@ -24606,35 +24729,47 @@ components:
                     - response_headers
                     - response_body
         match_kind:
-          type: string
-          enum: [regex, literal, contains, equals, luhn, cidr]
+          type: [string, "null"]
+          enum: [regex, literal, contains, equals, luhn, cidr, null]
           default: regex
         pattern:
-          type: string
+          type: [string, "null"]
+          minLength: 1
+          description: >-
+            Pattern text; a CIDR rule accepts an IP or CIDR range. Required and
+            non-empty for every match_kind except `luhn`.
         action:
-          type: string
-          enum: [enforce, monitor, disabled]
-          default: monitor
+          type: [string, "null"]
+          enum:
+            [enforce, block, reject, monitor, log, warn, disabled, disable, "off", null]
+          description: >-
+            Per-rule action. Unset (or null) INHERITS the global mode's default:
+            `enforce` under `mode: enforce`, `monitor` under `monitor` and
+            `disabled`. block/reject alias enforce, log/warn alias monitor, and
+            disable/off alias disabled.
         fp_filters:
-          type: array
+          type: [array, "null"]
           items:
             type: string
+            minLength: 1
           default: []
         paranoia_min:
-          type: integer
+          type: [integer, "null"]
           minimum: 1
           maximum: 4
           default: 1
         score:
-          type: integer
+          type: [integer, "null"]
+          format: uint32
           minimum: 0
+          maximum: 4294967295
           description: Anomaly-score contribution when scoring is enabled; defaults to the per-severity weight.
         conditions:
-          type: object
+          type: [object, "null"]
           additionalProperties: false
           properties:
             paths:
-              type: array
+              type: [array, "null"]
               description: >-
                 Exact paths by default. A trailing `*` means prefix match, and a
                 leading `~` means an operator-authored regex matched with regex
@@ -24642,25 +24777,28 @@ components:
                 unless the pattern itself is anchored.
               items:
                 type: string
+                minLength: 1
             methods:
-              type: array
+              type: [array, "null"]
               items:
                 type: string
+                minLength: 1
             headers:
-              type: object
+              type: [object, "null"]
               additionalProperties:
                 type: [string, "null"]
             consumers:
-              type: array
+              type: [array, "null"]
               items:
                 type: string
+                minLength: 1
 
     WafExemptions:
       type: object
       additionalProperties: false
       properties:
         paths:
-          type: array
+          type: [array, "null"]
           description: >-
             Paths that short-circuit the entire WAF. Each entry matches from the
             start of the path: a plain string is an exact full-path match,
@@ -24670,26 +24808,31 @@ components:
             the WAF on unintended routes.
           items:
             type: string
+            minLength: 1
         methods:
-          type: array
+          type: [array, "null"]
           items:
             type: string
+            minLength: 1
         consumers:
-          type: array
+          type: [array, "null"]
           items:
             type: string
+            minLength: 1
         ips:
-          type: array
+          type: [array, "null"]
           items:
             type: string
+            minLength: 1
         header_present:
-          type: object
+          type: [object, "null"]
           additionalProperties:
             type: [string, "null"]
         fp_capture_filters:
-          type: array
+          type: [array, "null"]
           items:
             type: string
+            minLength: 1
 
     ResponseSizeLimitingConfig:
       type: object
