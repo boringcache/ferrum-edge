@@ -2926,6 +2926,14 @@ pub mod _test_support {
         plugin.inflight_count_snapshot_for_tests()
     }
 
+    /// Whether a constructed `request_deduplication` instance's Redis client
+    /// requires the no-eviction retention screen (`None` in local mode).
+    pub fn request_deduplication_redis_requires_no_eviction_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+    ) -> Option<bool> {
+        plugin.redis_requires_no_eviction_for_tests()
+    }
+
     pub fn request_deduplication_request_identity_for_test(
         plugin: &crate::plugins::request_deduplication::RequestDeduplication,
         ctx: &crate::plugins::RequestContext,
