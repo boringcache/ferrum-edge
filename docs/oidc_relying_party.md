@@ -11,7 +11,9 @@ config:
     - issuer: "https://idp.example.com/"
       discovery_url: "https://idp.example.com/.well-known/openid-configuration"
       client_id: ferrum-edge
+      scopes: ["openid", "profile", "email"]
       redirect_uri: "https://edge.example.com/oidc/callback"
+      callback_path: "/oidc/callback"
       client_auth:
         method: client_secret_basic
         client_secret: "${OIDC_CLIENT_SECRET}"
@@ -27,6 +29,17 @@ config:
 Exactly one provider is supported. Use `discovery_url` for normal OIDC providers, or set `authorization_endpoint`, `token_endpoint`, and `jwks_uri` explicitly for providers without discovery. Provider endpoints must use HTTPS except for `localhost` or literal loopback development endpoints. Discovery-provided endpoints must preserve the discovery URL's host, scheme, and effective port.
 
 `userinfo_endpoint` and `end_session_endpoint` may be set alongside `discovery_url`. When both are configured, the explicitly configured values take precedence over what the discovery document advertises, and they remain in effect even when the discovery document omits either field. An explicitly overridden optional endpoint is not read from the discovery document at all, so an advertisement this deployment will never call — one on another origin, say — cannot fail discovery. An optional endpoint that is actually selected from discovery keeps its fail-closed same-origin validation. `authorization_endpoint`, `token_endpoint`, and `jwks_uri` remain mutually exclusive with `discovery_url`.
+
+## Request Lifecycle
+
+The plugin is active in four phases (priority `1075`):
+
+| Phase | Responsibility |
+|---|---|
+| `on_request_received` | Serves `providers[].callback_path` (authorization-code exchange) and `providers[].logout_path` (local cookie deletion, optional RP-initiated logout and revocation) before any proxying |
+| `authenticate` | Opens the session cookie, enforces the absolute/idle bounds and the claims-freshness gate, refreshes tokens when due, resolves the consumer identity, and issues the browser challenge when there is no usable session |
+| `before_proxy` | Installs `claim_headers` on the backend request and removes this plugin's own cookies from the forwarded `Cookie` header |
+| `after_proxy` | Emits the rolling/refreshed session cookie as `Set-Cookie` on the proxied response, preserving any cookie the backend also set |
 
 ## Security Behavior
 

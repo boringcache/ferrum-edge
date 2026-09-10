@@ -220,7 +220,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "oidc_relying_party",
         classification: BuiltinPluginClassification::Public,
         priority: 1075,
-        active_phases: "authenticate, before_proxy",
+        active_phases: "on_request_received, authenticate, before_proxy, after_proxy",
         matrix_protocols: HTTP_FAMILY_PROTOCOLS,
         protocol_rationale: "Browser-oriented HTTP authentication flow",
     },

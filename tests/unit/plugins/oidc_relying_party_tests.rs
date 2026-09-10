@@ -4031,3 +4031,52 @@ async fn hiding_the_session_cookie_preserves_claim_header_fan_out() {
         Some("alice@example.test")
     );
 }
+
+/// Both advertised minimal examples must actually construct. They previously
+/// omitted the required `scopes` (including `openid`) and paired an
+/// `/oidc/callback` `redirect_uri` with the default `/oauth/callback`
+/// `callback_path`, so an operator who copied either one got a config the
+/// gateway refuses (issue #5034).
+#[test]
+fn the_documented_minimal_examples_pass_admission() {
+    for (source, doc) in [
+        ("docs/oidc_relying_party.md", DEDICATED_DOC),
+        ("docs/plugins.md", CATALOG_DOC),
+    ] {
+        let example = first_oidc_yaml_example(doc)
+            .unwrap_or_else(|| panic!("{source} must document an oidc_relying_party example"));
+        let document: serde_json::Value =
+            serde_yaml::from_str(&example).unwrap_or_else(|e| panic!("{source} example: {e}"));
+        assert_eq!(document["plugin_name"], json!("oidc_relying_party"));
+        validate_plugin_config("oidc_relying_party", &document["config"])
+            .unwrap_or_else(|e| panic!("{source} example must be admissible: {e}"));
+    }
+}
+
+const DEDICATED_DOC: &str = include_str!("../../../docs/oidc_relying_party.md");
+const CATALOG_DOC: &str = include_str!("../../../docs/plugins.md");
+
+/// Extract the first fenced YAML block whose `plugin_name` is this plugin,
+/// substituting the documented `${...}` environment placeholders with fixture
+/// values so admission exercises the shape rather than the operator's secrets.
+fn first_oidc_yaml_example(doc: &str) -> Option<String> {
+    let mut remaining = doc;
+    while let Some(start) = remaining.find("```yaml\n") {
+        let body = &remaining[start + "```yaml\n".len()..];
+        let end = body.find("\n```")?;
+        let block = &body[..end];
+        remaining = &body[end..];
+        if !block.starts_with("plugin_name: oidc_relying_party") {
+            continue;
+        }
+        return Some(
+            block
+                .replace("${OIDC_CLIENT_SECRET}", "fixture-client-secret")
+                .replace(
+                    "${OIDC_SESSION_SECRET_32_BYTES_MIN}",
+                    "01234567890123456789012345678901",
+                ),
+        );
+    }
+    None
+}
