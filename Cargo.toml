@@ -503,8 +503,13 @@ hmac = "0.13.0"
 wiremock = "0.6"
 # Functional secret-backend tests: Vault dev server + LocalStack run in Docker
 # via testcontainers; env-mutating tests serialize via serial_test. Only the
-# `secrets_functional` test target uses these. See tests/secrets_functional/.
+# `secrets_functional` test target uses testcontainers.
+# See tests/secrets_functional/.
 testcontainers = "0.27"
+# `serial_test` is also the reader/writer gate in
+# `tests/unit/plugins/serverless_function_tests.rs`: a test that publishes a
+# provider credential fixture is `#[serial(serverless_env)]` and every test that
+# constructs the plugin — an environment READ — is `#[parallel(serverless_env)]`.
 serial_test = "3"
 # Functional testing dependencies
 rand = "0.10"

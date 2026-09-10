@@ -11983,6 +11983,14 @@ pub(crate) fn validate_plugin_config_with_http_client(
         // explicitly inside an open reload bracket.
         return transaction_log_schema::TransactionLogSchema::validate_config(config);
     }
+    if name == "serverless_function" {
+        // Shape-only: CP/admin admission must not require the AWS / Azure / GCP
+        // credentials that intentionally resolve only from a data plane's
+        // environment or external secret backend. Every supplied field is still
+        // validated here; runtime cache construction on the serving node
+        // resolves and validates the credentials fail closed (issue #5179).
+        return serverless_function::ServerlessFunction::validate_config(config, http_client);
+    }
     match create_plugin_with_http_client(name, config, http_client)? {
         Some(_) => Ok(()),
         None => Err(format!("Unknown plugin name '{}'", name)),
