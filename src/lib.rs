@@ -5334,6 +5334,15 @@ pub mod _test_support {
         }
     }
 
+    /// Mark a constructed `rate_limiting` policy's centralized store
+    /// unavailable so its next enforcement decision fails closed. `false` when
+    /// the policy is local-only and has no client to mark.
+    pub fn rate_limiting_mark_redis_unavailable_for_test(
+        plugin: &crate::plugins::rate_limiting::RateLimiting,
+    ) -> bool {
+        plugin.mark_redis_unavailable_for_test()
+    }
+
     /// Refusal a `rate_limiting` policy emits while the centralized store is
     /// unavailable: `Some((status, body))`, or `None` when it degraded to
     /// per-process admission instead of refusing.

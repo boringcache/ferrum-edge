@@ -24451,10 +24451,11 @@ components:
         consumers:
           type: array
           minItems: 1
+          uniqueItems: true
           items:
             type: string
             minLength: 1
-          description: "Effective consumer identities for `scope: consumers` rules. Each listed identity gets an independent counter using this rule's windows. Matched against mapped Consumer username first, then external authenticated identity."
+          description: "Effective consumer identities for `scope: consumers` rules. Each listed identity gets an independent counter using this rule's windows. Matched against mapped Consumer username first, then external authenticated identity. A repeated identity is rejected here and across rules; JSON Schema can only express the within-rule half, so the cross-rule duplicate is refused by the plugin constructor alone."
         requests_per_second:
           type: integer
           format: uint64
@@ -24497,43 +24498,92 @@ components:
       type: object
       required: [limits]
       additionalProperties: false
-      description: "Plugin: rate_limiting — Per-IP, per-consumer, or per-SPIFFE-identity request rate limiting. On stream proxies, consumer mode uses the identified stream Consumer when available and otherwise falls back to client IP; `spiffe_identity` keys on the SPIFFE ID extracted by the `spiffe_identity` / `mtls_auth` mesh chain and falls back to client IP when no SPIFFE identity is present. Supports centralized Redis-backed mode for coordinating rate limits across multiple gateway instances. `limits` must contain exactly one `scope: default` rule for generic keys and fallback IPs, plus optional `scope: consumers` rules that apply the same rate rule to one or many consumer identities, each with an independent counter. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
+      allOf:
+        # `scope: consumers` rules are only admitted with `limit_by: consumer`,
+        # and `limit_by` defaults to `ip`, so the dimension must be stated.
+        - if:
+            required: [limits]
+            properties:
+              limits:
+                contains:
+                  type: object
+                  required: [scope]
+                  properties:
+                    scope:
+                      type: string
+                      pattern: "^[cC][oO][nN][sS][uU][mM][eE][rR][sS]$"
+          then:
+            required: [limit_by]
+            properties:
+              limit_by:
+                # Narrower than the base declaration: `null` means `ip`, which
+                # the constructor refuses beside a consumer-scoped rule.
+                type: string
+                pattern: "^[cC][oO][nN][sS][uU][mM][eE][rR]$"
+        # Centralized counters need an endpoint; the constructor refuses
+        # `sync_mode: redis` without one rather than falling back to local.
+        - if:
+            required: [sync_mode]
+            properties:
+              sync_mode:
+                pattern: "^[rR][eE][dD][iI][sS]$"
+          then:
+            required: [redis_url]
+      description: "Plugin: rate_limiting — Per-IP, per-consumer, or per-SPIFFE-identity request rate limiting. On stream proxies, consumer mode uses the identified stream Consumer when available and otherwise falls back to client IP; `spiffe_identity` keys on the SPIFFE ID extracted by the `spiffe_identity` / `mtls_auth` mesh chain and falls back to client IP when no SPIFFE identity is present. Supports centralized Redis-backed mode for coordinating rate limits across multiple gateway instances. `limits` must contain exactly one `scope: default` rule for generic keys and fallback IPs, plus optional `scope: consumers` rules that apply the same rate rule to one or many consumer identities, each with an independent counter. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported. Residual admission rules this schema cannot express, enforced by the plugin constructor alone: one consumer identity may not appear in two different `scope: consumers` rules (JSON Schema can only reject a duplicate inside one rule), and `redis_url` details noted on that field."
       properties:
         limit_by:
-          type: string
-          enum: [ip, consumer, spiffe_identity, spiffe]
+          type: [string, "null"]
+          pattern: "^([iI][pP]|[cC][oO][nN][sS][uU][mM][eE][rR]|[sS][pP][iI][fF][fF][eE](_[iI][dD][eE][nN][tT][iI][tT][yY])?)$"
           default: ip
           description: |
-            Rate limit key:
+            Rate limit key. Parsed case-insensitively; `null` is the same as omitting the field:
             - `ip` (default) — client IP.
             - `consumer` — identified consumer (HTTP) or stream consumer (TCP/UDP); falls back to client IP when no consumer is present.
             - `spiffe_identity` — SPIFFE ID extracted from peer certificate (mesh authn). `spiffe` is accepted as an alias.
         expose_headers:
           type: boolean
           default: false
-          description: Inject x-ratelimit-* headers on requests and responses. Every admitted (counted) request's client-visible response carries the headers, including gateway-generated responses such as cache hits, response mocks, serverless short-circuits, and rejections from plugins that run after rate limiting.
+          description: "Inject x-ratelimit-* headers on requests and responses. Every admitted (counted) request's client-visible response carries the headers, including gateway-generated responses such as cache hits, response mocks, serverless short-circuits, and rejections from plugins that run after rate limiting. The header names are one public set, so when several rate_limiting instances run on a route exactly one verdict is published: the limiter that refused the request, or — when all of them admitted — the tightest remaining budget. A refusing limiter with expose_headers=false, and any fail-closed 503, publish no rate-limit headers at all."
         limits:
           type: array
           minItems: 1
           items:
             $ref: "#/components/schemas/RateLimitingRuleConfig"
+          contains:
+            type: object
+            required: [scope]
+            properties:
+              scope:
+                type: string
+                pattern: "^[dD][eE][fF][aA][uU][lL][tT]$"
+          minContains: 1
+          maxContains: 1
           description: "Rate-limit rules. Must include exactly one `scope: default` rule. `scope: consumers` rules are only valid when `limit_by` is `consumer`."
         sync_mode:
           type: string
-          enum: [local, redis]
+          pattern: "^([lL][oO][cC][aA][lL]|[rR][eE][dD][iI][sS])$"
           default: local
-          description: "Rate limit state storage: 'local' (in-memory per instance) or 'redis' (centralized across instances). Database-backed counters are unsupported. Any RESP-compatible server works (Redis, Valkey, DragonflyDB, KeyDB, Garnet)."
+          description: "Rate limit state storage: 'local' (in-memory per instance) or 'redis' (centralized across instances), parsed case-insensitively. `redis` additionally requires `redis_url`. Database-backed counters are unsupported. Any RESP-compatible server works (Redis, Valkey, DragonflyDB, KeyDB, Garnet)."
         redis_url:
           type: string
           minLength: 1
-          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
-          description: "Redis connection URL (e.g., redis://host:6379/0). Required when sync_mode is 'redis'. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY."
+          pattern: '^rediss?://[^/?#\s]+(?:/\d{0,10})?(?:\?[^\s#]*)?$'
+          description: >-
+            Redis connection URL (e.g., redis://host:6379/0). Required when
+            sync_mode is 'redis'. Must not carry a URL fragment; TLS skip-verify
+            is only FERRUM_TLS_NO_VERIFY. The path, when present, is the database
+            selector and must be a single non-negative integer no greater than
+            2147483647. Residual validation the pattern cannot express and the
+            plugin constructor still enforces: an out-of-range TCP port, and a
+            database index above the server's own `databases` setting (which only
+            the server can decide, on the handshake `SELECT`).
         redis_tls:
           type: boolean
           default: false
           description: "Enable TLS for the Redis connection (upgrades redis:// to rediss://). CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
+          minLength: 1
           default: "{FERRUM_NAMESPACE}:rate_limiting:{plugin-config-id}"
           description: >-
             Key prefix for all Redis keys. Defaults to
@@ -24568,17 +24618,26 @@ components:
             meaningful with sync_mode=redis, but validated in either mode.
         redis_connect_timeout_seconds:
           type: integer
+          format: uint64
+          minimum: 1
           default: 5
           description: >-
             Effective Redis connection-attempt timeout in seconds. Applied to the
             redis-rs inner connection config for cached, dedicated, and health-check
             paths (TCP connect, TLS handshake when enabled, Redis protocol handshake).
-            Gateway DNS screening/resolution of the Redis hostname runs before this
-            timeout starts.
+            It is also the deadline for the proactive `INFO CLUSTER` topology screen
+            (and the no-eviction memory screen) issued on every new connection, on
+            the pooled and dedicated paths as well as the recovery probe — the
+            redis-rs 500ms command cap does not preempt it. That per-command cap is
+            installed on the connection once it is screened, so ordinary command
+            execution stays bounded. Gateway DNS screening/resolution of the Redis
+            hostname runs before this timeout starts.
         redis_health_check_interval_seconds:
           type: integer
+          format: uint64
+          minimum: 1
           default: 5
-          description: Interval in seconds for health check pings when Redis is marked unavailable
+          description: Interval in seconds for health check pings when Redis is marked unavailable. Must be greater than zero.
 
     RequestSizeLimitingConfig:
       type: object
