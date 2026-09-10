@@ -603,6 +603,12 @@ fn pod_inbound_redirect_ports_from_spec(spec: Option<&PodSpec>) -> Vec<u16> {
 /// conventional tables so a co-resident Istio is unaffected.
 ///
 /// Pure so the exact rule/route shape is unit-testable without root.
+// Pure, but only ever *run* on Linux: the production callers are the
+// `ip`-invoking Linux impls and the aya loader's netns datapath test.
+// Compiling it into a non-Linux library would be dead code under
+// `-D warnings`, while the in-crate tests must still exercise the exact
+// rule shape on every developer host.
+#[cfg(any(test, target_os = "linux"))]
 pub(crate) fn ingress_redirect_routing_commands(ipv6: bool) -> Vec<Vec<String>> {
     let ip_family: &[&str] = if ipv6 { &["-6"] } else { &[] };
     let default_route = if ipv6 { "::/0" } else { "0.0.0.0/0" };
@@ -642,6 +648,12 @@ pub(crate) fn ingress_redirect_routing_commands(ipv6: bool) -> Vec<Vec<String>> 
 ///
 /// Deletion names the exact priority + table (never `flush`, never a
 /// lookup-only match), so a co-resident routing policy is never disturbed.
+// Pure, but only ever *run* on Linux: the production callers are the
+// `ip`-invoking Linux impls and the aya loader's netns datapath test.
+// Compiling it into a non-Linux library would be dead code under
+// `-D warnings`, while the in-crate tests must still exercise the exact
+// rule shape on every developer host.
+#[cfg(any(test, target_os = "linux"))]
 pub(crate) fn ingress_redirect_routing_teardown_commands(ipv6: bool) -> Vec<Vec<String>> {
     let ip_family: &[&str] = if ipv6 { &["-6"] } else { &[] };
     let default_route = if ipv6 { "::/0" } else { "0.0.0.0/0" };
