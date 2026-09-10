@@ -7679,6 +7679,72 @@ config:
 
 These plugins are registered built-ins even when they are most often generated or auto-injected by mesh mode.
 
+### `mesh_authz`
+
+Applies Istio-style mesh authorization (`MeshPolicy` ALLOW / DENY / AUDIT / CUSTOM) to the SPIFFE identity established by the `spiffe_identity` plugin or carried in the HBONE baggage of an ambient mTLS stream. It runs in the `authorize` phase at priority **2075** (after authentication, after `access_control`, before `opa`) and in `on_stream_connect` for Layer-4 sessions, so it covers every protocol family in the matrix: HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, raw TCP/TLS, and UDP/DTLS. Its failure policy is `FailClosed`.
+
+Mesh mode auto-injects it as the reserved global `__mesh_authz` on every applicable topology, carrying a `mesh_slice`. Operators can also configure it directly on a non-mesh gateway with a flat `mesh_policies` list; that is the form documented here. An operator-managed global of the same type overrides the mesh-injected instance.
+
+**Evaluation order.** DENY rules are evaluated first and the first match wins. `CUSTOM` delegations run before the DENY/ALLOW tiers. If any ALLOW rule is loaded and none matches, the request is denied by the implicit-deny floor (`mesh_authz.deny_policy=implicit-deny`). A configuration with no policies at all evaluates nothing and allows every request — an empty `mesh_policies: []` is a valid scaffold, not a lockdown.
+
+**Configuration.** Unknown top-level keys are rejected at construction, and a non-object, non-null `config` (a string, number, or array) is rejected too — a misspelled `mesh_policies` or a malformed root would otherwise build a policy-free instance whose implicit-deny floor never engages, allowing every request. The eleven accepted keys:
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `mesh_policies` | Array of `MeshPolicy` | `[]` | Operator-facing policy list, used when no slice is available. See [MeshPolicy](mesh.md#meshpolicy) for the document shape and [Rule Matching](mesh.md#rule-matching) for the matcher semantics. A `CUSTOM` rule here always denies: a flat list carries no `extensionProviders` source. |
+| `namespace` | String | `""` | This proxy workload's namespace, used by the construction-time `PolicyScope` filter. Overrides any namespace embedded in `mesh_slice`. Must be a string. |
+| `labels` | Object of string → string | `{}` | This proxy workload's labels, used by the scope filter for `WorkloadSelector`-scoped policies. Overrides any labels embedded in `mesh_slice`, and clears the slice's shared-SPIFFE ambiguity marker — supplying it asserts these are the workload's authoritative labels. |
+| `trust_domain_aliases` | Array of trust-domain strings, or `null` | `[]` | Additional SPIFFE trust domains accepted as equivalent to the peer certificate's own when authorizing HBONE baggage `source.principal`. Empty (the default) means strict same-trust-domain match. Each entry must be a valid trust domain; `null` is treated as absent. |
+| `trusted_hbone_assertors` | Array of strings or objects, or `null` | `["ztunnel", "waypoint"]` | Identity-asserting infrastructure whose HBONE baggage may rewrite the authz principal. Absent or `null` restores the built-in defaults; an explicit `[]` disables baggage rewriting entirely. Matching a peer is necessary but **not** sufficient — see [Trusted HBONE Assertors](mesh.md#trusted-hbone-assertors) for the per-entry grant contract. |
+| `per_pod_policy_scoping` | Boolean | `false` | Skips the construction-time scope filter and resolves policy scope per connection from the pod-scoped cache instead. Auto-set by mesh injection on `NodeWaypoint` topology, where one listener serves many pods. Must be a real boolean; a string or number is rejected rather than read as `false`. |
+| `mesh_slice` | Object | — | **Injection-only.** The embedded mesh slice: the filtered policy set plus the workload identity, ext-authz providers, and destination inventory. Operator-managed instances pass `mesh_policies` instead. |
+| `ambient_udp_source_scoping` | Boolean | `false` | **Injection-only.** Enables node-waypoint ambient UDP source-policy scoping. Same strict boolean admission as `per_pod_policy_scoping`. |
+| `cluster_domain` | String | `cluster.local` | **Injection-only.** Primary Kubernetes cluster domain, used for node-waypoint service-host matching. |
+| `cluster_domains` | Array of strings | `[]` | **Injection-only.** Deduplicated cluster-domain aliases for the same host matching. |
+| `node_waypoint_route_upstreams` | Array of objects | `[]` | **Injection-only.** Mesh-generated route upstream metadata used to precompute destination policy scopes for node-waypoint dispatch. |
+
+The six injection-only keys are populated by mesh mode and are documented here only so an operator reading a live `/plugins` response can identify them; do not hand-author them.
+
+**Direct policy example.** A namespace-scoped policy that denies `/admin` outright and otherwise allows only one service account:
+
+```yaml
+plugins:
+  - name: mesh_authz
+    config:
+      namespace: "default"
+      labels:
+        app: "payments"
+      mesh_policies:
+        - name: "deny-admin"
+          namespace: "default"
+          scope:
+            kind: namespace
+            namespace: "default"
+          rules:
+            - action: deny
+              to:
+                - paths: ["/admin/*"]
+        - name: "allow-checkout"
+          namespace: "default"
+          scope:
+            kind: namespace
+            namespace: "default"
+          rules:
+            - action: allow
+              from:
+                - spiffe_id_pattern: "spiffe://cluster.local/ns/default/sa/checkout"
+```
+
+**Strict configuration admission.** The policy grammar is closed at every level — the policy, each rule, and each `from` / `to` / `when` / `source_negation` matcher reject unknown members — and `action` is **required** on every rule. Every misspelling in this grammar removes a restriction rather than adding one: `not_paths` typed `not_path` would deserialize as an unconstrained rule, and `action` typed `actoin` would fall back to the `Allow` default and turn a DENY into a grant. Both now fail admission with a field-specific diagnostic instead.
+
+**Trusted identity is required.** `mesh_authz` authorizes the identity another plugin established; it does not authenticate. Without the `spiffe_identity` plugin (or an authenticated HBONE peer), `source_principal` is absent, so every `from` matcher fails, every ALLOW rule misses, and a policy set containing any ALLOW rule denies everything. Deploy it behind mesh mTLS, not on a plaintext listener.
+
+**Layer-4 sessions.** A raw TCP/TLS/UDP/DTLS session carries no HTTP request, so HTTP-only fields (`to.operation` methods/paths/hosts/headers, `request_principals`, `when: request.*`) are unsourceable there. Following Istio, a `DENY` or `CUSTOM` rule ignores an unsourceable field and still matches on its remaining constraints, while an `ALLOW` or `AUDIT` rule can never match on it. Scope such rules with `to.ports` when the workload also serves non-HTTP ports. On an HTTP-family request a header the client simply did not send is **absent**, not unsourceable, and fails a positive `to.headers` predicate for every action — see [Rule Matching](mesh.md#rule-matching).
+
+**CUSTOM delegation.** `action: {custom: {provider: <name>}}` delegates the decision to a `meshConfig.extensionProviders` entry carried on the mesh slice. A provider that does not bind, and a generation with no executor at all (which includes every direct `mesh_policies` config), refuse with a fixed `403` that no provider's `failOpen` can admit. See [AuthorizationPolicy `action: CUSTOM`](mesh.md#authorizationpolicy-action-custom-issue-3235) in the mesh guide for the outcome vocabulary, the failure table, and the process-wide in-flight budget.
+
+See [Authorization](mesh.md#authorization), [MeshPolicy](mesh.md#meshpolicy), [Trusted HBONE Assertors](mesh.md#trusted-hbone-assertors), and [plugin execution order](plugin_execution_order.md#why-this-order-matters).
+
 ### `mesh_route_dispatch`
 
 Applies per-request route overrides generated from mesh/Istio routing resources. It runs in `before_proxy` after authentication and admission plugins, so policy evaluates the original public proxy identity before the backend override is applied. For WebSockets, the override selects the upgrade backend only; individual frames are not re-routed.
