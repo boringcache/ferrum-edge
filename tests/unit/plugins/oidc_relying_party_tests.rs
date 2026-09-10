@@ -4080,3 +4080,200 @@ fn first_oidc_yaml_example(doc: &str) -> Option<String> {
     }
     None
 }
+
+/// The published `OidcRelyingPartyConfig` component and constructor admission
+/// must agree on what a valid plugin config is. The component previously
+/// accepted missing scopes, missing or conflicting endpoint sets, missing client
+/// credentials, short encryption secrets, disallowed statuses, oversized
+/// cookies, negative durations, and invalid cross-field combinations, while
+/// rejecting the runtime-supported capitalized `SameSite` and nullable optional
+/// values (issue #5035).
+///
+/// Only constraints a JSON Schema can express are listed here. Cross-object
+/// rules the constructor also enforces (`refresh_skew_secs <= ttl_secs / 2`,
+/// `callback_path` against `redirect_uri`, `logout_path` collisions, and
+/// key/algorithm pairing) stay constructor-only by design and have their own
+/// tests.
+#[test]
+fn the_config_component_agrees_with_constructor_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/OidcRelyingPartyConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("OidcRelyingPartyConfig compiles");
+
+    let case = |label: &str, config: serde_json::Value, admitted: bool| {
+        assert_eq!(
+            validator.is_valid(&config),
+            admitted,
+            "schema verdict for '{label}' disagrees with the constructor contract"
+        );
+        assert_eq!(
+            validate_plugin_config("oidc_relying_party", &config).is_ok(),
+            admitted,
+            "constructor verdict for '{label}' disagrees with the schema"
+        );
+    };
+    let drop_provider = |key: &str| {
+        let mut config = base_config();
+        config["providers"][0]
+            .as_object_mut()
+            .expect("provider object")
+            .remove(key);
+        config
+    };
+    let provider = |key: &str, value: serde_json::Value| {
+        let mut config = base_config();
+        config["providers"][0][key] = value;
+        config
+    };
+    let session = |key: &str, value: serde_json::Value| {
+        let mut config = base_config();
+        config["session"][key] = value;
+        config
+    };
+    let behavior = |key: &str, value: serde_json::Value| {
+        let mut config = base_config();
+        config["behavior"][key] = value;
+        config
+    };
+
+    let mut no_endpoints = base_config();
+    for key in ["authorization_endpoint", "token_endpoint", "jwks_uri"] {
+        no_endpoints["providers"][0]
+            .as_object_mut()
+            .expect("provider object")
+            .remove(key);
+    }
+    let discovery_conflict = provider(
+        "discovery_url",
+        json!("https://issuer.example.com/.well-known/openid-configuration"),
+    );
+    let mut same_site_none_insecure = session("same_site", json!("none"));
+    same_site_none_insecure["session"]["secure"] = json!(false);
+    let mut null_behavior = base_config();
+    null_behavior["behavior"] = json!(null);
+    let mut redirect_param_without_hosts = base_config();
+    redirect_param_without_hosts["behavior"]
+        .as_object_mut()
+        .expect("behavior object")
+        .remove("trusted_redirect_hosts");
+
+    case("valid base config", base_config(), true);
+    case("scopes omitted", drop_provider("scopes"), false);
+    case(
+        "scopes without openid",
+        provider("scopes", json!(["profile"])),
+        false,
+    );
+    case("no endpoint set", no_endpoints, false);
+    case(
+        "discovery plus explicit endpoints",
+        discovery_conflict,
+        false,
+    );
+    case("client_auth omitted", drop_provider("client_auth"), false);
+    case(
+        "client_auth without a secret",
+        provider("client_auth", json!({})),
+        false,
+    );
+    case(
+        "private_key_jwt without a key",
+        provider("client_auth", json!({"method": "private_key_jwt"})),
+        false,
+    );
+    case(
+        "non-string client_auth.method",
+        provider("client_auth", json!({"method": 9, "client_secret": "s"})),
+        false,
+    );
+    case(
+        "redirect_uri with a fragment",
+        provider("redirect_uri", json!("https://app.example.com/oauth/callback#x")),
+        false,
+    );
+    case(
+        "clock skew above the bound",
+        provider("id_token_clock_skew_secs", json!(3601)),
+        false,
+    );
+    case(
+        "null optional endpoint",
+        provider("userinfo_endpoint", json!(null)),
+        true,
+    );
+    case(
+        "short encryption secret",
+        session("encryption_secret", json!("too-short")),
+        false,
+    );
+    case("negative ttl", session("ttl_secs", json!(-1)), false);
+    case("zero ttl", session("ttl_secs", json!(0)), false);
+    case(
+        "oversized cookie cap",
+        session("max_cookie_bytes", json!(9000)),
+        false,
+    );
+    case(
+        "zero cookie cap",
+        session("max_cookie_bytes", json!(0)),
+        false,
+    );
+    case(
+        "unsupported session store",
+        session("store", json!("redis")),
+        false,
+    );
+    case(
+        "cookie name with a delimiter",
+        session("cookie_name", json!("bad;cookie")),
+        false,
+    );
+    case(
+        "domain carrying a scheme",
+        session("domain", json!("https://example.test")),
+        false,
+    );
+    case(
+        "SameSite=None without secure",
+        same_site_none_insecure,
+        false,
+    );
+    case(
+        "capitalized SameSite",
+        session("same_site", json!("Lax")),
+        true,
+    );
+    case("null behavior object", null_behavior, true);
+    case(
+        "disallowed challenge status",
+        behavior("challenge_html_status", json!(200)),
+        false,
+    );
+    case(
+        "disallowed API challenge status",
+        behavior("challenge_api_status", json!(500)),
+        false,
+    );
+    case(
+        "state ttl above the bound",
+        behavior("state_ttl_secs", json!(3601)),
+        false,
+    );
+    case(
+        "redirect param without trusted hosts",
+        redirect_param_without_hosts,
+        false,
+    );
+    case(
+        "unknown session field",
+        session("redis_url", json!("redis://x")),
+        false,
+    );
+}

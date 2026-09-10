@@ -109,6 +109,12 @@ When discovery advertises a validated `revocation_endpoint` and the session cont
 
 **Residual validity:** sessions are stateless, so deleting a browser cookie does not invalidate copies captured before logout. A copied cookie can still authenticate while its stored claims and configured absolute/idle lifetime checks permit; activity can keep the idle window sliding up to the absolute `session.ttl_secs` bound. Successful provider refresh-token revocation prevents future refresh with that token, but does not immediately invalidate the gateway cookie or its stored claims. Revocation failure or an absent endpoint leaves provider refresh-token validity unchanged. Full immediate session invalidation requires server-side session state, which this plugin does not implement.
 
+## Configuration Schema
+
+The `OidcRelyingPartyConfig` component in `openapi.yaml` models what constructor admission accepts, including the required `openid` scope, the discovery/explicit-endpoint alternatives and their mutual exclusion, method-specific client credentials, the 32-byte encryption-secret minimum, cookie-name/path/domain syntax, the session lifetime and cookie-size bounds, the allowed challenge statuses, and `SameSite=None` requiring `secure`. Optional string fields accept `null` as "unset" and `same_site` is case-insensitive, both matching runtime behavior.
+
+Four rules span more than one object and are enforced only by the constructor: `behavior.refresh_skew_secs <= session.ttl_secs / 2`, `behavior.state_cache_max_entries_per_source <= behavior.state_cache_max_entries`, `providers[].redirect_uri`'s path equalling `providers[].callback_path` (and not colliding with `logout_path`), and a `private_key_jwt` key that supports the selected algorithm.
+
 ## Related Plugins
 
 Use `oauth2_introspection` for API requests that already carry bearer access tokens and do not need a browser login flow. Use `jwks_auth` for self-contained JWT access tokens where local signature verification is enough.

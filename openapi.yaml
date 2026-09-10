@@ -20143,6 +20143,8 @@ components:
         code + PKCE and encrypted sessions. ID token verification requires a JWT
         header kid that selects exactly one current trusted JWKS key; missing,
         empty, and unknown kid values are rejected with no all-keys fallback.
+        Optional string fields accept null as "unset", matching constructor
+        admission.
       required: [providers, session]
       properties:
         providers:
@@ -20152,88 +20154,148 @@ components:
           items:
             type: object
             additionalProperties: false
-            required: [issuer, client_id, redirect_uri]
+            required: [issuer, client_id, redirect_uri, scopes, client_auth]
+            oneOf:
+              - required: [discovery_url]
+                not:
+                  anyOf:
+                    - required: [authorization_endpoint]
+                    - required: [token_endpoint]
+                    - required: [jwks_uri]
+              - required: [authorization_endpoint, token_endpoint, jwks_uri]
+                not:
+                  required: [discovery_url]
             properties:
               issuer:
                 type: string
+                minLength: 1
                 description: Expected ID token issuer
               discovery_url:
-                type: string
-                description: OIDC discovery URL
+                type: [string, "null"]
+                minLength: 1
+                description: OIDC discovery URL. Mutually exclusive with authorization_endpoint, token_endpoint, and jwks_uri.
               authorization_endpoint:
-                type: string
+                type: [string, "null"]
+                minLength: 1
               token_endpoint:
-                type: string
+                type: [string, "null"]
+                minLength: 1
               userinfo_endpoint:
-                type: string
-                description: Optional UserInfo endpoint. When set alongside discovery_url, the explicit value overrides the UserInfo endpoint advertised by the discovery document, including one that omits it.
+                type: [string, "null"]
+                minLength: 1
+                description: Optional UserInfo endpoint. When set alongside discovery_url, the explicit value overrides the UserInfo endpoint advertised by the discovery document, including one that omits it, and the discarded advertisement is not validated.
               jwks_uri:
-                type: string
+                type: [string, "null"]
+                minLength: 1
               end_session_endpoint:
-                type: string
-                description: Optional end-session endpoint used for RP-initiated logout. When set alongside discovery_url, the explicit value overrides the end-session endpoint advertised by the discovery document, including one that omits it.
+                type: [string, "null"]
+                minLength: 1
+                description: Optional end-session endpoint used for RP-initiated logout. When set alongside discovery_url, the explicit value overrides the end-session endpoint advertised by the discovery document, including one that omits it, and the discarded advertisement is not validated.
               post_logout_redirect_uri:
-                type: string
+                type: [string, "null"]
+                minLength: 1
                 description: Absolute HTTPS redirect URI sent to the provider after RP-initiated logout; HTTP is allowed only for localhost or literal loopback development endpoints.
               client_id:
                 type: string
+                minLength: 1
               client_auth:
                 type: object
                 additionalProperties: false
+                allOf:
+                  - if:
+                      properties:
+                        method:
+                          enum: [client_secret_basic, client_secret_post, null]
+                    then:
+                      required: [client_secret]
+                  - if:
+                      required: [method]
+                      properties:
+                        method:
+                          const: private_key_jwt
+                    then:
+                      required: [private_key_pem]
                 properties:
                   method:
-                    type: string
+                    type: [string, "null"]
                     enum:
                       - client_secret_basic
                       - client_secret_post
                       - private_key_jwt
                       - none
+                      - null
                     default: client_secret_basic
+                    description: Null or absent selects client_secret_basic. A non-string value is rejected. "none" is admitted only for localhost or literal loopback token endpoints.
                   client_secret:
                     type: string
+                    minLength: 1
                     format: password
                   private_key_pem:
                     type: string
+                    minLength: 1
                     format: password
+                    description: Must support private_key_jwt_alg; admission signs a throwaway assertion, so a key on the wrong curve or of the wrong family is rejected at config load.
                   private_key_jwt_alg:
-                    type: string
-                    enum: [RS256, RS384, RS512, ES256, ES384, EdDSA]
+                    type: [string, "null"]
+                    enum: [RS256, RS384, RS512, ES256, ES384, EdDSA, null]
+                    default: RS256
                   private_key_jwt_kid:
-                    type: string
+                    type: [string, "null"]
               redirect_uri:
                 type: string
-                description: Absolute callback URI registered with the provider. Before issuing a browser challenge, Ferrum requires its host to match the validated request Host/:authority; DNS comparison is case-insensitive, IP literals compare by address, and ports are ignored. Trailing-dot DNS callback hosts and missing, malformed, or cross-host request authorities fail closed before state or cookies are issued.
+                minLength: 1
+                pattern: '^[^#]*$'
+                description: Absolute callback URI registered with the provider, with no fragment (RFC 6749 §3.1.2). Before issuing a browser challenge, Ferrum requires its host to match the validated request Host/:authority; DNS comparison is case-insensitive, IP literals compare by address, and ports are ignored. Trailing-dot DNS callback hosts and missing, malformed, or cross-host request authorities fail closed before state or cookies are issued.
               callback_path:
-                type: string
+                type: [string, "null"]
+                pattern: '^/[^\s?#;,]*$'
                 default: /oauth/callback
-                description: Callback path handled by Ferrum; must equal the path in redirect_uri.
+                description: Callback path handled by Ferrum; must equal the path in redirect_uri. Also the correlation cookie's Path attribute, so it carries cookie-path syntax rules.
               logout_path:
-                type: string
+                type: [string, "null"]
+                pattern: '^/[^\s?#;,]*$'
                 default: /oauth/logout
+                description: Must not resolve to the same path as callback_path; the callback branch is evaluated first.
               scopes:
                 type: array
+                minItems: 1
+                contains:
+                  const: openid
                 items:
                   type: string
+                  minLength: 1
+                description: Must include "openid".
               audiences:
                 type: array
                 items:
                   type: string
+                  minLength: 1
               required_scopes:
                 type: array
                 items:
                   type: string
+                  minLength: 1
               required_roles:
                 type: array
                 items:
                   type: string
+                  minLength: 1
               scope_claim:
-                type: string
+                type: [string, "null"]
+                minLength: 1
+                default: scope
               role_claim:
-                type: string
+                type: [string, "null"]
+                minLength: 1
+                default: roles
               consumer_identity_claim:
-                type: string
+                type: [string, "null"]
+                minLength: 1
+                default: sub
               consumer_header_claim:
-                type: string
+                type: [string, "null"]
+                minLength: 1
+                default: sub
               claim_headers:
                 type: object
                 additionalProperties:
@@ -20249,39 +20311,61 @@ components:
                 type: integer
                 format: uint64
                 default: 60
+                minimum: 0
+                maximum: 3600
         session:
           type: object
           additionalProperties: false
           required: [encryption_secret]
+          not:
+            allOf:
+              - required: [same_site]
+                properties:
+                  same_site:
+                    pattern: '^[Nn][Oo][Nn][Ee]$'
+              - required: [secure]
+                properties:
+                  secure:
+                    const: false
           properties:
             encryption_secret:
               type: string
+              minLength: 32
               format: password
               description: AEAD key material for durable session cookies and sealed pending authorization-code correlation cookies; must be at least 32 bytes
             encryption_secret_previous:
-              type: string
+              type: [string, "null"]
+              minLength: 32
               format: password
               description: Previous encryption secret accepted while rotating session and pending-flow cookies within the same versioned OIDC context
             cookie_name:
-              type: string
-              description: Explicit cookie name opts out of automatic naming. When omitted, the context-derived name is prefixed __Host- when secure with no domain and a root path, __Secure- when secure otherwise, and left unprefixed when secure is false because browsers reject a prefixed cookie without Secure.
+              type: [string, "null"]
+              pattern: '^[A-Za-z0-9!#$%&''*+\-.^_`|~]+$'
+              description: Explicit cookie name opts out of automatic naming and must be an RFC 6265 cookie-name token. An explicit __Host- name additionally requires secure with no domain and a root path, and an explicit __Secure- name requires secure. When omitted, the context-derived name is prefixed __Host- when secure with no domain and a root path, __Secure- when secure otherwise, and left unprefixed when secure is false because browsers reject a prefixed cookie without Secure.
             store:
-              type: string
-              enum: [cookie]
+              type: [string, "null"]
+              enum: [cookie, null]
               default: cookie
             ttl_secs:
               type: integer
               format: uint64
               default: 3600
+              minimum: 1
+              maximum: 31536000
+              description: Absolute session lifetime. Bounded so it can take part in Unix-timestamp arithmetic on every authenticated request.
             idle_ttl_secs:
               type: integer
               format: uint64
               default: 1800
+              minimum: 1
+              maximum: 31536000
             max_cookie_bytes:
               type: integer
               format: uint64
               default: 8000
-              description: Maximum encoded size for sealed session cookies and sealed pending-flow correlation cookies
+              minimum: 1024
+              maximum: 8000
+              description: Maximum encoded size for sealed session cookies and sealed pending-flow correlation cookies. The minimum is what a sealed pending authorization flow needs before any original-URL bytes.
             secure:
               type: boolean
               default: true
@@ -20291,21 +20375,36 @@ components:
               default: true
             same_site:
               type: string
-              enum: [lax, strict, none]
+              pattern: '^([Ll][Aa][Xx]|[Ss][Tt][Rr][Ii][Cc][Tt]|[Nn][Oo][Nn][Ee])$'
               default: lax
+              description: Case-insensitive; normalized to lower case. "none" requires secure=true.
             domain:
-              type: string
-              description: Optional Domain attribute for the durable session cookie. The short-lived sealed pending-flow correlation cookie always remains host-only, is scoped to callback_path, and never inherits this value.
+              type: [string, "null"]
+              maxLength: 254
+              pattern: '^\.?[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?)*$'
+              description: Optional bare DNS Domain attribute (leading dot allowed) for the durable session cookie. The short-lived sealed pending-flow correlation cookie always remains host-only, is scoped to callback_path, and never inherits this value.
             path:
-              type: string
+              type: [string, "null"]
+              pattern: '^/[^\s;,]*$'
               default: /
             hide_session_cookie:
               type: boolean
               default: true
               description: Remove this plugin's own session and pending-flow correlation cookies from the Cookie header forwarded to the selected backend, leaving unrelated application cookies intact. The sealed session cookie is a complete replayable gateway credential and the upstream already receives the verified identity and claim headers, so passthrough must be an explicit opt-in.
         behavior:
-          type: object
+          type: [object, "null"]
           additionalProperties: false
+          allOf:
+            - if:
+                required: [post_login_redirect_param]
+                properties:
+                  post_login_redirect_param:
+                    type: string
+              then:
+                required: [trusted_redirect_hosts]
+                properties:
+                  trusted_redirect_hosts:
+                    minItems: 1
           properties:
             state_ttl_secs:
               type: integer
@@ -20326,31 +20425,40 @@ components:
               minimum: 1
               description: Per-instance maximum pending browser authorization flows started per resolved client IP; must not exceed state_cache_max_entries.
             post_login_redirect_param:
-              type: string
+              type: [string, "null"]
+              minLength: 1
+              description: Requires a non-empty trusted_redirect_hosts.
             trusted_redirect_hosts:
               type: array
               items:
                 type: string
+                minLength: 1
             refresh_skew_secs:
               type: integer
               format: uint64
               default: 30
+              minimum: 0
+              description: Refresh lead time before token expiry; must not exceed session.ttl_secs / 2, which the constructor enforces across the two objects.
             challenge_html_status:
               type: integer
               default: 302
+              enum: [302, 303, 307]
             challenge_api_status:
               type: integer
               default: 401
+              enum: [401, 403]
             html_accept_substrings:
               type: array
               items:
                 type: string
+                minLength: 1
             rp_initiated_logout:
               type: boolean
               default: true
               description: With an authentic session cookie, send id_token_hint on provider logout and attempt discovered refresh-token revocation within five seconds. Cookie copies remain valid within session and claims lifetime limits. Without a valid cookie, return the local logout page.
             post_login_default_path:
-              type: string
+              type: [string, "null"]
+              minLength: 1
               default: /
 
     JwtAuthConfig:

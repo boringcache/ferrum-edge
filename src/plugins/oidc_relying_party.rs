@@ -2994,11 +2994,16 @@ fn parse_client_auth(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    match auth
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or("client_secret_basic")
-    {
+    // A non-string `method` used to fall through to the default silently, so a
+    // typo such as a bare number quietly configured `client_secret_basic`
+    // instead of the intended mode (issue #5035).
+    let method = match auth.get("method") {
+        Some(Value::Null) | None => "client_secret_basic",
+        Some(value) => value.as_str().ok_or_else(|| {
+            "oidc_relying_party: provider[0].client_auth.method must be a string".to_string()
+        })?,
+    };
+    match method {
         "client_secret_basic" => Ok(OidcClientAuth::Basic {
             client_secret: SecretString(required_string(&auth, "client_secret", "client_auth")?),
         }),
