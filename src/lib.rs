@@ -3187,6 +3187,22 @@ pub mod _test_support {
         crate::plugins::soap_ws_security::count_wsu_id_occurrences(xml, id)
     }
 
+    pub fn soap_exclusive_canonicalize_with_budget_for_test(
+        xml: &str,
+        local_name: &str,
+        budget_bytes: usize,
+    ) -> (Result<String, String>, usize) {
+        crate::plugins::soap_ws_security::exclusive_canonicalize_with_budget_for_test(
+            xml,
+            local_name,
+            budget_bytes,
+        )
+    }
+
+    pub fn soap_canonicalization_source_len_for_test(xml: &str, local_name: &str) -> Option<usize> {
+        crate::plugins::soap_ws_security::canonicalization_source_len_for_test(xml, local_name)
+    }
+
     pub fn soap_exclusive_canonicalize_element_for_test(
         xml: &str,
         local_name: &str,
