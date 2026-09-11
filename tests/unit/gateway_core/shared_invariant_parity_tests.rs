@@ -169,6 +169,22 @@ const PROBE_ADMISSION_SITES: &[&str] = &[
 /// The one RAII type every admitting path must construct.
 const SHARED_PROBE_GUARD: &str = "HalfOpenProbeGuard::new(";
 
+/// UDP and TCP bypass the shared admission helper. Count admissions per body,
+/// then check each admission arm independently (issue #4979).
+const DIRECT_PROBE_ADMISSION_SITES: &[(&str, &str, usize)] = &[
+    (
+        "src/proxy/udp_proxy.rs",
+        "async fn handle_dtls_client_inner(",
+        1,
+    ),
+    ("src/proxy/udp_proxy.rs", "async fn create_session(", 1),
+    (
+        "src/proxy/tcp_proxy.rs",
+        "async fn handle_tcp_connection_inner(",
+        2,
+    ),
+];
+
 /// Files that must own a guard rather than re-deriving the release: the
 /// admission sites plus every module they hand the guard to.
 const PROBE_GUARD_HOLDERS: &[&str] = &[
@@ -178,6 +194,8 @@ const PROBE_GUARD_HOLDERS: &[&str] = &[
     "src/http3/websocket.rs",
     "src/proxy/hbone_proxy.rs",
     "src/proxy/mod.rs",
+    "src/proxy/tcp_proxy.rs",
+    "src/proxy/udp_proxy.rs",
 ];
 
 /// Every settle path on the shared guard: `(label, signature, terminator)`.
@@ -224,6 +242,43 @@ fn every_circuit_breaker_admission_site_carries_a_probe_guard() {
             SHARED_PROBE_GUARD
         );
     }
+
+    for &(file, signature, count) in DIRECT_PROBE_ADMISSION_SITES {
+        let text = source(file);
+        let expected_count: usize = DIRECT_PROBE_ADMISSION_SITES
+            .iter()
+            .filter(|(path, _, _)| *path == file)
+            .map(|(_, _, count)| count)
+            .sum();
+        assert_eq!(
+            text.matches("circuit_breaker_cache.can_execute(").count(),
+            expected_count,
+            "every direct-cache admission in {file} must be listed and own a probe guard"
+        );
+        let body = item_body(&text, signature, "\n}");
+        assert_eq!(
+            body.matches("circuit_breaker_cache.can_execute(").count(),
+            count,
+            "{signature} must retain its direct-cache admission checks"
+        );
+        for admission in body.split("circuit_breaker_cache.can_execute(").skip(1) {
+            let admitted = admission
+                .split_once("Err(_) =>")
+                .expect("cache admission must handle refusal")
+                .0;
+            assert!(
+                admitted
+                    .contains("HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe)"),
+                "{signature} must own each slot on the breaker returned by cache admission"
+            );
+            if file == "src/proxy/tcp_proxy.rs" {
+                assert!(
+                    admitted.contains("cb_probe.rearm(&cb, is_half_open_probe)"),
+                    "TCP retries must rearm the guard on the newly admitted breaker"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -238,9 +293,12 @@ fn no_dispatch_path_carries_a_bare_probe_flag_beside_the_guard() {
             "{file} must carry the shared `HalfOpenProbeGuard` as `cb_probe`"
         );
         for banned in [
+            "let mut cb_is_half_open_probe",
+            "let release_half_open_probe =",
             "ws_cb_probe_slot_available",
             "grpc_cb_probe_slot",
             "cb_retry_probe_slot_available",
+            "cb_info.is_half_open_probe",
         ] {
             assert!(
                 !text.contains(banned),
@@ -293,6 +351,7 @@ fn probe_breaker_config() -> CircuitBreakerConfig {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     }
 }
 
@@ -887,5 +946,63 @@ async fn every_pool_family_key_is_drained_by_the_svid_generation_matcher() {
                 );
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Declared response Content-Length ceiling skips bodyless replies (issue #5116)
+//
+// A representation Content-Length on HEAD / 1xx / 204 / 205 / 304 is not a
+// transferable-body size. The shared helper is the single predicate; a sibling
+// that compares a parsed Content-Length against the response ceiling without
+// going through it reintroduces the 502.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn response_content_length_ceiling_skips_bodyless_semantics_on_every_path() {
+    let proxy = source("src/proxy/mod.rs");
+    let helper = item_body(
+        &proxy,
+        "pub(crate) fn declared_response_length_exceeds_limit(",
+        "\n}",
+    );
+    assert!(
+        helper.contains("synthetic_response_omits_body(method, status)"),
+        "the shared declared-length ceiling must skip HEAD/1xx/204/205/304"
+    );
+
+    for relative in [
+        "src/proxy/mod.rs",
+        "src/http3/server.rs",
+        "src/http3/cross_protocol.rs",
+    ] {
+        assert!(
+            source(relative).contains("declared_response_length_exceeds_limit("),
+            "{relative} must run the shared declared-length ceiling"
+        );
+    }
+
+    for (path, text) in production_sources() {
+        assert!(
+            !text.contains(
+                "&& let Some(len) = content_length\n                && len > effective_max_response_body_size_bytes"
+            ),
+            "{path} compared a parsed Content-Length against the response ceiling \
+             without the bodyless-aware helper"
+        );
+        assert!(
+            !text.contains(
+                "&& let Some(len) = content_length\n        && len > effective_max_response_body_size_bytes"
+            ),
+            "{path} compared a parsed Content-Length against the response ceiling \
+             without the bodyless-aware helper"
+        );
+        assert!(
+            !text.contains(
+                "content_length.is_some_and(|len| len > effective_max_response_body_size_bytes as u64)"
+            ),
+            "{path} compared a parsed Content-Length against the response ceiling \
+             without the bodyless-aware helper"
+        );
     }
 }

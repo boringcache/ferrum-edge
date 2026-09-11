@@ -408,7 +408,7 @@ DTLS frontend configuration and reload are **listener- and owner-scoped**. Every
 
 #### BPF SOCK_OPS observability (GAP-SC3)
 
-The `__mesh_bpf_metrics` plugin is auto-injected on `NodeWaypoint` topology only and surfaces TCP-layer counters from `BPF_PROG_TYPE_SOCK_OPS` plus first-data evidence from `BPF_PROG_TYPE_SK_SKB`. The userspace consumer (`src/ebpf/event_consumer.rs::SockOpsConsumer`) drains the per-CPU ringbuf and increments a shared `BpfMetricsState`. Authenticated production `GET /metrics` appends that surface exactly once from the current plugin-cache generation's precomputed exporter (configured `prefix` preserved; absent from the scrape when the plugin is not in the published configuration). Metrics emitted (Prometheus text format):
+The `__mesh_bpf_metrics` plugin is auto-injected on `NodeWaypoint` topology only as a global instance and surfaces TCP-layer counters from `BPF_PROG_TYPE_SOCK_OPS` plus first-data evidence from `BPF_PROG_TYPE_SK_SKB`. The userspace consumer (`src/ebpf/event_consumer.rs::SockOpsConsumer`) drains the per-CPU ringbuf and increments a shared `BpfMetricsState`. Authenticated production `GET /metrics` appends that surface exactly once from the current plugin-cache generation's precomputed exporter (configured `prefix` preserved after `str::trim`; the trimmed value must match `[A-Za-z_][A-Za-z0-9_]*`; default `ferrum_mesh_bpf`; absent from the scrape when the plugin is not in the published configuration). Metrics emitted (Prometheus text format):
 
 - `ferrum_mesh_bpf_tcp_events_total{event="connect"|"accept_established"|"rst"|"fin_sent"|"fin_received"}` — per-TCP-event counts. Operators correlate `accept` vs `connect` rates to spot stuck pods or pre-handshake drops. `event="rst"` counts abnormal `ESTABLISHED→CLOSE` transitions; SOCK_OPS state callbacks cannot distinguish RST-sent from RST-received, so there is no directional `rst_sent` / `rst_received` pair.
 - `ferrum_mesh_bpf_drops_total{reason="bypass_uid_hit"|"exclude_cidr_hit"|"not_in_include_cidr"|"exclude_port_hit"}` — how often each BPF capture-bypass decision fired. Produced by the `connect4`/`connect6` hooks (same ringbuf + dropped-counter contract as SOCK_OPS lifecycle events). Include-CIDR misses and `includeOutboundPorts` misses share `not_in_include_cidr`.
@@ -417,7 +417,7 @@ The `__mesh_bpf_metrics` plugin is auto-injected on `NodeWaypoint` topology only
 
 **Process split**: the node-agent owns the BPF program lifecycle — it loads `ferrum_sock_ops` from the ELF, attaches it to the cgroup root, and pins the event ringbuf, per-CPU drop counter, and accepted-socket SOCKHASH at `/sys/fs/bpf/ferrum/sock_ops_events`, `/sys/fs/bpf/ferrum/sock_ops_stats`, and `/sys/fs/bpf/ferrum/accept_first_byte_sockets`. The mesh-proxy in `NodeWaypoint` topology opens those pinned maps by path, drives a `tokio::io::unix::AsyncFd` poll loop, queues first-data SOCKHASH removal behind a bounded 250 ms grace period, and feeds decoded records through `SockOpsConsumer::handle_event` into the shared `Arc<BpfMetricsState>` that `__mesh_bpf_metrics` reads. The node-agent publishes the ringbuf pin last as the complete-generation marker, so a consumer never adopts it before the matching stats and SOCKHASH pins. There is no cross-process pointer sharing — the pinned-path contract is the entire IPC surface.
 
-When the kernel-side program is not pinned (no node-agent on the host, kernel < 5.7, or a build without the `ebpf` feature), the consumer logs one info line at startup and exits; the plugin keeps emitting a stable Prometheus surface populated by zeros so dashboards do not break. An SK_SKB load/attach failure disables only accept-to-first-byte samples and never changes capture or traffic verdicts. Node-agent reload creates a fresh unpinned correlation-map generation: in-flight evidence is deliberately discarded, while userspace aggregate counters remain attached to the current process state. The ringbuf size is sized at BPF load time by the node-agent from `FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES` (default 4 MiB) — see [docs/configuration.md](configuration.md).
+On Linux `ebpf` builds the userspace consumer retries until the node-agent pins appear: it logs one `info` line on the first miss, then backs off 1s, 2s, 4s, 8s, 16s, and 30s (capped exponential backoff at 30s) until opening the maps succeeds or shutdown fires. A missing pin does not stop the consumer; attaching after the node-agent publishes the maps does not require restarting the mesh-proxy. Builds without the `ebpf` feature or on non-Linux targets never start the consumer task. In every case the plugin keeps emitting a stable Prometheus surface populated by zeros until (and unless) the consumer attaches, so dashboards do not break. An SK_SKB load/attach failure disables only accept-to-first-byte samples and never changes capture or traffic verdicts. Node-agent reload creates a fresh unpinned correlation-map generation: in-flight evidence is deliberately discarded, while userspace aggregate counters remain attached to the current process state. The ringbuf size is sized at BPF load time by the node-agent from `FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES` (default 4 MiB) — see [docs/configuration.md](configuration.md).
 
 ### Service Waypoint
 
@@ -1289,6 +1289,21 @@ rules:
     action: allow
 ```
 
+**The authorization grammar is closed, and `action` is required.** Every level
+of the policy document — the policy, each rule, and each `from` /
+`to` / `when` / `source_negation` matcher — rejects unknown members at
+admission, on the native/file mesh document and on a direct `mesh_authz`
+plugin config alike. This is not tidiness: every misspelling in this grammar
+*removes* a restriction the operator wrote. `not_paths` typed `not_path` would
+deserialize as an unconstrained rule, and an `action` key typed `actoin` used
+to fall back to the `Allow` default and convert a DENY into a grant, with no
+diagnostic anywhere. `action` therefore has no default on the wire — write it
+on every rule. Omitted optional matchers keep their documented empty defaults
+(an omitted `to` still means "any request"), and an explicitly empty
+`rules: []` remains a valid scaffold; only an *unrecognized* member or a
+missing `action` is refused. Kubernetes and xDS translation build these values
+programmatically and are unaffected.
+
 ### ServiceEntry
 
 External service registration for DNS resolution and egress materialization.
@@ -1793,9 +1808,14 @@ an operator's authorizer ever saw a request the scope it protects applied to
 **Bounds.** `timeout` is capped at 30s (default 1s), `includeRequestBodyInCheck.maxRequestBytes`
 at 1 MiB, provider response reads at 64 KiB, each header list at 32 exact
 entries (case-insensitively unique), and the admitted provider set at 16 per
-mesh generation. In-flight checks are capped process-wide and are **refused
-immediately** at the ceiling rather than queued, so provider slowness cannot
-become unbounded gateway latency or memory growth.
+mesh generation. In-flight checks are capped at **128 process-wide** and are
+**refused immediately** at the ceiling rather than queued, so provider slowness
+cannot become unbounded gateway latency or memory growth. That budget is ONE
+shared pool, not one per plugin instance: every enabled `mesh_authz` instance
+and every overlapping reload generation draws from it, and a check that started
+on a retiring generation stays charged until it finishes, because the permit
+follows the request rather than the config version. There is no per-provider or
+per-instance concurrency knob.
 
 **Nothing is retried.** The check is dispatched through a dedicated
 single-attempt seam on the shared plugin HTTP client, so it keeps that client's
@@ -1844,13 +1864,29 @@ denial status has arrived, that status remains authoritative even if its
 discarded body is oversized or cannot be drained; `failOpen` therefore cannot
 convert a provider denial into an allow through a body-framing failure.
 
-A provider name this generation does not carry, a generation with no executor,
-an unavailable request body for a body-inspecting provider, a concurrency
-refusal, and task cancellation are all failed checks and therefore also honour
+An unavailable request body for a body-inspecting provider and a concurrency
+refusal are failed checks and therefore honour the selected provider's
 `failOpen`. **Three** refusals are decided **without** contacting a provider and
 are therefore **not** subject to `failOpen`: a provider conflict (above), a
 matched delegation on a connection with no HTTP request to check, and a request
 body over the selected provider's `maxRequestBytes` (below).
+
+**Two more refusals never consult `failOpen` either, because there is no
+provider to consult.** A CUSTOM rule naming a provider this generation does not
+carry, and a matched CUSTOM rule in a generation with no executor at all (no
+outbound HTTP client, e.g. a direct `mesh_policies` config, which carries no
+provider source), are **unconditional fixed `403` refusals**. Neither has a
+provider whose `failOpen` or `statusOnError` could be honoured, so a `failOpen:
+true` provider elsewhere in the generation does not admit them; both count once
+as `provider_unbound` and as a fail-closed check. Configure the provider, or
+delete the CUSTOM policy — a delegation that cannot be executed is never
+allowed to fall through to the ALLOW/DENY tiers.
+
+**Task cancellation ends the request; it never synthesizes an allow.** The check
+runs under the ordinary request deadline, so when the request is cancelled the
+check future is dropped mid-flight. Nothing is recorded, no `failOpen` decision
+is made, and the client sees the cancellation — `failOpen` cannot turn a
+cancelled request into an admitted one.
 
 **Request body.** `includeRequestBodyInCheck.maxRequestBytes` is folded into
 the proxy's pre-`authorize` body ceiling, so an over-cap request is refused with
@@ -1919,17 +1955,45 @@ generation, so the previous valid one keeps serving.
 `ferrum_mesh_ext_authz_check_failures_total{disposition}` are fixed-cardinality:
 the labels are closed enums plus the gateway namespace, never a provider,
 policy, route, host, principal, or status string. `mesh_authz.ext_authz_outcome`
-request metadata carries the same closed reason token. Every matched
-delegation is counted **exactly once**, including the outcomes decided without
-contacting a provider (`provider_unbound` when no executor or no binding,
-`provider_conflict`, `unexecutable` for an L4 session), so a fail-closed
-denial is never invisible. `outcome` values are `allowed`, `denied_by_provider`,
-`provider_unbound`, `provider_error`, `provider_conflict`, `unexecutable`,
-`timeout`, `transport_error`, `response_refused`, `body_unavailable`,
-`body_too_large`, and `concurrency_exhausted`. `body_unavailable` (a failed
-check `failOpen` may admit) and `body_too_large` (the unconditional over-cap
-refusal) are deliberately separate series. No request body, credential header
-value, provider secret, or resolved provider URL is ever logged.
+request metadata carries a closed reason token from a RELATED but FINER
+vocabulary — see the two tables below. Every matched delegation is counted
+**exactly once**, including the outcomes decided without contacting a provider
+(`provider_unbound` when no executor or no binding, `provider_conflict`,
+`unexecutable` for an L4 session), so a fail-closed denial is never invisible.
+No request body, credential header value, provider secret, or resolved provider
+URL is ever logged.
+
+The metric's `outcome` label has **twelve** values. Ten map one-to-one to a
+reason token; two pairs of reasons are deliberately folded, because the
+distinction inside each pair is a diagnostic detail rather than an operational
+one:
+
+| `outcome` label | `mesh_authz.ext_authz_outcome` reason token(s) | Meaning |
+| --- | --- | --- |
+| `allowed` | `allowed` | The provider answered `200`. |
+| `denied_by_provider` | `denied_by_provider` | An explicit provider denial, carrying its own status. |
+| `provider_unbound` | `provider_unbound` | The named provider does not bind, or the generation has no executor. Fixed `403`; never `failOpen`. |
+| `provider_error` | `provider_error` | The provider answered `5xx` — it could not decide. |
+| `provider_conflict` | `provider_conflict` | Two different extension providers applied to one request. Never `failOpen`. |
+| `unexecutable` | `unexecutable` | A matched delegation on a connection with no HTTP request to check. Never `failOpen`. |
+| `timeout` | `timeout` | The check exceeded the provider's `timeout`. |
+| `transport_error` | `transport_error`, `request_build_failed` | The check could not be completed on the wire, or could not be built at all. |
+| `response_refused` | `response_too_large`, `response_read_failed` | An allow response larger than the 64 KiB read bound, or one that could not be read. |
+| `body_unavailable` | `body_unavailable` | A body-inspecting provider had no body to inspect. A failed check `failOpen` may admit. |
+| `body_too_large` | `body_too_large` | The body exceeded the SELECTED provider's `maxRequestBytes`. The unconditional over-cap refusal. |
+| `concurrency_exhausted` | `concurrency_exhausted` | The process-wide in-flight budget was full; refused immediately, never queued. |
+
+`body_unavailable` and `body_too_large` stay separate series on purpose:
+folding them would hide which of the two an operator is seeing, and only the
+first honours `failOpen`. `ferrum_mesh_ext_authz_check_failures_total`
+`{disposition}` splits the failed checks — every outcome except `allowed`,
+`denied_by_provider`, `provider_conflict`, `unexecutable`, and `body_too_large`
+— into `fail_closed` and `fail_open`.
+
+When alerting, use the `outcome` label values above; the finer reason tokens
+(`response_too_large`, `response_read_failed`, `request_build_failed`) appear
+only in per-request `mesh_authz.ext_authz_outcome` metadata and never as a
+metric label.
 
 ### Rule Matching
 
@@ -1938,7 +2002,8 @@ Each `MeshRule` checks the following dimensions (all must match — a conjunctio
 - **Principal matching** (`from`): Istio source-principal patterns (`<trust-domain>/ns/<namespace>/sa/<service-account>`, glob), `serviceAccounts`, namespace patterns (glob), and trust-domain patterns. Full `spiffe://...` patterns are also accepted in direct `MeshPolicy` config. Multiple `from[]` source entries are ORed.
 - **Request principal matching**: `request_principals` glob patterns matched against the `{issuer}/{subject}` composite extracted by `jwks_auth`. On an HTTP-family path, when `request_principals` is non-empty and no JWT is present, the rule does not match (Istio semantics: anonymous requests fail the principal check). An empty `request_principals` list matches any request including unauthenticated ones, on every protocol. `requestPrincipals` is a JWT-derived **HTTP-only** field, so on a Layer-4 session (raw TCP, TLS passthrough, UDP, DTLS) it follows the same Istio non-HTTP-port model as the HTTP-only `to.operation` fields and `when: request.auth.*` conditions: a `DENY` (or `CUSTOM`) rule ignores it and still matches on its remaining constraints, while an `ALLOW`/`AUDIT` rule can never match on it.
 - **Source negation / IP blocks** (per-source, ANDed with the positive `from`): Istio `notPrincipals`, `notServiceAccounts`, `notNamespaces`, `notTrustDomains`, `notRequestPrincipals`, `ipBlocks`, `notIpBlocks`, `remoteIpBlocks`, `notRemoteIpBlocks`. These are **conjunctive** with the positive matchers. Negative identity matchers fail the rule only when the corresponding source/JWT identity is present and matches an excluded pattern; if the identity is absent, the negative matcher succeeds, so `DENY notPrincipals: ["*"]` and `DENY notRequestPrincipals: ["*"]` catch anonymous traffic. That absent-identity rule applies to `notRequestPrincipals` only where a JWT could have been observed: on a Layer-4 session the field is unevaluable, not absent, so it resolves through the same non-HTTP-port model as its positive sibling — ignored by `DENY`/`CUSTOM`, never matched by `ALLOW`/`AUDIT`. A `from:`-only `ALLOW` carrying `notRequestPrincipals` therefore does not grant a raw TCP/UDP/TLS-passthrough session. IP block matchers fail closed when the IP they test is absent, so a positive `ipBlocks`/`remoteIpBlocks` constraint with no resolved IP does not match. `ipBlocks`/`notIpBlocks` match the direct connection peer IP (`source.ip`); `remoteIpBlocks`/`notRemoteIpBlocks` match the gateway-resolved client IP (`remote.ip`, XFF-derived when trusted proxies are configured). Unsupported source fields fail the resource closed at translation time (mirroring the `to.operation` side); a malformed CIDR rejects the resource or direct plugin config.
-- **Request matching** (`to`): methods, paths (glob), hosts (normalized, case-insensitive), ports (exact + glob patterns), headers (case-insensitive keys, normalized at config load). The negative `to.operation` matchers (`notMethods`/`notPaths`/`notHosts`/`notPorts`) are conjunctive; `notPorts` accepts the same bounded Istio port grammar as positive `ports` (`"*"`, `"<digits>*"`, `"*<digits>"` that can match an ordinary decimal port in `1..=65535`, plus literal `1`-`65535`) and evaluates through pre-normalized `not_ports` / `not_port_patterns` without per-request allocation. ALLOW/AUDIT rules fail closed when the corresponding request attribute is absent (including an unresolved destination/listener port for `notPorts`); DENY rules follow Istio and treat missing HTTP-only operation attributes as matches, so port scoping is recommended for DENY rules that mention HTTP fields and can see TCP traffic.
+- **Request matching** (`to`): methods, paths (glob), hosts (normalized, case-insensitive), ports (exact + glob patterns), headers (case-insensitive keys, normalized at config load). The negative `to.operation` matchers (`notMethods`/`notPaths`/`notHosts`/`notPorts`) are conjunctive; `notPorts` accepts the same bounded Istio port grammar as positive `ports` (`"*"`, `"<digits>*"`, `"*<digits>"` that can match an ordinary decimal port in `1..=65535`, plus literal `1`-`65535`) and evaluates through pre-normalized `not_ports` / `not_port_patterns` without per-request allocation. ALLOW/AUDIT rules fail closed when the corresponding request attribute is absent (including an unresolved destination/listener port for `notPorts`); DENY (and `CUSTOM`) rules follow Istio and treat **unsourceable** HTTP-only operation attributes as matches, so port scoping is recommended for DENY rules that mention HTTP fields and can see TCP traffic.
+  **"Unsourceable" is not the same as "absent", and `headers` is where the difference is observable.** On a Layer-4 session (raw TCP, TLS passthrough, UDP, DTLS) there is no header map at all, so a `to.headers` predicate is unevaluable and a DENY/`CUSTOM` rule ignores it and still matches on its remaining constraints. On an HTTP-family request Ferrum HAS parsed the header map, so a header the client simply did not send is genuinely **absent** and fails a positive `to.headers` predicate for **every** action, DENY and `CUSTOM` included — matching Envoy's `HeaderMatcher`, where a missing field never satisfies an exact non-empty value, and matching the sibling `when: request.headers[...]` condition, which has always drawn this distinction. A DENY carrying `headers: {x-mode: blocked}` therefore refuses an HTTP request that carries `x-mode: blocked` and lets an HTTP request with no `x-mode` header through to the remaining tiers; to refuse the header-less request as well, add a second rule with no header predicate. `methods`, `paths`, `hosts` and `ports` are unaffected in practice: an HTTP-family request always carries a method and a canonical path, and a request with no resolvable authority or port has nothing for the matcher to read.
   `hosts` and `notHosts` match the literal requested hostname/authority after case, trailing-dot, and decimal-port normalization; they do not identify a service or expand its aliases. For example, one service may be reachable as `svc`, `svc.ferrum`, `svc.ferrum.svc`, and `svc.ferrum.svc.cluster.local`. A DENY naming only the FQDN does not cover the short-name aliases. To cover a destination, use an appropriately scoped policy with `to.ports`, enumerate every admitted alias, or choose a host wildcard whose breadth you intend (for example, `svc*` also covers other names beginning with `svc`). A host pattern without a port also matches that hostname with a port; explicit decimal ports are compared numerically (`svc:080` and `svc:80` are equivalent), `:*` remains a wildcard, and signed request ports are invalid. Host matching describes what the client asked for, not which service ultimately receives it.
 
 - **Condition matching** (`when`): attribute-based with `values` (the attribute must be present and equal one of the values) and `not_values` (the attribute must not equal any value; an absent attribute satisfies a `not_values`-only condition, matching Istio's compiled `not_rule` semantics). Values follow Istio's `StringMatcherWithPrefix` grammar for most keys: `*` is a presence check, a trailing `*` is a prefix match, a leading `*` is a suffix match, and anything else — including a mid-string `*` — is an exact match on the literal text. **Three keys have their own Istio grammar and do not use that matcher** — `source.ip` / `remote.ip` / `destination.ip` are CIDR blocks, `source.serviceAccount` is an exact namespace-relative match, and `source.namespace` accepts a `*` at any position (see [Value grammars](#value-grammars-per-key) below). **Ferrum represents the complete documented Istio condition-key set** (see [Condition keys](#condition-keys) below): `source.principal` (Istio form without the `spiffe://` scheme), `source.namespace`, `source.serviceAccount`, and `source.trustDomain` (all from the resolved peer SPIFFE ID), `source.ip`, `remote.ip`, `destination.ip`, `destination.port`, `connection.sni`, `request.auth.principal`, `request.auth.presenter` (JWT `azp`), `request.auth.audiences`, `request.auth.claims[<name>]` and nested `request.auth.claims[<name>][<nested>]` string or string-list leaf values (from the validated JWT via the mesh `RequestAuthentication` plugin), `request.headers[<name>]`, and `experimental.envoy.filters.<filter>[<key>]`. Dynamic header/claim keys follow Istio's loose `validateMapKey` framing: the first `[` and final `]` delimit a non-empty interior, without an extra HTTP-header-name parse at policy admission. Known HTTP pseudo-headers (`:authority`, `:method`, `:path`, `:scheme`) come from typed request facts; unusual admitted interiors that no request or validated claim can materialize remain absent. Keys outside the documented prefixes are **rejected** at translation/config validation time with a field-specific diagnostic, so a DENY condition on an unmodelled attribute cannot silently fail open. Only the attribute keys some loaded policy references are materialized per request, so a policy set with no `when:` conditions adds no hot-path cost.
@@ -2052,11 +2117,27 @@ A bare `source.serviceAccount` is namespace-relative, so the same policy text me
 
 ### SPIFFE Identity
 
-The `spiffe_identity` plugin (priority 940) extracts the peer SPIFFE ID from TLS/DTLS client certificates on every inbound request. This identity feeds into:
+The [`spiffe_identity`](plugins.md#spiffe_identity) plugin (priority 940) extracts the peer SPIFFE ID from TLS/DTLS client certificates on every inbound request. Configuration, admission, hooks, outputs, trust-domain grammar, and invalid-SVID behavior are documented in that plugin reference. This identity feeds into:
 
 - `mesh_authz` principal matching
 - Workload metrics labels (`source.principal`, `destination.principal`)
 - Transaction summary `auth_method` tracking
+
+**SPIFFE-only chains are lifetime-bounded.** The mesh injection installs
+`spiffe_identity` plus `mesh_authz` and does not require `mtls_auth`, so on those
+chains the SVID alone authorizes the request. `spiffe_identity` therefore admits
+a certificate-derived peer identity as an authenticated principal carrying the
+leaf's `notAfter` as its authorization deadline, on the same protocol-neutral
+contract `mtls_auth` uses for Consumer-mapped certificates. Requests and streams
+authorized only by a peer SVID are re-checked against the leaf's validity window
+on every request and are terminated at SVID expiry (or the finite
+`FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` fallback, whichever is
+earlier) instead of running for the life of the transport connection. A
+pre-stamped kernel-attested (node-waypoint eBPF) or HBONE-asserted
+`peer_spiffe_id` carries no certificate validity window and is deliberately not
+treated as certificate-bounded; explicit trust withdrawal remains the separate
+mechanism described under
+[frontend_tls.md — Expiry is not revocation](frontend_tls.md#expiry-is-not-revocation).
 
 For production deployments, Ferrum delegates SVID issuance and trust-bundle
 distribution to a separately operated [SPIRE](https://spiffe.io/docs/latest/spire-about/)
@@ -2757,7 +2838,7 @@ When `FERRUM_MESH_TOPOLOGY=egress_gateway`, the mesh runtime materializes HTTP-f
 - HTTP-family protocols (`http`, `http2`, `grpc`, `tls`) materialize **HTTP-family** proxies: host-routed off the shared egress listener (mTLS termination at `egress_listen_addr`, default 15090). One proxy per host across all ports — host-only routing cannot disambiguate multiple ports under the same host.
 - Stream-family protocols (`tcp`, `mongo`, `redis`, `mysql`, `postgres`) are **opt-in** via `FERRUM_MESH_EGRESS_STREAM_ENABLED=true` (default `false`). When the flag is off, stream-family ports are skipped with a warning and only HTTP-family egress materializes. When the flag is on, each stream-family port materializes its own TCP proxy (T5-A) on the ServiceEntry's destination port (e.g., `mongo.external.io:27017/TCP` produces a TCP listener on port 27017). **Each stream egress listener terminates SVID-mTLS and runs `mesh_authz` at accept** — the same authn/z as HTTP egress: the materialized stream proxy is `frontend_tls: true` and uses the SAME mesh-inbound `ServerConfig` (server identity = gateway SVID leaf+key, peer verifier = SPIFFE against the trust bundle) that backs the egress 15090 HTTP listener, shared via the stream listener manager's TLS slot (`set_frontend_tls_config` / live `swap_frontend_tls_config`). After the handshake, the injected `__mesh_spiffe_identity` stream hook extracts the peer SPIFFE id from the verified client cert and `__mesh_authz` enforces policy **before the external backend is dialed** (TLS-terminating frontends complete crypto/admission before backend dispatch). **A client certificate is required, not optional:** because the egress gateway is a security boundary onto external networks, `resolve_mesh_inbound_client_auth` escalates a `PERMISSIVE` `PeerAuthentication` (the default when no STRICT policy is in force) to `Required` for this topology, so a cert-less TLS client is **rejected at the handshake** instead of being admitted to the external backend — the shared `ServerConfig` is built with required client auth, which is why the same protection also covers the sibling 15090 HTTP-family mTLS listener. (If `PERMISSIVE` somehow resolves with no trust anchor at all, the listener cannot authenticate clients and **fails closed** with a hard error rather than serving optional-no-verify mTLS; `validate_egress_gateway_mtls_config` already requires a peer verifier at config time, and the escalation is reapplied on `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true` slice apply so a reload cannot downgrade it.) **Fail-closed:** if no mTLS `ServerConfig` is loaded the stream listener manager *defers* the per-port bind (it never binds plaintext), mirroring the inbound posture (`enforce_mesh_inbound_fail_closed`); under `FERRUM_MESH_PRODUCTION_MODE=true` a no-identity egress gateway is already refused at startup by the inbound fail-closed gate. The explicit opt-out `FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT=true` restores the legacy plaintext + unauthenticated listener (`frontend_tls: false`) for operators who genuinely need it, with a loud startup warning — without compensating network controls, any pod that can reach the gateway then reaches the external service through it with no SPIFFE authn/z. One proxy per port; same-port collisions across ServiceEntries skip the second entry with a warning. Multi-port stream ServiceEntries bind each port separately. ServiceEntry ports that collide with the egress gateway's own listener port (`egress_listen_addr.port()`, default `15090`) or port `0` are skipped with a warning rather than emitted — letting them through would fail to bind at runtime (`EADDRINUSE`) and reject the entire slice apply.
 - Mongo / Redis / MySQL / Postgres are TCP-based at the wire level; the protocol tag is preserved on `Proxy.name` for observability but **no protocol-aware mediation** (e.g., MongoDB wire-format inspection) is performed. Protocol-level mediation is tracked separately.
-- **Wildcard hosts differ by transport family.** An HTTP-family wildcard `hosts[]` entry (`*.example.com`) supports `DNS` and `NONE`: its route and configured wildcard target materialize, then request dispatch replaces the selected target with the matching concrete request authority before DNS, SNI, and connection-pool selection. Under `resolution: STATIC` with non-empty `endpoints[]`, those declared addresses remain the dial targets. Stream-family wildcard entries still require declared `STATIC` endpoints because raw streams provide no HTTP authority to concretize; such a host is skipped on the stream-family branch with a `hosts[]`-named warning and the Istio CRD status reports it in `deferred_fields` (`FerrumAccepted` stays `True` — the resource is translated, just inert for that host). A refused stream entry returns **before** claiming its listen port, so a following exact-host ServiceEntry on the same port can materialize. The datagram (`protocol: UDP`/`DTLS`) branch is stricter and refuses **every** wildcard host, including the `STATIC`-with-endpoints case, because UDP destinations use exact CONNECT `:authority` admission.
+- **Wildcard hosts differ by transport family.** An HTTP-family wildcard `hosts[]` entry (`*.example.com`) supports `DNS` and `NONE`: its route and configured wildcard target materialize, then request dispatch replaces the selected target with the matching concrete request authority before DNS, SNI, and connection-pool selection. Under `resolution: STATIC` with non-empty `endpoints[]`, those declared addresses remain the dial targets; without a usable endpoint the entry fails closed and never resolves either the wildcard or a request authority. Stream-family wildcard entries still require declared `STATIC` endpoints because raw streams provide no HTTP authority to concretize; such a host is skipped on the stream-family branch with a `hosts[]`-named warning and the Istio CRD status reports it in `deferred_fields` (`FerrumAccepted` stays `True` — the resource is translated, just inert for that host). A refused stream entry returns **before** claiming its listen port, so a following exact-host ServiceEntry on the same port can materialize. The datagram (`protocol: UDP`/`DTLS`) branch is stricter and refuses **every** wildcard host, including the `STATIC`-with-endpoints case, because UDP destinations use exact CONNECT `:authority` admission.
 - DNS-resolution entries use ServiceEntry hosts as backend targets; static-resolution entries use endpoint addresses. Stream-family proxies pin to the first host (DNS) or all endpoints (Static) — a raw L4 listener cannot distinguish hosts (no SNI for plain TCP), so multi-host external services should be split into one SE per host.
 - HTTP-family materialized proxies use host-only routing (no `listen_path`), `preserve_host_header: true`, and passive health checks. Stream-family proxies use port routing (no `hosts`), `passthrough: false` (the per-port stream listener terminates SVID-mTLS itself — the sidecar mTLS boundary IS this listener, sharing the same `ServerConfig` as the sibling 15090 HTTP-family mTLS-termination listener; this is NOT raw SNI passthrough, that flow lives in the east-west gateway), `frontend_tls: true` by default (or `false` under `FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT=true`), and passive health checks.
 - The egress gateway materialization pairs with the `mesh_outbound_registry` plugin (HTTP-family, request-path 4xx/5xx). T5-A and the sibling T5-B (stream-family outbound enforcement at sidecar capture: connection-level drop / silent UDP datagram drop) close the `outboundTrafficPolicy: REGISTRY_ONLY` gap across both transport families.
@@ -2845,7 +2926,13 @@ The flag defaults `false` so existing deployments see zero behavior change on up
 
 When dry-run mode computes denied services, the data plane emits one transition warning when would-denies become active and one recovery info line when the next installed slice has no would-denies. It does not log per request. The `/health` response includes `mesh.egress_scope.sidecar_admitted_services` and `mesh.egress_scope.sidecar_denied_services` for readiness dashboards.
 
-The `mesh_outbound_registry` plugin exposes `ferrum_mesh_outbound_registry_decisions_total` with `mesh_namespace`, `host`, and `decision` labels. To keep label cardinality bounded, every `host` value is one of three fixed buckets: `host="<admit_explicit>"` for admits matched by an exact registry entry, `host="<admit_wildcard>"` for admits matched by a one-label wildcard entry, and `host="<denied>"` for every deny (the request Host header is attacker-controlled on that path). Operators can compare admit-vs-deny rates per namespace during rollout, but not per destination hostname — consult application logs for the requested host of denied traffic. Under effective `REGISTRY_ONLY`, outbound-capture HTTP route misses take the same configured reject status and deny-bucket metric as plugin-path denials.
+The `mesh_outbound_registry` plugin exposes `ferrum_mesh_outbound_registry_decisions_total` with `mesh_namespace`, `host`, and `decision` labels. To keep label cardinality bounded, every `host` value is one of three fixed buckets: `host="<admit_explicit>"` for admits matched by an exact registry entry, `host="<admit_wildcard>"` for admits matched by a one-label wildcard entry, and `host="<denied>"` for every deny (the request Host header is attacker-controlled on that path). An applicable exact entry takes precedence for metrics when both kinds match; a bare-host entry cannot classify an explicit-port request as an exact admit. Operators can compare admit-vs-deny rates per namespace during rollout, but not per destination hostname — consult application logs for the requested host of denied traffic. Under effective `REGISTRY_ONLY`, outbound-capture HTTP route misses take the same configured reject status and deny-bucket metric as plugin-path denials.
+
+The plugin's `config.namespace` supplies the `mesh_namespace` metric label and defaults to `ferrum`. Mesh injection explicitly sets it to the runtime namespace; direct instances do not inherit the enclosing `PluginConfig` resource namespace. Direct instances accept listener ports in 1–65535, with `outbound_listen_ports: []` applying wherever the plugin runs. An empty effective registry rejects every destination on those listeners, including when all entries are empty or whitespace-only.
+
+Registry entries are host authorities, with optional decimal ports in 1–65535 or `:*`, and optional leading one-label `*.` wildcards on hostnames. Hostname labels use ASCII letters, digits, and interior hyphens; internationalized names must be supplied in punycode. Surrounding whitespace, hostname case, trailing hostname dots, and IPv6 spelling are normalized. IPv4 names, bare or bracketed IPv6, and IPv6 any-port entries are supported; numeric IPv6 ports require brackets. URLs, paths, userinfo, internal whitespace, malformed brackets, misplaced wildcards, and invalid ports fail construction with the zero-based registry entry index. See the [plugin reference](plugins.md#mesh_outbound_registry) for all four configuration fields.
+
+If a mesh-derived registry is invalid, the shared stream and HTTP route-miss enforcement state retains a deny-all registry on outbound capture listeners and emits a construction warning. It does not remove the `REGISTRY_ONLY` gate.
 
 Stream-family egress (TCP / UDP / TCP+TLS / UDP+DTLS) is enforced at the connect / first-datagram stage rather than via a plugin: when `outbound_traffic_policy: registry_only` is active and the gateway owns at least one mesh outbound capture listener port, stream proxies bound to those ports consult the same slice-derived registry before dialing the backend. Rejection semantics differ from HTTP:
 
@@ -3676,6 +3763,18 @@ wide. Scope it with a workload selector instead.
 Each section (tracing, metrics, access logging) is merged independently. Within the same scope level, later resources win. Deterministic ordering is ensured by namespace/name tie-breaking.
 
 **Tracing configuration**:
+
+For direct plugin configuration outside Istio translation, see the complete
+[`workload_metrics` standalone reference](plugins.md#standalone-configuration),
+including provider envelopes, disable aliases, sampling omission, resource-name
+defaults, and exporter queue/retry ranges. Malformed recognized field types
+are constructor errors; OptionalFailOpen warns and omits the invalid instance.
+Across multiple effective instances, custom tag names compose within a shared
+32-name admission bound; later stamped values take precedence. A skipped or
+empty instance does not erase earlier tag names. The HTTP-family service graph
+records one observation per terminal client transaction regardless of instance
+count, honors memoized triggers, and counts nonzero final gRPC status as an
+error (including native and translated gRPC-Web outcomes).
 
 - `sampling_percentage`: 0.0--100.0. New root traces use a probabilistic PRNG decision; valid upstream W3C `traceparent` and B3 sampling decisions are inherited unchanged.
 - `custom_tags`: literal key-value tags injected into every span. Tags merge by key across matching Telemetry scopes; a more-specific scope overrides only keys it names. A source change for a named tag is exclusive: literal, header, or environment replaces the less-specific source and its fallback rather than leaving both active.
@@ -6161,7 +6260,7 @@ selected request Host when no authority rewrite exists) with the Envoy/Istio
 
 Per-route `rewrite` (Istio `http[].rewrite`) rides on each emitted `mesh_route_dispatch` rule as a per-rule `rewrite` action, so it follows the matched route through route-collapse without rewriting sibling routes:
 
-- `rewrite.uri` → the request path forwarded to the backend. When the route's `match.uri` is a `prefix`, Istio prefix-rewrite semantics apply — only the matched prefix is replaced and the remainder is preserved (`/api/users` with `prefix: /api`, `rewrite.uri: /v2` → `/v2/users`). For `exact` / `regex` matches (and URI-less matches) the whole path is replaced. The original path is still used for route selection and logging.
+- `rewrite.uri` → the request path forwarded to the backend. When the route's `match.uri` is a `prefix`, Istio prefix-rewrite semantics apply — only the matched prefix is replaced and the remainder is preserved (`/api/users` with `prefix: /api`, `rewrite.uri: /v2` → `/v2/users`). The replacement is literal: the unmatched suffix is appended verbatim, so a prefix that ends inside a path segment keeps that segment intact (`prefix: /prefix/old`, `rewrite.uri: /new` → `/prefix/oldtail` forwards as `/newtail`, not `/new/tail`). Two boundary adjustments survive that: a doubled separator is collapsed when both sides carry a `/`, which is Envoy's documented `prefix: /prefix` + `prefix_rewrite: /` pairing (`/prefix/etc` → `/etc`); and a suffix that opens with a `.` keeps its own segment boundary, so a traversal operand written immediately after the matched prefix is still evaluated as a whole segment and refused (`/prefix/old../admin` composes `/new/../admin` and is rejected with 400, rather than being laundered into the ordinary segment `/new../admin` and forwarded). A dot-leading suffix that is not itself a dot segment (`..hidden`) forwards, in its own segment. No separator is synthesized at any other boundary that had none. For `exact` / `regex` matches (and URI-less matches) the whole path is replaced. The original path is still used for route selection and logging.
 - `rewrite.authority` → the authority forwarded to the backend. The plugin writes the new authority into the request `Host` header and flips `preserve_host_header` on the effective proxy. For HTTP/1.1 backends (reqwest) the `Host` header is the on-wire request authority, so the rewrite takes full effect. For HTTP/2, gRPC, and HTTP/3 backends the `:authority` pseudo-header is derived from the backend connection target URL (the pool key's host/port), not the `Host` header; the rewrite lands in the `Host` header that travels as an application header within the H2/H3 frame, but the protocol-level `:authority` follows the backend target. HBONE CONNECT carries the rewritten `Host` in its CONNECT request headers, which the receiving mesh proxy reads as the application authority.
 
 `rewrite.uri` must be a canonical absolute path without a query or fragment; percent escapes, dot segments, backslashes, and CRLF are rejected at config load. The composed prefix replacement and request suffix are checked again before publishing the override. A composition that creates a dot segment or forbidden escape is refused with HTTP 400 (or the corresponding RPC error), before backend-path policy and dispatch; dot segments are never removed. Existing slash joining, backend base-path composition, and the original client path used for route selection and logging are preserved. The shared before-proxy boundary applies the canonical path contract to provider overrides as well, including deferred and absolute overrides.
@@ -6172,7 +6271,7 @@ CRLF and whitespace in authority rewrite values are rejected at config load.
 
 Per-route `redirect` (Istio `http[].redirect`) rides on each emitted `mesh_route_dispatch` rule as a per-rule `redirect` action. When the rule matches, the request is answered with a 3xx + `Location` response and never reaches a backend (so a redirect route needs no `route[]` backend — Istio forbids `route` + `redirect` together):
 
-- `redirect.uri` → replacement path (request path preserved when unset).
+- `redirect.uri` → replacement path (request path preserved when unset). When the rule carries `match_prefix`, only that prefix is replaced and the unmatched suffix is appended verbatim, sharing the literal-substitution contract described under [URI / Authority Rewrite](#uri--authority-rewrite).
 - `redirect.authority` → replacement authority (request `Host`/`:authority` preserved when unset).
 - `redirect.port` → replacement authority port (mutually exclusive with `derivePort`; request host preserved when authority is unset).
 - `redirect.derivePort` → dynamic port selection projected as `derive_port`:

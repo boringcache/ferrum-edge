@@ -48,7 +48,10 @@ use crate::fips::backend::rand::SecureRandom;
 use async_trait::async_trait;
 use base64::Engine;
 use dashmap::DashMap;
-use ldap3::{Ldap, LdapConnAsync, LdapConnSettings, Scope, SearchEntry, SearchOptions, StdStream};
+use ldap3::{
+    Ldap, LdapConnAsync, LdapConnSettings, Scope, SearchEntry, SearchOptions, StdStream,
+    parse_filter,
+};
 use rustls::ClientConfig;
 #[cfg(test)]
 use rustls::pki_types::CertificateDer;
@@ -78,6 +81,14 @@ use super::{RequestContext, strip_auth_scheme};
 pub const LDAP_AUTH_DEFAULT_CACHE_TTL_SECONDS: u64 = 0;
 pub const LDAP_AUTH_MAX_CACHE_TTL_SECONDS: u64 = 86_400;
 pub const LDAP_AUTH_DEFAULT_MAX_CACHE_ENTRIES: usize = 10_000;
+/// Upper bound on `max_cache_entries`. The cache holds one canonical identity
+/// per admitted credential, so an unbounded configured maximum is a memory
+/// commitment the operator cannot see; every other `ldap_auth` resource knob
+/// is bounded the same way.
+pub const LDAP_AUTH_MAX_CACHE_ENTRIES_LIMIT: usize = 1_000_000;
+
+/// `WWW-Authenticate` challenge advertised for rejected/absent credentials.
+const LDAP_AUTH_BASIC_CHALLENGE: &str = r#"Basic realm="ferrum-edge", charset="UTF-8""#;
 
 const LDAP_AUTH_DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 5;
 const LDAP_AUTH_MAX_CONNECT_TIMEOUT_SECONDS: u64 = 300;
@@ -187,6 +198,12 @@ pub struct LdapAuth {
     max_cache_entries: usize,
     /// Whether to try mapping to a gateway Consumer via consumer_index
     consumer_mapping: bool,
+    /// Remove the verified `Authorization: Basic` credential from the backend
+    /// request. Default `true`, matching `key_auth`.
+    hide_credentials: bool,
+    /// Request headers whose values carry reusable credentials and must be
+    /// omitted from diagnostics and policy calls.
+    request_headers_to_redact: Vec<String>,
     /// Pre-built rustls `ClientConfig` for LDAP TLS connections.
     /// Integrates `FERRUM_TLS_CA_BUNDLE_PATH` (exclusive trust) and
     /// `FERRUM_TLS_NO_VERIFY`. `Arc` so reuse across reconnects is cheap and
@@ -226,14 +243,19 @@ impl LdapAuth {
             );
         }
 
-        let is_ldaps = match parsed_ldap_url.scheme() {
-            "ldap" => false,
-            "ldaps" => true,
-            _ => {
-                return Err(
-                    "ldap_auth: 'ldap_url' must start with 'ldap://' or 'ldaps://'".to_string(),
-                );
-            }
+        // Decide the scheme from the RAW value, not from `Url::parse`, which
+        // case-folds it: the published contract (and every `ldap_url` pattern
+        // in `openapi.yaml`) is a lowercase scheme, so `LDAP://` must be
+        // refused here rather than silently admitted by the gateway and
+        // rejected by schema validation.
+        let is_ldaps = if ldap_url.starts_with("ldaps://") {
+            true
+        } else if ldap_url.starts_with("ldap://") {
+            false
+        } else {
+            return Err(
+                "ldap_auth: 'ldap_url' must start with 'ldap://' or 'ldaps://'".to_string(),
+            );
         };
         if !has_non_empty_authority(&ldap_url) {
             return Err("ldap_auth: 'ldap_url' must include a hostname".to_string());
@@ -304,18 +326,22 @@ impl LdapAuth {
             );
         }
 
-        if let Some(ref f) = search_filter
-            && !f.contains("{username}")
-        {
-            return Err(
-                "ldap_auth: 'search_filter' must contain '{username}' placeholder".to_string(),
-            );
+        if let Some(ref f) = search_filter {
+            if !f.contains("{username}") {
+                return Err(
+                    "ldap_auth: 'search_filter' must contain '{username}' placeholder".to_string(),
+                );
+            }
+            validate_ldap_filter_syntax(f, "search_filter")?;
         }
 
         // Group filtering config
         let group_base_dn = parse_optional_string(config_obj, "group_base_dn")?;
 
         let group_filter = parse_optional_string(config_obj, "group_filter")?;
+        if let Some(ref f) = group_filter {
+            validate_ldap_filter_syntax(f, "group_filter")?;
+        }
 
         let required_groups = parse_string_array(config_obj, "required_groups")?;
         let required_group_lookup = required_groups
@@ -445,8 +471,19 @@ impl LdapAuth {
         if max_cache_entries == 0 {
             return Err("ldap_auth: 'max_cache_entries' must be greater than zero".to_string());
         }
+        if max_cache_entries > LDAP_AUTH_MAX_CACHE_ENTRIES_LIMIT {
+            return Err(format!(
+                "ldap_auth: 'max_cache_entries' must not exceed {LDAP_AUTH_MAX_CACHE_ENTRIES_LIMIT}"
+            ));
+        }
 
         let consumer_mapping = parse_bool(config_obj, "consumer_mapping", true)?;
+
+        // Basic credentials are a reusable directory password, typically the
+        // user's corporate password. Removing them from the backend request by
+        // default keeps them inside the gateway trust boundary; `key_auth`
+        // established the same default for its reusable API keys.
+        let hide_credentials = parse_bool(config_obj, "hide_credentials", true)?;
 
         let allow_plaintext = parse_bool(config_obj, "allow_plaintext", false)?;
         let plaintext_requires_loopback = !is_ldaps && !starttls && !allow_plaintext;
@@ -520,6 +557,8 @@ impl LdapAuth {
             cache_hmac_key,
             max_cache_entries,
             consumer_mapping,
+            hide_credentials,
+            request_headers_to_redact: vec!["authorization".to_string()],
             tls_config,
             tls_no_verify,
             ldap_hostname,
@@ -1143,9 +1182,35 @@ impl LdapAuth {
             return Ok(true);
         }
 
-        // Also check the DN's CN component as a fallback.
-        Ok(extract_cn_from_dn(&entry.dn)
-            .is_some_and(|cn| self.required_group_lookup.contains(&cn.to_lowercase())))
+        // Fall back to the entry's OWN relative distinguished name when the
+        // directory did not return the group-name attribute. Only the first
+        // RDN may name the entry: scanning the whole DN for a `cn=` component
+        // would let `uid=visitors,cn=admins,ou=groups,...` — an entry merely
+        // nested UNDER a required group — satisfy the `admins` gate, and a
+        // naive comma split would do the same for an RDN whose value contains
+        // an escaped comma (`ou=visitors\,cn=admins,...`). Whoever can create
+        // or name entries under `group_base_dn` would otherwise mint gateway
+        // group membership without touching the real group object.
+        let Some(rdn) = parse_first_rdn(&entry.dn) else {
+            return Ok(false);
+        };
+        // The fallback stands in for the missing attribute, so the RDN must be
+        // typed with that attribute (or `cn`, the conventional group naming
+        // attribute this fallback has always accepted).
+        let group_attribute = self.group_attribute.as_str();
+        for ava in &rdn {
+            let attribute = ava.attribute_type.as_str();
+            if !attribute.eq_ignore_ascii_case(group_attribute)
+                && !attribute.eq_ignore_ascii_case("cn")
+            {
+                continue;
+            }
+            let value = ava.value.to_lowercase();
+            if self.required_group_lookup.contains(&value) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn returned_group_proves_membership(
@@ -1243,7 +1308,7 @@ fn unique_ldap_attribute_value(
 }
 
 fn reject_unknown_config_keys(config: &Map<String, Value>) -> Result<(), String> {
-    const KNOWN_KEYS: [&str; 19] = [
+    const KNOWN_KEYS: [&str; 20] = [
         "ldap_url",
         "bind_dn_template",
         "search_base_dn",
@@ -1263,6 +1328,7 @@ fn reject_unknown_config_keys(config: &Map<String, Value>) -> Result<(), String>
         "cache_ttl_seconds",
         "max_cache_entries",
         "consumer_mapping",
+        "hide_credentials",
     ];
     for key in config.keys() {
         if !KNOWN_KEYS.contains(&key.as_str()) {
@@ -1282,11 +1348,17 @@ fn parse_required_ldap_url(config: &Map<String, Value>) -> Result<&str, String> 
     let raw = value
         .as_str()
         .ok_or_else(|| format!("ldap_auth: 'ldap_url' must be a string, got: {value}"))?;
-    let value = raw.trim();
-    if value.is_empty() {
+    if raw.is_empty() {
         return Err("ldap_auth: 'ldap_url' must not be empty".to_string());
     }
-    Ok(value)
+    // Trimming here would admit a padded value that `openapi.yaml` rejects and
+    // that no directory URL legitimately carries.
+    if raw.trim() != raw {
+        return Err(
+            "ldap_auth: 'ldap_url' must not have leading or trailing whitespace".to_string(),
+        );
+    }
+    Ok(raw)
 }
 
 fn is_loopback_ldap_endpoint(parsed: &Url) -> bool {
@@ -1348,6 +1420,14 @@ fn parse_optional_string(
     Ok(Some(value.to_string()))
 }
 
+/// Parse a secret config value VERBATIM.
+///
+/// A password is an opaque string the directory compares byte for byte, so it
+/// is never trimmed the way [`parse_optional_string`] trims identifiers:
+/// silently dropping surrounding whitespace would make a legitimate secret
+/// fail every service-account bind and surface as a directory outage (`500`)
+/// rather than as a configuration error. Only a genuinely empty value is
+/// rejected — an empty simple-bind password requests an anonymous bind.
 fn parse_optional_secret_string(
     config: &Map<String, Value>,
     field: &str,
@@ -1358,11 +1438,10 @@ fn parse_optional_secret_string(
     let raw = value
         .as_str()
         .ok_or_else(|| format!("ldap_auth: '{field}' must be a string"))?;
-    let value = raw.trim();
-    if value.is_empty() {
+    if raw.is_empty() {
         return Err(format!("ldap_auth: '{field}' must not be empty"));
     }
-    Ok(Some(value.to_string()))
+    Ok(Some(raw.to_string()))
 }
 
 fn parse_bool(
@@ -1557,6 +1636,35 @@ pub fn escape_dn_value(input: &str) -> String {
     out
 }
 
+/// Substitutes used to syntax-check a configured filter template at admission.
+///
+/// Both are ordinary RFC 4515 assertion values built from characters that need
+/// no escaping, so a template that parses with them substituted also parses
+/// with the escaped runtime value in their place.
+const LDAP_FILTER_VALIDATION_USERNAME: &str = "ferrumfiltervalidation";
+const LDAP_FILTER_VALIDATION_USER_DN: &str = "cn=ferrumfiltervalidation,ou=users,dc=example,dc=com";
+
+/// Reject a configured filter template that is not a well-formed RFC 4515
+/// search filter.
+///
+/// `ldap_auth` fails closed, so a malformed filter such as `(uid={username}`
+/// would otherwise pass `validate`, the admin API, and startup, and then turn
+/// every request on the route into a `500` once the directory rejects the
+/// filter. `ldap3::parse_filter` is the same grammar `ldap3` applies to the
+/// filter this plugin sends, so admitting here means the wire filter is
+/// well-formed.
+fn validate_ldap_filter_syntax(filter: &str, field: &str) -> Result<(), String> {
+    let resolved = filter
+        .replace("{username}", LDAP_FILTER_VALIDATION_USERNAME)
+        .replace("{user_dn}", LDAP_FILTER_VALIDATION_USER_DN);
+    if parse_filter(&resolved).is_err() {
+        return Err(format!(
+            "ldap_auth: '{field}' is not a valid RFC 4515 LDAP search filter"
+        ));
+    }
+    Ok(())
+}
+
 /// Escape a string for use in an LDAP search filter value (RFC 4515 §3).
 ///
 /// The five characters `*`, `(`, `)`, `\`, and NUL are hex-escaped as `\xx`.
@@ -1581,25 +1689,152 @@ pub fn escape_filter_value(input: &str) -> String {
     out
 }
 
-/// Extract the CN value from a distinguished name.
-/// e.g. "CN=Domain Admins,OU=Groups,DC=example,DC=com" -> "Domain Admins"
-fn extract_cn_from_dn(dn: &str) -> Option<&str> {
-    for component in dn.split(',') {
-        let trimmed = component.trim();
-        if let Some(rest) = trimmed
-            .strip_prefix("CN=")
-            .or_else(|| trimmed.strip_prefix("cn="))
-        {
-            return Some(rest);
+/// RFC 4514 `special` characters plus `ESC` itself: the set a lone backslash
+/// may escape without a following hex pair.
+const DN_ESCAPABLE_SPECIALS: [char; 10] = ['\\', '"', '+', ',', ';', '<', '>', ' ', '#', '='];
+
+/// One attribute type / value pair of a relative distinguished name.
+struct RdnAttributeValue {
+    attribute_type: String,
+    value: String,
+}
+
+/// Parse the leading relative distinguished name of `dn` per RFC 4514.
+///
+/// Returns every attribute/value pair of the FIRST RDN only (a multi-valued
+/// RDN such as `cn=admins+ou=eng` yields two), honoring `\`-escaped separators
+/// and `\XX` hex escapes so a value containing a comma or plus cannot be split
+/// into a different DN shape. Returns `None` — never a partial guess — for any
+/// DN this parser cannot represent as text, including the RFC 4514 `#`
+/// hex-encoded BER value form, so callers fail closed.
+fn parse_first_rdn(dn: &str) -> Option<Vec<RdnAttributeValue>> {
+    let mut pairs = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for ch in dn.chars() {
+        if escaped {
+            current.push('\\');
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            // RFC 4514 separates RDNs with ','; RFC 2253 also allowed ';'.
+            // Either one ends the entry's own RDN.
+            ',' | ';' => break,
+            '+' => pairs.push(std::mem::take(&mut current)),
+            _ => current.push(ch),
         }
     }
-    None
+    if escaped {
+        // Trailing lone escape: the DN is malformed.
+        return None;
+    }
+    pairs.push(current);
+
+    let mut parsed = Vec::with_capacity(pairs.len());
+    for pair in pairs {
+        parsed.push(parse_rdn_pair(&pair)?);
+    }
+    Some(parsed)
+}
+
+/// Split one `type=value` pair of an RDN at its first unescaped `=`.
+fn parse_rdn_pair(pair: &str) -> Option<RdnAttributeValue> {
+    let mut escaped = false;
+    let mut separator = None;
+    for (index, ch) in pair.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '=' => {
+                separator = Some(index);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let separator = separator?;
+    let attribute_type = pair[..separator].trim();
+    if attribute_type.is_empty() {
+        return None;
+    }
+    Some(RdnAttributeValue {
+        attribute_type: attribute_type.to_string(),
+        value: unescape_rdn_value(&pair[separator + 1..])?,
+    })
+}
+
+/// Decode the RFC 4514 escaping of an RDN attribute value.
+///
+/// Unescaped leading and trailing spaces are layout, not value; escaped ones
+/// (`\ ` or `\20`) belong to the value and are preserved.
+fn unescape_rdn_value(raw: &str) -> Option<String> {
+    if raw.trim_start().starts_with('#') {
+        // Hex-encoded BER value: not comparable as text.
+        return None;
+    }
+    // Each decoded byte is tagged with whether an escape produced it, so
+    // trimming cannot drop a deliberately escaped space.
+    let mut decoded: Vec<(u8, bool)> = Vec::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            let mut buffer = [0u8; 4];
+            for byte in ch.encode_utf8(&mut buffer).bytes() {
+                decoded.push((byte, false));
+            }
+            continue;
+        }
+        // RFC 4514 `pair = ESC ( ESC / special / hexpair )`. No `special` is a
+        // hex digit, so a hex digit here always begins a hex pair.
+        let escaped = chars.next()?;
+        match escaped.to_digit(16) {
+            Some(high) => {
+                let low = chars.next()?.to_digit(16)?;
+                decoded.push((u8::try_from(high * 16 + low).ok()?, true));
+            }
+            None => {
+                if !DN_ESCAPABLE_SPECIALS.contains(&escaped) {
+                    return None;
+                }
+                decoded.push((u8::try_from(escaped).ok()?, true));
+            }
+        }
+    }
+
+    let mut start = 0;
+    while start < decoded.len() && decoded[start] == (b' ', false) {
+        start += 1;
+    }
+    let mut end = decoded.len();
+    while end > start && decoded[end - 1] == (b' ', false) {
+        end -= 1;
+    }
+    let mut bytes = Vec::with_capacity(end - start);
+    for (byte, _) in &decoded[start..end] {
+        bytes.push(*byte);
+    }
+    String::from_utf8(bytes).ok()
 }
 
 #[async_trait]
 impl AuthMechanism for LdapAuth {
     fn mechanism_name(&self) -> &'static str {
         "ldap_auth"
+    }
+
+    /// `ldap_auth` consumes RFC 7617 `Authorization: Basic` credentials, so an
+    /// unauthenticated request must be answered with the `Basic` challenge
+    /// (RFC 9110 section 11.6.1) — clients that drive Basic authentication off
+    /// the challenge never prompt for credentials otherwise. Same value as
+    /// `basic_auth`.
+    fn authentication_challenge(&self) -> Option<&'static str> {
+        Some(LDAP_AUTH_BASIC_CHALLENGE)
     }
 
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
@@ -1718,6 +1953,34 @@ auth_flow::impl_auth_plugin!(
     auth_flow::run_auth_external_identity;
     fn warmup_hostnames(&self) -> Vec<String> {
         vec![self.ldap_hostname.clone()]
+    }
+
+    fn request_headers_to_redact(&self) -> &[String] {
+        &self.request_headers_to_redact
+    }
+
+    fn modifies_request_headers(&self) -> bool {
+        self.hide_credentials
+    }
+
+    async fn before_proxy(
+        &self,
+        _ctx: &mut crate::plugins::RequestContext,
+        headers: &mut std::collections::HashMap<String, String>,
+    ) -> crate::plugins::PluginResult {
+        if self.hide_credentials {
+            // Removal is unconditional at this point, so a chain where another
+            // mechanism authenticated the request still cannot leak the Basic
+            // password upstream. Only the `Basic` scheme this plugin consumes
+            // is removed: an `Authorization` header carrying another scheme
+            // belongs to a different policy and must reach the backend intact.
+            headers.retain(|name, value| {
+                let is_basic_credential = name.eq_ignore_ascii_case("authorization")
+                    && crate::plugins::strip_auth_scheme(value, "Basic").is_some();
+                !is_basic_credential
+            });
+        }
+        crate::plugins::PluginResult::Continue
     }
 );
 

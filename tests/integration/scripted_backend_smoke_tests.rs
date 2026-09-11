@@ -16,7 +16,7 @@ use crate::scaffolding::clients::Http1Client;
 use crate::scaffolding::file_mode_yaml_for_backend;
 use crate::scaffolding::file_mode_yaml_for_backend_with;
 use crate::scaffolding::harness::GatewayHarness;
-use crate::scaffolding::ports::{reserve_port, unbound_port};
+use crate::scaffolding::ports::{BIND_DROP_SPAWN_ATTEMPTS, reserve_port, unbound_port};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1152,86 +1152,108 @@ async fn serve_drop_prebound_admin_https_without_tls_does_not_reserve_env_https_
     use ferrum_edge::config::{EnvConfig, OperatingMode};
     use ferrum_edge::modes::file::{self, ServeOptions};
 
-    // Ephemeral stand-in for a nonzero env admin HTTPS port (avoids hardcoding
-    // 9443 and colliding with unrelated listeners on the host).
-    let env_admin_https_reservation = reserve_port().await.expect("reserve env admin HTTPS port");
-    let env_admin_https_port = env_admin_https_reservation.port;
+    // `drop_and_take_port` cannot stay held: `file::serve()` binds the stream
+    // proxy itself. Retry with a fresh port when a sibling test steals the
+    // number between release and bind (issue #5404).
+    let mut last_error = String::from("no serve() error recorded");
+    for attempt in 1..=BIND_DROP_SPAWN_ATTEMPTS {
+        // Ephemeral stand-in for a nonzero env admin HTTPS port (avoids
+        // hardcoding 9443 and colliding with unrelated listeners on the host).
+        let env_admin_https_reservation =
+            reserve_port().await.expect("reserve env admin HTTPS port");
+        let env_admin_https_port = env_admin_https_reservation.port;
 
-    let admin_https_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind prebound admin HTTPS");
+        let admin_https_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind prebound admin HTTPS");
 
-    let config_json = serde_json::json!({
-        "version": "1",
-        "proxies": [{
-            "id": "stream-on-env-admin-https",
-            "backend_scheme": "tcp",
-            "backend_host": "127.0.0.1",
-            "backend_port": 65000_u16,
-            "listen_port": env_admin_https_port,
-        }],
-        "consumers": [],
-        "upstreams": [],
-        "plugin_configs": [],
-    });
-    let mut config: GatewayConfig =
-        serde_json::from_value(config_json).expect("deserialize config");
-    config.resolve_dispatch_kind();
+        let config_json = serde_json::json!({
+            "version": "1",
+            "proxies": [{
+                "id": "stream-on-env-admin-https",
+                "backend_scheme": "tcp",
+                "backend_host": "127.0.0.1",
+                "backend_port": 65000_u16,
+                "listen_port": env_admin_https_port,
+            }],
+            "consumers": [],
+            "upstreams": [],
+            "plugin_configs": [],
+        });
+        let mut config: GatewayConfig =
+            serde_json::from_value(config_json).expect("deserialize config");
+        config.resolve_dispatch_kind();
 
-    let env_config = EnvConfig {
-        mode: OperatingMode::File,
-        proxy_http_port: 0,
-        proxy_https_port: 0,
-        admin_http_port: 0,
-        // Nonzero env port + prebound FD without TLS: drop must not leave the
-        // env port reserved.
-        admin_https_port: env_admin_https_port,
-        admin_tls_cert_path: None,
-        admin_tls_key_path: None,
-        admin_jwt_secret: Some("regression-test-secret-32-chars-min-len".to_string()),
-        admin_jwt_issuer: "regression-test".to_string(),
-        shutdown_drain_seconds: 0,
-        pool_warmup_enabled: false,
-        max_connections: 0,
-        proxy_bind_address: "127.0.0.1".to_string(),
-        stream_proxy_bind_address: "127.0.0.1".to_string(),
-        ..EnvConfig::default()
-    };
+        let env_config = EnvConfig {
+            mode: OperatingMode::File,
+            proxy_http_port: 0,
+            proxy_https_port: 0,
+            admin_http_port: 0,
+            // Nonzero env port + prebound FD without TLS: drop must not leave
+            // the env port reserved.
+            admin_https_port: env_admin_https_port,
+            admin_tls_cert_path: None,
+            admin_tls_key_path: None,
+            admin_jwt_secret: Some("regression-test-secret-32-chars-min-len".to_string()),
+            admin_jwt_issuer: "regression-test".to_string(),
+            shutdown_drain_seconds: 0,
+            pool_warmup_enabled: false,
+            max_connections: 0,
+            proxy_bind_address: "127.0.0.1".to_string(),
+            stream_proxy_bind_address: "127.0.0.1".to_string(),
+            ..EnvConfig::default()
+        };
 
-    let opts = ServeOptions {
-        admin_https: Some(admin_https_listener),
-        admin_jwt_manager: Some(JwtManager::new(JwtConfig {
-            secret: env_config.admin_jwt_secret.clone().unwrap(),
-            issuer: env_config.admin_jwt_issuer.clone(),
-            audience: None,
-            max_ttl_seconds: 3600,
-            algorithm: jsonwebtoken::Algorithm::HS256,
-        })),
-        skip_initial_capability_refresh: true,
-        background_drain_timeout: Some(Duration::from_millis(200)),
-        ..ServeOptions::default()
-    };
+        let opts = ServeOptions {
+            admin_https: Some(admin_https_listener),
+            admin_jwt_manager: Some(JwtManager::new(JwtConfig {
+                secret: env_config.admin_jwt_secret.clone().unwrap(),
+                issuer: env_config.admin_jwt_issuer.clone(),
+                audience: None,
+                max_ttl_seconds: 3600,
+                algorithm: jsonwebtoken::Algorithm::HS256,
+            })),
+            skip_initial_capability_refresh: true,
+            background_drain_timeout: Some(Duration::from_millis(200)),
+            ..ServeOptions::default()
+        };
 
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-    let _ = env_admin_https_reservation.drop_and_take_port();
-    let handles = file::serve(env_config, config, opts, shutdown_tx.clone())
-        .await
-        .expect(
-            "serve() must accept a stream proxy on the env admin HTTPS port when a \
-             no-TLS prebound admin HTTPS FD is dropped (env reservation suppressed)",
-        );
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let _ = env_admin_https_reservation.drop_and_take_port();
+        match file::serve(env_config, config, opts, shutdown_tx.clone()).await {
+            Ok(handles) => {
+                assert!(
+                    handles.bound.admin_https.is_none(),
+                    "no-TLS prebound admin HTTPS must not be served; bound={:?}",
+                    handles.bound.admin_https
+                );
 
-    assert!(
-        handles.bound.admin_https.is_none(),
-        "no-TLS prebound admin HTTPS must not be served; bound={:?}",
-        handles.bound.admin_https
+                shutdown_tx.send(true).expect("shutdown_tx send");
+                tokio::time::timeout(Duration::from_secs(2), handles.join())
+                    .await
+                    .expect("join() did not complete within 2 s of shutdown")
+                    .expect("listener task panicked");
+                return;
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("already in use"),
+                    "serve() must accept a stream proxy on the env admin HTTPS \
+                     port when a no-TLS prebound admin HTTPS FD is dropped (env \
+                     reservation suppressed): {msg}"
+                );
+                last_error = format!(
+                    "attempt {attempt}/{BIND_DROP_SPAWN_ATTEMPTS} on {env_admin_https_port}: {msg}"
+                );
+            }
+        }
+    }
+    panic!(
+        "serve() must accept a stream proxy on the env admin HTTPS port when a \
+         no-TLS prebound admin HTTPS FD is dropped (env reservation suppressed) \
+         after {BIND_DROP_SPAWN_ATTEMPTS} fresh-port attempts: {last_error}"
     );
-
-    shutdown_tx.send(true).expect("shutdown_tx send");
-    tokio::time::timeout(Duration::from_secs(2), handles.join())
-        .await
-        .expect("join() did not complete within 2 s of shutdown")
-        .expect("listener task panicked");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

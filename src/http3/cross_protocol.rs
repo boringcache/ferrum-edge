@@ -132,11 +132,12 @@ use crate::proxy::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER, GrpcResponseKind, proxy_grpc_request_from_bytes,
 };
 use crate::proxy::headers::{
-    ClientResponseFraming, PrePolicyResponseHeaders, RejectBodyDisposition,
-    ResponseTrailerGovernance, TrailerSectionKind, apply_response_headers,
-    is_backend_response_strip_header, is_untrusted_real_ip_header, parse_connection_listed_headers,
-    reconcile_streaming_backend_trailers, sanitize_backend_request_trailers,
-    sanitize_client_response_headers_for_wire, strip_response_hop_by_hop_trailers,
+    BACKEND_REQUEST_STRIP_HEADER_NAMES, ClientResponseFraming, PrePolicyResponseHeaders,
+    RejectBodyDisposition, ResponseTrailerGovernance, TrailerSectionKind, apply_response_headers,
+    is_backend_request_strip_header, is_backend_response_strip_header, is_untrusted_real_ip_header,
+    parse_connection_listed_headers, reconcile_streaming_backend_trailers,
+    sanitize_backend_request_trailers, sanitize_client_response_headers_for_wire,
+    strip_response_hop_by_hop_trailers,
 };
 use crate::proxy::{
     BufferedUploadReplay, absolute_response_header_read_bound, await_upload_write_watermark_first,
@@ -2288,13 +2289,20 @@ where
     } else {
         None
     };
-    let should_buffer_response = retry_config.is_some()
-        || !crate::proxy::should_stream_response_body(
-            proxy,
-            plugins,
-            ctx,
-            requires_response_body_buffering,
-        );
+    // Deliberately NOT gated on `retry_config.is_some()`, for the same reason
+    // `stream_grpc_response` below is not gated on `grpc_has_retry`: this
+    // bridge's retry loop decides every attempt from the response STATUS the
+    // instant `send()` resolves, before a single body byte is read, so replay
+    // needs the REQUEST body preserved — never the response buffered. Coupling
+    // the two is what made a plain `sse` proxy with `retry.max_retries`
+    // configured collect a backend event stream to EOF before the client saw
+    // its first event, while the same configuration streamed on H1/H2.
+    let should_buffer_response = !crate::proxy::should_stream_response_body(
+        proxy,
+        plugins,
+        ctx,
+        requires_response_body_buffering,
+    );
 
     // Mesh egress needs an exact replayable body for the shared H1/H2 HBONE /
     // Sidecar mesh-mTLS pools. Force-buffer a streaming upload when the
@@ -4276,6 +4284,8 @@ where
     // comma-folded member so a repeated identical declaration is honored rather
     // than skipping this reject (`GHSA-xrfj-852f-645j`).
     if let Some(len) = crate::proxy::declared_response_length_exceeds_limit(
+        method,
+        status,
         &response_headers,
         effective_max_response_body_size_bytes,
     ) {
@@ -4347,6 +4357,46 @@ where
     // or `Cache-Control` ahead of compression would otherwise let compression
     // mislabel or rewrite a representation it must preserve.
     crate::http3::server::stamp_h3_original_response_metadata(ctx, status, &response_headers);
+
+    // Refine the pre-header buffer/stream decision now that the content-type is
+    // known — same downgrade the H1/H2 path applies. `inspect` mode buffers by
+    // default (so a JSON response is inspected via `on_response_body`); this
+    // downgrades only a response every active body plugin can release to the
+    // windowed streaming path. Retry-enabled requests use the same marked
+    // decision context as H1/H2, allowing inherently streaming responses such
+    // as MCP SSE to opt out conservatively after headers arrive.
+    //
+    // Runs BEFORE `after_proxy`, exactly as the H1/H2 dispatch and the native
+    // H3 refined path do, and over the same pristine backend header map the
+    // stamp above captured. Refining afterwards asked the chain about a
+    // representation the gateway itself had just relabelled: an `sse` instance
+    // with `wrap_non_sse_responses` rewrites the `Content-Type` to
+    // `text/event-stream` in `after_proxy` and then releases its own body
+    // (nothing left to wrap in an already-SSE response), so the bytes streamed
+    // out unframed under the event-stream label the wrap was supposed to fill.
+    let has_retry = crate::retry::has_effective_http_retries(proxy.retry.as_ref(), method)
+        && crate::proxy::current_retry_attempt_allowed(
+            route_retry_ceiling,
+            proxy,
+            current_target.as_deref(),
+            0,
+        );
+    // A mesh-egress response is already fully retained, so it is pinned to the
+    // buffered pipeline: there is no live body left to stream, and buffering is
+    // the strictly more inspected of the two paths.
+    let should_buffer_response = {
+        let retry_ctx = has_retry.then(|| crate::proxy::retry_response_decision_context(&*ctx));
+        let response_decision_ctx = retry_ctx.as_ref().unwrap_or(&*ctx);
+        matches!(body_source, PlainBridgeBodySource::MeshBuffered(_))
+            || !crate::proxy::refine_stream_response_for_content_type(
+                !should_buffer_response,
+                proxy,
+                plugins,
+                Some(response_decision_ctx),
+                status,
+                &response_headers,
+            )
+    };
 
     // Run `after_proxy` hooks so response-transformer, CORS, compression-
     // advertise, and other hooks that modify response headers see the
@@ -4446,35 +4496,6 @@ where
         sticky_reissue_target.is_some(),
         &mut response_headers,
     );
-
-    // Refine the pre-header buffer/stream decision now that the content-type is
-    // known — same downgrade the H1/H2 path applies. `inspect` mode buffers by
-    // default (so a JSON response is inspected via `on_response_body`); this
-    // downgrades only a response every active body plugin can release to the
-    // windowed streaming path. Retry-enabled requests use the same marked
-    // decision context as H1/H2, allowing inherently streaming responses such
-    // as MCP SSE to opt out conservatively after headers arrive.
-    let has_retry = crate::retry::has_effective_http_retries(proxy.retry.as_ref(), method)
-        && crate::proxy::current_retry_attempt_allowed(
-            route_retry_ceiling,
-            proxy,
-            current_target.as_deref(),
-            0,
-        );
-    let retry_ctx = has_retry.then(|| crate::proxy::retry_response_decision_context(&*ctx));
-    let response_decision_ctx = retry_ctx.as_ref().unwrap_or(&*ctx);
-    // A mesh-egress response is already fully retained, so it is pinned to the
-    // buffered pipeline: there is no live body left to stream, and buffering is
-    // the strictly more inspected of the two paths.
-    let should_buffer_response = matches!(body_source, PlainBridgeBodySource::MeshBuffered(_))
-        || !crate::proxy::refine_stream_response_for_content_type(
-            !should_buffer_response,
-            proxy,
-            plugins,
-            Some(response_decision_ctx),
-            status,
-            &response_headers,
-        );
 
     if should_buffer_response {
         let mut response_status = status;
@@ -5734,6 +5755,11 @@ where
         .as_deref()
         .filter(|_| crate::plugins::response_body_rewrite_allowed(streaming.status))
         .map(crate::plugins::grpc_web::is_grpc_web_text);
+    // `after_proxy` above judged the PRISTINE backend labelling. A non-gRPC
+    // HTTP error document is drained instead of being framed as gRPC-Web
+    // message bytes, so the terminal frame stays parseable at byte 0.
+    let grpc_web_suppress_backend_entity =
+        crate::plugins::grpc_web::response_entity_is_unframed_backend_error(ctx);
     if grpc_web_translation_mode.is_some() {
         // Match the shared H1/H2 boundary: policies cannot manufacture or
         // replace terminal status in initial headers. Restore only a pristine
@@ -5881,6 +5907,7 @@ where
             response_read_timeout_ms: streaming.response_read_timeout_ms,
             grpc_deadline_at: streaming.grpc_deadline_at,
             grpc_web_translation_mode,
+            grpc_web_suppress_backend_entity,
             grpc_response_messages: &ctx.grpc_response_messages_observed,
             // Authorization lifetime for this admitted stream (issue #3815),
             // captured from the accepted context before the relay borrows it
@@ -8439,7 +8466,17 @@ pub(crate) async fn dispatch_grpc_streaming(
     // Final upload byte count (codex P2): in bidi/client-streaming the pump can
     // forward request DATA while the response is streaming, so re-read after the
     // pump terminates rather than trusting the header-time snapshot.
-    outcome.bytes_sent = request_bytes_forwarded.load(Ordering::Relaxed);
+    let forwarded_request_bytes = request_bytes_forwarded.load(Ordering::Relaxed);
+    outcome.bytes_sent = forwarded_request_bytes;
+    // Mirror the same count into the shared request-byte counter so every
+    // consumer reading the request context — response-stream-termination hooks
+    // and any summary builder that reloads the atomic — agrees with the
+    // `bytes_sent` this outcome reports (GHSA-8x5h-g4xh-hgc9). `fetch_max`
+    // matches every other writer and cannot lower an earlier observation.
+    if forwarded_request_bytes > 0 {
+        ctx.bytes_sent_observed
+            .fetch_max(forwarded_request_bytes, Ordering::Release);
+    }
     Ok(outcome)
 }
 
@@ -9121,6 +9158,11 @@ struct StreamHyperIncomingOpts<'a> {
     response_read_timeout_ms: u64,
     grpc_deadline_at: Option<tokio::time::Instant>,
     grpc_web_translation_mode: Option<bool>,
+    /// The backend answered with an HTTP error whose entity is not a gRPC
+    /// message stream, so those bytes are drained rather than framed as
+    /// gRPC-Web DATA. The synthesized terminal frame still carries the mapped
+    /// status; see `grpc_web::response_entity_is_unframed_backend_error`.
+    grpc_web_suppress_backend_entity: bool,
     grpc_response_messages: &'a AtomicU64,
     /// Absolute authorization lifetime for this admitted stream (issue #3815),
     /// captured once from the accepted `RequestContext` before the relay took
@@ -9162,6 +9204,7 @@ where
         response_read_timeout_ms,
         grpc_deadline_at,
         grpc_web_translation_mode,
+        grpc_web_suppress_backend_entity,
         grpc_response_messages,
         auth_deadline,
         auth_latch,
@@ -9418,6 +9461,12 @@ where
                                     body_error_class = Some(ErrorClass::ResponseBodyTooLarge);
                                     break 'outer;
                                 }
+                            }
+                            // A non-gRPC HTTP error entity is drained, never
+                            // framed as gRPC-Web message bytes: the terminal
+                            // frame carries the mapped status on its own.
+                            if grpc_web_suppress_backend_entity {
+                                continue;
                             }
                             let data_len = data.len();
                             if crate::http3::config::should_direct_send_response_chunk(
@@ -10902,18 +10951,11 @@ fn parse_reqwest_method(method: &str) -> Option<reqwest::Method> {
     }
 }
 
-/// Closed inventory backing [`should_skip_cross_protocol_backend_header`].
-/// Lowercase; the predicate below matches these ASCII case-insensitively.
+/// The forwarding-identity names this bridge strips IN ADDITION to the canonical
+/// backend request inventory ([`BACKEND_REQUEST_STRIP_HEADER_NAMES`]).
+/// Lowercase; the predicate below matches both inventories ASCII
+/// case-insensitively.
 const CROSS_PROTOCOL_BACKEND_SKIP_NAMES: &[&str] = &[
-    "connection",
-    "content-length",
-    "transfer-encoding",
-    "keep-alive",
-    "te",
-    "trailer",
-    "proxy-authorization",
-    "proxy-connection",
-    "upgrade",
     "x-forwarded-for",
     "x-forwarded-proto",
     "x-forwarded-host",
@@ -10925,42 +10967,44 @@ const CROSS_PROTOCOL_BACKEND_SKIP_NAMES: &[&str] = &[
 /// backends. This is the shared filter for both the plain and gRPC
 /// bridge paths so the two cannot drift.
 ///
-/// The forwarding-identity names here (`x-forwarded-*`, `via`, `forwarded`)
-/// are the cross-protocol half of the ownership contract enforced on primary
-/// dispatch by `proxy::headers::is_proxy_owned_forwarding_header`: the bridge
-/// always strips them, then regenerates the gateway-owned values below.
-/// Matching is ASCII case-insensitive for the same reason that predicate is —
-/// H3 wire names are lowercase, but a plugin-synthesised mixed-case key in the
-/// materialised `HashMap<String, String>` would otherwise bypass the strip, and
-/// the plain builder's `reqwest::RequestBuilder::header` APPENDS, so a spoofed
+/// It is the union of two inventories:
+///
+/// * the CANONICAL backend request strip set
+///   ([`is_backend_request_strip_header`]) — RFC 9110 §7.6.1 hop-by-hop names,
+///   transport-managed framing, `expect`, and the gateway's own internal
+///   markers. Delegating rather than restating it is what keeps this bridge from
+///   drifting away from the H1/H2 and native-H3 backend builders, which both
+///   call that predicate: the bridge used to keep its own hand-written list and
+///   consequently forwarded `x-ferrum-original-content-encoding` to the origin
+///   after normalizing an upload, making an internal compression handoff marker
+///   visible to backends on H3 alone (issue #5110);
+/// * the forwarding-identity names (`x-forwarded-*`, `via`, `forwarded`), which
+///   are the cross-protocol half of the ownership contract enforced on primary
+///   dispatch by `proxy::headers::is_proxy_owned_forwarding_header`: the bridge
+///   always strips them, then regenerates the gateway-owned values below.
+///
+/// Matching is ASCII case-insensitive because H3 wire names are lowercase but a
+/// plugin-synthesised mixed-case key in the materialised
+/// `HashMap<String, String>` would otherwise bypass the strip, and the plain
+/// builder's `reqwest::RequestBuilder::header` APPENDS, so a spoofed
 /// `Forwarded` would precede the gateway-owned element on the wire.
 ///
-/// Hot path: the lowercase `matches!` arm answers every real request with no
+/// Hot path: the two lowercase `matches!` arms answer every real request with no
 /// scan. The case-insensitive sweep is only reached for a name that actually
 /// carries an uppercase ASCII byte, and it allocates nothing.
-fn should_skip_cross_protocol_backend_header(name: &str) -> bool {
-    if matches!(
-        name,
-        "connection"
-            | "content-length"
-            | "transfer-encoding"
-            | "keep-alive"
-            | "te"
-            | "trailer"
-            | "proxy-authorization"
-            | "proxy-connection"
-            | "upgrade"
-            | "x-forwarded-for"
-            | "x-forwarded-proto"
-            | "x-forwarded-host"
-            | "via"
-            | "forwarded"
-    ) {
+pub(crate) fn should_skip_cross_protocol_backend_header(name: &str) -> bool {
+    if is_backend_request_strip_header(name)
+        || matches!(
+            name,
+            "x-forwarded-for" | "x-forwarded-proto" | "x-forwarded-host" | "via" | "forwarded"
+        )
+    {
         return true;
     }
     name.bytes().any(|b| b.is_ascii_uppercase())
-        && CROSS_PROTOCOL_BACKEND_SKIP_NAMES
+        && BACKEND_REQUEST_STRIP_HEADER_NAMES
             .iter()
+            .chain(CROSS_PROTOCOL_BACKEND_SKIP_NAMES.iter())
             .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
@@ -11831,6 +11875,7 @@ mod tests {
             failure_status_codes: vec![500],
             half_open_max_requests: 1,
             trip_on_connection_errors: true,
+            half_open_probe_dwell_seconds: None,
         }
     }
 

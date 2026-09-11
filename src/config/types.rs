@@ -2207,6 +2207,18 @@ pub struct CircuitBreakerConfig {
     pub half_open_max_requests: u32,
     #[serde(default = "default_trip_on_connection_errors")]
     pub trip_on_connection_errors: bool,
+    /// Seconds a HALF_OPEN probe slot may stay unsettled before the breaker
+    /// reclaims it (defence in depth for a probe that is never released).
+    ///
+    /// Omitted derives `max(timeout_seconds * 2, 60)`. A configured value is
+    /// clamped to at least `timeout_seconds` and at least 1 second.
+    ///
+    /// The dwell MUST exceed the longest legitimate backend dispatch a probe
+    /// can take (backend connect + read timeouts): reclaiming a slot while a
+    /// real probe is still in flight lets a second probe reach a backend the
+    /// breaker is protecting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub half_open_probe_dwell_seconds: Option<u64>,
 }
 
 impl Default for CircuitBreakerConfig {
@@ -2218,6 +2230,7 @@ impl Default for CircuitBreakerConfig {
             failure_status_codes: default_failure_status_codes(),
             half_open_max_requests: default_half_open_max(),
             trip_on_connection_errors: default_trip_on_connection_errors(),
+            half_open_probe_dwell_seconds: None,
         }
     }
 }
@@ -8370,6 +8383,19 @@ impl Consumer {
         if let Err(e) = validate_string_field("username", &self.username, MAX_USERNAME_LENGTH) {
             errors.push(e);
         }
+        // RFC 7617 §2 splits the decoded `user-id ":" password` at the FIRST
+        // colon, so a colon-bearing user-id has no representation on the wire.
+        // Such a consumer starts fine and then fails every Basic login, which
+        // reads as a credential problem rather than an unusable configuration —
+        // reject the combination at admission instead. Colons inside a password
+        // remain valid, and a consumer without Basic credentials is unaffected.
+        if self.username.contains(':') && self.has_credential("basicauth") {
+            errors.push(
+                "username must not contain ':' when the consumer has basicauth credentials \
+                 — RFC 7617 Basic authentication cannot represent a colon in the user-id"
+                    .to_string(),
+            );
+        }
 
         // Custom ID
         if let Some(ref cid) = self.custom_id
@@ -9802,6 +9828,16 @@ impl CircuitBreakerConfig {
             errors.push(e);
         }
         if let Err(e) = validate_status_codes("failure_status_codes", &self.failure_status_codes) {
+            errors.push(e);
+        }
+        if let Some(dwell) = self.half_open_probe_dwell_seconds
+            && let Err(e) = validate_u64_range(
+                "half_open_probe_dwell_seconds",
+                dwell,
+                1,
+                MAX_TIMEOUT_SECONDS,
+            )
+        {
             errors.push(e);
         }
 

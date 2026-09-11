@@ -2833,7 +2833,10 @@ async fn handle_h3_request(
     // materializing the full HashMap — only 2-3 targeted lookups on the raw
     // HeaderMap. Parity with the H1/H2 path: the configured real-IP header is
     // read as ALL of its field lines so duplicate lines cannot hide a competing
-    // attacker-supplied value (advisory GHSA-fx4w-68hx-mj7r).
+    // attacker-supplied value (advisory GHSA-fx4w-68hx-mj7r), and
+    // X-Forwarded-For is read through that same byte-preserving accessor so no
+    // field line can leave the chain before it is walked
+    // (advisory GHSA-73ff-frj6-cpmp).
     if !state.trusted_proxies.is_empty() {
         // Latch the immediate-peer trust verdict for the whole request, before
         // any plugin phase runs — same contract as the H1/H2 frontend. Computed
@@ -2849,19 +2852,9 @@ async fn handle_h3_request(
         ) {
             request_scheme = forwarded_scheme;
         }
-        let xff_chain = {
-            let mut values = ctx.raw_header_values("x-forwarded-for");
-            values.next().map(|first| {
-                let mut combined = String::from(first);
-                for value in values {
-                    combined.push(',');
-                    combined.push_str(value);
-                }
-                combined
-            })
-        };
-        // Bound the immutable borrow of `ctx` (held by the field-line iterator)
-        // to this statement so the assignment below can take a mutable borrow.
+        // Bound the immutable borrows of `ctx` (held by the field-line
+        // iterators) to this statement so the assignment below can take a
+        // mutable borrow.
         let resolved = crate::proxy::client_ip::resolve_forwarded_client_ip(
             socket_ip,
             &socket_addr,
@@ -2873,7 +2866,7 @@ async fn handle_h3_request(
                 .map(|name| ctx.header_field_lines(name))
                 .into_iter()
                 .flatten(),
-            xff_chain.as_deref(),
+            ctx.header_field_lines("x-forwarded-for"),
             &state.trusted_proxies,
         )
         .unwrap_or_else(|| socket_ip.to_string());
@@ -3531,6 +3524,14 @@ async fn handle_h3_request(
     } else {
         crate::proxy::RequestBodyPhaseRequirements::default()
     };
+    // Extended CONNECT carries no request body: the DATA stream is the tunnel.
+    // Publish that transport proof so an integrity-verifying auth plugin can
+    // verify a signature over the empty handshake body (issue #5000).
+    if matches!(http_flavor, HttpFlavor::WebSocket)
+        && capabilities.has(crate::plugin_cache::PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
+    {
+        crate::proxy::publish_websocket_handshake_body_digests(&plugins, &mut ctx);
+    }
 
     let mut prebuffered_body_data: Option<Vec<u8>> = if authenticate_body_requirements.required {
         let protocol_max_body = if matches!(http_flavor, HttpFlavor::Grpc) {
@@ -5402,13 +5403,21 @@ async fn handle_h3_request(
                     Some(&original_request_path),
                 )
                 .await;
-                send_h3_reject_flavor_aware(
+                // Context-aware writer, like every other H3 plugin rejection:
+                // the contextless one drops the client's gRPC-Web flavor and
+                // passes `FramedGrpcUnaryProvenance::NONE`, which turns a
+                // browser-framed refusal into a native gRPC reply and degrades
+                // a valid `serverless_function` native gRPC terminate response
+                // into an empty trailers-only success (issue #5174).
+                send_h3_plugin_reject_flavor_aware(
                     &mut stream,
+                    &plugins,
+                    &mut ctx,
                     http_flavor,
+                    grpc_web_response_content_type,
                     http_status,
                     reject.body.clone(),
                     &headers,
-                    RejectBodyDisposition::for_request(&ctx.method, http_status.as_u16()),
                 )
                 .await?;
                 return Ok(());
@@ -5521,13 +5530,21 @@ async fn handle_h3_request(
                     Some(&original_request_path),
                 )
                 .await;
-                send_h3_reject_flavor_aware(
+                // Context-aware writer, like every other H3 plugin rejection:
+                // the contextless one drops the client's gRPC-Web flavor and
+                // passes `FramedGrpcUnaryProvenance::NONE`, which turns a
+                // browser-framed refusal into a native gRPC reply and degrades
+                // a valid `serverless_function` native gRPC terminate response
+                // into an empty trailers-only success (issue #5174).
+                send_h3_plugin_reject_flavor_aware(
                     &mut stream,
+                    &plugins,
+                    &mut ctx,
                     http_flavor,
+                    grpc_web_response_content_type,
                     http_status,
                     reject.body.clone(),
                     &headers,
-                    RejectBodyDisposition::for_request(&ctx.method, http_status.as_u16()),
                 )
                 .await?;
                 return Ok(());
@@ -7102,6 +7119,8 @@ async fn handle_h3_request(
 
         // Enforce response body size limit via Content-Length fast path
         if let Some(len) = crate::proxy::declared_response_length_exceeds_limit(
+            &method,
+            response_status,
             &response_headers,
             effective_max_response_body_size_bytes,
         ) && !response_omits_body
@@ -9442,26 +9461,6 @@ async fn handle_h3_request(
             .entry("content-type".to_string())
             .or_insert_with(|| "application/json".to_string());
 
-        // The aggregate MCP SSE final-body hook selects a new empty 202 after
-        // the ordinary buffered header-policy pass. Re-close that exact map —
-        // including the H3 default content type above — before the committed
-        // hook can make its reserved event visible.
-        if ctx.mcp_sse_publication.is_some() {
-            let phase_start = std::time::Instant::now();
-            if crate::proxy::enforce_buffered_final_client_visible_response_header_policy(
-                &plugins,
-                &mut ctx,
-                &mut response_status,
-                &mut response_headers,
-                &mut response_body,
-            )
-            .await
-            {
-                response_trailers = None;
-            }
-            plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-        }
-
         if capabilities.has(crate::plugin_cache::PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK) {
             let phase_start = std::time::Instant::now();
             if crate::proxy::run_deadline_bounded_response_committed_hooks(
@@ -10875,8 +10874,13 @@ async fn collect_h3_open_response_body(
     // honored by both the ceiling check and the preallocation hint below
     // (`GHSA-xrfj-852f-645j`).
     let content_length = crate::proxy::canonical_header_content_length_from_map(&response_headers);
-    if effective_max_response_body_size_bytes > 0
-        && content_length.is_some_and(|len| len > effective_max_response_body_size_bytes as u64)
+    if crate::proxy::declared_response_length_exceeds_limit(
+        method,
+        response_status,
+        &response_headers,
+        effective_max_response_body_size_bytes,
+    )
+    .is_some()
     {
         return H3BufferedDispatchResult {
             status: 502,
@@ -11143,6 +11147,8 @@ async fn stream_h3_open_response_to_client(
     let effective_max_response_body_size_bytes = ctx.effective_max_response_body_size_bytes();
     // A HEAD representation length is metadata, not bytes to retain or relay.
     if let Some(len) = crate::proxy::declared_response_length_exceeds_limit(
+        method,
+        response_status,
         &response_headers,
         effective_max_response_body_size_bytes,
     ) && !response_omits_body
@@ -13402,6 +13408,8 @@ async fn dispatch_grpc_native_h3(
     // apply — NOT the request-side gRPC receive cap, so a large-but-valid gRPC
     // response is not spuriously rejected.
     if let Some(len) = crate::proxy::declared_response_length_exceeds_limit(
+        method,
+        response_status,
         &response_headers,
         effective_max_response_body_size_bytes,
     ) {
@@ -15220,6 +15228,8 @@ async fn proxy_to_backend_h3_streaming(
     );
     // Enforce response body size limit via Content-Length fast path
     if let Some(len) = crate::proxy::declared_response_length_exceeds_limit(
+        method,
+        response_status,
         &response_headers,
         effective_max_response_body_size_bytes,
     ) && !response_omits_body
@@ -16866,6 +16876,15 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
 /// at most a partial event, which SSE framing discards) and then releases the
 /// listener slot. Authorization expiry after the 200/event-stream head has
 /// committed RESETS the stream rather than sending a clean FIN.
+///
+/// A PROTOCOL-only bound never resets on its own expiry. Reaching the listener
+/// lifetime is ordinary rotation — the client is expected to reattach with
+/// `Last-Event-ID` — so every way out of the pump (the composed bound firing, a
+/// blocked DATA write losing to it, a client disconnect, and the broker's own
+/// EOF at that same lifetime) settles at ONE terminal, which gives `finish` the
+/// bounded post-deadline grace instead of racing it against a deadline that has
+/// normally just elapsed. Only a write still blocked past that grace, or an
+/// expired authorization, resets.
 async fn send_h3_aggregate_sse_response(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     ctx: &mut RequestContext,
@@ -16982,47 +17001,38 @@ async fn send_h3_aggregate_sse_response(
                 // A failed write on a long-lived stream is an ordinary client
                 // disconnect, not a gateway fault: stop and let the body drop.
                 Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => break,
-                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                    return true;
-                }
+                // A write that lost to the composed bound IS that bound firing,
+                // so it leaves the pump the same way a disconnect does: the one
+                // terminal below owns the FIN-versus-reset decision.
+                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => break,
             }
         }
-        false
     };
-    let composed_deadline_fired = tokio::time::timeout_at(deadline, pump)
-        .await
-        .unwrap_or(true);
+    let _ = tokio::time::timeout_at(deadline, pump).await;
     // Release the listener slot before the QUIC stream teardown so a client
     // that reconnects immediately is never refused by its own stale lease.
     drop(body);
-    if composed_deadline_fired {
-        if let Some(termination) = aggregate_sse_bound.expired_authorization() {
-            ctx.record_authorization_termination_once(termination, auth_family);
-            crate::http3::stream_util::abort_response_stream(stream);
-        } else {
-            match crate::http3::stream_util::await_post_deadline_terminal_response_write(
-                stream.finish(),
-            )
-            .await
-            {
-                Ok(()) | Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {}
-                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                    crate::http3::stream_util::abort_response_stream(stream);
-                }
-            }
-        }
+    // ONE terminal for every pump exit: the composed bound firing, a blocked
+    // DATA write losing to it, a client disconnect, and the broker's own EOF at
+    // the configured listener lifetime. An expired AUTHORIZATION after the
+    // protected head committed resets and is recorded exactly once (issues
+    // #4112 / #4363). A PROTOCOL-only bound is ordinary listener rotation: the
+    // broker ends the body AT that lifetime, so the composed deadline has
+    // normally just elapsed, and racing the FIN against it would turn every
+    // quiet expiry into a stream RESET that reads as a transport fault. The FIN
+    // therefore gets the bounded post-deadline grace, and only a write still
+    // blocked past that grace resets.
+    if let Some(termination) = aggregate_sse_bound.expired_authorization() {
+        ctx.record_authorization_termination_once(termination, auth_family);
+        crate::http3::stream_util::abort_response_stream(stream);
     } else {
-        match crate::http3::stream_util::await_response_write_before_deadline(
-            Some(deadline),
+        match crate::http3::stream_util::await_post_deadline_terminal_response_write(
             stream.finish(),
         )
         .await
         {
             Ok(()) | Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {}
             Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                if let Some(termination) = aggregate_sse_bound.expired_authorization() {
-                    ctx.record_authorization_termination_once(termination, auth_family);
-                }
                 crate::http3::stream_util::abort_response_stream(stream);
             }
         }
@@ -18107,6 +18117,7 @@ mod h3_request_body_timeout_tests {
             failure_status_codes: vec![500],
             half_open_max_requests: 1,
             trip_on_connection_errors: true,
+            half_open_probe_dwell_seconds: None,
         });
         cb.record_failure(500, false, false);
         assert!(

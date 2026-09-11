@@ -12508,9 +12508,9 @@ fn egress_health_checks() -> Option<HealthCheckConfig> {
     })
 }
 
-/// Build upstream targets from a `ServiceEntry`. When the entry uses static
-/// resolution with explicit endpoints, those addresses become targets. When
-/// endpoints are empty (DNS or None resolution), each host becomes a target.
+/// Build upstream targets from a `ServiceEntry`. Static resolution uses only
+/// operator-declared endpoints and therefore yields no targets when none are
+/// usable. DNS and None resolution use each host as a target.
 fn build_egress_upstream_targets(
     entry: &ServiceEntry,
     host: &str,
@@ -12518,7 +12518,7 @@ fn build_egress_upstream_targets(
     backend_port: u16,
     port_name: &Option<String>,
 ) -> Vec<UpstreamTarget> {
-    if entry.resolution == Resolution::Static && !entry.endpoints.is_empty() {
+    if entry.resolution == Resolution::Static {
         entry
             .endpoints
             .iter()
@@ -13172,10 +13172,14 @@ fn inject_mesh_global_plugins(
         "node_id": runtime.node_id.clone(),
         "topology": runtime.topology.as_str(),
         "namespace": mesh_slice.namespace.clone(),
-        "workload_spiffe_id": mesh_slice.workload_spiffe_id.clone(),
         "labels": mesh_slice.labels.clone(),
         "trust_domain_aliases": trust_domain_aliases,
     });
+    // Optional identity hints must be omitted: explicit null is a type error
+    // under workload_metrics admission, including for mesh-managed instances.
+    if let Some(workload_spiffe_id) = &mesh_slice.workload_spiffe_id {
+        workload_metrics_config["workload_spiffe_id"] = serde_json::json!(workload_spiffe_id);
+    }
     // Mirror EVERY enabled global mesh_authz baggage gate PluginCache will
     // execute (issue #4274). Capture-on force-injects reserved `__mesh_authz`
     // beside an operator global; multiple enabled operator globals are also
@@ -14509,10 +14513,10 @@ async fn arm_mesh_runtime_startup(
         ) {
             owner.push_mesh_background(handle);
         }
-        // Spawn the SOCK_OPS ringbuf consumer. When the kernel program
-        // is not pinned (no node-agent on this host, kernel < 5.7, or
-        // build without the ebpf feature), the spawned task logs once
-        // and exits — the plugin still emits zero counters.
+        // Spawn the SOCK_OPS ringbuf consumer. Linux `ebpf` builds retry
+        // with capped backoff until the node-agent pins appear (or
+        // shutdown); other targets skip the task. The plugin still emits
+        // zero counters until the consumer attaches.
         if let Some(state) = bpf_metrics_state.as_ref()
             && let Some(handle) = spawn_sock_ops_consumer_task(state.clone(), &shutdown_tx)
         {

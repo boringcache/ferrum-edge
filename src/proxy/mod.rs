@@ -162,6 +162,8 @@ pub mod unix_backend;
 pub mod unix_backend_pool;
 pub mod upload_pump;
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
@@ -4306,6 +4308,57 @@ fn client_request_body_proven_empty(client_request_body: &ClientRequestBody) -> 
     }
 }
 
+/// Publish the transport's proof that a WebSocket HANDSHAKE carries no request
+/// body, so integrity-verifying authentication plugins can verify a signature
+/// over the empty body (issue #5000).
+///
+/// WebSocket streams are categorically excluded from request-body collection:
+/// after the upgrade, DATA is tunnel payload rather than an HTTP request body,
+/// and draining it would break the relay. That left `hmac_auth` with absent
+/// digest snapshots on every WebSocket route, and absent snapshots MUST fail
+/// closed — so a correctly signed handshake was answered `401` with a digest
+/// mismatch even though the plugin declares WebSocket support.
+///
+/// The handshake itself is an ordinary HTTP request whose body the transport can
+/// prove empty from wire framing alone, without reading a single tunnel byte.
+/// This publishes exactly that proof and nothing else:
+///
+/// * Only for the WebSocket flavor. HBONE CONNECT and `connect-udp` tunnels
+///   keep their absent snapshots and their documented fail-closed behavior.
+/// * Only when [`inbound_request_declares_body`] — which fails closed on any
+///   `Transfer-Encoding` and on any `Content-Length` that is not provably zero —
+///   says the handshake declared no body. A handshake that did declare one keeps
+///   the absent snapshots and is still rejected.
+/// * Only when a configured plugin actually asked for body digests, so an
+///   ordinary WebSocket route does no hashing at all.
+///
+/// This is never a global substitution of the empty digest for "the body was not
+/// collected": the empty representation here is a transport fact about the
+/// handshake, not an assumption about an uncollected body. Only the digest
+/// snapshots are published — no buffered-body metadata, text view, or byte view
+/// is synthesized, so nothing else can mistake a handshake for a collected body.
+pub(crate) fn publish_websocket_handshake_body_digests(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+) {
+    use crate::fips::approved::{Sha256, Sha512};
+
+    if ctx.request_body_sha256.is_some() || ctx.request_body_sha512.is_some() {
+        return;
+    }
+    if inbound_request_declares_body(ctx) {
+        return;
+    }
+    if !plugins
+        .iter()
+        .any(|plugin| plugin.needs_request_body_digests())
+    {
+        return;
+    }
+    ctx.request_body_sha256 = Some(Sha256::digest(b""));
+    ctx.request_body_sha512 = Some(Sha512::digest(b""));
+}
+
 /// Whether a `Content-Length` field-line value provably declares a zero-length
 /// body. Anything that is not a parseable zero — a non-UTF-8 field line, a
 /// malformed number, a value out of `u64` range — answers `false` so the
@@ -4603,6 +4656,10 @@ pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<Strin
     // transaction logs and retain only safe present/length correlation hints.
     crate::plugins::sse::redact_sse_log_metadata(metadata);
     crate::plugins::mcp_gateway::redact_internal_log_metadata(metadata);
+    // gRPC-Web stages the client's COMPLETE request trailer block for dispatch.
+    // It is transport state, not observability metadata, and the application
+    // trailing metadata inside it may carry credentials (GHSA-9f6g-hqpq-v8h7).
+    crate::plugins::grpc_web::redact_internal_log_metadata(metadata);
     // Fail-closed shared contract: request-deduplication lifecycle keys under
     // `_dedup_*` never enter any transaction-log projection. Ownership lives in
     // typed request state; this strips any residual public-metadata copies.
@@ -5012,11 +5069,13 @@ impl Drop for StreamLbSetupFailureGuard {
 ///
 /// Siblings that share this invariant and MUST route through this one type
 /// (issue #4792): the H1/H2, WebSocket and gRPC dispatch paths in this module,
-/// the HBONE CONNECT relay in [`crate::proxy::hbone_proxy`], and the HTTP/3
-/// request and WebSocket paths in [`crate::http3`].
+/// the HBONE CONNECT relay in [`crate::proxy::hbone_proxy`], the HTTP/3
+/// request and WebSocket paths in [`crate::http3`], the UDP/DTLS session
+/// setup paths in [`crate::proxy::udp_proxy`], and the passthrough and
+/// terminating TCP paths in [`crate::proxy::tcp_proxy`].
 /// `tests/unit/gateway_core/shared_invariant_parity_tests.rs` asserts that every
-/// file calling `check_circuit_breaker` owns a guard and that the guard settles
-/// NEUTRAL.
+/// file calling `check_circuit_breaker` and all UDP/TCP direct-cache admission
+/// paths own a guard and that the guard settles NEUTRAL.
 pub struct HalfOpenProbeGuard {
     /// The breaker that granted the slot, resolved ONCE at admission so a
     /// concurrent configuration reload cannot make the release land on a
@@ -5953,7 +6012,9 @@ pub(crate) async fn run_final_request_body_hooks_with_provenance_in(
                 // the `UNAVAILABLE` a bare `503` would otherwise map to, which
                 // would claim the backend is down.
                 use crate::proxy::response_buffer_budget as budget;
-                warn!("Governed request body decode refused: request-decode budget exhausted");
+                warn_sampled!(
+                    "Governed request body decode refused: request-decode budget exhausted"
+                );
                 // The SAME gateway-capacity terminal state the retained-response
                 // refusal uses. Without it this fixed `503` is an ordinary
                 // rejection with no provenance, and the response-side finalizer
@@ -5986,7 +6047,7 @@ pub(crate) async fn run_final_request_body_hooks_with_provenance_in(
             FinalRequestBodyPosture::Reject(rejection) => {
                 // Fixed-cardinality reason only: no coding token, no header
                 // value, and no body byte reaches the log or the client.
-                warn!(
+                warn_sampled!(
                     reason = rejection.reason(),
                     "Governed request body could not be reduced to plaintext; failing closed"
                 );
@@ -15755,11 +15816,6 @@ async fn handle_websocket_request_authenticated(
                             ws_write_buf,
                             ws_tunnel,
                             ws_tunnel_idle_disabled_safety_cap,
-                            // H1/H2: RFC 6455 / RFC 8441 mandate masked
-                            // client-to-server frames. The H3 caller in
-                            // `src/http3/websocket.rs` passes `true` for
-                            // RFC 9220 §5 compliance.
-                            false,
                             ws_idle_tracker,
                             ws_session_deadline,
                             ws_shutdown_rx,
@@ -15786,7 +15842,6 @@ async fn handle_websocket_request_authenticated(
                             ws_write_buf,
                             ws_tunnel,
                             ws_tunnel_idle_disabled_safety_cap,
-                            false,
                             ws_idle_tracker,
                             ws_session_deadline,
                             ws_shutdown_rx,
@@ -15825,7 +15880,6 @@ async fn handle_websocket_request_authenticated(
                             ws_write_buf,
                             ws_tunnel,
                             ws_tunnel_idle_disabled_safety_cap,
-                            false,
                             ws_idle_tracker,
                             ws_session_deadline,
                             ws_shutdown_rx,
@@ -16028,9 +16082,10 @@ fn proxy_header_entry_case_insensitive<'a>(
 }
 
 fn is_websocket_backend_strip_header(name: &str) -> bool {
-    matches!(
-        name,
-        "host"
+    headers_mod::is_consumer_assertion_header(name)
+        || matches!(
+            name,
+            "host"
             | "proxy-authenticate"
             | "sec-websocket-key"
             | "sec-websocket-version"
@@ -16042,10 +16097,8 @@ fn is_websocket_backend_strip_header(name: &str) -> bool {
             // down with a protocol error. Strip the offer so no extension is
             // ever negotiated end to end.
             | "sec-websocket-extensions"
-            | "x-consumer-username"
-            | "x-consumer-custom-id"
             | "x-geo-country"
-    )
+        )
 }
 
 fn push_forwardable_header_override(
@@ -18810,14 +18863,12 @@ where
 /// false` because RFC 9220 is already bridged as WebSocket frames over QUIC, not
 /// a raw TCP socket.
 ///
-/// `accept_unmasked_client_frames` controls whether the WebSocket framer
-/// accepts client-to-server frames without the RFC 6455 mask bit set.
-/// HTTP/1.1 and HTTP/2 callers pass `false` (RFC 6455 / RFC 8441 mandate
-/// masked client frames). HTTP/3 callers pass `true` — RFC 9220 §5
-/// REVERSES the masking requirement: client-to-server frames MUST NOT
-/// be masked when the WebSocket runs over HTTP/3. The H3 bridge validates
-/// that rule before bytes reach this shared tungstenite framer, then passes
-/// `true` here so compliant unmasked client frames are accepted.
+/// Client-to-server frame masking is RFC 6455 §5.1 on every frontend. RFC 8441
+/// §5 and RFC 9220 §3 only bootstrap the session — they hand the CONNECT stream
+/// to RFC 6455 "as if it were the TCP connection" and say nothing about masking
+/// — so H1, H2, and H3 all run this framer with `accept_unmasked_frames` off:
+/// masked client frames are unmasked here, and an unmasked one is a protocol
+/// error that closes the client with 1002 (issue #5011).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_websocket_proxy<C, B>(
     client_io: C,
@@ -18833,7 +18884,6 @@ pub(crate) async fn run_websocket_proxy<C, B>(
     websocket_write_buffer_size: usize,
     websocket_tunnel_mode: bool,
     websocket_tunnel_idle_disabled_safety_cap: Duration,
-    accept_unmasked_client_frames: bool,
     ws_idle_tracker: Option<Arc<WsIdleTracker>>,
     session_deadline: WsSessionDeadline,
     shutdown_rx: Option<watch::Receiver<bool>>,
@@ -18856,20 +18906,6 @@ where
     // return below stays generic.
     B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    // Invariant: the tunnel-mode raw-copy fast path is only reachable from H1
-    // frontends. RFC 6455 (H1.1) and RFC 8441 (H2 Extended CONNECT) mandate
-    // masked client frames, so H1/H2 always pass `accept_unmasked_client_frames
-    // = false`. RFC 9220 (H3 Extended CONNECT) reverses the rule and the H3
-    // caller passes `true` — but H3 cannot tunnel raw bytes (there is no TCP
-    // underneath QUIC) so the caller also passes `websocket_tunnel_mode =
-    // false`. If both are ever `true` simultaneously, a refactor has wired a
-    // non-TCP transport into the tunnel branch and `copy_bidirectional` would
-    // silently elide frame parsing on traffic that needs it.
-    debug_assert!(
-        !(websocket_tunnel_mode && accept_unmasked_client_frames),
-        "run_websocket_proxy: tunnel mode is incompatible with unmasked client \
-         frames (H3 caller must pass websocket_tunnel_mode=false)"
-    );
     // Issue #3857: the HTTP connection guard is dropped when
     // `serve_connection_with_upgrades` returns, which for an H1 upgrade is
     // before this relay ends. The cloned session handle still lives here; wrap
@@ -19111,10 +19147,11 @@ where
     ws_config.max_frame_size = Some(effective_size_limits.max_frame_bytes);
     ws_config.max_message_size = Some(effective_size_limits.max_message_bytes);
     ws_config.write_buffer_size = websocket_write_buffer_size;
-    // RFC 9220 §5: frames over HTTP/3 are NOT masked. H1/H2 callers
-    // pass `false` (RFC 6455 / RFC 8441 mandate masked client frames);
-    // H3 callers pass `true`.
-    ws_config.accept_unmasked_frames = accept_unmasked_client_frames;
+    // RFC 6455 §5.1: a server MUST close the connection on an unmasked
+    // client frame. RFC 8441 / RFC 9220 Extended CONNECT bootstrap the
+    // session without changing framing, so H1, H2, and H3 are identical
+    // here — there is no HTTP/3 masking exemption (issue #5011).
+    ws_config.accept_unmasked_frames = false;
     // Transparent relay shared by H1/H2/H3: forward Ping without a local
     // auto-Pong so end-to-end keepalive reflects the far side (issue #2963).
     ws_config.auto_pong = false;
@@ -19481,7 +19518,7 @@ where
                             let error_class = if let Some((close, limit_kind, size, max_size)) =
                                 size_limits_ctb.plugin_close_for_error(&e)
                             {
-                                warn!(
+                                warn_sampled!(
                                     plugin = "ws_message_size_limiting",
                                     proxy_id = %proxy_id_ctb,
                                     connection_id,
@@ -19503,7 +19540,7 @@ where
                             } else if let Some((close, limit_kind, size, max_size)) =
                                 EffectiveWsSizeLimits::global_capacity_close_for_error(&e)
                             {
-                                warn!(
+                                warn_sampled!(
                                     proxy_id = %proxy_id_ctb,
                                     connection_id,
                                     direction = "client->backend",
@@ -19522,7 +19559,7 @@ where
                             } else if let Some((close, limit_kind)) =
                                 ws_fragment_policy_close_for_error(&e)
                             {
-                                warn!(
+                                warn_sampled!(
                                     proxy_id = %proxy_id_ctb,
                                     connection_id,
                                     direction = "client->backend",
@@ -19807,7 +19844,7 @@ where
                             let error_class = if let Some((close, limit_kind, size, max_size)) =
                                 size_limits_btc.plugin_close_for_error(&e)
                             {
-                                warn!(
+                                warn_sampled!(
                                     plugin = "ws_message_size_limiting",
                                     proxy_id = %proxy_id_btc,
                                     connection_id,
@@ -19827,7 +19864,7 @@ where
                             } else if let Some((close, limit_kind, size, max_size)) =
                                 EffectiveWsSizeLimits::global_capacity_close_for_error(&e)
                             {
-                                warn!(
+                                warn_sampled!(
                                     proxy_id = %proxy_id_btc,
                                     connection_id,
                                     direction = "backend->client",
@@ -19846,7 +19883,7 @@ where
                             } else if let Some((close, limit_kind)) =
                                 ws_fragment_policy_close_for_error(&e)
                             {
-                                warn!(
+                                warn_sampled!(
                                     proxy_id = %proxy_id_btc,
                                     connection_id,
                                     direction = "backend->client",
@@ -22842,7 +22879,7 @@ async fn run_after_proxy_hooks_on_rejection(
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {
-                    warn!(
+                    warn_sampled!(
                         rejecting_plugin = plugin.name(),
                         "after_proxy rejection could not be normalized"
                     );
@@ -22911,7 +22948,7 @@ async fn run_after_proxy_hooks_on_rejection(
                         ctx.mark_final_body_policy_terminal_replacement();
                     }
                     if plugin.warn_on_rejection_response_replacement() {
-                        warn!(
+                        warn_sampled!(
                             rejecting_plugin = plugin.name(),
                             replacement_status = *status_code,
                             replaced_status,
@@ -22936,7 +22973,7 @@ async fn run_after_proxy_hooks_on_rejection(
                 // short-circuit — a federated 2xx missing usage metadata is still
                 // returned to the client. See docs/plugins.md (ai_rate_limiter
                 // federation limitation).
-                warn!(
+                warn_sampled!(
                     rejecting_plugin = plugin.name(),
                     attempted_reject_status = reject_status,
                     committed_status = *status_code,
@@ -23416,7 +23453,7 @@ async fn evaluate_final_synthetic_client_visible_response_body_policy(
             }
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let reject = plugin_result_into_reject_parts(reject).unwrap_or_else(|| {
-                    warn!(
+                    warn_sampled!(
                         plugin = plugin.name(),
                         "Final client-visible response policy re-decision could not be \
                          converted; failing closed"
@@ -23617,7 +23654,7 @@ async fn reenforce_final_synthetic_client_visible_response_body_policy(
                 if final_response_body_policy_scope(response_headers)
                     != gateway_authored_rejection_body_policy_scope()
                 {
-                    warn!(
+                    warn_sampled!(
                         "Final client-visible response body policy rejection rebuilt an unexpected \
                          representation; collapsing to the fixed gateway terminal"
                     );
@@ -23677,6 +23714,13 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     response_headers: &mut HashMap<String, String>,
     response_body: &mut Bytes,
 ) -> Option<FinalSyntheticBodyPolicyWitness> {
+    // Semantic-cache entries retain the finalized application body with only
+    // transport encoding removed. Body inspection must see replay provenance
+    // so mandatory policy rewrites still run, while ordinary rewrites do not.
+    // Restore it before live header rules and the late compression phase.
+    let previous_finalized_response_replay = ctx.finalized_response_replay;
+    ctx.finalized_response_replay |= ctx.semantic_cache_response_replay;
+
     // Mark the context for the duration of this body-hook phase so that storing
     // plugins (e.g. `request_deduplication`) can tell this body is a synthetic
     // plugin short-circuit and skip caching/replaying it. Saved/restored so a
@@ -24010,6 +24054,8 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     } else {
         ctx.metadata.remove(SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
     }
+
+    ctx.finalized_response_replay = previous_finalized_response_replay;
 
     // A gateway-authored terminal — a capacity refusal, a body rejection, a
     // failed mandatory replay redaction — is already the answer, and must never
@@ -24516,7 +24562,7 @@ pub(crate) async fn run_after_proxy_hooks(
                     mut headers,
                 } = plugin_result_into_reject_parts(reject)
                     .expect("reject result should convert to rejection parts");
-                warn!(
+                warn_sampled!(
                     "after_proxy plugin '{}' rejected response before downstream commit (status {})",
                     plugin.name(),
                     status_code,
@@ -26123,7 +26169,7 @@ pub(crate) fn install_pending_buffered_response_capacity_refusal(
     }
     if let Some(produced_bytes) = produced_bytes {
         ctx.mark_response_transform_size_refusal_selected();
-        warn!(
+        warn_sampled!(
             proxy_id = ctx.matched_proxy.as_ref().map(|proxy| proxy.id.as_str()),
             plugin = "response_transformer",
             produced_bytes_at_least = produced_bytes,
@@ -26261,7 +26307,7 @@ async fn replace_buffered_response_with_representation_error(
     initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
     apply_reject_after_proxy_hooks: bool,
 ) {
-    warn!(
+    warn_sampled!(
         reason = rejection.reason(),
         "Buffered response rejected: configured response body policy could not be enforced"
     );
@@ -26439,7 +26485,9 @@ pub(crate) async fn admit_buffered_response_body_transforms(
             // passive health, and adaptive concurrency, rather than the `502`
             // representation error that would blame the upstream
             // (GHSA-pwcm-6rh8-f2gh).
-            warn!("Response representation decode refused: retained-response budget exhausted");
+            warn_sampled!(
+                "Response representation decode refused: retained-response budget exhausted"
+            );
             replace_buffered_response_with_capacity_refusal_with_policy_source(
                 ctx,
                 response_status,
@@ -26459,7 +26507,7 @@ pub(crate) async fn admit_buffered_response_body_transforms(
                 // decode above does — never a forward of the claimed encoded
                 // bytes (GHSA-pwcm-6rh8-f2gh).
                 if !install_decoded_response_body(ctx, response_headers, response_body, decoded) {
-                    warn!(
+                    warn_sampled!(
                         "Response representation decode refused: retained-response budget exhausted"
                     );
                     replace_buffered_response_with_capacity_refusal_with_policy_source(
@@ -26593,7 +26641,7 @@ async fn run_final_client_visible_response_body_policy(
                     // body a policy just refused — so substitute the fixed,
                     // non-sensitive gateway terminal rather than continuing.
                     None => {
-                        warn!(
+                        warn_sampled!(
                             plugin = plugin.name(),
                             "Final client-visible response policy rejection could not be \
                              converted; failing closed"
@@ -27069,7 +27117,7 @@ async fn enforce_final_client_visible_response_header_policy(
             );
             return true;
         }
-        warn!(
+        warn_sampled!(
             "Final client-visible response header policy still refused the rebuilt rejection; \
              collapsing to the fixed gateway terminal"
         );
@@ -27175,7 +27223,7 @@ pub(crate) async fn enforce_buffered_final_client_visible_response_header_policy
             .await;
             return true;
         }
-        warn!(
+        warn_sampled!(
             "Final client-visible response header policy still refused the buffered rejection; \
              collapsing to the fixed protocol terminal"
         );
@@ -27371,7 +27419,9 @@ async fn transform_buffered_response_body_with_deadline_inner(
         match response_buffer_budget::ResponseTransformWindow::open(ceiling) {
             Some(window) => Some(window),
             None => {
-                warn!("Response body transform refused: retained-response budget exhausted");
+                warn_sampled!(
+                    "Response body transform refused: retained-response budget exhausted"
+                );
                 replace_buffered_response_with_capacity_refusal(
                     ctx,
                     response_status,
@@ -27412,9 +27462,10 @@ async fn transform_buffered_response_body_with_deadline_inner(
                 plugin.response_body_production(),
                 window.as_mut(),
             ) {
-                warn!(
+                warn_sampled!(
                     plugin = plugin.name(),
-                    reason, "Response body transform refused before invoking the producer"
+                    reason,
+                    "Response body transform refused before invoking the producer"
                 );
                 replace_buffered_response_with_capacity_refusal(
                     ctx,
@@ -27505,7 +27556,7 @@ async fn transform_buffered_response_body_with_deadline_inner(
                 // refused rather than installed uncharged.
                 let transformed_len = transformed.len();
                 let Some(charged) = window.as_mut().and_then(|w| w.charge(transformed)) else {
-                    warn!(
+                    warn_sampled!(
                         plugin = plugin.name(),
                         replacement_bytes = transformed_len,
                         "Response body transform refused: replacement body is not covered by a \
@@ -30266,7 +30317,9 @@ async fn handle_proxy_request_inner(
     // materializing the full HashMap — only 2-3 targeted lookups on the raw
     // HeaderMap. The configured real-IP header is read as ALL of its field
     // lines, never a single `get()`, so duplicate lines cannot hide a competing
-    // attacker-supplied value (advisory GHSA-fx4w-68hx-mj7r).
+    // attacker-supplied value (advisory GHSA-fx4w-68hx-mj7r). X-Forwarded-For
+    // is read through the same byte-preserving accessor so no field line can
+    // leave the chain before it is walked (advisory GHSA-73ff-frj6-cpmp).
     if !state.trusted_proxies.is_empty() {
         // Latch the immediate-peer trust verdict for the whole request, before
         // any plugin phase runs. Plugin phases that build their own outbound
@@ -30284,19 +30337,8 @@ async fn handle_proxy_request_inner(
             {
                 request_scheme = forwarded_scheme;
             }
-            let xff_chain = {
-                let mut values = ctx.raw_header_values("x-forwarded-for");
-                values.next().map(|first| {
-                    let mut combined = String::from(first);
-                    for value in values {
-                        combined.push(',');
-                        combined.push_str(value);
-                    }
-                    combined
-                })
-            };
-            // Bound the immutable borrow of `ctx` (held by the field-line
-            // iterator) to this statement so the assignment below can take a
+            // Bound the immutable borrows of `ctx` (held by the field-line
+            // iterators) to this statement so the assignment below can take a
             // mutable borrow.
             let resolved = client_ip::resolve_forwarded_client_ip(
                 &socket_ip,
@@ -30309,7 +30351,7 @@ async fn handle_proxy_request_inner(
                     .map(|name| ctx.header_field_lines(name))
                     .into_iter()
                     .flatten(),
-                xff_chain.as_deref(),
+                ctx.header_field_lines("x-forwarded-for"),
                 &state.trusted_proxies,
             );
             if let Some(resolved) = resolved {
@@ -31162,6 +31204,14 @@ async fn handle_proxy_request_inner(
     } else {
         RequestBodyPhaseRequirements::default()
     };
+    // A WebSocket handshake declares no body on the wire, so the transport can
+    // prove the empty representation an integrity-verifying auth plugin has to
+    // sign over without touching a tunnel byte (issue #5000).
+    if matches!(flavor, HttpFlavor::WebSocket)
+        && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
+    {
+        publish_websocket_handshake_body_digests(&plugins, &mut ctx);
+    }
 
     if authenticate_body_requirements.required {
         client_request_body = match client_request_body {
@@ -33763,6 +33813,14 @@ async fn handle_proxy_request_inner(
         // CLOSED state, or the buffered-request streaming path) records the
         // outcome at response-header time as before.
         let mut grpc_streaming_probe_recorder: Option<Arc<GrpcStreamingProbeRecorder>> = None;
+        // Publication latch for the fully-streamed native-gRPC upload's
+        // forwarded request bytes (GHSA-8x5h-g4xh-hgc9). That arm never
+        // collects a body, so `ctx.bytes_sent_observed` is written once at
+        // upload termination; a backend that answers before a client-streaming
+        // upload finishes would otherwise build the deferred summary — and bill
+        // `api_chargeback` — against a still-zero counter. `None` on every
+        // buffered arm, which publishes the collected length synchronously.
+        let mut grpc_streaming_request_bytes_latch: Option<Arc<body::DirectH2BytesLatch>> = None;
         // Unread frontend upload retained across a synthesized Trailers-Only
         // error on the fully-streaming H2 path. The pinned h2 transport already
         // orders response HEADERS before its permitted NO_ERROR cancellation;
@@ -34286,6 +34344,12 @@ async fn handle_proxy_request_inner(
                     upstream_balancer.clone(),
                 ));
                 grpc_backend_admission_started_at = Instant::now();
+                let request_bytes_latch = Arc::new(body::DirectH2BytesLatch::new());
+                grpc_streaming_request_bytes_latch = Some(Arc::clone(&request_bytes_latch));
+                let request_bytes_accounting = grpc_proxy::GrpcUploadByteAccounting::new(
+                    Arc::clone(&ctx.bytes_sent_observed),
+                    request_bytes_latch,
+                );
                 let result = grpc_proxy::proxy_grpc_request_streaming(
                     request,
                     grpc_dispatch_proxy,
@@ -34303,6 +34367,11 @@ async fn handle_proxy_request_inner(
                     ctx.grpc_deadline_at(),
                     &mut held_frontend_grpc_upload,
                     Some(Arc::clone(&ctx.grpc_request_messages_observed)),
+                    // The buffered arms `fetch_max` the collected length into
+                    // this counter; the streamed arm has no collected length,
+                    // so the body publishes its forwarded DATA tally at upload
+                    // termination instead (GHSA-8x5h-g4xh-hgc9).
+                    Some(request_bytes_accounting),
                     // Same absolute plan the buffered gRPC arms use (#3815);
                     // the fully-streamed upload gets the gateway-owned pump
                     // instead of a bounded collect.
@@ -35554,6 +35623,17 @@ async fn handle_proxy_request_inner(
                 } else {
                     None
                 };
+                // A fully-streamed upload publishes its forwarded request bytes
+                // only at upload termination, which a server- or bidi-streaming
+                // RPC can reach long after the response headers this summary was
+                // built from. Waiting on the latch is what keeps `bytes_sent`
+                // (and `api_chargeback`'s sent-bandwidth charge) from settling on
+                // a still-zero counter. `None` on every buffered request arm.
+                let deferred_grpc_logger = deferred_grpc_logger.map(|logger| {
+                    logger.with_passthrough_request_bytes_latch(
+                        grpc_streaming_request_bytes_latch.clone(),
+                    )
+                });
 
                 if body_exceeded {
                     drop(backend_admission_permits.take());
@@ -35846,6 +35926,7 @@ async fn handle_proxy_request_inner(
                         content_type,
                         grpc_streaming.status,
                         grpc_web_streaming_initial_metadata,
+                        crate::plugins::grpc_web::response_entity_is_unframed_backend_error(&ctx),
                     );
                 }
                 if let Some(logger) = deferred_grpc_logger {
@@ -38759,28 +38840,6 @@ async fn handle_proxy_request_inner(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
-    // `mcp_gateway` may have replaced the governed JSON-RPC body with an empty
-    // POST-side 202 while privately reserving the event. The ordinary buffered
-    // header policy ran before that legacy final-body hook, over the original
-    // 200 response. Close the newly selected acknowledgement here so the
-    // committed hook never publishes an event whose actual POST response did
-    // not pass final header policy. Synthetic rejects reach the equivalent
-    // boundary inside `apply_reject_after_proxy_and_synthetic_body_hooks`.
-    if ctx.mcp_sse_publication.is_some()
-        && let ResponseBody::Buffered(ref mut data) = response_body
-    {
-        let phase_start = Instant::now();
-        let _ = enforce_buffered_final_client_visible_response_header_policy(
-            &plugins,
-            &mut ctx,
-            &mut response_status,
-            &mut response_headers,
-            data,
-        )
-        .await;
-        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-    }
-
     // Inject the sticky-session cookie before committed exporters observe the
     // final header view. This remains after every rejection/body replacement so
     // the cookie lands on the same response that will be sent downstream.
@@ -39934,6 +39993,7 @@ async fn handle_proxy_request_inner(
             &content_type,
             response_status,
             Some(initial_terminal_metadata),
+            crate::plugins::grpc_web::response_entity_is_unframed_backend_error(&ctx),
         )
     } else {
         body
@@ -41284,13 +41344,18 @@ pub(crate) async fn proxy_to_backend_retry(
                 .and_then(|len| usize::try_from(len).ok());
 
             // Fast path: reject immediately when Content-Length exceeds limit.
-            if effective_max_response_body_size_bytes > 0
-                && let Some(len) = content_length
-                && len > effective_max_response_body_size_bytes
-            {
-                warn!(
+            // HEAD / 1xx / 204 / 205 / 304 advertise a representation length,
+            // not transferred body bytes, so they skip this comparison.
+            if let Some(len) = declared_response_length_exceeds_limit(
+                method,
+                status,
+                &resp_headers,
+                effective_max_response_body_size_bytes,
+            ) {
+                warn_sampled!(
                     "Backend response body ({} bytes) exceeds limit ({} bytes)",
-                    len, effective_max_response_body_size_bytes
+                    len,
+                    effective_max_response_body_size_bytes
                 );
                 return retry::BackendResponse {
                     status_code: 502,
@@ -42474,7 +42539,7 @@ fn buffered_backend_response_from_eager_collect(
             // Size POLICY, not process capacity: the origin sent more than the
             // operator allows to be retained. Kept separate from the aggregate
             // refusal above so telemetry and health accounting stay honest.
-            warn!(
+            warn_sampled!(
                 proxy_id = %proxy.id,
                 transport,
                 max_response_body_size_bytes = ceiling,
@@ -45107,7 +45172,7 @@ async fn proxy_to_backend(
             // contractual 413. Mirror the `Err`-branch check so the outcome is
             // deterministic across both arms of the race.
             if body_size_exceeded.load(Ordering::Acquire) {
-                warn!(
+                warn_sampled!(
                     proxy_id = %proxy.id,
                     backend_url = %strip_query_params(backend_url),
                     max_body_size = effective_max_request_body_size_bytes,
@@ -45156,16 +45221,22 @@ async fn proxy_to_backend(
                 // failing to parse and skipping this reject
                 // (`GHSA-xrfj-852f-645j`). An ambiguous declaration yields `None`
                 // and falls through to the bounded collect/stream paths below,
-                // which never trust a declared length.
+                // which never trust a declared length. HEAD / 1xx / 204 / 205 /
+                // 304 keep a representation Content-Length without transferring
+                // those bytes, so they are not compared against the ceiling.
                 let content_length = canonical_header_content_length(response.headers())
                     .and_then(|len| usize::try_from(len).ok());
 
-                if let Some(len) = content_length
-                    && len > effective_max_response_body_size_bytes
-                {
-                    warn!(
+                if let Some(len) = declared_response_length_exceeds_limit(
+                    method,
+                    status,
+                    &resp_headers,
+                    effective_max_response_body_size_bytes,
+                ) {
+                    warn_sampled!(
                         "Backend response body ({} bytes) exceeds limit ({} bytes)",
-                        len, effective_max_response_body_size_bytes
+                        len,
+                        effective_max_response_body_size_bytes
                     );
                     return backend_dispatch_response(
                         retry::BackendResponse {
@@ -45480,7 +45551,7 @@ async fn proxy_to_backend(
             // Check if the error was caused by the streaming body exceeding
             // the size limit. If so, return 413 instead of generic 502.
             if body_size_exceeded.load(Ordering::Acquire) {
-                warn!(
+                warn_sampled!(
                     proxy_id = %proxy.id,
                     backend_url = %strip_query_params(backend_url),
                     max_body_size = effective_max_request_body_size_bytes,
@@ -45721,14 +45792,16 @@ fn buffered_collect_retain_failure(
 ) -> BufferedCollectFailure {
     match rejection {
         response_buffer_budget::RetainRejection::TooLarge => {
-            warn!(
+            warn_sampled!(
                 "Backend response truncated: exceeded {} byte limit",
                 max_size
             );
             BufferedCollectFailure::too_large()
         }
         response_buffer_budget::RetainRejection::BudgetExhausted => {
-            warn!("Response buffering refused: aggregate retained-response budget exhausted");
+            warn_sampled!(
+                "Response buffering refused: aggregate retained-response budget exhausted"
+            );
             BufferedCollectFailure::budget_exhausted()
         }
     }
@@ -47339,7 +47412,9 @@ fn hyper_collect_retain_error(
     match rejection {
         response_buffer_budget::RetainRejection::TooLarge => HyperBodyCollectError::TooLarge,
         response_buffer_budget::RetainRejection::BudgetExhausted => {
-            warn!("Response buffering refused: aggregate retained-response budget exhausted");
+            warn_sampled!(
+                "Response buffering refused: aggregate retained-response budget exhausted"
+            );
             HyperBodyCollectError::BudgetExhausted
         }
     }
@@ -47371,7 +47446,7 @@ fn response_buffer_capacity_response(
     resolved_ip: Option<String>,
     transport: &'static str,
 ) -> retry::BackendResponse {
-    warn!(
+    warn_sampled!(
         proxy_id = %proxy.id,
         transport = transport,
         "Response buffering refused: aggregate retained-response budget exhausted"
@@ -47400,7 +47475,7 @@ fn mesh_grpc_response_buffer_capacity_response(
     proxy: &Proxy,
     resolved_ip: Option<String>,
 ) -> retry::BackendResponse {
-    warn!(
+    warn_sampled!(
         proxy_id = %proxy.id,
         transport = "mesh-mtls-grpc",
         "gRPC response buffering refused: aggregate retained-response budget exhausted"
@@ -47530,7 +47605,7 @@ fn grpc_web_reframe_capacity_terminal(
     response_headers: &mut HashMap<String, String>,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) {
-    warn!("gRPC-Web trailer reframing refused: retained-response capacity unavailable");
+    warn_sampled!("gRPC-Web trailer reframing refused: retained-response capacity unavailable");
     replace_buffered_response_with_capacity_refusal(
         ctx,
         response_status,
@@ -47553,14 +47628,14 @@ fn mesh_transport_response_body_too_large_response(
     max_size: usize,
 ) -> retry::BackendResponse {
     match observed_size {
-        Some(size) => warn!(
+        Some(size) => warn_sampled!(
             proxy_id = %proxy.id,
             response_body_bytes = size,
             max_response_body_size_bytes = max_size,
             "{} backend response body exceeds configured size limit",
             transport.log_noun()
         ),
-        None => warn!(
+        None => warn_sampled!(
             proxy_id = %proxy.id,
             max_response_body_size_bytes = max_size,
             "{} backend response body exceeded configured size limit while buffering",
@@ -47592,14 +47667,14 @@ fn mesh_transport_request_body_too_large_response(
     max_size: usize,
 ) -> retry::BackendResponse {
     match observed_size {
-        Some(size) => warn!(
+        Some(size) => warn_sampled!(
             proxy_id = %proxy.id,
             request_body_bytes = size,
             max_request_body_size_bytes = max_size,
             "{} request body exceeds configured size limit",
             transport.log_noun()
         ),
-        None => warn!(
+        None => warn_sampled!(
             proxy_id = %proxy.id,
             max_request_body_size_bytes = max_size,
             "{} streaming request body exceeded configured size limit",
@@ -48674,13 +48749,13 @@ fn mesh_grpc_response_body_too_large_response(
     max_size: usize,
 ) -> retry::BackendResponse {
     match observed_size {
-        Some(size) => warn!(
+        Some(size) => warn_sampled!(
             proxy_id = %proxy.id,
             response_body_bytes = size,
             max_response_body_size_bytes = max_size,
             "sidecar mTLS gRPC backend response body exceeds configured size limit"
         ),
-        None => warn!(
+        None => warn_sampled!(
             proxy_id = %proxy.id,
             max_response_body_size_bytes = max_size,
             "sidecar mTLS gRPC backend response body exceeded configured size limit while buffering"
@@ -49551,12 +49626,14 @@ async fn proxy_to_backend_hbone_after_ready(
     };
 
     let status = response.status().as_u16();
-    let content_length = canonical_header_content_length(response.headers())
-        .and_then(|len| usize::try_from(len).ok());
-    if effective_max_response_body_size_bytes > 0
-        && let Some(len) = content_length
-        && len > effective_max_response_body_size_bytes
-    {
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    collect_hyper_response_headers(response.headers(), &mut resp_headers);
+    if let Some(len) = declared_response_length_exceeds_limit(
+        method,
+        status,
+        &resp_headers,
+        effective_max_response_body_size_bytes,
+    ) {
         return (
             hbone_response_body_too_large_response(
                 proxy,
@@ -49568,8 +49645,6 @@ async fn proxy_to_backend_hbone_after_ready(
             None,
         );
     }
-    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
-    collect_hyper_response_headers(response.headers(), &mut resp_headers);
 
     // Content-type-aware buffer -> stream downgrade (see `proxy_to_backend`).
     let stream_response = refine_stream_response_for_content_type(
@@ -50339,10 +50414,14 @@ async fn proxy_to_backend_unix(
     let status = response.status().as_u16();
     let content_length = canonical_header_content_length(response.headers())
         .and_then(|len| usize::try_from(len).ok());
-    if effective_max_response_body_size_bytes > 0
-        && let Some(len) = content_length
-        && len > effective_max_response_body_size_bytes
-    {
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    collect_hyper_response_headers(response.headers(), &mut resp_headers);
+    if let Some(len) = declared_response_length_exceeds_limit(
+        method,
+        status,
+        &resp_headers,
+        effective_max_response_body_size_bytes,
+    ) {
         return (
             unix_response_body_too_large_response(
                 proxy,
@@ -50354,8 +50433,6 @@ async fn proxy_to_backend_unix(
             None,
         );
     }
-    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
-    collect_hyper_response_headers(response.headers(), &mut resp_headers);
 
     let stream_response = refine_stream_response_for_content_type(
         stream_response,
@@ -50635,7 +50712,7 @@ fn unix_request_body_too_large_response(
     resolved_ip: Option<String>,
     max_size: usize,
 ) -> retry::BackendResponse {
-    warn!(
+    warn_sampled!(
         proxy_id = %proxy.id,
         max_request_body_size_bytes = max_size,
         "Unix backend streaming request body exceeded configured size limit"
@@ -50660,13 +50737,13 @@ fn unix_response_body_too_large_response(
     max_size: usize,
 ) -> retry::BackendResponse {
     match observed_size {
-        Some(size) => warn!(
+        Some(size) => warn_sampled!(
             proxy_id = %proxy.id,
             response_body_bytes = size,
             max_response_body_size_bytes = max_size,
             "Unix backend response body exceeds configured size limit"
         ),
-        None => warn!(
+        None => warn_sampled!(
             proxy_id = %proxy.id,
             max_response_body_size_bytes = max_size,
             "Unix backend response body exceeded configured size limit while buffering"
@@ -51903,12 +51980,14 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
     };
 
     let status = response.status().as_u16();
-    let content_length = canonical_header_content_length(response.headers())
-        .and_then(|len| usize::try_from(len).ok());
-    if effective_max_response_body_size_bytes > 0
-        && let Some(len) = content_length
-        && len > effective_max_response_body_size_bytes
-    {
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    collect_hyper_response_headers(response.headers(), &mut resp_headers);
+    if let Some(len) = declared_response_length_exceeds_limit(
+        method,
+        status,
+        &resp_headers,
+        effective_max_response_body_size_bytes,
+    ) {
         return (
             if is_grpc_flavored {
                 mesh_grpc_response_body_too_large_response(
@@ -51929,8 +52008,6 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
             None,
         );
     }
-    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
-    collect_hyper_response_headers(response.headers(), &mut resp_headers);
 
     // Content-type-aware buffer -> stream downgrade (see `proxy_to_backend`).
     let stream_response = refine_stream_response_for_content_type(
@@ -53100,10 +53177,12 @@ async fn proxy_to_backend_http2(
     collect_hyper_response_headers(response.headers(), &mut resp_headers);
 
     if let Some(len) = declared_response_length_exceeds_limit(
+        method,
+        status,
         &resp_headers,
         effective_max_response_body_size_bytes,
     ) {
-        warn!(
+        warn_sampled!(
             proxy_id = %proxy.id,
             response_body_bytes = len,
             max_response_body_size_bytes = effective_max_response_body_size_bytes,
@@ -53188,7 +53267,7 @@ async fn proxy_to_backend_http2(
         let body_bytes = match collect_result {
             Ok(collected) => collected,
             Err(HyperBodyCollectError::TooLarge) => {
-                warn!(
+                warn_sampled!(
                     proxy_id = %proxy.id,
                     max_response_body_size_bytes = effective_max_response_body_size_bytes,
                     "HTTP/2 buffered body collection exceeded configured size limit"
@@ -53619,6 +53698,7 @@ async fn proxy_to_backend_http3(
                                 h3_streaming_backend_response(
                                     response,
                                     proxy,
+                                    method,
                                     resolved_ip,
                                     effective_max_response_body_size_bytes,
                                 ),
@@ -54016,6 +54096,7 @@ async fn proxy_to_backend_http3(
                 h3_streaming_backend_response(
                     response,
                     proxy,
+                    method,
                     resolved_ip,
                     effective_max_response_body_size_bytes,
                 ),
@@ -54135,6 +54216,7 @@ async fn proxy_to_backend_http3(
                         h3_streaming_backend_response(
                             response,
                             proxy,
+                            method,
                             resolved_ip,
                             effective_max_response_body_size_bytes,
                         ),
@@ -54233,12 +54315,16 @@ async fn proxy_to_backend_http3(
 fn h3_streaming_backend_response(
     response: crate::http3::client::H3StreamingResponse,
     proxy: &Proxy,
+    method: &str,
     resolved_ip: Option<String>,
     max_response_body_size_bytes: usize,
 ) -> retry::BackendResponse {
-    if let Some(len) =
-        declared_response_length_exceeds_limit(&response.headers, max_response_body_size_bytes)
-    {
+    if let Some(len) = declared_response_length_exceeds_limit(
+        method,
+        response.status,
+        &response.headers,
+        max_response_body_size_bytes,
+    ) {
         return h3_response_body_too_large_response(
             proxy,
             resolved_ip,
@@ -54516,13 +54602,13 @@ fn h3_response_body_too_large_response(
     max_size: usize,
 ) -> retry::BackendResponse {
     match observed_size {
-        Some(size) => warn!(
+        Some(size) => warn_sampled!(
             proxy_id = %proxy.id,
             response_body_bytes = size,
             max_response_body_size_bytes = max_size,
             "HTTP/3 backend response body exceeds configured size limit"
         ),
-        None => warn!(
+        None => warn_sampled!(
             proxy_id = %proxy.id,
             max_response_body_size_bytes = max_size,
             "HTTP/3 backend response body exceeded configured size limit while streaming"
@@ -54553,11 +54639,20 @@ fn h3_response_body_too_large_response(
 /// failed and skipped this fast path (`GHSA-xrfj-852f-645j`). An ambiguous fold
 /// yields `None` here and is bounded by the collection/streaming ceiling
 /// instead, which never trusts a declared length.
+///
+/// Bodyless semantics (`HEAD`, `1xx`, `204`/`205`/`304`) may advertise a
+/// representation `Content-Length` while transferring zero body bytes (RFC 9110
+/// §8.6 / §6.4.1). That value is not a transferable-body size and must not be
+/// compared against the ceiling.
 pub(crate) fn declared_response_length_exceeds_limit(
+    method: &str,
+    status: u16,
     headers: &HashMap<String, String>,
     max_response_body_size_bytes: usize,
 ) -> Option<usize> {
-    if max_response_body_size_bytes == 0 {
+    if max_response_body_size_bytes == 0
+        || crate::plugins::utils::synthetic_response::synthetic_response_omits_body(method, status)
+    {
         return None;
     }
     let len = canonical_header_content_length_from_map(headers)?;
@@ -54716,6 +54811,8 @@ async fn proxy_to_backend_http3_retry(
                 // oversized declared body unguarded (the downstream H3 body
                 // builder only size-limits when Content-Length is absent).
                 if let Some(len) = declared_response_length_exceeds_limit(
+                    method,
+                    response.status,
                     &response.headers,
                     effective_max_response_body_size_bytes,
                 ) {
@@ -54862,7 +54959,7 @@ async fn proxy_to_backend_http3_retry(
             if effective_max_response_body_size_bytes > 0
                 && response.body.len() > effective_max_response_body_size_bytes
             {
-                warn!(
+                warn_sampled!(
                     "Backend response body ({} bytes) exceeds limit ({} bytes)",
                     response.body.len(),
                     effective_max_response_body_size_bytes
@@ -55024,6 +55121,7 @@ mod tests {
             failure_status_codes: vec![500],
             half_open_max_requests: 1,
             trip_on_connection_errors: true,
+            half_open_probe_dwell_seconds: None,
         });
         cb.record_failure(500, false, false);
         assert!(
@@ -55876,6 +55974,7 @@ mod tests {
                 failure_status_codes: vec![500],
                 half_open_max_requests: 1,
                 trip_on_connection_errors: true,
+                half_open_probe_dwell_seconds: None,
             }
         }
 
@@ -59769,6 +59868,7 @@ mod tests {
         headers.insert("connection".to_string(), "upgrade".to_string());
         headers.insert("x-request-id".to_string(), "req-1".to_string());
         headers.insert("x-added-by-plugin".to_string(), "kept".to_string());
+        headers.insert("X-Consumer-Role".to_string(), "admin".to_string());
 
         let forwarded = collect_forwardable_proxy_headers(&headers);
 
@@ -59778,6 +59878,12 @@ mod tests {
         assert!(forwarded.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("x-added-by-plugin") && value == "kept"
         }));
+        assert!(
+            !forwarded
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-consumer-role")),
+            "the complete consumer assertion namespace must be stripped"
+        );
         assert!(
             !forwarded
                 .iter()
@@ -62150,22 +62256,44 @@ mod tests {
 
     /// Guards the declared-Content-Length fast-path reject used by every
     /// streaming H3 retry attempt: only a nonzero limit with a parseable
-    /// over-limit Content-Length triggers the pre-stream 502.
+    /// over-limit Content-Length on a body-bearing response triggers the
+    /// pre-stream 502. HEAD / 1xx / 204 / 205 / 304 keep a representation length.
     #[test]
     fn declared_response_length_exceeds_limit_only_when_header_is_over_cap() {
         let mut headers = HashMap::new();
-        assert_eq!(declared_response_length_exceeds_limit(&headers, 10), None);
+        assert_eq!(
+            declared_response_length_exceeds_limit("GET", 200, &headers, 10),
+            None
+        );
 
         headers.insert("content-length".to_string(), "11".to_string());
-        assert_eq!(declared_response_length_exceeds_limit(&headers, 0), None);
-        assert_eq!(declared_response_length_exceeds_limit(&headers, 11), None);
         assert_eq!(
-            declared_response_length_exceeds_limit(&headers, 10),
+            declared_response_length_exceeds_limit("GET", 200, &headers, 0),
+            None
+        );
+        assert_eq!(
+            declared_response_length_exceeds_limit("GET", 200, &headers, 11),
+            None
+        );
+        assert_eq!(
+            declared_response_length_exceeds_limit("GET", 200, &headers, 10),
             Some(11)
         );
 
         headers.insert("content-length".to_string(), "not-a-number".to_string());
-        assert_eq!(declared_response_length_exceeds_limit(&headers, 10), None);
+        assert_eq!(
+            declared_response_length_exceeds_limit("GET", 200, &headers, 10),
+            None
+        );
+
+        headers.insert("content-length".to_string(), "11".to_string());
+        for (method, status) in [("HEAD", 200), ("GET", 304), ("GET", 204)] {
+            assert_eq!(
+                declared_response_length_exceeds_limit(method, status, &headers, 10),
+                None,
+                "bodyless {method} {status} must not trip the declared-length ceiling"
+            );
+        }
     }
 
     /// The 502 built for an over-limit H3 response must not replay (no
