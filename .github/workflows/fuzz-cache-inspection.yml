@@ -38,6 +38,11 @@ on:
         required: false
         type: boolean
         default: false
+      download_width:
+        description: Optional cap on concurrent blob downloads for every variant
+        required: false
+        type: string
+        default: ""
       entry:
         description: Cache entry tag to restore into fuzz/target
         required: false
@@ -135,6 +140,7 @@ jobs:
           BASELINE_ARTIFACT_ID: ${{ inputs.baseline_cli_artifact_id }}
           CANDIDATE_FIRST: ${{ inputs.candidate_first }}
           CACHE_ENTRY: ${{ inputs.entry }}
+          DOWNLOAD_WIDTH: ${{ inputs.download_width }}
         run: |
           set -euo pipefail
           boringcache --version
@@ -156,18 +162,29 @@ jobs:
               cli="${RUNNER_TEMP}/baseline-cli/boringcache"
             fi
             for protocol in "${protocols[@]}"; do
-              if (( pass > 0 )); then
-                # Each pass writes the complete target from a fresh restore, and
-                # starts only once the previous pass's writeback has drained so
-                # the second variant does not inherit the first one's I/O pressure.
-                rm -rf -- fuzz/target
-                sync
-                for _ in $(seq 1 120); do
-                  some="$(awk '/^some/ {sub("avg10=","",$2); print $2}' /proc/pressure/io)"
-                  awk -v s="$some" 'BEGIN { exit !(s < 2.0) }' && break
-                  sleep 1
-                done
-                echo "io pressure some avg10 before pass ${pass}: $(cut -d' ' -f2 /proc/pressure/io | head -1)"
+              # Every pass, including the first, starts from the same disk
+              # state: no target tree, writeback drained, page cache dropped,
+              # and I/O pressure below the same threshold. A pass whose
+              # cooldown budget expires is marked so the comparison can be
+              # classified rather than read as equal footing.
+              rm -rf -- fuzz/target
+              sync
+              echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+              equalised=false
+              for _ in $(seq 1 180); do
+                some="$(awk '/^some/ {sub("avg10=","",$2); print $2}' /proc/pressure/io)"
+                if awk -v s="$some" 'BEGIN { exit !(s < 2.0) }'; then
+                  equalised=true
+                  break
+                fi
+                sleep 1
+              done
+              echo "io pressure before pass ${pass} (${variant}, http2=${protocol}): $(head -1 /proc/pressure/io); memory: $(head -1 /proc/pressure/memory); equalised=${equalised}"
+              if [[ "$equalised" != "true" ]]; then
+                echo "::warning::pass ${pass} (${variant}) started above the I/O pressure threshold; this pair is not equalised"
+              fi
+              if [[ -n "$DOWNLOAD_WIDTH" ]]; then
+                export BORINGCACHE_RESTORE_MAX_CONCURRENCY="$DOWNLOAD_WIDTH"
               fi
               export BORINGCACHE_TRANSFER_HTTP2="$protocol"
               export BORINGCACHE_OBSERVABILITY_JSONL_PATH="${RUNNER_TEMP}/restore-observability-${variant}-${protocol}.jsonl"
