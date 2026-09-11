@@ -107,6 +107,21 @@ jobs:
           trust-policy: restore
           fail-on-cache-error: true
 
+      - name: Measure runner disk write floor
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq fio >/dev/null
+          df -h / /mnt 2>/dev/null || df -h /
+          for mode in "1 8" "4 8"; do
+            set -- $mode
+            fio --name=seqwrite --directory=. --rw=write --bs=1M --size=2G --numjobs=$1 --iodepth=$2 \
+              --direct=1 --ioengine=libaio --group_reporting --output-format=json --unlink=1 \
+              | python3 -c 'import json,sys; j=json.load(sys.stdin)["jobs"][0]["write"]; print(f"direct seqwrite jobs='$1' qd='$2': {j["bw_bytes"]/1e6:.0f} MB/s")'
+          done
+          fio --name=bufwrite --directory=. --rw=write --bs=1M --size=8G --numjobs=1 --direct=0 --end_fsync=1 \
+            --ioengine=sync --output-format=json --unlink=1 \
+            | python3 -c 'import json,sys; j=json.load(sys.stdin)["jobs"][0]["write"]; print(f"buffered seqwrite 8G + fsync: {j["bw_bytes"]/1e6:.0f} MB/s")'
+
       - name: Restore the published fuzz target
         env:
           RUST_LOG: error,boring_cache_cli::storage_transfer=info
@@ -136,8 +151,17 @@ jobs:
             fi
             for protocol in "${protocols[@]}"; do
               if (( pass > 0 )); then
-                # Each pass writes the complete target from a fresh restore.
+                # Each pass writes the complete target from a fresh restore, and
+                # starts only once the previous pass's writeback has drained so
+                # the second variant does not inherit the first one's I/O pressure.
                 rm -rf -- fuzz/target
+                sync
+                for _ in $(seq 1 120); do
+                  some="$(awk '/^some/ {sub("avg10=","",$2); print $2}' /proc/pressure/io)"
+                  awk -v s="$some" 'BEGIN { exit !(s < 2.0) }' && break
+                  sleep 1
+                done
+                echo "io pressure some avg10 before pass ${pass}: $(cut -d' ' -f2 /proc/pressure/io | head -1)"
               fi
               export BORINGCACHE_TRANSFER_HTTP2="$protocol"
               export BORINGCACHE_OBSERVABILITY_JSONL_PATH="${RUNNER_TEMP}/restore-observability-${variant}-${protocol}.jsonl"
