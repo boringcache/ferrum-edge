@@ -38,6 +38,11 @@ on:
         required: false
         type: boolean
         default: false
+      entry:
+        description: Cache entry tag to restore into fuzz/target
+        required: false
+        type: string
+        default: fuzz-target-toolchain-e3b99108dfccdd33-graph-551e4f3879e93b22-branch-boringcache-validation-ubuntu-24-x86_64
 
 permissions:
   contents: read
@@ -129,6 +134,7 @@ jobs:
           COMPARE_HTTP1: ${{ inputs.compare_http1 }}
           BASELINE_ARTIFACT_ID: ${{ inputs.baseline_cli_artifact_id }}
           CANDIDATE_FIRST: ${{ inputs.candidate_first }}
+          CACHE_ENTRY: ${{ inputs.entry }}
         run: |
           set -euo pipefail
           boringcache --version
@@ -168,7 +174,7 @@ jobs:
               echo "Restore variant: ${variant}; storage HTTP/2 negotiation: ${protocol}"
               df -h .
               "$cli" restore boringcache/ferrum-edge \
-                --entry fuzz-target-toolchain-e3b99108dfccdd33-graph-551e4f3879e93b22-branch-boringcache-validation-ubuntu-24-x86_64:fuzz/target \
+                --entry "${CACHE_ENTRY}:fuzz/target" \
                 --no-git --no-platform --fail-on-cache-miss --fail-on-cache-error
               pass=$((pass + 1))
             done
