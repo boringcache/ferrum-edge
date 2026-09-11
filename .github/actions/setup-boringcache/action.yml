@@ -4,7 +4,7 @@ runs:
   using: composite
   steps:
     - name: BoringCache Cargo
-      uses: boringcache/one@a610ec5a564efd9b360925056dbade04deb5def6 # v1.30.0
+      uses: boringcache/one@1039999c65011be670f5655e0e48ad556188ab12 # v1.30.4
       with:
         mode: archive
         cache-profiles: dependencies
