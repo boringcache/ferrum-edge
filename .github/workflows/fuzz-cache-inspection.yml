@@ -38,6 +38,11 @@ on:
         required: false
         type: boolean
         default: false
+      slow_read_min_mb:
+        description: Minimum archive blob size eligible for the slow-body probe
+        required: false
+        type: string
+        default: ""
       entry:
         description: Cache entry tag to restore into fuzz/target
         required: false
@@ -135,8 +140,12 @@ jobs:
           BASELINE_ARTIFACT_ID: ${{ inputs.baseline_cli_artifact_id }}
           CANDIDATE_FIRST: ${{ inputs.candidate_first }}
           CACHE_ENTRY: ${{ inputs.entry }}
+          SLOW_READ_MIN_MB: ${{ inputs.slow_read_min_mb }}
         run: |
           set -euo pipefail
+          if [[ -n "${SLOW_READ_MIN_MB}" ]]; then
+            export BORINGCACHE_STORAGE_SLOW_READ_MIN_MB="${SLOW_READ_MIN_MB}"
+          fi
           boringcache --version
           protocols=("${BORINGCACHE_TRANSFER_HTTP2}")
           if [[ "$COMPARE_HTTP1" == "true" && "$BORINGCACHE_TRANSFER_HTTP2" == "true" ]]; then
