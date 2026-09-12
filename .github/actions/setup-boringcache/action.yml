@@ -3,9 +3,35 @@ description: Restore Cargo downloads and install BoringCache for target and comp
 runs:
   using: composite
   steps:
+    - name: Pull the candidate BoringCache CLI artifact
+      if: env.FERRUM_BORINGCACHE_CLI_ARTIFACT_ID != '' && runner.os == 'Linux'
+      uses: boringcache/one@1039999c65011be670f5655e0e48ad556188ab12 # v1.30.4
+      env:
+        BORINGCACHE_RESTORE_TOKEN: ${{ env.FERRUM_BORINGCACHE_CLI_ARTIFACT_RESTORE_TOKEN }}
+      with:
+        cli-version: v1.30.4
+        mode: artifact
+        artifact-command: pull
+        artifact-id: ${{ env.FERRUM_BORINGCACHE_CLI_ARTIFACT_ID }}
+        artifact-workspace: ${{ env.FERRUM_BORINGCACHE_CLI_ARTIFACT_WORKSPACE }}
+        artifact-path: ${{ runner.temp }}/candidate-cli
+        trust-policy: restore
+
+    - name: Select the candidate BoringCache CLI
+      if: env.FERRUM_BORINGCACHE_CLI_ARTIFACT_ID != '' && runner.os == 'Linux'
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "${RUNNER_TEMP}/candidate-cli"
+        sha256sum --check boringcache.sha256
+        chmod +x boringcache
+        echo "${RUNNER_TEMP}/candidate-cli" >> "$GITHUB_PATH"
+        ./boringcache --version
+
     - name: BoringCache Cargo
       uses: boringcache/one@1039999c65011be670f5655e0e48ad556188ab12 # v1.30.4
       with:
+        cli-version: ${{ env.FERRUM_BORINGCACHE_CLI_ARTIFACT_ID != '' && runner.os == 'Linux' && 'skip' || 'v1.30.4' }}
         mode: archive
         cache-profiles: dependencies
         trust-policy: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'auto' || 'restore' }}

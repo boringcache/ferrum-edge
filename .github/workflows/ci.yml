@@ -11,6 +11,15 @@ on:
     types:
       - checks_requested
   workflow_dispatch:
+    inputs:
+      cli_artifact_id:
+        description: Optional immutable Linux BoringCache CLI artifact to run this CI with instead of the pinned release
+        required: false
+        default: ""
+      cli_artifact_workspace:
+        description: Workspace that owns the optional CLI artifact
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -32,6 +41,9 @@ env:
   # Rationale and the failure mode live in .cargo/config.toml.
   CARGO_NET_RETRY: "10"
   CARGO_HTTP_MULTIPLEXING: "false"
+  FERRUM_BORINGCACHE_CLI_ARTIFACT_ID: ${{ inputs.cli_artifact_id || '' }}
+  FERRUM_BORINGCACHE_CLI_ARTIFACT_WORKSPACE: ${{ inputs.cli_artifact_workspace || '' }}
+  FERRUM_BORINGCACHE_CLI_ARTIFACT_RESTORE_TOKEN: ${{ secrets.BORINGCACHE_CLI_ARTIFACT_RESTORE_TOKEN }}
 
 jobs:
   ci-plan:
