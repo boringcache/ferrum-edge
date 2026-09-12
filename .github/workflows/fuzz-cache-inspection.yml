@@ -38,6 +38,11 @@ on:
         required: false
         type: boolean
         default: false
+      compare_probe_off:
+        description: Also restore each variant with the slow-read probe disabled on the same runner
+        required: false
+        type: boolean
+        default: false
       download_width:
         description: Optional comma-separated caps on concurrent blob downloads, each restored as its own pass
         required: false
@@ -141,6 +146,7 @@ jobs:
           CANDIDATE_FIRST: ${{ inputs.candidate_first }}
           CACHE_ENTRY: ${{ inputs.entry }}
           DOWNLOAD_WIDTH: ${{ inputs.download_width }}
+          COMPARE_PROBE_OFF: ${{ inputs.compare_probe_off }}
         run: |
           set -euo pipefail
           boringcache --version
@@ -159,6 +165,10 @@ jobs:
           if [[ -n "$DOWNLOAD_WIDTH" ]]; then
             IFS=',' read -r -a widths <<< "$DOWNLOAD_WIDTH"
           fi
+          probes=(1)
+          if [[ "$COMPARE_PROBE_OFF" == "true" ]]; then
+            probes=(1 0)
+          fi
           pass=0
           for variant in "${variants[@]}"; do
             cli="$(command -v boringcache)"
@@ -167,6 +177,7 @@ jobs:
             fi
             for protocol in "${protocols[@]}"; do
             for width in "${widths[@]}"; do
+            for probe in "${probes[@]}"; do
               # Every pass, including the first, starts from the same disk
               # state: no target tree, writeback drained, page cache dropped,
               # and I/O pressure below the same threshold. A pass whose
@@ -184,22 +195,24 @@ jobs:
                 fi
                 sleep 1
               done
-              echo "io pressure before pass ${pass} (${variant}, http2=${protocol}, width=${width:-adaptive}): $(head -1 /proc/pressure/io); memory: $(head -1 /proc/pressure/memory); equalised=${equalised}"
+              echo "io pressure before pass ${pass} (${variant}, http2=${protocol}, width=${width:-adaptive}, probe=${probe}): $(head -1 /proc/pressure/io); memory: $(head -1 /proc/pressure/memory); equalised=${equalised}"
               if [[ "$equalised" != "true" ]]; then
-                echo "::warning::pass ${pass} (${variant}, width=${width:-adaptive}) started above the I/O pressure threshold; this pass is not equalised"
+                echo "::warning::pass ${pass} (${variant}, width=${width:-adaptive}, probe=${probe}) started above the I/O pressure threshold; this pass is not equalised"
               fi
+              export BORINGCACHE_STORAGE_SLOW_READ_PROBE="$probe"
               unset BORINGCACHE_RESTORE_MAX_CONCURRENCY
               if [[ -n "$width" ]]; then
                 export BORINGCACHE_RESTORE_MAX_CONCURRENCY="$width"
               fi
               export BORINGCACHE_TRANSFER_HTTP2="$protocol"
-              export BORINGCACHE_OBSERVABILITY_JSONL_PATH="${RUNNER_TEMP}/restore-observability-${variant}-${protocol}${width:+-w$width}.jsonl"
-              echo "Restore variant: ${variant}; storage HTTP/2 negotiation: ${protocol}; download width: ${width:-adaptive}"
+              export BORINGCACHE_OBSERVABILITY_JSONL_PATH="${RUNNER_TEMP}/restore-observability-${variant}-${protocol}${width:+-w$width}-p${probe}.jsonl"
+              echo "Restore variant: ${variant}; storage HTTP/2 negotiation: ${protocol}; download width: ${width:-adaptive}; slow-read probe: ${probe}"
               df -h .
               "$cli" restore boringcache/ferrum-edge \
                 --entry "${CACHE_ENTRY}:fuzz/target" \
                 --no-git --no-platform --fail-on-cache-miss --fail-on-cache-error
               pass=$((pass + 1))
+            done
             done
             done
           done
