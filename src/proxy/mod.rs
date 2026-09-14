@@ -48173,6 +48173,16 @@ pub(crate) async fn optional_sleep_elapsed(sleep: std::pin::Pin<&mut Option<toki
 /// `Err(())` means the watermark fired first. The wrapped future is polled
 /// FIRST, so a backend that answered in the same poll still wins the race and a
 /// completed exchange is never reclassified as a write stall.
+///
+/// For a watermark-only pump this race is also what DRIVES the upload (issue
+/// #5505): the pump runs inline on this task rather than on one of its own,
+/// so an ordinary request/response upload costs no spawn and no cross-task
+/// hop per frame. When the race ends before the pump has resolved — the
+/// backend answered before consuming the upload, or the post-EOS drain watch
+/// is still running — the pump is handed to its own task before this returns,
+/// so a caller that goes on to await the response body, join the pump later,
+/// or race it again never leaves it unpolled. Cancellation (dropping this
+/// future) leaves the pump inside the join, whose `Drop` does the same.
 pub(crate) async fn await_upload_write_watermark_first<F>(
     fut: F,
     pump: Option<&mut upload_pump::UploadPumpJoin>,
@@ -48183,6 +48193,18 @@ where
     let Some(pump) = pump else {
         return Ok(fut.await);
     };
+    let raced = race_upload_write_watermark(fut, pump).await;
+    pump.detach_if_live();
+    raced
+}
+
+async fn race_upload_write_watermark<F>(
+    fut: F,
+    pump: &mut upload_pump::UploadPumpJoin,
+) -> Result<F::Output, ()>
+where
+    F: std::future::Future,
+{
     // Issue #4411: the bundled HTTP client dials its backend socket on THIS
     // task, inside `fut`, and reports it through the vendored
     // connection-admission hook rather than handing the gateway a `TcpStream`.
