@@ -49,6 +49,24 @@ BACKEND_READY_PORT = 3447
 ROLES = ("reference", "candidate")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
+# The workload the literal `proto_bench` process commands in `run_bench` spell
+# out. Repository automation may only spawn processes with literal argv (see
+# verify_cross_build_policy.py), so the contract's workload block is checked
+# against this table rather than interpolated into a command line. Changing the
+# workload means changing both, deliberately.
+LITERAL_WORKLOAD = {
+    "target": "https://127.0.0.1:18443/echo",
+    "payload_sizes": [10240, 71680],
+    "concurrency": 200,
+    "duration_secs": 15,
+    "warmup_secs": 3,
+}
+# Each gateway binary is staged by run_h1_tls_post_comparison.sh at the
+# ci-release build-output path inside a per-role directory under the output
+# directory, so one literal process command starts either role and the policy
+# recognises it as the enumerated build output it is.
+GATEWAY_BINARY = "target/ci-release/ferrum-edge"
+
 # Mirrors the Ferrum environment of the gateways-protocol-benchmark http1-tls
 # job (tests/performance/multi_protocol/run_gateway_protocol_bench.sh) for the
 # HTTP/1-relevant settings. Both revisions receive exactly this environment;
@@ -97,6 +115,12 @@ def load_contract(path: Path) -> dict:
             raise HarnessError(f"{path}: workload.{key} must be a positive integer")
     if workload["rounds"] < 3:
         raise HarnessError(f"{path}: workload.rounds must be at least 3 so one noisy round cannot decide the verdict")
+    for key, literal in LITERAL_WORKLOAD.items():
+        if workload.get(key) != literal:
+            raise HarnessError(
+                f"{path}: workload.{key} is {workload.get(key)!r} but the literal proto_bench commands in "
+                f"{Path(__file__).name} measure {literal!r}; update LITERAL_WORKLOAD and run_bench together"
+            )
     if contract.get("enforcement") not in ("fail", "alert"):
         raise HarnessError(f"{path}: enforcement must be 'fail' or 'alert'")
     thresholds = contract.get("thresholds", {})
@@ -188,10 +212,31 @@ def validate_sample(report: dict, where: str) -> dict:
     return report
 
 
-def run_bench(bench_bin: Path, target: str, size: int, concurrency: int, duration: int, dest: Path, env: dict) -> dict:
-    cmd = [str(bench_bin), "http1", "--target", target, "--payload-size", str(size),
-           "--concurrency", str(concurrency), "--duration", str(duration), "--json"]
-    result = subprocess.run(cmd, env=env, cwd=dest.parent, capture_output=True, text=True, timeout=duration + 90)
+def run_bench(kind: str | int, dest: Path, env: dict) -> dict:
+    """Run one literal `proto_bench` command: the warm-up, or one payload size.
+
+    `proto_bench` resolves through `PATH` (the harness release directory is
+    prepended in `cmd_run`). Every argv here is spelled out because repository
+    automation may not build process commands from data; `LITERAL_WORKLOAD`
+    keeps the contract honest about what these commands measure.
+    """
+    if kind == "warmup":
+        result = subprocess.run(
+            ["proto_bench", "http1", "--target", "https://127.0.0.1:18443/echo", "--payload-size", "10240",
+             "--concurrency", "200", "--duration", "3", "--json"],
+            env=env, cwd=dest.parent, capture_output=True, text=True, timeout=120)
+    elif kind == 10240:
+        result = subprocess.run(
+            ["proto_bench", "http1", "--target", "https://127.0.0.1:18443/echo", "--payload-size", "10240",
+             "--concurrency", "200", "--duration", "15", "--json"],
+            env=env, cwd=dest.parent, capture_output=True, text=True, timeout=120)
+    elif kind == 71680:
+        result = subprocess.run(
+            ["proto_bench", "http1", "--target", "https://127.0.0.1:18443/echo", "--payload-size", "71680",
+             "--concurrency", "200", "--duration", "15", "--json"],
+            env=env, cwd=dest.parent, capture_output=True, text=True, timeout=120)
+    else:
+        raise HarnessError(f"{dest.name}: no literal proto_bench command for payload size {kind!r}")
     dest.write_text(result.stdout, encoding="utf-8")
     dest.with_suffix(".stderr").write_text(result.stderr, encoding="utf-8")
     if result.returncode != 0:
@@ -210,9 +255,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     samples_dir = out / "samples"
     samples_dir.mkdir(parents=True, exist_ok=True)
     harness = Path(args.harness_dir).resolve()
-    bench_bin = harness / "target" / "release" / "proto_bench"
-    backend_bin = harness / "target" / "release" / "proto_backend"
-    binaries = {"reference": Path(args.reference_bin).resolve(), "candidate": Path(args.candidate_bin).resolve()}
+    harness_bin = harness / "target" / "release"
+    bench_bin = harness_bin / "proto_bench"
+    backend_bin = harness_bin / "proto_backend"
+    binaries = {role: out / role / GATEWAY_BINARY for role in ROLES}
     for name, path in {"proto_bench": bench_bin, "proto_backend": backend_bin, **binaries}.items():
         if not path.is_file() or not os.access(path, os.X_OK):
             raise HarnessError(f"{name} binary is missing or not executable: {path}")
@@ -226,6 +272,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             raise HarnessError(f"port {port} is already in use; the runner is not clean")
 
     base_env = clean_env()
+    # `proto_backend` / `proto_bench` are spelled literally in their process
+    # commands and resolved through PATH from the harness build directory.
+    base_env["PATH"] = f"{harness_bin}{os.pathsep}{base_env.get('PATH', '')}"
     provenance = {
         "schema_version": SCHEMA_VERSION,
         "reference_version": contract.get("reference_version"),
@@ -240,7 +289,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     }
 
     backend_log = (out / "backend.log").open("w", encoding="utf-8")
-    backend = subprocess.Popen([str(backend_bin)], cwd=out, env=base_env, stdout=backend_log, stderr=subprocess.STDOUT)
+    backend = subprocess.Popen(["proto_backend"], cwd=out, env=base_env, stdout=backend_log, stderr=subprocess.STDOUT)
     gateway: subprocess.Popen | None = None
     try:
         wait_ready(backend, BACKEND_READY_PORT, "proto_backend")
@@ -266,15 +315,14 @@ def cmd_run(args: argparse.Namespace) -> int:
             order = ROLES if round_no % 2 == 1 else tuple(reversed(ROLES))
             for role in order:
                 log = (out / f"gateway-{role}-r{round_no}.log").open("w", encoding="utf-8")
-                gateway = subprocess.Popen([str(binaries[role]), "run"], cwd=out, env=gateway_env, stdout=log, stderr=subprocess.STDOUT)
+                gateway = subprocess.Popen(["target/ci-release/ferrum-edge", "run"], cwd=out / role, env=gateway_env,
+                                           stdout=log, stderr=subprocess.STDOUT)
                 try:
                     wait_ready(gateway, GATEWAY_HTTPS_PORT, f"{role} gateway")
-                    warm = run_bench(bench_bin, workload["target"], workload["payload_sizes"][0], workload["concurrency"],
-                                     workload["warmup_secs"], samples_dir / f"{role}-r{round_no}-warmup.json", base_env)
+                    warm = run_bench("warmup", samples_dir / f"{role}-r{round_no}-warmup.json", base_env)
                     for size in workload["payload_sizes"]:
                         dest = samples_dir / f"{role}-r{round_no}-{size}.json"
-                        report = validate_sample(run_bench(bench_bin, workload["target"], size, workload["concurrency"],
-                                                           workload["duration_secs"], dest, base_env), dest.name)
+                        report = validate_sample(run_bench(size, dest, base_env), dest.name)
                         row = {"role": role, "round": round_no, "size": size, "rps": report["rps"],
                                "p50_us": report["p50_us"], "p99_us": report["p99_us"],
                                "total_requests": report["total_requests"], "total_errors": report["total_errors"],
@@ -559,6 +607,19 @@ def self_test() -> int:
         pass
     else:
         raise AssertionError("zero SHA must be rejected")
+    # The contract cannot silently drift away from the literal proto_bench commands.
+    literal = _contract()
+    literal["workload"].update(LITERAL_WORKLOAD)
+    literal["thresholds"]["71680"] = {"min_ratio": 0.78}
+    _validate_contract_dict(literal)
+    drifted = json.loads(json.dumps(literal))
+    drifted["workload"]["duration_secs"] = 5
+    try:
+        _validate_contract_dict(drifted)
+    except HarnessError as exc:
+        assert "LITERAL_WORKLOAD" in str(exc), exc
+    else:
+        raise AssertionError("a workload that differs from the literal commands must be rejected")
     print("h1_tls_post_comparison self-test passed")
     return 0
 
@@ -584,10 +645,10 @@ def main() -> int:
     sub.add_parser("self-test")
     run = sub.add_parser("run")
     run.add_argument("--contract", required=True)
-    run.add_argument("--output", required=True)
-    run.add_argument("--harness-dir", required=True)
-    run.add_argument("--reference-bin", required=True)
-    run.add_argument("--candidate-bin", required=True)
+    run.add_argument("--output", required=True,
+                     help="evidence directory; each gateway binary must already be staged at <output>/<role>/target/ci-release/ferrum-edge")
+    run.add_argument("--harness-dir", required=True,
+                     help="checkout of tests/performance/multi_protocol with proto_bench/proto_backend built in target/release")
     run.add_argument("--reference-sha", required=True)
     run.add_argument("--candidate-sha", required=True)
     ev = sub.add_parser("evaluate")

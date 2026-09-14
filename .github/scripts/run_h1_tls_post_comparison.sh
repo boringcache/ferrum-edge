@@ -11,7 +11,7 @@ if [ -e "$OUTPUT" ]; then
   echo '::error::comparison output must be new; stale results cannot be reused'
   exit 1
 fi
-mkdir -p "$OUTPUT/bin"
+mkdir -p "$OUTPUT/candidate/target/ci-release" "$OUTPUT/reference/target/ci-release"
 
 python3 .github/scripts/h1_tls_post_comparison.py self-test
 
@@ -52,7 +52,7 @@ fi
 
 echo "::group::Build candidate ${CANDIDATE_SHA} (ci-release)"
 cargo build --profile ci-release --bin ferrum-edge --locked
-cp target/ci-release/ferrum-edge "$OUTPUT/bin/candidate"
+cp target/ci-release/ferrum-edge "$OUTPUT/candidate/target/ci-release/ferrum-edge"
 echo "::endgroup::"
 
 echo "::group::Build benchmark harness from the candidate tree (release)"
@@ -74,20 +74,18 @@ git -c core.hooksPath=/dev/null worktree add --detach "$WORK/reference-source" "
 # must not disturb the cached candidate artifacts.
 (cd "$WORK/reference-source" && CARGO_TARGET_DIR="$WORK/reference-target" \
   cargo build --profile ci-release --bin ferrum-edge --locked)
-cp "$WORK/reference-target/ci-release/ferrum-edge" "$OUTPUT/bin/reference"
+cp "$WORK/reference-target/ci-release/ferrum-edge" "$OUTPUT/reference/target/ci-release/ferrum-edge"
 echo "::endgroup::"
 
 python3 .github/scripts/h1_tls_post_comparison.py run \
   --contract "$CONTRACT" \
   --output "$OUTPUT" \
   --harness-dir "$HARNESS_DIR" \
-  --reference-bin "$OUTPUT/bin/reference" \
-  --candidate-bin "$OUTPUT/bin/candidate" \
   --reference-sha "$REFERENCE_SHA" \
   --candidate-sha "$CANDIDATE_SHA"
 
 # Binaries are large and reproducible from the recorded SHAs; keep the artifact small.
-rm -rf "$OUTPUT/bin"
+rm -rf "$OUTPUT/candidate" "$OUTPUT/reference"
 
 python3 .github/scripts/h1_tls_post_comparison.py evaluate \
   --contract "$CONTRACT" \
