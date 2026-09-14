@@ -2625,8 +2625,12 @@ git tag v0.3.0
 
 ### Step-by-Step
 
-1. Update the package version and changelog in a PR, then merge and wait for the
-   main validation checks. Do not tag an unvalidated direct push.
+1. Update the package version and changelog in a PR, then use **Create a merge
+   commit** and wait for the main validation checks. The publication gate binds
+   the release commit's second parent to the associated PR head; squash and
+   rebase merges cannot satisfy that check. Do not tag an unvalidated direct
+   push. If the version PR was squash-merged, land a follow-up PR with a merge
+   commit and validate that main commit before releasing.
 2. In Actions, select **Start Production Release**, choose branch **main**, and
    enter the new stable version tag matching Cargo.toml, for example `v1.2.3`.
    The CLI equivalent is:
