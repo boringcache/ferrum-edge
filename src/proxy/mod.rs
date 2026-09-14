@@ -48193,18 +48193,6 @@ where
     let Some(pump) = pump else {
         return Ok(fut.await);
     };
-    let raced = race_upload_write_watermark(fut, pump).await;
-    pump.detach_if_live();
-    raced
-}
-
-async fn race_upload_write_watermark<F>(
-    fut: F,
-    pump: &mut upload_pump::UploadPumpJoin,
-) -> Result<F::Output, ()>
-where
-    F: std::future::Future,
-{
     // Issue #4411: the bundled HTTP client dials its backend socket on THIS
     // task, inside `fut`, and reports it through the vendored
     // connection-admission hook rather than handing the gateway a `TcpStream`.
@@ -48214,15 +48202,20 @@ where
     // already filled the slot; it is write-once, so they still win. The future
     // is pinned once, here, and the scope borrows it: wrapping it by value
     // copied the gateway's largest state machine onto a worker stack that an
-    // HTTP/3 → plain dispatch already fills to the brim.
+    // HTTP/3 → plain dispatch already fills to the brim. For the same reason
+    // the race and the hand-off below live in THIS function rather than in a
+    // nested `async fn`: a nested future would carry its own copy of `fut`
+    // alongside this one, doubling that footprint.
     tokio::pin!(fut);
     let mut fut =
         backend_send_queue::ReqwestBackendSocketScope::new(fut, pump.backend_socket_slot());
-    tokio::select! {
+    let raced = tokio::select! {
         biased;
         output = &mut fut => Ok(output),
         () = pump.backend_write_watermark_expired() => Err(()),
-    }
+    };
+    pump.detach_if_live();
+    raced
 }
 
 /// Install the FULL upload lifecycle on a size-limited streaming client body
