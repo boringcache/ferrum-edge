@@ -10326,8 +10326,8 @@ pub mod _test_support {
                 std::task::Poll::Ready(Some(data)) => {
                     std::task::Poll::Ready(Some(Ok(http_body::Frame::data(data))))
                 }
-                // The feed channel is kept open by the probe, so this arm only
-                // fires once the probe itself is gone.
+                // The feed channel stays open until the probe ends the client
+                // body or is itself gone.
                 std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
                 std::task::Poll::Pending => std::task::Poll::Pending,
             }
@@ -10407,6 +10407,12 @@ pub mod _test_support {
                 feed.send(bytes::Bytes::from_static(data.as_bytes()))
                     .is_ok()
             })
+        }
+
+        /// End the client body: the feed closes and the body reports end of
+        /// stream once everything fed so far has been taken.
+        pub fn end_client_body(&mut self) {
+            self.feed = None;
         }
 
         /// The bounded bridge's in-flight frame budget.

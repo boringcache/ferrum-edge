@@ -62,7 +62,11 @@
 //!   resolved — the response head arrived first, a NACK replay is about to
 //!   replace it, or the join is dropped — so from then on it behaves exactly
 //!   as the always-spawned pump did, post-EOS drain watch included. A pump
-//!   that has already resolved is never detached.
+//!   that has already resolved is never detached. A pump with nothing to
+//!   enforce at all (no plan, `backend_write_timeout_ms = 0`) is also
+//!   detached at install: no watermark race will ever poll it, so inline it
+//!   would relay nothing. Production never installs one, but the contract of
+//!   the join does not depend on that.
 //!
 //! Both modes run the same loop and publish the same terminals; the mode only
 //! decides which task polls it.
@@ -891,7 +895,12 @@ where
     // polls nothing else (pool acquisition, admission). It needs its own task
     // from the start. A watermark-only pump has nothing due before the
     // dispatcher's race starts polling it (see the module docs).
-    if auth_armed {
+    //
+    // A pump with nothing to enforce at all is a plain relay: no watermark race
+    // will ever drive it, so inline it would relay nothing. Production never
+    // installs one (`UploadSource::install_pump` returns early), but the join
+    // contract must not depend on that.
+    if auth_armed || write_timeout_ms == 0 {
         join.detach(&drain_diagnostics::PUMP_DETACHED_AT_INSTALL);
     }
     (

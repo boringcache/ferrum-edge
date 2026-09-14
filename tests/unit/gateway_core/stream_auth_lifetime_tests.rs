@@ -3079,6 +3079,31 @@ fn an_empty_buffered_upload_installs_no_pump() {
 // that race ends while the upload is still live. Every bound it enforces must
 // still fire, on time, from that race alone.
 
+/// A pump with neither an authorization lifetime nor a write watermark has no
+/// race that will ever poll it, so inline it would relay nothing: it must be
+/// given a task at install. Production never builds one (`install_pump`
+/// returns early), but the trailer-boundary probes do, and the join contract
+/// must not depend on the caller.
+#[tokio::test(start_paused = true)]
+async fn a_pump_with_nothing_to_enforce_relays_on_a_task_of_its_own() {
+    let mut probe = UploadPumpProbe::start_watermark_only(0);
+    assert_eq!(probe.pump_runs_on_its_own_task(), Some(true));
+    assert!(probe.feed("relayed"));
+    probe.end_client_body();
+    // Nothing here polls the join: the relay must progress on its own.
+    let mut relayed = Vec::new();
+    for _ in 0..64 {
+        match probe.poll_transport_once() {
+            ProbeTransportPoll::Data(len) => relayed.push(len),
+            ProbeTransportPoll::Ended => break,
+            ProbeTransportPoll::Pending => tokio::task::yield_now().await,
+            ProbeTransportPoll::Errored(message) => panic!("unexpected relay error: {message}"),
+        }
+    }
+    assert_eq!(relayed, vec!["relayed".len()]);
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_watermark_only_pump_is_driven_by_the_header_race_not_by_a_task_of_its_own() {
     let mut probe = BufferedUploadPumpProbe::start(1024 * 1024, 800).expect("buffered pump");
