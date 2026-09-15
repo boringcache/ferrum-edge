@@ -9,7 +9,10 @@
 //!
 //! Counters are process-global by design (a plugin-cache reload must not reset
 //! evidence of loss), so every assertion is a delta around the operation under
-//! test rather than an absolute value.
+//! test rather than an absolute value. A delta is only exact while nothing else
+//! touches the same bucket, and every case here drives the shared `other`
+//! bucket, so the counter-touching cases serialize on [`OTHER_BUCKET_LOCK`] for
+//! their whole body, awaits included.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +29,36 @@ use ferrum_edge::plugins::utils::sink_loss::{
 /// Probe identity outside the closed set, so these tests exercise the
 /// `other` bucket instead of perturbing a real sink's series.
 const PROBE_PLUGIN: &str = "ferrum_sink_loss_probe";
+
+/// Serializes every case that reads or writes the shared `other` bucket.
+///
+/// `cargo test --test unit_plugins_b_tests` runs this file's cases on parallel
+/// threads, and all of them drive the same process-global counters through
+/// `PROBE_PLUGIN`. Without mutual exclusion one case's admissions land inside
+/// another case's before/after window: CI saw `a_healthy_sink…` read an
+/// accepted delta of 13 rather than 12 because `buffer_full_counts…` admitted
+/// its single record in between (PR #5508, run 34938340458).
+///
+/// A tokio mutex rather than a `std` one so the async cases can hold the guard
+/// across their awaits, and so a panicking case releases it instead of
+/// poisoning it for the rest of the binary. Bind the guard FIRST in the test
+/// body: locals drop in reverse order, so it then outlives every logger and
+/// budget the case builds, and the counter writes their teardown performs stay
+/// inside the window. Nothing else in this binary writes the `other` bucket in
+/// a passing run — the real sinks attribute to their own closed-set label,
+/// `log_helpers` gates on `SINK_PLUGINS`, and the `_test_support` budgets only
+/// count a refusal their callers assert never happens — so ordering this file
+/// against itself is sufficient. The purely structural cases (label sets,
+/// exposition shape) never read a value and do not take it.
+static OTHER_BUCKET_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn other_bucket_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    OTHER_BUCKET_LOCK.blocking_lock()
+}
+
+async fn other_bucket_guard_async() -> tokio::sync::MutexGuard<'static, ()> {
+    OTHER_BUCKET_LOCK.lock().await
+}
 
 fn leaked_ceiling(max_bytes: usize) -> &'static RetainedByteCeiling {
     Box::leak(Box::new(RetainedByteCeiling::new(max_bytes)))
@@ -94,6 +127,7 @@ fn plugin_labels_are_a_closed_sorted_set_with_a_catch_all() {
 
 #[test]
 fn hostile_plugin_identities_fold_into_other_without_growing_the_label_set() {
+    let _other_bucket = other_bucket_guard();
     let before = dropped_total(OTHER_PLUGIN, SinkLossReason::SinkError);
     // Each of these would be its own series if the label were free text.
     for index in 0..512u32 {
@@ -130,6 +164,7 @@ fn hostile_plugin_identities_fold_into_other_without_growing_the_label_set() {
 
 #[test]
 fn zero_record_calls_do_not_manufacture_a_loss() {
+    let _other_bucket = other_bucket_guard();
     let before = dropped_total_all_reasons(OTHER_PLUGIN);
     record_dropped(PROBE_PLUGIN, SinkLossReason::QueueFull, 0);
     assert_eq!(dropped_total_all_reasons(OTHER_PLUGIN), before);
@@ -137,6 +172,7 @@ fn zero_record_calls_do_not_manufacture_a_loss() {
 
 #[test]
 fn byte_budget_exhaustion_increments_the_byte_budget_reason() {
+    let _other_bucket = other_bucket_guard();
     let before = dropped_total(OTHER_PLUGIN, SinkLossReason::ByteBudget);
     let ceiling = leaked_ceiling(1024 * 1024);
     let budget = ByteBudget::with_ceiling(PROBE_PLUGIN, 64, ceiling);
@@ -156,6 +192,7 @@ fn byte_budget_exhaustion_increments_the_byte_budget_reason() {
 
 #[test]
 fn process_ceiling_exhaustion_also_lands_on_the_byte_budget_reason() {
+    let _other_bucket = other_bucket_guard();
     let before = dropped_total(OTHER_PLUGIN, SinkLossReason::ByteBudget);
     // The instance budget is generous; the shared ceiling is what refuses.
     let ceiling = leaked_ceiling(32);
@@ -169,6 +206,7 @@ fn process_ceiling_exhaustion_also_lands_on_the_byte_budget_reason() {
 
 #[tokio::test]
 async fn buffer_full_counts_queue_full_and_accepted_accounts_for_every_record() {
+    let _other_bucket = other_bucket_guard_async().await;
     let accepted_before = accepted_total(OTHER_PLUGIN);
     let dropped_before = dropped_total(OTHER_PLUGIN, SinkLossReason::QueueFull);
 
@@ -205,6 +243,7 @@ async fn buffer_full_counts_queue_full_and_accepted_accounts_for_every_record() 
 
 #[tokio::test]
 async fn a_healthy_sink_reports_accepted_records_and_no_drops() {
+    let _other_bucket = other_bucket_guard_async().await;
     let accepted_before = accepted_total(OTHER_PLUGIN);
     let dropped_before = dropped_total_all_reasons(OTHER_PLUGIN);
 
@@ -229,6 +268,7 @@ async fn a_healthy_sink_reports_accepted_records_and_no_drops() {
 
 #[tokio::test]
 async fn declined_failed_batch_fallback_counts_every_lost_record() {
+    let _other_bucket = other_bucket_guard_async().await;
     let before = dropped_total(OTHER_PLUGIN, SinkLossReason::BatchDiscard);
 
     // Merely installing a fallback is not evidence of durable ownership. A
@@ -258,6 +298,7 @@ async fn declined_failed_batch_fallback_counts_every_lost_record() {
 
 #[tokio::test]
 async fn closed_admission_counts_a_shutdown_loss() {
+    let _other_bucket = other_bucket_guard_async().await;
     let before = dropped_total(OTHER_PLUGIN, SinkLossReason::Shutdown);
 
     let mut logger: BatchingLogger<u64> = BatchingLogger::spawn(
@@ -275,6 +316,7 @@ async fn closed_admission_counts_a_shutdown_loss() {
 
 #[test]
 fn records_offered_before_staging_are_counted_rather_than_vanishing() {
+    let _other_bucket = other_bucket_guard();
     let before = dropped_total(OTHER_PLUGIN, SinkLossReason::Shutdown);
     let logger: DeferredBatchingLogger<u64> = DeferredBatchingLogger::for_plugin(PROBE_PLUGIN);
     let outcome = logger.try_send_outcome(1);
@@ -318,6 +360,7 @@ fn exposition_carries_help_type_and_every_series_even_at_zero() {
 
 #[test]
 fn status_snapshot_lists_only_non_zero_reasons_and_no_free_text() {
+    let _other_bucket = other_bucket_guard();
     record_dropped(PROBE_PLUGIN, SinkLossReason::RecordTooLarge, 3);
     let projection = snapshot();
     let reasons = projection
