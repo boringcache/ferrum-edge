@@ -8092,6 +8092,7 @@ fn test_priority_override_delegates_ws_session_binding() {
 
 #[tokio::test]
 async fn test_requires_ws_frame_hooks_defaults_false_for_all_plugins() {
+    let _registry = super::plugin_utils::log_schema_registry_guard();
     use ferrum_edge::plugins::available_plugins;
     use ferrum_edge::plugins::create_plugin;
 
@@ -8121,6 +8122,7 @@ async fn test_requires_ws_frame_hooks_defaults_false_for_all_plugins() {
 
 #[tokio::test]
 async fn test_pre_auth_body_buffering_plugins_are_explicitly_tracked_for_hbone() {
+    let _registry = super::plugin_utils::log_schema_registry_guard();
     use ferrum_edge::plugins::{available_plugins, create_plugin};
 
     const HBONE_PRE_AUTH_BODY_PLUGINS: &[&str] = &["hmac_auth"];

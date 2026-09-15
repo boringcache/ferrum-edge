@@ -249,6 +249,7 @@ async fn test_all_plugins_available() {
 
 #[tokio::test]
 async fn test_plugin_creation_all_plugins() {
+    let _registry = super::plugin_utils::log_schema_registry_guard();
     super::plugin_utils::ensure_basic_auth_test_secret();
     for plugin_name in available_plugins() {
         // Some plugins now require specific config fields
