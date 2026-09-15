@@ -18,7 +18,7 @@ use ferrum_edge::config::db_loader::{
     sqlstate_is_retryable_transaction_conflict,
 };
 use ferrum_edge::config::namespace_registry::{
-    NAMESPACE_RENAME_COPY_TABLES, NAMESPACE_RENAME_SIMPLE_TABLES, NamespaceRegistryCorrupt,
+    NAMESPACE_RENAME_COPY_TABLES, NAMESPACE_RENAME_SIMPLE_TABLES,
 };
 use ferrum_edge::config::plugin_trigger::PluginTrigger;
 use ferrum_edge::config::types::{
