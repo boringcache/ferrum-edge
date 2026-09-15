@@ -5,6 +5,7 @@ use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, DispatchKind, PluginAssociation, PluginConfig, PluginScope,
     Proxy, default_namespace,
 };
+use ferrum_edge::plugins::utils::log_schema::registry;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use hmac::{KeyInit, Mac};
 use http::HeaderMap;
@@ -612,6 +613,31 @@ pub fn ensure_basic_auth_test_secret() {
             std::env::set_var(KEY, "unit-test-basic-auth-hmac-secret-0123456789abcdef");
         }
     }
+}
+
+/// Hold the named log-schema registry's reload-bracket serializer for the
+/// guard's lifetime, so a bare `create_plugin("transaction_log_schema", ..)`
+/// is the validation-mode no-op it is documented to be.
+///
+/// `TransactionLogSchema::new` registers every schema it compiles whenever a
+/// staging map is open, and "open" is read from the PROCESS-GLOBAL staging
+/// slot rather than from the calling thread's bracket. Every plugin-cache
+/// build opens a bracket on its own thread, so an unbracketed construction on
+/// another thread is a no-op only while no sibling test happens to be
+/// mid-build; otherwise it writes into that sibling's staging map, or fails
+/// with `named schema 'default' registered more than once` when the sibling
+/// (or a third bare constructor) staged the same name first. Holding the
+/// serializer guarantees no other thread has a bracket open.
+///
+/// The bracket is reentrant on this thread and its state is thread-local:
+/// bind the guard first in the test body and keep the body on one thread
+/// (`#[tokio::test]`'s current-thread runtime qualifies). Tests that assert
+/// registry contents additionally call `registry::reset_for_tests()` under
+/// the guard, as `transaction_log_schema_tests` and `plugin_cache_tests` do.
+#[allow(dead_code)]
+#[must_use = "bind the guard so the serializer stays held for the test body"]
+pub(crate) fn log_schema_registry_guard() -> registry::ReloadBracketTestGuard {
+    registry::lock_for_tests()
 }
 
 /// Install a thread-local capturing subscriber for the duration of the returned
