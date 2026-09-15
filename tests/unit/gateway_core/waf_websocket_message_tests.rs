@@ -38,7 +38,20 @@ fn upgrade_ctx(path: &str) -> RequestContext {
     )
 }
 
-fn waf(config: Value) -> Arc<dyn Plugin> {
+/// Build the WAF under test with the wall-clock scan budget pinned to
+/// unbounded unless the config sets its own (`scan_timeout_block_closes_the_session`
+/// does). The production default is a 50 ms budget with
+/// `on_scan_timeout: log_and_allow`, and `Waf::run_body_scan_with_budget` skips
+/// the message scan outright when the scheduler alone burns that budget before
+/// the scan starts, which under CPU starvation turns an expected policy Close
+/// into a forwarded message. These tests pin message-rule semantics, not
+/// machine speed.
+fn waf(mut config: Value) -> Arc<dyn Plugin> {
+    if let Some(object) = config.as_object_mut()
+        && !object.contains_key("scan_budget_ms")
+    {
+        object.insert("scan_budget_ms".to_string(), json!(0));
+    }
     Arc::new(Waf::new(&config).expect("valid waf config"))
 }
 

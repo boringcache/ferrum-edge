@@ -32,6 +32,7 @@ const RESPONSE_RULE_ID: &str = "CUSTOM-PARITY-RESPONSE-BODY";
 fn parity_waf() -> Waf {
     Waf::new(&json!({
         "include_default_rules": false,
+        "scan_budget_ms": 0,
         "response_inspection": true,
         "response_body_inspection": true,
         "custom_rules": [

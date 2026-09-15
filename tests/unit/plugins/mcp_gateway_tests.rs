@@ -10742,6 +10742,7 @@ fn scoring_response_body_waf() -> Arc<dyn ferrum_edge::plugins::Plugin> {
     let waf = Waf::new(&json!({
         "mode": "enforce",
         "include_default_rules": false,
+        "scan_budget_ms": 0,
         "response_inspection": true,
         "response_body_inspection": true,
         "inspect_binary_body": true,
@@ -10768,6 +10769,7 @@ fn enforcing_framing_waf() -> Arc<dyn ferrum_edge::plugins::Plugin> {
     let waf = Waf::new(&json!({
         "mode": "enforce",
         "include_default_rules": false,
+        "scan_budget_ms": 0,
         "response_inspection": true,
         "response_body_inspection": true,
         "inspect_binary_body": true,
