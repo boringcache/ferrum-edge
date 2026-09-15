@@ -3658,124 +3658,10 @@ async fn parameterized_json_content_type_is_inspected() {
 // `debug!` reject arm — is never exercised. The tests below install a
 // DEBUG-level subscriber so `tracing::enabled!(DEBUG)` returns true, forcing the
 // lazy detail string (and the closures that build it) to run, and assert the
-// log-only detail never leaks to the client body.
-
-#[derive(Clone, Default)]
-struct DebugLogCapture {
-    buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-}
-
-impl DebugLogCapture {
-    fn contents(&self) -> String {
-        String::from_utf8(self.buffer.lock().unwrap().clone()).unwrap_or_default()
-    }
-}
-
-struct DebugLogWriter {
-    buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-}
-
-impl std::io::Write for DebugLogWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.buffer.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for DebugLogCapture {
-    type Writer = DebugLogWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        DebugLogWriter {
-            buffer: std::sync::Arc::clone(&self.buffer),
-        }
-    }
-}
-
-/// A process-global, no-op `tracing` subscriber whose sole purpose is to keep
-/// every callsite's cached interest at `sometimes` (never `disabled`) and the
-/// global max-level hint at `TRACE`. It emits nothing — `enabled` is always
-/// `false` — so it produces no output and never interferes with any per-test
-/// thread-local capture.
-///
-/// Why it exists: the per-test capture below installs its DEBUG subscriber with
-/// `set_default`, which is *thread-local* only. `rebuild_interest_cache()`
-/// recomputes each callsite's interest from the set of *globally* registered
-/// dispatchers — which, without this floor, is empty, so the DEBUG reject
-/// callsites can be cached as `never`. A `never` callsite is skipped by the
-/// `debug!` macro before the thread-local subscriber is ever consulted, so the
-/// capture comes back empty — the flaky failure seen under the parallel,
-/// instrumented coverage run. With this floor registered globally,
-/// `register_callsite` always reports `sometimes` and the hint stays at `TRACE`,
-/// so the macro always defers to the current thread's dispatcher at emit time and
-/// the capture is deterministic regardless of test ordering or parallelism.
-struct InterestFloorSubscriber;
-
-impl tracing::Subscriber for InterestFloorSubscriber {
-    fn register_callsite(&self, _: &tracing::Metadata<'_>) -> tracing::subscriber::Interest {
-        // Never `never`: force a per-event `enabled()` check against whatever
-        // dispatcher is current at emit time (the thread-local capture, here).
-        tracing::subscriber::Interest::sometimes()
-    }
-    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-        false
-    }
-    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
-        Some(tracing::level_filters::LevelFilter::TRACE)
-    }
-    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
-    }
-    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-    fn event(&self, _: &tracing::Event<'_>) {}
-    fn enter(&self, _: &tracing::span::Id) {}
-    fn exit(&self, _: &tracing::span::Id) {}
-}
-
-/// Install [`InterestFloorSubscriber`] as the global default exactly once for the
-/// test binary. Idempotent and tolerant of an already-set global default — the
-/// only invariant we need is that *some* global dispatcher with a `TRACE` hint
-/// exists so callsite interest never collapses to `never`.
-fn install_interest_floor() {
-    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    INSTALLED.get_or_init(|| {
-        let _ = tracing::subscriber::set_global_default(InterestFloorSubscriber);
-    });
-}
-
-/// Install a DEBUG-level `fmt` subscriber as the thread-local default and return
-/// the capture buffer + drop guard. `set_default` is thread-local, so callers
-/// must run on a single-thread runtime (`flavor = "current_thread"`) so the
-/// `debug!` calls land on the same thread the subscriber is bound to.
-fn debug_capture() -> (DebugLogCapture, tracing::subscriber::DefaultGuard) {
-    // Guarantee a global dispatcher with a TRACE hint exists so the
-    // `rebuild_interest_cache()` below can never recompute these callsites to
-    // `never` (see `InterestFloorSubscriber`). Must run before the rebuild.
-    install_interest_floor();
-
-    let capture = DebugLogCapture::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_target(false)
-        .without_time()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_writer(capture.clone())
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
-    // Re-evaluate every callsite's interest now that the global floor is in place.
-    // `set_default` installs only a thread-local dispatcher and does NOT rebuild
-    // tracing's global interest cache, so a callsite a *parallel* test hit first
-    // (before any DEBUG dispatcher existed) may be cached as `disabled`. With the
-    // floor registered, the rebuild yields `sometimes` for these callsites and the
-    // DEBUG events are reliably captured regardless of test ordering.
-    tracing::callsite::rebuild_interest_cache();
-    (capture, guard)
-}
+// log-only detail never leaks to the client body. The capture comes from
+// `plugin_utils::capture_debug_logs`, which also owns the process-global
+// interest floor that keeps these thread-local captures deterministic under
+// parallel load.
 
 /// With DEBUG enabled, a `malformed_json` reject in `before_proxy` materializes
 /// the lazy detail string (the `format!("...: {err}")` closure runs), logs at
@@ -3784,7 +3670,7 @@ fn debug_capture() -> (DebugLogCapture, tracing::subscriber::DefaultGuard) {
 /// `malformed_json` closure + the `debug!` reject arm.
 #[tokio::test(flavor = "current_thread")]
 async fn malformed_json_reject_logs_detail_at_debug() {
-    let (logs, guard) = debug_capture();
+    let (logs, guard) = super::plugin_utils::capture_debug_logs();
 
     let plugin = AiRequestGuard::new(&json!({"max_tokens_limit": 1000})).unwrap();
     let mut ctx = create_test_context();
@@ -3827,7 +3713,7 @@ async fn malformed_json_reject_logs_detail_at_debug() {
 /// `empty_body` closure body under the `Some(details())` branch.
 #[tokio::test(flavor = "current_thread")]
 async fn empty_body_reject_logs_detail_at_debug() {
-    let (logs, guard) = debug_capture();
+    let (logs, guard) = super::plugin_utils::capture_debug_logs();
 
     let plugin = AiRequestGuard::new(&json!({"allowed_models": ["gpt-4"]})).unwrap();
     let mut ctx = create_test_context();
@@ -3855,7 +3741,7 @@ async fn empty_body_reject_logs_detail_at_debug() {
 /// `debug!` compatibility-mode arm together with `Some(details())`.
 #[tokio::test(flavor = "current_thread")]
 async fn malformed_json_compatibility_mode_logs_detail_at_debug() {
-    let (logs, guard) = debug_capture();
+    let (logs, guard) = super::plugin_utils::capture_debug_logs();
 
     let plugin = AiRequestGuard::new(&json!({
         "max_tokens_limit": 1000,
@@ -3891,7 +3777,7 @@ async fn malformed_json_compatibility_mode_logs_detail_at_debug() {
 /// Exercises the final-hook `compressed_body` closure under `Some(details())`.
 #[tokio::test(flavor = "current_thread")]
 async fn final_hook_compressed_body_reject_logs_detail_at_debug() {
-    let (logs, guard) = debug_capture();
+    let (logs, guard) = super::plugin_utils::capture_debug_logs();
 
     let plugin = AiRequestGuard::new(&json!({"blocked_models": ["evil"]})).unwrap();
     let mut ctx = create_test_context();
@@ -3923,7 +3809,7 @@ async fn final_hook_compressed_body_reject_logs_detail_at_debug() {
 /// `empty_body` closure under `Some(details())`.
 #[tokio::test(flavor = "current_thread")]
 async fn final_hook_empty_body_reject_logs_detail_at_debug() {
-    let (logs, guard) = debug_capture();
+    let (logs, guard) = super::plugin_utils::capture_debug_logs();
 
     let plugin = AiRequestGuard::new(&json!({"blocked_models": ["evil"]})).unwrap();
     let mut ctx = create_test_context();
@@ -3955,7 +3841,7 @@ async fn final_hook_empty_body_reject_logs_detail_at_debug() {
 /// `malformed_json` closure under `Some(details())`.
 #[tokio::test(flavor = "current_thread")]
 async fn final_hook_malformed_json_reject_logs_detail_at_debug() {
-    let (logs, guard) = debug_capture();
+    let (logs, guard) = super::plugin_utils::capture_debug_logs();
 
     let plugin = AiRequestGuard::new(&json!({"blocked_models": ["evil"]})).unwrap();
     let mut ctx = create_test_context();

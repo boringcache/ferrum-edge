@@ -1,6 +1,5 @@
-use std::io;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ferrum_edge::config::PoolConfig;
@@ -9,7 +8,6 @@ use ferrum_edge::plugins::{
     opa::Opa, priority, validate_plugin_config,
 };
 use serde_json::{Value, json};
-use tracing_subscriber::fmt::MakeWriter;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -20,42 +18,6 @@ use super::plugin_utils::{
 
 const POLICY_PATH: &str = "ferrum/authz/allow";
 const DECISION_PATH: &str = "/v1/data/ferrum/authz/allow";
-
-#[derive(Clone, Default)]
-struct SharedWriter {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
-
-impl SharedWriter {
-    fn contents(&self) -> String {
-        String::from_utf8(self.buffer.lock().unwrap().clone()).unwrap_or_default()
-    }
-}
-
-struct SharedGuard {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
-
-impl io::Write for SharedGuard {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buffer.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for SharedWriter {
-    type Writer = SharedGuard;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        SharedGuard {
-            buffer: Arc::clone(&self.buffer),
-        }
-    }
-}
 
 fn default_client() -> PluginHttpClient {
     PluginHttpClient::from_pool_config(&PoolConfig::default())
@@ -1143,15 +1105,7 @@ async fn opa_body_is_forwarded_only_when_configured() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn opa_error_logs_do_not_include_request_fields() {
-    let writer = SharedWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_target(false)
-        .without_time()
-        .with_writer(writer.clone())
-        .finish();
-
-    let guard = tracing::subscriber::set_default(subscriber);
+    let (writer, guard) = super::plugin_utils::capture_logs();
     {
         let server = MockServer::start().await;
         mount_opa_raw(
@@ -1301,14 +1255,7 @@ async fn spawn_delayed_body_opa(body_delay: Duration) -> std::net::SocketAddr {
 
 #[tokio::test(flavor = "current_thread")]
 async fn opa_external_io_and_slow_call_telemetry_cover_the_decision_body_wait() {
-    let writer = SharedWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_target(false)
-        .without_time()
-        .with_writer(writer.clone())
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
+    let (writer, guard) = super::plugin_utils::capture_logs();
 
     let body_delay = Duration::from_millis(200);
     let addr = spawn_delayed_body_opa(body_delay).await;
@@ -1374,14 +1321,7 @@ async fn opa_external_io_charges_a_header_delayed_decision_exactly_once() {
 async fn opa_slow_call_diagnostics_never_print_the_configured_base_path() {
     const BASE_PATH_CANARY: &str = "opa-base-path-canary";
 
-    let writer = SharedWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_target(false)
-        .without_time()
-        .with_writer(writer.clone())
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
+    let (writer, guard) = super::plugin_utils::capture_logs();
 
     let server = MockServer::start().await;
     let decision_path = format!("/{BASE_PATH_CANARY}{DECISION_PATH}");

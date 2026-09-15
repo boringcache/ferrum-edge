@@ -9,11 +9,9 @@ use ferrum_edge::plugins::{
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::io;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tracing_subscriber::fmt::MakeWriter;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -163,42 +161,6 @@ fn assert_firewall_metadata_omits(ctx: &RequestContext, raw_text: &str) {
                 !value.contains(raw_text),
                 "firewall metadata key {key} leaked raw text"
             );
-        }
-    }
-}
-
-#[derive(Clone, Default)]
-struct SharedWriter {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
-
-impl SharedWriter {
-    fn contents(&self) -> String {
-        String::from_utf8(self.buffer.lock().unwrap().clone()).unwrap_or_default()
-    }
-}
-
-struct SharedWriterGuard {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
-
-impl io::Write for SharedWriterGuard {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buffer.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for SharedWriter {
-    type Writer = SharedWriterGuard;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        SharedWriterGuard {
-            buffer: Arc::clone(&self.buffer),
         }
     }
 }
@@ -6915,13 +6877,7 @@ async fn no_hold_timeout_metadata_without_an_expiry() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn detect_mode_hold_timeout_abandons_without_cutting() {
-    let writer = SharedWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .without_time()
-        .with_writer(writer.clone())
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
+    let (writer, guard) = super::plugin_utils::capture_logs();
 
     let server = stalled_embedding_server().await;
     let config = hold_config(

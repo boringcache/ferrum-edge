@@ -1,8 +1,7 @@
 //! Tests for ws_logging plugin
 
 use std::collections::HashMap;
-use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ferrum_edge::plugins::utils::sink_loss::{
@@ -18,47 +17,10 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::protocol::Message;
-use tracing_subscriber::fmt::MakeWriter;
 
 use super::plugin_utils::{
     create_test_context, create_test_stream_transaction_summary, create_test_transaction_summary,
 };
-
-#[derive(Clone, Default)]
-struct SharedWriter {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
-
-impl SharedWriter {
-    fn contents(&self) -> String {
-        String::from_utf8(self.buffer.lock().unwrap().clone()).unwrap_or_default()
-    }
-}
-
-struct SharedGuard {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
-
-impl io::Write for SharedGuard {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buffer.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for SharedWriter {
-    type Writer = SharedGuard;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        SharedGuard {
-            buffer: Arc::clone(&self.buffer),
-        }
-    }
-}
 
 fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
@@ -1439,14 +1401,7 @@ async fn test_ws_logging_binary_and_repeated_ack_generations() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_ws_logging_diagnostics_redact_endpoint_path_and_query() {
-    let writer = SharedWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_target(false)
-        .without_time()
-        .with_writer(writer.clone())
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
+    let (writer, guard) = super::plugin_utils::capture_logs();
 
     let path_secret = "path-token-secret-canary";
     let query_secret = "query-token-secret-canary";

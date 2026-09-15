@@ -1,4 +1,3 @@
-use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,43 +12,6 @@ use ferrum_edge::plugins::utils::{
 use serde_json::json;
 use tokio::sync::{Notify, watch};
 use tokio::time::timeout;
-use tracing_subscriber::fmt::MakeWriter;
-
-#[derive(Clone, Default)]
-struct SharedWriter {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
-
-impl SharedWriter {
-    fn contents(&self) -> String {
-        String::from_utf8(self.buffer.lock().unwrap().clone()).unwrap_or_default()
-    }
-}
-
-struct SharedGuard {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
-
-impl io::Write for SharedGuard {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buffer.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for SharedWriter {
-    type Writer = SharedGuard;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        SharedGuard {
-            buffer: Arc::clone(&self.buffer),
-        }
-    }
-}
 
 fn test_logger_config(
     plugin_name: &'static str,
@@ -590,15 +552,7 @@ async fn retry_policy_retries_failed_flushes() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn exhausted_retries_log_and_drop_batch() {
-    let writer = SharedWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_target(false)
-        .without_time()
-        .with_writer(writer.clone())
-        .finish();
-
-    let guard = tracing::subscriber::set_default(subscriber);
+    let (writer, guard) = super::plugin_utils::capture_logs();
     {
         let notify = Arc::new(Notify::new());
         let notify_clone = Arc::clone(&notify);
@@ -657,15 +611,7 @@ async fn dropping_logger_drains_remaining_entries() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn full_channel_warns_once_per_rate_limit_window() {
-    let writer = SharedWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_target(false)
-        .without_time()
-        .with_writer(writer.clone())
-        .finish();
-
-    let guard = tracing::subscriber::set_default(subscriber);
+    let (writer, guard) = super::plugin_utils::capture_logs();
     {
         let logger = BatchingLogger::spawn(
             test_logger_config("batching_logger_drop", 10, 1),

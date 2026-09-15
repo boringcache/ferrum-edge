@@ -6,7 +6,9 @@ use ferrum_edge::plugins::{
 use serde_json::json;
 use std::collections::HashMap;
 
-use super::plugin_utils::normalize_compressed_request_for_plugin_test;
+use super::plugin_utils::{
+    capture_debug_logs_during, normalize_compressed_request_for_plugin_test,
+};
 
 fn make_ctx() -> RequestContext {
     RequestContext::new(
@@ -1963,50 +1965,6 @@ async fn test_request_transformer_route_level_accepted_value_applies() {
 
 // ── Header mutation tracing must never emit configured values ─────────────
 
-use std::future::Future;
-use std::io::{self, Write};
-use std::sync::Mutex;
-use tracing_subscriber::fmt::MakeWriter;
-
-#[derive(Clone, Default)]
-struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
-
-impl Write for SharedLogWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for SharedLogWriter {
-    type Writer = Self;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-async fn capture_debug_logs<F, Fut>(operation: F) -> String
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = ()>,
-{
-    let writer = SharedLogWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_max_level(tracing::Level::DEBUG)
-        .with_writer(writer.clone())
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
-    operation().await;
-    String::from_utf8(writer.0.lock().unwrap().clone()).unwrap()
-}
-
 fn assert_secret_absent_from_logs(logs: &str, secret: &str) {
     assert!(
         !logs.contains(secret),
@@ -2056,7 +2014,7 @@ async fn test_request_transformer_header_mutations_never_log_configured_values()
 
     for (label, rule, mut seed_headers, expected_key, secret) in cases {
         let plugin = RequestTransformer::new(&json!({ "rules": [rule] })).unwrap();
-        let logs = capture_debug_logs(|| async {
+        let logs = capture_debug_logs_during(|| async {
             let mut ctx = make_ctx();
             let mut headers = std::mem::take(&mut seed_headers);
             let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -2081,7 +2039,7 @@ async fn test_request_transformer_header_mutations_never_log_configured_values()
         ]
     }))
     .unwrap();
-    let logs = capture_debug_logs(|| async {
+    let logs = capture_debug_logs_during(|| async {
         let mut ctx = make_ctx();
         let mut headers = HashMap::from([(
             "authorization".to_string(),
@@ -2286,7 +2244,7 @@ async fn test_query_transform_does_not_log_secret_values() {
         ]
     }))
     .unwrap();
-    let logs = capture_debug_logs(|| async {
+    let logs = capture_debug_logs_during(|| async {
         let mut ctx = make_ctx();
         ctx.set_raw_query_string("access_token=never-log-this-token&page=1".to_string());
         let mut headers = HashMap::new();
