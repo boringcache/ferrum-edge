@@ -17,12 +17,10 @@ use ferrum_edge::proxy::tcp_proxy::StreamIoSide;
 use ferrum_edge::retry::ErrorClass;
 use serde_json::json;
 use std::collections::HashMap;
-use std::future::Future;
-use std::io::{self, Write};
-use std::sync::{Arc, Mutex};
-use tracing_subscriber::fmt::MakeWriter;
 
-use super::plugin_utils::create_test_transaction_summary;
+use super::plugin_utils::{
+    capture_debug_logs, capture_debug_logs_during, create_test_transaction_summary,
+};
 
 fn make_ctx() -> RequestContext {
     let mut ctx = RequestContext::new(
@@ -182,58 +180,13 @@ fn make_ctx_with_sensitive_headers() -> RequestContext {
     ctx
 }
 
-#[derive(Clone, Default)]
-struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
-
-impl Write for SharedLogWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for SharedLogWriter {
-    type Writer = Self;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-async fn capture_debug_logs<F, Fut>(operation: F) -> String
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = ()>,
-{
-    let writer = SharedLogWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_max_level(tracing::Level::DEBUG)
-        .with_writer(writer.clone())
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
-    operation().await;
-    String::from_utf8(writer.0.lock().unwrap().clone()).unwrap()
-}
-
 /// Run `operation` with a DEBUG-level thread-local subscriber installed.
 ///
 /// The body-buffering predicates release bodies to streaming when the
 /// `transaction_debug` DEBUG target cannot emit, so every synchronous test that
 /// asserts a buffering decision has to state which side of that gate it is on.
 fn with_debug_target<T>(operation: impl FnOnce() -> T) -> T {
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_max_level(tracing::Level::DEBUG)
-        .with_writer(SharedLogWriter::default())
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let (_logs, _guard) = capture_debug_logs();
     operation()
 }
 
@@ -250,14 +203,7 @@ fn with_capture_target_disabled<T>(operation: impl FnOnce() -> T) -> T {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_transaction_debugger_redacts_builtin_sensitive_headers_in_both_directions() {
-    let writer = SharedLogWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_max_level(tracing::Level::DEBUG)
-        .with_writer(writer.clone())
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let (writer, _guard) = capture_debug_logs();
     let plugin = TransactionDebugger::new(&json!({})).unwrap();
     let mut ctx = make_ctx();
     ctx.headers
@@ -298,7 +244,7 @@ async fn test_transaction_debugger_redacts_builtin_sensitive_headers_in_both_dir
         ferrum_edge::plugins::PluginResult::Continue
     ));
 
-    let logs = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
+    let logs = writer.contents();
     for secret in [
         "azure-request-secret",
         "google-request-secret",
@@ -859,7 +805,7 @@ async fn test_transaction_debugger_http_terminal_output_is_bounded_and_redacted(
         .metadata
         .insert("authorization".to_string(), "http-secret".to_string());
 
-    let logs = capture_debug_logs(|| async { plugin.log(&summary).await }).await;
+    let logs = capture_debug_logs_during(|| async { plugin.log(&summary).await }).await;
     for expected in [
         "Transaction terminal diagnostic",
         "outcome=body_error",
@@ -889,7 +835,8 @@ async fn test_transaction_debugger_stream_output_includes_typed_teardown() {
     summary.disconnect_direction = Some(Direction::BackendToClient);
     summary.disconnect_cause = Some(DisconnectCause::BackendError);
 
-    let logs = capture_debug_logs(|| async { plugin.on_stream_disconnect(&summary).await }).await;
+    let logs =
+        capture_debug_logs_during(|| async { plugin.on_stream_disconnect(&summary).await }).await;
     for expected in [
         "Stream terminal diagnostic",
         "outcome=stream_error",
@@ -922,7 +869,7 @@ async fn test_transaction_debugger_websocket_disconnect_output_and_multiple_inst
         "websocket_error"
     );
 
-    let logs = capture_debug_logs(|| async {
+    let logs = capture_debug_logs_during(|| async {
         first.on_ws_disconnect(&summary).await;
         second.on_ws_disconnect(&summary).await;
     })
@@ -955,7 +902,8 @@ async fn test_transaction_debugger_websocket_clean_disconnect() {
         "completed"
     );
 
-    let logs = capture_debug_logs(|| async { plugin.on_ws_disconnect(&summary).await }).await;
+    let logs =
+        capture_debug_logs_during(|| async { plugin.on_ws_disconnect(&summary).await }).await;
     assert!(logs.contains("outcome=completed"), "got: {logs}");
 }
 
@@ -998,7 +946,7 @@ async fn test_body_capture_disabled_by_default_is_zero_cost() {
     );
 
     let headers = body_headers("application/json", 12);
-    let logs = capture_debug_logs(|| async {
+    let logs = capture_debug_logs_during(|| async {
         let _ = plugin
             .on_final_request_body(&headers, br#"{"a":"bcde"}"#)
             .await;
@@ -1019,7 +967,7 @@ async fn test_small_json_request_body_is_captured_and_redacted() {
     assert!(plugin.requires_request_body_buffering());
     assert!(plugin.request_body_capture_decision(&headers).is_capture());
 
-    let logs = capture_debug_logs(|| async {
+    let logs = capture_debug_logs_during(|| async {
         let _ = plugin.on_final_request_body(&headers, body).await;
     })
     .await;
@@ -1041,7 +989,7 @@ async fn test_json_response_body_capture_covers_error_responses() {
     let headers = body_headers("application/problem+json", 48);
     let body = br#"{"title":"upstream failed","detail":"pool exhausted"}"#;
 
-    let logs = capture_debug_logs(|| async {
+    let logs = capture_debug_logs_during(|| async {
         let _ = plugin
             .on_final_response_body(&mut ctx, 500, &headers, body)
             .await;
@@ -1058,7 +1006,7 @@ async fn test_credential_shaped_values_are_redacted_regardless_of_field_name() {
     let body = br#"{"note":"upstream said Authorization: Bearer sk-live-abcdefghijklmnop","basic":"prefix Basic dXNlcjpwYXNz","jot":"embedded eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig"}"#;
     let headers = body_headers("application/json", body.len());
 
-    let logs = capture_debug_logs(|| async {
+    let logs = capture_debug_logs_during(|| async {
         let _ = plugin.on_final_request_body(&headers, body).await;
     })
     .await;
@@ -1664,7 +1612,7 @@ async fn test_omission_records_are_emitted_with_stable_reasons() {
     let mut ctx = make_ctx();
     let mut headers = body_headers("application/octet-stream", 32);
 
-    let logs = capture_debug_logs(|| async {
+    let logs = capture_debug_logs_during(|| async {
         let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
     })
     .await;
@@ -1674,7 +1622,7 @@ async fn test_omission_records_are_emitted_with_stable_reasons() {
 
     let mut response_headers = body_headers("text/event-stream", 32);
     let mut ctx = make_ctx();
-    let logs = capture_debug_logs(|| async {
+    let logs = capture_debug_logs_during(|| async {
         let _ = plugin
             .after_proxy(&mut ctx, 200, &mut response_headers)
             .await;
@@ -1699,7 +1647,7 @@ async fn test_final_request_hook_fails_closed_when_the_actual_body_exceeds_the_c
     let body = format!(r#"{{"password":"hunter2","pad":"{}"}}"#, "q".repeat(4096));
     assert!(plugin.request_body_capture_decision(&headers).is_capture());
 
-    let logs = capture_debug_logs(|| async {
+    let logs = capture_debug_logs_during(|| async {
         let _ = plugin
             .on_final_request_body(&headers, body.as_bytes())
             .await;
@@ -1736,7 +1684,7 @@ async fn test_final_response_hook_fails_closed_on_transformation_length_drift() 
     );
     assert!(plugin.response_body_capture_decision(&headers).is_capture());
 
-    let logs = capture_debug_logs(|| async {
+    let logs = capture_debug_logs_during(|| async {
         let _ = plugin
             .on_final_response_body(&mut ctx, 200, &headers, body.as_bytes())
             .await;
@@ -1751,7 +1699,7 @@ async fn test_final_response_hook_fails_closed_on_transformation_length_drift() 
 
     // A body that actually fits is still captured on the same path.
     let small = br#"{"detail":"ok"}"#;
-    let logs = capture_debug_logs(|| async {
+    let logs = capture_debug_logs_during(|| async {
         let _ = plugin
             .on_final_response_body(&mut ctx, 200, &headers, small)
             .await;
@@ -1775,7 +1723,7 @@ async fn test_final_hooks_report_a_declared_but_absent_body_as_empty_not_malform
     let empty: &[u8] = b"";
     assert!(plugin.response_body_capture_decision(&headers).is_capture());
 
-    let logs = capture_debug_logs(|| async {
+    let logs = capture_debug_logs_during(|| async {
         let _ = plugin
             .on_final_response_body(&mut ctx, 304, &headers, empty)
             .await;
@@ -1791,7 +1739,7 @@ async fn test_final_hooks_report_a_declared_but_absent_body_as_empty_not_malform
 
     // Same rule on the request side, where a `before_proxy` transform can empty
     // a body the header screen already admitted.
-    let logs = capture_debug_logs(|| async {
+    let logs = capture_debug_logs_during(|| async {
         let _ = plugin.on_final_request_body(&headers, empty).await;
     })
     .await;
@@ -1811,7 +1759,7 @@ async fn test_final_hooks_report_a_declared_but_absent_body_as_empty_not_malform
     // The unstructured families take the same path rather than reporting an
     // empty `captured` sample that reads like a real one.
     let text = body_headers("text/plain", 50);
-    let logs = capture_debug_logs(|| async {
+    let logs = capture_debug_logs_during(|| async {
         let _ = plugin.on_final_request_body(&text, empty).await;
     })
     .await;
@@ -1925,7 +1873,7 @@ async fn test_request_capture_record_carries_method_and_path_from_context() {
     let headers = body_headers("application/json", 24);
     let body = br#"{"user":"alice"}"#;
 
-    let logs = capture_debug_logs(|| async {
+    let logs = capture_debug_logs_during(|| async {
         let mut ctx = make_ctx();
         let _ = plugin
             .on_final_request_body_with_context(&mut ctx, &headers, body)
@@ -1937,7 +1885,7 @@ async fn test_request_capture_record_carries_method_and_path_from_context() {
     assert!(logs.contains("path=/api/data"), "got: {logs}");
 
     // The context-free hook still works and still emits a bounded record.
-    let logs = capture_debug_logs(|| async {
+    let logs = capture_debug_logs_during(|| async {
         let _ = plugin.on_final_request_body(&headers, body).await;
     })
     .await;

@@ -190,8 +190,12 @@ fn preview_plugin(preview_bytes: u64) -> WsFrameLogging {
 }
 
 fn install_ws_log_capture(capture: &WsLogCapture) -> tracing::subscriber::DefaultGuard {
+    // Thread-local captures need the global interest floor; see plugin_utils.
+    super::plugin_utils::install_interest_floor();
     let subscriber = tracing_subscriber::registry().with(capture.layer());
-    tracing::subscriber::set_default(subscriber)
+    let guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
+    guard
 }
 
 /// Install a capture subscriber filtered like the gateway EnvFilter
@@ -206,6 +210,7 @@ fn install_filtered_ws_log_capture(
     directive: &str,
     capture: &WsLogCapture,
 ) -> tracing::subscriber::DefaultGuard {
+    super::plugin_utils::install_interest_floor();
     let subscriber =
         tracing_subscriber::registry().with(capture.layer().with_filter(EnvFilter::new(directive)));
     let guard = tracing::subscriber::set_default(subscriber);

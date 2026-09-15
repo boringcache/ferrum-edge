@@ -14,7 +14,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::plugin_utils::create_test_proxy;
+use super::plugin_utils::{capture_debug_logs_during, create_test_proxy};
 
 /// Origin validators / integrity fields that become stale after a body rewrite.
 const STALE_REPRESENTATION_HEADERS: &[&str] = &[
@@ -2159,50 +2159,6 @@ fn h1_h2_h3_paths_reach_shared_body_transform_finalize() {
 
 // ── Header mutation tracing must never emit configured values ─────────────
 
-use std::future::Future;
-use std::io::{self, Write};
-use std::sync::Mutex;
-use tracing_subscriber::fmt::MakeWriter;
-
-#[derive(Clone, Default)]
-struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
-
-impl Write for SharedLogWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for SharedLogWriter {
-    type Writer = Self;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-async fn capture_debug_logs<F, Fut>(operation: F) -> String
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = ()>,
-{
-    let writer = SharedLogWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_max_level(tracing::Level::DEBUG)
-        .with_writer(writer.clone())
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
-    operation().await;
-    String::from_utf8(writer.0.lock().unwrap().clone()).unwrap()
-}
-
 fn assert_secret_absent_from_logs(logs: &str, secret: &str) {
     assert!(
         !logs.contains(secret),
@@ -2252,7 +2208,7 @@ async fn test_response_transformer_header_mutations_never_log_configured_values(
 
     for (label, rule, mut seed_headers, expected_key, secret) in cases {
         let plugin = ResponseTransformer::new(&json!({ "rules": [rule] })).unwrap();
-        let logs = capture_debug_logs(|| async {
+        let logs = capture_debug_logs_during(|| async {
             let mut ctx = make_ctx();
             let mut headers = std::mem::take(&mut seed_headers);
             let _ = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
@@ -2276,7 +2232,7 @@ async fn test_response_transformer_header_mutations_never_log_configured_values(
         ]
     }))
     .unwrap();
-    let logs = capture_debug_logs(|| async {
+    let logs = capture_debug_logs_during(|| async {
         let mut ctx = make_ctx();
         let mut headers = HashMap::from([(
             "authorization".to_string(),
@@ -2420,7 +2376,7 @@ async fn response_transform_size_policy_admits_the_exact_boundary() {
             HashMap::from([("content-type".to_string(), "application/json".to_string())]);
         stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
         let mut body = bytes::Bytes::from_static(b"{}");
-        let logs = capture_debug_logs(|| async {
+        let logs = capture_debug_logs_during(|| async {
             let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
                 &plugins,
                 &mut ctx,
@@ -2522,7 +2478,7 @@ async fn claimed_body_rewrite_marks_capacity_refusal_distinct_from_noop() {
     ]);
     stamp_original_response_metadata_for_test(&mut loop_ctx, status, &loop_headers);
     let mut body_buf = bytes::Bytes::from(body.to_vec());
-    let logs = capture_debug_logs(|| async {
+    let logs = capture_debug_logs_during(|| async {
         let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
             &[plugin],
             &mut loop_ctx,
