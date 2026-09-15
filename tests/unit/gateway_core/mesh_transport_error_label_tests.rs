@@ -24,8 +24,6 @@ use ferrum_edge::proxy::hbone_pool::{HbonePoolError, MeshTransportLabel};
 use ferrum_edge::retry::error_class_log_kind;
 use ferrum_edge::tls::spiffe::SpiffeTlsError;
 use std::io;
-use std::sync::{Arc, Mutex};
-use tracing_subscriber::fmt::MakeWriter;
 
 /// Values a client and the operator log must never echo from `Display`.
 const SECRET_HOST: &str = "10.4.7.9:15006";
@@ -61,40 +59,12 @@ fn tls_handshake_error() -> HbonePoolError {
     }
 }
 
-#[derive(Clone, Default)]
-struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
-
-impl io::Write for SharedLogWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for SharedLogWriter {
-    type Writer = Self;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
 fn capture_pool_error_log(label: MeshTransportLabel, err: &HbonePoolError) -> String {
-    let writer = SharedLogWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_target(false)
-        .without_time()
-        .with_writer(writer.clone())
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
-        label.log_pool_error("mesh-outbound", err);
-    });
-    String::from_utf8(writer.0.lock().unwrap().clone()).expect("operator log must be utf-8")
+    // Thread-local captures need the global interest floor; see plugin_utils.
+    let (logs, guard) = crate::unit::plugins::plugin_utils::capture_logs();
+    label.log_pool_error("mesh-outbound", err);
+    drop(guard);
+    logs.contents()
 }
 
 fn sensitive_pool_errors() -> Vec<HbonePoolError> {

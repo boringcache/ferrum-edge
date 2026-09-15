@@ -1,8 +1,5 @@
 //! Apply-begin capabilities must keep the serving generation as the rollback floor.
 
-use std::io;
-use std::sync::{Arc, Mutex};
-
 use chrono::Utc;
 use ferrum_edge::modes::mesh::revision::{
     MeshConfigRevision, MeshRevisionContentIdentity, MeshRevisionGate, MeshRevisionOrder,
@@ -12,35 +9,12 @@ use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock;
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::plugins::mesh::prometheus_helpers::render_mesh_observability_metrics;
-use tracing_subscriber::fmt::MakeWriter;
 
 fn slice(sequence: u64) -> MeshSlice {
     MeshSlice {
         version: format!("v-{sequence}"),
         revision: Some(MeshConfigRevision::new("db", sequence)),
         ..MeshSlice::default()
-    }
-}
-
-#[derive(Clone, Default)]
-struct LogWriter(Arc<Mutex<Vec<u8>>>);
-
-impl io::Write for LogWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for LogWriter {
-    type Writer = Self;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
     }
 }
 
@@ -104,16 +78,11 @@ fn a_missing_commit_token_is_loud_and_preserves_the_serving_baseline() {
     assert!(late_token.is_none());
 
     let before = missing_token_rejections();
-    let writer = LogWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .without_time()
-        .with_writer(writer.clone())
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
-        assert!(!state.record_applied_slice_with_token(&candidate, late_token));
-    });
-    let log = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
+    // Thread-local captures need the global interest floor; see plugin_utils.
+    let (writer, guard) = crate::unit::plugins::plugin_utils::capture_logs();
+    assert!(!state.record_applied_slice_with_token(&candidate, late_token));
+    drop(guard);
+    let log = writer.contents();
     assert!(log.contains("ERROR"));
     assert!(log.contains("Mesh revision commit has no apply token"));
     for field in [
