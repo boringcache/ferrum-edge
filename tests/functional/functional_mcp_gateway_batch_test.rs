@@ -117,7 +117,14 @@ async fn start_mcp_recording_echo_server_on(
                 .into_bytes();
                 response.extend_from_slice(&body);
                 if let Some(requests) = requests {
-                    let _ = requests.send((headers, body));
+                    // The gateway's backend capability refresh opens an h2c
+                    // prior-knowledge connection (`PRI * HTTP/2.0`) to classify
+                    // the upstream. It is answered like any other request but
+                    // is not a forwarded MCP request, so it stays out of the
+                    // recorded sequence the tests assert on.
+                    if !headers.starts_with("PRI * HTTP/2.0") {
+                        let _ = requests.send((headers, body));
+                    }
                 }
                 let _ = stream.write_all(&response).await;
                 let _ = stream.shutdown().await;
