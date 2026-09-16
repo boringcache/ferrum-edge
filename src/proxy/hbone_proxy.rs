@@ -18,8 +18,8 @@ use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
 use super::hbone_admission_fence::{
-    HBONE_ADMISSION_REVOKED_MESSAGE, HboneAdmissionSnapshot, HboneRelayDestinationGate,
-    HboneRevocationReason,
+    HBONE_ADMISSION_REVOKED_MESSAGE, HboneAdmissionSnapshot, HbonePeerCredential,
+    HboneRelayDestinationGate, HboneRevocationReason,
 };
 use super::{
     ClientRequestBody, LoadBalancerConnectionGuard, ProxyBody, ProxyState, backend_dispatch,
@@ -1061,6 +1061,11 @@ pub(super) async fn handle_hbone_request(
         request_protocol: admission_view.request_protocol,
         grpc_web_request: admission_view.grpc_web_request,
         admission_sweep_epoch: admission_view.sweep_epoch,
+        // Credential dimension (issue #5568). Read from the SAME epoch the
+        // gates above judged, so the trust generation and the policy generation
+        // this snapshot records can never come from two different loads.
+        gateway_trust_generation: epoch.gateway_trust().generation(),
+        peer_credential: HbonePeerCredential::from_admitted_connect(ctx, epoch.gateway_trust()),
     });
     let relay_proxy = proxy.clone();
     let relay_method = method.to_string();
@@ -1760,6 +1765,11 @@ pub(super) async fn handle_hbone_udp_request(
         request_protocol: admission_view.request_protocol,
         grpc_web_request: admission_view.grpc_web_request,
         admission_sweep_epoch: admission_view.sweep_epoch,
+        // Credential dimension (issue #5568); see the byte-stream relay. A
+        // datagram tunnel rides the same inbound mTLS session and is bounded by
+        // the same peer SVID, so it carries the same snapshot fields.
+        gateway_trust_generation: epoch.gateway_trust().generation(),
+        peer_credential: HbonePeerCredential::from_admitted_connect(ctx, epoch.gateway_trust()),
     });
     let relay_proxy = proxy.clone();
     let relay_plugins: Vec<Arc<dyn Plugin>> = plugins.to_vec();

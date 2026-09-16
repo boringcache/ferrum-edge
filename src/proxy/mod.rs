@@ -8252,15 +8252,37 @@ impl ProxyState {
     /// Idempotent: when the published admission is already live and already
     /// carries this exact snapshot, nothing is stored and the trust generation
     /// does not advance, so ordinary reloads and repeated commits are free.
+    ///
+    /// This is the ONE place the request-facing gateway trust generation
+    /// advances, so it is also where the HBONE admission fence is asked to
+    /// re-check live tunnels' credentials against it (issue #5568). Every trust
+    /// publisher — `commit_gateway_trust_generation_locked` for an accepted
+    /// `Replace`/`Clear`, `install_gateway_runtime_svid_bundle` for a SPIRE /
+    /// file / CA-backend source rotation, and the epoch publication above —
+    /// ends here, so one call site covers them all and a new publisher cannot
+    /// forget the sweep.
+    ///
+    /// The sweep is requested AFTER the store, which is the same
+    /// publish-then-recheck ordering `publish_mesh_inbound_tls_policy` relies
+    /// on: a CONNECT that read the superseded trust necessarily captured a
+    /// stale sweep counter too, and `HboneAdmissionFence::admit` turns that
+    /// into a fresh sweep. [`Self::fence_gateway_trust_generation`] deliberately
+    /// does NOT sweep — fencing carries the same material forward, so there is
+    /// nothing a credential re-check could decide differently, and sweeping
+    /// mid-publication would only judge tunnels against the outgoing
+    /// generation.
     fn publish_live_gateway_trust(&self) {
         let svid = self.gateway_svid_bundle.load_full();
-        let _committed = self.request_epoch.update_gateway_trust(|current| {
+        let committed = self.request_epoch.update_gateway_trust(|current| {
             let published = current.gateway_trust();
             if published.is_live() && Arc::ptr_eq(published.svid(), &svid) {
                 return None;
             }
             Some(published.committed(Arc::clone(&svid)))
         });
+        if committed.is_some() {
+            self.hbone_admission_fence.request_sweep();
+        }
     }
 
     /// Whether request paths may authenticate gateway-to-mesh peers right now.

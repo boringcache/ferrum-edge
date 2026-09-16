@@ -31,6 +31,19 @@
 //!   first leaves its reason readable after the relay retires;
 //! * publications coalesce and revoke every live tunnel exactly once;
 //! * a revocation never lands on `ferrum_mesh_hbone_relay_failures_total`.
+//!
+//! and the CREDENTIAL dimension (issue #5568), which a sweep re-decides because
+//! an established inbound mTLS session is never re-handshaked:
+//!
+//! * a gateway trust rotation that still anchors the peer revokes nothing;
+//! * withdrawing the peer's trust domain, and rotating away the authority that
+//!   issued its leaf, each revoke with `peer_trust`;
+//! * an admitted SVID past its `notAfter` is revoked by the fence's own expiry
+//!   watcher with NO publication of any kind;
+//! * a published trust bundle that cannot be compiled into a verifier fails
+//!   closed with `reevaluation_failed`;
+//! * a peer the admitting gateway trust generation never anchored — the
+//!   chain-only inbound posture — is never revoked for trust.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -49,7 +62,10 @@ use crate::scaffolding::port_registry::TestSocket;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope, Proxy};
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
-use ferrum_edge::identity::SpiffeId;
+use ferrum_edge::identity::{
+    SpiffeId, SvidBundle, TrustBundle as RuntimeTrustBundle,
+    TrustBundleSet as RuntimeTrustBundleSet, TrustDomain,
+};
 use ferrum_edge::modes::mesh::config::{
     MeshConfig, MeshInboundRelayDestination, MeshInboundRelayHost, MeshPolicy,
     MeshRelayEnrollmentEvidence, MtlsMode, PolicyScope,
@@ -57,7 +73,8 @@ use ferrum_edge::modes::mesh::config::{
 use ferrum_edge::modes::mesh::{MeshTrafficDirection, prepare_gateway_config_for_mesh};
 use ferrum_edge::plugins::{ProxyProtocol, RequestContext};
 use ferrum_edge::proxy::hbone_admission_fence::{
-    AdmittedHboneTunnel, HboneAdmissionSnapshot, HboneRelayDestinationGate, HboneRevocationReason,
+    AdmittedHboneTunnel, HboneAdmissionSnapshot, HbonePeerCredential, HboneRelayDestinationGate,
+    HboneRevocationReason,
 };
 use ferrum_edge::proxy::{
     ConfigApplyOutcome, MeshInboundTlsPolicy, ProxyState,
@@ -293,6 +310,12 @@ fn synthetic_snapshot(
         request_protocol: ProxyProtocol::Http,
         grpc_web_request: false,
         admission_sweep_epoch,
+        // No peer credential: these fixtures isolate a POLICY gate, and a
+        // credential-less snapshot leaves the credential gate (and the expiry
+        // watcher) inapplicable. `credential_snapshot` is the fixture for that
+        // dimension.
+        gateway_trust_generation: 0,
+        peer_credential: None,
     }
 }
 
@@ -329,6 +352,8 @@ fn dual_gate_snapshot(proxy: Arc<Proxy>, admission_sweep_epoch: u64) -> HboneAdm
         request_protocol: ProxyProtocol::Http,
         grpc_web_request: false,
         admission_sweep_epoch,
+        gateway_trust_generation: 0,
+        peer_credential: None,
     }
 }
 
@@ -554,13 +579,19 @@ async fn wait_for_revocation(tunnel: &AdmittedHboneTunnel) {
         .expect("the fence must revoke the tunnel within the deadline");
 }
 
-fn revocation_counts(state: &ProxyState) -> [u64; 5] {
+/// Every revocation reason, in the fence's own GATE ORDER, so an assertion
+/// reads the same way the sweep decides:
+/// `[proxy_withdrawn, peer_expired, peer_trust, authorization_denied,
+///   peer_auth_transport, relay_destination, reevaluation_failed]`.
+fn revocation_counts(state: &ProxyState) -> [u64; 7] {
     let fence = &state.hbone_admission_fence;
     [
         fence.revocations(HboneRevocationReason::ProxyWithdrawn),
+        fence.revocations(HboneRevocationReason::PeerExpired),
+        fence.revocations(HboneRevocationReason::PeerTrust),
+        fence.revocations(HboneRevocationReason::AuthorizationDenied),
         fence.revocations(HboneRevocationReason::PeerAuthTransport),
         fence.revocations(HboneRevocationReason::RelayDestination),
-        fence.revocations(HboneRevocationReason::AuthorizationDenied),
         fence.revocations(HboneRevocationReason::ReevaluationFailed),
     ]
 }
@@ -591,7 +622,7 @@ async fn admit_client_tunnel(policies: Vec<MeshPolicy>) -> AdmittedFixture {
         .expect("admitted CONNECT under the initial policy generation");
     echo_round_trip(&mut tunnel, b"before-publish").await;
     assert_eq!(state.hbone_admission_fence.live_tunnels(), 1);
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0]);
 
     AdmittedFixture {
         state,
@@ -626,7 +657,7 @@ async fn tightened_authorization_policy_revokes_live_tunnel_and_denies_the_next_
     wait_for_no_live_tunnels(&fx.state).await;
     assert_eq!(
         revocation_counts(&fx.state),
-        [0, 0, 0, 1, 0],
+        [0, 0, 0, 1, 0, 0, 0],
         "exactly one authorization_denied revocation"
     );
     assert!(
@@ -644,7 +675,7 @@ async fn tightened_authorization_policy_revokes_live_tunnel_and_denies_the_next_
     );
     assert_eq!(
         revocation_counts(&fx.state),
-        [0, 0, 0, 1, 0],
+        [0, 0, 0, 1, 0, 0, 0],
         "a refused CONNECT is never a revocation"
     );
 
@@ -670,7 +701,7 @@ async fn unrelated_policy_publication_reevaluates_but_keeps_the_tunnel() {
         fx.state.hbone_admission_fence.reevaluations() > reevaluations_before,
         "the publication must re-judge the live tunnel, not skip it"
     );
-    assert_eq!(revocation_counts(&fx.state), [0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&fx.state), [0, 0, 0, 0, 0, 0, 0]);
     assert_eq!(fx.state.hbone_admission_fence.live_tunnels(), 1);
     echo_round_trip(&mut fx.tunnel, b"after-unrelated-publish").await;
 
@@ -691,7 +722,7 @@ async fn withdrawing_the_admitting_proxy_revokes_live_tunnel() {
     wait_for_no_live_tunnels(&fx.state).await;
     assert_eq!(
         revocation_counts(&fx.state),
-        [1, 0, 0, 0, 0],
+        [1, 0, 0, 0, 0, 0, 0],
         "exactly one proxy_withdrawn revocation"
     );
 
@@ -710,7 +741,7 @@ async fn peer_authentication_swap_revokes_only_a_non_compliant_tunnel() {
             ..MeshInboundTlsPolicy::default()
         });
     wait_for_sweep_after(&fx.state, completed_before).await;
-    assert_eq!(revocation_counts(&fx.state), [0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&fx.state), [0, 0, 0, 0, 0, 0, 0]);
     echo_round_trip(&mut fx.tunnel, b"still-admitted-under-strict").await;
 
     // DISABLE refuses TLS transport for the app port: the same tunnel is now
@@ -724,7 +755,7 @@ async fn peer_authentication_swap_revokes_only_a_non_compliant_tunnel() {
     wait_for_no_live_tunnels(&fx.state).await;
     assert_eq!(
         revocation_counts(&fx.state),
-        [0, 1, 0, 0, 0],
+        [0, 0, 0, 0, 1, 0, 0],
         "exactly one peer_auth_transport revocation"
     );
 
@@ -775,7 +806,7 @@ async fn peer_authentication_swap_revokes_a_live_datagram_tunnel() {
     wait_for_no_live_tunnels(&state).await;
     assert_eq!(
         revocation_counts(&state),
-        [0, 1, 0, 0, 0],
+        [0, 0, 0, 0, 1, 0, 0],
         "the datagram relay honors the same revocation as the byte-stream relay"
     );
 
@@ -822,7 +853,7 @@ async fn an_admission_that_raced_a_publication_is_reswept_when_it_registers() {
     // Read at the cancellation edge, deliberately: the accounting is published
     // before the token is cancelled, so anything woken by the cancellation
     // already sees the revocation counted.
-    assert_eq!(revocation_counts(&state), [0, 0, 1, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 1, 0]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -874,7 +905,7 @@ async fn a_withdrawn_relay_destination_revokes_a_live_inbound_relay_tunnel() {
         Some(HboneRevocationReason::RelayDestination),
         "the synthesized inbound relay's ownership guard is what revoked it"
     );
-    assert_eq!(revocation_counts(&state), [0, 0, 1, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 1, 0]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -961,7 +992,7 @@ async fn a_grpc_classified_connect_is_refused_before_it_can_become_a_fenced_tunn
         0,
         "a refused CONNECT must not register a sweepable tunnel"
     );
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0]);
 
     // The same peer's plain CONNECT IS admitted, on the plain-HTTP view, and
     // the fence judges it against exactly that view.
@@ -984,7 +1015,7 @@ async fn a_grpc_classified_connect_is_refused_before_it_can_become_a_fenced_tunn
         state.hbone_admission_fence.reevaluations() > reevaluations_before,
         "the sweep must have resolved a non-empty authorize chain for the admitting view"
     );
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 1, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 1, 0, 0, 0]);
 
     let _ = shutdown_tx.send(true);
     backend_handle.abort();
@@ -1027,7 +1058,7 @@ async fn a_side_effecting_operator_authorize_plugin_is_never_re_run_by_a_sweep()
 
     assert_eq!(
         revocation_counts(&state),
-        [0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0],
         "a sweep must not revoke a compliant tunnel over a plugin it may not re-run"
     );
     assert_eq!(state.hbone_admission_fence.live_tunnels(), 1);
@@ -1091,7 +1122,7 @@ async fn close_publications_coalesce_and_revoke_every_live_tunnel_exactly_once()
 
     assert_eq!(
         revocation_counts(&state),
-        [0, 0, 0, 3, 0],
+        [0, 0, 0, 3, 0, 0, 0],
         "each live tunnel is revoked exactly once"
     );
     let fence = &state.hbone_admission_fence;
@@ -1187,7 +1218,7 @@ async fn an_authorization_denial_outranks_a_transport_mismatch_in_one_sweep() {
 
     let tunnel = fence.admit(dual_gate_snapshot(proxy, fence.sweep_epoch()));
     assert_eq!(tunnel.revoked_reason(), None);
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0]);
 
     // STRICT arms the transport gate for this plaintext tunnel AND is what
     // schedules the single sweep that now sees both gates failing.
@@ -1205,7 +1236,7 @@ async fn an_authorization_denial_outranks_a_transport_mismatch_in_one_sweep() {
     );
     assert_eq!(
         revocation_counts(&state),
-        [0, 0, 0, 1, 0],
+        [0, 0, 0, 1, 0, 0, 0],
         "exactly one authorization_denied revocation, and no peer_auth_transport one"
     );
     assert!(
@@ -1253,7 +1284,7 @@ async fn a_tunnel_the_relay_retired_first_is_never_counted_or_classified_as_revo
     );
     assert_eq!(
         revocation_counts(&state),
-        [0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0],
         "a retired tunnel must never be counted as a revocation"
     );
     assert!(
@@ -1291,5 +1322,405 @@ async fn a_revoked_tunnels_reason_survives_the_relays_retire() {
         Some(HboneRevocationReason::RelayDestination),
         "the reason must outlive the relay's retire(), or the datagram relay misreports it"
     );
-    assert_eq!(revocation_counts(&state), [0, 0, 1, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 1, 0]);
+}
+
+// ── Credential dimension (issue #5568) ────────────────────────────────────
+
+/// The peer's trust domain, as it appears in [`CLIENT_SPIFFE`].
+const PEER_TRUST_DOMAIN: &str = "cluster.local";
+/// The gateway's own workload identity. Never consulted by the fence, which
+/// reads only the trust bundles, but a real SVID keeps the published slot the
+/// shape every other consumer expects.
+const GATEWAY_SPIFFE: &str = "spiffe://cluster.local/ns/default/sa/gateway";
+/// `backend_port` on the configured proxy the credential fixtures name.
+///
+/// No socket is ever bound to it and nothing dials it: these fixtures register
+/// a snapshot with the fence directly and assert on the sweep's verdict, so the
+/// value is only a field on a `Proxy` struct — the same way the relay-
+/// destination fixtures above use their generation tag.
+const CREDENTIAL_BACKEND_PORT: u16 = 9600;
+
+/// A self-signed CA plus one SPIFFE leaf it issued, both DER.
+///
+/// Minted here rather than borrowed from `mesh_hbone_tests` so these tests own
+/// the issuing root they assert about: several of them turn on one chain
+/// anchoring in one bundle and not in another.
+struct PeerChain {
+    ca_der: Vec<u8>,
+    leaf_der: Vec<u8>,
+}
+
+fn mint_peer_chain(spiffe: &str) -> PeerChain {
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+        KeyPair, KeyUsagePurpose, SanType, string::Ia5String,
+    };
+
+    let ca_key = KeyPair::generate().expect("ca key");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, format!("{spiffe} issuing CA"));
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let ca_cert = ca_params.self_signed(&ca_key).expect("self-signed ca");
+    let ca_der = ca_cert.der().to_vec();
+    // `Issuer::new` consumes the params + key, so capture the CA DER first.
+    let issuer = Issuer::new(ca_params, ca_key);
+
+    let leaf_key = KeyPair::generate().expect("leaf key");
+    let mut leaf_params = CertificateParams::new(Vec::<String>::new()).expect("leaf params");
+    leaf_params.subject_alt_names.push(SanType::URI(
+        Ia5String::try_from(spiffe.to_string()).expect("spiffe uri san"),
+    ));
+    leaf_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let leaf = leaf_params.signed_by(&leaf_key, &issuer).expect("leaf");
+
+    PeerChain {
+        ca_der,
+        leaf_der: leaf.der().to_vec(),
+    }
+}
+
+/// Publish one gateway trust generation carrying exactly `authorities` for
+/// `trust_domain`.
+///
+/// Goes through `install_gateway_runtime_svid_bundle`, the production SVID
+/// source-rotation entry point, so the publication really is the complete
+/// fence → install → retire → commit transaction that ends at
+/// `publish_live_gateway_trust` — the one writer that schedules the sweep.
+fn publish_gateway_trust(
+    state: &ProxyState,
+    gateway: &PeerChain,
+    trust_domain: &str,
+    authorities: Vec<Vec<u8>>,
+) {
+    let _withdrew = state.install_gateway_runtime_svid_bundle(SvidBundle {
+        spiffe_id: SpiffeId::new(GATEWAY_SPIFFE).expect("gateway spiffe id"),
+        cert_chain_der: vec![gateway.leaf_der.clone()],
+        private_key_pkcs8_der: vec![8, 8, 8].into(),
+        trust_bundles: RuntimeTrustBundleSet {
+            local: RuntimeTrustBundle {
+                trust_domain: TrustDomain::new(trust_domain).expect("trust domain"),
+                x509_authorities: authorities,
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            federated: Default::default(),
+        },
+    });
+}
+
+fn gateway_trust_generation(state: &ProxyState) -> u64 {
+    state.request_epoch.load().gateway_trust().generation()
+}
+
+/// A credential deadline far enough out that the expiry half of the gate never
+/// fires, so a test isolates the trust half.
+fn live_deadline() -> Option<tokio::time::Instant> {
+    Some(tokio::time::Instant::now() + Duration::from_secs(3600))
+}
+
+fn peer_credential(
+    chain: &PeerChain,
+    leaf_not_after: Option<tokio::time::Instant>,
+    anchored_at_admission: bool,
+) -> HbonePeerCredential {
+    HbonePeerCredential {
+        spiffe_id: SpiffeId::new(CLIENT_SPIFFE).expect("client spiffe id"),
+        leaf_der: Arc::new(chain.leaf_der.clone()),
+        intermediates_der: None,
+        leaf_not_after,
+        anchored_at_admission,
+    }
+}
+
+/// An admission snapshot whose ONLY live gate is the credential one.
+///
+/// A configured proxy (so the relay-destination guard does not apply and no
+/// lifecycle generation is recorded), no mesh direction (so the transport gate
+/// is inapplicable), and a published generation carrying no authorize plugins
+/// at all — see [`relay_destination_config`], which does not run mesh
+/// preparation.
+fn credential_snapshot(
+    admission_sweep_epoch: u64,
+    gateway_trust_generation: u64,
+    peer_credential: HbonePeerCredential,
+) -> HboneAdmissionSnapshot {
+    let mut snapshot = synthetic_snapshot(
+        create_mesh_proxy(CREDENTIAL_BACKEND_PORT),
+        HboneRelayDestinationGate::Configured,
+        None,
+        admission_sweep_epoch,
+    );
+    snapshot.gateway_trust_generation = gateway_trust_generation;
+    snapshot.peer_credential = Some(peer_credential);
+    snapshot
+}
+
+/// A state whose published generation exercises nothing but the credential
+/// gate: no relay inventory, no policies, no injected plugins.
+fn credential_state(generation_tag: u16) -> ProxyState {
+    build_state(relay_destination_config(Vec::new(), false, generation_tag))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_trust_rotation_that_keeps_the_peer_anchored_revokes_nothing() {
+    let gateway = mint_peer_chain(GATEWAY_SPIFFE);
+    let peer = mint_peer_chain(CLIENT_SPIFFE);
+    let joining = mint_peer_chain(OTHER_SPIFFE);
+    let state = credential_state(9601);
+
+    publish_gateway_trust(
+        &state,
+        &gateway,
+        PEER_TRUST_DOMAIN,
+        vec![peer.ca_der.clone()],
+    );
+    let admitted_generation = gateway_trust_generation(&state);
+    let fence = &state.hbone_admission_fence;
+    let tunnel = fence.admit(credential_snapshot(
+        fence.sweep_epoch(),
+        admitted_generation,
+        peer_credential(&peer, live_deadline(), true),
+    ));
+    assert_eq!(tunnel.revoked_reason(), None);
+
+    // A CA rotation that ADDS a root: a real new generation, and the authority
+    // that issued this peer's leaf is still in it.
+    publish_gateway_trust(
+        &state,
+        &gateway,
+        PEER_TRUST_DOMAIN,
+        vec![peer.ca_der.clone(), joining.ca_der.clone()],
+    );
+    assert!(
+        gateway_trust_generation(&state) > admitted_generation,
+        "the rotation must advance the gateway trust generation, or the sweep would \
+         legitimately skip the chain re-verification and prove nothing"
+    );
+    wait_for_settled_sweeps(&state).await;
+
+    assert_eq!(tunnel.revoked_reason(), None);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(fence.live_tunnels(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn withdrawing_the_peers_trust_domain_revokes_its_live_tunnel() {
+    let gateway = mint_peer_chain(GATEWAY_SPIFFE);
+    let peer = mint_peer_chain(CLIENT_SPIFFE);
+    let state = credential_state(9602);
+
+    publish_gateway_trust(
+        &state,
+        &gateway,
+        PEER_TRUST_DOMAIN,
+        vec![peer.ca_der.clone()],
+    );
+    let fence = &state.hbone_admission_fence;
+    let tunnel = fence.admit(credential_snapshot(
+        fence.sweep_epoch(),
+        gateway_trust_generation(&state),
+        peer_credential(&peer, live_deadline(), true),
+    ));
+    assert_eq!(tunnel.revoked_reason(), None);
+
+    // The federated trust domain is retired. The peer's own issuing root is
+    // still in the published material — it simply no longer names a trust
+    // domain this gateway accepts, which is exactly what a fresh handshake
+    // would refuse.
+    publish_gateway_trust(&state, &gateway, "partner.local", vec![peer.ca_der.clone()]);
+
+    wait_for_revocation(&tunnel).await;
+    assert_eq!(
+        tunnel.revoked_reason(),
+        Some(HboneRevocationReason::PeerTrust),
+        "a retired trust domain is a credential withdrawal, not a policy denial"
+    );
+    assert_eq!(revocation_counts(&state), [0, 0, 1, 0, 0, 0, 0]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rotating_away_the_issuing_authority_revokes_its_live_tunnel() {
+    let gateway = mint_peer_chain(GATEWAY_SPIFFE);
+    let peer = mint_peer_chain(CLIENT_SPIFFE);
+    let replacement = mint_peer_chain(OTHER_SPIFFE);
+    let state = credential_state(9603);
+
+    publish_gateway_trust(
+        &state,
+        &gateway,
+        PEER_TRUST_DOMAIN,
+        vec![peer.ca_der.clone()],
+    );
+    let fence = &state.hbone_admission_fence;
+    let tunnel = fence.admit(credential_snapshot(
+        fence.sweep_epoch(),
+        gateway_trust_generation(&state),
+        peer_credential(&peer, live_deadline(), true),
+    ));
+    assert_eq!(tunnel.revoked_reason(), None);
+
+    // Same trust domain, different root: the retained chain no longer builds a
+    // path. Only re-verifying the chain can see this — the trust domain is
+    // still present, so a membership check alone would keep the tunnel.
+    publish_gateway_trust(
+        &state,
+        &gateway,
+        PEER_TRUST_DOMAIN,
+        vec![replacement.ca_der.clone()],
+    );
+
+    wait_for_revocation(&tunnel).await;
+    assert_eq!(
+        tunnel.revoked_reason(),
+        Some(HboneRevocationReason::PeerTrust)
+    );
+    assert_eq!(revocation_counts(&state), [0, 0, 1, 0, 0, 0, 0]);
+}
+
+/// The one revocation nothing publishes. An established inbound mTLS session is
+/// never re-handshaked, so a peer SVID that simply ages out on an otherwise
+/// quiet mesh is ended by the fence's own expiry watcher or by nothing at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expired_peer_svid_is_revoked_with_no_publication_at_all() {
+    let peer = mint_peer_chain(CLIENT_SPIFFE);
+    let state = credential_state(9604);
+    let fence = &state.hbone_admission_fence;
+    let sweep_epoch_before = fence.sweep_epoch();
+
+    // `Instant::now()` is monotonic and non-decreasing and the gate compares
+    // `>=`, so this deadline is already elapsed for every later clock read —
+    // without the panic risk of subtracting from a fresh monotonic instant.
+    let tunnel = fence.admit(credential_snapshot(
+        sweep_epoch_before,
+        gateway_trust_generation(&state),
+        peer_credential(&peer, Some(tokio::time::Instant::now()), false),
+    ));
+
+    wait_for_revocation(&tunnel).await;
+    assert_eq!(
+        tunnel.revoked_reason(),
+        Some(HboneRevocationReason::PeerExpired),
+        "an aged-out leaf is `peer_expired`, never folded into the trust verdict"
+    );
+    assert_eq!(revocation_counts(&state), [0, 1, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        fence.sweep_epoch(),
+        sweep_epoch_before,
+        "the expiry watcher must sweep directly, not through the coalescing \
+         publication counter"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_trust_bundle_that_cannot_be_compiled_fails_closed() {
+    let gateway = mint_peer_chain(GATEWAY_SPIFFE);
+    let peer = mint_peer_chain(CLIENT_SPIFFE);
+    let state = credential_state(9605);
+
+    publish_gateway_trust(
+        &state,
+        &gateway,
+        PEER_TRUST_DOMAIN,
+        vec![peer.ca_der.clone()],
+    );
+    let fence = &state.hbone_admission_fence;
+    let tunnel = fence.admit(credential_snapshot(
+        fence.sweep_epoch(),
+        gateway_trust_generation(&state),
+        peer_credential(&peer, live_deadline(), true),
+    ));
+    assert_eq!(tunnel.revoked_reason(), None);
+
+    // The published generation still declares the peer's trust domain, but its
+    // authorities are not usable trust roots, so the sweep can produce no
+    // verdict for anything anchored there.
+    publish_gateway_trust(
+        &state,
+        &gateway,
+        PEER_TRUST_DOMAIN,
+        vec![b"not-a-certificate".to_vec()],
+    );
+
+    wait_for_revocation(&tunnel).await;
+    assert_eq!(
+        tunnel.revoked_reason(),
+        Some(HboneRevocationReason::ReevaluationFailed),
+        "an unjudgeable trust state cuts the tunnel rather than leaving it serving"
+    );
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 1]);
+}
+
+/// The guard against a false mass revocation: a mesh inbound listener with no
+/// gateway SVID material verifies peers chain-only against the operator client
+/// CA bundle, which the request epoch's gateway trust does not describe at all.
+/// Such a tunnel was never anchored by a gateway trust generation, so the trust
+/// half of the gate must never judge it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_the_admitting_generation_never_anchored_is_not_revoked_for_trust() {
+    let gateway = mint_peer_chain(GATEWAY_SPIFFE);
+    let peer = mint_peer_chain(CLIENT_SPIFFE);
+    let unrelated = mint_peer_chain(OTHER_SPIFFE);
+    let state = credential_state(9606);
+
+    // The admitting generation carries a bundle for an unrelated trust domain,
+    // so it never anchored this peer.
+    publish_gateway_trust(
+        &state,
+        &gateway,
+        "partner.local",
+        vec![unrelated.ca_der.clone()],
+    );
+    let fence = &state.hbone_admission_fence;
+    let tunnel = fence.admit(credential_snapshot(
+        fence.sweep_epoch(),
+        gateway_trust_generation(&state),
+        peer_credential(&peer, live_deadline(), false),
+    ));
+
+    publish_gateway_trust(&state, &gateway, "other.local", vec![unrelated.ca_der]);
+    wait_for_settled_sweeps(&state).await;
+
+    assert_eq!(tunnel.revoked_reason(), None);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(fence.live_tunnels(), 1);
+}
+
+/// The credential gate is only as good as the publication that schedules it.
+/// `publish_live_gateway_trust` is the ONE writer of the request-facing trust
+/// generation, and every trust publisher — an accepted `Replace`/`Clear`, a
+/// SPIRE/file/CA-backend SVID source rotation, and the request-epoch
+/// publication — ends there. Pinning the sweep request inside it is what keeps
+/// a future publisher from growing its own path and silently leaving live
+/// tunnels judged against retired trust.
+#[test]
+fn the_single_gateway_trust_publisher_requests_a_sweep() {
+    let source = include_str!("../../src/proxy/mod.rs");
+    let start = source
+        .find("fn publish_live_gateway_trust(&self) {")
+        .expect("publish_live_gateway_trust must exist");
+    let body = &source[start..];
+    let end = body
+        .find("\n    /// Whether request paths may authenticate gateway-to-mesh peers")
+        .expect("admits_gateway_mesh_identity follows the live-trust publisher");
+    let func = &body[..end];
+
+    let store = func
+        .find("self.request_epoch.update_gateway_trust(")
+        .expect("the epoch store is what publishes the trust generation");
+    let sweep = func
+        .find("self.hbone_admission_fence.request_sweep()")
+        .expect("every gateway trust publication must schedule an admission-fence sweep");
+    assert!(
+        store < sweep,
+        "publish-then-recheck: the sweep must be requested AFTER the store, or a CONNECT that \
+         read the superseded trust could register between them and never be re-judged"
+    );
 }

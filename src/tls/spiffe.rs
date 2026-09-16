@@ -741,6 +741,124 @@ fn build_peer_chain_verifier(
         .map_err(|e| format!("webpki verifier build failed: {e}"))
 }
 
+/// Verdict of re-checking an ALREADY-ADMITTED peer chain against the trust
+/// bundles a later generation published (issue #5568).
+///
+/// Deliberately separate from the handshake path: nothing here admits anything.
+/// It answers only whether a chain this gateway already accepted would still
+/// anchor, so the HBONE admission fence can revoke a live tunnel whose issuing
+/// trust was retired. No certificate, subject, or authority material reaches
+/// the caller — the fence renders a fixed reason label from this verdict alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmittedPeerTrustVerdict {
+    /// The retained chain still validates against the published bundle for its
+    /// trust domain.
+    Trusted,
+    /// The trust domain is gone from the published set, declares no X.509
+    /// authority at all, or the retained chain no longer validates under it.
+    Withdrawn,
+    /// No verdict could be produced: the published bundle for that trust domain
+    /// is not compilable into a verifier, or nothing was retained to verify.
+    /// The caller must fail CLOSED — this is not "still trusted".
+    Unverifiable,
+}
+
+/// What one trust domain's published bundle compiled to.
+enum CompiledPeerAnchors {
+    Verifier(PeerChainVerifier),
+    /// The set declares the trust domain but carries no X.509 authority, so it
+    /// can anchor nothing. That is a WITHDRAWAL, not an inability to judge —
+    /// and it has to be classified before the builder sees it, because
+    /// `WebPkiClientVerifier` also refuses to build from an empty root store,
+    /// which would otherwise report a withdrawn authority as a fence failure.
+    NoAnchors,
+    /// The declared authorities are not usable trust roots.
+    Unusable,
+}
+
+/// Chain verifiers compiled from the trust bundles one published generation
+/// carries, for re-checking peers that were admitted under an earlier one.
+pub(crate) struct AdmittedPeerTrustAnchors {
+    by_trust_domain: HashMap<TrustDomain, CompiledPeerAnchors>,
+}
+
+impl AdmittedPeerTrustAnchors {
+    /// Compile every trust domain in `trust_bundles` into one chain verifier.
+    ///
+    /// Built ONCE per admission-fence sweep, never per tunnel: a namespace-wide
+    /// trust change re-checks every live tunnel against the same two or three
+    /// domains, and rebuilding a `RootCertStore` per tunnel would make an
+    /// operator's CA rotation quadratic in live tunnels.
+    ///
+    /// Trust-domain precedence mirrors [`TrustBundleSet::get`]: the local
+    /// bundle wins over a federated entry declaring the same domain.
+    ///
+    /// CRLs are deliberately NOT applied. The mesh inbound CRL snapshot belongs
+    /// to the inbound TLS reload state rather than to the request epoch this
+    /// re-check reads, so this stays strictly a trust-anchor question; see
+    /// `docs/mesh.md` → "HBONE Admission Fence".
+    pub(crate) fn compile(trust_bundles: &TrustBundleSet) -> Self {
+        let mut by_trust_domain: HashMap<TrustDomain, CompiledPeerAnchors> = HashMap::new();
+        let declared = std::iter::once((&trust_bundles.local.trust_domain, &trust_bundles.local))
+            .chain(trust_bundles.federated.iter());
+        for (trust_domain, bundle) in declared {
+            if by_trust_domain.contains_key(trust_domain) {
+                continue;
+            }
+            let compiled = if bundle.x509_authorities.is_empty() {
+                CompiledPeerAnchors::NoAnchors
+            } else {
+                match build_peer_chain_verifier(bundle, &[]) {
+                    Ok(verifier) => CompiledPeerAnchors::Verifier(verifier),
+                    Err(error) => {
+                        debug!(
+                            %trust_domain,
+                            %error,
+                            "Published trust bundle could not be compiled into a peer chain \
+                             verifier; live tunnels anchored in it fail closed"
+                        );
+                        CompiledPeerAnchors::Unusable
+                    }
+                }
+            };
+            by_trust_domain.insert(trust_domain.clone(), compiled);
+        }
+        Self { by_trust_domain }
+    }
+
+    /// Re-check one retained peer chain against the published anchors for
+    /// `trust_domain`. Takes the leaf and its intermediates separately, exactly
+    /// as the handshake verifier does, so the retained DER is borrowed rather
+    /// than reassembled.
+    pub(crate) fn recheck(
+        &self,
+        trust_domain: &TrustDomain,
+        leaf_der: &[u8],
+        intermediates_der: &[Vec<u8>],
+    ) -> AdmittedPeerTrustVerdict {
+        let Some(compiled) = self.by_trust_domain.get(trust_domain) else {
+            return AdmittedPeerTrustVerdict::Withdrawn;
+        };
+        let verifier = match compiled {
+            CompiledPeerAnchors::Verifier(verifier) => verifier,
+            CompiledPeerAnchors::NoAnchors => return AdmittedPeerTrustVerdict::Withdrawn,
+            CompiledPeerAnchors::Unusable => return AdmittedPeerTrustVerdict::Unverifiable,
+        };
+        if leaf_der.is_empty() {
+            return AdmittedPeerTrustVerdict::Unverifiable;
+        }
+        let end_entity = CertificateDer::from(leaf_der);
+        let intermediates: Vec<CertificateDer<'_>> = intermediates_der
+            .iter()
+            .map(|der| CertificateDer::from(der.as_slice()))
+            .collect();
+        match verify_peer_chain(verifier.as_ref(), &end_entity, &intermediates) {
+            Ok(()) => AdmittedPeerTrustVerdict::Trusted,
+            Err(_) => AdmittedPeerTrustVerdict::Withdrawn,
+        }
+    }
+}
+
 fn extract_and_check_peer_spiffe_id(
     end_entity: &CertificateDer<'_>,
     expected_peer: Option<&SpiffeId>,
