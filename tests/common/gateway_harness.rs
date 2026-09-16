@@ -80,6 +80,25 @@
 //! Callers that pin `FERRUM_ADMIN_JWT_SECRET` / `FERRUM_METRICS_BEARER_TOKEN`
 //! (or open `FERRUM_METRICS_ALLOWED_CIDRS`) keep their explicit value; identity
 //! is then only as unique as what they chose.
+//!
+//! # Log filter isolation (issue #5533)
+//!
+//! Production tracing prefers `RUST_LOG` (`EnvFilter::try_from_default_env()`)
+//! over `FERRUM_LOG_LEVEL`. [`TestGatewayBuilder::log_level`] previously set
+//! only the latter, so a developer shell with `RUST_LOG=warn` hid debug lines
+//! that log-asserting tests require and produced false failures.
+//!
+//! Every spawn therefore pins the child's `RUST_LOG` to the effective
+//! `FERRUM_LOG_LEVEL` unless the test already set `RUST_LOG` via
+//! [`.env`](TestGatewayBuilder::env). Inherited parent-shell `RUST_LOG` is
+//! never forwarded.
+//!
+//! To raise verbosity on tests that did **not** request a specific filter, set
+//! [`HARNESS_GATEWAY_RUST_LOG_OPT_IN`] (`FERRUM_TEST_GATEWAY_RUST_LOG`) in the
+//! parent. That harness-only opt-in is ignored when the test already chose
+//! `.log_level()`, `.env("FERRUM_LOG_LEVEL", ...)`, or `.env("RUST_LOG", ...)`,
+//! so log assertions stay deterministic. Bespoke spawners that do not go
+//! through [`TestGateway`] should call [`pin_gateway_command_rust_log`].
 
 use super::port_registry::TestSocket;
 
@@ -178,8 +197,9 @@ pub struct TestGateway {
 
 impl TestGateway {
     /// Start a fluent builder. Sets sensible defaults: `FERRUM_MODE=database`
-    /// with SQLite, `FERRUM_LOG_LEVEL=info`, 30s health timeout, 3 retry
-    /// attempts, pool warmup disabled (tests are ephemeral).
+    /// with SQLite, `FERRUM_LOG_LEVEL=info` (and a matching `RUST_LOG` pin),
+    /// 30s health timeout, 3 retry attempts, pool warmup disabled (tests are
+    /// ephemeral).
     pub fn builder() -> TestGatewayBuilder {
         TestGatewayBuilder::default()
     }
@@ -567,6 +587,9 @@ pub struct TestGatewayBuilder {
     auto_build: bool,
     prefer_release: bool,
     extra_env: Vec<(String, String)>,
+    /// `true` after [`Self::log_level`] — the test requested a specific
+    /// filter, so [`HARNESS_GATEWAY_RUST_LOG_OPT_IN`] must not override it.
+    log_level_explicit: bool,
     /// Env var names that receive a FRESH ephemeral port on every spawn
     /// attempt (see [`Self::env_ephemeral_port`]).
     ephemeral_port_env: Vec<String>,
@@ -602,6 +625,7 @@ impl Default for TestGatewayBuilder {
             auto_build: true,
             prefer_release: false,
             extra_env: Vec::new(),
+            log_level_explicit: false,
             ephemeral_port_env: Vec::new(),
             reserved_listener_ports: HashSet::new(),
             scrub_env: Vec::new(),
@@ -689,9 +713,16 @@ impl TestGatewayBuilder {
         self
     }
 
-    /// Set `FERRUM_LOG_LEVEL`. Defaults to `info`.
+    /// Set `FERRUM_LOG_LEVEL` and pin the child's `RUST_LOG` to the same
+    /// value. Defaults to `info`.
+    ///
+    /// Production `EnvFilter::try_from_default_env()` prefers `RUST_LOG` over
+    /// `FERRUM_LOG_LEVEL`, so this pin is what makes log-asserting tests
+    /// independent of the caller's shell (issue #5533). `.env("RUST_LOG", ...)`
+    /// still wins when a test needs a target-specific directive.
     pub fn log_level(mut self, level: impl Into<String>) -> Self {
         self.log_level = level.into();
+        self.log_level_explicit = true;
         self
     }
 
@@ -723,6 +754,9 @@ impl TestGatewayBuilder {
 
     /// Add a custom env var. Takes precedence over the builder's defaults,
     /// so `.env("FERRUM_LOG_LEVEL", "debug")` overrides `.log_level(..)`.
+    ///
+    /// `.env("RUST_LOG", ...)` pins the child's tracing filter directly and
+    /// skips the default pin-to-`FERRUM_LOG_LEVEL` behaviour.
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.extra_env.push((key.into(), value.into()));
         self
@@ -932,26 +966,11 @@ impl TestGatewayBuilder {
             port_holds.push(hold);
         }
 
+        isolate_spawned_gateway_log_env(self, &mut env);
+
         let mut cmd = Command::new(&binary);
         cmd.arg("run");
-        if self.clear_env {
-            cmd.env_clear();
-            preserve_base_env(&mut cmd);
-        }
-        for key in &self.scrub_env {
-            cmd.env_remove(key);
-        }
-        // Clear common parent-shell `FERRUM_*` leakage so builder defaults win
-        // deterministically. Only vars not explicitly set by the builder get
-        // removed — `env` below re-sets the ones we care about.
-        for var in SCRUB_DEFAULTS.iter() {
-            if !env.contains_key(*var) {
-                cmd.env_remove(*var);
-            }
-        }
-        for (k, v) in &env {
-            cmd.env(k, v);
-        }
+        apply_builder_env_to_command(&mut cmd, self, &env);
         let stdout_path = self
             .capture_output
             .then(|| temp_dir.path().join("gateway.stdout.log"));
@@ -1089,23 +1108,11 @@ impl TestGatewayBuilder {
             env.insert(k.clone(), v.clone());
         }
 
+        isolate_spawned_gateway_log_env(self, &mut env);
+
         let mut cmd = Command::new(&binary);
         cmd.arg("run");
-        if self.clear_env {
-            cmd.env_clear();
-            preserve_base_env(&mut cmd);
-        }
-        for key in &self.scrub_env {
-            cmd.env_remove(key);
-        }
-        for var in SCRUB_DEFAULTS.iter() {
-            if !env.contains_key(*var) {
-                cmd.env_remove(*var);
-            }
-        }
-        for (k, v) in &env {
-            cmd.env(k, v);
-        }
+        apply_builder_env_to_command(&mut cmd, self, &env);
         parse_port_override(&env, "FERRUM_PROXY_HTTP_PORT", proxy_port)?;
         parse_port_override(&env, "FERRUM_ADMIN_HTTP_PORT", admin_port)?;
         let stdout_path = temp_dir.path().join("gateway.stdout.log");
@@ -1336,6 +1343,11 @@ const SCRUB_DEFAULTS: &[&str] = &[
     "FERRUM_ADMIN_MAX_CONNECTIONS",
     "FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP",
     "FERRUM_LOG_LEVEL",
+    // Production tracing prefers `RUST_LOG` over `FERRUM_LOG_LEVEL`. Scrub the
+    // inherited parent-shell value so log-asserting tests cannot be silenced
+    // by `RUST_LOG=warn` (issue #5533). `isolate_spawned_gateway_log_env`
+    // re-inserts the pin after extra_env is merged.
+    "RUST_LOG",
     "FERRUM_POOL_WARMUP_ENABLED",
     "FERRUM_ACCEPT_THREADS",
     "FERRUM_BASIC_AUTH_HMAC_SECRET",
@@ -1356,6 +1368,110 @@ const SCRUB_DEFAULTS: &[&str] = &[
     "FERRUM_METRICS_BEARER_TOKEN",
     "FERRUM_METRICS_ALLOWED_CIDRS",
 ];
+
+/// Parent-process env var that opts a spawned gateway into a developer-chosen
+/// `RUST_LOG` filter. Read only by this harness; never forwarded as itself.
+///
+/// Ignored when the test already requested a filter via
+/// [`TestGatewayBuilder::log_level`], `.env("FERRUM_LOG_LEVEL", ...)`, or
+/// `.env("RUST_LOG", ...)`, so log assertions stay independent of the
+/// caller's shell (issue #5533).
+pub const HARNESS_GATEWAY_RUST_LOG_OPT_IN: &str = "FERRUM_TEST_GATEWAY_RUST_LOG";
+
+/// Pin `RUST_LOG` on a bespoke spawned-gateway `Command` so an inherited
+/// parent-shell filter cannot hide log assertions (issue #5533).
+///
+/// Production `EnvFilter::try_from_default_env()` prefers `RUST_LOG` over
+/// `FERRUM_LOG_LEVEL`. Call this with the same level the test already set as
+/// `FERRUM_LOG_LEVEL`, or a target-specific directive. A later
+/// `.env("RUST_LOG", ...)` still wins.
+///
+/// This helper always pins the requested filter and does **not** honour
+/// [`HARNESS_GATEWAY_RUST_LOG_OPT_IN`]; log-asserting tests must observe the
+/// lines they asked for. [`TestGateway`] callers get the same isolation
+/// automatically.
+pub fn pin_gateway_command_rust_log(cmd: &mut Command, filter: &str) {
+    cmd.env("RUST_LOG", filter);
+}
+
+/// Pin the child's tracing filter so log-asserting tests do not inherit the
+/// caller's `RUST_LOG`.
+///
+/// Rules (issue #5533):
+/// 1. If `env` already contains `RUST_LOG` (`.env("RUST_LOG", ...)`), keep it.
+/// 2. Else if the test explicitly chose a filter via `.log_level()` or
+///    `.env("FERRUM_LOG_LEVEL", ...)`, set `RUST_LOG` to the effective
+///    `FERRUM_LOG_LEVEL` so both knobs agree.
+/// 3. Else if `opt_in_rust_log` is a non-empty harness debug opt-in, use that.
+/// 4. Else set `RUST_LOG` to the effective `FERRUM_LOG_LEVEL` (default `info`)
+///    so a parent-shell `RUST_LOG=warn` cannot leak through.
+fn pin_spawned_gateway_log_filter(
+    env: &mut HashMap<String, String>,
+    log_level_explicit: bool,
+    extra_env_set_ferrum_log_level: bool,
+    opt_in_rust_log: Option<&str>,
+) {
+    if env.contains_key("RUST_LOG") {
+        return;
+    }
+    let ferrum_level = env
+        .get("FERRUM_LOG_LEVEL")
+        .cloned()
+        .unwrap_or_else(|| "info".to_string());
+    let test_requested_filter = log_level_explicit || extra_env_set_ferrum_log_level;
+    if !test_requested_filter
+        && let Some(opt_in) = opt_in_rust_log
+        && !opt_in.is_empty()
+    {
+        env.insert("RUST_LOG".to_string(), opt_in.to_string());
+        return;
+    }
+    env.insert("RUST_LOG".to_string(), ferrum_level);
+}
+
+fn isolate_spawned_gateway_log_env(
+    builder: &TestGatewayBuilder,
+    env: &mut HashMap<String, String>,
+) {
+    let extra_env_set_ferrum_log_level = builder
+        .extra_env
+        .iter()
+        .any(|(key, _)| key == "FERRUM_LOG_LEVEL");
+    let opt_in = std::env::var(HARNESS_GATEWAY_RUST_LOG_OPT_IN).ok();
+    pin_spawned_gateway_log_filter(
+        env,
+        builder.log_level_explicit,
+        extra_env_set_ferrum_log_level,
+        opt_in.as_deref(),
+    );
+}
+
+/// Apply the builder's env map to `cmd`, scrubbing inherited parent-shell
+/// leakage first so builder defaults (and the log-filter pin) win.
+fn apply_builder_env_to_command(
+    cmd: &mut Command,
+    builder: &TestGatewayBuilder,
+    env: &HashMap<String, String>,
+) {
+    if builder.clear_env {
+        cmd.env_clear();
+        preserve_base_env(cmd);
+    }
+    for key in &builder.scrub_env {
+        cmd.env_remove(key);
+    }
+    // Clear common parent-shell `FERRUM_*` / `RUST_LOG` leakage so builder
+    // defaults win deterministically. Only vars not explicitly set by the
+    // builder get removed — `env` below re-sets the ones we care about.
+    for var in SCRUB_DEFAULTS.iter() {
+        if !env.contains_key(*var) {
+            cmd.env_remove(*var);
+        }
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+}
 
 /// Per-spawn-attempt credentials that make one gateway process individually
 /// identifiable on its admin port.
@@ -2560,5 +2676,109 @@ mod ownership_proof_tests {
 
         let _ = child.wait();
         listener.abort();
+    }
+}
+
+#[cfg(test)]
+mod log_filter_isolation_tests {
+    use super::*;
+
+    fn ferrum_debug() -> HashMap<String, String> {
+        HashMap::from([("FERRUM_LOG_LEVEL".to_string(), "debug".to_string())])
+    }
+
+    #[test]
+    fn explicit_log_level_pins_rust_log_and_ignores_opt_in() {
+        let mut env = ferrum_debug();
+        pin_spawned_gateway_log_filter(&mut env, true, false, Some("error"));
+        assert_eq!(env.get("RUST_LOG").map(String::as_str), Some("debug"));
+    }
+
+    #[test]
+    fn extra_env_rust_log_wins_over_log_level_and_opt_in() {
+        let mut env = ferrum_debug();
+        env.insert("RUST_LOG".to_string(), "ws_frame_log=info".to_string());
+        pin_spawned_gateway_log_filter(&mut env, true, false, Some("error"));
+        assert_eq!(
+            env.get("RUST_LOG").map(String::as_str),
+            Some("ws_frame_log=info")
+        );
+    }
+
+    #[test]
+    fn extra_env_ferrum_log_level_pins_rust_log_and_ignores_opt_in() {
+        let mut env = ferrum_debug();
+        pin_spawned_gateway_log_filter(&mut env, false, true, Some("error"));
+        assert_eq!(env.get("RUST_LOG").map(String::as_str), Some("debug"));
+    }
+
+    #[test]
+    fn default_log_level_uses_nonempty_opt_in() {
+        let mut env = HashMap::from([("FERRUM_LOG_LEVEL".to_string(), "info".to_string())]);
+        pin_spawned_gateway_log_filter(&mut env, false, false, Some("ferrum_edge=trace"));
+        assert_eq!(
+            env.get("RUST_LOG").map(String::as_str),
+            Some("ferrum_edge=trace")
+        );
+    }
+
+    #[test]
+    fn default_log_level_pins_info_without_opt_in() {
+        let mut env = HashMap::from([("FERRUM_LOG_LEVEL".to_string(), "info".to_string())]);
+        pin_spawned_gateway_log_filter(&mut env, false, false, None);
+        assert_eq!(env.get("RUST_LOG").map(String::as_str), Some("info"));
+    }
+
+    #[test]
+    fn empty_opt_in_is_ignored() {
+        let mut env = HashMap::from([("FERRUM_LOG_LEVEL".to_string(), "info".to_string())]);
+        pin_spawned_gateway_log_filter(&mut env, false, false, Some(""));
+        assert_eq!(env.get("RUST_LOG").map(String::as_str), Some("info"));
+    }
+
+    #[test]
+    fn inherited_rust_log_is_in_scrub_defaults() {
+        assert!(
+            SCRUB_DEFAULTS.contains(&"RUST_LOG"),
+            "inherited RUST_LOG must be scrubbed unless the env map pins it"
+        );
+        assert!(SCRUB_DEFAULTS.contains(&"FERRUM_LOG_LEVEL"));
+    }
+
+    /// Count the lines that start with `call`: the needle also appears in
+    /// this test module's own source, so a plain substring count would
+    /// include itself.
+    fn call_sites(src: &str, call: &str) -> usize {
+        src.lines()
+            .filter(|line| line.trim_start().starts_with(call))
+            .count()
+    }
+
+    #[test]
+    fn both_spawn_paths_isolate_log_filter() {
+        let src = include_str!("gateway_harness.rs");
+        assert_eq!(
+            call_sites(src, "isolate_spawned_gateway_log_env(self, &mut env);"),
+            2,
+            "try_spawn and try_spawn_expect_failure must both isolate log filters"
+        );
+        assert_eq!(
+            call_sites(src, "apply_builder_env_to_command(&mut cmd, self, &env);"),
+            2,
+            "both spawn paths must share apply_builder_env_to_command"
+        );
+        assert_eq!(
+            HARNESS_GATEWAY_RUST_LOG_OPT_IN,
+            "FERRUM_TEST_GATEWAY_RUST_LOG"
+        );
+    }
+
+    #[test]
+    fn builder_log_level_marks_the_filter_explicit() {
+        let unset = TestGatewayBuilder::default();
+        assert!(!unset.log_level_explicit);
+        let set = TestGateway::builder().log_level("debug");
+        assert!(set.log_level_explicit);
+        assert_eq!(set.log_level, "debug");
     }
 }
