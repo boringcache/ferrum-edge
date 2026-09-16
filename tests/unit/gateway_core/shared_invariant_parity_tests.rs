@@ -50,7 +50,18 @@ fn repository_root() -> PathBuf {
 fn database_tls_snapshot_and_reload_cover_all_sql_consumers() {
     let loader = source("src/config/db_loader.rs");
     assert!(loader.contains("snapshot.pin(options)"));
-    assert!(loader.contains("snapshot.pin(Self::build_pool_options_from_config"));
+    // The backup-bootstrap pool snapshots best-effort: it pins the snapshot
+    // when the material is readable and otherwise starts from the unmodified
+    // URL, so the first successful reconnect restores the retained-material
+    // guarantee instead of the gateway failing to come up.
+    let offline = item_body(
+        &loader,
+        "pub fn connect_offline_with_pool_config(",
+        "\n    }",
+    );
+    assert!(offline.contains("build_pool_options_from_config(&pool_config, db_type)"));
+    assert!(offline.contains("Ok(snapshot) => snapshot.pin(options)"));
+    assert!(offline.contains("(options, db_url.to_string())"));
     for path in ["src/modes/database.rs", "src/modes/control_plane.rs"] {
         let mode = source(path);
         assert!(mode.contains("start_db_tls_reload_task("), "{path}");
