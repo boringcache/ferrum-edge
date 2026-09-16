@@ -16,6 +16,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   development databases after baseline changes; custom-plugin migrations are
   unchanged. The external ClickHouse baseline is now
   `schemas/clickhouse/charges.sql`.
+- **WAF scan budget never skips a body scan** (issue #5528). `scan_budget_ms` is
+  now a post-hoc deadline on every surface. The body and WebSocket-message path
+  used to bail out *before* the scan when the tokio scheduler alone had burned
+  the budget across the plugin's pre-scan yield, which discarded an enforcing
+  body rule's verdict entirely and — with the fail-open timeout default —
+  forwarded the body unscanned. Scheduler latency is attacker-influenceable with
+  a cheap request flood, so that turned a wall-clock deadline into an on-demand
+  way to retire an enforcing body rule. The scan now always runs to completion
+  and its hits always decide first, so an enforcing hit found over budget still
+  rejects. The budget clock also starts *after* the fairness yield, so it bounds
+  the scan's own `O(active_rules × max_scan_bytes)` cost rather than scheduler
+  re-poll delay.
+- **WAF `on_scan_timeout` gains an opt-in `fail_closed` disposition**
+  (issue #5528). The default is unchanged (`log_and_allow`): now that the scan
+  always completes, an over-budget clean result names a body the WAF inspected
+  end to end and found nothing in, so the budget is a latency signal rather than
+  a coverage gap. The new `fail_closed` value rejects such a body when the
+  governed direction carries an enforcing body policy
+  (`request_body_policy_enforces` / `response_body_policy_enforces`, which also
+  count an `on_body_too_large: block` size cap while globally enforcing) and
+  logs and allows otherwise, matching the vocabulary and shape of
+  `on_body_too_large: fail_closed`; `block` still rejects unconditionally on
+  every surface. **Operators enabling `fail_closed` or `block` should first
+  measure their `waf.scan_timed_out` rate** — a deployment whose scans routinely
+  exceed `scan_budget_ms` will begin rejecting that traffic with no rule having
+  matched. A timeout rejection carries `waf.action=blocked` with the new
+  `waf.block_reason=scan_timeout`. On WebSocket, the session policy resolves
+  `fail_closed` through the same disjunction as the HTTP path, and a missed
+  deadline is now warned about independently of `log_to_stdout`, since messages
+  carry no `waf.*` metadata.
 
 ## [0.9.5] - 2026-09-13
 

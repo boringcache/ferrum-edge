@@ -1334,6 +1334,14 @@ async fn restore_rejects_non_object_envelopes_before_deleting_configuration() {
         ),
         r#"{"proxies":[],"unknown_top_level":true}"#,
         r#"{"Proxies":[]}"#,
+        // The accepted-and-ignored `GET /backup` metadata is shape-checked
+        // against what `openapi.yaml` publishes: `counts` is `type: object`,
+        // so a non-object is a `400` before the destructive clear rather than
+        // an ignored member on a malformed artifact.
+        r#"{"counts":[]}"#,
+        r#"{"counts":5}"#,
+        r#"{"counts":"3"}"#,
+        r#"{"proxies":[],"counts":true}"#,
     ] {
         let (status, body) = post_admin_raw(&base, "/restore?confirm=true", &admin, hostile).await;
         assert_eq!(status, 400, "{hostile} must be rejected, got {body}");

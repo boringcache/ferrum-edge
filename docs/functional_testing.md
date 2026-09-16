@@ -4,6 +4,23 @@ This document describes the functional testing strategy for the Ferrum Edge, par
 
 ## Test Files
 
+### admin_metrics_tls_inventory_snapshot_tests.rs
+
+The TLS inventory scrape regressions run in-process through real admin listeners:
+
+```bash
+cargo test --test integration_tests admin
+```
+
+Each counting fixture owns its inventory cache and metrics registry. The suite
+checks concurrent fixtures, config reload invalidation, serving-cycle replacement,
+single-flight collection, and fetch-free cached scrapes. Collector channels and
+joined refresh tasks provide synchronization without sleeps or retries; the broad
+Cargo invocation uses its normal parallel test threads, which hosted CI does not
+exercise (it runs integration tests under nextest, one process per test).
+Production retains the process-wide cache, TTL, and TLS-event invalidation
+behavior.
+
 ### cp_dp_grpc_tests.rs
 
 Located in `tests/integration/cp_dp_grpc_tests.rs`, this file contains integration tests for gRPC communication between CP and DP.
@@ -358,6 +375,17 @@ Tests that pin `FERRUM_ADMIN_JWT_SECRET` or `FERRUM_METRICS_BEARER_TOKEN`
 (or open `FERRUM_METRICS_ALLOWED_CIDRS`) keep their explicit value; their
 identity is then only as unique as the value they chose. The contract is
 covered by `functional_shared_harness_smoke_test`.
+
+Spawned gateways do not inherit the caller's `RUST_LOG`. Production tracing
+prefers `RUST_LOG` over `FERRUM_LOG_LEVEL`, so a developer shell with
+`RUST_LOG=warn` used to hide debug lines that log-asserting tests require
+(issue #5533). `TestGatewayBuilder::log_level` therefore pins both variables.
+Tests that need a target-specific directive still set `.env("RUST_LOG", ...)`.
+To raise verbosity on tests that did **not** request a specific filter, set
+`FERRUM_TEST_GATEWAY_RUST_LOG` in the parent (harness-only; ignored when the
+test already chose `.log_level()`, `FERRUM_LOG_LEVEL`, or `RUST_LOG`). Bespoke
+spawners that do not go through `TestGateway` should call
+`pin_gateway_command_rust_log`.
 
 The same barrier is mandatory for suites that keep a bespoke spawner
 instead of `TestGatewayBuilder`. `functional_websocket_test.rs` reuses the

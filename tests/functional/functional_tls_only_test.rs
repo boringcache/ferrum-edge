@@ -16,8 +16,11 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
 use tempfile::TempDir;
 use tokio::time::sleep;
+
+use crate::common::pin_gateway_command_rust_log;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -437,6 +440,7 @@ async fn functional_tls_only_warn_when_plaintext_disabled_and_no_tls() {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        pin_gateway_command_rust_log(&mut cmd, "warn");
 
         let mut child = cmd.spawn().expect("spawn gateway");
 

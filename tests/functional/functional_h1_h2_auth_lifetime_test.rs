@@ -29,6 +29,13 @@
 //! * exactly one `credential_expired` termination is counted for the `http`
 //!   family on a freshly spawned gateway.
 //!
+//! The HTTP/1.1 case runs twice, against an integer and a fractional `exp`
+//! (issue #5521). Both are conforming RFC 7519 §2 NumericDates and the JWT
+//! layer validates both, but only the integer one used to publish a credential
+//! deadline — so the fractional token authenticated and then held the admitted
+//! stream open indefinitely. The paired runs are the live-wire proof that the
+//! two shapes bound the stream identically.
+//!
 //! Run with:
 //!
 //! ```bash
@@ -63,12 +70,34 @@ const TOKEN_TTL_SECS: i64 = 6;
 /// multi-minute lifetime the backend script below would otherwise keep alive.
 const TERMINATION_GRACE: Duration = Duration::from_secs(20);
 
-fn mint_short_lived_token() -> String {
+/// Which RFC 7519 §2 NumericDate shape the minted `exp` carries.
+///
+/// A NumericDate is a JSON *number*, not an integer, so both shapes are equally
+/// conforming and `jsonwebtoken` validates both. Issue #5521: only the integer
+/// one used to publish a credential deadline, so a fractional `exp` left the
+/// admitted stream unbounded on the live wire.
+#[derive(Clone, Copy)]
+enum ExpShape {
+    /// Whole seconds — the pre-existing positive control.
+    Integer,
+    /// The same instant plus a quarter second. Ferrum truncates an `exp` toward
+    /// the past, so the enforced deadline is the SAME second as the integer
+    /// control: the two cases are directly comparable, and nothing in the
+    /// assertions below depends on sub-second timing.
+    Fractional,
+}
+
+fn mint_short_lived_token(exp_shape: ExpShape) -> String {
     let now = Utc::now();
+    let exp_seconds = (now + chrono::Duration::seconds(TOKEN_TTL_SECS)).timestamp();
+    let exp = match exp_shape {
+        ExpShape::Integer => json!(exp_seconds),
+        ExpShape::Fractional => json!(exp_seconds as f64 + 0.25),
+    };
     let claims = json!({
         "sub": CONSUMER,
         "iat": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(TOKEN_TTL_SECS)).timestamp(),
+        "exp": exp,
     });
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
@@ -233,7 +262,7 @@ async fn h1_h2_auth_lifetime_zero_flow_credit_h2_client_cannot_outlive_the_crede
 
     let harness = spawn_gateway(backend_port).await;
     let authority = proxy_authority(&harness);
-    let token = mint_short_lived_token();
+    let token = mint_short_lived_token(ExpShape::Integer);
 
     let tcp = tokio::net::TcpStream::connect(authority.as_str())
         .await
@@ -314,6 +343,29 @@ async fn h1_h2_auth_lifetime_zero_flow_credit_h2_client_cannot_outlive_the_crede
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn h1_h2_auth_lifetime_non_reading_h1_client_cannot_outlive_the_credential() {
+    assert_non_reading_h1_client_cannot_outlive_the_credential(ExpShape::Integer).await;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 3. The same HTTP/1.1 case with a FRACTIONAL `exp` (issue #5521).
+//
+//    RFC 7519 §2 makes a NumericDate a JSON number, so `exp = <secs>.25` is an
+//    ordinary conforming claim that the JWT layer validates exactly like the
+//    integer control above. Ferrum used to read only `as_i64()`/`as_u64()` when
+//    extracting the credential deadline, so this token authenticated and then
+//    published NO bound: the admitted stream outlived its own credential on the
+//    live wire, which is the state the integer control cannot observe.
+//
+//    Everything else is byte-identical to case 2, including the deadline: the
+//    truncation is toward the past, so `<secs>.25` lands on `<secs>`.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn h1_h2_auth_lifetime_fractional_exp_h1_client_cannot_outlive_the_credential() {
+    assert_non_reading_h1_client_cannot_outlive_the_credential(ExpShape::Fractional).await;
+}
+
+async fn assert_non_reading_h1_client_cannot_outlive_the_credential(exp_shape: ExpShape) {
     let reservation = reserve_port().await.expect("backend port");
     let backend_port = reservation.port;
     let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
@@ -323,7 +375,7 @@ async fn h1_h2_auth_lifetime_non_reading_h1_client_cannot_outlive_the_credential
 
     let harness = spawn_gateway(backend_port).await;
     let authority = proxy_authority(&harness);
-    let token = mint_short_lived_token();
+    let token = mint_short_lived_token(exp_shape);
 
     let mut tcp = tokio::net::TcpStream::connect(authority.as_str())
         .await

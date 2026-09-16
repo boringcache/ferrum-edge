@@ -612,6 +612,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AcmeCertificateRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -746,6 +748,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "501":
@@ -828,6 +832,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "501":
@@ -849,6 +855,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AcmeOrder"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -1799,6 +1807,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "408":
           $ref: "#/components/responses/RequestTimeout"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
 
   # ── Overload ────────────────────────────────────────────────────────
   /overload:
@@ -1966,6 +1976,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/RuntimeMetricsSnapshot"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -2123,6 +2135,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AdminMetrics"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -2283,6 +2297,8 @@ paths:
                       config_diverged: false
                       config_diverged_since: null
                       config_divergence_recoveries_total: 0
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -2347,6 +2363,8 @@ paths:
                         hbone: unknown
                         last_probe_at_unix_secs: 1714003200
                         last_probe_error: "H2/TLS downgraded after ALPN-negotiated HTTP/1.1 on request path"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "503":
@@ -2419,6 +2437,8 @@ paths:
                     status: joined
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "503":
           description: Proxy state unavailable in this mode
           content:
@@ -2486,6 +2506,8 @@ paths:
                         orig_dst4_cookies: 0
                         orig_dst6_cookies: 0
                         has_policy_scope: false
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -2549,6 +2571,8 @@ paths:
                     name: ratings
                     ports: [8081]
                     workload_count: 1
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -2691,6 +2715,8 @@ paths:
                     duration_ms_avg: 6.7364
                     last_seen_unix_ms: 1779035398000
                     last_seen: "2026-05-17T16:29:58Z"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -2732,6 +2758,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/MeshEgressScopeResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -2820,6 +2848,8 @@ paths:
                     type: string
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           description: No active mesh egress scope
           content:
@@ -2831,6 +2861,8 @@ paths:
                     type: string
         "408":
           $ref: "#/components/responses/RequestTimeout"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "503":
           description: Proxy state unavailable in this mode
           content:
@@ -2910,6 +2942,8 @@ paths:
                           type: [integer, "null"]
                           format: int64
                           description: SPIFFE `spiffe_refresh_hint` from the bundle, if present.
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -3145,6 +3179,8 @@ paths:
                         outbound_trust_active: false
                         inbound_trust_active: false
                         trust_source: blocked_pending_poll
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -3276,6 +3312,8 @@ paths:
                           value:
                             numerator: 25
                             denominator: hundred
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -3753,6 +3791,8 @@ paths:
                       adopted_total: 0
                       foreign_authority_adopt_secs: 300
                       quarantine_active: false
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -3783,7 +3823,8 @@ paths:
         never returned by this endpoint, metrics, or logs. Caller-supplied
         NACK text is discarded rather than retained.
 
-        Returns 404 outside CP mode. Returns 200 with an empty
+        Returns 404 outside CP mode. Returns 400 for an invalid
+        `X-Ferrum-Namespace` header. Returns 200 with an empty
         `data_planes` list when CP mode is active but no local mesh DP
         has subscribed yet. Disconnected rows are retained for 300s;
         the registry hard-caps at 4096 identities.
@@ -3807,6 +3848,7 @@ paths:
                       tracked: 1
                       connected: 1
                       converged: 1
+                      accepted: 0
                       drifted: 0
                       rejecting: 0
                       pending: 0
@@ -3828,11 +3870,55 @@ paths:
                           version: "v2"
                           at: "2026-08-02T15:59:31Z"
                           age_seconds: 29
+                        applied:
+                          version: "v2"
+                          at: "2026-08-02T15:59:32Z"
+                          age_seconds: 28
                         convergence: converged
                         drift:
                           desired_vs_sent: false
                           desired_vs_acknowledged: false
                           sent_vs_acknowledged: false
+                          desired_vs_applied: false
+                accepted:
+                  summary: Install ACK without proxy-runtime application
+                  value:
+                    mode: cp
+                    generated_at: "2026-08-02T16:00:00Z"
+                    summary:
+                      tracked: 1
+                      connected: 1
+                      converged: 0
+                      accepted: 1
+                      drifted: 0
+                      rejecting: 0
+                      pending: 0
+                      disconnected: 0
+                    data_planes:
+                      - node_id: mesh-dp-b
+                        namespace: ferrum
+                        connected: true
+                        session_connected_at: "2026-08-02T15:59:00Z"
+                        desired:
+                          version: "v2"
+                          at: "2026-08-02T15:59:30Z"
+                          age_seconds: 30
+                        sent:
+                          version: "v2"
+                          at: "2026-08-02T15:59:30Z"
+                          age_seconds: 30
+                        acknowledged:
+                          version: "v2"
+                          at: "2026-08-02T15:59:31Z"
+                          age_seconds: 29
+                        convergence: accepted
+                        drift:
+                          desired_vs_sent: false
+                          desired_vs_acknowledged: false
+                          sent_vs_acknowledged: false
+                          desired_vs_applied: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -4349,6 +4435,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/BatchAtomicFailureResponse"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "501":
@@ -4858,6 +4946,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -4882,6 +4972,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Proxy"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -4945,6 +5037,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -5108,6 +5202,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -5134,6 +5230,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Consumer"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -5189,6 +5287,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -5309,6 +5409,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -5368,6 +5470,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -5590,6 +5694,8 @@ paths:
                 - api_chargeback_sink
                 - workload_metrics
                 - fault_injection
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -5693,6 +5799,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -5717,6 +5825,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PluginConfig"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -5787,6 +5897,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -5903,6 +6015,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -5926,6 +6040,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Upstream"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -5976,6 +6092,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
     delete:
@@ -6120,6 +6238,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GatewayTrustBundleConflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -6210,6 +6330,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GatewayTrustBundleConflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
     delete:
@@ -6270,6 +6392,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GatewayTrustStatus"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -7056,6 +7180,8 @@ paths:
                 description: The raw spec document (YAML format)
         "304":
           description: Spec unchanged — ETag matches `If-None-Match`
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -7365,6 +7491,8 @@ paths:
                 description: The raw spec document (YAML format)
         "304":
           description: Spec unchanged — ETag matches `If-None-Match`
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -17925,7 +18053,12 @@ components:
         restore as legacy backups; database-backed exports always include it
         (possibly with an empty `items` array). The aggregate decompressed
         API-spec content is bounded by the configured restore body limit.
+
+        Closed on restore: an unknown member is rejected with `400` rather
+        than silently ignored, so a misspelled section key cannot read as an
+        empty API-spec wipe.
       required: [section_version, items]
+      additionalProperties: false
       properties:
         section_version:
           type: string
@@ -17945,6 +18078,10 @@ components:
         One API spec document in a backup/restore payload. `spec_content_base64`
         is the gzip-compressed original document (standard Base64). Do not log
         this field; it may contain proprietary API definitions.
+
+        Closed on restore: an unknown member is rejected with `400` rather than
+        silently ignored.
+      additionalProperties: false
       required:
         - id
         - proxy_id
@@ -18167,8 +18304,11 @@ components:
             Backup metadata from `GET /backup`. Accepted and ignored.
         counts:
           type: object
-          description: >-
-            Backup metadata from `GET /backup`. Accepted and ignored.
+          description: |
+            Backup metadata from `GET /backup`. Accepted and ignored, but the
+            declared `type: object` is enforced: a non-object `counts` is a
+            `400` like every other shape mismatch, so a malformed artifact
+            cannot reach the destructive clear.
 
     RestoreResponse:
       type: object
@@ -21046,7 +21186,10 @@ components:
                 description: >-
                   Expected JWT iss claim — routes tokens to this provider.
                   When set, the token MUST carry iss and it must match exactly;
-                  the issuer check alone rejects only a mismatching claim.
+                  the issuer check alone rejects only a mismatching claim. Per
+                  RFC 7519 section 4.1.1 a present iss must be a single string:
+                  an array, object, number, boolean, or null iss is rejected
+                  even when one element matches this value.
                   Required and must be nonblank when require_dpop is true: the
                   DPoP replay realm is this exact issuer, so key-set or JWKS
                   source rotation cannot reopen a proof. Issuers are compared
@@ -21104,8 +21247,15 @@ components:
                 description: >-
                   Per-provider override for requiring an exp claim. Expiry is
                   always validated when present. A present nbf is always
-                  validated too (it is not required). JWT exp/nbf use zero
-                  clock leeway; DPoP skew is a separate proof contract.
+                  validated too (it is not required). exp is an RFC 7519
+                  section 2 NumericDate (a JSON number that may carry a
+                  fractional part); a fractional exp bounds the authenticated
+                  stream exactly like an integer one, truncated toward the past
+                  so the enforced expiry is never later than the token states.
+                  nbf presence and validation are delegated to the JWT
+                  validation layer; Ferrum does not normalize a fractional nbf.
+                  JWT exp/nbf use zero clock leeway; DPoP skew is a separate
+                  proof contract.
               required_scopes:
                 type: array
                 items:
@@ -21416,7 +21566,25 @@ components:
     Oauth2IntrospectionConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: oauth2_introspection — RFC 7662 bearer token introspection with bounded, explicit multi-provider routing."
+      description: >-
+        Plugin: oauth2_introspection — RFC 7662 bearer token introspection with
+        bounded, explicit multi-provider routing. Both ends of a returned
+        validity window are enforced independently of the active member, as
+        defense in depth against a contradictory provider response: exp,
+        active_until, and expires_in close it, and nbf (RFC 7662 section 2.2)
+        opens it. An active:true response whose nbf is still in the future is
+        rejected with a bearer 401 and is not cached in either direction; a
+        present non-integer nbf is a dependency-response error and returns 503,
+        like malformed expiry data. An omitted nbf remains supported, including
+        a JSON null, which is treated as absent. Both bounds are absolute
+        instants resolved once at the provider-response boundary and re-checked
+        on every cache hit. Both are compared against the gateway clock with no
+        leeway: this plugin deliberately has no clock-skew knob, matching its
+        long-standing exp behaviour, so an authorization server whose clock runs
+        ahead of the gateway can have a freshly issued token rejected for the
+        first second(s) of its life, and each such request costs a provider
+        round trip because that rejection is never cached. Keep the
+        authorization server and the gateway clocks synchronized (NTP).
       required: [providers]
       properties:
         providers:
@@ -21748,7 +21916,11 @@ components:
               issuer:
                 type: string
                 minLength: 1
-                description: Expected ID token issuer
+                description: >-
+                  Expected ID token issuer, compared as an exact case-sensitive
+                  string. Per RFC 7519 section 4.1.1 a present iss must be a
+                  single string; an array, object, number, boolean, or null iss
+                  is rejected.
               discovery_url:
                 type: [string, "null"]
                 minLength: 1
@@ -21892,6 +22064,15 @@ components:
                 default: 60
                 minimum: 0
                 maximum: 3600
+                description: >-
+                  Leeway added to the ID token exp when deciding whether the
+                  session's claims are still live. The ID token exp is an RFC
+                  7519 section 2 NumericDate (a JSON number that may carry a
+                  fractional part) and is the session's authoritative claim
+                  lifetime, truncated toward the past; it does not fall back to
+                  session.ttl_secs or the access-token lifetime. The session is
+                  still additionally capped by session.ttl_secs and
+                  session.idle_ttl_secs.
         session:
           type: object
           additionalProperties: false
@@ -22067,8 +22248,9 @@ components:
           minLength: 1
           pattern: "\\S"
           description: >-
-            Required iss claim; must not be blank. Mutually exclusive with
-            expected_issuers — supplying both is rejected.
+            Required iss claim, compared as an exact case-sensitive string; must
+            not be blank. Mutually exclusive with expected_issuers — supplying
+            both is rejected.
         expected_issuers:
           type: array
           items:
@@ -22077,7 +22259,10 @@ components:
             pattern: "\\S"
           description: >-
             Accepted iss claims; no entry may be blank. Mutually exclusive with
-            expected_issuer.
+            expected_issuer. A token still claims exactly one issuer: per RFC
+            7519 section 4.1.1 a present iss must be a single string, and an
+            array, object, number, boolean, or null iss is rejected even when
+            one element matches an accepted value.
         audiences:
           type: array
           items:
@@ -22090,7 +22275,14 @@ components:
         require_exp:
           type: boolean
           default: true
-          description: Require an exp claim; expiration is always validated when present
+          description: >-
+            Require an exp claim; expiration is always validated when present.
+            exp is an RFC 7519 section 2 NumericDate (a JSON number that may
+            carry a fractional part); a fractional exp bounds the authenticated
+            stream exactly like an integer one, truncated toward the past so the
+            enforced expiry is never later than the token states. nbf presence
+            and validation are delegated to the JWT validation layer; Ferrum
+            does not normalize a fractional nbf.
         require_nbf:
           type: boolean
           default: false
@@ -27490,8 +27682,10 @@ components:
         the HTTP media-type selectors (body_methods, body_content_types,
         inspect_multipart, inspect_binary_body) do not apply because a WebSocket
         message carries no Content-Type — control frames are never scanned, and
-        max_scan_bytes / on_body_too_large / on_scan_timeout fail closed by
-        closing the connection with RFC 6455 code 1008.
+        max_scan_bytes / on_body_too_large / on_scan_timeout close the
+        connection with RFC 6455 code 1008 on the same terms as the HTTP body
+        path, which for their fail_closed dispositions means only when that
+        direction carries an enforcing body policy.
       properties:
         mode:
           type: [string, "null"]
@@ -27560,7 +27754,16 @@ components:
           description: >-
             Post-hoc scan deadline in milliseconds; 0 disables the timeout
             wrapper. Parsed as an unsigned 64-bit integer, so a negative or
-            above-u64 value is rejected at construction.
+            above-u64 value is rejected at construction. The deadline is
+            post-hoc only on every surface, including bodies and WebSocket
+            messages: the scan always runs and its hits always decide first, so
+            an enforcing rule that matched still rejects even when the scan
+            finished over budget. on_scan_timeout governs only a scan that
+            completed clean but late. The budget bounds the scan itself: the
+            clock starts after the body path's fairness yield, so scheduler
+            re-poll delay is never counted. Size it against
+            active_rules x max_scan_bytes, the only term that is under the
+            operator's control.
         max_scan_bytes:
           type: [integer, "null"]
           format: uint64
@@ -27572,8 +27775,34 @@ components:
             zero — construction rejects 0.
         on_scan_timeout:
           type: [string, "null"]
-          enum: [allow, block, log_and_allow, null]
+          enum: [allow, block, fail_closed, log_and_allow, null]
           default: log_and_allow
+          description: >-
+            Outcome for a scan that completed CLEAN but over scan_budget_ms.
+            Because the scan always runs and its hits always decide first, this
+            names a body the WAF inspected end to end and found nothing in, so
+            it is a latency control rather than a coverage control.
+            log_and_allow (default) forwards with a sampled warning and
+            waf.scan_timed_out metadata; allow forwards silently. fail_closed is
+            the opt-in strict-latency posture: it rejects when the governed body
+            direction carries an enforcing body policy, resolved through
+            request_body_policy_enforces / response_body_policy_enforces, which
+            ask the same question as on_body_too_large: fail_closed and
+            additionally count an on_body_too_large: block size cap while
+            globally enforcing; monitor mode and monitor-only rule sets without
+            that cap never start blocking. block rejects every over-budget scan
+            on every surface, independently of global mode. Request metadata,
+            header, query, and path scans are not disposition-aware under
+            fail_closed: they are bounded by the frontend header limits rather
+            than by max_scan_bytes, so only block applies the strict deadline to
+            them. A rejection sets waf.action=blocked with
+            waf.block_reason=scan_timeout; the timeout block itself contributes
+            no waf.rule_hits, though an earlier monitor-only phase may already
+            have recorded some. On a WebSocket session the same table decides
+            the message, with the RFC 6455 code 1008 Close taking the place of
+            the HTTP rejection, and a missed deadline is recorded with a sampled
+            warning independently of log_to_stdout because messages carry no
+            waf.* metadata.
         on_body_too_large:
           type: [string, "null"]
           enum: [fail_closed, scan_truncated, skip, block, null]
@@ -34120,7 +34349,7 @@ components:
                 # backslash, and no dot segment. The remaining canonicalization
                 # rules are checked at plugin load.
                 pattern: '%|\\|(^|/)\.\.?($|/)'
-              description: Canonical public MCP endpoint path, such as /mcp. Must not be "/" — the endpoint reserves its whole path subtree, so a root endpoint would refuse every other handler on the proxy and is rejected at admission. Only the exact path is served; slash-delimited descendants return 404 in both modes. A trailing-slash endpoint also reserves its unsuffixed scope. Two enabled mcp_gateway instances on one proxy may not have nesting endpoint scopes; admission rejects the pair. Queries do not change selection. Methods other than GET, POST, and DELETE return 405 when they reach this plugin.
+              description: Canonical public MCP endpoint path, such as /mcp. Must not be "/" — the endpoint reserves its whole path subtree, so a root endpoint would refuse every other handler on the proxy and is rejected at admission. A single trailing slash is accepted and canonicalised to the configured spelling through full mediation in both modes (/mcp and /mcp/ are equivalent); upstream requests use the configured servers.*.upstream_url path. Extra segments, repeated trailing slashes, case variants, encoded separators, and dot segments are different, rejected paths. Variants reaching the plugin return 404 with JSON-RPC -32600 / Unknown MCP endpoint; the HTTP frontend rejects encoded separators and dot segments earlier with 400. Two enabled mcp_gateway instances on one proxy may not have overlapping endpoint scopes, including case variants; admission rejects the pair. Queries do not change selection. Methods other than GET, POST, and DELETE return 405 when they reach this plugin.
             protocol_versions:
               type: [array, "null"]
               minItems: 1

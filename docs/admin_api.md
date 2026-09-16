@@ -593,7 +593,7 @@ Two endpoints intentionally differ and document their own bounds below: `GET /au
 
 The request body is read only for routes that consume it, and only after that route's role gate. An unknown path, a method the path does not route, a read/delete route, and a caller whose role the route would reject with `403` are all answered without the body being buffered — the receiver is dropped so the protocol layer discards any remaining bytes instead of collecting them into a buffer no handler will read.
 
-For the routes that do consume a body, the size cap (1 MiB, or `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` for `POST /restore` and `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` for `POST`/`PUT /api-specs`) is paired with an absolute deadline, `FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS` (default 30, `0` disables). A size cap bounds how many bytes a client may send, not how long it may take: without the deadline a client that trickles one byte at a time holds the collecting task, its buffer, and the underlying connection or HTTP/2 stream open indefinitely. A body that has not finished arriving when the deadline expires returns `408 Request Timeout` and its HTTP/1.1 connection or HTTP/2 stream is released.
+For the routes that do consume a body, the size cap (1 MiB, or `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` for `POST /restore` and `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` for `POST`/`PUT /api-specs`) is paired with an absolute deadline, `FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS` (default 30, `0` disables). A size cap bounds how many bytes a client may send, not how long it may take: without the deadline a client that trickles one byte at a time holds the collecting task, its buffer, and the underlying connection or HTTP/2 stream open indefinitely. A body that exceeds the size cap returns `413 Payload Too Large`. A body that has not finished arriving when the deadline expires returns `408 Request Timeout` and its HTTP/1.1 connection or HTTP/2 stream is released.
 
 The deadline is the budget for a 1 MiB body; routes with a larger cap scale it by that cap, so the bound is one shared minimum throughput rather than a flat wall clock. At the defaults a 1 MiB body has 30s, a 25 MiB `/api-specs` body has 750s, and a 100 MiB `/restore` body has 3000s — the ~80 MB backups `/restore` exists to accept would otherwise need ~22 Mbit/s sustained to fit inside a flat 30s, and raising the knob far enough for a slow restore link would loosen every 1 MiB route by the same factor. Raising a route's size cap raises its deadline proportionally.
 
@@ -1441,6 +1441,9 @@ escapes, invalid UTF-8, duplicate keys that differ only in encoding, and a
 key-only `?resources` all fail closed with `400`, the static
 `Unsupported backup resource filter` text, no attachment, and the fixed
 `invalid` audit sentinel — raw rejected text is never echoed or persisted.
+Raw whitespace inside the value (`?resources=proxies, upstreams`) was
+previously trimmed and accepted and is now `400`, matching the `%20` spelling
+that was already rejected.
 
 `POST /restore` requires a **JSON object** envelope and rejects unknown
 top-level keys with `400` before the recovery snapshot and the destructive
@@ -1451,7 +1454,9 @@ namespace with nothing" meaning. Accepted keys are `version`, `proxies`,
 `consumers`, `plugin_configs`, `upstreams`, `api_specs`,
 `gateway_trust_bundles`, plus the `GET /backup` metadata members
 `ferrum_version`, `exported_at`, `source`, and `counts`, which are accepted and
-ignored so an unmodified backup round-trips. `POST /batch` and the ordinary
+ignored so an unmodified backup round-trips — ignored, but still shape-checked:
+`counts` must be a JSON object, as `openapi.yaml` publishes it, and the three
+others must be strings. `POST /batch` and the ordinary
 single-resource admin write bodies require a JSON object the same way, and
 object-valued resource fields (`circuit_breaker`, `retry`, `stream_match`,
 `trigger`, `health_checks`, `hash_on_cookie_config`, `service_discovery`,
@@ -2117,7 +2122,8 @@ Force an immediate, synchronous classification pass over every HTTP-family backe
 
 This operational recovery endpoint is available in every proxy-serving mode,
 including read-only file, DP, and mesh admin states. It does not persist a
-configuration or database mutation and still requires a valid admin JWT.
+configuration or database mutation. It requires a valid admin JWT with the
+`operator` role; a viewer token is refused with `403 Forbidden`.
 
 ```bash
 curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:9000/backend-capabilities/refresh
@@ -2297,7 +2303,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" "http://localhost:9000/mesh/confi
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/mesh/slice-drift
 ```
 
-Returns `404` outside CP mode. Returns `200` with an empty `data_planes` list when CP mode is active but no local `MeshSubscribe` DP has connected yet. Desired versions reflect actual per-DP projected content changes, not global reload timestamps; rejection diagnostics retain only a closed `rejected.stage` (`install` / `runtime`) and `rejected.reason` label mapped from the DP's wire enum, and no caller-supplied text is ever accepted or retained.
+Returns `404` outside CP mode. Returns `400` for an invalid `X-Ferrum-Namespace` header. Returns `200` with an empty `data_planes` list when CP mode is active but no local `MeshSubscribe` DP has connected yet. Desired versions reflect actual per-DP projected content changes, not global reload timestamps; rejection diagnostics retain only a closed `rejected.stage` (`install` / `runtime`) and `rejected.reason` label mapped from the DP's wire enum, and no caller-supplied text is ever accepted or retained.
 
 This surface is **observability only and never gates mesh configuration delivery**: a DP the bounded registry declines to track (4096-identity cap, oversized retained selector) is still served its full mesh slice, it simply does not appear in `data_planes`. A missing DP therefore means "not tracked or not connected", not "not configured" — cross-check `GET /cluster` for the connected set. On fleets above 256 tracked identities the published watermarks may lag live state by up to one maintenance interval while high-frequency send/ACK updates coalesce.
 
@@ -2392,7 +2398,7 @@ Response (truncated):
 
 **Disclosure surface**: the payload reveals the mesh topology shape the current workload can reach — service names, namespaces, hosts, ports, FQDN aliases. This is not secret traffic data (no bodies, headers, or credentials), but operators wiring this into long-running scrapers should still scope JWT issuance accordingly.
 
-Returns `503 Service Unavailable` when proxy state is not yet available, `404 Not Found` when no active mesh egress scope has been installed.
+Returns `503 Service Unavailable` when proxy state is not yet available, `404 Not Found` when no active mesh egress scope has been installed, and `400 Bad Request` for an invalid `X-Ferrum-Namespace` header.
 
 ### `POST /mesh/egress-scope/test`
 
@@ -2422,7 +2428,7 @@ Response:
 
 The handler memoises the resolved `OutboundRegistry` against the installed snapshot, so repeated calls do not re-parse `known_destinations` on every request.
 
-Returns `503` when proxy state is unavailable, `404` when no active mesh egress scope, `400` when the body is not valid JSON / `host` is missing or empty / `port` is `0`.
+Returns `503` when proxy state is unavailable, `404` when no active mesh egress scope, `403` when the token lacks the `operator` role, `413` when the body exceeds the 1 MiB shared cap, and `400` when the body is not valid JSON / `host` is missing or empty / `port` is `0`.
 
 ### Related environment variables
 

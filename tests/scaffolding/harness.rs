@@ -234,6 +234,11 @@ impl GatewayHarnessBuilder {
     }
 
     /// Override log level (defaults to `info`).
+    ///
+    /// In binary mode this pins both `FERRUM_LOG_LEVEL` and `RUST_LOG` so an
+    /// inherited parent-shell `RUST_LOG` cannot hide log assertions
+    /// (issue #5533). `.env("RUST_LOG", ...)` still wins for a target-specific
+    /// directive.
     pub fn log_level(mut self, level: impl Into<String>) -> Self {
         let level = level.into();
         self.inner = self.inner.log_level(level.clone());

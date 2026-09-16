@@ -24,37 +24,44 @@ use ferrum_edge::admin::{
 use ferrum_edge::config::env_config::EnvConfig;
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
+use ferrum_edge::plugins::prometheus_metrics::MetricsRegistry;
 use ferrum_edge::proxy::client_ip::TrustedProxies;
 use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
 use ferrum_edge::tls::inventory::{
     TlsInventory, TlsInventoryEntry, TlsInventorySource, TlsInventoryState, TlsInventoryUsage,
 };
-use ferrum_edge::tls::inventory_cache::{self, TlsInventoryCollector};
+use ferrum_edge::tls::inventory_cache::{self, TlsInventoryCache, TlsInventoryCollector};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 const JWT_SECRET: &str = "tls-inventory-snapshot-scrape-test-secret-key";
 const JWT_ISSUER: &str = "ferrum-edge-tls-inventory-snapshot-test";
 const CERT_ID: &str = "certificate-2410cachedsnapshot";
+const SNAPSHOT_TTL: Duration = Duration::from_secs(300);
+const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Counting stand-in for a certificate source / secret provider. Every call is a
-/// "fetch"; `delay_ms` simulates a slow or unavailable secret manager.
+/// Every call is a source fetch. A channel can hold collection in flight until
+/// the test releases it, with no sleep or assumption about scheduler timing.
 struct CountingInventoryCollector {
+    cert_id: &'static str,
     fetches: AtomicU64,
-    delay_ms: AtomicU64,
+    started: tokio::sync::watch::Sender<u64>,
+    next_gate: Mutex<Option<mpsc::Receiver<()>>>,
     not_after: DateTime<Utc>,
 }
 
 impl CountingInventoryCollector {
-    fn new() -> Self {
+    fn new(cert_id: &'static str) -> Self {
         Self {
+            cert_id,
             fetches: AtomicU64::new(0),
-            delay_ms: AtomicU64::new(0),
+            started: tokio::sync::watch::channel(0).0,
+            next_gate: Mutex::new(None),
             not_after: Utc::now() + ChronoDuration::days(30),
         }
     }
@@ -63,22 +70,33 @@ impl CountingInventoryCollector {
         self.fetches.load(Ordering::SeqCst)
     }
 
-    fn set_delay(&self, delay: Duration) {
-        self.delay_ms
-            .store(delay.as_millis() as u64, Ordering::SeqCst);
+    fn block_next_fetch(&self) -> mpsc::Sender<()> {
+        let (release, gate) = mpsc::channel();
+        *self.next_gate.lock().expect("collector gate") = Some(gate);
+        release
+    }
+
+    async fn wait_for_fetches(&self, target: u64) {
+        let mut started = self.started.subscribe();
+        tokio::time::timeout(TEST_TIMEOUT, started.wait_for(|count| *count >= target))
+            .await
+            .expect("collector must start")
+            .expect("collector notification channel");
     }
 }
 
 impl TlsInventoryCollector for CountingInventoryCollector {
     fn collect_public_metadata(&self) -> TlsInventory {
-        self.fetches.fetch_add(1, Ordering::SeqCst);
-        let delay_ms = self.delay_ms.load(Ordering::SeqCst);
-        if delay_ms > 0 {
-            std::thread::sleep(Duration::from_millis(delay_ms));
+        let gate = self.next_gate.lock().expect("collector gate").take();
+        let count = self.fetches.fetch_add(1, Ordering::SeqCst) + 1;
+        self.started.send_replace(count);
+        if let Some(gate) = gate {
+            // Dropping the sender on assertion failure also releases the worker.
+            let _ = gate.recv();
         }
         TlsInventory {
             entries: vec![TlsInventoryEntry {
-                id: CERT_ID.to_string(),
+                id: self.cert_id.to_string(),
                 material_kind: "certificate".to_string(),
                 source: TlsInventorySource {
                     kind: "file".to_string(),
@@ -108,6 +126,10 @@ impl TlsInventoryCollector for CountingInventoryCollector {
                 error: None,
             }],
         }
+    }
+
+    fn serving_cycle_key(&self) -> Option<usize> {
+        Some(self as *const Self as usize)
     }
 }
 
@@ -201,12 +223,8 @@ async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<b
         )
         .await;
     });
-    for _ in 0..200 {
-        if tokio::net::TcpStream::connect(actual).await.is_ok() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    // The listener is already bound and owned; requests can queue before the
+    // accept task is first polled. No readiness retry is necessary.
     (format!("http://{actual}"), shutdown_tx)
 }
 
@@ -221,46 +239,25 @@ async fn scrape(client: &reqwest::Client, base: &str) -> String {
     response.text().await.expect("metrics body")
 }
 
-/// Scrape until `needle` shows up, so the publication that follows the counted
-/// fetch cannot race the assertion.
-async fn scrape_until_contains(client: &reqwest::Client, base: &str, needle: &str) -> String {
-    let mut body = String::new();
-    for _ in 0..200 {
-        body = scrape(client, base).await;
-        if body.contains(needle) {
-            return body;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("'{needle}' never appeared in the metrics exposition:\n{body}");
+async fn join_refresh(refresh: tokio::task::JoinHandle<()>) {
+    tokio::time::timeout(TEST_TIMEOUT, refresh)
+        .await
+        .expect("refresh must finish")
+        .expect("refresh must not panic");
 }
 
-async fn wait_for_fetches(collector: &CountingInventoryCollector, target: u64) {
-    for _ in 0..400 {
-        if collector.fetches() >= target {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!(
-        "background TLS inventory refresh never reached {target} fetches (saw {})",
-        collector.fetches()
-    );
+async fn refresh(cache: &Arc<TlsInventoryCache>) {
+    join_refresh(
+        cache
+            .schedule_refresh_if_due(SNAPSHOT_TTL)
+            .expect("refresh due"),
+    )
+    .await;
 }
 
-/// One test function on purpose: the cached snapshot is process-wide, so the
-/// phases below run in a fixed order instead of racing each other.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn metrics_scrapes_read_cached_snapshot_without_refetching_or_blocking() {
-    let collector = Arc::new(CountingInventoryCollector::new());
-    inventory_cache::pin_collector(collector.clone());
-    // Another test in this binary may already have published a snapshot from the
-    // production collector; make sure the first admin start refreshes through the
-    // counting fake.
-    inventory_cache::mark_stale();
-
+fn isolated_proxy_state(cache: Arc<TlsInventoryCache>) -> ProxyState {
     let dns_cache = DnsCache::new(DnsConfig::default());
-    let (proxy_state, _handles) = ProxyState::new(
+    let (mut proxy_state, _handles) = ProxyState::new(
         GatewayConfig::default(),
         dns_cache,
         EnvConfig::default(),
@@ -268,8 +265,32 @@ async fn metrics_scrapes_read_cached_snapshot_without_refetching_or_blocking() {
         None,
     )
     .expect("proxy state");
+    assert!(Arc::ptr_eq(
+        &proxy_state.tls_inventory_cache,
+        inventory_cache::process_cache(),
+    ));
+    assert!(Arc::ptr_eq(
+        &proxy_state.admin_metrics_registry,
+        &ferrum_edge::plugins::prometheus_metrics::global_registry(),
+    ));
+    proxy_state.tls_inventory_cache = cache;
+    proxy_state.admin_metrics_registry = Arc::new(MetricsRegistry::new());
+    proxy_state
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metrics_scrapes_read_cached_snapshot_without_refetching_or_blocking() {
+    let collector = Arc::new(CountingInventoryCollector::new(CERT_ID));
+    let cache = Arc::new(TlsInventoryCache::with_collector(collector.clone()));
+    let proxy_state = isolated_proxy_state(cache.clone());
+    // Join publication, not merely entry into the collector. Listener startup
+    // must retain this cache's fixed collector and already-fresh snapshot.
+    refresh(&cache).await;
     let (base, shutdown) = start_admin(admin_state_with_proxy(proxy_state.clone())).await;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(TEST_TIMEOUT)
+        .build()
+        .expect("client");
 
     // Phase 0: the auth tier is untouched.
     let unauthenticated = client
@@ -285,9 +306,13 @@ async fn metrics_scrapes_read_cached_snapshot_without_refetching_or_blocking() {
 
     // Phase 1: the bounded background refresh publishes the snapshot; the scrape
     // path renders certificate gauges from it plus explicit freshness.
-    wait_for_fetches(&collector, 1).await;
+    assert_eq!(collector.fetches(), 1);
     let cert_label = format!("cert_id=\"{CERT_ID}\"");
-    let body = scrape_until_contains(&client, &base, &cert_label).await;
+    let body = scrape(&client, &base).await;
+    assert!(
+        body.contains(&cert_label),
+        "cached certificate missing:\n{body}"
+    );
     assert!(
         body.contains("ferrum_tls_cert_expiry_seconds"),
         "certificate expiry family missing:\n{body}"
@@ -316,32 +341,23 @@ async fn metrics_scrapes_read_cached_snapshot_without_refetching_or_blocking() {
         );
     }
 
-    // Phase 3: a slow provider must not slow the scrape. Mark the snapshot stale
-    // so the next scrape schedules a refresh, then keep scraping while that
-    // refresh sits in the collector's simulated provider latency.
-    collector.set_delay(Duration::from_secs(3));
-    inventory_cache::mark_stale();
-    let scheduling_scrape = Instant::now();
+    // Phase 3: hold collection in flight until after the scrapes complete.
+    // Retain the task handle to prove publication before the next phase.
+    let release = collector.block_next_fetch();
+    cache.mark_stale();
+    let pending = cache
+        .schedule_refresh_if_due(SNAPSHOT_TTL)
+        .expect("refresh due");
+    collector.wait_for_fetches(baseline + 1).await;
     let during = scrape(&client, &base).await;
-    let scheduling_elapsed = scheduling_scrape.elapsed();
-    assert!(
-        scheduling_elapsed < Duration::from_secs(1),
-        "the scrape that scheduled the refresh blocked for {scheduling_elapsed:?}"
-    );
     assert!(
         during.contains(&cert_label),
         "a scrape during an in-flight refresh must keep serving the previous snapshot:\n{during}"
     );
 
-    let in_flight = Instant::now();
     for _ in 0..3 {
         let _ = scrape(&client, &base).await;
     }
-    let in_flight_elapsed = in_flight.elapsed();
-    assert!(
-        in_flight_elapsed < Duration::from_secs(1),
-        "scrapes blocked on the in-flight provider fetch for {in_flight_elapsed:?}"
-    );
     assert_eq!(
         collector.fetches(),
         baseline + 1,
@@ -349,9 +365,9 @@ async fn metrics_scrapes_read_cached_snapshot_without_refetching_or_blocking() {
     );
 
     // Phase 4: once the slow refresh lands, scrapes are quiet again.
-    collector.set_delay(Duration::ZERO);
-    wait_for_fetches(&collector, baseline + 1).await;
-    tokio::time::sleep(Duration::from_millis(3_200)).await;
+    release.send(()).expect("release collector");
+    join_refresh(pending).await;
+    assert_eq!(cache.snapshot().expect("published snapshot").generation, 2);
     let settled = collector.fetches();
     for _ in 0..3 {
         let _ = scrape(&client, &base).await;
@@ -366,6 +382,23 @@ async fn metrics_scrapes_read_cached_snapshot_without_refetching_or_blocking() {
     // even when no source watcher fired. Config reloads can replace TLS source
     // descriptors themselves, so waiting for the ordinary TTL here would
     // expose stale certificate metadata after a successful reload.
+    let release = collector.block_next_fetch();
+    assert_eq!(
+        proxy_state.update_config(reloaded_config()),
+        ConfigApplyOutcome::Applied,
+        "the fixture reload must publish before testing cache invalidation"
+    );
+    assert!(cache.refresh_is_due(SNAPSHOT_TTL));
+    let before_reload_refresh = collector.fetches();
+    let _ = scrape(&client, &base).await;
+    collector.wait_for_fetches(before_reload_refresh + 1).await;
+    assert_eq!(collector.fetches(), before_reload_refresh + 1);
+    release.send(()).expect("release reload collector");
+
+    let _ = shutdown.send(true);
+}
+
+fn reloaded_config() -> GatewayConfig {
     let mut reloaded = GatewayConfig::default();
     reloaded.proxies.push(
         serde_json::from_value(json!({
@@ -386,14 +419,126 @@ async fn metrics_scrapes_read_cached_snapshot_without_refetching_or_blocking() {
         }))
         .expect("reload proxy should deserialize"),
     );
-    assert_eq!(
-        proxy_state.update_config(reloaded),
-        ConfigApplyOutcome::Applied,
-        "the fixture reload must publish before testing cache invalidation"
-    );
-    let before_reload_refresh = collector.fetches();
-    let _ = scrape(&client, &base).await;
-    wait_for_fetches(&collector, before_reload_refresh + 1).await;
+    reloaded
+}
 
-    let _ = shutdown.send(true);
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_inventory_fixtures_keep_collectors_snapshots_and_invalidations_isolated() {
+    let first = Arc::new(CountingInventoryCollector::new("certificate-first-owner"));
+    let second = Arc::new(CountingInventoryCollector::new("certificate-second-owner"));
+    let first_cache = Arc::new(TlsInventoryCache::with_collector(first.clone()));
+    let second_cache = Arc::new(TlsInventoryCache::with_collector(second.clone()));
+    let first_proxy = isolated_proxy_state(first_cache.clone());
+    let second_proxy = isolated_proxy_state(second_cache.clone());
+    let first_registry = Arc::clone(&first_proxy.admin_metrics_registry);
+    let second_registry = Arc::clone(&second_proxy.admin_metrics_registry);
+    refresh(&first_cache).await;
+    refresh(&second_cache).await;
+    let client = reqwest::Client::builder()
+        .timeout(TEST_TIMEOUT)
+        .build()
+        .expect("client");
+
+    let (first_base, first_shutdown) = start_admin(admin_state_with_proxy(first_proxy)).await;
+    assert!(scrape(&client, &first_base).await.contains(first.cert_id));
+    let release = first.block_next_fetch();
+    // A 1 ns TTL is always expired without moving wall clocks and stays inside
+    // the positive domain production passes (both call sites gate on ttl > 0).
+    let pending = first_cache
+        .schedule_refresh_if_due(Duration::from_nanos(1))
+        .expect("expired snapshot must refresh");
+    first.wait_for_fetches(2).await;
+
+    // Start another listener and publish its config while the first collector
+    // is blocked. Neither operation may replace, stale, or refresh the first.
+    let (second_base, second_shutdown) =
+        start_admin(admin_state_with_proxy(second_proxy.clone())).await;
+    assert!(scrape(&client, &second_base).await.contains(second.cert_id));
+    // Assert ownership directly as well as through concurrent responses: this
+    // catches registry sharing even if the two handlers happen to run serially.
+    assert!(!Arc::ptr_eq(&first_registry, &second_registry));
+    let first_gauges = first_registry.render();
+    let second_gauges = second_registry.render();
+    assert!(first_gauges.contains(first.cert_id));
+    assert!(!first_gauges.contains(second.cert_id));
+    assert!(second_gauges.contains(second.cert_id));
+    assert!(!second_gauges.contains(first.cert_id));
+    assert_eq!(
+        second_proxy.update_config(reloaded_config()),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(second_cache.refresh_is_due(SNAPSHOT_TTL));
+    refresh(&second_cache).await;
+    assert_eq!(second.fetches(), 2);
+
+    // TLS events and unrelated fixtures still invalidate the production cache.
+    // This was enough to force extra counting-collector fetches before #5544.
+    inventory_cache::mark_stale();
+    assert!(!first_cache.refresh_is_due(SNAPSHOT_TTL));
+    assert!(!second_cache.refresh_is_due(SNAPSHOT_TTL));
+
+    for _ in 0..4 {
+        let (first_body, second_body) =
+            tokio::join!(scrape(&client, &first_base), scrape(&client, &second_base));
+        assert!(first_body.contains(first.cert_id));
+        assert!(!first_body.contains(second.cert_id));
+        assert!(second_body.contains(second.cert_id));
+        assert!(!second_body.contains(first.cert_id));
+        assert_eq!(first.fetches(), 2);
+        assert_eq!(second.fetches(), 2);
+    }
+
+    release.send(()).expect("release first collector");
+    join_refresh(pending).await;
+    inventory_cache::mark_stale();
+    let _ = scrape(&client, &first_base).await;
+    let _ = scrape(&client, &second_base).await;
+    assert_eq!(first.fetches(), 2, "foreign invalidation after publication");
+    assert_eq!(second.fetches(), 2);
+
+    let _ = first_shutdown.send(true);
+    let _ = second_shutdown.send(true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_inventory_serving_cycles_fence_old_results_and_preserve_mid_refresh_invalidation() {
+    let cache = Arc::new(TlsInventoryCache::default());
+    let old = Arc::new(CountingInventoryCollector::new("certificate-old-cycle"));
+    let next = Arc::new(CountingInventoryCollector::new("certificate-new-cycle"));
+    assert!(cache.install_collector(old.clone()));
+    refresh(&cache).await;
+    let original = cache.snapshot().expect("original snapshot");
+    assert!(!cache.replace_collector_for_serving_cycle(old.clone()));
+    assert!(Arc::ptr_eq(&original, &cache.snapshot().unwrap()));
+    assert!(!cache.refresh_is_due(SNAPSHOT_TTL));
+
+    let release = old.block_next_fetch();
+    cache.mark_stale();
+    let pending = cache
+        .schedule_refresh_if_due(SNAPSHOT_TTL)
+        .expect("old refresh");
+    old.wait_for_fetches(2).await;
+    assert!(cache.replace_collector_for_serving_cycle(next.clone()));
+    assert!(cache.snapshot().is_none());
+    assert!(cache.schedule_refresh_if_due(SNAPSHOT_TTL).is_none());
+    release.send(()).expect("release old collector");
+    join_refresh(pending).await;
+    assert!(cache.snapshot().is_none(), "old result must remain fenced");
+
+    let release = next.block_next_fetch();
+    let pending = cache
+        .schedule_refresh_if_due(SNAPSHOT_TTL)
+        .expect("new cycle refresh");
+    next.wait_for_fetches(1).await;
+    cache.mark_stale();
+    assert!(cache.schedule_refresh_if_due(SNAPSHOT_TTL).is_none());
+    release.send(()).expect("release new collector");
+    join_refresh(pending).await;
+    let current = cache.snapshot().expect("new snapshot");
+    assert_eq!(current.inventory.entries[0].id, next.cert_id);
+    assert!(current.generation > original.generation);
+    assert!(cache.refresh_is_due(SNAPSHOT_TTL));
+    refresh(&cache).await;
+    assert_eq!(next.fetches(), 2);
+    assert!(!cache.refresh_is_due(SNAPSHOT_TTL));
 }

@@ -60,13 +60,16 @@ pub struct CachedAuthorizationError {
 ///
 /// `expires_at_unix` is the absolute credential validity derived once at the
 /// provider-response boundary so cache hits and single-flight followers cannot
-/// extend a relative `expires_in` bound.
+/// extend a relative `expires_in` bound. `not_before_unix` is the other end of
+/// the same window, retained so every cache hit re-checks it rather than
+/// trusting the one evaluation made when the response arrived (issue #5523).
 pub struct CachedAuthorization {
     pub authorization_error: Option<CachedAuthorizationError>,
     pub identity: Option<Box<str>>,
     pub identity_header: Option<Box<str>>,
     pub claim_headers: Box<[CachedClaimHeader]>,
     pub expires_at_unix: Option<i64>,
+    pub not_before_unix: Option<i64>,
 }
 
 impl CachedAuthorization {
@@ -659,6 +662,7 @@ mod tests {
             identity_header: None,
             claim_headers: Box::default(),
             expires_at_unix: None,
+            not_before_unix: None,
         })
     }
 

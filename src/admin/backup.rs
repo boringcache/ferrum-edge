@@ -101,6 +101,16 @@ const fn hex_nibble(byte: u8) -> Option<u8> {
 ///   duplicates that differ only in encoding), an undecodable key or
 ///   `resources` value, or other structural malformation → `Err` (fail closed;
 ///   never widen to unfiltered)
+///
+/// Strictness is deliberately whole-query: an undecodable *key* fails the
+/// request even when it is not `resources`, because a key cannot be compared
+/// against `"resources"` without decoding it, and guessing would be exactly the
+/// silent-widening failure this parser exists to close. `GET /backup` reads no
+/// other query parameter today (`handle_backup` reaches `query` only through
+/// this function), so nothing else is affected. A future `GET /backup`
+/// parameter must decide its own strictness explicitly rather than inherit this
+/// one — and if it needs a laxer key form, scope the strict decode to the
+/// matched `resources` pair instead of loosening it for every key.
 pub(crate) fn parse_backup_resources(
     query: Option<&str>,
 ) -> Result<Option<HashSet<String>>, BackupResourcesQueryMalformed> {
@@ -581,8 +591,13 @@ pub(crate) struct RestorePayload {
     pub(crate) _exported_at: Option<String>,
     #[serde(default, rename = "source")]
     pub(crate) _source: Option<String>,
+    /// `GET /backup` emits `counts` as a JSON object, and `openapi.yaml`
+    /// publishes it as `type: object`. Typed as a map rather than a bare
+    /// `Value` so the runtime enforces what the schema promises: a non-object
+    /// `counts` is a `400` like every other shape mismatch instead of being
+    /// accepted and ignored.
     #[serde(default, rename = "counts")]
-    pub(crate) _counts: Option<serde_json::Value>,
+    pub(crate) _counts: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// Project a cached multi-namespace snapshot onto one namespace for a

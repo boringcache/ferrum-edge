@@ -479,7 +479,7 @@ Two client-side options, both applying equally to DP ConfigSync, native
   | Claim | Requirement |
   |---|---|
   | `kid` (JWS header) | the trust-bundle credential to verify under; required on a trust-bundle CP |
-  | `iss` | exactly `FERRUM_CP_DP_GRPC_JWT_ISSUER` (default `ferrum-edge-cp-dp`) |
+  | `iss` | exactly one string, equal to `FERRUM_CP_DP_GRPC_JWT_ISSUER` (default `ferrum-edge-cp-dp`); arrays and other non-string shapes are rejected |
   | `sub` | required (present; the node id by convention) |
   | `iat` | required |
   | `exp` | required and unexpired |

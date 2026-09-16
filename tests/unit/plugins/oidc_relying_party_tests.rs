@@ -4353,3 +4353,66 @@ fn the_config_component_agrees_with_constructor_admission() {
         false,
     );
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Issue #5521: an ID token's `exp` is a NumericDate, not an integer
+// ────────────────────────────────────────────────────────────────────
+
+fn zero_skew_config() -> serde_json::Value {
+    let mut config = base_config();
+    config["providers"][0]["id_token_clock_skew_secs"] = json!(0);
+    config
+}
+
+/// RFC 7519 §2 permits a fractional NumericDate, and the ID token validates
+/// with one. Reading `exp` with `as_i64()` only dropped it, so the session fell
+/// back to the configured session/access-token lifetime and a five-second ID
+/// token authorized requests for the whole hour.
+#[tokio::test]
+async fn a_fractional_id_token_expiry_still_bounds_the_session() {
+    let plugin = OidcRelyingParty::new(&zero_skew_config(), PluginHttpClient::default()).unwrap();
+    let now = Utc::now().timestamp();
+    let set_cookie = oidc_sealed_session_cookie_for_test(
+        &plugin,
+        json!({"sub": "oidc-subject", "exp": now as f64 + 5.25}),
+        false,
+    )
+    .expect("session seals");
+    let mut ctx = session_ctx(&set_cookie);
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_continue(result);
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("oidc-subject"));
+
+    let remaining = request_credential_deadline_remaining(&ctx)
+        .expect("a fractional ID-token expiry must still bound the session");
+    assert!(
+        remaining <= Duration::from_secs(6),
+        "the bound must be the truncated ID-token expiry, not the session/idle \
+         cap: {remaining:?}"
+    );
+}
+
+/// The same claim past its expiry must re-challenge instead of riding the
+/// configured session lifetime, which is the browser-session half of the
+/// regression: the cookie stayed usable minutes after the ID token died.
+#[tokio::test]
+async fn an_expired_fractional_id_token_re_challenges_instead_of_riding_the_session_ttl() {
+    let plugin = OidcRelyingParty::new(&zero_skew_config(), PluginHttpClient::default()).unwrap();
+    let now = Utc::now().timestamp();
+    let set_cookie = oidc_sealed_session_cookie_for_test(
+        &plugin,
+        json!({"sub": "oidc-subject", "exp": now as f64 - 0.5}),
+        false,
+    )
+    .expect("session seals");
+    let mut ctx = session_ctx(&set_cookie);
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_reject(result, Some(401));
+    assert!(ctx.authenticated_identity.is_none());
+}
