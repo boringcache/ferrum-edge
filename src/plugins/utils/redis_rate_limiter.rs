@@ -610,7 +610,14 @@ fn validate_redis_url(raw_url: &str) -> Result<(), String> {
     // Never echo the rejected URL (or parse detail that might restate it): the
     // field can carry userinfo credentials, query tokens, or fragments.
     if raw_url.chars().any(char::is_whitespace) {
-        return Err("redis rate limiter: 'redis_url' must not contain whitespace".to_string());
+        // Same diagnostic family as the parse failure below: a whitespace-bearing
+        // value is rejected before `Url::parse` can normalize it, and the text
+        // still never echoes the value.
+        return Err(
+            "redis rate limiter: 'redis_url' must be a valid URL with scheme redis or rediss \
+             and no whitespace"
+                .to_string(),
+        );
     }
     let parsed = Url::parse(raw_url).map_err(|_| {
         "redis rate limiter: 'redis_url' must be a valid URL with scheme redis or rediss"
@@ -4274,7 +4281,9 @@ impl RedisRateLimitClient {
             Ok(counts) if counts.len() == windows.len() * 2 => {
                 self.note_command_success()?;
                 Ok(counts
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pair| (pair[0].unwrap_or(0), pair[1].unwrap_or(0)))
                     .collect())
             }
