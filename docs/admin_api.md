@@ -214,6 +214,55 @@ A later proxy create may set `upstream_id` instead of `backend_host` /
 Full field lists, status codes, and plugin `config` schemas stay in
 [`openapi.yaml`](../openapi.yaml). Endpoint behavior is in the sections below.
 
+### Resource validation bounds
+
+The shared OpenAPI components encode the numeric and structural constraints
+used by create, full-replace, batch, and restore admission. API-spec imports
+validate the extracted resources with the same runtime validators after filling
+in their generated IDs and associations. Nullable overrides still accept `null`;
+an omitted override inherits the process default.
+
+| Fields | Inclusive range |
+| --- | --- |
+| Proxy `backend_port` | 1–65535 for direct backends; 0–65535 with `upstream_id` |
+| Proxy `listen_port`, upstream target `port`, discovery mesh `port` | 1–65535 when set |
+| Proxy `backend_connect_timeout_ms`, active health `timeout_ms` | 1–86400000 |
+| Proxy `backend_read_timeout_ms`, `backend_write_timeout_ms` | 0–86400000; 0 disables the bound |
+| Proxy `dns_cache_ttl_seconds`, TCP/H2 pool keepalive intervals and timeout | 1–86400 |
+| Proxy `pool_idle_timeout_seconds`, `udp_idle_timeout_seconds` | 1–3600 |
+| Proxy `tcp_idle_timeout_seconds`, `websocket_idle_timeout_seconds` | 0–86400; 0 disables the idle bound |
+| Proxy H2 stream/connection window sizes | 65535–134217728 bytes |
+| Proxy H2 max frame size | 16384–1048576 bytes |
+| Proxy H2 max concurrent streams | 1–2147483647 |
+| Proxy max requests per connection | 0–2147483647 (reserved, no runtime effect) |
+| Proxy H3 connections per backend | 1–256 |
+| Target `weight`, discovery `default_weight` | 1–65535 |
+| Circuit-breaker failure/success thresholds and half-open requests | 1–10000 |
+| Circuit-breaker `timeout_seconds` (input alias `cooldown_seconds`) | 1–86400 |
+| Retry `max_retries` | 0–100 |
+| Retry backoff `delay_ms`, `base_ms`, `max_ms` | 0–300000 |
+| Sticky-cookie `ttl_seconds` | 0–86400 |
+| Active health interval and discovery poll intervals | 1–3600 seconds |
+| Active health healthy/unhealthy thresholds | 1–10000 |
+| Passive health unhealthy threshold | 1–1000 |
+| Passive health unhealthy window | 1–86400 seconds |
+| Passive health `healthy_after_seconds` | 0–86400; 0 disables timed recovery |
+| Passive health `max_ejection_percent` | 0–100 |
+| Circuit-breaker, retry, and health-check status-code entries | 100–599; at most 500 entries per list |
+| Plugin `priority_override` | 0–10000 |
+
+All fields in this table require integers. Discovery `max_stale_seconds` accepts
+`null`, 0, or 5–86400; runtime policy controls whether unbounded retention (0)
+is honored. UDP amplification accepts numbers from 0 through 1024 on UDP/DTLS
+proxies, with 0 meaning explicitly unlimited; other schemes require a positive
+value when this field is set.
+
+Schema validation does not replace runtime admission. File existence and TLS
+material parsing, DNS resolution and egress policy, port availability, resource
+existence/uniqueness, and subset references depend on runtime state. Numeric
+cross-field comparisons such as exponential backoff `base_ms <= max_ms` also
+remain runtime checks.
+
 ## Liveness and Health Checks
 
 ### `/live` — liveness (unauthenticated, minimal)
@@ -803,6 +852,12 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 Plaintext backends need `backend_scheme: http`. Omitting `backend_scheme` on
 `POST /proxies` stores `https` (the HTTP-family default).
 
+HTTP proxies require non-empty `hosts` and/or a non-empty `listen_path`.
+`listen_path: ""` is rejected even when hosts are present. Use `null` or omit
+the path for host-only routing. `allowed_methods` must be null/omitted (allow
+all) or a non-empty array; `[]` is rejected. Setting `upstream_subset` requires
+`upstream_id` and is not supported on UDP/DTLS proxies.
+
 ```bash
 # Get a proxy
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/proxies/{proxy_id}
@@ -841,14 +896,18 @@ and never cascades. See
 
 ### Stream Proxy (TCP/UDP)
 
-Stream proxies use `listen_port` instead of `listen_path`:
+Stream proxies require an explicit `tcp`, `tcps`, `udp`, or `dtls` scheme and
+`listen_port`; omit `listen_path` or set it to null. `passthrough: true` and
+`stream_proxy_protocol: true` are stream-only controls. Outbound
+`backend_proxy_protocol` and non-null `stream_match` require TCP/TCPS.
+Passthrough and frontend TLS termination are mutually exclusive. Stream proxies
+use `response_body_mode: stream` (the default).
 
 ```bash
 # Create a TCP stream proxy
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "listen_path": "",
     "listen_port": 5432,
     "backend_scheme": "tcp",
     "backend_host": "db.internal",
@@ -1047,6 +1106,10 @@ templated partial body will reset anything it leaves out to the schema default.
 
 ## Plugin Configs
 
+`plugin_name` must be non-empty (whitespace-only names are rejected).
+`scope: proxy` requires a non-empty, valid `proxy_id`, even when the plugin is
+disabled. Global and proxy-group plugins do not require a proxy attachment.
+
 ```bash
 # List available plugin types
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/plugins
@@ -1146,6 +1209,15 @@ Header **values** are secret by default wherever a plugin accepts an arbitrary h
 For Redis-backed plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, `request_deduplication`, `graphql`, `grpc_method_router`, `ai_semantic_cache`) the same projection covers two more secrets. `redis_integrity_key` — the HMAC-SHA256 secret that authenticates `ai_semantic_cache` Redis envelopes — is replaced wholesale by `[REDACTED]`, as is any other key whose normalized (delimiter-stripped lowercase) name contains `integritykey` (so `redis_integrity_key`, `redisIntegrityKey`, and `redisintegritykey` match); disclosure would let a reader forge an envelope the gateway replays as a cache hit. `redis_url` (including delimiter-stripped forms such as `redisUrl`, `redis-url`, and `redisurl`) is *not* wholesale-redacted, because its scheme, host, port, and database number are the diagnostics an operator needs: userinfo is replaced and query/fragment data is removed, so `redis://user:pass@cache.internal:6379/3?token=secret#private` projects as `redis://redacted@cache.internal:6379/3`. A `redis_url` value that cannot be parsed as a URL, or that uses any scheme other than `redis`/`rediss`, fails closed to `[REDACTED]`. The separate `redis_password` field is already covered by the existing password matcher; `redis_username` is not secret material and stays visible. Because full `admin` reads stay raw, rotating either secret by read-modify-write still works.
 
 ## Upstreams
+
+`targets` is required, and must contain at least one target unless a
+`service_discovery` source is configured; discovery-only upstreams send
+`targets: []`. Each target requires a non-empty `host`, a port in 1–65535, and
+a weight in 1–65535 (default 1). At most 1000 static targets are accepted.
+Omit `subsets` or send null when none are configured; `subsets: []` is rejected,
+and at most 100 subsets are accepted. A supplied `backend_tls_sni` must be a
+non-empty exact DNS name. Sticky-cookie `path` must be non-empty and start with
+`/`; a supplied `domain` must be a non-empty ASCII domain name.
 
 ```bash
 # List upstreams (first page)
