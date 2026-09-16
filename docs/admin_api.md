@@ -214,6 +214,55 @@ A later proxy create may set `upstream_id` instead of `backend_host` /
 Full field lists, status codes, and plugin `config` schemas stay in
 [`openapi.yaml`](../openapi.yaml). Endpoint behavior is in the sections below.
 
+### Resource validation bounds
+
+The shared OpenAPI components encode the numeric and structural constraints
+used by create, full-replace, batch, and restore admission. API-spec imports
+validate the extracted resources with the same runtime validators after filling
+in their generated IDs and associations. Nullable overrides still accept `null`;
+an omitted override inherits the process default.
+
+| Fields | Inclusive range |
+| --- | --- |
+| Proxy `backend_port` | 1–65535 for direct backends; 0–65535 with `upstream_id` |
+| Proxy `listen_port`, upstream target `port`, discovery mesh `port` | 1–65535 when set |
+| Proxy `backend_connect_timeout_ms`, active health `timeout_ms` | 1–86400000 |
+| Proxy `backend_read_timeout_ms`, `backend_write_timeout_ms` | 0–86400000; 0 disables the bound |
+| Proxy `dns_cache_ttl_seconds`, TCP/H2 pool keepalive intervals and timeout | 1–86400 |
+| Proxy `pool_idle_timeout_seconds`, `udp_idle_timeout_seconds` | 1–3600 |
+| Proxy `tcp_idle_timeout_seconds`, `websocket_idle_timeout_seconds` | 0–86400; 0 disables the idle bound |
+| Proxy H2 stream/connection window sizes | 65535–134217728 bytes |
+| Proxy H2 max frame size | 16384–1048576 bytes |
+| Proxy H2 max concurrent streams | 1–2147483647 |
+| Proxy max requests per connection | 0–2147483647 (reserved, no runtime effect) |
+| Proxy H3 connections per backend | 1–256 |
+| Target `weight`, discovery `default_weight` | 1–65535 |
+| Circuit-breaker failure/success thresholds and half-open requests | 1–10000 |
+| Circuit-breaker `timeout_seconds` (input alias `cooldown_seconds`) | 1–86400 |
+| Retry `max_retries` | 0–100 |
+| Retry backoff `delay_ms`, `base_ms`, `max_ms` | 0–300000 |
+| Sticky-cookie `ttl_seconds` | 0–86400 |
+| Active health interval and discovery poll intervals | 1–3600 seconds |
+| Active health healthy/unhealthy thresholds | 1–10000 |
+| Passive health unhealthy threshold | 1–1000 |
+| Passive health unhealthy window | 1–86400 seconds |
+| Passive health `healthy_after_seconds` | 0–86400; 0 disables timed recovery |
+| Passive health `max_ejection_percent` | 0–100 |
+| Circuit-breaker, retry, and health-check status-code entries | 100–599; at most 500 entries per list |
+| Plugin `priority_override` | 0–10000 |
+
+All fields in this table require integers. Discovery `max_stale_seconds` accepts
+`null`, 0, or 5–86400; runtime policy controls whether unbounded retention (0)
+is honored. UDP amplification accepts numbers from 0 through 1024 on UDP/DTLS
+proxies, with 0 meaning explicitly unlimited; other schemes require a positive
+value when this field is set.
+
+Schema validation does not replace runtime admission. File existence and TLS
+material parsing, DNS resolution and egress policy, port availability, resource
+existence/uniqueness, and subset references depend on runtime state. Numeric
+cross-field comparisons such as exponential backoff `base_ms <= max_ms` also
+remain runtime checks.
+
 ## Liveness and Health Checks
 
 ### `/live` — liveness (unauthenticated, minimal)
@@ -340,6 +389,8 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 The response is paginated and includes each source's non-secret provenance, material kind, load state, certificate subject/issuer/SANs, validity window, SHA-256 certificate fingerprint, and the runtime/config surfaces using it. Inline PEM values and private key bytes are redacted. Unsupported URI providers are listed with `state: "unsupported"` until their runtime loader is enabled.
 
+`sans` is an array of plain canonical strings with no `DNS:` / `IP:` type prefix, shared with managed and ACME certificate summaries: DNS names as encoded (`localhost`), IPv4 as dotted decimal (`127.0.0.1`), IPv6 as RFC 5952 (`2001:db8::1`), URI and email (`rfc822Name`) as their string values, and other `GeneralName` types as `othername:<oid>`, `directory:<dn>`, `rid:<oid>`, `x400`, `ediparty`, `invalid-ip:<hex>`, or `invalid:<tag>`. Values are unique and sorted.
+
 This endpoint loads every configured source, including private keys (which are parse-checked and immediately dropped), so it performs real filesystem, Kubernetes, and secret-manager reads on each explicit request.
 
 Exact `/metrics` never does that. It emits `ferrum_tls_cert_expiry_seconds` and `ferrum_tls_cert_not_before_seconds` from a cached, non-secret inventory snapshot and performs **zero** certificate, private-key, Kubernetes, HSM, or cloud-secret I/O on the scrape path. The snapshot is produced by a bounded, single-flight background refresh that reads only public certificate-family material (certificate, CA bundle, CRL) — private-key, JWKS, and OCSP sources are never materialized for metrics, and their entries report health from the owning validated config/reload state. A scrape whose snapshot is older than `FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS` (default 300, `0` disables the refresh) only *schedules* the refresh; it never waits on a provider. Validated rotation and reload outcomes mark the snapshot stale so the next scrape refreshes immediately. Freshness is exported explicitly as `ferrum_tls_inventory_snapshot_timestamp_seconds` with the configured bound `ferrum_tls_inventory_snapshot_max_age_seconds`; the certificate gauges are absent until the first snapshot is published.
@@ -414,7 +465,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   http://localhost:9000/admin/tls/acme/certificates
 ```
 
-Responses return non-secret certificate metadata, source URI, issuer, SANs, validity, fingerprint, ACME directory/account/order metadata, and timestamps. Private keys are persisted but never returned. Create, update, and delete operations ask active TLS source watchers to re-pull immediately; `DELETE` returns `409 Conflict` when the current runtime/config inventory still references the record.
+Responses return non-secret certificate metadata, source URI, issuer, SANs, validity, fingerprint, ACME directory/account/order metadata, and timestamps. Private keys are persisted but never returned. Create, update, and delete operations ask active TLS source watchers to re-pull immediately; `DELETE` returns `409 Conflict` when the current runtime/config inventory still references the record. SAN strings use the same canonical representation as [TLS Inventory](#tls-inventory).
 
 Import, update, and order finalization return `413 Payload Too Large` when the certificate, private key, or combined certificate chain exceeds `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`; the error never echoes material or source identifiers.
 
@@ -507,7 +558,7 @@ Record IDs are **globally unique** across those typed collections (one shared st
 
 `POST`/`PUT /admin/tls/ocsp-responses` validates the decoded DER structurally: at most 64 KiB, `responseStatus` `successful(0)`, `responseType` `id-pkix-ocsp-basic`, and a well-formed `BasicOCSPResponse` with at least one `SingleResponse`. It cannot bind the response to a certificate, because the record is stored before anything says which certificate it belongs to. Storing a record is therefore not a promise it can be served: the mandatory certificate-bound validation — `CertID` match against the served leaf and issuer, responder authorization, signature verification, `thisUpdate`/`nextUpdate` with a 5-minute skew allowance, and a `good` status — runs when a frontend TLS configuration that references `managed://ocsp-responses/{id}#ocsp` is built, and a mismatch is refused there while the previous known-good configuration keeps serving. With `FERRUM_FIPS_MODE=enforce` the structural pass additionally refuses a response whose responder signature algorithm is `sha1WithRSAEncryption` or Ed25519, or that carries a responder certificate with a non-approved key, so a non-approved response cannot be stored at all. See [Stapled OCSP Responses](frontend_tls.md#stapled-ocsp-responses).
 
-Responses return non-secret metadata only: source URI, subject, issuer, SANs, validity, public-material fingerprint, counts, and timestamps. Private keys are persisted in the managed store but never returned. Configure the store directory with `FERRUM_TLS_MANAGED_STORE_PATH`; on Unix, the JSON store files are written with owner-only permissions.
+Responses return non-secret metadata only: source URI, subject, issuer, SANs, validity, public-material fingerprint, counts, and timestamps. Private keys are persisted in the managed store but never returned. Configure the store directory with `FERRUM_TLS_MANAGED_STORE_PATH`; on Unix, the JSON store files are written with owner-only permissions. SAN strings use the same canonical representation as [TLS Inventory](#tls-inventory).
 
 Managed TLS create and update operations return `413 Payload Too Large` when an admitted material value or combined certificate chain exceeds `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`; the error never echoes material or source identifiers.
 
@@ -542,7 +593,7 @@ Two endpoints intentionally differ and document their own bounds below: `GET /au
 
 The request body is read only for routes that consume it, and only after that route's role gate. An unknown path, a method the path does not route, a read/delete route, and a caller whose role the route would reject with `403` are all answered without the body being buffered — the receiver is dropped so the protocol layer discards any remaining bytes instead of collecting them into a buffer no handler will read.
 
-For the routes that do consume a body, the size cap (1 MiB, or `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` for `POST /restore` and `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` for `POST`/`PUT /api-specs`) is paired with an absolute deadline, `FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS` (default 30, `0` disables). A size cap bounds how many bytes a client may send, not how long it may take: without the deadline a client that trickles one byte at a time holds the collecting task, its buffer, and the underlying connection or HTTP/2 stream open indefinitely. A body that has not finished arriving when the deadline expires returns `408 Request Timeout` and its HTTP/1.1 connection or HTTP/2 stream is released.
+For the routes that do consume a body, the size cap (1 MiB, or `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` for `POST /restore` and `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` for `POST`/`PUT /api-specs`) is paired with an absolute deadline, `FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS` (default 30, `0` disables). A size cap bounds how many bytes a client may send, not how long it may take: without the deadline a client that trickles one byte at a time holds the collecting task, its buffer, and the underlying connection or HTTP/2 stream open indefinitely. A body that exceeds the size cap returns `413 Payload Too Large`. A body that has not finished arriving when the deadline expires returns `408 Request Timeout` and its HTTP/1.1 connection or HTTP/2 stream is released.
 
 The deadline is the budget for a 1 MiB body; routes with a larger cap scale it by that cap, so the bound is one shared minimum throughput rather than a flat wall clock. At the defaults a 1 MiB body has 30s, a 25 MiB `/api-specs` body has 750s, and a 100 MiB `/restore` body has 3000s — the ~80 MB backups `/restore` exists to accept would otherwise need ~22 Mbit/s sustained to fit inside a flat 30s, and raising the knob far enough for a slow restore link would loosen every 1 MiB route by the same factor. Raising a route's size cap raises its deadline proportionally.
 
@@ -657,9 +708,11 @@ Practical consequences for API clients:
   conflict is reported through the normal `409`/`400` shapes, so response codes
   cannot be used to probe whether another tenant owns a guessed id.
 
-Namespaces are first-class registry objects. Historically `GET /namespaces` was a `DISTINCT` union over resource tables, so an empty tenant could not exist and there was no rename or delete. The durable `namespaces` table (SQL and Mongo) holds `name` (primary key), optional `description`, `created_at`, and `updated_at`. Connect/migrate runs a **one-time** compatibility backfill: a database that has never completed it inserts every pre-existing derived name from proxies, consumers, plugin configs, upstreams, and gateway trust bundles, plus the canonical `ferrum` row, then durably marks that backfill complete. A failed or partial attempt leaves the marker absent so a later startup retries the same idempotent inserts. That compatibility pass takes the **same global namespace-registry admission lease** every live create/rename/delete takes, and it commits as **one transaction** so it cannot read derived names next to a concurrent confirmed `DELETE` and then resurrect the removed row. On SQL the transaction's first statement verifies the lease row *and locks it* (`SELECT ... FOR UPDATE`; on SQLite the equivalent conditional `UPDATE`, which takes the single database writer lock), then holds that lock across the derived-name scan, the inserts, the marker, and the commit. Because every competing lease acquisition is a write to that same row, no other gateway can take the global key while the pass runs — so a pass that simply takes longer than one lease duration still commits instead of rolling back and starving; the commit-boundary check proves the same owner and generation, which only an ownership change could alter and nothing can alter under the lock. On MongoDB the pass runs the derived-name discovery, the registry upserts, the strict split-identity validation, the completion marker, and the owner/generation lease proof inside a single transaction, so the name set cannot go stale before it is durable; a delete that acquired the lease first fails the in-transaction proof, and one that tries to acquire it later write-conflicts with the same lease document the transaction touches. A standalone `mongod` has no multi-document transactions, so the pass **writes nothing at all** there rather than claiming an atomicity that topology does not have — `POST`/`PUT`/`DELETE /namespaces` already return `501` before mutating anything on that topology, `GET /namespaces` is the registry ∪ derived union either way, and the marker stays absent so the first replica-set-capable startup performs the full fenced pass. A lease already held elsewhere simply defers the pass — the marker stays absent, which is the same crash-retry state — and the lease is released on every path, success or error, so a failed pass never stalls namespace CRUD for its full lease duration. Once completion is durable, later connect/migrate/reconnect/startup passes do **not** reseed deleted names or materialize newer derived-only names. The marker lives in internal compatibility state (`_ferrum_schema_compat`), not as a fake registry row, and never appears in `GET /namespaces`. Nothing else is seeded: the backfill never reads the process environment, so a deployment-specific `FERRUM_NAMESPACE` that has no resources yet is created through `POST /namespaces`. Ordinary resource writes with a new `X-Ferrum-Namespace` still isolate data and appear in `GET /namespaces` as derived names, but they do **not** insert a registry row.
-
-Before either backend writes the compatibility marker, it validates every durable registry identity inside the same transaction. A legacy derived namespace that no longer satisfies the current namespace grammar therefore rolls the complete pass back with a redacted corruption diagnostic; it is never copied into a completed registry for a later admin read to discover.
+Namespaces are first-class registry objects. The durable `namespaces` table
+(SQL and MongoDB) holds `name` (primary key), optional `description`,
+`created_at`, and `updated_at`. Fresh initialization seeds canonical `ferrum`.
+Startup does not backfill resource-derived names or recreate deleted registry
+rows. Create empty tenants explicitly through `POST /namespaces`.
 
 Writing a proxy (or other resource) with a new `X-Ferrum-Namespace` still isolates data without a prior `POST` — that implicit path remains valid. What the registry adds is the ability to create a tenant before any resource, and to rename or delete it.
 
@@ -803,6 +856,12 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 Plaintext backends need `backend_scheme: http`. Omitting `backend_scheme` on
 `POST /proxies` stores `https` (the HTTP-family default).
 
+HTTP proxies require non-empty `hosts` and/or a non-empty `listen_path`.
+`listen_path: ""` is rejected even when hosts are present. Use `null` or omit
+the path for host-only routing. `allowed_methods` must be null/omitted (allow
+all) or a non-empty array; `[]` is rejected. Setting `upstream_subset` requires
+`upstream_id` and is not supported on UDP/DTLS proxies.
+
 ```bash
 # Get a proxy
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/proxies/{proxy_id}
@@ -841,14 +900,18 @@ and never cascades. See
 
 ### Stream Proxy (TCP/UDP)
 
-Stream proxies use `listen_port` instead of `listen_path`:
+Stream proxies require an explicit `tcp`, `tcps`, `udp`, or `dtls` scheme and
+`listen_port`; omit `listen_path` or set it to null. `passthrough: true` and
+`stream_proxy_protocol: true` are stream-only controls. Outbound
+`backend_proxy_protocol` and non-null `stream_match` require TCP/TCPS.
+Passthrough and frontend TLS termination are mutually exclusive. Stream proxies
+use `response_body_mode: stream` (the default).
 
 ```bash
 # Create a TCP stream proxy
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "listen_path": "",
     "listen_port": 5432,
     "backend_scheme": "tcp",
     "backend_host": "db.internal",
@@ -1047,6 +1110,10 @@ templated partial body will reset anything it leaves out to the schema default.
 
 ## Plugin Configs
 
+`plugin_name` must be non-empty (whitespace-only names are rejected).
+`scope: proxy` requires a non-empty, valid `proxy_id`, even when the plugin is
+disabled. Global and proxy-group plugins do not require a proxy attachment.
+
 ```bash
 # List available plugin types
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/plugins
@@ -1146,6 +1213,15 @@ Header **values** are secret by default wherever a plugin accepts an arbitrary h
 For Redis-backed plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, `request_deduplication`, `graphql`, `grpc_method_router`, `ai_semantic_cache`) the same projection covers two more secrets. `redis_integrity_key` — the HMAC-SHA256 secret that authenticates `ai_semantic_cache` Redis envelopes — is replaced wholesale by `[REDACTED]`, as is any other key whose normalized (delimiter-stripped lowercase) name contains `integritykey` (so `redis_integrity_key`, `redisIntegrityKey`, and `redisintegritykey` match); disclosure would let a reader forge an envelope the gateway replays as a cache hit. `redis_url` (including delimiter-stripped forms such as `redisUrl`, `redis-url`, and `redisurl`) is *not* wholesale-redacted, because its scheme, host, port, and database number are the diagnostics an operator needs: userinfo is replaced and query/fragment data is removed, so `redis://user:pass@cache.internal:6379/3?token=secret#private` projects as `redis://redacted@cache.internal:6379/3`. A `redis_url` value that cannot be parsed as a URL, or that uses any scheme other than `redis`/`rediss`, fails closed to `[REDACTED]`. The separate `redis_password` field is already covered by the existing password matcher; `redis_username` is not secret material and stays visible. Because full `admin` reads stay raw, rotating either secret by read-modify-write still works.
 
 ## Upstreams
+
+`targets` is required, and must contain at least one target unless a
+`service_discovery` source is configured; discovery-only upstreams send
+`targets: []`. Each target requires a non-empty `host`, a port in 1–65535, and
+a weight in 1–65535 (default 1). At most 1000 static targets are accepted.
+Omit `subsets` or send null when none are configured; `subsets: []` is rejected,
+and at most 100 subsets are accepted. A supplied `backend_tls_sni` must be a
+non-empty exact DNS name. Sticky-cookie `path` must be non-empty and start with
+`/`; a supplied `domain` must be a non-empty ASCII domain name.
 
 ```bash
 # List upstreams (first page)
@@ -1343,6 +1419,7 @@ curl -H "Authorization: Bearer $TOKEN" \
   http://localhost:9000/backup > ferrum-backup.json
 
 # Partial backup — only proxies and upstreams
+# (percent-encoded commas and keys decode to the same filter)
 curl -H "Authorization: Bearer $TOKEN" \
   "http://localhost:9000/backup?resources=proxies,upstreams" > partial-backup.json
 
@@ -1354,6 +1431,37 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 ```
 
 The backup output is directly compatible with `POST /batch` (additive) and `POST /restore` (full replacement). Backup resources always include `id`s; restore requires them, while batch will auto-generate them if a caller strips them. Successful exports and authenticated denied/failed attempts are always audited with request context before (or instead of) releasing unredacted bytes — independent of `FERRUM_ADMIN_AUDIT_ENABLED`, which gates ordinary mutation audit events only — see [Audit Log](#audit-log) and [admin_backup_restore.md](admin_backup_restore.md). Before replacement, restore acquires a persistent namespace guard and snapshots the current namespace with a non-validating raw load from the primary, so an already-invalid-but-present config still snapshots and keeps rollback available while it is repaired. If that snapshot cannot be taken at all — a genuine database/connectivity failure — restore **aborts with `503` before deleting anything** and leaves the prior config intact (retry once the database is reachable). Database inserts are chunked into 1,000-record transactions for large-scale imports. Conditional mTLS DNS-identity uniqueness is checked under the same namespace-scoped datastore admission guard used by ordinary Consumer, plugin, proxy-association, upstream, and API-spec writes, so a concurrent admin process cannot race a batch/restore policy activation with a case-variant credential. Restore retains one persistent guard owner from before its snapshot through the clear and every import or compensating-replay batch. All non-owning namespace resource writers and replays fail closed for that full interval, so no concurrent resource can be lost merely because it was absent from the restore payload. The compensating replay intentionally does not apply newly introduced mTLS DNS admission to the old snapshot: otherwise a pre-existing ambiguity would be deleted successfully and then become impossible to restore. Normal batch/restore admission never receives this rollback-only bypass. The endpoint returns `500 Internal Server Error` with a `rollback` field (`completed` / `incomplete` / `not_needed` / `unknown_outcome`). `not_needed` means the clear definitively aborted atomically (SQL / replica-set MongoDB), so nothing was deleted and the prior config was retained without any re-import. An unknown MongoDB commit remains `unknown_outcome` with the guard retained even when immediate verification still sees the prior counts, because the clear can become visible later. API specs are included in backup and restore as a versioned `api_specs` section (`section_version: "2"`). Legacy backups that omit the section require `?confirm_api_spec_deletion=true` (in addition to `?confirm=true`) when the target namespace still holds specs. `api_specs_not_restored` / `api_specs_note` appear only when rollback is `incomplete` and the prior namespace carried specs — see [admin_backup_restore.md](admin_backup_restore.md).
+
+`GET /backup` parses the `resources` filter from **percent-decoded** query keys
+and values, so `?resources=proxies%2Cconsumers` is the documented two-token
+filter and `?%72esources=proxies` is the same parameter rather than an
+unrecognized one that silently widens the export to everything, credentials
+included. Decoding is strict: `+`, decoded whitespace, incomplete/non-hex `%`
+escapes, invalid UTF-8, duplicate keys that differ only in encoding, and a
+key-only `?resources` all fail closed with `400`, the static
+`Unsupported backup resource filter` text, no attachment, and the fixed
+`invalid` audit sentinel — raw rejected text is never echoed or persisted.
+Raw whitespace inside the value (`?resources=proxies, upstreams`) was
+previously trimmed and accepted and is now `400`, matching the `%20` spelling
+that was already rejected.
+
+`POST /restore` requires a **JSON object** envelope and rejects unknown
+top-level keys with `400` before the recovery snapshot and the destructive
+clear. A top-level array, a positional sequence, a scalar, or a misspelled
+collection key (`proxise`) is not "a restore with that collection empty"; an
+explicit `{}` or explicit empty arrays keep their documented "replace this
+namespace with nothing" meaning. Accepted keys are `version`, `proxies`,
+`consumers`, `plugin_configs`, `upstreams`, `api_specs`,
+`gateway_trust_bundles`, plus the `GET /backup` metadata members
+`ferrum_version`, `exported_at`, `source`, and `counts`, which are accepted and
+ignored so an unmodified backup round-trips — ignored, but still shape-checked:
+`counts` must be a JSON object, as `openapi.yaml` publishes it, and the three
+others must be strings. `POST /batch` and the ordinary
+single-resource admin write bodies require a JSON object the same way, and
+object-valued resource fields (`circuit_breaker`, `retry`, `stream_match`,
+`trigger`, `health_checks`, `hash_on_cookie_config`, `service_discovery`,
+`locality_lb_setting`) accept an object or `null` rather than coercing an array
+into a default-constructed object.
 
 Gateway trust bundles ride along as a `gateway_trust_bundles` array on full,
 unfiltered database-backed exports (possibly empty). Resource-filtered and
@@ -2014,7 +2122,8 @@ Force an immediate, synchronous classification pass over every HTTP-family backe
 
 This operational recovery endpoint is available in every proxy-serving mode,
 including read-only file, DP, and mesh admin states. It does not persist a
-configuration or database mutation and still requires a valid admin JWT.
+configuration or database mutation. It requires a valid admin JWT with the
+`operator` role; a viewer token is refused with `403 Forbidden`.
 
 ```bash
 curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:9000/backend-capabilities/refresh
@@ -2194,7 +2303,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" "http://localhost:9000/mesh/confi
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/mesh/slice-drift
 ```
 
-Returns `404` outside CP mode. Returns `200` with an empty `data_planes` list when CP mode is active but no local `MeshSubscribe` DP has connected yet. Desired versions reflect actual per-DP projected content changes, not global reload timestamps; rejection diagnostics retain only a closed `rejected.stage` (`install` / `runtime`) and `rejected.reason` label mapped from the DP's wire enum, and no caller-supplied text is ever accepted or retained.
+Returns `404` outside CP mode. Returns `400` for an invalid `X-Ferrum-Namespace` header. Returns `200` with an empty `data_planes` list when CP mode is active but no local `MeshSubscribe` DP has connected yet. Desired versions reflect actual per-DP projected content changes, not global reload timestamps; rejection diagnostics retain only a closed `rejected.stage` (`install` / `runtime`) and `rejected.reason` label mapped from the DP's wire enum, and no caller-supplied text is ever accepted or retained.
 
 This surface is **observability only and never gates mesh configuration delivery**: a DP the bounded registry declines to track (4096-identity cap, oversized retained selector) is still served its full mesh slice, it simply does not appear in `data_planes`. A missing DP therefore means "not tracked or not connected", not "not configured" — cross-check `GET /cluster` for the connected set. On fleets above 256 tracked identities the published watermarks may lag live state by up to one maintenance interval while high-frequency send/ACK updates coalesce.
 
@@ -2289,7 +2398,7 @@ Response (truncated):
 
 **Disclosure surface**: the payload reveals the mesh topology shape the current workload can reach — service names, namespaces, hosts, ports, FQDN aliases. This is not secret traffic data (no bodies, headers, or credentials), but operators wiring this into long-running scrapers should still scope JWT issuance accordingly.
 
-Returns `503 Service Unavailable` when proxy state is not yet available, `404 Not Found` when no active mesh egress scope has been installed.
+Returns `503 Service Unavailable` when proxy state is not yet available, `404 Not Found` when no active mesh egress scope has been installed, and `400 Bad Request` for an invalid `X-Ferrum-Namespace` header.
 
 ### `POST /mesh/egress-scope/test`
 
@@ -2319,7 +2428,7 @@ Response:
 
 The handler memoises the resolved `OutboundRegistry` against the installed snapshot, so repeated calls do not re-parse `known_destinations` on every request.
 
-Returns `503` when proxy state is unavailable, `404` when no active mesh egress scope, `400` when the body is not valid JSON / `host` is missing or empty / `port` is `0`.
+Returns `503` when proxy state is unavailable, `404` when no active mesh egress scope, `403` when the token lacks the `operator` role, `413` when the body exceeds the 1 MiB shared cap, and `400` when the body is not valid JSON / `host` is missing or empty / `port` is `0`.
 
 ### Related environment variables
 

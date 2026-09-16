@@ -97,18 +97,13 @@ info:
     authorization-scoping `namespace` follows the tenant so a later reuse of
     the old name cannot expose the renamed tenant's `GET /audit` history, while
     immutable `namespace_at_event` keeps the namespace recorded when the event
-    occurred. The one-time
-    connect/migrate compatibility backfill of pre-existing derived names takes
-    that same global registry lease and commits as one transaction — on SQL the
-    lease row is verified and locked (`FOR UPDATE`, or SQLite's writer lock)
-    before the derived-name scan and stays locked through the commit, so the
-    pass neither resurrects a namespace a concurrent confirmed `DELETE` removed
-    nor rolls itself back merely for outrunning the lease TTL. Standalone
-    MongoDB has no multi-document transactions and therefore refuses these
-    three operations with `501` before mutating anything, and for the same
-    reason the compatibility backfill writes nothing on that topology; `GET`
-    remains available and still returns the union of registry names and derived
-    resource names.
+    occurred. Fresh database initialization seeds canonical `ferrum`; startup
+    does not backfill derived names into registry rows. Live registry mutations
+    preserve at least one row, so later startups do not reseed a deleted default.
+    Standalone MongoDB has no multi-document transactions and therefore refuses
+    these three operations with `501` before mutating anything. Single-document
+    initialization still seeds an empty registry; `GET` remains available and
+    returns the union of registry names and derived resource names.
 
     ## Caching and read-only mode
 
@@ -617,6 +612,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AcmeCertificateRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -751,6 +748,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "501":
@@ -833,6 +832,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "501":
@@ -854,6 +855,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AcmeOrder"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -1804,6 +1807,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "408":
           $ref: "#/components/responses/RequestTimeout"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
 
   # ── Overload ────────────────────────────────────────────────────────
   /overload:
@@ -1971,6 +1976,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/RuntimeMetricsSnapshot"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -2128,6 +2135,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AdminMetrics"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -2288,6 +2297,8 @@ paths:
                       config_diverged: false
                       config_diverged_since: null
                       config_divergence_recoveries_total: 0
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -2352,6 +2363,8 @@ paths:
                         hbone: unknown
                         last_probe_at_unix_secs: 1714003200
                         last_probe_error: "H2/TLS downgraded after ALPN-negotiated HTTP/1.1 on request path"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "503":
@@ -2424,6 +2437,8 @@ paths:
                     status: joined
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "503":
           description: Proxy state unavailable in this mode
           content:
@@ -2491,6 +2506,8 @@ paths:
                         orig_dst4_cookies: 0
                         orig_dst6_cookies: 0
                         has_policy_scope: false
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -2554,6 +2571,8 @@ paths:
                     name: ratings
                     ports: [8081]
                     workload_count: 1
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -2696,6 +2715,8 @@ paths:
                     duration_ms_avg: 6.7364
                     last_seen_unix_ms: 1779035398000
                     last_seen: "2026-05-17T16:29:58Z"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -2737,6 +2758,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/MeshEgressScopeResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -2825,6 +2848,8 @@ paths:
                     type: string
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           description: No active mesh egress scope
           content:
@@ -2836,6 +2861,8 @@ paths:
                     type: string
         "408":
           $ref: "#/components/responses/RequestTimeout"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "503":
           description: Proxy state unavailable in this mode
           content:
@@ -2915,6 +2942,8 @@ paths:
                           type: [integer, "null"]
                           format: int64
                           description: SPIFFE `spiffe_refresh_hint` from the bundle, if present.
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -3150,6 +3179,8 @@ paths:
                         outbound_trust_active: false
                         inbound_trust_active: false
                         trust_source: blocked_pending_poll
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -3281,6 +3312,8 @@ paths:
                           value:
                             numerator: 25
                             denominator: hundred
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -3758,6 +3791,8 @@ paths:
                       adopted_total: 0
                       foreign_authority_adopt_secs: 300
                       quarantine_active: false
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -3788,7 +3823,8 @@ paths:
         never returned by this endpoint, metrics, or logs. Caller-supplied
         NACK text is discarded rather than retained.
 
-        Returns 404 outside CP mode. Returns 200 with an empty
+        Returns 404 outside CP mode. Returns 400 for an invalid
+        `X-Ferrum-Namespace` header. Returns 200 with an empty
         `data_planes` list when CP mode is active but no local mesh DP
         has subscribed yet. Disconnected rows are retained for 300s;
         the registry hard-caps at 4096 identities.
@@ -3812,6 +3848,7 @@ paths:
                       tracked: 1
                       connected: 1
                       converged: 1
+                      accepted: 0
                       drifted: 0
                       rejecting: 0
                       pending: 0
@@ -3833,11 +3870,55 @@ paths:
                           version: "v2"
                           at: "2026-08-02T15:59:31Z"
                           age_seconds: 29
+                        applied:
+                          version: "v2"
+                          at: "2026-08-02T15:59:32Z"
+                          age_seconds: 28
                         convergence: converged
                         drift:
                           desired_vs_sent: false
                           desired_vs_acknowledged: false
                           sent_vs_acknowledged: false
+                          desired_vs_applied: false
+                accepted:
+                  summary: Install ACK without proxy-runtime application
+                  value:
+                    mode: cp
+                    generated_at: "2026-08-02T16:00:00Z"
+                    summary:
+                      tracked: 1
+                      connected: 1
+                      converged: 0
+                      accepted: 1
+                      drifted: 0
+                      rejecting: 0
+                      pending: 0
+                      disconnected: 0
+                    data_planes:
+                      - node_id: mesh-dp-b
+                        namespace: ferrum
+                        connected: true
+                        session_connected_at: "2026-08-02T15:59:00Z"
+                        desired:
+                          version: "v2"
+                          at: "2026-08-02T15:59:30Z"
+                          age_seconds: 30
+                        sent:
+                          version: "v2"
+                          at: "2026-08-02T15:59:30Z"
+                          age_seconds: 30
+                        acknowledged:
+                          version: "v2"
+                          at: "2026-08-02T15:59:31Z"
+                          age_seconds: 29
+                        convergence: accepted
+                        drift:
+                          desired_vs_sent: false
+                          desired_vs_acknowledged: false
+                          sent_vs_acknowledged: false
+                          desired_vs_applied: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -4381,6 +4462,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/BatchAtomicFailureResponse"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "501":
@@ -4463,8 +4546,18 @@ paths:
             Comma-separated list of resource types to include.
             Valid values: `proxies`, `consumers`, `plugin_configs`, `upstreams`, `api_specs`.
             When omitted, all resource types are included.
+            Keys and values are strictly percent-decoded before the parameter
+            is identified, before duplicate detection, and before the CSV
+            split, so `resources=proxies%2Cconsumers` is the same filter as
+            `resources=proxies,consumers` and `%72esources=proxies` is the same
+            parameter as `resources=proxies` rather than an unrecognized one
+            that widens the export. Decoding is strict and never lossy: `+`
+            (this is not `application/x-www-form-urlencoded`), decoded
+            whitespace, an incomplete or non-hex `%` escape, and bytes that are
+            not valid UTF-8 are all rejected with `400`.
             The parameter must appear at most once as `resources=<csv>`. A
-            key-only `resources` (no `=`), duplicate/ambiguous occurrences, or
+            key-only `resources` (no `=`), duplicate/ambiguous occurrences
+            (including duplicates that differ only in encoding), or
             other structurally malformed forms are rejected with `400` and the
             same static error message — they never widen to an unfiltered
             export. Unknown tokens are likewise rejected with `400` and a
@@ -4880,6 +4973,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -4904,6 +4999,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Proxy"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -4967,6 +5064,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -5130,6 +5229,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -5156,6 +5257,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Consumer"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -5211,6 +5314,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -5331,6 +5436,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -5390,6 +5497,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -5612,6 +5721,8 @@ paths:
                 - api_chargeback_sink
                 - workload_metrics
                 - fault_injection
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -5715,6 +5826,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -5739,6 +5852,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PluginConfig"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -5809,6 +5924,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -5925,6 +6042,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -5948,6 +6067,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Upstream"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -5998,6 +6119,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
     delete:
@@ -6142,6 +6265,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GatewayTrustBundleConflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -6232,6 +6357,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GatewayTrustBundleConflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
     delete:
@@ -6292,6 +6419,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GatewayTrustStatus"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -7078,6 +7207,8 @@ paths:
                 description: The raw spec document (YAML format)
         "304":
           description: Spec unchanged — ETag matches `If-None-Match`
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -7387,6 +7518,8 @@ paths:
                 description: The raw spec document (YAML format)
         "304":
           description: Spec unchanged — ETag matches `If-None-Match`
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -8084,6 +8217,14 @@ components:
           type: array
           items:
             type: string
+          description: >-
+            Subject Alternative Names from the leaf certificate as plain canonical
+            strings with no type prefix. DNS names are the encoded name; IPv4 uses
+            dotted decimal; IPv6 uses RFC 5952 (`std::net::IpAddr` display); URI and
+            email (rfc822Name) use their string values. Other GeneralName types use an
+            explicit `othername:<oid>`, `directory:<dn>`, `rid:<oid>`, `x400`,
+            `ediparty`, `invalid-ip:<hex>`, or `invalid:<tag>` form. Values are unique
+            and sorted.
         not_before:
           type: string
           format: date-time
@@ -8443,6 +8584,14 @@ components:
           type: array
           items:
             type: string
+          description: >-
+            Subject Alternative Names from the leaf certificate as plain canonical
+            strings with no type prefix. DNS names are the encoded name; IPv4 uses
+            dotted decimal; IPv6 uses RFC 5952 (`std::net::IpAddr` display); URI and
+            email (rfc822Name) use their string values. Other GeneralName types use an
+            explicit `othername:<oid>`, `directory:<dn>`, `rid:<oid>`, `x400`,
+            `ediparty`, `invalid-ip:<hex>`, or `invalid:<tag>` form. Values are unique
+            and sorted.
         not_before:
           type: string
           format: date-time
@@ -8647,6 +8796,14 @@ components:
           type: array
           items:
             type: string
+          description: >-
+            Subject Alternative Names from the leaf certificate as plain canonical
+            strings with no type prefix. DNS names are the encoded name; IPv4 uses
+            dotted decimal; IPv6 uses RFC 5952 (`std::net::IpAddr` display); URI and
+            email (rfc822Name) use their string values. Other GeneralName types use an
+            explicit `othername:<oid>`, `directory:<dn>`, `rid:<oid>`, `x400`,
+            `ediparty`, `invalid-ip:<hex>`, or `invalid:<tag>` form. Values are unique
+            and sorted.
         not_before:
           type: string
           format: date-time
@@ -9025,6 +9182,7 @@ components:
             Optional friendly name. Must be unique across all proxies when set.
         listen_path:
           type: [string, "null"]
+          minLength: 1
           description: >-
             URL path prefix, `=/exact-path`, or `~regex` this proxy matches.
             Must start with `/` for literal prefix matching, `=/` for exact
@@ -9159,6 +9317,8 @@ components:
         backend_port:
           type: integer
           format: uint16
+          minimum: 0
+          maximum: 65535
           default: 0
           description: >-
             Backend server port. Required (>= 1) when `upstream_id` is not set.
@@ -9182,12 +9342,15 @@ components:
         backend_connect_timeout_ms:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 86400000
           default: 5000
           description: TCP connect timeout in milliseconds
         backend_read_timeout_ms:
           type: integer
           format: uint64
           minimum: 0
+          maximum: 86400000
           default: 30000
           description: >-
             Backend read timeout in milliseconds (default 30000). For HTTP/gRPC
@@ -9202,6 +9365,7 @@ components:
           type: integer
           format: uint64
           minimum: 0
+          maximum: 86400000
           default: 30000
           description: Backend write timeout in milliseconds. For TCP proxies, this is a per-direction inactivity timeout on the backend write path. 0 = disabled.
         backend_tls_client_cert_path:
@@ -9244,6 +9408,8 @@ components:
         dns_cache_ttl_seconds:
           type: [integer, "null"]
           format: uint64
+          minimum: 1
+          maximum: 86400
           description: DNS cache TTL override in seconds
         auth_mode:
           $ref: "#/components/schemas/AuthMode"
@@ -9262,6 +9428,8 @@ components:
         pool_idle_timeout_seconds:
           type: [integer, "null"]
           format: uint64
+          minimum: 1
+          maximum: 3600
           description: Idle connection timeout in seconds (overrides global)
         pool_enable_http_keep_alive:
           type: [boolean, "null"]
@@ -9272,14 +9440,20 @@ components:
         pool_tcp_keepalive_seconds:
           type: [integer, "null"]
           format: uint64
+          minimum: 1
+          maximum: 86400
           description: TCP keep-alive probe interval (overrides global)
         pool_http2_keep_alive_interval_seconds:
           type: [integer, "null"]
           format: uint64
+          minimum: 1
+          maximum: 86400
           description: HTTP/2 PING interval in seconds (overrides global)
         pool_http2_keep_alive_timeout_seconds:
           type: [integer, "null"]
           format: uint64
+          minimum: 1
+          maximum: 86400
           description: HTTP/2 PING timeout in seconds (overrides global)
         pool_http2_initial_stream_window_size:
           type: [integer, "null"]
@@ -9369,6 +9543,7 @@ components:
           type: [integer, "null"]
           format: uint16
           minimum: 1
+          maximum: 65535
           description: |
             Listen-port identity for this proxy (must be >= 1 when set).
 
@@ -9417,6 +9592,8 @@ components:
         tcp_idle_timeout_seconds:
           type: [integer, "null"]
           format: uint64
+          minimum: 0
+          maximum: 86400
           description: |
             TCP stream idle timeout in seconds. After this duration of no data transfer
             in either direction, the connection is closed. When omitted, uses the global
@@ -9530,6 +9707,8 @@ components:
         udp_idle_timeout_seconds:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 3600
           default: 60
           description: |
             UDP session idle timeout in seconds. After this duration of inactivity,
@@ -9565,6 +9744,7 @@ components:
         allowed_methods:
           oneOf:
             - type: array
+              minItems: 1
               items:
                 type: string
                 enum: [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS, TRACE, CONNECT]
@@ -9641,6 +9821,104 @@ components:
           format: date-time
           description: Last modification timestamp (set by server)
 
+      allOf:
+        - anyOf:
+            - required: [upstream_id]
+              properties:
+                upstream_id:
+                  type: string
+                  minLength: 1
+            - required: [backend_host, backend_port]
+              properties:
+                backend_host:
+                  type: string
+                  minLength: 1
+                backend_port:
+                  type: integer
+                  format: uint16
+                  minimum: 1
+        - if:
+            required: [backend_scheme]
+            properties:
+              backend_scheme:
+                enum: [tcp, tcps, udp, dtls]
+          then:
+            required: [listen_port]
+            properties:
+              listen_port:
+                type: integer
+              listen_path:
+                type: "null"
+              response_body_mode:
+                const: stream
+          else:
+            anyOf:
+              - required: [hosts]
+                properties:
+                  hosts:
+                    minItems: 1
+              - required: [listen_path]
+                properties:
+                  listen_path:
+                    type: string
+                    minLength: 1
+            properties:
+              passthrough:
+                const: false
+              stream_proxy_protocol:
+                enum: [false, null]
+              backend_proxy_protocol:
+                type: "null"
+              stream_match:
+                type: "null"
+        - if:
+            required: [backend_scheme]
+            properties:
+              backend_scheme:
+                enum: [udp, dtls]
+          then:
+            properties:
+              backend_proxy_protocol:
+                type: "null"
+              stream_match:
+                type: "null"
+              upstream_subset:
+                type: "null"
+          else:
+            properties:
+              udp_max_response_amplification_factor:
+                exclusiveMinimum: 0
+        - if:
+            required: [passthrough]
+            properties:
+              passthrough:
+                const: true
+          then:
+            properties:
+              frontend_tls:
+                const: false
+        - if:
+            required: [upstream_subset]
+            properties:
+              upstream_subset:
+                type: string
+          then:
+            required: [upstream_id]
+            properties:
+              upstream_id:
+                type: string
+                minLength: 1
+        - if:
+            required: [listen_port]
+            properties:
+              listen_port:
+                type: integer
+          then:
+            required: [backend_scheme]
+            properties:
+              backend_scheme:
+                type: string
+
     ProxyCreate:
       description: |
         Request body for creating or updating a proxy. Same schema as Proxy
@@ -9662,21 +9940,20 @@ components:
           is set. They remain required for a direct-backend proxy.
       allOf:
         - $ref: "#/components/schemas/Proxy"
-        - anyOf:
-            - required: [upstream_id]
-              properties:
-                upstream_id:
-                  type: string
-                  minLength: 1
-            - required: [backend_host, backend_port]
-              properties:
-                backend_host:
-                  type: string
-                  minLength: 1
-                backend_port:
-                  type: integer
-                  format: uint16
-                  minimum: 1
+      examples:
+        - listen_path: /api
+          backend_scheme: http
+          backend_host: backend.example.com
+          backend_port: 8080
+        - hosts: [api.example.com]
+          listen_path: null
+          upstream_id: api-pool
+          backend_port: 0
+          allowed_methods: null
+        - backend_scheme: tcp
+          listen_port: 5432
+          backend_host: db.internal
+          backend_port: 5432
 
     StreamMatchCriteria:
       type: object
@@ -10894,6 +11171,9 @@ components:
             is ignored.
         plugin_name:
           type: string
+          minLength: 1
+          maxLength: 255
+          pattern: '\S'
           description: >-
             Plugin type name. Must be one of the available built-in plugins
             (e.g., key_auth, rate_limiting, cors, stdout_logging). Use
@@ -11807,6 +12087,19 @@ components:
             properties:
               scope:
                 const: global
+        - if:
+            required: [scope]
+            properties:
+              scope:
+                const: proxy
+          then:
+            required: [proxy_id]
+            properties:
+              proxy_id:
+                type: string
+                minLength: 1
+                maxLength: 254
+                pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
 
     PluginConfig:
       description: >-
@@ -11832,6 +12125,15 @@ components:
         - $ref: "#/components/schemas/PluginConfigBase"
         - type: object
           required: [plugin_name, scope]
+      examples:
+        - plugin_name: stdout_logging
+          scope: global
+          config: {}
+        - plugin_name: stdout_logging
+          scope: proxy
+          proxy_id: api-proxy
+          enabled: false
+          config: {}
 
     PluginConfigReplace:
       description: >-
@@ -12291,16 +12593,22 @@ components:
         failure_threshold:
           type: integer
           format: uint32
+          minimum: 1
+          maximum: 10000
           default: 5
           description: Consecutive failures to trip the circuit open
         success_threshold:
           type: integer
           format: uint32
+          minimum: 1
+          maximum: 10000
           default: 3
           description: Consecutive successes in half-open to close the circuit
         timeout_seconds:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 86400
           default: 30
           description: >
             Seconds to wait in open state before transitioning to half-open.
@@ -12310,6 +12618,8 @@ components:
         cooldown_seconds:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 86400
           writeOnly: true
           deprecated: true
           description: >
@@ -12319,14 +12629,19 @@ components:
             in one object is rejected as a duplicate field.
         failure_status_codes:
           type: array
+          maxItems: 500
           items:
             type: integer
             format: uint16
+            minimum: 100
+            maximum: 599
           default: [500, 502, 503, 504]
           description: HTTP status codes that count as failures
         half_open_max_requests:
           type: integer
           format: uint32
+          minimum: 1
+          maximum: 10000
           default: 1
           description: Maximum concurrent probe requests allowed in half-open state
         trip_on_connection_errors:
@@ -12346,13 +12661,18 @@ components:
         max_retries:
           type: integer
           format: uint32
+          minimum: 0
+          maximum: 100
           default: 3
           description: Maximum retry attempts
         retryable_status_codes:
           type: array
+          maxItems: 500
           items:
             type: integer
             format: uint16
+            minimum: 100
+            maximum: 599
           default: [502, 503, 504]
           description: HTTP status codes eligible for retry
         retryable_methods:
@@ -12386,6 +12706,8 @@ components:
                 delay_ms:
                   type: integer
                   format: uint64
+                  minimum: 0
+                  maximum: 300000
                   default: 100
                   description: Fixed delay between retries in milliseconds
         - type: object
@@ -12399,10 +12721,14 @@ components:
                 base_ms:
                   type: integer
                   format: uint64
+                  minimum: 0
+                  maximum: 300000
                   description: Base delay in milliseconds (doubled each attempt)
                 max_ms:
                   type: integer
                   format: uint64
+                  minimum: 0
+                  maximum: 300000
                   description: Maximum delay cap in milliseconds
       default:
         fixed:
@@ -12418,6 +12744,17 @@ components:
         - $ref: "#/components/schemas/Upstream"
       required:
         - targets
+      examples:
+        - targets:
+            - host: backend.example.com
+              port: 8080
+              weight: 1
+          subsets: null
+        - targets: []
+          service_discovery:
+            provider: dns_sd
+            dns_sd:
+              service_name: _http._tcp.backend.example.com
 
     GatewayTrustBundle:
       type: object
@@ -12698,6 +13035,14 @@ components:
     Upstream:
       type: object
       required: [targets]
+      anyOf:
+        - properties:
+            targets:
+              minItems: 1
+        - required: [service_discovery]
+          properties:
+            service_discovery:
+              type: object
       properties:
         labels:
           $ref: "#/components/schemas/ResourceLabels"
@@ -12726,6 +13071,7 @@ components:
             Optional friendly name. Must be unique across all upstreams when set.
         targets:
           type: array
+          maxItems: 1000
           items:
             $ref: "#/components/schemas/UpstreamTarget"
           description: >-
@@ -12764,6 +13110,8 @@ components:
             source (allowing `targets` to be empty).
         subsets:
           type: [array, "null"]
+          minItems: 1
+          maxItems: 100
           items:
             $ref: "#/components/schemas/SubsetDefinition"
           description: |
@@ -12846,6 +13194,7 @@ components:
             exactly, with no path or query options.
         backend_tls_sni:
           type: [string, "null"]
+          minLength: 1
           maxLength: 253
           description: >-
             Optional backend TLS Server Name Indication override. Mesh
@@ -12918,13 +13267,19 @@ components:
       properties:
         host:
           type: string
+          minLength: 1
+          maxLength: 255
           description: Backend hostname or IP
         port:
           type: integer
           format: uint16
+          minimum: 1
+          maximum: 65535
         weight:
           type: integer
           format: uint32
+          minimum: 1
+          maximum: 65535
           default: 1
           description: Relative weight for weighted round-robin
         tags:
@@ -13457,12 +13812,16 @@ components:
       properties:
         path:
           type: string
+          minLength: 1
+          maxLength: 2048
           default: "/"
           description: >-
             Cookie `Path` attribute. Must start with `/` and must not contain
             control bytes or `;`.
         ttl_seconds:
           type: integer
+          minimum: 0
+          maximum: 86400
           default: 3600
           description: >-
             Cookie `Max-Age` in seconds (default 1 hour). Ignored when
@@ -13477,6 +13836,8 @@ components:
             `Permanent` lifetime keeps `ttl_seconds` from `absoluteTimeout`.
         domain:
           type: [string, "null"]
+          minLength: 1
+          maxLength: 253
           description: >-
             Optional ASCII domain name. An optional leading dot is accepted.
         http_only:
@@ -13515,28 +13876,39 @@ components:
         interval_seconds:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 3600
           default: 10
           description: Seconds between probes
         timeout_ms:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 86400000
           default: 5000
           description: Probe timeout in milliseconds
         healthy_threshold:
           type: integer
           format: uint32
+          minimum: 1
+          maximum: 10000
           default: 3
           description: Consecutive healthy probes to mark target healthy
         unhealthy_threshold:
           type: integer
           format: uint32
+          minimum: 1
+          maximum: 10000
           default: 3
           description: Consecutive unhealthy probes to mark target unhealthy
         healthy_status_codes:
           type: array
+          maxItems: 500
           items:
             type: integer
             format: uint16
+            minimum: 100
+            maximum: 599
           default: [200, 302]
           description: Status codes considered healthy (HTTP probe only)
         probe_type:
@@ -13570,24 +13942,33 @@ components:
       properties:
         unhealthy_status_codes:
           type: array
+          maxItems: 500
           items:
             type: integer
             format: uint16
+            minimum: 100
+            maximum: 599
           default: [500, 502, 503, 504]
           description: Status codes that count toward the unhealthy threshold
         unhealthy_threshold:
           type: integer
           format: uint32
+          minimum: 1
+          maximum: 1000
           default: 3
           description: Failures within the window to mark target unhealthy
         unhealthy_window_seconds:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 86400
           default: 30
           description: Sliding window for counting failures
         healthy_after_seconds:
           type: integer
           format: uint64
+          minimum: 0
+          maximum: 86400
           default: 30
           description: |
             Seconds after which an unhealthy target is automatically restored
@@ -13607,9 +13988,12 @@ components:
             passive ejections are re-admitted first. Null means no cap.
         gateway_error_codes:
           type: [array, "null"]
+          maxItems: 500
           items:
             type: integer
             format: uint16
+            minimum: 100
+            maximum: 599
           description: |
             Reserved for DestinationRule parity. Validated and persisted, but
             not yet applied by passive health at runtime.
@@ -13646,6 +14030,11 @@ components:
     ServiceDiscoveryConfig:
       type: object
       required: [provider]
+      description: >-
+        The selected provider requires its matching configuration object. Its
+        poll interval must be 1–3600 seconds, and a selected mesh port must be
+        1–65535. Configuration objects for inactive providers are ignored;
+        their numeric fields still have to fit their unsigned integer types.
       properties:
         provider:
           type: string
@@ -13677,6 +14066,8 @@ components:
             poll_interval_seconds:
               type: integer
               format: uint64
+              minimum: 0
+              maximum: 18446744073709551615
               default: 30
               description: Re-query interval in seconds
         kubernetes:
@@ -13713,6 +14104,8 @@ components:
             poll_interval_seconds:
               type: integer
               format: uint64
+              minimum: 0
+              maximum: 18446744073709551615
               default: 30
         consul:
           type: [object, "null"]
@@ -13741,6 +14134,8 @@ components:
             poll_interval_seconds:
               type: integer
               format: uint64
+              minimum: 0
+              maximum: 18446744073709551615
               default: 30
         mesh:
           type: [object, "null"]
@@ -13756,10 +14151,14 @@ components:
             port:
               type: [integer, "null"]
               format: uint16
+              minimum: 0
+              maximum: 65535
               description: Mesh service port to select. Defaults to the first service/workload port.
             poll_interval_seconds:
               type: integer
               format: uint64
+              minimum: 0
+              maximum: 18446744073709551615
               default: 30
             topology:
               type: string
@@ -13777,6 +14176,8 @@ components:
         default_weight:
           type: integer
           format: uint32
+          minimum: 1
+          maximum: 65535
           default: 1
           description: Default weight assigned to discovered targets
         max_stale_seconds:
@@ -13821,6 +14222,10 @@ components:
             properties:
               dns_sd:
                 type: object
+                properties:
+                  poll_interval_seconds:
+                    minimum: 1
+                    maximum: 3600
         - if:
             required: [provider]
             properties:
@@ -13831,6 +14236,10 @@ components:
             properties:
               kubernetes:
                 type: object
+                properties:
+                  poll_interval_seconds:
+                    minimum: 1
+                    maximum: 3600
         - if:
             required: [provider]
             properties:
@@ -13841,6 +14250,10 @@ components:
             properties:
               consul:
                 type: object
+                properties:
+                  poll_interval_seconds:
+                    minimum: 1
+                    maximum: 3600
         - if:
             required: [provider]
             properties:
@@ -13851,6 +14264,12 @@ components:
             properties:
               mesh:
                 type: object
+                properties:
+                  port:
+                    minimum: 1
+                  poll_interval_seconds:
+                    minimum: 1
+                    maximum: 3600
 
     MeshEgressScopeResponse:
       type: object
@@ -17661,7 +18080,12 @@ components:
         restore as legacy backups; database-backed exports always include it
         (possibly with an empty `items` array). The aggregate decompressed
         API-spec content is bounded by the configured restore body limit.
+
+        Closed on restore: an unknown member is rejected with `400` rather
+        than silently ignored, so a misspelled section key cannot read as an
+        empty API-spec wipe.
       required: [section_version, items]
+      additionalProperties: false
       properties:
         section_version:
           type: string
@@ -17681,6 +18105,10 @@ components:
         One API spec document in a backup/restore payload. `spec_content_base64`
         is the gzip-compressed original document (standard Base64). Do not log
         this field; it may contain proprietary API definitions.
+
+        Closed on restore: an unknown member is rejected with `400` rather than
+        silently ignored.
+      additionalProperties: false
       required:
         - id
         - proxy_id
@@ -17766,37 +18194,148 @@ components:
           type: string
           format: date-time
 
+    ProxyRestoreItem:
+      description: >-
+        Proxy item accepted by `POST /restore`. Identical to `Proxy` except
+        that `id` is required and must be non-empty: `GET /backup` always emits
+        ids, and restore refuses to mint one because repeating the same body
+        would invent a different identity on a destructive replacement. The
+        create surfaces that generate ids are unaffected.
+      allOf:
+        - $ref: "#/components/schemas/Proxy"
+        - type: object
+          required: [id]
+          properties:
+            id:
+              type: string
+              minLength: 1
+
+    UpstreamRestoreItem:
+      description: >-
+        Upstream item accepted by `POST /restore`. Identical to `Upstream`
+        except that `id` is required and must be non-empty.
+      allOf:
+        - $ref: "#/components/schemas/Upstream"
+        - type: object
+          required: [id]
+          properties:
+            id:
+              type: string
+              minLength: 1
+
+    PluginConfigRestoreItem:
+      description: >-
+        Plugin configuration item accepted by `POST /restore`. Identical to
+        `PluginConfig` except that `id` is required and must be non-empty.
+      allOf:
+        - $ref: "#/components/schemas/PluginConfig"
+        - type: object
+          required: [id]
+          properties:
+            id:
+              type: string
+              minLength: 1
+
+    ConsumerRestoreItem:
+      description: >-
+        Consumer item accepted by `POST /restore`: the `ConsumerRestore`
+        credential contract plus restore's required non-empty `id`.
+      allOf:
+        - $ref: "#/components/schemas/ConsumerRestore"
+        - type: object
+          required: [id]
+          properties:
+            id:
+              type: string
+              minLength: 1
+
     RestoreRequest:
       type: object
       description: |
-        Same format as the backup output. All resource arrays are optional —
-        omitted types are treated as empty. Every included proxy, consumer,
-        plugin config, and upstream must carry a non-empty `id` (`GET /backup`
-        always includes them). A batch-shaped body that omits ids is not
-        restorable. Omitting `api_specs` entirely means a legacy backup
-        (preflight may require `confirm_api_spec_deletion=true`). An empty
-        `api_specs.items` array is an intentional wipe of API specs.
-        Backup metadata (`exported_at`, `source`, `counts`, `ferrum_version`)
-        is ignored if present.
+        Same format as the backup output, and a **closed** envelope: the body
+        must be a JSON object and unknown top-level keys are rejected with
+        `400` before anything is deleted. A JSON array, a positional sequence,
+        a scalar, or a misspelled collection key (for example `proxise`) is not
+        "a restore with that collection empty" — accepting it would delete the
+        namespace.
+
+        All resource arrays are optional — omitted types are treated as empty,
+        so an explicit `{}` is a deliberate "replace this namespace with
+        nothing". Every included proxy, consumer, plugin config, and upstream
+        must carry a non-empty `id` (`GET /backup` always includes them). A
+        batch-shaped body that omits ids is not restorable. Omitting
+        `api_specs` entirely means a legacy backup (preflight may require
+        `confirm_api_spec_deletion=true`). An empty `api_specs.items` array is
+        an intentional wipe of API specs.
+
+        Backup metadata emitted by `GET /backup` (`exported_at`, `source`,
+        `counts`, `ferrum_version`) is accepted and ignored, so an unmodified
+        backup artifact round-trips.
+      additionalProperties: false
       properties:
+        version:
+          type: string
+          description: |
+            Configuration schema version carried by the backup. When present
+            and non-empty it must equal the version this gateway expects;
+            an incompatible value is rejected with `400` and nothing is
+            deleted. Omitted or empty skips the check.
+          example: "1"
         proxies:
           type: array
           items:
-            $ref: "#/components/schemas/Proxy"
+            $ref: "#/components/schemas/ProxyRestoreItem"
         consumers:
           type: array
           items:
-            $ref: "#/components/schemas/ConsumerRestore"
+            $ref: "#/components/schemas/ConsumerRestoreItem"
         plugin_configs:
           type: array
           items:
-            $ref: "#/components/schemas/PluginConfig"
+            $ref: "#/components/schemas/PluginConfigRestoreItem"
         upstreams:
           type: array
           items:
-            $ref: "#/components/schemas/Upstream"
+            $ref: "#/components/schemas/UpstreamRestoreItem"
         api_specs:
           $ref: "#/components/schemas/ApiSpecsBackupSection"
+        gateway_trust_bundles:
+          type: array
+          description: |
+            Namespace-keyed gateway trust bundles (issue #3727). Three-valued
+            on purpose, so a restore can never *accidentally* change trust:
+
+            - **Absent** — trust is left exactly as it is. An older config
+              artifact that predates the resource (and every cached-fallback or
+              `?resources=` filtered export, which omit the section) must not
+              silently revoke a namespace's roots.
+            - **Present and empty (`[]`)** — an explicit revocation; the
+              namespace's record is deleted.
+            - **Present and non-empty** — authoritative; the namespace
+              reconciles to exactly what is listed. The resource is a namespace
+              singleton, so more than one record for the target namespace is
+              refused rather than silently reduced to the first.
+          items:
+            $ref: "#/components/schemas/GatewayTrustBundle"
+        ferrum_version:
+          type: string
+          description: >-
+            Backup metadata from `GET /backup`. Accepted and ignored.
+        exported_at:
+          type: string
+          description: >-
+            Backup metadata from `GET /backup`. Accepted and ignored.
+        source:
+          type: string
+          description: >-
+            Backup metadata from `GET /backup`. Accepted and ignored.
+        counts:
+          type: object
+          description: |
+            Backup metadata from `GET /backup`. Accepted and ignored, but the
+            declared `type: object` is enforced: a non-object `counts` is a
+            `400` like every other shape mismatch, so a malformed artifact
+            cannot reach the destructive clear.
 
     RestoreResponse:
       type: object
@@ -20674,7 +21213,10 @@ components:
                 description: >-
                   Expected JWT iss claim — routes tokens to this provider.
                   When set, the token MUST carry iss and it must match exactly;
-                  the issuer check alone rejects only a mismatching claim.
+                  the issuer check alone rejects only a mismatching claim. Per
+                  RFC 7519 section 4.1.1 a present iss must be a single string:
+                  an array, object, number, boolean, or null iss is rejected
+                  even when one element matches this value.
                   Required and must be nonblank when require_dpop is true: the
                   DPoP replay realm is this exact issuer, so key-set or JWKS
                   source rotation cannot reopen a proof. Issuers are compared
@@ -20732,8 +21274,15 @@ components:
                 description: >-
                   Per-provider override for requiring an exp claim. Expiry is
                   always validated when present. A present nbf is always
-                  validated too (it is not required). JWT exp/nbf use zero
-                  clock leeway; DPoP skew is a separate proof contract.
+                  validated too (it is not required). exp is an RFC 7519
+                  section 2 NumericDate (a JSON number that may carry a
+                  fractional part); a fractional exp bounds the authenticated
+                  stream exactly like an integer one, truncated toward the past
+                  so the enforced expiry is never later than the token states.
+                  nbf presence and validation are delegated to the JWT
+                  validation layer; Ferrum does not normalize a fractional nbf.
+                  JWT exp/nbf use zero clock leeway; DPoP skew is a separate
+                  proof contract.
               required_scopes:
                 type: array
                 items:
@@ -21044,7 +21593,25 @@ components:
     Oauth2IntrospectionConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: oauth2_introspection — RFC 7662 bearer token introspection with bounded, explicit multi-provider routing."
+      description: >-
+        Plugin: oauth2_introspection — RFC 7662 bearer token introspection with
+        bounded, explicit multi-provider routing. Both ends of a returned
+        validity window are enforced independently of the active member, as
+        defense in depth against a contradictory provider response: exp,
+        active_until, and expires_in close it, and nbf (RFC 7662 section 2.2)
+        opens it. An active:true response whose nbf is still in the future is
+        rejected with a bearer 401 and is not cached in either direction; a
+        present non-integer nbf is a dependency-response error and returns 503,
+        like malformed expiry data. An omitted nbf remains supported, including
+        a JSON null, which is treated as absent. Both bounds are absolute
+        instants resolved once at the provider-response boundary and re-checked
+        on every cache hit. Both are compared against the gateway clock with no
+        leeway: this plugin deliberately has no clock-skew knob, matching its
+        long-standing exp behaviour, so an authorization server whose clock runs
+        ahead of the gateway can have a freshly issued token rejected for the
+        first second(s) of its life, and each such request costs a provider
+        round trip because that rejection is never cached. Keep the
+        authorization server and the gateway clocks synchronized (NTP).
       required: [providers]
       properties:
         providers:
@@ -21376,7 +21943,11 @@ components:
               issuer:
                 type: string
                 minLength: 1
-                description: Expected ID token issuer
+                description: >-
+                  Expected ID token issuer, compared as an exact case-sensitive
+                  string. Per RFC 7519 section 4.1.1 a present iss must be a
+                  single string; an array, object, number, boolean, or null iss
+                  is rejected.
               discovery_url:
                 type: [string, "null"]
                 minLength: 1
@@ -21520,6 +22091,15 @@ components:
                 default: 60
                 minimum: 0
                 maximum: 3600
+                description: >-
+                  Leeway added to the ID token exp when deciding whether the
+                  session's claims are still live. The ID token exp is an RFC
+                  7519 section 2 NumericDate (a JSON number that may carry a
+                  fractional part) and is the session's authoritative claim
+                  lifetime, truncated toward the past; it does not fall back to
+                  session.ttl_secs or the access-token lifetime. The session is
+                  still additionally capped by session.ttl_secs and
+                  session.idle_ttl_secs.
         session:
           type: object
           additionalProperties: false
@@ -21695,8 +22275,9 @@ components:
           minLength: 1
           pattern: "\\S"
           description: >-
-            Required iss claim; must not be blank. Mutually exclusive with
-            expected_issuers — supplying both is rejected.
+            Required iss claim, compared as an exact case-sensitive string; must
+            not be blank. Mutually exclusive with expected_issuers — supplying
+            both is rejected.
         expected_issuers:
           type: array
           items:
@@ -21705,7 +22286,10 @@ components:
             pattern: "\\S"
           description: >-
             Accepted iss claims; no entry may be blank. Mutually exclusive with
-            expected_issuer.
+            expected_issuer. A token still claims exactly one issuer: per RFC
+            7519 section 4.1.1 a present iss must be a single string, and an
+            array, object, number, boolean, or null iss is rejected even when
+            one element matches an accepted value.
         audiences:
           type: array
           items:
@@ -21718,7 +22302,14 @@ components:
         require_exp:
           type: boolean
           default: true
-          description: Require an exp claim; expiration is always validated when present
+          description: >-
+            Require an exp claim; expiration is always validated when present.
+            exp is an RFC 7519 section 2 NumericDate (a JSON number that may
+            carry a fractional part); a fractional exp bounds the authenticated
+            stream exactly like an integer one, truncated toward the past so the
+            enforced expiry is never later than the token states. nbf presence
+            and validation are delegated to the JWT validation layer; Ferrum
+            does not normalize a fractional nbf.
         require_nbf:
           type: boolean
           default: false
@@ -27118,8 +27709,10 @@ components:
         the HTTP media-type selectors (body_methods, body_content_types,
         inspect_multipart, inspect_binary_body) do not apply because a WebSocket
         message carries no Content-Type — control frames are never scanned, and
-        max_scan_bytes / on_body_too_large / on_scan_timeout fail closed by
-        closing the connection with RFC 6455 code 1008.
+        max_scan_bytes / on_body_too_large / on_scan_timeout close the
+        connection with RFC 6455 code 1008 on the same terms as the HTTP body
+        path, which for their fail_closed dispositions means only when that
+        direction carries an enforcing body policy.
       properties:
         mode:
           type: [string, "null"]
@@ -27188,7 +27781,16 @@ components:
           description: >-
             Post-hoc scan deadline in milliseconds; 0 disables the timeout
             wrapper. Parsed as an unsigned 64-bit integer, so a negative or
-            above-u64 value is rejected at construction.
+            above-u64 value is rejected at construction. The deadline is
+            post-hoc only on every surface, including bodies and WebSocket
+            messages: the scan always runs and its hits always decide first, so
+            an enforcing rule that matched still rejects even when the scan
+            finished over budget. on_scan_timeout governs only a scan that
+            completed clean but late. The budget bounds the scan itself: the
+            clock starts after the body path's fairness yield, so scheduler
+            re-poll delay is never counted. Size it against
+            active_rules x max_scan_bytes, the only term that is under the
+            operator's control.
         max_scan_bytes:
           type: [integer, "null"]
           format: uint64
@@ -27200,8 +27802,34 @@ components:
             zero — construction rejects 0.
         on_scan_timeout:
           type: [string, "null"]
-          enum: [allow, block, log_and_allow, null]
+          enum: [allow, block, fail_closed, log_and_allow, null]
           default: log_and_allow
+          description: >-
+            Outcome for a scan that completed CLEAN but over scan_budget_ms.
+            Because the scan always runs and its hits always decide first, this
+            names a body the WAF inspected end to end and found nothing in, so
+            it is a latency control rather than a coverage control.
+            log_and_allow (default) forwards with a sampled warning and
+            waf.scan_timed_out metadata; allow forwards silently. fail_closed is
+            the opt-in strict-latency posture: it rejects when the governed body
+            direction carries an enforcing body policy, resolved through
+            request_body_policy_enforces / response_body_policy_enforces, which
+            ask the same question as on_body_too_large: fail_closed and
+            additionally count an on_body_too_large: block size cap while
+            globally enforcing; monitor mode and monitor-only rule sets without
+            that cap never start blocking. block rejects every over-budget scan
+            on every surface, independently of global mode. Request metadata,
+            header, query, and path scans are not disposition-aware under
+            fail_closed: they are bounded by the frontend header limits rather
+            than by max_scan_bytes, so only block applies the strict deadline to
+            them. A rejection sets waf.action=blocked with
+            waf.block_reason=scan_timeout; the timeout block itself contributes
+            no waf.rule_hits, though an earlier monitor-only phase may already
+            have recorded some. On a WebSocket session the same table decides
+            the message, with the RFC 6455 code 1008 Close taking the place of
+            the HTTP rejection, and a missed deadline is recorded with a sampled
+            warning independently of log_to_stdout because messages carry no
+            waf.* metadata.
         on_body_too_large:
           type: [string, "null"]
           enum: [fail_closed, scan_truncated, skip, block, null]
@@ -33748,7 +34376,7 @@ components:
                 # backslash, and no dot segment. The remaining canonicalization
                 # rules are checked at plugin load.
                 pattern: '%|\\|(^|/)\.\.?($|/)'
-              description: Canonical public MCP endpoint path, such as /mcp. Must not be "/" — the endpoint reserves its whole path subtree, so a root endpoint would refuse every other handler on the proxy and is rejected at admission. Only the exact path is served; slash-delimited descendants return 404 in both modes. A trailing-slash endpoint also reserves its unsuffixed scope. Two enabled mcp_gateway instances on one proxy may not have nesting endpoint scopes; admission rejects the pair. Queries do not change selection. Methods other than GET, POST, and DELETE return 405 when they reach this plugin.
+              description: Canonical public MCP endpoint path, such as /mcp. Must not be "/" — the endpoint reserves its whole path subtree, so a root endpoint would refuse every other handler on the proxy and is rejected at admission. A single trailing slash is accepted and canonicalised to the configured spelling through full mediation in both modes (/mcp and /mcp/ are equivalent); upstream requests use the configured servers.*.upstream_url path. Extra segments, repeated trailing slashes, case variants, encoded separators, and dot segments are different, rejected paths. Variants reaching the plugin return 404 with JSON-RPC -32600 / Unknown MCP endpoint; the HTTP frontend rejects encoded separators and dot segments earlier with 400. Two enabled mcp_gateway instances on one proxy may not have overlapping endpoint scopes, including case variants; admission rejects the pair. Queries do not change selection. Methods other than GET, POST, and DELETE return 405 when they reach this plugin.
             protocol_versions:
               type: [array, "null"]
               minItems: 1

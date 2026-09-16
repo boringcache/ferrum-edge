@@ -1048,3 +1048,228 @@ fn docker_fixtures_pin_host_ports_outside_the_ephemeral_range() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Object-valued admin admission fields reject positional sequences
+// ---------------------------------------------------------------------------
+//
+// Invariant: a field documented as an object must not accept a JSON array.
+// serde's derived struct visitors implement `visit_seq`, so an array is
+// silently read as a *positional* construction — every element fills the next
+// declared field and a short array leaves the rest at their `#[serde(default)]`
+// values. `[]` therefore became a fully default-constructed object. That is the
+// same root cause as the `POST /restore` envelope accepting `[]` and committing
+// a destructive empty restore (issue #5538); the nested resource fields listed
+// in that issue (`circuit_breaker`, `retry`, `health_checks`,
+// `hash_on_cookie_config`) are its siblings, and the remaining object-valued
+// optional fields on the same three admin resource structs carry it too.
+//
+// Siblings: `Proxy::{circuit_breaker, retry, stream_match}`,
+// `Upstream::{hash_on_cookie_config, health_checks, service_discovery,
+// locality_lb_setting}`, and `PluginConfig::trigger`. The envelope boundaries
+// themselves (`POST /restore`, `POST /batch`, and the generic admin resource
+// write path) go through `util::json_object::from_json_object_slice`, which is
+// asserted structurally below.
+
+/// `(struct, field, one valid object value)` for every field whose
+/// deserialization must reject a sequence.
+const OBJECT_ONLY_RESOURCE_FIELDS: [(&str, &str, &str); 8] = [
+    ("Proxy", "circuit_breaker", "{}"),
+    ("Proxy", "retry", "{}"),
+    ("Proxy", "stream_match", "{}"),
+    ("Upstream", "hash_on_cookie_config", "{}"),
+    ("Upstream", "health_checks", "{}"),
+    ("Upstream", "service_discovery", r#"{"provider":"dns_sd"}"#),
+    ("Upstream", "locality_lb_setting", "{}"),
+    (
+        "PluginConfig",
+        "trigger",
+        r#"{"when":{"match":{"method":["GET"]}}}"#,
+    ),
+];
+
+/// Minimal valid body for each resource struct the table covers.
+fn object_only_resource_base(resource: &str) -> serde_json::Value {
+    match resource {
+        "Proxy" => json!({
+            "id": "object-only",
+            "listen_path": "/object-only",
+            "backend_host": "127.0.0.1",
+            "backend_port": 8080,
+        }),
+        "Upstream" => json!({"id": "object-only", "name": "object-only", "targets": []}),
+        "PluginConfig" => json!({
+            "id": "object-only",
+            "plugin_name": "cors",
+            "scope": "global",
+        }),
+        other => panic!("unmapped resource struct {other}"),
+    }
+}
+
+/// Deserialize `body` as the named resource struct, reporting only success.
+fn object_only_resource_accepts(resource: &str, body: &serde_json::Value) -> bool {
+    match resource {
+        "Proxy" => {
+            serde_json::from_value::<ferrum_edge::config::types::Proxy>(body.clone()).is_ok()
+        }
+        "Upstream" => {
+            serde_json::from_value::<ferrum_edge::config::types::Upstream>(body.clone()).is_ok()
+        }
+        "PluginConfig" => {
+            serde_json::from_value::<ferrum_edge::config::types::PluginConfig>(body.clone()).is_ok()
+        }
+        other => panic!("unmapped resource struct {other}"),
+    }
+}
+
+#[test]
+fn object_valued_resource_fields_reject_sequences_and_keep_null() {
+    for (resource, field, valid_object) in OBJECT_ONLY_RESOURCE_FIELDS {
+        let mut sequence = object_only_resource_base(resource);
+        sequence[field] = json!([]);
+        assert!(
+            !object_only_resource_accepts(resource, &sequence),
+            "{resource}.{field} must reject an array instead of default-constructing an object"
+        );
+
+        let mut nonempty_sequence = object_only_resource_base(resource);
+        nonempty_sequence[field] = json!([1, 2, 3]);
+        assert!(
+            !object_only_resource_accepts(resource, &nonempty_sequence),
+            "{resource}.{field} must reject a positional sequence"
+        );
+
+        let mut scalar = object_only_resource_base(resource);
+        scalar[field] = json!("not-an-object");
+        assert!(
+            !object_only_resource_accepts(resource, &scalar),
+            "{resource}.{field} must reject a scalar"
+        );
+
+        // The documented forms still work: absent, explicit null, and a valid
+        // object value.
+        let absent = object_only_resource_base(resource);
+        assert!(
+            object_only_resource_accepts(resource, &absent),
+            "{resource} must still deserialize with {field} absent"
+        );
+        let mut null = object_only_resource_base(resource);
+        null[field] = serde_json::Value::Null;
+        assert!(
+            object_only_resource_accepts(resource, &null),
+            "{resource}.{field} must still accept an explicit null"
+        );
+        let mut object = object_only_resource_base(resource);
+        object[field] = serde_json::from_str(valid_object)
+            .unwrap_or_else(|error| panic!("{resource}.{field} sample parses: {error}"));
+        assert!(
+            object_only_resource_accepts(resource, &object),
+            "{resource}.{field} must still accept an object"
+        );
+    }
+}
+
+/// Fields on the admin resource structs that the table above does not list but
+/// that would silently accept a positional sequence.
+///
+/// Structural, so a newly added object-valued optional field fails the build
+/// rather than shipping the gap. A field is a candidate when its type is a
+/// plain (non-generic) struct declared in `config/types.rs`, or one of the
+/// out-of-module struct types those resources embed. `#[serde(skip)]` fields
+/// are derived state that never crosses the wire.
+#[test]
+fn every_object_valued_admin_resource_field_carries_the_guard() {
+    let types = source("src/config/types.rs");
+
+    let mut struct_names: BTreeSet<&str> = types
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("pub struct "))
+        .map(|rest| {
+            rest.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .next()
+                .unwrap_or("")
+        })
+        .filter(|name| !name.is_empty())
+        .collect();
+    // Struct-typed fields whose definition lives outside `config/types.rs`.
+    struct_names.insert("PluginTrigger");
+    struct_names.insert("StreamMatchCriteria");
+
+    for resource in ["Proxy", "Upstream", "PluginConfig"] {
+        let header = format!("pub struct {resource} {{");
+        let start = types
+            .find(&header)
+            .unwrap_or_else(|| panic!("{resource} must be declared in config/types.rs"));
+        let body = &types[start..];
+        let end = body
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("{resource} declaration must terminate"));
+        let body = &body[..end];
+
+        // Attributes accumulate until the field they decorate.
+        let mut attributes = String::new();
+        for line in body.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("///") || trimmed.starts_with("//") || trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.starts_with('#') || (!attributes.is_empty() && !trimmed.contains("pub ")) {
+                attributes.push_str(trimmed);
+                continue;
+            }
+            let Some(declaration) = trimmed.strip_prefix("pub ") else {
+                attributes.clear();
+                continue;
+            };
+            let Some((field, type_text)) = declaration.split_once(": ") else {
+                attributes.clear();
+                continue;
+            };
+            let type_text = type_text.trim_end_matches(',');
+            let is_candidate = type_text
+                .strip_prefix("Option<")
+                .and_then(|inner| inner.strip_suffix('>'))
+                .filter(|inner| !inner.contains('<'))
+                .map(|inner| inner.rsplit("::").next().unwrap_or(inner))
+                .is_some_and(|inner| struct_names.contains(inner));
+            if is_candidate && !attributes.contains("skip)") && !attributes.contains("skip,") {
+                assert!(
+                    attributes.contains("json_object::deserialize_optional_object"),
+                    "{resource}.{field} is object-valued and must use \
+                     `util::json_object::deserialize_optional_object`, or a JSON array \
+                     silently default-constructs it (issue #5538). Add it to \
+                     OBJECT_ONLY_RESOURCE_FIELDS as well."
+                );
+                assert!(
+                    OBJECT_ONLY_RESOURCE_FIELDS
+                        .iter()
+                        .any(
+                            |(table_resource, table_field, _)| *table_resource == resource
+                                && *table_field == field
+                        ),
+                    "{resource}.{field} carries the object-only guard but is missing from \
+                     OBJECT_ONLY_RESOURCE_FIELDS"
+                );
+            }
+            attributes.clear();
+        }
+    }
+}
+
+/// The typed admin body boundaries all parse through the object-only helper.
+#[test]
+fn admin_typed_body_boundaries_require_a_json_object_envelope() {
+    for (relative, context) in [
+        ("src/admin/mod.rs", "POST /restore and POST /batch"),
+        ("src/admin/crud.rs", "the generic admin resource write path"),
+    ] {
+        let text = source(relative);
+        assert!(
+            text.contains("json_object::from_json_object_slice"),
+            "{relative} ({context}) must parse typed request bodies through \
+             `util::json_object::from_json_object_slice` so a JSON array cannot be read as a \
+             positionally/defaults-constructed value (issue #5538)"
+        );
+    }
+}

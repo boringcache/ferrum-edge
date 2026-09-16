@@ -472,7 +472,8 @@ impl GraphqlPlugin {
     /// name lands on a different bucket, which is still unclaimed and therefore
     /// still enforced.
     fn charge_bucket_once(&self, ctx: &mut RequestContext, key: &str) -> bool {
-        ctx.graphql_charged_rate_buckets
+        ctx.plugin_state_mut()
+            .graphql_charged_rate_buckets
             .insert((self.instance_id, key.to_string()))
     }
 
@@ -1645,7 +1646,8 @@ impl Plugin for GraphqlPlugin {
         };
 
         let body = body.as_bytes().to_vec();
-        ctx.graphql_request_envelope_hashes
+        ctx.plugin_state_mut()
+            .graphql_request_envelope_hashes
             .insert(self.instance_id, graphql_envelope_digest(&body));
         self.enforce_graphql_envelope(ctx, &body).await
     }
@@ -1683,8 +1685,8 @@ impl Plugin for GraphqlPlugin {
         // Its absence means `before_proxy` never ran or already rejected, so
         // there is nothing to re-decide here.
         let Some(previous) = ctx
-            .graphql_request_envelope_hashes
-            .get(&self.instance_id)
+            .plugin_state()
+            .and_then(|state| state.graphql_request_envelope_hashes.get(&self.instance_id))
             .copied()
         else {
             return PluginResult::Continue;
@@ -1726,7 +1728,8 @@ impl Plugin for GraphqlPlugin {
                  and cannot be inspected",
             );
         }
-        ctx.graphql_request_envelope_hashes
+        ctx.plugin_state_mut()
+            .graphql_request_envelope_hashes
             .insert(self.instance_id, graphql_envelope_digest(envelope));
         self.enforce_graphql_envelope(ctx, envelope).await
     }
@@ -1745,9 +1748,11 @@ impl Plugin for GraphqlPlugin {
         _body: &[u8],
     ) -> bool {
         self.has_any_config
-            && ctx
-                .graphql_request_envelope_hashes
-                .contains_key(&self.instance_id)
+            && ctx.plugin_state().is_some_and(|state| {
+                state
+                    .graphql_request_envelope_hashes
+                    .contains_key(&self.instance_id)
+            })
             && headers
                 .get("content-type")
                 .is_some_and(|ct| is_graphql_json_content_type(ct))

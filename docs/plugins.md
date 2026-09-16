@@ -2591,6 +2591,8 @@ Unknown top-level, provider, and custom-header-location fields are rejected so m
 
 Remote discovery documents are capped at 128 KiB and JWKS responses at 1 MiB/256 keys, with bounded key components. A valid non-empty JWKS atomically replaces the key map, refreshes the monotonic trust deadline, clears failure state, and can restore authentication after expiry. Empty 200 responses, malformed or oversized bodies, non-2xx status, and transport/DNS/TLS/timeout failures retain last-known-good material only for the finite grace window and use a bounded accelerated retry cadence; after the deadline, verification refuses the retained material without deleting diagnostic/recovery state. JWKs are accepted for signature verification only when `use` is absent or `sig` and `key_ops` is absent or includes `verify`; contradictory operation metadata is rejected. The JWK `alg` parameter is honoured per RFC 7517 §4.4: a key that declares an `alg` is admitted only when that value names a supported signature algorithm for its key type — `RS256`/`RS384`/`RS512` for RSA, and `ES256`/`ES384` matching the key's `crv` for EC — and verification is then bound to exactly that algorithm. Keys declaring an encryption algorithm (`RSA-OAEP`, `RSA-OAEP-256`, `RSA1_5`), RSASSA-PSS (`PS256`/`PS384`/`PS512`), a key-agreement algorithm, or an `alg` that contradicts the curve are skipped as unsupported rather than silently treated as RS256/curve-derived verification keys. A key with no `alg` keeps the previous defaults (RS256 for RSA, curve-derived for EC). RSA signing keys must carry a modulus of at least 2048 bits; weaker keys are skipped rather than trusted. Signing keys without a non-empty `kid` are unusable, and a JWKS with duplicate usable `kid` values is rejected rather than choosing one by response order.
 
+Registered claims are validated for shape, not only for value. A present `iss` must be exactly one string (RFC 7519 §4.1.1); an array, object, number, boolean, or null `iss` is rejected with the same generic 401 even when one array element matches the configured issuer. Configuring an accepted issuer is a decision about which issuers this gateway trusts; it never lets one token claim several. `exp` is read as an RFC 7519 §2 NumericDate — a JSON number that may carry a fractional part — so a conforming fractional expiry bounds the authenticated stream exactly like an integer one instead of being read as "no expiry at all". Fractional `exp` seconds truncate toward the past, so the enforced expiry is never later than the one the token states. `nbf` presence and validation are delegated to the JWT validation layer, which decides them on its own terms; Ferrum does not normalize a fractional `nbf`.
+
 JWT header `kid` is required and binding. A missing `kid`, an empty `kid`, or a `kid` that is not in the selected provider's current trusted JWKS is rejected with the same generic 401 (`{"error":"Invalid or unrecognized JWT"}`) as any other invalid token. There is no all-keys fallback: a known `kid` selects only that key, so a token signed by a different published key is still rejected. Ferrum never logs token data, key material, claims, or attacker-controlled `kid` values.
 
 A token naming a non-empty `kid` the trusted key set does not contain also triggers **at most one out-of-band JWKS fetch per `kid_miss_refresh_cooldown_seconds` window**, so an identity-provider key rotation recovers in seconds instead of waiting out `jwks_refresh_interval_secs`. The triggering request still fails closed — it never blocks on the fetch — and a later request verifies once the refreshed key set is published. A missing or empty `kid` triggers nothing, and the cooldown bounds tokens carrying random identifiers to one fetch per window. The out-of-band fetch is strictly additional: it never shortens the periodic refresh cadence or the empty-store retry backoff. Because `oidc_relying_party` and mesh `MeshRequestAuthentication` injection consume the same shared store, they inherit the behaviour without a knob of their own; a shared store honours the most restrictive cooldown among its active consumers (disabled wins, otherwise the longest window).
@@ -2674,7 +2676,9 @@ Active cache entries retain only the prevalidated authorization outcome, canonic
 
 Authorization fallback never fans a token across providers by default. Explicit `Authorization: Bearer` locations and the implicit Authorization fallback are treated as the same routing source and both match the Bearer scheme case-insensitively. Multi-provider configurations should use distinct `from_headers` or `from_params` locations as deterministic routing hints. Without shared-trust opt-in, the first matching routing hint selects exactly one provider even if a client repeats the same token in another provider location. Set `allow_provider_fanout: true` only for providers inside one shared trust boundary. When `forward_original_token: false`, every configured occurrence of the accepted token is stripped from headers and query parameters before proxying while unrelated credentials are preserved.
 
-Only ordinary bearer tokens are supported. Active responses containing `cnf` or a non-Bearer `token_type` fail closed because this plugin does not validate DPoP or mTLS proof-of-possession. Missing or non-Boolean `active` members, oversized/malformed responses, provider transport failures, and non-success provider responses are treated as dependency failures and return `503`; only explicit `active: false` is negative-cached and returned as `401`. In multi-auth mode, a dependency failure takes precedence over later client-authentication rejections when no authentication method succeeds. OAuth authentication failures include a `WWW-Authenticate: Bearer` challenge; when an authentication chain has no credential, the first configured auth plugin challenge is advertised.
+Only ordinary bearer tokens are supported. Active responses containing `cnf` or a non-Bearer `token_type` fail closed because this plugin does not validate DPoP or mTLS proof-of-possession. Missing or non-Boolean `active` members, oversized/malformed responses, provider transport failures, and non-success provider responses are treated as dependency failures and return `503`; only explicit `active: false` is negative-cached and returned as `401`.
+
+Both ends of the returned validity window are enforced independently of `active`, as defense in depth against a contradictory or malformed provider response. `exp`, `active_until`, and `expires_in` close the window; `nbf` (RFC 7662 §2.2) opens it. An `active: true` response whose `nbf` is still in the future is rejected with a bearer `401` and is **not** cached in either direction, so the same token authenticates normally as soon as its window opens. A present but non-integer `nbf` is a broken dependency response and returns the same fixed `503` as malformed expiry data. An omitted `nbf` — including a JSON `null`, which is treated as absent — remains fully supported. Both bounds are absolute instants resolved once at the provider-response boundary and re-checked on every cache hit, so a cached authorization can never outlive the window it was admitted under. Both are compared against the gateway clock with **no leeway**: this plugin has no skew knob, deliberately matching its long-standing `exp` behaviour, so an authorization server whose clock runs ahead of the gateway can have a freshly issued token rejected for the first second(s) of its life — and, because a future-`nbf` rejection is never cached, each such request also costs a provider round trip. Keep the authorization server and the gateway synchronized (NTP). Use `jwt_auth` / `jwks_auth` `leeway_secs` or `oidc_relying_party` `id_token_clock_skew_secs` where bounded skew tolerance is required. In multi-auth mode, a dependency failure takes precedence over later client-authentication rejections when no authentication method succeeds. OAuth authentication failures include a `WWW-Authenticate: Bearer` challenge; when an authentication chain has no credential, the first configured auth plugin challenge is advertised.
 
 ```yaml
 plugin_name: oauth2_introspection
@@ -2703,7 +2707,7 @@ Active in `on_request_received` (callback and logout paths), `authenticate` (ses
 | Parameter | Type | Description |
 |---|---|---|
 | `providers` | Array | Exactly one OIDC provider configuration |
-| `providers[].issuer` | String | Expected ID token issuer |
+| `providers[].issuer` | String | Expected ID token issuer, compared as an exact case-sensitive string. A present `iss` must be a single string (RFC 7519 §4.1.1); an array, object, number, boolean, or null `iss` is rejected |
 | `providers[].discovery_url` | String | OIDC discovery URL |
 | `providers[].authorization_endpoint` | String | Explicit authorization endpoint when discovery is not used |
 | `providers[].token_endpoint` | String | Explicit token endpoint when discovery is not used |
@@ -2790,6 +2794,18 @@ there is no all-keys fallback. A known `kid` with a bad signature under that
 key is also rejected. Token data, key material, claims, and attacker-controlled
 `kid` values are never logged.
 
+The ID token's registered claims are held to the same shapes as `jwt_auth` and
+`jwks_auth`. A present `iss` must be exactly one string (RFC 7519 §4.1.1), so an
+array `iss` never satisfies the provider's configured issuer. The ID token `exp`
+is an RFC 7519 §2 NumericDate — a JSON number that may carry a fractional part —
+and it is the session's authoritative claim lifetime: a conforming fractional
+expiry bounds the session exactly like an integer one, truncated toward the past,
+rather than falling back to `session.ttl_secs` / the access-token lifetime. The
+session is still additionally capped by `session.ttl_secs` and
+`session.idle_ttl_secs`, and `providers[].id_token_clock_skew_secs` is the only
+leeway added to the claim expiry. A sealed cookie's stored claim expiry is
+honoured only where it is no looser than the claims it carries.
+
 ### Credential storage at rest
 
 Ferrum stores consumer credentials in the configuration database (the
@@ -2843,12 +2859,14 @@ Authenticates requests using HS256 JWT Bearer tokens matched against consumer cr
 |---|---|---|---|
 | `token_lookup` | String | `header:Authorization` | Exact credential location (`header:<name>` or `query:<name>`). Whitespace is not trimmed; a header name must be a valid HTTP header name and a query name must be non-empty and contain no whitespace. A location no request could ever satisfy is refused at config admission rather than published as a route that answers every request `401`. A `query:<name>` location is decoded identically on HTTP/1.1, HTTP/2, and HTTP/3, so a percent-encoded parameter name or token authenticates on every frontend |
 | `consumer_claim_field` | String | `sub` | JWT claim identifying the consumer |
-| `expected_issuer` | String | *(none)* | Required `iss` value; mutually exclusive with `expected_issuers` |
-| `expected_issuers` | String[] | `[]` | Accepted `iss` values |
+| `expected_issuer` | String | *(none)* | Required `iss` value, compared as an exact case-sensitive string; mutually exclusive with `expected_issuers` |
+| `expected_issuers` | String[] | `[]` | Accepted `iss` values. A token still claims exactly one issuer; several accepted values do not admit an array-valued `iss` |
 | `audiences` | String[] | `[]` | Accepted `aud` values; audience validation is disabled when empty |
 | `require_exp` | Boolean | `true` | Require an `exp` claim; expiration is always validated when present |
 | `require_nbf` | Boolean | `false` | Require an `nbf` claim; when present, `nbf` is always validated |
 | `leeway_secs` | u64 | `0` | Clock leeway for time-based JWT claims; max `300` |
+
+Registered claims are validated for shape as well as value. A present `iss` must be exactly one string (RFC 7519 §4.1.1): an array, object, number, boolean, or null `iss` is rejected with the generic `401` even when one array element matches a configured issuer, and even when no issuer is configured. `exp` is an RFC 7519 §2 NumericDate — a JSON number that may carry a fractional part — so a conforming fractional expiry bounds the authenticated stream exactly like an integer one; fractional `exp` seconds truncate toward the past, so the enforced expiry is never later than the one the token states. `nbf` presence and validation are delegated to the JWT validation layer, which decides them on its own terms; Ferrum does not normalize a fractional `nbf`.
 
 **Consumer credential** (`jwt`) — array. Secrets must be at least 32 characters:
 ```yaml
@@ -5298,12 +5316,16 @@ Binary are both inspected — the HTTP media-type selectors (`body_methods`,
 because a WebSocket message carries no `Content-Type`. Control frames
 (Ping/Pong/Close) are never scanned as application payload, messages arrive
 reassembled and uncompressed (`permessage-deflate` is never negotiated end to
-end), and `max_scan_bytes` / `on_body_too_large` / `on_scan_timeout` fail closed
-by closing the connection with RFC 6455 code 1008 and a fixed reason that never
-echoes message bytes. Anomaly scoring is evaluated per complete message rather
-than accumulated across a session, and message findings are emitted as `waf`
-log events rather than `waf.*` transaction metadata. See
-[waf.md](waf.md#websocket-message-inspection).
+end), and `max_scan_bytes` / `on_body_too_large` / `on_scan_timeout` close the
+connection with RFC 6455 code 1008 and a fixed reason that never echoes message
+bytes, on the same terms as the HTTP body path — the session policy resolved at
+upgrade mirrors `request_body_policy_enforces` / `response_body_policy_enforces`,
+`on_body_too_large: block` term included. Anomaly scoring is evaluated per
+complete message rather than accumulated across a session, and message findings
+are emitted as `waf` log events rather than `waf.*` transaction metadata.
+Because a message carries no metadata at all, a scan that missed its deadline is
+warned about independently of `log_to_stdout` (suppressed only by
+`on_scan_timeout: allow`). See [waf.md](waf.md#websocket-message-inspection).
 
 That drop is decided **per request**, not per configuration. A request matched
 by `global_exemptions` (path, method, IP, or consumer) never reaches a WAF
@@ -5364,8 +5386,8 @@ contract.
 | `inspect_binary_body` | bool | `false` | Inspect bodies whose content type is not in `body_content_types`. |
 | `max_scan_bytes` | usize | `1048576` | Maximum bytes scanned from each body. Must be greater than zero. |
 | `on_body_too_large` | string | `fail_closed` | `fail_closed` rejects an oversize governed body when that direction has an enforcing body rule or anomaly scoring, and otherwise scans the first `max_scan_bytes` and records truncation; `scan_truncated` is the explicit compatibility opt-out that always scans only the prefix and forwards the complete body; `skip` skips known-oversized bodies; `block` rejects every oversize governed body in enforce mode and, when a body inspection surface can run, satisfies `mode: enforce` admission on its own; it is also a blocking disposition for the buffered-representation claim on both directions, so an origin-encoded body is decoded before the cap is measured. |
-| `scan_budget_ms` | u64 | `50` | Post-hoc deadline for metadata/header and body scans. `0` disables the timeout wrapper. The synchronous scan cannot be cancelled mid-regex; over-budget scans are reported after the scan returns. |
-| `on_scan_timeout` | string | `log_and_allow` | Action when a body scan times out: `allow`, `block`, or `log_and_allow`. |
+| `scan_budget_ms` | u64 | `50` | Post-hoc deadline for metadata/header, body, and WebSocket-message scans. `0` disables the timeout wrapper. The synchronous scan cannot be cancelled mid-regex; it always runs to completion and over-budget scans are reported after the scan returns, so an enforcing hit found over budget still rejects. It bounds the scan itself: on the body path the clock starts after the fairness yield, so scheduler re-poll delay is never counted. Size it against `active_rules × max_scan_bytes`. |
+| `on_scan_timeout` | string | `log_and_allow` | Outcome for a scan that completed **clean** but over `scan_budget_ms` — a body the WAF inspected end to end and found nothing in, so this is a latency control rather than a coverage control. `log_and_allow` (default) forwards with a sampled warning and `waf.scan_timed_out` metadata; `allow` forwards silently. `fail_closed` is the opt-in strict-latency posture: it rejects when the governed body direction carries an enforcing body policy, resolved through `request_body_policy_enforces` / `response_body_policy_enforces` (the same question `on_body_too_large: fail_closed` asks, plus an `on_body_too_large: block` size cap while globally enforcing), so `monitor` mode and monitor-only rule sets without that cap never start blocking. `block` rejects every over-budget scan on every surface, independently of global mode. Request metadata/header/query/path scans are not disposition-aware under `fail_closed` — they are bounded by the frontend's header limits rather than by `max_scan_bytes` — so only `block` applies the strict deadline to them. A timeout rejection sets `waf.action=blocked` with `waf.block_reason=scan_timeout`. |
 | `disallowed_methods` | string[] | `[]` | Methods that should trigger the built-in `FE-METHOD-001` rule when that rule is active. |
 | `log_to_metadata` | bool | `true` | Write WAF metadata such as `waf.rule_hits`, `waf.action`, and `waf.severity` into transaction logs. |
 | `log_to_stdout` | bool | `false` | Emit sampled warnings for rule matches (one per source site per 10 seconds across instances, with `suppressed_events` counts) and per-hit debug detail. Each event's `action` is that rule's effective direct outcome after applying the global mode (`blocked`, `monitored`, `disabled`); `rule_action` carries the configured rule action (`enforce`, `monitor`, `disabled`). Aggregate anomaly scoring can still make the final transaction `waf.action=blocked` after individual per-rule events. |
@@ -5418,9 +5440,15 @@ recorded, never blocked. With `log_to_metadata: true`, oversize bodies handled b
 `waf.body_too_large=true` and `waf.body_too_large_target` (`request_body` or
 `response_body`); a blocked one adds `waf.action=blocked` and
 `waf.block_reason=body_too_large`, and a prefix-scanned one adds
-`waf.scan_truncated=true`. No body bytes are logged. The explicit `skip` mode
-records none of these fields because it may avoid buffering a known-oversize
-request entirely.
+`waf.scan_truncated=true`. A body rejected under `on_scan_timeout: fail_closed`
+or `block` because its scan completed over `scan_budget_ms` sets
+`waf.scan_timed_out=true`, `waf.action=blocked`, and
+`waf.block_reason=scan_timeout`. The timeout block itself contributes no
+`waf.rule_hits`; `waf.block_reason=scan_timeout` (rather than `rule`) names the
+deciding control, and a monitor-only hit recorded by an earlier phase still
+appears in `waf.rule_hits` beside it. No body bytes are logged. The explicit
+`skip` mode records none of these fields because it may avoid buffering a
+known-oversize request entirely.
 
 Set `on_body_too_large: scan_truncated` to keep the previous prefix-only
 behavior. That is an explicit acceptance of the suffix bypass and should be
@@ -7936,7 +7964,9 @@ plugins:
 
 HTTP-only Model Context Protocol gateway for AI agent tool traffic. `transparent_proxy` mode preserves MCP JSON-RPC and session headers while routing one Ferrum endpoint to one upstream MCP server. `aggregate_router` mode exposes one Ferrum MCP endpoint for multiple upstream MCP servers, synthesizes downstream `initialize`, lazily initializes upstream sessions, aggregates `tools/list`, `resources/list`, and `prompts/list`, namespaces public names, routes singleton `tools/call`, `resources/read`, and `prompts/get`, rewrites public names back to upstream names, validates tool arguments against discovered `inputSchema`, admits bounded JSON-RPC batch arrays with per-item validation and ordered synthetic response assembly (upstream-routed members must be singleton requests so later plugin phases are preserved), and emits `mcp.*` metadata for existing Ferrum authz, logging, tracing, chargeback, and alert plugins. A private, gateway-authenticated public→upstream tool-name mapping accompanies each aggregate `tools/call` rewrite so `ai_tool_governor` can keep policy keys on the public namespaced identity across that rewrite without trusting forgeable metadata.
 
-`endpoint.path` must be a canonical policy path and may not be `/`. The exact path is the only MCP endpoint; its slash-delimited descendants (including a trailing slash) are reserved and return HTTP 404 with a bounded JSON-RPC error in both modes. Because that subtree is reserved, a root endpoint would reserve the entire origin and refuse every other handler on the proxy, so `endpoint.path: "/"` is rejected at admission — use a sub-path such as `/mcp`. For the same reason, two enabled `mcp_gateway` instances on one proxy may not have nesting endpoint scopes (`/mcp` with `/mcp/v2`, or two instances on the same path): admission rejects the pair, because one of them could never be reached. Disjoint scopes such as `/mcp` and `/tools` compose normally. Configuring a trailing-slash endpoint reserves the corresponding unsuffixed scope too. Unrelated sibling paths remain available to other handlers. Query parameters do not change endpoint selection. GET, POST, and DELETE retain their MCP semantics; other methods reaching the plugin return 405 (CORS preflight can be handled by the CORS plugin earlier in the chain).
+`endpoint.path` must be a canonical policy path and may not be `/`. A single trailing slash is accepted and canonicalised to the configured spelling: `/mcp` and `/mcp/` enter the same full mediation path in both modes, including POST buffering, session ownership, tool policy, response rewriting, GET event streams, and DELETE. Upstream requests always use the configured `servers.*.upstream_url` path, never the client's alias. No other path normalization is performed by this matcher: extra segments (`/mcp/tools`, `/mcp/tools/`), repeated trailing slashes (`/mcp//`), case variants (`/MCP`), percent-encoded separators (`/mcp%2F`), and dot segments (`/mcp/.`) are different, rejected paths. Variants reaching the plugin return HTTP 404 with JSON-RPC `-32600` / `Unknown MCP endpoint`; encoded separators and dot segments are already rejected with HTTP 400 by the shared HTTP frontend.
+
+The endpoint reserves its whole slash-delimited subtree, including case variants for rejection. A root endpoint would reserve the entire origin and refuse every other handler on the proxy, so `endpoint.path: "/"` remains rejected at admission — use a sub-path such as `/mcp`. Two enabled `mcp_gateway` instances on one proxy may not have overlapping endpoint scopes (`/mcp` with `/mcp/v2`, `/mcp/`, or `/MCP`): admission rejects the pair, because one of them could never be reached. Disjoint scopes such as `/mcp` and `/tools` compose normally. Unrelated sibling paths remain available to other handlers. Query parameters do not change endpoint selection. GET, POST, and DELETE retain their MCP semantics; other methods reaching the plugin return 405 (CORS preflight can be handled by the CORS plugin earlier in the chain).
 
 Transparent mode has no mediated catalog. Explicit `policy.default_action`, `policy.tools`, `policy.hide_denied_tools`, `discovery.aggregate_tools`, `discovery.aggregate_resources`, `discovery.aggregate_prompts`, `discovery.namespace_separator`, `discovery.cache_ttl_seconds`, `discovery.hide_denied_items`, `discovery.on_new_tool`, or `discovery.on_schema_change` configuration is therefore rejected at admission, including explicitly configured defaults: every one of them is inert in this mode, and silently accepting it would promise a control that is never enforced. Use `aggregate_router` to enforce those controls; transparent mode never silently removes a configured policy.
 
@@ -8003,7 +8033,7 @@ config:
 | --- | --- | --- | --- |
 | `enabled` | bool | `true` | Disabling keeps the instance configured but inert on every phase. |
 | `mode` | enum | — | **Required.** `transparent_proxy` or `aggregate_router`. |
-| `endpoint.path` | string | — | **Required.** Canonical policy path; may not be `/`. Reserves its whole slash-delimited subtree. |
+| `endpoint.path` | string | — | **Required.** Canonical policy path; may not be `/`. One trailing slash is accepted and canonicalised to the configured spelling through full mediation. Extra segments, repeated trailing slashes, case changes, encoded separators, and dot segments are rejected. Reserves its whole slash-delimited subtree. |
 | `endpoint.protocol_versions` | string[] | `["2025-11-25"]` | Non-empty; entries may not be blank. First entry is the preferred version. |
 | `discovery.aggregate_tools` | bool | `true` | Aggregate-router only (see *Transparent mode* above). |
 | `discovery.aggregate_resources` | bool | `true` | Aggregate-router only. |

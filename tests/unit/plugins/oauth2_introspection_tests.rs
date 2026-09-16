@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use base64::Engine as _;
-use ferrum_edge::_test_support::request_credential_deadline_at;
+use ferrum_edge::_test_support::{
+    introspection_cached_window_status_for_test, request_credential_deadline_at,
+};
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::AuthMode;
@@ -2135,4 +2137,301 @@ async fn oauth2_discovery_failure_diagnostics_never_print_endpoint_credentials()
         "the discovery failure must have been reported: {captured}"
     );
     assert_endpoint_canaries_absent(&captured, "discovery diagnostics");
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Issue #5523: the returned validity window has two ends
+// ────────────────────────────────────────────────────────────────────
+
+/// RFC 7662 §2.2 defines `nbf` as the integer time before which the token MUST
+/// NOT be accepted. A conforming authorization server already accounts for it
+/// when it answers `active`, so a returned future `nbf` is a contradictory
+/// response — enforced independently as defense in depth rather than
+/// authenticating on `active` alone.
+#[tokio::test]
+async fn future_introspection_nbf_must_not_authenticate() {
+    let server = MockServer::start().await;
+    let now = chrono::Utc::now().timestamp();
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "active": true,
+            "username": "external-user",
+            "nbf": now + 3600,
+            "exp": now + 7200
+        })))
+        .mount(&server)
+        .await;
+    let plugin = Oauth2Introspection::new(
+        &config(&format!("{}/introspect", server.uri())),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx("future-token");
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+
+    assert_bearer_reject(result, 401, "invalid_token");
+    assert!(ctx.authenticated_identity.is_none());
+    assert!(ctx.identified_consumer.is_none());
+}
+
+/// An inverted window — the token's not-before is after its own expiry — is
+/// rejected on the not-before end first (the `nbf` check runs before the expiry
+/// check), and still never authenticates. Both ends map to the same bearer
+/// `401`, so the body is what pins the ordering.
+#[tokio::test]
+async fn an_inverted_introspection_window_never_authenticates() {
+    let server = MockServer::start().await;
+    let now = chrono::Utc::now().timestamp();
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "active": true,
+            "username": "external-user",
+            "nbf": now + 3600,
+            "exp": now - 1
+        })))
+        .mount(&server)
+        .await;
+    let plugin = Oauth2Introspection::new(
+        &config(&format!("{}/introspect", server.uri())),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx("inverted-window-token");
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+
+    let body = match &result {
+        PluginResult::Reject { body, .. } => body.clone(),
+        other => panic!("expected rejection, got {other:?}"),
+    };
+    assert_eq!(
+        body, r#"{"error":"Token is not yet valid"}"#,
+        "the not-before end must decide an inverted window, not the expiry end"
+    );
+    assert_bearer_reject(result, 401, "invalid_token");
+    assert!(ctx.authenticated_identity.is_none());
+}
+
+/// An omitted `nbf` stays supported, and a past or exactly-current one still
+/// authenticates: the check closes only the window that has not opened yet.
+///
+/// A JSON `null` is the same case. Many authorization servers serialize an
+/// optional member they did not set rather than omitting it, so reading `null`
+/// as malformed would turn a provider that authenticates today into a permanent
+/// `503` — with no cache, and therefore a provider round trip per request.
+#[tokio::test]
+async fn absent_null_past_and_current_nbf_still_authenticate() {
+    let server = MockServer::start().await;
+    let now = chrono::Utc::now().timestamp();
+    let responses = Arc::new([
+        json!({"active": true, "username": "no-nbf"}),
+        json!({"active": true, "username": "null-nbf", "nbf": null}),
+        json!({"active": true, "username": "past-nbf", "nbf": now - 3600}),
+        json!({"active": true, "username": "current-nbf", "nbf": now}),
+    ]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with({
+            let responses = Arc::clone(&responses);
+            let calls = Arc::clone(&calls);
+            move |_: &wiremock::Request| {
+                let index = calls
+                    .fetch_add(1, Ordering::SeqCst)
+                    .min(responses.len() - 1);
+                ResponseTemplate::new(200).set_body_json(responses[index].clone())
+            }
+        })
+        .mount(&server)
+        .await;
+    let plugin = Oauth2Introspection::new(
+        &config(&format!("{}/introspect", server.uri())),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    for (token, expected) in [
+        ("absent-nbf", "no-nbf"),
+        ("null-nbf", "null-nbf"),
+        ("past-nbf", "past-nbf"),
+        ("current-nbf", "current-nbf"),
+    ] {
+        let mut ctx = make_ctx(token);
+        assert_continue(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+        );
+        assert_eq!(ctx.authenticated_identity.as_deref(), Some(expected));
+    }
+}
+
+/// A present but malformed `nbf` is a broken dependency response, classified
+/// like malformed expiry data: a fixed plain `503`, never a bearer challenge
+/// and never cached in either direction.
+///
+/// A JSON `null` is deliberately NOT in this set — it is read as an omitted
+/// member and covered by `absent_null_past_and_current_nbf_still_authenticate`.
+#[tokio::test]
+async fn malformed_introspection_nbf_is_a_503_and_never_cached() {
+    let server = MockServer::start().await;
+    let responses = Arc::new([
+        json!({"active": true, "username": "u", "nbf": "1700000000"}),
+        json!({"active": true, "username": "u", "nbf": 1_700_000_000.5}),
+        json!({"active": true, "username": "u", "nbf": true}),
+        json!({"active": true, "username": "u", "nbf": [1_700_000_000]}),
+        json!({"active": true, "username": "u", "nbf": {"iat": 1_700_000_000}}),
+        json!({"active": true, "username": "recovered"}),
+    ]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with({
+            let responses = Arc::clone(&responses);
+            let calls = Arc::clone(&calls);
+            move |_: &wiremock::Request| {
+                let index = calls
+                    .fetch_add(1, Ordering::SeqCst)
+                    .min(responses.len() - 1);
+                ResponseTemplate::new(200).set_body_json(responses[index].clone())
+            }
+        })
+        .mount(&server)
+        .await;
+    let plugin = Oauth2Introspection::new(
+        &config(&format!("{}/introspect", server.uri())),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    for token in ["string", "fraction", "boolean", "array", "object"] {
+        assert_plain_reject(
+            plugin
+                .authenticate(&mut make_ctx(token), &ConsumerIndex::new(&[]))
+                .await,
+            503,
+        );
+    }
+    // Nothing was cached for the malformed responses, so the same token
+    // authenticates as soon as the provider answers correctly.
+    let mut ctx = make_ctx("string");
+    assert_continue(
+        plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("recovered"));
+    assert_eq!(calls.load(Ordering::SeqCst), 6);
+}
+
+/// A future `nbf` must not be negative-cached past its own boundary: the
+/// rejection has to be re-derived from the provider, so the very same token
+/// authenticates once its window opens. Positive caching is on, which is the
+/// configuration that could otherwise pin either answer.
+#[tokio::test]
+async fn a_future_nbf_is_not_cached_and_authenticates_once_its_window_opens() {
+    let server = MockServer::start().await;
+    let now = chrono::Utc::now().timestamp();
+    let responses = Arc::new([
+        json!({"active": true, "username": "pending", "nbf": now + 3600}),
+        json!({"active": true, "username": "pending", "nbf": now + 3600}),
+        json!({"active": true, "username": "opened", "nbf": now - 1}),
+    ]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with({
+            let responses = Arc::clone(&responses);
+            let calls = Arc::clone(&calls);
+            move |_: &wiremock::Request| {
+                let index = calls
+                    .fetch_add(1, Ordering::SeqCst)
+                    .min(responses.len() - 1);
+                ResponseTemplate::new(200).set_body_json(responses[index].clone())
+            }
+        })
+        .mount(&server)
+        .await;
+    let plugin = Oauth2Introspection::new(
+        &json!({
+            "providers": [{
+                "introspection_endpoint": format!("{}/introspect", server.uri()),
+                "client_auth": {"method": "none"},
+                "positive_cache_ttl_secs": 3600
+            }]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    for _ in 0..2 {
+        assert_bearer_reject(
+            plugin
+                .authenticate(&mut make_ctx("not-yet-token"), &ConsumerIndex::new(&[]))
+                .await,
+            401,
+            "invalid_token",
+        );
+    }
+    let mut ctx = make_ctx("not-yet-token");
+    assert_continue(
+        plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("opened"));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "every attempt must re-introspect; neither answer may be cached"
+    );
+}
+
+/// The cached authorization carries BOTH ends of its window, and every hit
+/// re-evaluates them against the current instant rather than trusting the
+/// single evaluation made when the response arrived.
+#[test]
+fn a_cached_authorization_window_is_re_evaluated_at_use_time() {
+    // Usable: no window, a window that is open, and an exactly-current `nbf`.
+    assert_eq!(
+        introspection_cached_window_status_for_test(None, None, 1_000),
+        None
+    );
+    assert_eq!(
+        introspection_cached_window_status_for_test(Some(1_001), Some(999), 1_000),
+        None
+    );
+    assert_eq!(
+        introspection_cached_window_status_for_test(Some(1_001), Some(1_000), 1_000),
+        None,
+        "a not-before that has just been reached admits the credential"
+    );
+
+    // Closed at the expiry end, inclusive of the exact boundary.
+    assert_eq!(
+        introspection_cached_window_status_for_test(Some(1_000), None, 1_000),
+        Some(401)
+    );
+    assert_eq!(
+        introspection_cached_window_status_for_test(Some(999), Some(1), 1_000),
+        Some(401)
+    );
+
+    // Not yet open. A cached entry admitted earlier under a wall-clock that has
+    // since moved backwards must stop authenticating, not keep its old verdict.
+    assert_eq!(
+        introspection_cached_window_status_for_test(Some(9_999), Some(1_001), 1_000),
+        Some(401)
+    );
+    assert_eq!(
+        introspection_cached_window_status_for_test(None, Some(1_001), 1_000),
+        Some(401)
+    );
 }

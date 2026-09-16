@@ -1211,16 +1211,15 @@ impl McpGateway {
     }
 
     fn matches_endpoint(&self, ctx: &RequestContext) -> bool {
-        ctx.path == self.endpoint_path
+        super::utils::endpoint_path::matches_endpoint_path(&ctx.path, &self.endpoint_path)
     }
 
     fn within_endpoint_scope(&self, ctx: &RequestContext) -> bool {
         let scope = self.endpoint_path.trim_end_matches('/');
-        ctx.path == scope
-            || ctx
-                .path
-                .strip_prefix(scope)
-                .is_some_and(|tail| tail.starts_with('/'))
+        // Case variants and encoded suffixes are reserved only for rejection,
+        // never for endpoint matching. The HTTP frontend already refuses
+        // encoded separators; keep direct plugin dispatch fail-closed too.
+        ctx.path.eq_ignore_ascii_case(scope) || endpoint_scope_contains(scope, &ctx.path)
     }
 
     /// Claim this request for this instance. Called once, from the same
@@ -5693,6 +5692,12 @@ impl Plugin for McpGateway {
                 )]),
             };
         }
+        // Normalize only after exact-or-single-slash admission. All methods,
+        // session handling, and response ownership follow the same path. The
+        // upstream target remains the configured server URL, never this alias.
+        if ctx.path != self.endpoint_path {
+            ctx.path.clone_from(&self.endpoint_path);
+        }
 
         if ctx.method.eq_ignore_ascii_case("GET") {
             if self.mode == McpGatewayMode::TransparentProxy {
@@ -8349,11 +8354,14 @@ fn authority_for_host_port(
     }
 }
 
-/// Whether `scope` reserves `other` as a strict slash-delimited descendant.
+/// Reserve descendants and ambiguous encoded suffixes, including case variants.
 fn endpoint_scope_contains(scope: &str, other: &str) -> bool {
     other
-        .strip_prefix(scope)
-        .is_some_and(|tail| tail.starts_with('/'))
+        .get(..scope.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scope))
+        && other
+            .get(scope.len()..)
+            .is_some_and(|tail| tail.starts_with('/') || tail.starts_with('%'))
 }
 
 /// Whether two endpoint scopes reserve overlapping request paths.
@@ -8361,7 +8369,9 @@ fn endpoint_scope_contains(scope: &str, other: &str) -> bool {
 /// Scopes are already trailing-slash trimmed, so `/mcp` and `/mcp/` are the
 /// same scope, `/mcp` contains `/mcp/v2`, and `/mcp` is disjoint from `/mcpx`.
 fn endpoint_scopes_nest(left: &str, right: &str) -> bool {
-    left == right || endpoint_scope_contains(left, right) || endpoint_scope_contains(right, left)
+    left.eq_ignore_ascii_case(right)
+        || endpoint_scope_contains(left, right)
+        || endpoint_scope_contains(right, left)
 }
 
 /// Reject two enabled `mcp_gateway` instances whose endpoint scopes nest on one

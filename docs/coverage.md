@@ -84,6 +84,20 @@ orchestration:
   port calculation with pre-bound listeners, and HTTP/3 bind-address parity.
   Subprocess functional tests cover YAML startup and SIGHUP reload behavior.
 
+## Admin TLS Inventory Regression Notes
+
+The in-process admin TLS inventory regressions in
+`tests/integration/admin_metrics_tls_inventory_snapshot_tests.rs` cover cached,
+I/O-free scrapes, single-flight refresh, TTL expiry, config invalidation,
+serving-cycle generation fencing, and invalidation during collection. Two active
+admin fixtures own separate caches, collectors, and metrics registries, including
+while one collector is blocked and the other fixture reloads. They use channel
+barriers and refresh-task completion rather than sleeps or scrape retries, so
+`cargo test --test integration_tests admin` keeps working with parallel test
+threads (#5544). Hosted CI runs integration tests under nextest, one process per
+test, so that single-process property holds by construction rather than by a
+CI gate.
+
 ## CI Baseline And Gates
 
 The `Coverage` workflow runs on pull requests, merge-queue `merge_group`

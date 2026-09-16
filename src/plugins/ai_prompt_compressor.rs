@@ -1423,7 +1423,7 @@ impl Plugin for AiPromptCompressor {
         };
         ctx.metadata.insert("request_body".to_string(), serialized);
         if let Some(output) = staged_output {
-            ctx.ai_prompt_compressor_staged.insert(
+            ctx.plugin_state_mut().ai_prompt_compressor_staged.insert(
                 self.instance_id,
                 StagedCompression {
                     source_len,
@@ -1432,8 +1432,8 @@ impl Plugin for AiPromptCompressor {
                     stats: compression.stats.clone(),
                 },
             );
-        } else {
-            ctx.ai_prompt_compressor_staged.remove(&self.instance_id);
+        } else if let Some(state) = ctx.plugin_state_opt_mut() {
+            state.ai_prompt_compressor_staged.remove(&self.instance_id);
         }
         if let Some(stats) = compression.stats.as_ref() {
             record_stats_metadata(ctx, &self.metadata_keys, stats);
@@ -1500,7 +1500,9 @@ impl Plugin for AiPromptCompressor {
 
         if content_type.is_some_and(is_json_content_type)
             && !has_non_identity_content_encoding(request_headers)
-            && let Some(staged) = ctx.ai_prompt_compressor_staged.remove(&self.instance_id)
+            && let Some(staged) = ctx
+                .plugin_state_opt_mut()
+                .and_then(|state| state.ai_prompt_compressor_staged.remove(&self.instance_id))
         {
             if body.len() == staged.source_len
                 && self.body_digest(body).await == Some(staged.source_sha256)
@@ -1510,8 +1512,8 @@ impl Plugin for AiPromptCompressor {
                 }
                 return Some(staged.output);
             }
-        } else {
-            ctx.ai_prompt_compressor_staged.remove(&self.instance_id);
+        } else if let Some(state) = ctx.plugin_state_opt_mut() {
+            state.ai_prompt_compressor_staged.remove(&self.instance_id);
         }
 
         let compression = match self
@@ -1546,7 +1548,9 @@ impl Plugin for AiPromptCompressor {
         let Some(status_code) = ctx.ai_prompt_compressor_marker_reject_status.take() else {
             return PluginResult::Continue;
         };
-        ctx.ai_prompt_compressor_staged.clear();
+        if let Some(state) = ctx.plugin_state_opt_mut() {
+            state.ai_prompt_compressor_staged.clear();
+        }
         PluginResult::Reject {
             status_code,
             body: if status_code == 413 {

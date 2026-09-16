@@ -86,6 +86,25 @@ pub use router_cache::{RouteMatch, RouterCache};
 /// The leading underscore signals that this module is not part of the public API.
 #[doc(hidden)]
 pub mod _test_support {
+    /// Structural admission of a `POST /restore` envelope (issue #5538).
+    ///
+    /// `true` when the body is a JSON object whose keys are all recognized
+    /// restore/backup members; `false` for a JSON array, a positional
+    /// sequence, a scalar, or an unknown/misspelled key.
+    pub fn restore_envelope_admits_for_test(body: &[u8]) -> bool {
+        crate::admin::restore_envelope_admits_for_test(body)
+    }
+
+    /// Serde-accepted member names of the `POST /restore` envelope
+    /// (issue #5542).
+    ///
+    /// Recovered from the derived `Deserialize` itself, so a new Rust member
+    /// appears here without anyone updating a manifest. The OpenAPI contract
+    /// test compares this inventory with `RestoreRequest.properties`.
+    pub fn restore_envelope_field_names_for_test() -> Vec<String> {
+        crate::admin::restore_envelope_field_names_for_test()
+    }
+
     /// Exercise the dispatch coordinate rebase and its cloned diagnostic context.
     pub fn rebase_backend_path_for_test(
         ctx: &mut crate::plugins::RequestContext,
@@ -8412,6 +8431,30 @@ pub mod _test_support {
         crate::proxy::clone_log_metadata(ctx)
     }
 
+    /// Whether this request has materialized the boxed per-plugin working state
+    /// (issue #5537).
+    ///
+    /// The plugin-free hot path must answer `false` for the whole lifetime of
+    /// the context: that box is precisely what a request with no configured
+    /// plugin family exists not to allocate. Exposed for external unit tests so
+    /// the property can be asserted without widening the field.
+    pub fn request_context_has_plugin_state(ctx: &crate::plugins::RequestContext) -> bool {
+        ctx.plugin_state().is_some()
+    }
+
+    /// Stage one WAF-owned metadata field exactly as a `waf` instance would.
+    ///
+    /// The setter is `pub(crate)` so only the plugin can claim ownership of a
+    /// `waf.*` field; this wrapper lets external tests assert the staging
+    /// lifecycle (and its log projection) without widening that boundary.
+    pub fn set_waf_metadata_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        key: &str,
+        value: &str,
+    ) {
+        ctx.set_waf_metadata(key, value);
+    }
+
     pub fn ai_prompt_compressor_marker_scan_work_for_test(
         body: &[u8],
         tag: &str,
@@ -8431,14 +8474,17 @@ pub mod _test_support {
         ctx: &crate::plugins::RequestContext,
         instance_id: u64,
     ) -> Option<&Vec<f32>> {
-        ctx.ai_semantic_cache_embeddings.get(&instance_id)
+        ctx.plugin_state()?
+            .ai_semantic_cache_embeddings
+            .get(&instance_id)
     }
 
     pub fn ai_semantic_cache_scope_key(
         ctx: &crate::plugins::RequestContext,
         instance_id: u64,
     ) -> Option<&str> {
-        ctx.ai_semantic_cache_scope_keys
+        ctx.plugin_state()?
+            .ai_semantic_cache_scope_keys
             .get(&instance_id)
             .map(String::as_str)
     }
@@ -8450,10 +8496,14 @@ pub mod _test_support {
     ) {
         match embedding {
             Some(values) => {
-                ctx.ai_semantic_cache_embeddings.insert(instance_id, values);
+                ctx.plugin_state_mut()
+                    .ai_semantic_cache_embeddings
+                    .insert(instance_id, values);
             }
             None => {
-                ctx.ai_semantic_cache_embeddings.remove(&instance_id);
+                if let Some(state) = ctx.plugin_state_opt_mut() {
+                    state.ai_semantic_cache_embeddings.remove(&instance_id);
+                }
             }
         }
     }
@@ -8465,10 +8515,14 @@ pub mod _test_support {
     ) {
         match scope_key {
             Some(key) => {
-                ctx.ai_semantic_cache_scope_keys.insert(instance_id, key);
+                ctx.plugin_state_mut()
+                    .ai_semantic_cache_scope_keys
+                    .insert(instance_id, key);
             }
             None => {
-                ctx.ai_semantic_cache_scope_keys.remove(&instance_id);
+                if let Some(state) = ctx.plugin_state_opt_mut() {
+                    state.ai_semantic_cache_scope_keys.remove(&instance_id);
+                }
             }
         }
     }
@@ -8728,6 +8782,32 @@ pub mod _test_support {
             now_mono,
         )
     }
+
+    /// The use-time re-check a CACHED `oauth2_introspection` authorization goes
+    /// through on every hit (issue #5523). `None` means the window admits the
+    /// credential; `Some(status)` is the HTTP status of the rejection. Takes an
+    /// explicit `now_unix` so the boundary cases are deterministic.
+    pub fn introspection_cached_window_status_for_test(
+        expires_at_unix: Option<i64>,
+        not_before_unix: Option<i64>,
+        now_unix: i64,
+    ) -> Option<u16> {
+        crate::plugins::oauth2_introspection::cached_window_status(
+            expires_at_unix,
+            not_before_unix,
+            now_unix,
+        )
+    }
+
+    /// The shared RFC 7519 §2 NumericDate normalization (issue #5521), so the
+    /// conservative truncation direction is covered directly: an upper bound
+    /// (`exp`) rounds toward the past, a lower bound (`nbf`/`iat`) toward the
+    /// future, and neither widens the window the claim states. Both names are
+    /// crate-private — Ferrum normalizes only `exp` today — so this re-export
+    /// is the single mechanism external tests use to reach them.
+    pub use crate::plugins::utils::auth_flow::numeric_date::{
+        NumericDateBound, numeric_date_seconds,
+    };
 
     /// The same conversion driven from already-validated claims, so the `exp`
     /// extraction `jwt_auth` and `jwks_auth` authenticate through is covered at

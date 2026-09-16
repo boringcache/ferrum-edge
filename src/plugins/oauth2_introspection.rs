@@ -611,10 +611,7 @@ impl Oauth2Introspection {
         let now = Instant::now();
         match provider.cache.get(token, now) {
             CacheLookup::Active(credential) => {
-                if credential_expired(credential.expires_at_unix) {
-                    return Err(IntrospectionDecision::Inactive);
-                }
-                return Ok(credential);
+                return usable_cached_credential(credential);
             }
             CacheLookup::Negative => return Err(IntrospectionDecision::Inactive),
             CacheLookup::Miss => {}
@@ -648,10 +645,7 @@ impl Oauth2Introspection {
         // initial lookup and installation of a new in-flight cell.
         match provider.cache.get(token, now) {
             CacheLookup::Active(credential) => {
-                if credential_expired(credential.expires_at_unix) {
-                    return Err(IntrospectionDecision::Inactive);
-                }
-                return Ok(credential);
+                return usable_cached_credential(credential);
             }
             CacheLookup::Negative => return Err(IntrospectionDecision::Inactive),
             CacheLookup::Miss => {}
@@ -847,9 +841,18 @@ impl Oauth2Introspection {
                 r#"{"error":"Invalid token audience"}"#.to_string(),
             ));
         }
+        // The complete temporal window is settled before normalization, so a
+        // contradictory response never reaches identity resolution or the
+        // positive cache. A future `nbf` is rejected without caching anything,
+        // so the token authenticates normally once its window opens.
+        let not_before_unix = validated_introspection_not_before(&claims)?;
         let expires_at_unix = validated_introspection_expiry(&claims)?;
-        let authorization =
-            Arc::new(self.normalize_authorization(&claims, provider, expires_at_unix));
+        let authorization = Arc::new(self.normalize_authorization(
+            &claims,
+            provider,
+            expires_at_unix,
+            not_before_unix,
+        ));
         provider
             .cache
             .insert_active(token, Arc::clone(&authorization), now);
@@ -886,6 +889,7 @@ impl Oauth2Introspection {
         claims: &Value,
         provider: &IntrospectionProvider,
         expires_at_unix: Option<i64>,
+        not_before_unix: Option<i64>,
     ) -> CachedAuthorization {
         if let Err((status_code, body)) = self.check_claims_authorization(claims, provider) {
             return CachedAuthorization {
@@ -897,6 +901,7 @@ impl Oauth2Introspection {
                 identity_header: None,
                 claim_headers: Box::default(),
                 expires_at_unix,
+                not_before_unix,
             };
         }
         let identity_claim = provider
@@ -927,6 +932,7 @@ impl Oauth2Introspection {
             identity_header: header_value.map(String::into_boxed_str),
             claim_headers,
             expires_at_unix,
+            not_before_unix,
         }
     }
 
@@ -1193,8 +1199,104 @@ enum IntrospectionDecision {
     Unavailable,
 }
 
-fn credential_expired(expires_at_unix: Option<i64>) -> bool {
-    expires_at_unix.is_some_and(|expiry| expiry <= chrono::Utc::now().timestamp())
+/// Generic rejection body for a token whose advertised validity window has not
+/// opened yet. Carries no provider response content.
+const NOT_YET_VALID_BODY: &str = r#"{"error":"Token is not yet valid"}"#;
+
+/// Re-check a cached authorization's temporal window at USE time.
+///
+/// Both ends are absolute instants resolved once at the provider-response
+/// boundary, but a positive cache entry outlives that response, so the window
+/// has to be re-evaluated on every hit rather than trusted from the fetch that
+/// populated it (issue #5523).
+fn usable_cached_credential(
+    credential: Arc<CachedAuthorization>,
+) -> Result<Arc<CachedAuthorization>, IntrospectionDecision> {
+    match cached_window_decision(
+        credential.expires_at_unix,
+        credential.not_before_unix,
+        chrono::Utc::now().timestamp(),
+    ) {
+        Some(decision) => Err(decision),
+        None => Ok(credential),
+    }
+}
+
+/// Classify an absolute validity window at an explicit instant. `None` means
+/// the credential is usable now.
+fn cached_window_decision(
+    expires_at_unix: Option<i64>,
+    not_before_unix: Option<i64>,
+    now: i64,
+) -> Option<IntrospectionDecision> {
+    if expires_at_unix.is_some_and(|expiry| expiry <= now) {
+        return Some(IntrospectionDecision::Inactive);
+    }
+    if not_before_unix.is_some_and(|not_before| not_before > now) {
+        return Some(IntrospectionDecision::Unauthorized(
+            NOT_YET_VALID_BODY.to_string(),
+        ));
+    }
+    None
+}
+
+/// The HTTP status [`cached_window_decision`] maps to, for the external
+/// regression suite. `None` means the window admits the credential.
+pub(crate) fn cached_window_status(
+    expires_at_unix: Option<i64>,
+    not_before_unix: Option<i64>,
+    now: i64,
+) -> Option<u16> {
+    cached_window_decision(expires_at_unix, not_before_unix, now)
+        .map(|decision| decision.into_rejection().status_code)
+}
+
+/// Resolve an introspection response's `nbf`, the opening of the same validity
+/// window [`validated_introspection_expiry`] closes.
+///
+/// RFC 7662 §2.2 defines `nbf` as the integer time before which the token MUST
+/// NOT be accepted. A conforming authorization server already accounts for it
+/// when it answers `active`, so a returned future `nbf` is a contradictory
+/// response; Ferrum enforces it independently as defense in depth rather than
+/// authenticating on the provider's `active` alone (issue #5523).
+///
+/// A malformed value is a broken dependency response, classified like malformed
+/// expiry data ([`IntrospectionDecision::Unavailable`], 503). A well-formed
+/// future value is an ordinary bearer rejection.
+///
+/// A JSON `null` is how a large family of authorization servers serializes an
+/// optional member it did not set, so it is read as "no `nbf` in this response"
+/// rather than as malformed data: an omitted `nbf` is fully supported, and
+/// serializing that omission explicitly must not turn a provider that
+/// authenticates today into a permanent 503. Every other present non-integer
+/// shape is still a broken dependency response.
+///
+/// The comparison carries no clock leeway, matching this plugin's
+/// long-standing `exp` handling; it has no skew knob, so operators keep the
+/// authorization server and the gateway synchronized.
+fn validated_introspection_not_before(
+    claims: &Value,
+) -> Result<Option<i64>, IntrospectionDecision> {
+    validated_introspection_not_before_at(claims, chrono::Utc::now().timestamp())
+}
+
+fn validated_introspection_not_before_at(
+    claims: &Value,
+    now: i64,
+) -> Result<Option<i64>, IntrospectionDecision> {
+    let Some(value) = claims.get("nbf").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let not_before = value
+        .as_i64()
+        .or_else(|| value.as_u64()?.try_into().ok())
+        .ok_or(IntrospectionDecision::Unavailable)?;
+    if not_before > now {
+        return Err(IntrospectionDecision::Unauthorized(
+            NOT_YET_VALID_BODY.to_string(),
+        ));
+    }
+    Ok(Some(not_before))
 }
 
 /// Resolve an introspection credential's authoritative validity once, at the

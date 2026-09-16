@@ -2594,44 +2594,23 @@ pub struct RequestContext {
     /// and consumed by the cache-inserted CORS finalizer. Kept outside public
     /// metadata so policy details never enter transaction logs.
     pub(crate) cors_state: cors::CorsRequestState,
-    /// Claim-derived upstream headers committed by the first accepted
-    /// authentication attempt and held until `before_proxy`. Kept out of
-    /// `metadata` so authorization-phase rejection logging can never serialize
-    /// raw claim values.
-    pub(crate) pending_claim_headers: HashMap<String, String>,
-    /// Lowercase `claim_headers` destinations already sanitized for this
-    /// request. Gateway-owned destinations are stripped exactly once, by the
-    /// first plugin instance that owns them, so a later instance sharing a
-    /// destination can never erase a verified value an earlier instance already
-    /// installed. Empty (and non-allocating) unless a `claim_headers` mapping is
-    /// configured.
-    pub(crate) sanitized_claim_header_destinations: HashSet<String>,
+    /// Per-plugin request-scoped working state, allocated on first use.
+    ///
+    /// Every collection a plugin family stages for its own later phases lives
+    /// in [`PluginRequestState`] behind one `Option<Box<..>>` rather than as
+    /// two dozen inline maps and sets. A request whose proxy configures none of
+    /// those families — the common edge proxy — therefore constructs, moves,
+    /// clones, and drops a single null pointer instead of building and tearing
+    /// down every collection's hasher state per request, and `RequestContext`
+    /// itself (which lives across every await in the handler future) shrinks by
+    /// the same amount. Read through [`RequestContext::plugin_state`], mutate
+    /// through [`RequestContext::plugin_state_mut`] (which materializes) or
+    /// [`RequestContext::plugin_state_opt_mut`] (which does not).
+    plugin_state: Option<Box<PluginRequestState>>,
     /// Credential header names precomputed by the plugin cache for safe
     /// diagnostics and policy calls. Kept outside public metadata so plugin
     /// configuration details do not enter transaction logs.
     request_headers_to_redact: Option<Arc<Vec<String>>>,
-    /// Digests of credential-bearing query parameters that were present before
-    /// authentication and request transformation. Kept outside public metadata
-    /// so neither reusable credentials nor correlatable digests enter logs.
-    /// The shared replay partition carries this private snapshot because an
-    /// authentication strip may remove the parameter before a retained-result
-    /// plugin builds its key.
-    query_credential_partition_digests: Vec<(String, [u8; 32])>,
-    /// Deltas from the original request-header view to the complete
-    /// backend-visible view, staged by `response_caching` instances during
-    /// lookup and consumed when the origin supplies its final `Vary`
-    /// dimensions. `Some(value)` adds/replaces a field and `None` records a
-    /// removal.
-    ///
-    /// An origin may vary on any field, including one an earlier request
-    /// transformer added or rewrote. The final response-body hook otherwise has
-    /// only `self.headers`, the original client view, and could store a response
-    /// under a key that no longer describes what the backend received. Raw
-    /// header values deliberately stay in this private, per-request map rather
-    /// than public `metadata`, which can be serialized into transaction logs.
-    /// The outer key is the process-unique cache instance ID, bounding the map
-    /// by configured `response_caching` instances.
-    response_cache_request_header_deltas: HashMap<u64, Arc<HashMap<String, Option<String>>>>,
     /// Buffered response policy provenance, present only while the ordered
     /// `after_proxy` chain is processing a merged gRPC header+trailer view.
     /// Shared through `Arc` so the rare hook-preflight context clone remains
@@ -2669,115 +2648,6 @@ pub struct RequestContext {
     /// the shared reject finalizer can remove transport-owned handshake fields
     /// after every ordered response hook without reclassifying or allocating.
     websocket_response_boundary: bool,
-    /// Per-`ai_semantic_cache`-instance embedding vectors staged between
-    /// `before_proxy` and `on_final_response_body`. Kept out of `metadata` so
-    /// high-dimensional vectors cannot enter transaction logs. The outer key is
-    /// a process-unique cache instance ID so sibling instances on one proxy
-    /// cannot overwrite or consume each other's staged vectors.
-    pub(crate) ai_semantic_cache_embeddings: HashMap<u64, Vec<f32>>,
-    /// Per-instance semantic-cache scope keys paired with
-    /// `ai_semantic_cache_embeddings`.
-    pub(crate) ai_semantic_cache_scope_keys: HashMap<u64, String>,
-    /// OpenAPI validator operation matches staged between `before_proxy` and
-    /// final body hooks. Kept out of public metadata so per-instance state does
-    /// not leak into transaction logs.
-    pub(crate) openapi_validator_matches: HashMap<usize, (String, String)>,
-    /// OpenAPI validator instances whose CLIENT-contract decision has already
-    /// been made on the original client representation in
-    /// `validate_client_request_body_contract`.
-    ///
-    /// Keyed by process-unique validator instance ID so sibling instances on one
-    /// proxy can never consume each other's decision, and so the backend-side
-    /// `on_final_request_body` hook of an instance that already decided does not
-    /// validate, reject, or log the same request a second time over transformed
-    /// bytes (`GHSA-896v-jx23-9g6p`). Kept out of public metadata: it is
-    /// per-instance lifecycle bookkeeping, not observability.
-    pub(crate) openapi_validator_client_contract_enforced: HashSet<usize>,
-    /// Per-`ai_tool_governor`-instance internal correlation markers staged between
-    /// `on_response_body` / `transform_response_body` and the
-    /// `on_final_response_body` re-check. Kept out of public `metadata` so this
-    /// per-request bookkeeping — the governed-body hash and the per-call
-    /// identity multiset, both DERIVED FROM RAW TOOL ARGUMENTS — never reaches
-    /// transaction logs (an operator who disabled `observability.hash_arguments`
-    /// must not get an arg-derived hash logged via a correlation marker).
-    /// The outer key is a process-unique governor instance ID. Multiple
-    /// instances may coexist on one proxy and must never consume each other's
-    /// dedup state.
-    pub(crate) ai_tool_governor_response_hashes: HashMap<u64, String>,
-    /// `ai_response_guard` instances that inspected an already-finalized
-    /// deduplication replay and found content requiring a current-policy
-    /// redaction transform. Kept outside public metadata so response data or a
-    /// custom plugin cannot opt a replay into or out of mandatory rewriting.
-    pub(crate) ai_response_guard_replay_redactions: HashSet<u64>,
-    /// `ai_response_guard` instances that DETECTED governed content under
-    /// `action: redact` and have not yet installed a replacement for it.
-    ///
-    /// Detection returns `Continue` so the redaction can happen in the producer
-    /// phase, but a producer may legitimately return `None` — an over-ceiling or
-    /// refused construction, a representation its rewriter cannot address — and
-    /// `None` means UNCHANGED to the shared transform loop. Without this, the
-    /// original detected body would be forwarded while the request was recorded
-    /// as redacted. The instance clears its own entry when its transform installs
-    /// bytes, and anything still pending at `on_final_response_body` is a
-    /// fail-closed rejection (GHSA-pwcm-6rh8-f2gh).
-    ///
-    /// Typed and outside `metadata` deliberately: this is the authority for
-    /// whether a redaction actually happened, so neither response content nor a
-    /// custom plugin may clear it.
-    pub(crate) ai_response_guard_pending_redactions: HashMap<u64, String>,
-    /// Per-instance digest of residual-verified HTTP redaction output, including
-    /// its media type. Only byte-identical output may reuse the verification;
-    /// later semantic changes still require a fresh detection pass. Never logged.
-    pub(crate) ai_response_guard_verified_redactions: HashMap<u64, [u8; 32]>,
-    /// `ai_tool_governor` equivalent of
-    /// `ai_response_guard_replay_redactions`. Instance scoping prevents one
-    /// governor from consuming another instance's transform requirement.
-    pub(crate) ai_tool_governor_replay_redactions: HashSet<u64>,
-    /// Per-`graphql`-instance digest of the request envelope that instance
-    /// actually parsed, charged, and admitted in `before_proxy` (priority 2850).
-    ///
-    /// `request_transformer` (3000) applies its body rules afterwards, so a
-    /// rename or replacement can put a deeper, introspecting, aliased, or
-    /// differently named operation into the backend-visible envelope after the
-    /// only structural and rate pass ran (`GHSA-3xrr-4h3f-89pc`). The final
-    /// request-body hook compares the dispatched envelope against this digest and
-    /// re-parses only when it changed, so an untransformed request is never
-    /// charged twice.
-    ///
-    /// Typed rather than `metadata`: a digest of a client query document must not
-    /// enter a transaction log, and no plugin may forge one to skip the recheck.
-    pub(crate) graphql_request_envelope_hashes: HashMap<u64, [u8; 32]>,
-    /// Rate-limit buckets one `graphql` instance already charged for this
-    /// request, as `(instance id, bucket key)`.
-    ///
-    /// The envelope digest above answers "is this the document already parsed?",
-    /// which is the right question for structural policy but the wrong one for
-    /// accounting: an unrelated `request_transformer` addition (an `extensions`
-    /// member, a JSON reserialization) changes the digest without changing the
-    /// operation, and re-running enforcement over it used to spend a second
-    /// token from the same budget — so `max_requests: 1` refused the very first
-    /// request. A bucket is charged at most once per request, while a transform
-    /// that actually selects a different operation type or name still reaches
-    /// its own uncharged bucket and is enforced there.
-    ///
-    /// Keyed by instance because two configured `graphql` instances build
-    /// identical key strings over separate budgets.
-    pub(crate) graphql_charged_rate_buckets: HashSet<(u64, String)>,
-    /// Per-`waf`-instance digest of the response header map that instance
-    /// actually scanned in `after_proxy` (priority 2930).
-    ///
-    /// `response_transformer` (4000), `compression` (4050), and every other later
-    /// header rule mutate the same map afterwards, so the only pass that ever
-    /// enforced response-header policy described a representation the client may
-    /// never receive (`GHSA-62jg-v563-4q23`). The final client-visible phase
-    /// compares the published map against this digest and re-asserts policy only
-    /// when it changed, so an untouched header set is never scanned — or scored —
-    /// twice.
-    ///
-    /// Instance-scoped so one WAF cannot consume another's marker, and typed
-    /// rather than `metadata` because a digest of response headers must not enter
-    /// a transaction log.
-    pub(crate) waf_response_header_digests: HashMap<u64, [u8; 32]>,
     /// Per-request memo of duplicate-object-member screens over governed JSON
     /// bodies (advisory `GHSA-c78j-5w9p-cpq6`). `openapi_validator`,
     /// `body_validator`, and `ai_tool_governor` can all inspect the same
@@ -2823,36 +2693,6 @@ pub struct RequestContext {
     ///   ([`RequestContext::inspectable_final_request_body_owned`]) instead of
     ///   copying the plaintext out to escape a borrow of `ctx`.
     governed_request_body_plaintext: Option<bytes::Bytes>,
-    /// Per-instance governed-call identity multisets (identity hash -> count),
-    /// the one-for-one skip ledgers final re-checks consume. Kept off
-    /// `metadata` for the same reason as the response hashes.
-    pub(crate) ai_tool_governor_call_hashes: HashMap<u64, HashMap<String, usize>>,
-    /// Per-instance governed-request-body hashes, staged in `before_proxy` for
-    /// the `on_final_request_body` re-check. Same leak class as the response
-    /// markers (a hash over the raw request body including tool-call arguments),
-    /// so they remain off `metadata` too.
-    pub(crate) ai_tool_governor_request_hashes: HashMap<u64, String>,
-    /// Per-instance buffered `redact_args` rewrites computed during governance
-    /// amplification preflight and consumed by the response-body transform.
-    /// Keys are digests of `(tool name, raw args)`; aggregate value bytes are
-    /// capped at the plugin's 4 MiB inspectable window, and at most one plugin
-    /// instance may stage a memo set at once, so multiple configured governors
-    /// cannot multiply that retained window between hooks.
-    pub(crate) ai_tool_governor_redaction_memos: HashMap<u64, HashMap<String, String>>,
-    /// Per-`ai_semantic_firewall`-instance hashes of request bodies already
-    /// inspected before request transforms. Kept outside serialized metadata so
-    /// prompt-derived digests never enter transaction logs.
-    pub(crate) ai_semantic_firewall_request_hashes: HashMap<u64, String>,
-    /// Per-instance response-body hashes used to skip unchanged final bodies and
-    /// re-evaluate transformed client-visible representations. Also private for
-    /// the same prompt/response confidentiality reason.
-    pub(crate) ai_semantic_firewall_response_hashes: HashMap<u64, String>,
-    /// Per-`request_deduplication`-instance completion state acquired during
-    /// `before_proxy`. Keeping this out of public metadata prevents internal
-    /// cache keys and lock tokens from entering transaction logs. The map is
-    /// bounded by the configured deduplication instances on the matched proxy.
-    pub(crate) request_deduplication_states:
-        HashMap<u64, request_deduplication::RequestDeduplicationRequestState>,
     /// Whether this request is replaying an already-finalized client
     /// representation — a `response_caching` HIT/REVALIDATED or a
     /// `request_deduplication` idempotent replay. The shared synthetic
@@ -2892,17 +2732,6 @@ pub struct RequestContext {
     /// replay must fail closed on `None` rather than claim provenance it cannot
     /// substantiate. Kept private so request metadata cannot forge one.
     pub(crate) response_presentation_policy_digest: Option<[u8; 32]>,
-    /// Deduplication instances whose in-flight ownership can be released after
-    /// a serverless rejection proven to occur before external invocation. Each
-    /// committed hook consumes only its own entry, preserving exactly-once
-    /// cleanup without weakening uncertain-side-effect retention.
-    pub(crate) serverless_pre_invocation_rejection_owners: HashSet<u64>,
-    /// Deduplication instances that own protection for a terminal serverless
-    /// invocation. Each committed/stream-terminal hook consumes or observes
-    /// only its own entry, so one instance cannot publish into another cache or
-    /// release another instance's in-flight marker. This set is bounded by the
-    /// completion-state map above.
-    pub(crate) serverless_external_side_effect_owners: HashSet<u64>,
     /// Whether a successful terminate-mode serverless invocation produced the
     /// current synthetic response. Unlike ordinary plugin rejections, every
     /// final 2xx-5xx function response is application-owned content and must run
@@ -2929,10 +2758,6 @@ pub struct RequestContext {
     /// can be stored. Committed hooks run sequentially, so at most one instance
     /// occupies the slot.
     pub(crate) serverless_owned_dedup_publication: Option<u64>,
-    /// Per-`ai_prompt_compressor`-instance source digest, transformed bytes, and
-    /// stats staged by `before_proxy`. Kept out of public metadata so a staged
-    /// prompt copy and prompt-derived digest cannot enter transaction logs.
-    pub(crate) ai_prompt_compressor_staged: HashMap<u64, ai_prompt_compressor::StagedCompression>,
     /// Incoming request path captured once by the first auto-family compressor
     /// before backend routing can rewrite `path`. All compressor instances share
     /// this single bounded snapshot, and public metadata cannot spoof it.
@@ -3118,14 +2943,6 @@ pub struct RequestContext {
     /// copy lives in `waf_owned_metadata` so other plugins or inbound request
     /// data cannot spoof WAF transaction-log fields.
     pub(crate) waf_metadata_initialized: bool,
-    pub(crate) waf_owned_metadata: HashMap<String, String>,
-    /// Per-WAF-instance anomaly scores for the current request.
-    ///
-    /// Keyed by the process-unique runtime id of each `waf` plugin instance so
-    /// sibling policies on the same proxy accumulate and threshold-check in
-    /// isolation. Bounded by the number of attached WAF instances (operator
-    /// configuration), never by request content.
-    pub(crate) waf_instance_scores: HashMap<u64, WafInstanceScoreState>,
     /// JWT audiences emitted by mesh `jwks_auth` for Istio
     /// `request.auth.audiences` conditions. Kept out of `metadata` so JWT
     /// claim material does not flow into transaction logs.
@@ -3537,6 +3354,221 @@ pub struct RequestContext {
     pub finalized_request_egress_dispatched: bool,
 }
 
+/// Request-scoped working state owned by individual plugin families.
+///
+/// Split out of [`RequestContext`] so the plugin-free hot path allocates none
+/// of it (issue #5537). Every field here keeps the exact type, visibility
+/// intent, and lifecycle it had as an inline `RequestContext` field — the only
+/// change is that the whole group is materialized on first mutation instead of
+/// on every request. Nothing in here is public API: custom plugins reach this
+/// state through the same `RequestContext` methods as before.
+///
+/// `Default` is what "no plugin family has staged anything" means, so an absent
+/// box and a present all-empty box are observationally identical.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PluginRequestState {
+    /// Claim-derived upstream headers committed by the first accepted
+    /// authentication attempt and held until `before_proxy`. Kept out of
+    /// `metadata` so authorization-phase rejection logging can never serialize
+    /// raw claim values.
+    pub(crate) pending_claim_headers: HashMap<String, String>,
+    /// Lowercase `claim_headers` destinations already sanitized for this
+    /// request. Gateway-owned destinations are stripped exactly once, by the
+    /// first plugin instance that owns them, so a later instance sharing a
+    /// destination can never erase a verified value an earlier instance already
+    /// installed. Empty (and non-allocating) unless a `claim_headers` mapping is
+    /// configured.
+    pub(crate) sanitized_claim_header_destinations: HashSet<String>,
+    /// Digests of credential-bearing query parameters that were present before
+    /// authentication and request transformation. Kept outside public metadata
+    /// so neither reusable credentials nor correlatable digests enter logs.
+    /// The shared replay partition carries this private snapshot because an
+    /// authentication strip may remove the parameter before a retained-result
+    /// plugin builds its key.
+    pub(crate) query_credential_partition_digests: Vec<(String, [u8; 32])>,
+    /// Deltas from the original request-header view to the complete
+    /// backend-visible view, staged by `response_caching` instances during
+    /// lookup and consumed when the origin supplies its final `Vary`
+    /// dimensions. `Some(value)` adds/replaces a field and `None` records a
+    /// removal.
+    ///
+    /// An origin may vary on any field, including one an earlier request
+    /// transformer added or rewrote. The final response-body hook otherwise has
+    /// only `self.headers`, the original client view, and could store a response
+    /// under a key that no longer describes what the backend received. Raw
+    /// header values deliberately stay in this private, per-request map rather
+    /// than public `metadata`, which can be serialized into transaction logs.
+    /// The outer key is the process-unique cache instance ID, bounding the map
+    /// by configured `response_caching` instances.
+    pub(crate) response_cache_request_header_deltas:
+        HashMap<u64, Arc<HashMap<String, Option<String>>>>,
+    /// Per-`ai_semantic_cache`-instance embedding vectors staged between
+    /// `before_proxy` and `on_final_response_body`. Kept out of `metadata` so
+    /// high-dimensional vectors cannot enter transaction logs. The outer key is
+    /// a process-unique cache instance ID so sibling instances on one proxy
+    /// cannot overwrite or consume each other's staged vectors.
+    pub(crate) ai_semantic_cache_embeddings: HashMap<u64, Vec<f32>>,
+    /// Per-instance semantic-cache scope keys paired with
+    /// `ai_semantic_cache_embeddings`.
+    pub(crate) ai_semantic_cache_scope_keys: HashMap<u64, String>,
+    /// OpenAPI validator operation matches staged between `before_proxy` and
+    /// final body hooks. Kept out of public metadata so per-instance state does
+    /// not leak into transaction logs.
+    pub(crate) openapi_validator_matches: HashMap<usize, (String, String)>,
+    /// OpenAPI validator instances whose CLIENT-contract decision has already
+    /// been made on the original client representation in
+    /// `validate_client_request_body_contract`.
+    ///
+    /// Keyed by process-unique validator instance ID so sibling instances on one
+    /// proxy can never consume each other's decision, and so the backend-side
+    /// `on_final_request_body` hook of an instance that already decided does not
+    /// validate, reject, or log the same request a second time over transformed
+    /// bytes (`GHSA-896v-jx23-9g6p`). Kept out of public metadata: it is
+    /// per-instance lifecycle bookkeeping, not observability.
+    pub(crate) openapi_validator_client_contract_enforced: HashSet<usize>,
+    /// Per-`ai_tool_governor`-instance internal correlation markers staged between
+    /// `on_response_body` / `transform_response_body` and the
+    /// `on_final_response_body` re-check. Kept out of public `metadata` so this
+    /// per-request bookkeeping — the governed-body hash and the per-call
+    /// identity multiset, both DERIVED FROM RAW TOOL ARGUMENTS — never reaches
+    /// transaction logs (an operator who disabled `observability.hash_arguments`
+    /// must not get an arg-derived hash logged via a correlation marker).
+    /// The outer key is a process-unique governor instance ID. Multiple
+    /// instances may coexist on one proxy and must never consume each other's
+    /// dedup state.
+    pub(crate) ai_tool_governor_response_hashes: HashMap<u64, String>,
+    /// `ai_response_guard` instances that inspected an already-finalized
+    /// deduplication replay and found content requiring a current-policy
+    /// redaction transform. Kept outside public metadata so response data or a
+    /// custom plugin cannot opt a replay into or out of mandatory rewriting.
+    pub(crate) ai_response_guard_replay_redactions: HashSet<u64>,
+    /// `ai_response_guard` instances that DETECTED governed content under
+    /// `action: redact` and have not yet installed a replacement for it.
+    ///
+    /// Detection returns `Continue` so the redaction can happen in the producer
+    /// phase, but a producer may legitimately return `None` — an over-ceiling or
+    /// refused construction, a representation its rewriter cannot address — and
+    /// `None` means UNCHANGED to the shared transform loop. Without this, the
+    /// original detected body would be forwarded while the request was recorded
+    /// as redacted. The instance clears its own entry when its transform installs
+    /// bytes, and anything still pending at `on_final_response_body` is a
+    /// fail-closed rejection (GHSA-pwcm-6rh8-f2gh).
+    ///
+    /// Typed and outside `metadata` deliberately: this is the authority for
+    /// whether a redaction actually happened, so neither response content nor a
+    /// custom plugin may clear it.
+    pub(crate) ai_response_guard_pending_redactions: HashMap<u64, String>,
+    /// Per-instance digest of residual-verified HTTP redaction output, including
+    /// its media type. Only byte-identical output may reuse the verification;
+    /// later semantic changes still require a fresh detection pass. Never logged.
+    pub(crate) ai_response_guard_verified_redactions: HashMap<u64, [u8; 32]>,
+    /// `ai_tool_governor` equivalent of
+    /// `ai_response_guard_replay_redactions`. Instance scoping prevents one
+    /// governor from consuming another instance's transform requirement.
+    pub(crate) ai_tool_governor_replay_redactions: HashSet<u64>,
+    /// Per-`graphql`-instance digest of the request envelope that instance
+    /// actually parsed, charged, and admitted in `before_proxy` (priority 2850).
+    ///
+    /// `request_transformer` (3000) applies its body rules afterwards, so a
+    /// rename or replacement can put a deeper, introspecting, aliased, or
+    /// differently named operation into the backend-visible envelope after the
+    /// only structural and rate pass ran (`GHSA-3xrr-4h3f-89pc`). The final
+    /// request-body hook compares the dispatched envelope against this digest and
+    /// re-parses only when it changed, so an untransformed request is never
+    /// charged twice.
+    ///
+    /// Typed rather than `metadata`: a digest of a client query document must not
+    /// enter a transaction log, and no plugin may forge one to skip the recheck.
+    pub(crate) graphql_request_envelope_hashes: HashMap<u64, [u8; 32]>,
+    /// Rate-limit buckets one `graphql` instance already charged for this
+    /// request, as `(instance id, bucket key)`.
+    ///
+    /// The envelope digest above answers "is this the document already parsed?",
+    /// which is the right question for structural policy but the wrong one for
+    /// accounting: an unrelated `request_transformer` addition (an `extensions`
+    /// member, a JSON reserialization) changes the digest without changing the
+    /// operation, and re-running enforcement over it used to spend a second
+    /// token from the same budget — so `max_requests: 1` refused the very first
+    /// request. A bucket is charged at most once per request, while a transform
+    /// that actually selects a different operation type or name still reaches
+    /// its own uncharged bucket and is enforced there.
+    ///
+    /// Keyed by instance because two configured `graphql` instances build
+    /// identical key strings over separate budgets.
+    pub(crate) graphql_charged_rate_buckets: HashSet<(u64, String)>,
+    /// Per-`waf`-instance digest of the response header map that instance
+    /// actually scanned in `after_proxy` (priority 2930).
+    ///
+    /// `response_transformer` (4000), `compression` (4050), and every other later
+    /// header rule mutate the same map afterwards, so the only pass that ever
+    /// enforced response-header policy described a representation the client may
+    /// never receive (`GHSA-62jg-v563-4q23`). The final client-visible phase
+    /// compares the published map against this digest and re-asserts policy only
+    /// when it changed, so an untouched header set is never scanned — or scored —
+    /// twice.
+    ///
+    /// Instance-scoped so one WAF cannot consume another's marker, and typed
+    /// rather than `metadata` because a digest of response headers must not enter
+    /// a transaction log.
+    pub(crate) waf_response_header_digests: HashMap<u64, [u8; 32]>,
+    /// Per-instance governed-call identity multisets (identity hash -> count),
+    /// the one-for-one skip ledgers final re-checks consume. Kept off
+    /// `metadata` for the same reason as the response hashes.
+    pub(crate) ai_tool_governor_call_hashes: HashMap<u64, HashMap<String, usize>>,
+    /// Per-instance governed-request-body hashes, staged in `before_proxy` for
+    /// the `on_final_request_body` re-check. Same leak class as the response
+    /// markers (a hash over the raw request body including tool-call arguments),
+    /// so they remain off `metadata` too.
+    pub(crate) ai_tool_governor_request_hashes: HashMap<u64, String>,
+    /// Per-instance buffered `redact_args` rewrites computed during governance
+    /// amplification preflight and consumed by the response-body transform.
+    /// Keys are digests of `(tool name, raw args)`; aggregate value bytes are
+    /// capped at the plugin's 4 MiB inspectable window, and at most one plugin
+    /// instance may stage a memo set at once, so multiple configured governors
+    /// cannot multiply that retained window between hooks.
+    pub(crate) ai_tool_governor_redaction_memos: HashMap<u64, HashMap<String, String>>,
+    /// Per-`ai_semantic_firewall`-instance hashes of request bodies already
+    /// inspected before request transforms. Kept outside serialized metadata so
+    /// prompt-derived digests never enter transaction logs.
+    pub(crate) ai_semantic_firewall_request_hashes: HashMap<u64, String>,
+    /// Per-instance response-body hashes used to skip unchanged final bodies and
+    /// re-evaluate transformed client-visible representations. Also private for
+    /// the same prompt/response confidentiality reason.
+    pub(crate) ai_semantic_firewall_response_hashes: HashMap<u64, String>,
+    /// Per-`request_deduplication`-instance completion state acquired during
+    /// `before_proxy`. Keeping this out of public metadata prevents internal
+    /// cache keys and lock tokens from entering transaction logs. The map is
+    /// bounded by the configured deduplication instances on the matched proxy.
+    pub(crate) request_deduplication_states:
+        HashMap<u64, request_deduplication::RequestDeduplicationRequestState>,
+    /// Deduplication instances whose in-flight ownership can be released after
+    /// a serverless rejection proven to occur before external invocation. Each
+    /// committed hook consumes only its own entry, preserving exactly-once
+    /// cleanup without weakening uncertain-side-effect retention.
+    pub(crate) serverless_pre_invocation_rejection_owners: HashSet<u64>,
+    /// Deduplication instances that own protection for a terminal serverless
+    /// invocation. Each committed/stream-terminal hook consumes or observes
+    /// only its own entry, so one instance cannot publish into another cache or
+    /// release another instance's in-flight marker. This set is bounded by the
+    /// completion-state map above.
+    pub(crate) serverless_external_side_effect_owners: HashSet<u64>,
+    /// Per-`ai_prompt_compressor`-instance source digest, transformed bytes, and
+    /// stats staged by `before_proxy`. Kept out of public metadata so a staged
+    /// prompt copy and prompt-derived digest cannot enter transaction logs.
+    pub(crate) ai_prompt_compressor_staged: HashMap<u64, ai_prompt_compressor::StagedCompression>,
+    /// WAF-owned copies of the `waf.*` transaction-log fields: the authority for
+    /// which of those fields a `waf` instance actually published, so neither
+    /// another plugin nor inbound request data can spoof them.
+    pub(crate) waf_owned_metadata: HashMap<String, String>,
+    /// Per-WAF-instance anomaly scores for the current request.
+    ///
+    /// Keyed by the process-unique runtime id of each `waf` plugin instance so
+    /// sibling policies on the same proxy accumulate and threshold-check in
+    /// isolation. Bounded by the number of attached WAF instances (operator
+    /// configuration), never by request content.
+    pub(crate) waf_instance_scores: HashMap<u64, WafInstanceScoreState>,
+}
+
 /// Return an identity only when it contains a meaningful non-whitespace value.
 /// Security identities are preserved byte-for-byte; this helper rejects blank
 /// principals rather than silently canonicalizing signed claim content.
@@ -3580,6 +3612,100 @@ impl RequestContext {
 
     pub(crate) fn backend_dispatch_state(&self) -> BackendDispatchState {
         self.backend_dispatch_state
+    }
+
+    /// Carry a final-request-body hook context's plugin state back onto the
+    /// live request context.
+    ///
+    /// Exactly the four families the handler has always written back field by
+    /// field: WAF-owned metadata and per-instance scores, plus
+    /// `ai_semantic_cache`'s staged scope key and embedding — its store hook
+    /// runs later against the live context, so without these a semantic miss
+    /// would silently store as exact-only. Everything else the compatibility
+    /// context staged is discarded with it, exactly as before.
+    ///
+    /// A donor that materialized no plugin state means all four are empty, and
+    /// the live context's copies are cleared to match, which is what the
+    /// unconditional field moves produced.
+    pub(crate) fn adopt_final_request_body_hook_plugin_state(&mut self, donor: &mut Self) {
+        let Some(donor_state) = donor.plugin_state.as_deref_mut() else {
+            if let Some(state) = self.plugin_state.as_deref_mut() {
+                state.waf_owned_metadata = HashMap::new();
+                state.waf_instance_scores = HashMap::new();
+                state.ai_semantic_cache_embeddings = HashMap::new();
+                state.ai_semantic_cache_scope_keys = HashMap::new();
+            }
+            return;
+        };
+        let waf_owned_metadata = std::mem::take(&mut donor_state.waf_owned_metadata);
+        let waf_instance_scores = std::mem::take(&mut donor_state.waf_instance_scores);
+        let ai_semantic_cache_embeddings =
+            std::mem::take(&mut donor_state.ai_semantic_cache_embeddings);
+        let ai_semantic_cache_scope_keys =
+            std::mem::take(&mut donor_state.ai_semantic_cache_scope_keys);
+        if self.plugin_state.is_none()
+            && waf_owned_metadata.is_empty()
+            && waf_instance_scores.is_empty()
+            && ai_semantic_cache_embeddings.is_empty()
+            && ai_semantic_cache_scope_keys.is_empty()
+        {
+            // Nothing to carry and nothing to clear: do not materialize live
+            // state just to hold four empty collections.
+            return;
+        }
+        let state = self.plugin_state_mut();
+        state.waf_owned_metadata = waf_owned_metadata;
+        state.waf_instance_scores = waf_instance_scores;
+        state.ai_semantic_cache_embeddings = ai_semantic_cache_embeddings;
+        state.ai_semantic_cache_scope_keys = ai_semantic_cache_scope_keys;
+    }
+
+    /// Release the request-scoped leases a deferred terminal never owned.
+    ///
+    /// The streaming terminal used to be handed a CLONE of this context, and
+    /// exactly three fields deliberately do not survive a clone: the bounded
+    /// response-buffer permit, the `request_mirror` admission leases, and the
+    /// `hmac_auth` prebuffer staging. They are the crate's only `Clone` impls
+    /// that reset rather than duplicate, precisely because duplicating them
+    /// would double-release a bounded admission.
+    ///
+    /// Moving the context into the logger instead would hand it all three and
+    /// hold each until the body terminates and the terminal task finishes.
+    /// Dropping them here releases them where the handler has always released
+    /// them — at the end of request handling — so the move carries exactly what
+    /// the clone carried.
+    pub(crate) fn release_leases_before_terminal_handoff(&mut self) {
+        drop(self.compression_response_buffer_permit.take());
+        self.request_mirror_admissions = request_mirror::RequestMirrorAdmissions::default();
+        self.hmac_prebuffer_state = hmac_auth::HmacPrebufferState::default();
+    }
+
+    /// Read the per-plugin working state, if any family has staged anything.
+    ///
+    /// `None` is the common case and means "every collection in
+    /// [`PluginRequestState`] is empty" — read paths must treat it exactly that
+    /// way rather than materializing the box to answer a question.
+    #[inline]
+    pub(crate) fn plugin_state(&self) -> Option<&PluginRequestState> {
+        self.plugin_state.as_deref()
+    }
+
+    /// Mutate the per-plugin working state WITHOUT materializing it.
+    ///
+    /// For removals, clears, and other operations whose result on absent state
+    /// is already "nothing to do".
+    #[inline]
+    pub(crate) fn plugin_state_opt_mut(&mut self) -> Option<&mut PluginRequestState> {
+        self.plugin_state.as_deref_mut()
+    }
+
+    /// Mutate the per-plugin working state, allocating it on first use.
+    ///
+    /// Only staging paths — which run because a plugin family is configured on
+    /// this proxy — should reach this; the plugin-free request never does.
+    #[inline]
+    pub(crate) fn plugin_state_mut(&mut self) -> &mut PluginRequestState {
+        self.plugin_state.get_or_insert_default()
     }
 
     pub fn new(client_ip: String, method: String, path: String) -> Self {
@@ -3650,47 +3776,23 @@ impl RequestContext {
             ai_usage_export_token_prefix: None,
             ai_usage_export_cost_prefix: None,
             cors_state: cors::CorsRequestState::default(),
-            pending_claim_headers: HashMap::new(),
-            sanitized_claim_header_destinations: HashSet::new(),
+            plugin_state: None,
             request_headers_to_redact: None,
-            query_credential_partition_digests: Vec::new(),
-            response_cache_request_header_deltas: HashMap::new(),
             buffered_initial_response_header_policy_state: None,
             buffered_deadline_response_header_provenance: None,
             request_http_flavor: HttpFlavor::Plain,
             h3_response_upstream_is_fallback: false,
             original_accept_encoding: None,
             websocket_response_boundary: false,
-            ai_semantic_cache_embeddings: HashMap::new(),
-            ai_semantic_cache_scope_keys: HashMap::new(),
-            openapi_validator_matches: HashMap::new(),
-            openapi_validator_client_contract_enforced: HashSet::new(),
-            ai_tool_governor_response_hashes: HashMap::new(),
-            ai_response_guard_replay_redactions: HashSet::new(),
-            ai_response_guard_pending_redactions: HashMap::new(),
-            ai_response_guard_verified_redactions: HashMap::new(),
-            ai_tool_governor_replay_redactions: HashSet::new(),
-            graphql_request_envelope_hashes: HashMap::new(),
-            graphql_charged_rate_buckets: HashSet::new(),
-            waf_response_header_digests: HashMap::new(),
             json_scan_memo: crate::util::json_dup_keys::JsonScanMemo::default(),
             governed_request_body_plaintext: None,
-            ai_tool_governor_call_hashes: HashMap::new(),
-            ai_tool_governor_request_hashes: HashMap::new(),
-            ai_tool_governor_redaction_memos: HashMap::new(),
-            ai_semantic_firewall_request_hashes: HashMap::new(),
-            ai_semantic_firewall_response_hashes: HashMap::new(),
-            request_deduplication_states: HashMap::new(),
             finalized_response_replay: false,
             semantic_cache_response_replay: false,
             response_policy_stamp: None,
             response_presentation_policy_digest: None,
-            serverless_pre_invocation_rejection_owners: HashSet::new(),
-            serverless_external_side_effect_owners: HashSet::new(),
             serverless_terminate_response: false,
             serverless_grpc_terminate_frame: None,
             serverless_owned_dedup_publication: None,
-            ai_prompt_compressor_staged: HashMap::new(),
             ai_prompt_compressor_classification_path: None,
             ai_prompt_compressor_wire_stats_started: false,
             ai_prompt_compressor_marker_reject_status: None,
@@ -3716,8 +3818,6 @@ impl RequestContext {
             mcp_sse_stream: None,
             mcp_sse_publication: None,
             waf_metadata_initialized: false,
-            waf_owned_metadata: HashMap::new(),
-            waf_instance_scores: HashMap::new(),
             mesh_request_auth_audiences: Vec::new(),
             mesh_request_auth_claims: HashMap::new(),
             tls_client_cert_der: None,
@@ -4395,10 +4495,14 @@ impl RequestContext {
             }
         }
         if delta.is_empty() {
-            self.response_cache_request_header_deltas
-                .remove(&instance_id);
+            if let Some(state) = self.plugin_state_opt_mut() {
+                state
+                    .response_cache_request_header_deltas
+                    .remove(&instance_id);
+            }
         } else {
-            self.response_cache_request_header_deltas
+            self.plugin_state_mut()
+                .response_cache_request_header_deltas
                 .insert(instance_id, Arc::new(delta));
         }
     }
@@ -4407,14 +4511,18 @@ impl RequestContext {
         &self,
         instance_id: u64,
     ) -> Option<&HashMap<String, Option<String>>> {
-        self.response_cache_request_header_deltas
+        self.plugin_state()?
+            .response_cache_request_header_deltas
             .get(&instance_id)
             .map(Arc::as_ref)
     }
 
     pub(crate) fn clear_response_cache_request_header_delta(&mut self, instance_id: u64) {
-        self.response_cache_request_header_deltas
-            .remove(&instance_id);
+        if let Some(state) = self.plugin_state_opt_mut() {
+            state
+                .response_cache_request_header_deltas
+                .remove(&instance_id);
+        }
     }
 
     /// Record the genuine origin/backend HTTP status exactly once.
@@ -4972,44 +5080,42 @@ impl RequestContext {
             // aggregate. CORS has no body hook, and only metadata is copied
             // back from this compatibility context.
             cors_state: cors::CorsRequestState::default(),
-            // Claim-header staging stays on the real request context. Final
-            // body hooks never consume it, and copying raw claim values into a
-            // compatibility clone would extend their lifetime unnecessarily.
-            pending_claim_headers: HashMap::new(),
-            sanitized_claim_header_destinations: HashSet::new(),
             request_headers_to_redact: self.request_headers_to_redact.clone(),
-            query_credential_partition_digests: self.query_credential_partition_digests.clone(),
-            // Response caching has no final request-body hook. Its private
-            // backend-header delta remains on the live donor context for the
-            // eventual response store rather than extending raw values into
-            // this short-lived compatibility clone.
-            response_cache_request_header_deltas: HashMap::new(),
+            // Per-plugin working state. The split into `PluginRequestState`
+            // did not change any family's lifecycle here: most are CLONED, the
+            // claim-header staging and the `response_caching` header delta stay
+            // on the live donor, and the potentially body-sized compressor
+            // stage is TRANSFERRED.
+            plugin_state: self.plugin_state.as_deref_mut().map(|state| {
+                // Take the transferred stage BEFORE cloning so the clone never
+                // duplicates a body-sized map only to overwrite it.
+                //
+                // Transfer rather than clone the potentially body-sized
+                // compressor stage. The final wire hook consumes it from this
+                // compatibility context, while the live context no longer
+                // retains a second copy.
+                let ai_prompt_compressor_staged =
+                    std::mem::take(&mut state.ai_prompt_compressor_staged);
+                let mut hook_state = state.clone();
+                hook_state.ai_prompt_compressor_staged = ai_prompt_compressor_staged;
+                // Claim-header staging stays on the real request context. Final
+                // body hooks never consume it, and copying raw claim values into a
+                // compatibility clone would extend their lifetime unnecessarily.
+                hook_state.pending_claim_headers = HashMap::new();
+                hook_state.sanitized_claim_header_destinations = HashSet::new();
+                // Response caching has no final request-body hook. Its private
+                // backend-header delta remains on the live donor context for the
+                // eventual response store rather than extending raw values into
+                // this short-lived compatibility clone.
+                hook_state.response_cache_request_header_deltas = HashMap::new();
+                Box::new(hook_state)
+            }),
             buffered_initial_response_header_policy_state: None,
             buffered_deadline_response_header_provenance: None,
             request_http_flavor: self.request_http_flavor,
             h3_response_upstream_is_fallback: self.h3_response_upstream_is_fallback,
             original_accept_encoding: self.original_accept_encoding.clone(),
             websocket_response_boundary: self.websocket_response_boundary,
-            ai_semantic_cache_embeddings: self.ai_semantic_cache_embeddings.clone(),
-            ai_semantic_cache_scope_keys: self.ai_semantic_cache_scope_keys.clone(),
-            openapi_validator_matches: self.openapi_validator_matches.clone(),
-            openapi_validator_client_contract_enforced: self
-                .openapi_validator_client_contract_enforced
-                .clone(),
-            ai_tool_governor_response_hashes: self.ai_tool_governor_response_hashes.clone(),
-            ai_response_guard_replay_redactions: self.ai_response_guard_replay_redactions.clone(),
-            ai_response_guard_pending_redactions: self.ai_response_guard_pending_redactions.clone(),
-            ai_response_guard_verified_redactions: self
-                .ai_response_guard_verified_redactions
-                .clone(),
-            ai_tool_governor_replay_redactions: self.ai_tool_governor_replay_redactions.clone(),
-            // Carried into the final-request-body stage so every plugin in that
-            // stage shares one duplicate-key screen of the same body.
-            graphql_request_envelope_hashes: self.graphql_request_envelope_hashes.clone(),
-            // Carried so the final-request-body re-check can see which budgets
-            // `before_proxy` already charged for this request.
-            graphql_charged_rate_buckets: self.graphql_charged_rate_buckets.clone(),
-            waf_response_header_digests: self.waf_response_header_digests.clone(),
             json_scan_memo: self.json_scan_memo.clone(),
             // Deliberately NOT carried: the shared request representation gate
             // stages this view from the exact `(headers, body)` pair the final
@@ -5017,29 +5123,13 @@ impl RequestContext {
             // an older decode in would risk handing a hook plaintext that does
             // not describe the bytes it was given.
             governed_request_body_plaintext: None,
-            ai_tool_governor_call_hashes: self.ai_tool_governor_call_hashes.clone(),
-            ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
-            ai_tool_governor_redaction_memos: self.ai_tool_governor_redaction_memos.clone(),
-            ai_semantic_firewall_request_hashes: self.ai_semantic_firewall_request_hashes.clone(),
-            ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
-            request_deduplication_states: self.request_deduplication_states.clone(),
             finalized_response_replay: self.finalized_response_replay,
             semantic_cache_response_replay: self.semantic_cache_response_replay,
             response_policy_stamp: self.response_policy_stamp.clone(),
             response_presentation_policy_digest: self.response_presentation_policy_digest,
-            serverless_pre_invocation_rejection_owners: self
-                .serverless_pre_invocation_rejection_owners
-                .clone(),
-            serverless_external_side_effect_owners: self
-                .serverless_external_side_effect_owners
-                .clone(),
             serverless_terminate_response: self.serverless_terminate_response,
             serverless_grpc_terminate_frame: self.serverless_grpc_terminate_frame.clone(),
             serverless_owned_dedup_publication: self.serverless_owned_dedup_publication,
-            // Transfer rather than clone the potentially body-sized compressor
-            // stage. The final wire hook consumes it from this compatibility
-            // context, while the live context no longer retains a second copy.
-            ai_prompt_compressor_staged: std::mem::take(&mut self.ai_prompt_compressor_staged),
             ai_prompt_compressor_classification_path: std::mem::take(
                 &mut self.ai_prompt_compressor_classification_path,
             ),
@@ -5100,8 +5190,6 @@ impl RequestContext {
             mcp_sse_stream: None,
             mcp_sse_publication: None,
             waf_metadata_initialized: self.waf_metadata_initialized,
-            waf_owned_metadata: self.waf_owned_metadata.clone(),
-            waf_instance_scores: self.waf_instance_scores.clone(),
             mesh_request_auth_audiences: self.mesh_request_auth_audiences.clone(),
             mesh_request_auth_claims: self.mesh_request_auth_claims.clone(),
             tls_client_cert_der: self.tls_client_cert_der.clone(),
@@ -5232,7 +5320,9 @@ impl RequestContext {
             return;
         }
         self.metadata.retain(|key, _| !key.starts_with("waf."));
-        self.waf_owned_metadata.clear();
+        if let Some(state) = self.plugin_state_opt_mut() {
+            state.waf_owned_metadata.clear();
+        }
         self.waf_metadata_initialized = true;
     }
 
@@ -5258,21 +5348,22 @@ impl RequestContext {
 
     /// Retain one credential-query digest outside public metadata.
     pub(crate) fn mark_query_credential_partition_digest(&mut self, name: &str, digest: [u8; 32]) {
-        if let Some((_, known_digest)) = self
-            .query_credential_partition_digests
+        let digests = &mut self.plugin_state_mut().query_credential_partition_digests;
+        if let Some((_, known_digest)) = digests
             .iter_mut()
             .find(|(known_name, _)| known_name == name)
         {
             *known_digest = digest;
             return;
         }
-        self.query_credential_partition_digests
-            .push((name.to_string(), digest));
+        digests.push((name.to_string(), digest));
     }
 
     /// Credential-query digests captured before authentication stripping.
     pub(crate) fn query_credential_partition_digests(&self) -> &[(String, [u8; 32])] {
-        &self.query_credential_partition_digests
+        self.plugin_state()
+            .map(|state| state.query_credential_partition_digests.as_slice())
+            .unwrap_or(&[])
     }
 
     pub(crate) fn set_websocket_response_boundary(&mut self, enabled: bool) {
@@ -5392,20 +5483,26 @@ impl RequestContext {
     pub(crate) fn set_waf_metadata(&mut self, key: &str, value: impl Into<String>) {
         self.ensure_waf_metadata_initialized();
         let value = value.into();
-        self.waf_owned_metadata
+        self.plugin_state_mut()
+            .waf_owned_metadata
             .insert(key.to_string(), value.clone());
         self.metadata.insert(key.to_string(), value);
     }
 
     pub(crate) fn clear_waf_metadata(&mut self, key: &str) {
         self.ensure_waf_metadata_initialized();
-        self.waf_owned_metadata.remove(key);
+        if let Some(state) = self.plugin_state_opt_mut() {
+            state.waf_owned_metadata.remove(key);
+        }
         self.metadata.remove(key);
     }
 
     pub(crate) fn set_waf_metadata_if_absent(&mut self, key: &str, value: impl Into<String>) {
         self.ensure_waf_metadata_initialized();
-        if self.waf_owned_metadata.contains_key(key) {
+        if self
+            .plugin_state()
+            .is_some_and(|state| state.waf_owned_metadata.contains_key(key))
+        {
             return;
         }
         self.set_waf_metadata(key, value);
@@ -5426,10 +5523,15 @@ impl RequestContext {
         phase: WafScorePhase,
         contribution: u32,
     ) -> Option<u32> {
-        if contribution == 0 && !self.waf_instance_scores.contains_key(&instance_id) {
+        if contribution == 0
+            && !self
+                .plugin_state()
+                .is_some_and(|state| state.waf_instance_scores.contains_key(&instance_id))
+        {
             return None;
         }
         let entry = self
+            .plugin_state_mut()
             .waf_instance_scores
             .entry(instance_id)
             .or_insert_with(|| WafInstanceScoreState {
@@ -5449,22 +5551,30 @@ impl RequestContext {
             return;
         }
         self.ensure_waf_metadata_initialized();
-        merge_metadata_value(&mut self.waf_owned_metadata, key, value);
+        let state = self.plugin_state_mut();
+        merge_metadata_value(&mut state.waf_owned_metadata, key, value);
         // `merge_metadata_value` always inserts or modifies the entry, so
         // `get(key)` is guaranteed `Some` here; no fallback branch needed.
-        if let Some(owned_value) = self.waf_owned_metadata.get(key) {
-            self.metadata.insert(key.to_string(), owned_value.clone());
+        let owned_value = state.waf_owned_metadata.get(key).cloned();
+        if let Some(owned_value) = owned_value {
+            self.metadata.insert(key.to_string(), owned_value);
         }
     }
 
     pub(crate) fn waf_metadata_value(&self, key: &str) -> Option<&str> {
-        self.waf_owned_metadata.get(key).map(String::as_str)
+        self.plugin_state()
+            .and_then(|state| state.waf_owned_metadata.get(key))
+            .map(String::as_str)
     }
 
     pub(crate) fn apply_waf_owned_log_metadata(&self, metadata: &mut HashMap<String, String>) {
         metadata.retain(|key, _| !key.starts_with("waf."));
+        let Some(state) = self.plugin_state() else {
+            return;
+        };
         metadata.extend(
-            self.waf_owned_metadata
+            state
+                .waf_owned_metadata
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone())),
         );

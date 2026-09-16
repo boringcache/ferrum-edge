@@ -379,6 +379,8 @@ async fn test_http3_proxy_state_creation() {
     let request_epoch_for_fence = request_epoch.clone();
     let proxy_state = ProxyState {
         config: gateway_config,
+        tls_inventory_cache: Arc::clone(ferrum_edge::tls::inventory_cache::process_cache()),
+        admin_metrics_registry: ferrum_edge::plugins::prometheus_metrics::global_registry(),
         request_epoch,
         dns_cache,
         connection_pool,
@@ -716,6 +718,8 @@ async fn test_http3_full_integration() {
     let request_epoch_for_fence = request_epoch.clone();
     let proxy_state = ProxyState {
         config: gateway_config,
+        tls_inventory_cache: Arc::clone(ferrum_edge::tls::inventory_cache::process_cache()),
+        admin_metrics_registry: ferrum_edge::plugins::prometheus_metrics::global_registry(),
         request_epoch,
         dns_cache,
         connection_pool,

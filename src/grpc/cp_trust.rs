@@ -940,7 +940,8 @@ pub enum TenantAuthRejectReason {
     /// under an algorithm it was not provisioned for.
     AlgorithmMismatch,
     /// Signature or standard-claim validation failed after credential
-    /// selection. Shares the outward message with [`Self::UnknownKeyId`] and
+    /// selection, including a present `iss` that is not a single JSON string.
+    /// Shares the outward message with [`Self::UnknownKeyId`] and
     /// [`Self::AlgorithmMismatch`] so callers cannot enumerate the trusted
     /// inventory from response text.
     TokenValidation,

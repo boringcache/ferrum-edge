@@ -11325,26 +11325,39 @@ fn a_root_endpoint_path_is_refused_at_admission() {
 
 #[tokio::test]
 async fn endpoint_scope_refuses_descendants_in_both_modes() {
+    let upstream = MockServer::start().await;
     for mode in ["aggregate_router", "transparent_proxy"] {
         for endpoint in ["/mcp", "/mcp/"] {
-            let mut config = transparent_config("http://127.0.0.1:9/mcp");
+            let mut config = transparent_config(&format!("{}/mcp", upstream.uri()));
             config["mode"] = json!(mode);
             config["endpoint"]["path"] = json!(endpoint);
             let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
-            for path in ["/mcp", "/mcp/", "/mcp//", "/mcp/child"] {
-                if path == endpoint {
-                    continue;
-                }
+            for path in [
+                "/mcp//",
+                "/mcp/tools",
+                "/mcp/tools/",
+                "/mcp%2F",
+                "/mcp%2f",
+                "/mcp/.",
+                "/mcp/./",
+                "/MCP",
+                "/mCp/",
+                "/MCP/tools",
+            ] {
                 for method in ["POST", "GET", "DELETE", "PUT", "HEAD", "OPTIONS"] {
                     let (mut ctx, mut headers) = mcp_ctx(json!({
                         "jsonrpc": "2.0", "id": 1, "method": "ping"
                     }));
                     ctx.path = path.to_string();
                     ctx.method = method.to_string();
-                    let (status, _, _) =
+                    assert!(!plugin.should_buffer_request_body(&ctx));
+                    let (status, body, _) =
                         reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
                     assert_eq!(status, 404, "{mode} {endpoint} {method} {path}");
+                    assert_eq!(body["error"]["code"], -32600);
+                    assert_eq!(body["error"]["message"], "Unknown MCP endpoint");
                     assert!(ctx.route_override_backend_host.is_none());
+                    assert!(ctx.route_override_path.is_none());
                     // A reserved descendant is denied, exactly like the 405.
                     assert_eq!(
                         ctx.metadata.get("mcp.route_decision").map(String::as_str),
@@ -11362,6 +11375,175 @@ async fn endpoint_scope_refuses_descendants_in_both_modes() {
             ));
         }
     }
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+}
+
+#[test]
+fn endpoint_matcher_accepts_only_a_single_trailing_slash() {
+    use ferrum_edge::plugins::utils::endpoint_path::matches_endpoint_path;
+
+    for endpoint in ["/mcp", "/mcp/", "/api/mcp", "/api/mcp/"] {
+        let base = endpoint.trim_end_matches('/');
+        assert!(matches_endpoint_path(base, endpoint));
+        assert!(matches_endpoint_path(&format!("{base}/"), endpoint));
+        for suffix in ["//", "/tools", "/tools/", "%2F", "/.", "/./", "/%2e"] {
+            assert!(!matches_endpoint_path(&format!("{base}{suffix}"), endpoint));
+        }
+        assert!(!matches_endpoint_path(&base.to_uppercase(), endpoint));
+    }
+    assert!(matches_endpoint_path("/", "/"));
+    assert!(!matches_endpoint_path("//", "/"));
+    assert!(!matches_endpoint_path("/", "//"));
+}
+
+#[tokio::test]
+async fn endpoint_alias_uses_transparent_routing_for_post_get_and_delete() {
+    for endpoint in ["/mcp", "/mcp/"] {
+        let mut config = transparent_config("http://upstream.example:8080/canonical/mcp");
+        config["endpoint"]["path"] = json!(endpoint);
+        let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+        for path in ["/mcp", "/mcp/"] {
+            for method in ["POST", "GET", "DELETE"] {
+                let (mut ctx, mut headers) = mcp_ctx(initialize_request_body());
+                ctx.path = path.to_string();
+                ctx.method = method.to_string();
+                headers.insert("mcp-session-id".to_string(), "client-session".to_string());
+                assert_eq!(plugin.should_buffer_request_body(&ctx), method == "POST");
+                assert!(matches!(
+                    plugin.before_proxy(&mut ctx, &mut headers).await,
+                    PluginResult::Continue
+                ));
+                assert_eq!(ctx.path, endpoint);
+                assert_eq!(ctx.route_override_path.as_deref(), Some("/canonical/mcp"));
+                assert!(ctx.route_override_path_is_absolute);
+                assert_eq!(
+                    ctx.route_override_backend_host.as_deref(),
+                    Some("upstream.example")
+                );
+                assert_eq!(headers["mcp-session-id"], "client-session");
+                assert_eq!(ctx.metadata["mcp.route_decision"], "forward");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn endpoint_alias_preserves_aggregate_session_and_tool_policy() {
+    let upstream = start_mcp_catalog_server().await;
+    let config = aggregate_config(&format!("{}/mcp", upstream.uri()));
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    for initialize_path in ["/mcp", "/mcp/"] {
+        let mut owner = caller_as_consumer(initialize_request_body(), "consumer-a", "alice");
+        owner.0.path = initialize_path.to_string();
+        let session_id = initialize_as(&plugin, owner).await;
+        for path in ["/mcp", "/mcp/"] {
+            let mut other = caller_as_consumer(tools_list_body(2), "consumer-b", "mallory");
+            other.0.path = path.to_string();
+            assert_session_refused(reuse_session_as(&plugin, &session_id, other).await);
+
+            let mut owner = caller_as_consumer(tools_list_body(3), "consumer-a", "alice");
+            owner.0.path = path.to_string();
+            assert_tools_listed(reuse_session_as(&plugin, &session_id, owner).await);
+
+            for tool in ["github.merge_pr", "github.create_pr"] {
+                // Denied tool and allowed tool with invalid arguments must
+                // both stop before routing at either spelling.
+                let denied = json!({
+                    "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                    "params": {"name": tool, "arguments": {}}
+                });
+                let (mut ctx, mut headers) = caller_as_consumer(denied, "consumer-a", "alice");
+                ctx.path = path.to_string();
+                headers.insert("mcp-session-id".to_string(), session_id.clone());
+                let (_, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+                assert!(body.get("error").is_some());
+                assert!(ctx.route_override_backend_host.is_none());
+            }
+
+            let request = json!({
+                "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                "params": {"name": "github.create_pr", "arguments": {"repo": "payments-api"}}
+            });
+            let (mut ctx, mut headers) = caller_as_consumer(request.clone(), "consumer-a", "alice");
+            ctx.path = path.to_string();
+            headers.insert("mcp-session-id".to_string(), session_id.clone());
+            assert!(matches!(
+                plugin.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ));
+            assert_eq!(ctx.path, "/mcp");
+            assert_eq!(ctx.route_override_path.as_deref(), Some("/mcp"));
+            let rewritten = plugin
+                .transform_request_body_with_context(
+                    &mut ctx,
+                    &serde_json::to_vec(&request).unwrap(),
+                    Some("application/json"),
+                    &headers,
+                )
+                .await
+                .unwrap();
+            let rewritten: Value = serde_json::from_slice(&rewritten).unwrap();
+            assert_eq!(rewritten["params"]["name"], "create_pr");
+            assert!(plugin.should_buffer_response_body(&ctx));
+            let response = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0", "id": 5,
+                "result": {"content": [{
+                    "type": "resource_link", "uri": "file:///project/generated.txt", "name": "File"
+                }]}
+            }))
+            .unwrap();
+            let rewritten = plugin
+                .transform_response_body_with_context(
+                    &mut ctx,
+                    &response,
+                    Some("application/json"),
+                    &known_json_response_headers(&response),
+                )
+                .await
+                .unwrap();
+            let rewritten: Value = serde_json::from_slice(&rewritten).unwrap();
+            assert!(
+                rewritten["result"]["content"][0]["uri"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("mcp://github/")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn endpoint_alias_attaches_sse_and_deletes_the_same_session() {
+    let plugin = mcp_plugin();
+    let session_id = initialize(&plugin).await;
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    ctx.path = "/mcp/".to_string();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Reject {
+            status_code: 200,
+            ..
+        }
+    ));
+    assert_eq!(ctx.path, "/mcp");
+    assert!(mcp_aggregate_sse_listener_is_staged_for_test(&ctx));
+    let mut stream = sse_body(&mut ctx);
+
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    ctx.path = "/mcp/".to_string();
+    ctx.method = "DELETE".to_string();
+    let (status, _, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while stream.next().await.is_some() {}
+    })
+    .await;
+    assert!(ended.is_ok(), "DELETE must end the attached SSE body");
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    assert_eq!(
+        reject_raw(plugin.before_proxy(&mut ctx, &mut headers).await).0,
+        404
+    );
 }
 
 fn raw_response_id(body: &str) -> String {

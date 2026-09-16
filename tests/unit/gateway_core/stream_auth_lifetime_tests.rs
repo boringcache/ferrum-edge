@@ -28,11 +28,12 @@ use ferrum_edge::_test_support::{
     compose_h3_upload_bound_for_test, compose_precommit_response_phase_bound_for_test,
     direct_h2_upload_join_bound_for_test, dispatch_phase_authorization_expiry_for_test,
     dtls_authorization_expired_before_relay_for_test,
-    dtls_setup_stage_under_authorization_for_test, precommit_authorization_gate_for_test,
-    relay_failure_is_client_facing, request_received_at_for_test,
-    request_upload_auth_deadline_for_test, set_grpc_deadline_budget_for_test,
-    set_request_credential_deadline_for_test, settle_dtls_relay_authorization_expiry_for_test,
-    tcp_plain_splice_eligible_for_test, within_stream_auth_deadline_for_test,
+    dtls_setup_stage_under_authorization_for_test, post_eos_drain_diagnostics,
+    precommit_authorization_gate_for_test, relay_failure_is_client_facing,
+    request_received_at_for_test, request_upload_auth_deadline_for_test,
+    set_grpc_deadline_budget_for_test, set_request_credential_deadline_for_test,
+    settle_dtls_relay_authorization_expiry_for_test, tcp_plain_splice_eligible_for_test,
+    within_stream_auth_deadline_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::{Direction, DisconnectCause, RequestContext};
@@ -3347,12 +3348,11 @@ async fn a_direct_upload_finished_inside_the_dispatch_poll_settles_without_a_tas
     // that also yields the response head, so the race ends before it ever
     // polls the pump again. The join must still recognise a finished upload
     // and not pay a task to learn what one poll would tell it.
+    let unarmed_before = post_eos_drain_diagnostics()
+        .into_iter()
+        .find_map(|(name, count)| (name == "POST_EOS_UNARMED").then_some(count));
     let frame = BufferedUploadPumpProbe::frame_size();
-    let mut probe = BufferedUploadPumpProbe::start(frame * 2, 600_000).expect("buffered pump");
-    assert!(matches!(
-        probe.poll_transport_only(),
-        ProbeTransportPoll::Data(_)
-    ));
+    let mut probe = BufferedUploadPumpProbe::start(frame, 600_000).expect("buffered pump");
     assert!(matches!(
         probe.poll_transport_only(),
         ProbeTransportPoll::Data(_)
@@ -3368,6 +3368,13 @@ async fn a_direct_upload_finished_inside_the_dispatch_poll_settles_without_a_tas
         "a finished upload must settle in place when the race ends, not be detached"
     );
     assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+    let unarmed_after = post_eos_drain_diagnostics()
+        .into_iter()
+        .find_map(|(name, count)| (name == "POST_EOS_UNARMED").then_some(count));
+    assert_eq!(
+        unarmed_after, unarmed_before,
+        "the queued consumer arm must be consumed before direct completion settles"
+    );
 }
 
 #[tokio::test(start_paused = true)]

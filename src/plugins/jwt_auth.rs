@@ -25,6 +25,7 @@ use crate::consumer_index::ConsumerIndex;
 
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
 use super::utils::header_extract::{ConfiguredHeaderLookup, lookup_configured_header};
+use super::utils::jwt_verifier::issuer_claim_is_single_string;
 use super::utils::token_extract::bearer_credential_from_authorization_value;
 use super::{RequestContext, strip_auth_scheme};
 
@@ -251,6 +252,14 @@ impl AuthMechanism for JwtAuth {
                 let key = DecodingKey::from_secret(secret.as_bytes());
                 if let Ok(token_data) = decode::<serde_json::Value>(&token, &key, &self.validation)
                 {
+                    // `jsonwebtoken` matches a multi-valued `iss` by set
+                    // intersection, so an array containing the configured
+                    // issuer satisfies an exact issuer check. RFC 7519 §4.1.1
+                    // allows exactly one `StringOrURI` (issue #5522).
+                    if !issuer_claim_is_single_string(&token_data.claims) {
+                        debug!("jwt_auth: JWT 'iss' claim is not a single string");
+                        return VerifyOutcome::Invalid(r#"{"error":"Invalid JWT token"}"#.into());
+                    }
                     if self.require_nbf && token_data.claims.get("nbf").is_none() {
                         debug!("jwt_auth: JWT missing required nbf claim");
                         return VerifyOutcome::Invalid(

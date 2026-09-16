@@ -816,6 +816,28 @@ impl fmt::Debug for RequestDeduplicationRequestState {
     }
 }
 
+/// Take this instance's completion state out of the boxed per-plugin request
+/// state. Absent state means "this instance never acquired ownership", which is
+/// exactly what an absent box means too.
+#[inline]
+fn take_request_state(
+    ctx: &mut RequestContext,
+    instance_id: u64,
+) -> Option<RequestDeduplicationRequestState> {
+    ctx.plugin_state_opt_mut()
+        .and_then(|state| state.request_deduplication_states.remove(&instance_id))
+}
+
+/// Whether this instance still holds completion state for the request.
+#[inline]
+fn owns_request_state(ctx: &RequestContext, instance_id: u64) -> bool {
+    ctx.plugin_state().is_some_and(|state| {
+        state
+            .request_deduplication_states
+            .contains_key(&instance_id)
+    })
+}
+
 #[allow(dead_code)]
 pub(crate) fn set_request_state_for_test(
     plugin: &RequestDeduplication,
@@ -825,7 +847,7 @@ pub(crate) fn set_request_state_for_test(
     local_inflight_owner_token: &str,
     redis_lock_token: Option<&str>,
 ) {
-    ctx.request_deduplication_states.insert(
+    ctx.plugin_state_mut().request_deduplication_states.insert(
         plugin.instance_id,
         RequestDeduplicationRequestState {
             key: key.to_string(),
@@ -843,8 +865,9 @@ pub(crate) fn set_request_state_for_test(
 #[allow(dead_code)]
 pub(crate) fn logical_keys_from_request_context_for_test(ctx: &RequestContext) -> Vec<String> {
     let mut keys: Vec<String> = ctx
-        .request_deduplication_states
-        .values()
+        .plugin_state()
+        .into_iter()
+        .flat_map(|state| state.request_deduplication_states.values())
         .map(|state| state.key.clone())
         .collect();
     keys.sort();
@@ -1384,8 +1407,8 @@ impl RequestDeduplication {
         &self,
         ctx: &RequestContext,
     ) -> Option<(String, String)> {
-        ctx.request_deduplication_states
-            .get(&self.instance_id)
+        ctx.plugin_state()
+            .and_then(|state| state.request_deduplication_states.get(&self.instance_id))
             .map(|state| (state.key.clone(), state.fingerprint.clone()))
     }
 
@@ -2101,12 +2124,12 @@ impl RequestDeduplication {
     /// `EXTERNAL_OPERATION_COMPLETED_METADATA_KEY` in `src/plugins/mod.rs`.
     fn owns_completed_external_operation(&self, ctx: &RequestContext) -> bool {
         let key = super::EXTERNAL_OPERATION_COMPLETED_METADATA_KEY;
-        let owns_state = ctx
-            .request_deduplication_states
-            .contains_key(&self.instance_id);
-        let serverless_owner = ctx
-            .serverless_external_side_effect_owners
-            .contains(&self.instance_id);
+        let owns_state = owns_request_state(ctx, self.instance_id);
+        let serverless_owner = ctx.plugin_state().is_some_and(|state| {
+            state
+                .serverless_external_side_effect_owners
+                .contains(&self.instance_id)
+        });
         owns_state && (serverless_owner || ctx.metadata.contains_key(key))
     }
 
@@ -2121,16 +2144,16 @@ impl RequestDeduplication {
     async fn publish_external_operation_tombstone(&self, ctx: &mut RequestContext) {
         let external_key = super::EXTERNAL_OPERATION_COMPLETED_METADATA_KEY;
         let synthetic_key = crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY;
-        if !ctx
-            .request_deduplication_states
-            .contains_key(&self.instance_id)
-        {
+        if !owns_request_state(ctx, self.instance_id) {
             return;
         }
         // Consume only this instance's provenance; sibling instances publish
         // their own tombstones from their own hooks.
-        ctx.serverless_external_side_effect_owners
-            .remove(&self.instance_id);
+        if let Some(state) = ctx.plugin_state_opt_mut() {
+            state
+                .serverless_external_side_effect_owners
+                .remove(&self.instance_id);
+        }
         // The publication path must run instead of the retain-and-return
         // synthetic guard, so the synthetic marker is cleared around the call
         // and restored for any later hook that observes it.
@@ -2194,7 +2217,8 @@ impl RequestDeduplication {
         if !owns_external_operation {
             return;
         }
-        ctx.request_deduplication_states
+        ctx.plugin_state_mut()
+            .request_deduplication_states
             .insert(self.instance_id, state);
     }
 
@@ -3398,8 +3422,7 @@ impl Plugin for RequestDeduplication {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        ctx.request_deduplication_states
-            .contains_key(&self.instance_id)
+        owns_request_state(ctx, self.instance_id)
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -3732,7 +3755,7 @@ impl Plugin for RequestDeduplication {
         // Store completion state outside public metadata and key it by this
         // configured instance. Multiple instances may acquire independent keys
         // on the same request and must never consume one another's state.
-        ctx.request_deduplication_states.insert(
+        ctx.plugin_state_mut().request_deduplication_states.insert(
             self.instance_id,
             RequestDeduplicationRequestState {
                 key,
@@ -3785,7 +3808,7 @@ impl Plugin for RequestDeduplication {
             return;
         }
 
-        let Some(state) = ctx.request_deduplication_states.remove(&self.instance_id) else {
+        let Some(state) = take_request_state(ctx, self.instance_id) else {
             return;
         };
 
@@ -3811,10 +3834,11 @@ impl Plugin for RequestDeduplication {
         // empty 2xx, HEAD, and non-2xx responses) after body validators and
         // reject-path header hooks have settled the client response. Storage
         // still sanitizes per-request and credential-bearing headers.
-        if ctx
-            .serverless_external_side_effect_owners
-            .contains(&self.instance_id)
-        {
+        if ctx.plugin_state().is_some_and(|state| {
+            state
+                .serverless_external_side_effect_owners
+                .contains(&self.instance_id)
+        }) {
             return PluginResult::Continue;
         }
         // Publish a fixed-size execution barrier (rather than fail open) when
@@ -3844,7 +3868,7 @@ impl Plugin for RequestDeduplication {
         // Only cache if this instance acquired a completion state in
         // `before_proxy`. Take it before any await so a later hook cannot reuse
         // or consume it a second time.
-        let state = match ctx.request_deduplication_states.remove(&self.instance_id) {
+        let state = match take_request_state(ctx, self.instance_id) {
             Some(state) => state,
             None => return PluginResult::Continue,
         };
@@ -3895,7 +3919,7 @@ impl Plugin for RequestDeduplication {
                 // tombstone once every response decision is final. Both the
                 // local and Redis in-flight markers stay held until that
                 // publication (or `inflight_ttl` as the backstop).
-                ctx.request_deduplication_states.insert(
+                ctx.plugin_state_mut().request_deduplication_states.insert(
                     self.instance_id,
                     RequestDeduplicationRequestState {
                         key,
@@ -4201,11 +4225,12 @@ impl Plugin for RequestDeduplication {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) {
-        if ctx
-            .serverless_pre_invocation_rejection_owners
-            .remove(&self.instance_id)
-        {
-            let Some(state) = ctx.request_deduplication_states.remove(&self.instance_id) else {
+        if ctx.plugin_state_opt_mut().is_some_and(|state| {
+            state
+                .serverless_pre_invocation_rejection_owners
+                .remove(&self.instance_id)
+        }) {
+            let Some(state) = take_request_state(ctx, self.instance_id) else {
                 return;
             };
             self.remove_matching_local_inflight(
@@ -4219,10 +4244,11 @@ impl Plugin for RequestDeduplication {
             return;
         }
 
-        if ctx
-            .serverless_external_side_effect_owners
-            .remove(&self.instance_id)
-        {
+        if ctx.plugin_state_opt_mut().is_some_and(|state| {
+            state
+                .serverless_external_side_effect_owners
+                .remove(&self.instance_id)
+        }) {
             // Consume only this instance's provenance before reusing the ordinary
             // publication path. Other instances retain their ownership and publish
             // into their own caches when their committed hooks run.
@@ -4248,10 +4274,7 @@ impl Plugin for RequestDeduplication {
             // `execution_barrier_retention()` so the barrier outlives the lease
             // it replaces. A capacity or Redis rejection there still fails
             // closed on the retained in-flight markers.
-            if ctx
-                .request_deduplication_states
-                .contains_key(&self.instance_id)
-            {
+            if owns_request_state(ctx, self.instance_id) {
                 self.publish_external_operation_tombstone(ctx).await;
             }
             ctx.serverless_owned_dedup_publication = previous_publication_owner;
@@ -4289,7 +4312,7 @@ impl Plugin for RequestDeduplication {
 
         match ctx.backend_dispatch_state() {
             super::BackendDispatchState::PreWireFailure => {
-                let Some(state) = ctx.request_deduplication_states.remove(&self.instance_id) else {
+                let Some(state) = take_request_state(ctx, self.instance_id) else {
                     return;
                 };
                 self.remove_matching_local_inflight(
@@ -4335,7 +4358,7 @@ impl Plugin for RequestDeduplication {
                 .metadata
                 .contains_key(super::EXTERNAL_OPERATION_COMPLETED_METADATA_KEY)
         {
-            let Some(state) = ctx.request_deduplication_states.remove(&self.instance_id) else {
+            let Some(state) = take_request_state(ctx, self.instance_id) else {
                 return;
             };
             self.remove_matching_local_inflight(

@@ -74,6 +74,10 @@ All gRPC calls are authenticated with JWT HS256 tokens:
 - The DP sends its auth token in the gRPC metadata on every request
 - Both CP and DP use the same shared secret for JWT signing/verification
 
+The `iss` claim must be a single JSON string equal to
+`FERRUM_CP_DP_GRPC_JWT_ISSUER` (RFC 7519 §4.1.1); arrays and other non-string
+shapes are rejected even when they contain the expected issuer.
+
 For `ConfigSync.Subscribe`, the bearer token's `sub` must equal the request's
 `node_id` after trimming surrounding whitespace from `node_id`, as for native
 `MeshSubscribe`. Built-in DP token minting already sets `sub` to the DP node ID.
