@@ -807,9 +807,32 @@ jobs:
           port_forward_pid=$!
           trap 'kill "$port_forward_pid" 2>/dev/null || true; wait "$port_forward_pid" 2>/dev/null || true' EXIT
 
+          metric='ferrum_mesh_bpf_drops_total{reason="exclude_port_hit"}'
+
+          # Scrape once. Non-zero means the port-forward could not serve
+          # /metrics, which is a different failure from a counter that did not
+          # move and must never be reported as one.
+          scrape() {
+            curl -fsS --max-time 10 http://127.0.0.1:19450/metrics \
+              >"$1" 2>"$results/scrape.err"
+          }
+
+          read_metric() {
+            awk -v metric="$2" '$1 == metric { value = $2 } END { print value }' "$1"
+          }
+
+          # Greatest common divisor of every cumulative ferrum_mesh_bpf_*
+          # counter in one scrape (issue #5502): the replay factor a stalled
+          # ringbuf consumer multiplies the whole family by, or 1 on a healthy
+          # consumer. The always-1 gauges are excluded because they would pin
+          # the result at 1 and hide the rescale.
+          scrape_scale() {
+            awk 'function gcd(a, b,   t) { while (b) { t = a % b; a = b; b = t } return a } { series = $1; value = $2; if (series ~ /^ferrum_mesh_bpf_/ && value ~ /^[0-9]+$/ && series !~ /drop_reasons|ringbuf_overruns_total|ringbuf_in_overrun_regime/ && value > 0) { scale = (scale == "" ? value + 0 : gcd(scale, value + 0)) } } END { if (scale == "" || scale < 1) scale = 1; printf "%d\n", scale }' "$1"
+          }
+
           fetched=false
           for _ in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:19450/metrics >"$results/before.prom"; then
+            if scrape "$results/before.prom"; then
               fetched=true
               break
             fi
@@ -817,12 +840,12 @@ jobs:
           done
           if [[ "$fetched" != "true" ]]; then
             echo "failed to fetch same-node ambient metrics before the bypass" >&2
+            cat "$results/scrape.err" >&2 || true
             cat "$results/port-forward.log" >&2 || true
             exit 1
           fi
 
-          metric='ferrum_mesh_bpf_drops_total{reason="exclude_port_hit"}'
-          before="$(awk -v metric="$metric" '$1 == metric { value = $2 } END { print value }' "$results/before.prom")"
+          before="$(read_metric "$results/before.prom" "$metric")"
           if [[ ! "$before" =~ ^[0-9]+$ ]]; then
             echo "missing integer $metric baseline in ambient metrics" >&2
             grep 'ferrum_mesh_bpf_drops_total' "$results/before.prom" >&2 || true
