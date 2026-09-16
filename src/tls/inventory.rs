@@ -29,7 +29,6 @@ use crate::fips::approved::Sha256;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
-use x509_parser::extensions::{GeneralName, ParsedExtension};
 use x509_parser::prelude::*;
 
 use crate::config::EnvConfig;
@@ -914,40 +913,13 @@ fn populate_certificate_metadata(
 
     entry.subject = Some(parsed_leaf.subject().to_string());
     entry.issuer = Some(parsed_leaf.issuer().to_string());
-    entry.sans = certificate_sans(&parsed_leaf);
+    entry.sans = crate::tls::san::certificate_san_strings(&parsed_leaf);
     entry.not_before = DateTime::<Utc>::from_timestamp(not_before_ts, 0);
     entry.not_after = DateTime::<Utc>::from_timestamp(not_after_ts, 0);
     entry.days_until_expiry = Some((not_after_ts - now_ts) / 86_400);
     entry.fingerprint_sha256 = Some(hex::encode(Sha256::digest(leaf.as_ref())));
     entry.certificate_count = Some(certs.len());
     Ok(())
-}
-
-fn certificate_sans(cert: &X509Certificate<'_>) -> Vec<String> {
-    let mut sans = BTreeSet::new();
-    for extension in cert.extensions() {
-        let ParsedExtension::SubjectAlternativeName(san) = extension.parsed_extension() else {
-            continue;
-        };
-        for name in &san.general_names {
-            match name {
-                GeneralName::DNSName(value) => {
-                    sans.insert(format!("dns:{value}"));
-                }
-                GeneralName::IPAddress(value) => {
-                    sans.insert(format!("ip:{}", hex::encode(value)));
-                }
-                GeneralName::URI(value) => {
-                    sans.insert(format!("uri:{value}"));
-                }
-                GeneralName::RFC822Name(value) => {
-                    sans.insert(format!("email:{value}"));
-                }
-                _ => {}
-            }
-        }
-    }
-    sans.into_iter().collect()
 }
 
 fn validate_private_key(bytes: &crate::tls::source::SecretBytes) -> Result<(), String> {
