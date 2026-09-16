@@ -13,9 +13,13 @@
 //! [`BPF_SOCK_OPS_EVENTS_PIN_PATH`](crate::ebpf::BPF_SOCK_OPS_EVENTS_PIN_PATH)
 //! and runs [`run_pinned_consumer`] as a background task that:
 //!   1. Drives the kernel ringbuf with `tokio::io::unix::AsyncFd`, draining
-//!      every record the kernel has published on each wakeup — and nothing
+//!      the records the kernel has published on each wakeup — and nothing
 //!      past the producer position, which is what keeps a record from being
-//!      counted twice (see [`RingBufCursor`] and issue #5563).
+//!      counted twice (see [`RingBufCursor`] and issue #5563). Each wakeup
+//!      is bounded by [`RINGBUF_DRAIN_RECORD_BUDGET`]; a pass that hits the
+//!      budget retains ringbuf readiness instead of clearing it, so the
+//!      drain resumes immediately while the other `select!` arms still get
+//!      a turn.
 //!   2. Decodes each record via [`SockOpsEvent::from_record_bytes`] and
 //!      hands it to [`SockOpsConsumer::handle_event`].
 //!   3. Queues first-data SockHash removal behind a bounded grace period, so
@@ -418,22 +422,64 @@ pub trait RingBufCursor {
     fn with_next_record<R, F: FnOnce(&[u8]) -> R>(&mut self, f: F) -> Option<R>;
 }
 
-/// Drain every record the kernel has published, and not one byte more.
+/// Records one [`drain_outstanding_records`] call delivers before handing
+/// control back to its caller.
+///
+/// The drain shares a `tokio::select!` with the drop-reason poll, the
+/// first-byte cleanup sweep and the pin-inode check. Without a bound, a node
+/// producing events at or above the drain rate keeps the readable arm
+/// resident and those timers never get a turn — the same starvation that let
+/// the kernel per-CPU bypass counters go unread for a whole live-datapath
+/// window. 4096 records is ~128 KiB of a 4 MiB ring, so a completely full
+/// ring still drains in a bounded number of wakeups while every other arm
+/// runs between them.
+pub const RINGBUF_DRAIN_RECORD_BUDGET: u32 = 4096;
+
+/// What one bounded drain pass observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DrainOutcome {
+    /// Records handed to `on_record` during this call.
+    pub records: u32,
+    /// The per-wakeup budget stopped the pass while committed records were
+    /// still outstanding behind the producer. The caller must retain ringbuf
+    /// readiness (skip `clear_ready()`) so the drain resumes on the next
+    /// poll instead of waiting for a fresh producer commit.
+    pub budget_exhausted: bool,
+    /// The kernel position pair could not describe this ring: the consumer
+    /// position ran past the producer, or is stale by more than a whole
+    /// ring. Nothing can be drained from it and the kernel drops every
+    /// record it tries to reserve, so the ring has to be re-attached.
+    pub needs_resynchronize: bool,
+}
+
+/// Drain the records the kernel has published, and not one byte more, up to
+/// `record_budget` records.
 ///
 /// Each pass takes a producer snapshot and consumes records while the
 /// cursor's committed consumer position is still behind it; a pass that
 /// made progress re-snapshots, because the producer may have published more
-/// while the pass ran and a ringbuf wakeup only fires on commit. Returns the
-/// number of records handed to `on_record`.
+/// while the pass ran and a ringbuf wakeup only fires on commit.
 ///
 /// The bound is what gives the exactly-once contract: a record can only be
 /// delivered while the consumer position is behind the producer, and taking
 /// it advances that position past the record.
-pub fn drain_outstanding_records<C, F>(cursor: &mut C, ring_bytes: u64, mut on_record: F) -> u32
+///
+/// `record_budget` bounds one call rather than the ring: hitting it reports
+/// [`DrainOutcome::budget_exhausted`] with the consumer position committed
+/// exactly where the pass stopped, so the next call resumes from there. A
+/// budget of `0` is raised to `1` — a drain that can never take a record
+/// would spin the caller's readiness loop forever.
+pub fn drain_outstanding_records<C, F>(
+    cursor: &mut C,
+    ring_bytes: u64,
+    record_budget: u32,
+    mut on_record: F,
+) -> DrainOutcome
 where
     C: RingBufCursor,
     F: FnMut(&[u8]),
 {
+    let budget = record_budget.max(1);
     let mut records: u32 = 0;
     loop {
         let producer_pos = cursor.producer_position();
@@ -441,21 +487,45 @@ where
         loop {
             let consumer_pos = cursor.consumer_position();
             match ringbuf_outstanding_bytes(producer_pos, consumer_pos, ring_bytes) {
-                // Caught up with this snapshot, or a position pair that is
-                // not resumable — either way, stop walking the ring.
-                Some(0) | None => break,
+                // Caught up with this snapshot — stop walking the ring.
+                Some(0) => break,
+                // Not a position pair this consumer may resume from. Report
+                // it so the caller can re-attach; walking on would hand out
+                // bytes the producer never published.
+                None => {
+                    return DrainOutcome {
+                        records,
+                        budget_exhausted: false,
+                        needs_resynchronize: true,
+                    };
+                }
                 Some(_) => {}
+            }
+            if records >= budget {
+                return DrainOutcome {
+                    records,
+                    budget_exhausted: true,
+                    needs_resynchronize: false,
+                };
             }
             if cursor.with_next_record(&mut on_record).is_none() {
                 // The next record is still uncommitted. The producer's commit
                 // delivers the wakeup that resumes this drain.
-                return records;
+                return DrainOutcome {
+                    records,
+                    budget_exhausted: false,
+                    needs_resynchronize: false,
+                };
             }
             records = records.saturating_add(1);
             made_progress = true;
         }
         if !made_progress {
-            return records;
+            return DrainOutcome {
+                records,
+                budget_exhausted: false,
+                needs_resynchronize: false,
+            };
         }
     }
 }
@@ -488,9 +558,10 @@ pub mod production {
     use tracing::{debug, info, warn};
 
     use super::{
-        BPF_DROP_REASON_COUNT, BPF_DROP_REASON_STATS_SLOTS, PollOutcome, RingBufAttach,
-        RingBufCursor, SOCK_OPS_RECOVERY_THRESHOLD, SockOpsConsumer, SockOpsEvent,
-        drain_outstanding_records, drop_reason_delta, ringbuf_attach, seed_dropped_baseline,
+        BPF_DROP_REASON_COUNT, BPF_DROP_REASON_STATS_SLOTS, PollOutcome,
+        RINGBUF_DRAIN_RECORD_BUDGET, RingBufAttach, RingBufCursor, SOCK_OPS_RECOVERY_THRESHOLD,
+        SockOpsConsumer, SockOpsEvent, drain_outstanding_records, drop_reason_delta, ringbuf_attach,
+        seed_dropped_baseline,
     };
     use crate::ebpf::{
         BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH, BPF_SOCK_OPS_EVENTS_PIN_PATH,
@@ -499,6 +570,15 @@ pub mod production {
 
     static MALFORMED_SOCK_OPS_RECORD_WARNED: AtomicBool = AtomicBool::new(false);
     static DROP_REASON_STATS_READ_WARNED: AtomicBool = AtomicBool::new(false);
+    // `wait_for_pinned_maps` retries forever at a 30s cap, and every refusal
+    // `attach_events_ring` can raise is a static property of the pinned map:
+    // the map info cannot be read, its size is not a non-zero power of two,
+    // or its metadata pages cannot be mapped. Without a once-guard each of
+    // those emits a warn every 30s for the life of the pod.
+    static RINGBUF_INFO_READ_WARNED: AtomicBool = AtomicBool::new(false);
+    static RINGBUF_SIZE_WARNED: AtomicBool = AtomicBool::new(false);
+    static RINGBUF_POSITION_PAGES_WARNED: AtomicBool = AtomicBool::new(false);
+    static RINGBUF_RUNTIME_RESYNC_WARNED: AtomicBool = AtomicBool::new(false);
     const FIRST_BYTE_HOOK_REMOVAL_GRACE: Duration = Duration::from_millis(250);
     const FIRST_BYTE_HOOK_CLEANUP_INTERVAL: Duration = Duration::from_millis(50);
     const FIRST_BYTE_HOOK_REMOVAL_QUEUE_CAP: usize = ACCEPT_FIRST_BYTE_MAP_MAX_ENTRIES as usize;
@@ -583,6 +663,12 @@ pub mod production {
         drop_reason_refresh.tick().await; // consume the immediate first tick
 
         loop {
+            // Why the ringbuf has to be re-opened, if it does. Both reasons
+            // need the identical repair `attach_events_ring` performs — the
+            // consumer page is republished BEFORE aya adopts it, because
+            // `RingBuf::new` caches that word and a later write to the page
+            // alone would leave aya's own cursor stale-ahead.
+            let mut reopen_reason: Option<&'static str> = None;
             tokio::select! {
                 changed = shutdown_rx.changed() => {
                     if changed.is_err() || *shutdown_rx.borrow() {
@@ -599,51 +685,7 @@ pub mod production {
                             pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
                             "SOCK_OPS pin inode changed (likely node-agent restart); re-opening ringbuf"
                         );
-                        // Drop the old async_fd / ring_buf / stats by
-                        // returning from the inner loop body and letting
-                        // the outer logic re-open. Easiest path: just
-                        // recurse via tail-call into a fresh consumer run.
-                        // We instead loop locally: drop old handles and
-                        // attempt re-open with the same retry/backoff
-                        // contract used at startup.
-                        drop(async_fd);
-                        drop(ring_buf);
-                        drop(stats);
-                        drop(first_byte_sockets);
-                        pending_first_byte_removals.clear();
-                        match wait_for_pinned_maps(&mut shutdown_rx).await {
-                            WaitOutcome::Found((new_rb, new_stats, new_first_byte_sockets)) => {
-                                ring_buf = new_rb;
-                                stats = new_stats;
-                                first_byte_sockets = new_first_byte_sockets;
-                                let new_fd = ring_buf.as_raw_fd();
-                                async_fd = AsyncFd::with_interest(
-                                    RingBufFd(new_fd),
-                                    Interest::READABLE,
-                                )
-                                .map_err(|e| anyhow::anyhow!(
-                                    "Failed to re-wrap SOCK_OPS ringbuf fd in AsyncFd: {e}"
-                                ))?;
-                                last_dropped_total = seed_dropped_baseline(
-                                    &consumer,
-                                    read_dropped_total(&stats),
-                                );
-                                last_drop_totals = read_drop_reason_totals(&stats);
-                                consecutive_drained = 0;
-                                events_inode = pin_inode(BPF_SOCK_OPS_EVENTS_PIN_PATH);
-                                info!(
-                                    pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
-                                    inode = events_inode,
-                                    initial_dropped_total = last_dropped_total,
-                                    "SOCK_OPS ringbuf consumer re-attached after pin rotation"
-                                );
-                            }
-                            WaitOutcome::Shutdown => {
-                                info!("SOCK_OPS ringbuf consumer shutting down during pin re-open");
-                                return Ok(());
-                            }
-                        }
-                        continue;
+                        reopen_reason = Some("pin rotation");
                     }
                 }
                 _ = first_byte_cleanup.tick() => {
@@ -658,7 +700,7 @@ pub mod production {
                 }
                 guard = async_fd.readable() => {
                     let mut guard = guard.map_err(|e| anyhow::anyhow!("SOCK_OPS AsyncFd readable failed: {e}"))?;
-                    let events_handled = drain_ringbuf(
+                    let drain = drain_ringbuf(
                         &mut ring_buf,
                         &mut pending_first_byte_removals,
                         &consumer,
@@ -676,7 +718,7 @@ pub mod production {
                         // artifacts in a row would clear the overrun regime
                         // even while the kernel is still dropping events on
                         // another CPU.
-                        PollOutcome::Drained { events: events_handled }
+                        PollOutcome::Drained { events: drain.events }
                     };
                     consumer.observe_poll(
                         outcome,
@@ -684,7 +726,64 @@ pub mod production {
                         SOCK_OPS_RECOVERY_THRESHOLD,
                     );
 
-                    guard.clear_ready();
+                    // A pass stopped by the per-wakeup budget deliberately
+                    // KEEPS readiness: clearing it would park this arm until
+                    // the producer commits again even though committed
+                    // records are still outstanding. Retaining it re-polls
+                    // the select immediately, so the drain resumes while the
+                    // drop-reason poll, the first-byte cleanup and the inode
+                    // check each get their turn (issue #5563).
+                    if !drain.budget_exhausted {
+                        guard.clear_ready();
+                    }
+
+                    if drain.needs_resynchronize {
+                        reopen_reason = Some("ringbuf resynchronization");
+                    }
+                }
+            }
+
+            let Some(reason) = reopen_reason else {
+                continue;
+            };
+
+            // Drop the old handles before re-opening so the pin is re-read
+            // with the same retry/backoff contract used at startup. The
+            // AsyncFd goes first: it must deregister the fd while the
+            // RingBuf that owns it is still alive.
+            drop(async_fd);
+            drop(ring_buf);
+            drop(stats);
+            drop(first_byte_sockets);
+            pending_first_byte_removals.clear();
+            match wait_for_pinned_maps(&mut shutdown_rx).await {
+                WaitOutcome::Found((new_rb, new_stats, new_first_byte_sockets)) => {
+                    ring_buf = new_rb;
+                    stats = new_stats;
+                    first_byte_sockets = new_first_byte_sockets;
+                    let new_fd = ring_buf.as_raw_fd();
+                    async_fd = AsyncFd::with_interest(RingBufFd(new_fd), Interest::READABLE)
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to re-wrap SOCK_OPS ringbuf fd in AsyncFd: {e}")
+                        })?;
+                    last_dropped_total =
+                        seed_dropped_baseline(&consumer, read_dropped_total(&stats));
+                    last_drop_totals = read_drop_reason_totals(&stats);
+                    consecutive_drained = 0;
+                    events_inode = pin_inode(BPF_SOCK_OPS_EVENTS_PIN_PATH);
+                    info!(
+                        pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
+                        inode = events_inode,
+                        initial_dropped_total = last_dropped_total,
+                        reason,
+                        producer_pos = ring_buf.producer_position(),
+                        consumer_pos = ring_buf.consumer_position(),
+                        "SOCK_OPS ringbuf consumer re-attached"
+                    );
+                }
+                WaitOutcome::Shutdown => {
+                    info!("SOCK_OPS ringbuf consumer shutting down during pin re-open");
+                    return Ok(());
                 }
             }
         }
@@ -738,6 +837,15 @@ pub mod production {
             let Ok(offset) = libc::off_t::try_from(offset) else {
                 return Err(io::Error::other("ringbuf page offset does not fit off_t"));
             };
+            // `position()` reads the first machine word of the mapping, so a
+            // shorter mapping would make that read out of bounds. Both call
+            // sites pass `page_size()`, but enforce the precondition here
+            // rather than leaving it to construction.
+            if len < std::mem::size_of::<AtomicUsize>() {
+                return Err(io::Error::other(
+                    "ringbuf metadata page is shorter than one position word",
+                ));
+            }
             // SAFETY: `fd` is a live BPF ringbuf map fd, and `offset`/`len`
             // are the page-aligned metadata extents the kernel defines for
             // that map type. A failed mapping is reported as MAP_FAILED.
@@ -763,8 +871,9 @@ pub mod production {
         /// The position word the kernel publishes at the head of the page.
         fn position(&self) -> &AtomicUsize {
             // SAFETY: both ringbuf metadata pages begin with one
-            // naturally-aligned `unsigned long` position word, and the
-            // mapping is at least a page long and outlives the borrow.
+            // naturally-aligned `unsigned long` position word; `map`
+            // refuses any length shorter than that word, and the mapping
+            // outlives the borrow.
             unsafe { self.ptr.cast::<AtomicUsize>().as_ref() }
         }
     }
@@ -867,32 +976,62 @@ pub mod production {
         let ring_bytes = match events_map.info() {
             Ok(info) => u64::from(info.max_entries()),
             Err(e) => {
-                warn!(
-                    pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
-                    error = %e,
-                    "Failed to read pinned SOCK_OPS ringbuf size; refusing to attach consumer"
-                );
+                if !RINGBUF_INFO_READ_WARNED.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
+                        error = %e,
+                        "Failed to read pinned SOCK_OPS ringbuf size; refusing to attach \
+                         consumer. Suppressing repeated warnings: the attach loop retries \
+                         forever and this condition is static."
+                    );
+                } else {
+                    debug!(
+                        pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
+                        error = %e,
+                        "Failed to read pinned SOCK_OPS ringbuf size"
+                    );
+                }
                 return None;
             }
         };
         if ring_bytes == 0 || !ring_bytes.is_power_of_two() {
-            warn!(
-                pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
-                ring_bytes,
-                "Pinned SOCK_OPS ringbuf size is not a non-zero power of two; refusing to attach \
-                 consumer because the drain bound cannot be trusted"
-            );
+            if !RINGBUF_SIZE_WARNED.swap(true, Ordering::Relaxed) {
+                warn!(
+                    pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
+                    ring_bytes,
+                    "Pinned SOCK_OPS ringbuf size is not a non-zero power of two; refusing to \
+                     attach consumer because the drain bound cannot be trusted. Suppressing \
+                     repeated warnings: the attach loop retries forever and this condition is \
+                     static."
+                );
+            } else {
+                debug!(
+                    pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
+                    ring_bytes,
+                    "Pinned SOCK_OPS ringbuf size is not a non-zero power of two"
+                );
+            }
             return None;
         }
 
         let positions = match RingBufPositions::open(events_map.fd().as_fd()) {
             Ok(positions) => positions,
             Err(e) => {
-                warn!(
-                    pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
-                    error = %e,
-                    "Failed to map SOCK_OPS ringbuf position pages; refusing to attach consumer"
-                );
+                if !RINGBUF_POSITION_PAGES_WARNED.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
+                        error = %e,
+                        "Failed to map SOCK_OPS ringbuf position pages; refusing to attach \
+                         consumer. Suppressing repeated warnings: the attach loop retries \
+                         forever and this condition is static."
+                    );
+                } else {
+                    debug!(
+                        pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
+                        error = %e,
+                        "Failed to map SOCK_OPS ringbuf position pages"
+                    );
+                }
                 return None;
             }
         };
@@ -1092,11 +1231,24 @@ pub mod production {
         Some((ring_buf, stats, first_byte_sockets))
     }
 
-    /// Drain pending ringbuf items and return the count of valid events
-    /// dispatched. Counter is critical for the recovery state machine —
-    /// a spurious wakeup with zero events must NOT advance
-    /// `consecutive_drained` (which would falsely trigger recovery while
-    /// the kernel is still dropping events on another CPU).
+    /// What one bounded `drain_ringbuf` wakeup produced.
+    struct RingBufDrain {
+        /// Valid decoded events dispatched to the consumer. Critical for the
+        /// recovery state machine — a spurious wakeup with zero events must
+        /// NOT advance `consecutive_drained` (which would falsely trigger
+        /// recovery while the kernel is still dropping events on another
+        /// CPU).
+        events: u32,
+        /// The per-wakeup budget stopped the pass with records still
+        /// outstanding, so the caller must retain ringbuf readiness.
+        budget_exhausted: bool,
+        /// The kernel position pair is not one this consumer can resume
+        /// from, so the ring has to be re-attached.
+        needs_resynchronize: bool,
+    }
+
+    /// Drain pending ringbuf items, bounded by
+    /// [`RINGBUF_DRAIN_RECORD_BUDGET`] records per wakeup.
     ///
     /// The walk is bounded by the kernel producer position rather than by
     /// aya deciding the ring looks empty; see [`drain_outstanding_records`].
@@ -1104,46 +1256,123 @@ pub mod production {
         ring_buf: &mut PinnedRingBuf,
         pending_first_byte_removals: &mut VecDeque<(Instant, u64)>,
         consumer: &SockOpsConsumer,
-    ) -> u32 {
+    ) -> RingBufDrain {
         let ring_bytes = ring_buf.ring_bytes();
         let mut events_handled: u32 = 0;
-        drain_outstanding_records(ring_buf, ring_bytes, |bytes: &[u8]| {
-            if bytes.len() < std::mem::size_of::<SockOpsRecord>() {
-                log_malformed_sock_ops_record(
-                    "short_read",
-                    std::mem::size_of::<SockOpsRecord>(),
-                    bytes.len(),
-                );
-                return;
-            }
-            match SockOpsEvent::from_record_bytes(bytes) {
-                Some(event) => {
-                    if let SockOpsEvent::AcceptToFirstByteLatency { socket_cookie, .. } = event {
-                        // Ringbuf submission happens inside the stream parser,
-                        // so readiness does not prove that the parser and its
-                        // paired verdict have returned. Deleting immediately
-                        // can race the socket callback's read-side lock. Queue
-                        // removal behind a bounded grace period; correlation
-                        // state was already consumed in-kernel, so no duplicate
-                        // sample can be emitted while the hook remains attached.
-                        queue_first_byte_removal(
-                            pending_first_byte_removals,
-                            socket_cookie,
-                            Instant::now(),
-                        );
-                    }
-                    consumer.handle_event(event);
+        let outcome = drain_outstanding_records(
+            ring_buf,
+            ring_bytes,
+            RINGBUF_DRAIN_RECORD_BUDGET,
+            |bytes: &[u8]| {
+                if handle_ringbuf_record(bytes, pending_first_byte_removals, consumer) {
                     events_handled = events_handled.saturating_add(1);
                 }
-                None => {
-                    // Unknown discriminant. Log once at warn level and
-                    // suppress repeats; high-volume malformed records are
-                    // otherwise able to starve the admin health path.
-                    log_malformed_sock_ops_record("unknown_discriminant", bytes.len(), bytes.len());
+            },
+        );
+        if outcome.needs_resynchronize {
+            log_ringbuf_runtime_resynchronization(
+                ring_buf.producer_position(),
+                ring_buf.consumer_position(),
+                ring_bytes,
+            );
+        }
+        RingBufDrain {
+            events: events_handled,
+            budget_exhausted: outcome.budget_exhausted,
+            needs_resynchronize: outcome.needs_resynchronize,
+        }
+    }
+
+    /// Decode one ringbuf record and dispatch it. Returns `true` when a
+    /// valid event reached the consumer; a malformed record is logged and
+    /// still counts as a consumed ringbuf slot, never as an event.
+    fn handle_ringbuf_record(
+        bytes: &[u8],
+        pending_first_byte_removals: &mut VecDeque<(Instant, u64)>,
+        consumer: &SockOpsConsumer,
+    ) -> bool {
+        if bytes.len() < std::mem::size_of::<SockOpsRecord>() {
+            log_malformed_sock_ops_record(
+                "short_read",
+                std::mem::size_of::<SockOpsRecord>(),
+                bytes.len(),
+            );
+            return false;
+        }
+        match SockOpsEvent::from_record_bytes(bytes) {
+            Some(event) => {
+                if let SockOpsEvent::AcceptToFirstByteLatency { socket_cookie, .. } = event {
+                    // Ringbuf submission happens inside the stream parser,
+                    // so readiness does not prove that the parser and its
+                    // paired verdict have returned. Deleting immediately
+                    // can race the socket callback's read-side lock. Queue
+                    // removal behind a bounded grace period; correlation
+                    // state was already consumed in-kernel, so no duplicate
+                    // sample can be emitted while the hook remains attached.
+                    queue_first_byte_removal(
+                        pending_first_byte_removals,
+                        socket_cookie,
+                        Instant::now(),
+                    );
                 }
+                consumer.handle_event(event);
+                true
             }
-        });
-        events_handled
+            None => {
+                // Unknown discriminant. Log once at warn level and suppress
+                // repeats; high-volume malformed records are otherwise able
+                // to starve the admin health path.
+                log_malformed_sock_ops_record("unknown_discriminant", bytes.len(), bytes.len());
+                false
+            }
+        }
+    }
+
+    /// Warn once that a live ring presented a consumer position this
+    /// consumer cannot resume from.
+    ///
+    /// `attach_events_ring` repairs this at attach and at pin rotation, but
+    /// nothing repaired it mid-run: the drain simply stopped, reported
+    /// `Drained { events: 0 }`, and the pod silently stopped receiving every
+    /// ringbuf-sourced metric because the 30s inode check never fires on a
+    /// pin that did not rotate. aya's `next()` loops internally over
+    /// discarded records without consulting the producer snapshot, so a
+    /// discard adjacent to the producer position is enough to advance its
+    /// cursor past it.
+    ///
+    /// Republishing the producer position onto the consumer page is NOT
+    /// sufficient on its own: aya caches that word in `ConsumerPos` when the
+    /// `RingBuf` is constructed and writes `cached + len` back on every
+    /// commit, so a page-only write would be undone by the next record and
+    /// meanwhile hand out bytes the producer never published. The repair
+    /// therefore runs through a full re-attach, where `attach_events_ring`
+    /// republishes the position BEFORE `RingBuf::new` adopts it.
+    fn log_ringbuf_runtime_resynchronization(
+        producer_pos: u64,
+        consumer_pos: u64,
+        ring_bytes: u64,
+    ) {
+        if !RINGBUF_RUNTIME_RESYNC_WARNED.swap(true, Ordering::Relaxed) {
+            warn!(
+                pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
+                producer_pos,
+                consumer_pos,
+                ring_bytes,
+                "Live SOCK_OPS ringbuf presented a consumer position that cannot be resumed \
+                 from; re-attaching to resynchronize it to the producer position. While the \
+                 consumer position is ahead of the producer the kernel drops every record it \
+                 tries to reserve, so the ring delivers nothing until this is repaired. \
+                 Suppressing repeated warnings."
+            );
+        } else {
+            debug!(
+                pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
+                producer_pos,
+                consumer_pos,
+                ring_bytes,
+                "Live SOCK_OPS ringbuf consumer position is not resumable; re-attaching"
+            );
+        }
     }
 
     fn queue_first_byte_removal(

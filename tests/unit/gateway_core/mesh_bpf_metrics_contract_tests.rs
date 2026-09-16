@@ -22,9 +22,10 @@ use ferrum_edge::ebpf::bpf_metrics::{
     bpf_latency_exclusive_bucket_index,
 };
 use ferrum_edge::ebpf::event_consumer::{
-    BPF_DROP_REASON_COUNT, BPF_DROP_REASON_STATS_SLOTS, PollOutcome, RingBufAttach, RingBufCursor,
-    SockOpsConsumer, SockOpsEvent, drain_outstanding_records, drop_reason_delta, ringbuf_attach,
-    ringbuf_outstanding_bytes, seed_dropped_baseline,
+    BPF_DROP_REASON_COUNT, BPF_DROP_REASON_STATS_SLOTS, DrainOutcome, PollOutcome,
+    RINGBUF_DRAIN_RECORD_BUDGET, RingBufAttach, RingBufCursor, SockOpsConsumer, SockOpsEvent,
+    drain_outstanding_records, drop_reason_delta, ringbuf_attach, ringbuf_outstanding_bytes,
+    seed_dropped_baseline,
 };
 use ferrum_edge::plugins::mesh::bpf_metrics::MeshBpfMetrics;
 use serde_json::json;
@@ -858,12 +859,27 @@ fn resume(outstanding_bytes: u64) -> RingBufAttach {
     RingBufAttach::Resume { outstanding_bytes }
 }
 
+/// Drain with an explicit per-wakeup record budget.
+fn drain_with_budget(
+    ring: &mut ReplayingRingBuf,
+    budget: u32,
+    on_record: impl FnMut(&[u8]),
+) -> DrainOutcome {
+    drain_outstanding_records(ring, FAKE_RING_BYTES, budget, on_record)
+}
+
+/// Drain with the production per-wakeup record budget.
+fn drain_all(ring: &mut ReplayingRingBuf, on_record: impl FnMut(&[u8])) -> DrainOutcome {
+    drain_with_budget(ring, RINGBUF_DRAIN_RECORD_BUDGET, on_record)
+}
+
 fn drain_into(ring: &mut ReplayingRingBuf, consumer: &SockOpsConsumer) -> u32 {
-    drain_outstanding_records(ring, FAKE_RING_BYTES, |bytes: &[u8]| {
+    let outcome = drain_all(ring, |bytes: &[u8]| {
         if let Some(event) = SockOpsEvent::from_record_bytes(bytes) {
             consumer.handle_event(event);
         }
-    })
+    });
+    outcome.records
 }
 
 #[test]
@@ -975,11 +991,11 @@ fn a_pass_re_reads_the_producer_position_after_making_progress() {
     ring.publish_after_take = Some((1, 2));
     let mut seen = 0u32;
 
-    let drained = drain_outstanding_records(&mut ring, FAKE_RING_BYTES, |_bytes: &[u8]| {
+    let drained = drain_all(&mut ring, |_bytes: &[u8]| {
         seen += 1;
     });
 
-    assert_eq!(drained, 4, "late records drain in the same wakeup");
+    assert_eq!(drained.records, 4, "late records drain in the same wakeup");
     assert_eq!(seen, 4);
     assert_eq!(ring.consumer_position(), ring.producer_position());
 }
@@ -992,13 +1008,14 @@ fn an_uncommitted_record_halts_the_pass_and_the_next_drain_resumes() {
     let mut ring = ReplayingRingBuf::with_resident(64, resident);
     ring.busy_at = Some(64 + FAKE_RECORD_STRIDE * 2);
 
-    let drained = drain_outstanding_records(&mut ring, FAKE_RING_BYTES, |_bytes: &[u8]| {});
-    assert_eq!(drained, 2, "the pass stops at the uncommitted record");
+    let drained = drain_all(&mut ring, |_bytes: &[u8]| {});
+    assert_eq!(drained.records, 2, "the pass stops at the uncommitted record");
+    assert!(!drained.budget_exhausted);
     assert_eq!(ring.consumer_position(), 64 + FAKE_RECORD_STRIDE * 2);
 
     ring.busy_at = None;
-    let drained = drain_outstanding_records(&mut ring, FAKE_RING_BYTES, |_bytes: &[u8]| {});
-    assert_eq!(drained, 2, "the rest drains once the producer commits");
+    let drained = drain_all(&mut ring, |_bytes: &[u8]| {});
+    assert_eq!(drained.records, 2, "the rest drains once the producer commits");
     assert_eq!(ring.delivered.len(), 4, "and nothing was delivered twice");
 }
 
@@ -1026,4 +1043,109 @@ fn a_consumer_position_past_the_producer_drains_nothing() {
         RingBufAttach::Resynchronize,
         "attach must republish the producer position to un-wedge the ring"
     );
+}
+
+/// The drain shares a `tokio::select!` with the drop-reason poll, the
+/// first-byte cleanup sweep and the pin-inode check. A node producing events
+/// at or above the drain rate would otherwise keep the readable arm resident
+/// forever, which is exactly how the kernel per-CPU bypass counters went
+/// unread for a whole live-datapath window. The budget caps one wakeup and
+/// the next one resumes from the committed consumer position.
+#[test]
+fn a_drain_pass_stops_at_its_budget_and_the_next_one_resumes() {
+    let resident: Vec<Vec<u8>> = (1..=4).map(rtt_record_bytes).collect();
+    let mut ring = ReplayingRingBuf::with_resident(4_096, resident.clone());
+
+    let first = drain_with_budget(&mut ring, 2, |_bytes: &[u8]| {});
+    assert_eq!(first.records, 2, "the budget stops the pass");
+    assert!(
+        first.budget_exhausted,
+        "the caller must retain ringbuf readiness"
+    );
+    assert!(!first.needs_resynchronize);
+    assert_eq!(ring.consumer_position(), 4_096 + FAKE_RECORD_STRIDE * 2);
+
+    let second = drain_with_budget(&mut ring, 2, |_bytes: &[u8]| {});
+    assert_eq!(second.records, 2, "the next drain resumes where it stopped");
+    assert!(
+        !second.budget_exhausted,
+        "the ring is caught up, so readiness may be cleared"
+    );
+    assert_eq!(ring.delivered, resident, "delivered once, in ring order");
+    assert_eq!(ring.consumer_position(), ring.producer_position());
+
+    // A budget that exactly covers the backlog must not claim exhaustion:
+    // nothing is left behind the producer to come back for.
+    ring.publish(2);
+    let exact = drain_with_budget(&mut ring, 2, |_bytes: &[u8]| {});
+    assert_eq!(exact.records, 2);
+    assert!(!exact.budget_exhausted);
+}
+
+/// A budget of zero would let the caller spin on a drain that can never take
+/// a record, so it is raised to one.
+#[test]
+fn a_zero_record_budget_still_makes_forward_progress() {
+    let resident: Vec<Vec<u8>> = (1..=2).map(rtt_record_bytes).collect();
+    let mut ring = ReplayingRingBuf::with_resident(0, resident);
+
+    let outcome = drain_with_budget(&mut ring, 0, |_bytes: &[u8]| {});
+
+    assert_eq!(outcome.records, 1);
+    assert!(outcome.budget_exhausted);
+    assert_eq!(ring.consumer_position(), FAKE_RECORD_STRIDE);
+}
+
+/// `attach_events_ring` repairs an unusable consumer position at attach and
+/// at pin rotation, but a ring that reaches that state mid-run used to stall
+/// silently: the drain stopped, `Drained { events: 0 }` was recorded, and the
+/// 30s inode check never fired because the pin did not rotate. The drain now
+/// reports the condition so the consumer can re-attach through that same
+/// repair.
+#[test]
+fn a_live_ring_that_runs_past_the_producer_asks_to_be_resynchronized() {
+    let resident: Vec<Vec<u8>> = (1..=4).map(rtt_record_bytes).collect();
+    let mut ring = ReplayingRingBuf::with_resident(0, resident);
+    ring.consumer_pos = ring.producer_pos + FAKE_RECORD_STRIDE;
+
+    let outcome = drain_all(&mut ring, |_bytes: &[u8]| {});
+
+    assert_eq!(outcome.records, 0);
+    assert!(!outcome.budget_exhausted);
+    assert!(
+        outcome.needs_resynchronize,
+        "a position the ring cannot describe must not read as a quiet wakeup"
+    );
+    assert!(ring.delivered.is_empty());
+    assert_eq!(
+        ringbuf_attach(
+            ring.producer_position(),
+            ring.consumer_position(),
+            FAKE_RING_BYTES
+        ),
+        RingBufAttach::Resynchronize,
+        "the re-attach path classifies the same pair the drain reported"
+    );
+}
+
+/// A ring that is merely caught up, or that stops on an uncommitted record,
+/// is an ordinary quiet wakeup and must never trigger a re-attach.
+#[test]
+fn an_ordinary_drain_never_asks_to_be_resynchronized() {
+    let resident: Vec<Vec<u8>> = (1..=3).map(rtt_record_bytes).collect();
+    let mut ring = ReplayingRingBuf::with_resident(512, resident);
+    ring.busy_at = Some(512 + FAKE_RECORD_STRIDE);
+
+    let halted = drain_all(&mut ring, |_bytes: &[u8]| {});
+    assert_eq!(halted.records, 1);
+    assert!(!halted.needs_resynchronize);
+
+    ring.busy_at = None;
+    let rest = drain_all(&mut ring, |_bytes: &[u8]| {});
+    assert_eq!(rest.records, 2);
+    assert!(!rest.needs_resynchronize);
+
+    let quiet = drain_all(&mut ring, |_bytes: &[u8]| {});
+    assert_eq!(quiet.records, 0);
+    assert!(!quiet.needs_resynchronize);
 }
