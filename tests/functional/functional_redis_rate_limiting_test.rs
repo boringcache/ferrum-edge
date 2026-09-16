@@ -1048,98 +1048,147 @@ async fn test_rate_limiting_redis_centralized() {
     println!("test_rate_limiting_redis_centralized PASSED");
 }
 
-/// Both routes receive sustained excess traffic. Redis must retain the local
-/// token-bucket burst/refill behavior and never charge rejected attempts.
+/// Issue #5517: sustained excess traffic must keep being throttled at the
+/// configured rate instead of locking the client out until it stops trying.
+///
+/// The Redis admission script charges a window only for an admitted request, so
+/// a one-second budget behaves exactly like the in-memory token bucket of the
+/// `local` route driven side by side with it.
 #[tokio::test]
 #[ignore]
 async fn test_rate_limiting_redis_sustained_load_matches_local() {
     if !redis_is_available().await {
         return;
     }
-    for (window_seconds, minute_limit) in [(1, 100), (1, 12), (6, 100)] {
-        let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
-            .await
-            .unwrap();
-        let backend_port = listener.local_addr().unwrap().port();
-        let backend = start_header_echo_backend_on(listener).await.unwrap();
-        let prefix = format!("ferrum:test:sustained:{}", Uuid::new_v4().simple());
-        let mut config = json!({
-            "version": "1", "proxies": [], "consumers": [], "plugin_configs": []
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
+    let backend_port = listener.local_addr().unwrap().port();
+    let backend = start_header_echo_backend_on(listener).await.unwrap();
+    let prefix = format!("ferrum:test:sustained:{}", Uuid::new_v4().simple());
+    let mut config = json!({
+        "version": "1", "proxies": [], "consumers": [], "plugin_configs": []
+    });
+    for mode in ["local", "redis"] {
+        config["proxies"].as_array_mut().unwrap().push(json!({
+            "id": mode, "listen_path": format!("/{mode}"),
+            "backend_scheme": "http", "backend_host": "127.0.0.1",
+            "backend_port": backend_port, "strip_listen_path": true,
+            "plugins": [{"plugin_config_id": mode}]
+        }));
+        let mut policy = json!({
+            "expose_headers": true, "sync_mode": mode,
+            "limits": [{"scope": "default", "window_seconds": 1, "max_requests": 5}]
         });
-        for mode in ["local", "redis"] {
-            config["proxies"].as_array_mut().unwrap().push(json!({
-                "id": mode, "listen_path": format!("/{mode}"),
-                "backend_scheme": "http", "backend_host": "127.0.0.1",
-                "backend_port": backend_port, "strip_listen_path": true,
-                "plugins": [{"plugin_config_id": mode}]
-            }));
-            let mut policy = json!({
-                "expose_headers": true, "sync_mode": mode,
-                "limits": [{
-                    "scope": "default",
-                    "requests_per_second": 5,
-                    "requests_per_minute": minute_limit
-                }]
-            });
-            if minute_limit == 100 {
-                policy["limits"] = json!([{
-                    "scope": "default", "window_seconds": window_seconds,
-                    "max_requests": if window_seconds == 1 { 5 } else { 3 }
-                }]);
-            }
-            if mode == "redis" {
-                policy["redis_url"] = json!(REDIS_URL);
-                policy["redis_key_prefix"] = json!(prefix);
-                // A healthy-store regression may never pass through fallback.
-                policy["redis_failure_policy"] = json!("fail_closed");
-            }
-            config["plugin_configs"].as_array_mut().unwrap().push(json!({
-                "id": mode, "plugin_name": "rate_limiting", "scope": "proxy",
-                "proxy_id": mode, "enabled": true, "config": policy
-            }));
+        if mode == "redis" {
+            policy["redis_url"] = json!(REDIS_URL);
+            policy["redis_key_prefix"] = json!(prefix);
+            // A healthy store may never answer through the fallback budget.
+            policy["redis_failure_policy"] = json!("fail_closed");
         }
-        let mut gateway = spawn_file_gateway(config.to_string(), vec![]).await;
-        let client = reqwest::Client::new();
-        let seconds = if window_seconds == 6 { 14 } else { 6 };
-        let mut admitted = vec![vec![0_u64; seconds]; 2];
-        let start = tokio::time::Instant::now();
-        for attempt in 0..seconds * 20 {
-            tokio::time::sleep_until(start + Duration::from_millis(attempt as u64 * 50)).await;
-            for (index, mode) in ["local", "redis"].into_iter().enumerate() {
-                let response = client
-                    .get(format!("{}/{mode}/test", gateway.proxy_base_url))
-                    .send()
-                    .await
-                    .unwrap();
-                let status = response.status().as_u16();
-                assert!(matches!(status, 200 | 429), "{mode}: {status}");
-                if status == 200 {
-                    admitted[index][attempt / 20] += 1;
-                }
-            }
-        }
-        let local: u64 = admitted[0].iter().sum();
-        let redis: u64 = admitted[1].iter().sum();
-        if minute_limit == 12 {
-            assert_eq!(local, 12);
-            assert_eq!(redis, 12, "denials must not consume the minute budget");
-        } else if window_seconds == 6 {
-            assert!(local >= 9 && redis >= 9, "sliding admissions: {admitted:?}");
-            assert_eq!(local, redis, "sliding admissions: {admitted:?}");
-        } else {
-            assert!(local >= 30 && redis >= 30, "admissions: {admitted:?}");
-            assert!(local.abs_diff(redis) <= 2, "admissions: {admitted:?}");
-            for second in 1..6 {
-                assert!(
-                    admitted[1][second] >= 3,
-                    "Redis must keep admitting during overload: {admitted:?}"
-                );
-            }
-        }
-        gateway.shutdown();
-        backend.abort();
-        delete_redis_keys_by_prefix(&prefix).await;
+        config["plugin_configs"].as_array_mut().unwrap().push(json!({
+            "id": mode, "plugin_name": "rate_limiting", "scope": "proxy",
+            "proxy_id": mode, "enabled": true, "config": policy
+        }));
     }
+    let mut gateway = spawn_file_gateway(config.to_string(), vec![]).await;
+    let client = reqwest::Client::new();
+    let seconds = 6;
+    let mut admitted = vec![vec![0_u64; seconds]; 2];
+    let start = tokio::time::Instant::now();
+    for attempt in 0..seconds * 20 {
+        tokio::time::sleep_until(start + Duration::from_millis(attempt as u64 * 50)).await;
+        for (index, mode) in ["local", "redis"].into_iter().enumerate() {
+            let response = client
+                .get(format!("{}/{mode}/test", gateway.proxy_base_url))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status().as_u16();
+            // 503 would mean the script never decided; this store is healthy.
+            assert!(matches!(status, 200 | 429), "{mode}: {status}");
+            if status == 200 {
+                admitted[index][attempt / 20] += 1;
+            }
+        }
+    }
+    let local: u64 = admitted[0].iter().sum();
+    let redis: u64 = admitted[1].iter().sum();
+    assert!(local >= 30 && redis >= 30, "admissions: {admitted:?}");
+    assert!(local.abs_diff(redis) <= 3, "admissions: {admitted:?}");
+    for second in 1..seconds {
+        assert!(
+            admitted[1][second] >= 3,
+            "Redis must keep admitting during overload: {admitted:?}"
+        );
+    }
+    gateway.shutdown();
+    backend.abort();
+    delete_redis_keys_by_prefix(&prefix).await;
+}
+
+/// Issue #5517 across two windows: a refused attempt must charge neither the
+/// tight nor the loose window. Before the fix every attempt — admitted or not —
+/// incremented the per-minute counter, so a client sending above its per-second
+/// rate exhausted a 20/minute budget within the first second and then received
+/// nothing at all.
+#[tokio::test]
+#[ignore]
+async fn test_rate_limiting_redis_sustained_multi_window_keeps_admitting() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
+
+    if !redis_is_available().await {
+        return;
+    }
+    let prefix = format!("ferrum:test:sustained-windows:{}", Uuid::new_v4().simple());
+    let config = RedisConfig::from_plugin_config(
+        &json!({"sync_mode": "redis", "redis_url": REDIS_URL}),
+        &prefix,
+    )
+    .unwrap()
+    .unwrap();
+    let redis = RedisRateLimitClient::new(config, None, false, None).unwrap();
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![
+        RateLimitWindowSpec {
+            limit: 5,
+            duration: Duration::from_secs(1),
+        },
+        RateLimitWindowSpec {
+            limit: 20,
+            duration: Duration::from_secs(60),
+        },
+    ]);
+    let seconds = 4;
+    let mut admitted = vec![0_u64; seconds];
+    let start = tokio::time::Instant::now();
+    for attempt in 0..seconds * 20 {
+        tokio::time::sleep_until(start + Duration::from_millis(attempt as u64 * 50)).await;
+        if algorithm
+            .check_redis(&redis, "client", &op)
+            .await
+            .unwrap()
+            .allowed
+        {
+            admitted[attempt / 20] += 1;
+        }
+    }
+    let total: u64 = admitted.iter().sum();
+    for second in 1..3 {
+        assert!(
+            admitted[second] >= 3,
+            "refused attempts must not consume the per-minute budget: {admitted:?}"
+        );
+    }
+    assert!(total >= 15, "sustained admissions: {admitted:?}");
+    assert!(
+        total <= 24,
+        "the looser per-minute window must still bind: {admitted:?}"
+    );
+    delete_redis_keys_by_prefix(&prefix).await;
 }
 
 // ============================================================================
@@ -2387,8 +2436,9 @@ plugin_configs:
         "6th request (to GW2) should also be rate limited — shared Redis counter"
     );
 
-    // Race two independent gateways on the same fresh budget. Losing WATCH
-    // attempts must not consume quota or open a per-pod fallback budget.
+    // Race two independent gateways on the same fresh budget. The admission
+    // script is serialised by Redis, so concurrency neither over-admits nor
+    // manufactures a contention refusal: every answer is a real decision.
     delete_redis_keys_by_prefix(&unique_prefix).await;
     let responses = futures_util::future::join_all((0..32).map(|index| {
         let client = client.clone();
@@ -2405,7 +2455,10 @@ plugin_configs:
     }))
     .await;
     assert_eq!(responses.iter().filter(|status| **status == 200).count(), 4);
-    assert!(responses.iter().all(|status| matches!(status, 200 | 429 | 503)));
+    assert!(
+        responses.iter().all(|status| matches!(status, 200 | 429)),
+        "a healthy store must never answer a concurrent race with 503: {responses:?}"
+    );
 
     gw1.shutdown();
     gw2.shutdown();

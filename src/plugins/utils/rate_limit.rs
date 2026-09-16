@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use super::http_client::PluginHttpClient;
-use super::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
+use super::redis_rate_limiter::{
+    RedisAdmissionWindow, RedisConfig, RedisRateLimitClient, RedisWindowKind,
+};
 
 /// Root config keys every Redis-backed rate-limit plugin accepts.
 ///
@@ -2012,165 +2014,97 @@ fn check_http_windows(
     outcome
 }
 
-/// Portable snapshots retain the LOCAL algorithm's state, not attempted-request
-/// counters. Ages are relative to one Redis TIME sample, so different gateways'
-/// wall clocks cannot refill the same interval twice. Each sliding window has
-/// exactly 64 counters regardless of traffic volume.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct RedisHttpWindows {
-    sampled_at: Duration,
-    windows: Vec<RedisHttpWindow>,
-}
+/// Redis key holding the whole multi-window state of one rate identity.
+///
+/// The effective window list is part of the key, so a policy edit starts a
+/// fresh centralized budget exactly as a changed spec resets retained local
+/// state — a shrunk window can never be charged from a wider window's counters.
+fn http_windows_state_key(
+    redis: &RedisRateLimitClient,
+    key: &str,
+    specs: &[RateLimitWindowSpec],
+) -> Result<String, ()> {
+    use std::fmt::Write;
 
-#[derive(serde::Serialize, serde::Deserialize)]
-enum RedisHttpWindow {
-    Bucket {
-        tokens: f64,
-        refill_age: Duration,
-    },
-    Sliding {
-        buckets: Vec<u64>,
-        current_bucket: u64,
-        epoch_age: Option<Duration>,
-        activity_age: Option<Duration>,
-    },
-}
-
-impl RedisHttpWindows {
-    fn restore(
-        self,
-        specs: &[RateLimitWindowSpec],
-        sampled_at: Duration,
-        now: Instant,
-    ) -> Result<Vec<HttpWindowState>, ()> {
-        if self.windows.len() != specs.len() {
-            return Err(());
-        }
-        let elapsed = sampled_at.saturating_sub(self.sampled_at);
-        let restore_time = |age: Duration| {
-            now.checked_sub(age.checked_add(elapsed).ok_or(())?)
-                .ok_or(())
-        };
-        self.windows
-            .into_iter()
-            .zip(specs)
-            .map(|(window, spec)| match (window, local_window_algorithm(spec.duration)) {
-                (
-                    RedisHttpWindow::Bucket { tokens, refill_age },
-                    LocalWindowAlgorithm::TokenBucket,
-                ) if tokens.is_finite() && tokens >= 0.0 && tokens <= spec.limit as f64 => {
-                    let mut bucket = TokenBucket::from_window(spec.limit, spec.duration);
-                    bucket.tokens = tokens;
-                    bucket.last_refill = restore_time(refill_age)?;
-                    Ok(HttpWindowState::Bucket(bucket))
-                }
-                (
-                    RedisHttpWindow::Sliding {
-                        buckets,
-                        current_bucket,
-                        epoch_age,
-                        activity_age,
-                    },
-                    LocalWindowAlgorithm::SlidingAggregate,
-                ) => {
-                    let buckets: [u64; SLIDING_WINDOW_BUCKET_COUNT] =
-                        buckets.try_into().map_err(|_| ())?;
-                    let total = buckets
-                        .iter()
-                        .try_fold(0_u64, |sum, count| sum.checked_add(*count))
-                        .ok_or(())?;
-                    if total > spec.limit || epoch_age.is_none() || activity_age.is_none() {
-                        return Err(());
-                    }
-                    Ok(HttpWindowState::Sliding(SlidingWindow {
-                        buckets: Box::new(buckets),
-                        current_bucket,
-                        epoch: epoch_age.map(restore_time).transpose()?,
-                        total,
-                        last_activity: activity_age.map(restore_time).transpose()?,
-                        window_duration: spec.duration,
-                        limit: spec.limit,
-                    }))
-                }
-                _ => Err(()),
-            })
-            .collect()
+    let mut state_key = redis.make_slot_key(key, &["http-windows"]);
+    for spec in specs {
+        // `fmt::Write` on a String is infallible. A formatting failure would
+        // leave the key no longer bound to this window list, so refuse rather
+        // than risk sharing another policy's budget.
+        write!(state_key, ":{}-{}", spec.duration.as_millis(), spec.limit).map_err(|_| ())?;
     }
-
-    fn capture(sampled_at: Duration, windows: &[HttpWindowState], now: Instant) -> Self {
-        let age = |time| now.saturating_duration_since(time);
-        Self {
-            sampled_at,
-            windows: windows
-                .iter()
-                .map(|window| match window {
-                    HttpWindowState::Bucket(bucket) => RedisHttpWindow::Bucket {
-                        tokens: bucket.tokens,
-                        refill_age: age(bucket.last_refill),
-                    },
-                    HttpWindowState::Sliding(window) => RedisHttpWindow::Sliding {
-                        buckets: window.buckets.to_vec(),
-                        current_bucket: window.current_bucket,
-                        epoch_age: window.epoch.map(age),
-                        activity_age: window.last_activity.map(age),
-                    },
-                })
-                .collect(),
-        }
-    }
+    Ok(state_key)
 }
 
-/// Admit and charge every window together using the same algorithms as local
-/// mode. A refusal writes nothing, including TTLs. WATCH conflicts retry within
-/// a fixed budget; exhaustion refuses this request without declaring an outage
-/// (and therefore cannot mint a local fallback budget under contention).
+/// Distributed (Redis-backed) multi-window admission check.
+///
+/// One `EVALSHA` per decision on the shared pooled connections. The server-side
+/// script owns the whole decision, so:
+///
+/// * **Only admitted requests mutate state.** A refusal charges no window and
+///   does not renew the key's TTL, so sustained excess traffic keeps being
+///   throttled at the configured rate instead of re-arming its own exhaustion
+///   (issue #5517). This is what the earlier `INCR`-then-compare shape got
+///   wrong: every rejected attempt inflated the counter that decided the next
+///   one, and a client over its limit never recovered while it kept trying.
+/// * **Every window is charged, or none is.** A later (tighter) window's
+///   refusal cannot consume an earlier (looser) window's budget.
+/// * **Admission stays O(1) under contention.** There is no optimistic
+///   `WATCH` retry budget to exhaust on a hot key, so a client that is *not*
+///   over its limit is never refused because other gateways were busy.
+///
+/// Redis `TIME` is the only clock, so gateways' wall clocks never enter the
+/// math. Windows at or below [`LOCAL_TOKEN_BUCKET_MAX_WINDOW_SECONDS`] use the
+/// same continuously refilling token bucket as [`check_http_windows`]; longer
+/// windows use the documented previous/current weighted approximation rather
+/// than shipping a 64-bucket ring to the server on every request. Both charge
+/// one unit per admitted request and refuse at the configured cap, so the
+/// admitted-request contract matches local mode within that approximation.
 async fn check_http_windows_redis(
     specs: &[RateLimitWindowSpec],
     redis: &RedisRateLimitClient,
     key: &str,
 ) -> Result<RateLimitOutcome, ()> {
-    use std::fmt::Write;
-
-    // Bind the state format and effective windows into the key. A semantic
-    // config change starts a new budget, as it does for retained local state.
-    let mut state_key = redis.make_slot_key(key, &["http-windows"]);
-    let mut ttl = 1;
-    for spec in specs {
-        write!(state_key, ":{}-{}", spec.duration.as_nanos(), spec.limit).map_err(|_| ())?;
-        ttl = ttl.max(two_window_ttl_seconds(spec.duration.as_secs()));
+    if specs.is_empty() {
+        // Admission rejects an empty window list; mirror the local path rather
+        // than manufacturing an outage for a policy that limits nothing.
+        return Ok(RateLimitOutcome::allow());
     }
-    // The bound includes JSON framing, 64 u64 counters, and duration fields.
-    let max_bytes = specs.len().max(1).checked_mul(4096).ok_or(())?;
-    redis
-        .update_rate_limit_state(&state_key, ttl, max_bytes, |stored, sampled_at| {
-            // A newly booted replica may have a much younger monotonic clock
-            // than this Redis budget. Place the temporary timeline in the
-            // future so reconstructing historical ages cannot underflow the
-            // host's Instant origin. Only relative durations are persisted.
-            let now = Instant::now().checked_add(sampled_at).ok_or(())?;
-            let (mut windows, sampled_at) = match stored {
-                Some(bytes) => {
-                    let snapshot: RedisHttpWindows = serde_json::from_slice(bytes).map_err(|_| ())?;
-                    // Redis TIME can move backwards. Keep the last watermark
-                    // until it catches up, just like the local monotonic guard.
-                    let sampled_at = sampled_at.max(snapshot.sampled_at);
-                    (snapshot.restore(specs, sampled_at, now)?, sampled_at)
-                }
-                None => (new_http_window_states(specs), sampled_at),
-            };
-            let outcome = check_http_windows(specs, &mut windows, now);
-            let replacement = if outcome.allowed {
-                Some(
-                    serde_json::to_vec(&RedisHttpWindows::capture(sampled_at, &windows, now))
-                        .map_err(|_| ())?,
-                )
-            } else {
-                None
-            };
-            Ok((outcome, replacement))
-        })
-        .await
-        .map(|outcome| outcome.unwrap_or_else(RateLimitOutcome::deny_enforcement_unavailable))
+
+    let mut ttl = 1;
+    let mut windows = Vec::with_capacity(specs.len());
+    for spec in specs {
+        ttl = ttl.max(two_window_ttl_seconds(spec.duration.as_secs()));
+        // Admission bounds the window at MAX_RATE_LIMIT_WINDOW_SECONDS, so this
+        // conversion cannot saturate for a configured policy; the floor keeps a
+        // sub-millisecond duration from dividing by zero inside the script.
+        let millis = spec.duration.as_millis();
+        let window_millis = u64::try_from(millis).unwrap_or(u64::MAX).max(1);
+        windows.push(RedisAdmissionWindow {
+            kind: match local_window_algorithm(spec.duration) {
+                LocalWindowAlgorithm::TokenBucket => RedisWindowKind::TokenBucket,
+                LocalWindowAlgorithm::SlidingAggregate => RedisWindowKind::WeightedSliding,
+            },
+            window_millis,
+            limit: spec.limit,
+        });
+    }
+
+    let state_key = http_windows_state_key(redis, key, specs)?;
+    let admission = redis
+        .admit_rate_limit_windows(&state_key, ttl, &windows)
+        .await?;
+    // The script only ever reports a window it was given; `admit_rate_limit_windows`
+    // already refused an out-of-range index.
+    let spec = specs.get(admission.window).ok_or(())?;
+    let outcome = if admission.allowed {
+        RateLimitOutcome::allow().with_remaining(admission.remaining)
+    } else {
+        RateLimitOutcome::deny()
+    };
+    Ok(outcome
+        .with_limit(spec.limit)
+        .with_window(spec.duration.as_secs()))
 }
 
 #[cfg(test)]

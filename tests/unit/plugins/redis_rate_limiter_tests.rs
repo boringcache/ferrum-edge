@@ -1229,9 +1229,11 @@ fn redis_one_second_prior_bucket_decays_instead_of_full_suppression() {
     use ferrum_edge::_test_support::redis_window_progress_at;
     use ferrum_edge::plugins::utils::rate_limit::FixedWindow;
 
-    // Redis path: prev bucket full (10), current has the candidate request (1).
-    // At fraction 0.0 the old code always denied; with subsecond decay the mid-
-    // window candidate is admitted.
+    // Weighted-counter path (AI tokens, WebSocket frames, UDP datagrams, and
+    // the longer HTTP windows the admission script approximates the same way):
+    // prev bucket full (10), current has the candidate request (1). At fraction
+    // 0.0 the old code always denied; with subsecond decay the mid-window
+    // candidate is admitted.
     let window = FixedWindow::new(10, 1);
     let start = redis_window_progress_at(Duration::from_secs(50), 1);
     let mid = redis_window_progress_at(Duration::from_millis(50_500), 1);
@@ -2905,31 +2907,90 @@ async fn a_recovery_probe_proving_cluster_topology_clears_every_cached_pool_slot
 // routine socket recycling into roughly two intervals of blanket refusals.
 // `is_available()` is now the only admission gate.
 
-/// The HTTP-window transaction commits a single snapshot with SET EX.
-const TRANSACTION_PREAMBLE: &[u8] = b"+OK\r\n+QUEUED\r\n";
-const TRANSACTION_SUCCESS: &[u8] = b"*1\r\n+OK\r\n";
-/// A plain (non-Cluster) server error on `EXEC` — the ordinary retryable
-/// failure a recycled socket produces, not a topology proof.
-const TRANSACTION_FAILURE: &[u8] = b"-ERR simulated transient backend failure\r\n";
-const MULTI_CMD: &[u8] = b"$5\r\nMULTI\r\n";
+/// One RESP round trip of the HTTP-window limiter: a single `EVALSHA` carrying
+/// the state key and the configured window triples.
+const EVALSHA_CMD: &[u8] = b"EVALSHA";
+const SCRIPT_CMD: &[u8] = b"SCRIPT";
+const INFO_ARG: &[u8] = b"INFO";
+/// The script's `{allowed, remaining, window}` reply for an admitted request.
+const ADMISSION_SUCCESS: &[u8] = b"*3\r\n:1\r\n:4\r\n:1\r\n";
+/// A plain (non-Cluster) server error — the ordinary retryable failure a
+/// recycled socket produces, not a topology proof.
+const ADMISSION_FAILURE: &[u8] = b"-ERR simulated transient backend failure\r\n";
+/// What Redis answers when the cached SHA is gone (restart or `SCRIPT FLUSH`).
+const NOSCRIPT_REPLY: &[u8] = b"-NOSCRIPT No matching script please use EVAL\r\n";
+
+/// How the fake server answers the FIRST admission-script call.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FirstAdmission {
+    /// A plain server error: an ordinary retryable outage.
+    ServerError,
+    /// `NOSCRIPT`, which the client repairs with `SCRIPT LOAD` + a retried
+    /// `EVALSHA` on the same connection.
+    NoScript,
+}
 
 struct TransactionServer {
     port: u16,
     shutdown: oneshot::Sender<()>,
     accepts: Arc<AtomicUsize>,
     transactions: Arc<AtomicUsize>,
+    script_loads: Arc<AtomicUsize>,
 }
 
-/// Screens clean on every connection, fails the FIRST HTTP-window
-/// transaction with a plain server error, and answers every later transaction
-/// normally.
-async fn spawn_first_transaction_fails_redis_server() -> TransactionServer {
+/// Offset of the `\r\n` that terminates the RESP line starting at `from`.
+fn resp_line_end(buf: &[u8], from: usize) -> Option<usize> {
+    buf.get(from..)?
+        .windows(2)
+        .position(|window| window == b"\r\n")
+        .map(|index| from + index)
+}
+
+/// Pull one COMPLETE RESP command array out of `pending`, or `None` while the
+/// buffer holds only part of one.
+///
+/// Framing matters here: the Lua body of `SCRIPT LOAD` is kilobytes long and
+/// may legitimately span several reads, so a chunk-substring stub would answer
+/// its tail as if it were another command and desynchronize the connection.
+fn take_resp_command(pending: &mut Vec<u8>) -> Option<Vec<Vec<u8>>> {
+    let end = resp_line_end(pending, 0)?;
+    if pending.first() != Some(&b'*') {
+        return None;
+    }
+    let count: usize = std::str::from_utf8(&pending[1..end]).ok()?.parse().ok()?;
+    let mut position = end + 2;
+    let mut args = Vec::with_capacity(count);
+    for _ in 0..count {
+        let end = resp_line_end(pending, position)?;
+        if pending.get(position) != Some(&b'$') {
+            return None;
+        }
+        let length: usize = std::str::from_utf8(&pending[position + 1..end])
+            .ok()?
+            .parse()
+            .ok()?;
+        let start = end + 2;
+        if pending.len() < start + length + 2 {
+            return None;
+        }
+        args.push(pending[start..start + length].to_vec());
+        position = start + length + 2;
+    }
+    pending.drain(..position);
+    Some(args)
+}
+
+/// Screens clean on every connection, answers the FIRST admission script call
+/// per `first`, and admits every later call.
+async fn spawn_admission_script_redis_server(first: FirstAdmission) -> TransactionServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("local_addr").port();
     let accepts = Arc::new(AtomicUsize::new(0));
     let transactions = Arc::new(AtomicUsize::new(0));
+    let script_loads = Arc::new(AtomicUsize::new(0));
     let accepts_task = Arc::clone(&accepts);
     let transactions_task = Arc::clone(&transactions);
+    let script_loads_task = Arc::clone(&script_loads);
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
 
     tokio::spawn(async move {
@@ -2940,35 +3001,44 @@ async fn spawn_first_transaction_fails_redis_server() -> TransactionServer {
                     let Ok((mut stream, _)) = accepted else { break; };
                     accepts_task.fetch_add(1, Ordering::Relaxed);
                     let transactions = Arc::clone(&transactions_task);
+                    let script_loads = Arc::clone(&script_loads_task);
                     tokio::spawn(async move {
                         let mut buf = vec![0u8; 16 * 1024];
+                        let mut pending: Vec<u8> = Vec::new();
                         loop {
                             let n = match stream.read(&mut buf).await {
                                 Ok(0) | Err(_) => break,
                                 Ok(n) => n,
                             };
-                            let chunk = &buf[..n];
+                            pending.extend_from_slice(&buf[..n]);
                             let mut reply: Vec<u8> = Vec::new();
-                            if chunk_contains(chunk, INFO_CMD) {
-                                let text = "# Cluster\r\ncluster_enabled:0\r\n";
-                                let len = text.len();
-                                reply.extend_from_slice(
-                                    format!("${len}\r\n{text}\r\n").as_bytes(),
-                                );
-                            } else if chunk_contains(chunk, b"$8\r\nGETRANGE\r\n") {
-                                reply.extend_from_slice(b"$0\r\n\r\n*2\r\n:1000000\r\n:0\r\n");
-                            } else if chunk_contains(chunk, MULTI_CMD) {
-                                let index = transactions.fetch_add(1, Ordering::Relaxed);
-                                reply.extend_from_slice(TRANSACTION_PREAMBLE);
-                                if index == 0 {
-                                    reply.extend_from_slice(TRANSACTION_FAILURE);
+                            while let Some(args) = take_resp_command(&mut pending) {
+                                let name = args.first().cloned().unwrap_or_default();
+                                if name.eq_ignore_ascii_case(INFO_ARG) {
+                                    let text = "# Cluster\r\ncluster_enabled:0\r\n";
+                                    let len = text.len();
+                                    let bulk = format!("${len}\r\n{text}\r\n");
+                                    reply.extend_from_slice(bulk.as_bytes());
+                                } else if name.eq_ignore_ascii_case(SCRIPT_CMD) {
+                                    script_loads.fetch_add(1, Ordering::Relaxed);
+                                    reply.extend_from_slice(
+                                        b"$40\r\n0000000000000000000000000000000000000000\r\n",
+                                    );
+                                } else if name.eq_ignore_ascii_case(EVALSHA_CMD) {
+                                    let index = transactions.fetch_add(1, Ordering::Relaxed);
+                                    if index > 0 {
+                                        reply.extend_from_slice(ADMISSION_SUCCESS);
+                                    } else if first == FirstAdmission::NoScript {
+                                        reply.extend_from_slice(NOSCRIPT_REPLY);
+                                    } else {
+                                        reply.extend_from_slice(ADMISSION_FAILURE);
+                                    }
                                 } else {
-                                    reply.extend_from_slice(TRANSACTION_SUCCESS);
-                                }
-                            } else {
-                                for _ in 0..command_count(chunk) {
                                     reply.extend_from_slice(b"+OK\r\n");
                                 }
+                            }
+                            if reply.is_empty() {
+                                continue;
                             }
                             if stream.write_all(&reply).await.is_err() {
                                 break;
@@ -2985,6 +3055,7 @@ async fn spawn_first_transaction_fails_redis_server() -> TransactionServer {
         shutdown: shutdown_tx,
         accepts,
         transactions,
+        script_loads,
     }
 }
 
@@ -2999,7 +3070,7 @@ async fn failover_admission_resumes_on_client_recovery_without_an_observer_tick(
         RedisFailurePolicy,
     };
 
-    let server = spawn_first_transaction_fails_redis_server().await;
+    let server = spawn_admission_script_redis_server(FirstAdmission::ServerError).await;
     let accepts = Arc::clone(&server.accepts);
     let transactions = Arc::clone(&server.transactions);
 
@@ -3112,6 +3183,154 @@ async fn failover_admission_resumes_on_client_recovery_without_an_observer_tick(
     assert!(client.is_topology_unsupported());
 
     let _ = server.shutdown.send(());
+}
+
+/// A `NOSCRIPT` answer (server restart, `SCRIPT FLUSH`) must repair itself on
+/// the same connection: `SCRIPT LOAD` once, retry `EVALSHA`, and return a real
+/// decision. It is not an outage, so it must not mark the client unavailable or
+/// reach the failure policy.
+#[tokio::test]
+async fn admission_script_reload_after_noscript_admits_without_an_outage() {
+    use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitBackend, RateLimitWindowSpec,
+    };
+
+    let server = spawn_admission_script_redis_server(FirstAdmission::NoScript).await;
+    let backend: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm> =
+        RateLimitBackend::from_plugin_config(
+            "rate_limiting",
+            &json!({
+                "sync_mode": "redis",
+                "redis_url": format!("redis://127.0.0.1:{}/0", server.port),
+                "redis_pool_size": 1,
+                "redis_failure_policy": "fail_closed",
+                "redis_health_check_interval_seconds": 3600,
+            }),
+            &PluginHttpClient::default(),
+            DynamicHttpRateLimitAlgorithm::new(),
+        )
+        .expect("failover backend");
+    let client = backend
+        .redis_client_arc_for_test()
+        .expect("backend must own a Redis client");
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 1_000,
+        duration: Duration::from_secs(60),
+    }]);
+
+    let outcome = backend
+        .check_with_redis_key_and_local_capacity(
+            "identity-a".to_string(),
+            || "{ferrum%3Atest:identity-a}".to_string(),
+            &op,
+            1_000,
+        )
+        .await
+        .expect("outcome");
+    assert!(
+        outcome.allowed && !outcome.enforcement_unavailable,
+        "a reloaded script must produce a centralized decision"
+    );
+    assert!(
+        !outcome.local_fallback,
+        "NOSCRIPT repair must not mint a per-process budget"
+    );
+    assert_eq!(
+        server.script_loads.load(Ordering::Relaxed),
+        1,
+        "NOSCRIPT must load the script exactly once"
+    );
+    assert_eq!(
+        server.transactions.load(Ordering::Relaxed),
+        2,
+        "the reloaded script must be retried rather than abandoned"
+    );
+    assert_eq!(
+        server.accepts.load(Ordering::Relaxed),
+        1,
+        "the repair must reuse the pooled connection, not dial a new one"
+    );
+    assert!(client.is_available());
+
+    let _ = server.shutdown.send(());
+}
+
+/// Issue #5517 design pins. The HTTP-window decision is one server-side script
+/// on the SHARED POOLED connection: no per-request dial, no `WATCH` retry loop,
+/// and no write on a refusal.
+#[test]
+fn http_window_admission_is_one_pooled_script_call_that_only_writes_on_admission() {
+    let redis = include_str!("../../../src/plugins/utils/redis_rate_limiter.rs");
+    let limiter = include_str!("../../../src/plugins/utils/rate_limit.rs");
+
+    let start = redis
+        .find("pub(super) async fn admit_rate_limit_windows(")
+        .expect("admission helper");
+    let rest = &redis[start..];
+    let end = rest[1..]
+        .find("\n    /// ")
+        .map(|i| i + 1)
+        .unwrap_or(rest.len());
+    let body = &rest[..end];
+    assert!(
+        body.contains("self.get_connection().await"),
+        "admission must run on the shared pooled multiplexed slots"
+    );
+    assert!(
+        !body.contains("get_dedicated_connection"),
+        "admission must never dial a per-request connection"
+    );
+    assert!(
+        !body.contains("WATCH") && !body.contains("MULTI"),
+        "admission must not reintroduce an optimistic transaction"
+    );
+    assert!(
+        body.contains("invoke_async"),
+        "admission must run the cached script (EVALSHA, SCRIPT LOAD on NOSCRIPT)"
+    );
+
+    let script_start = redis
+        .find("const HTTP_WINDOW_ADMISSION_SCRIPT: &str = r#\"")
+        .expect("admission script");
+    let tail = &redis[script_start..];
+    let script_end = tail.find("\"#;").expect("admission script terminator");
+    let script = &tail[..script_end];
+    assert!(
+        script.contains("redis.call('TIME')"),
+        "the server's own clock must decide every window"
+    );
+    assert_eq!(
+        script.matches("redis.call('SET'").count(),
+        1,
+        "the state value must have exactly one write site"
+    );
+    let write = script.find("redis.call('SET'").expect("state write");
+    assert_eq!(
+        script.matches("if allowed == 1 then").count(),
+        1,
+        "there must be exactly one admitted-only guard"
+    );
+    let guard = script
+        .find("if allowed == 1 then")
+        .expect("admitted-only guard");
+    assert!(
+        guard < write,
+        "the only state write must sit behind the admitted-only guard"
+    );
+    assert!(
+        script.contains("'EX'"),
+        "the TTL must be refreshed with the same admitted-only write"
+    );
+
+    assert!(
+        !redis.contains("update_rate_limit_state") && !limiter.contains("update_rate_limit_state"),
+        "the retried WATCH snapshot helper must be gone"
+    );
+    assert!(
+        !limiter.contains("RedisHttpWindows"),
+        "the per-request JSON snapshot of the local algorithm state must be gone"
+    );
 }
 
 // ── Cached pool must not transparently reconnect (GHSA-87rq root review) ──
