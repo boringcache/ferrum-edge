@@ -105,6 +105,24 @@ pub mod _test_support {
         crate::admin::restore_envelope_field_names_for_test()
     }
 
+    /// Whether the closed `POST /batch` envelope admits `body` (issue #5565).
+    ///
+    /// Same object-only parse the batch handler maps to `400` with
+    /// `{"error": "Invalid JSON body: …"}`.
+    pub fn batch_envelope_admits_for_test(body: &[u8]) -> bool {
+        crate::admin::batch_envelope_admits_for_test(body)
+    }
+
+    /// Serde-accepted member names of the `POST /batch` envelope
+    /// (issue #5565).
+    ///
+    /// Recovered from the derived `Deserialize` itself, so a new Rust member
+    /// appears here without anyone updating a manifest. The OpenAPI contract
+    /// test compares this inventory with `BatchCreateRequest.properties`.
+    pub fn batch_envelope_field_names_for_test() -> Vec<String> {
+        crate::admin::batch_envelope_field_names_for_test()
+    }
+
     /// Exercise the dispatch coordinate rebase and its cloned diagnostic context.
     pub fn rebase_backend_path_for_test(
         ctx: &mut crate::plugins::RequestContext,

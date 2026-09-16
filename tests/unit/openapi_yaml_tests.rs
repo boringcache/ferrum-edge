@@ -18211,3 +18211,106 @@ fn restore_request_publishes_the_complete_closed_envelope() {
     proxy_with_id["id"] = json!("p1");
     assert_component_validity(&spec, "ProxyRestoreItem", &proxy_with_id, true);
 }
+
+/// The published `BatchCreateRequest` must be the complete, closed batch wire
+/// contract (issue #5565). Backup metadata members are typed the same way
+/// restore types them, so a schema-invalid envelope is a `400` with the
+/// same `{"error": "Invalid JSON body: …"}` shape `POST /restore` uses.
+#[test]
+fn batch_create_request_publishes_the_complete_closed_envelope() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let batch = &spec["components"]["schemas"]["BatchCreateRequest"];
+
+    assert_eq!(
+        batch["additionalProperties"],
+        json!(false),
+        "the batch envelope must reject unknown top-level keys"
+    );
+
+    let members: BTreeMap<&str, serde_json::Value> = BTreeMap::from([
+        ("proxies", json!([])),
+        ("consumers", json!([])),
+        ("plugin_configs", json!([])),
+        ("upstreams", json!([])),
+        ("version", json!("1")),
+        ("ferrum_version", json!("0.9.5")),
+        ("exported_at", json!("2026-09-16T00:00:00Z")),
+        ("source", json!("database")),
+        ("counts", json!({})),
+        ("api_specs", json!({"section_version": "2", "items": []})),
+        ("gateway_trust_bundles", json!([])),
+    ]);
+
+    let published: BTreeSet<&str> = batch["properties"]
+        .as_object()
+        .expect("BatchCreateRequest declares properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let expected: BTreeSet<&str> = members.keys().copied().collect();
+    assert_eq!(
+        published, expected,
+        "BatchCreateRequest must publish exactly the members batch accepts"
+    );
+
+    let runtime_names = ferrum_edge::_test_support::batch_envelope_field_names_for_test();
+    let runtime_members: BTreeSet<&str> = runtime_names.iter().map(String::as_str).collect();
+    assert_eq!(
+        runtime_members, published,
+        "BatchCreateRequest.properties must equal the serde-accepted batch members"
+    );
+
+    let mut whole = serde_json::Map::new();
+    for (member, value) in &members {
+        let mut single = serde_json::Map::new();
+        single.insert((*member).to_string(), value.clone());
+        let single = serde_json::Value::Object(single);
+        assert!(
+            ferrum_edge::_test_support::batch_envelope_admits_for_test(
+                single.to_string().as_bytes()
+            ),
+            "runtime batch must accept the published member {member}"
+        );
+        assert_component_validity(&spec, "BatchCreateRequest", &single, true);
+        whole.insert((*member).to_string(), value.clone());
+    }
+    let whole = serde_json::Value::Object(whole);
+    assert!(
+        ferrum_edge::_test_support::batch_envelope_admits_for_test(whole.to_string().as_bytes()),
+        "a complete GET /backup artifact must still round-trip through POST /batch"
+    );
+    assert_component_validity(&spec, "BatchCreateRequest", &whole, true);
+
+    // Schema-invalid metadata is a `400` on POST /batch, same parse restore
+    // uses: non-object `counts`, an array `api_specs`, a non-array
+    // `gateway_trust_bundles`.
+    for rejected in [
+        json!({"counts": []}),
+        json!({"counts": 5}),
+        json!({"counts": "3"}),
+        json!({"counts": true}),
+        json!({"api_specs": []}),
+        json!({"api_specs": ["2", []]}),
+        json!({"api_specs": "not-an-object"}),
+        json!({"gateway_trust_bundles": {}}),
+        json!({"gateway_trust_bundles": "not-an-array"}),
+        json!({"gateway_trust_bundles": 1}),
+        json!({"proxise": []}),
+        json!({"proxies": [], "unknown_top_level": true}),
+        json!([]),
+        json!("a string"),
+        json!(5),
+    ] {
+        assert!(
+            !ferrum_edge::_test_support::batch_envelope_admits_for_test(
+                rejected.to_string().as_bytes()
+            ),
+            "runtime batch must reject {rejected}"
+        );
+        assert_component_validity(&spec, "BatchCreateRequest", &rejected, false);
+    }
+
+    assert!(ferrum_edge::_test_support::batch_envelope_admits_for_test(b"{}"));
+    assert_component_validity(&spec, "BatchCreateRequest", &json!({}), true);
+}
