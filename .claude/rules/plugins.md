@@ -295,6 +295,22 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     response-size ceiling restate it. The metadata reason beside them is
     plugin-writable and authorizes nothing.
 6. `on_final_request_body`: body validator, gRPC-Web validation, WAF body rules, OpenAPI request schema (backend-final fallback), post-transform request-size ceiling, `ai_prompt_compressor` staged marker-sanitization rejection (4055), and `ai_semantic_cache` exact/semantic lookup (4057). `ai_semantic_cache` looks up here — not in `before_proxy` — so its replay partition binds the finalized outbound headers/query/destination and fully transformed request body, and a hit cannot bypass fail-closed final-body policy.
+   - `waf`'s `scan_budget_ms` is a POST-HOC deadline on EVERY surface: the scan
+     always runs and its hits always decide first, so an enforcing hit found
+     over budget still rejects (issue #5528 — do not reintroduce a pre-scan
+     bail). On the body path the clock starts AFTER the fairness yield, so the
+     budget bounds `O(active_rules × max_scan_bytes)` and never the scheduler's
+     attacker-influenceable re-poll delay. Because the scan always completes,
+     `on_scan_timeout` decides only a CLEAN over-budget scan — a body inspected
+     end to end with no match — and is a LATENCY control, not a coverage one:
+     the default stays `log_and_allow`. The opt-in `fail_closed` rejects when
+     the governed body direction carries an enforcing body policy
+     (`request_body_policy_enforces` / `response_body_policy_enforces`, which
+     also count `on_body_too_large: block` while globally enforcing); `allow` is
+     the silent variant of the default; `block` rejects unconditionally and is
+     the only setting that also covers the cheap metadata/header scans. Do not
+     make a fail-closed timeout the default: it rejects traffic the WAF scanned
+     and cleared.
 6b. `dispatch_finalized_request_egress`: irreversible outbound request egress
     (`request_mirror`, `serverless_function`, `ai_federation`) over the immutable
     backend-visible body and finalized pre-egress header snapshot, after every
@@ -457,7 +473,16 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
       response set; Text and Binary are both inspected and the HTTP media-type
       selectors do not apply. Control frames are never scanned as application
       payload, and `max_scan_bytes` / `on_body_too_large` / `on_scan_timeout`
-      fail closed with a fixed 1008 Close that never echoes message bytes.
+      fail closed with a fixed 1008 Close that never echoes message bytes when
+      that direction carries an enforcing body policy. `WsSessionPolicy` carries
+      a separate `timeout_enforces` pair mirroring the HTTP
+      `request_body_policy_enforces` / `response_body_policy_enforces`
+      disjunction (`on_body_too_large: block` term included) so
+      `on_scan_timeout: fail_closed` decides one config identically on both
+      paths; `enforcing_*` stays the narrower "did a body RULE enforce?"
+      question `clamp` and `uninspectable` ask. A message whose scan missed its
+      deadline is warned about independently of `log_to_stdout` (messages carry
+      no `waf.*` metadata); only `on_scan_timeout: allow` suppresses it.
     - First terminal Close from an admission/mutating hook wins; later mutating
       plugins are skipped for that frame while observational hooks
       (`observes_ws_frame_decisions`) may still record the final decision.

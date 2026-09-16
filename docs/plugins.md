@@ -5316,12 +5316,16 @@ Binary are both inspected — the HTTP media-type selectors (`body_methods`,
 because a WebSocket message carries no `Content-Type`. Control frames
 (Ping/Pong/Close) are never scanned as application payload, messages arrive
 reassembled and uncompressed (`permessage-deflate` is never negotiated end to
-end), and `max_scan_bytes` / `on_body_too_large` / `on_scan_timeout` fail closed
-by closing the connection with RFC 6455 code 1008 and a fixed reason that never
-echoes message bytes. Anomaly scoring is evaluated per complete message rather
-than accumulated across a session, and message findings are emitted as `waf`
-log events rather than `waf.*` transaction metadata. See
-[waf.md](waf.md#websocket-message-inspection).
+end), and `max_scan_bytes` / `on_body_too_large` / `on_scan_timeout` close the
+connection with RFC 6455 code 1008 and a fixed reason that never echoes message
+bytes, on the same terms as the HTTP body path — the session policy resolved at
+upgrade mirrors `request_body_policy_enforces` / `response_body_policy_enforces`,
+`on_body_too_large: block` term included. Anomaly scoring is evaluated per
+complete message rather than accumulated across a session, and message findings
+are emitted as `waf` log events rather than `waf.*` transaction metadata.
+Because a message carries no metadata at all, a scan that missed its deadline is
+warned about independently of `log_to_stdout` (suppressed only by
+`on_scan_timeout: allow`). See [waf.md](waf.md#websocket-message-inspection).
 
 That drop is decided **per request**, not per configuration. A request matched
 by `global_exemptions` (path, method, IP, or consumer) never reaches a WAF
@@ -5382,8 +5386,8 @@ contract.
 | `inspect_binary_body` | bool | `false` | Inspect bodies whose content type is not in `body_content_types`. |
 | `max_scan_bytes` | usize | `1048576` | Maximum bytes scanned from each body. Must be greater than zero. |
 | `on_body_too_large` | string | `fail_closed` | `fail_closed` rejects an oversize governed body when that direction has an enforcing body rule or anomaly scoring, and otherwise scans the first `max_scan_bytes` and records truncation; `scan_truncated` is the explicit compatibility opt-out that always scans only the prefix and forwards the complete body; `skip` skips known-oversized bodies; `block` rejects every oversize governed body in enforce mode and, when a body inspection surface can run, satisfies `mode: enforce` admission on its own; it is also a blocking disposition for the buffered-representation claim on both directions, so an origin-encoded body is decoded before the cap is measured. |
-| `scan_budget_ms` | u64 | `50` | Post-hoc deadline for metadata/header and body scans. `0` disables the timeout wrapper. The synchronous scan cannot be cancelled mid-regex; over-budget scans are reported after the scan returns. |
-| `on_scan_timeout` | string | `log_and_allow` | Action when a body scan times out: `allow`, `block`, or `log_and_allow`. |
+| `scan_budget_ms` | u64 | `50` | Post-hoc deadline for metadata/header, body, and WebSocket-message scans. `0` disables the timeout wrapper. The synchronous scan cannot be cancelled mid-regex; it always runs to completion and over-budget scans are reported after the scan returns, so an enforcing hit found over budget still rejects. It bounds the scan itself: on the body path the clock starts after the fairness yield, so scheduler re-poll delay is never counted. Size it against `active_rules × max_scan_bytes`. |
+| `on_scan_timeout` | string | `log_and_allow` | Outcome for a scan that completed **clean** but over `scan_budget_ms` — a body the WAF inspected end to end and found nothing in, so this is a latency control rather than a coverage control. `log_and_allow` (default) forwards with a sampled warning and `waf.scan_timed_out` metadata; `allow` forwards silently. `fail_closed` is the opt-in strict-latency posture: it rejects when the governed body direction carries an enforcing body policy, resolved through `request_body_policy_enforces` / `response_body_policy_enforces` (the same question `on_body_too_large: fail_closed` asks, plus an `on_body_too_large: block` size cap while globally enforcing), so `monitor` mode and monitor-only rule sets without that cap never start blocking. `block` rejects every over-budget scan on every surface, independently of global mode. Request metadata/header/query/path scans are not disposition-aware under `fail_closed` — they are bounded by the frontend's header limits rather than by `max_scan_bytes` — so only `block` applies the strict deadline to them. A timeout rejection sets `waf.action=blocked` with `waf.block_reason=scan_timeout`. |
 | `disallowed_methods` | string[] | `[]` | Methods that should trigger the built-in `FE-METHOD-001` rule when that rule is active. |
 | `log_to_metadata` | bool | `true` | Write WAF metadata such as `waf.rule_hits`, `waf.action`, and `waf.severity` into transaction logs. |
 | `log_to_stdout` | bool | `false` | Emit sampled warnings for rule matches (one per source site per 10 seconds across instances, with `suppressed_events` counts) and per-hit debug detail. Each event's `action` is that rule's effective direct outcome after applying the global mode (`blocked`, `monitored`, `disabled`); `rule_action` carries the configured rule action (`enforce`, `monitor`, `disabled`). Aggregate anomaly scoring can still make the final transaction `waf.action=blocked` after individual per-rule events. |
@@ -5436,9 +5440,15 @@ recorded, never blocked. With `log_to_metadata: true`, oversize bodies handled b
 `waf.body_too_large=true` and `waf.body_too_large_target` (`request_body` or
 `response_body`); a blocked one adds `waf.action=blocked` and
 `waf.block_reason=body_too_large`, and a prefix-scanned one adds
-`waf.scan_truncated=true`. No body bytes are logged. The explicit `skip` mode
-records none of these fields because it may avoid buffering a known-oversize
-request entirely.
+`waf.scan_truncated=true`. A body rejected under `on_scan_timeout: fail_closed`
+or `block` because its scan completed over `scan_budget_ms` sets
+`waf.scan_timed_out=true`, `waf.action=blocked`, and
+`waf.block_reason=scan_timeout`. The timeout block itself contributes no
+`waf.rule_hits`; `waf.block_reason=scan_timeout` (rather than `rule`) names the
+deciding control, and a monitor-only hit recorded by an earlier phase still
+appears in `waf.rule_hits` beside it. No body bytes are logged. The explicit
+`skip` mode records none of these fields because it may avoid buffering a
+known-oversize request entirely.
 
 Set `on_body_too_large: scan_truncated` to keep the previous prefix-only
 behavior. That is an explicit acceptance of the suffix bypass and should be
