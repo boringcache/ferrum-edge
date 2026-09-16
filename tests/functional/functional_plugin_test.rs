@@ -2220,11 +2220,6 @@ mod waf_wide_charset {
                     "proxy_id": "wide", "enabled": true,
                     "config": {
                         "include_default_rules": false,
-                        // Unbounded scan budget: the default 50 ms deadline now
-                        // fails closed under an enforcing body policy, so a
-                        // descheduled worker on a loaded runner would otherwise
-                        // turn these clean bodies into rejections.
-                        "scan_budget_ms": 0,
                         "response_inspection": true, "response_body_inspection": true,
                         "custom_rules": [
                             {

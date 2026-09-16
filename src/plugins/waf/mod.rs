@@ -102,22 +102,22 @@ enum GlobalMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimeoutAction {
-    /// Default. A scan that finished over `scan_budget_ms` without a confirmed
-    /// blocking hit rejects when the governed BODY direction carries an
-    /// enforcing body policy, and is logged and allowed otherwise — the
-    /// disposition-aware shape `on_body_too_large: fail_closed` already uses
-    /// (issue #5528). `monitor` mode and monitor-only rule sets never start
-    /// blocking.
-    EnforceAware,
-    /// Explicit fail-open opt-out: forward silently. Weakens enforcement — an
-    /// enforcing body policy that missed its deadline is forwarded with no
-    /// warning at all.
+    /// Forward silently, with no record that the deadline was missed.
     Allow,
     /// Strictest: reject on every over-budget scan, on every governed surface,
     /// independently of global mode and of which rules enforce.
     Block,
-    /// Explicit fail-open opt-out with a record: forward, but warn and write
-    /// `waf.scan_timed_out`. Weakens enforcement the same way `allow` does.
+    /// Opt-in strict-latency posture. A CLEAN over-budget BODY scan is rejected
+    /// when the governed direction carries an enforcing body policy, and logged
+    /// and allowed otherwise — the disposition-aware shape and vocabulary
+    /// `on_body_too_large: fail_closed` already uses. The scan itself always ran
+    /// to completion (issue #5528), so this defends a latency budget rather than
+    /// a coverage gap; `monitor` mode and monitor-only rule sets never start
+    /// blocking.
+    FailClosed,
+    /// Default. Forward, but warn and write `waf.scan_timed_out`. Since the scan
+    /// always runs and its hits always decide first, an over-budget CLEAN result
+    /// is a latency signal rather than lost coverage.
     LogAndAllow,
 }
 
@@ -362,14 +362,16 @@ impl Waf {
         if max_scan_bytes == 0 {
             return Err("waf: 'max_scan_bytes' must be greater than zero".to_string());
         }
-        // Disposition-aware by default (issue #5528): a governed body whose scan
-        // missed its deadline is refused exactly when that direction could have
-        // refused a hit, mirroring `on_body_too_large: fail_closed`. `allow` and
-        // `log_and_allow` remain available as explicit, documented opt-outs.
+        // The budget is post-hoc only (issue #5528): a scan that missed its
+        // deadline still ran to completion and its hits still rejected, so a
+        // clean over-budget result is a latency signal and the default records
+        // it rather than refusing traffic the WAF fully inspected and cleared.
+        // `fail_closed` is the opt-in strict-latency posture, `block` the
+        // unconditional one.
         let on_scan_timeout = parse_timeout_action(
             optional_string(object, "on_scan_timeout")?
                 .as_deref()
-                .unwrap_or("enforce_aware"),
+                .unwrap_or("log_and_allow"),
         )?;
         // Fail closed by default (GHSA-7jh9-fjqf-jcvf). `scan_truncated` remains
         // available as an explicit, documented prefix-only opt-out.
@@ -622,6 +624,12 @@ impl Waf {
     /// guarantees O(n) matching and the input is capped by `max_scan_bytes`, so
     /// execution time is bounded by O(active_rules × max_scan_bytes) with no
     /// pathological backtracking.
+    ///
+    /// The clock starts AFTER the fairness yield, so the budget measures the
+    /// scan's own cost and never the scheduler's re-poll delay. That delay is
+    /// attacker-influenceable with a cheap request flood, and `scan_budget_ms`
+    /// is the operator's sizing knob for `O(active_rules × max_scan_bytes)` —
+    /// the only term they can actually size.
     async fn run_body_scan_with_budget<F>(&self, scan: F) -> ScanOutcome
     where
         F: FnOnce() -> ScanOutcome,
@@ -629,11 +637,11 @@ impl Waf {
         if self.config.scan_budget_ms == 0 {
             return scan();
         }
-        let start = std::time::Instant::now();
         // Yield before the (synchronous, uninterruptible) scan so a runtime
         // worker shared with other connections gets a scheduling point here
         // rather than only after the scan returns.
         tokio::task::yield_now().await;
+        let start = std::time::Instant::now();
         let mut outcome = scan();
         if start.elapsed() >= Duration::from_millis(self.config.scan_budget_ms) {
             outcome.timed_out = true;
@@ -667,11 +675,14 @@ impl Waf {
     /// [`WafScorePhase`]. It changes nothing else about the decision.
     ///
     /// `timeout_enforces` answers "could this instance actually have REFUSED
-    /// the surface this scan covered?" — the same question
-    /// `on_body_too_large: fail_closed` asks through `has_enforcing_body_policy`.
-    /// It is read only by the `enforce_aware` timeout default, and only when
-    /// `outcome.timed_out` is set, so every caller evaluates the predicate
-    /// behind `outcome.timed_out` and the in-budget path stays free of it.
+    /// the surface this scan covered?" — the same QUESTION
+    /// `on_body_too_large: fail_closed` asks, resolved for a body scan through
+    /// `request_body_policy_enforces` / `response_body_policy_enforces` (which
+    /// also count `on_body_too_large: block` while globally enforcing) rather
+    /// than through `has_enforcing_body_policy` alone. It is read only by
+    /// `on_scan_timeout: fail_closed`, and only when `outcome.timed_out` is set,
+    /// so every caller evaluates the predicate behind `outcome.timed_out` and
+    /// the in-budget path stays free of it.
     fn finish_scan(
         &self,
         ctx: &mut RequestContext,
@@ -1033,14 +1044,15 @@ impl Waf {
     ///
     /// The scan itself always ran (`run_body_scan_with_budget` /
     /// `run_cheap_with_budget` are both post-hoc), so this decides only the
-    /// CLEAN-but-late case. `enforces` is the caller's answer to "could this
-    /// surface have been refused?"; the `enforce_aware` default rejects exactly
-    /// there and forwards a monitor-only observation, so switching a WAF to
-    /// `monitor` never starts blocking on a slow scan.
+    /// CLEAN-but-late case — the WAF inspected the surface end to end and
+    /// nothing matched. `enforces` is the caller's answer to "could this surface
+    /// have been refused?"; the opt-in `fail_closed` rejects exactly there and
+    /// forwards a monitor-only observation, so switching a WAF to `monitor`
+    /// never starts blocking on a slow scan.
     fn finish_timeout(&self, ctx: &mut RequestContext, enforces: bool) -> PluginResult {
         let block = match self.config.on_scan_timeout {
             TimeoutAction::Block => true,
-            TimeoutAction::EnforceAware => enforces,
+            TimeoutAction::FailClosed => enforces,
             TimeoutAction::Allow | TimeoutAction::LogAndAllow => false,
         };
         if self.config.log_to_metadata {
@@ -1596,13 +1608,13 @@ impl Plugin for Waf {
         }
         let outcome = self.run_cheap_with_budget(|| self.run_cheap_scan(ctx));
         // Metadata/header/query/path scans are not disposition-aware on
-        // timeout: `enforce_aware` mirrors `on_body_too_large: fail_closed`,
-        // which is a BODY-coverage control. This surface is bounded by the
-        // frontend's header limits rather than by `max_scan_bytes`, is not
-        // buffered, decoded, or clamped, and cannot be made expensive by a
-        // large payload, so an over-budget clean cheap scan is a latency signal
-        // rather than a coverage risk. `on_scan_timeout: block` applies the
-        // strict deadline to every surface.
+        // timeout: `on_scan_timeout: fail_closed` mirrors
+        // `on_body_too_large: fail_closed`, which is a BODY sizing control. This
+        // surface is bounded by the frontend's header limits rather than by
+        // `max_scan_bytes`, is not buffered, decoded, or clamped, and cannot be
+        // made expensive by a large payload, so it has no `max_scan_bytes` to
+        // size and nothing for a fail-closed latency posture to act on.
+        // `on_scan_timeout: block` applies the strict deadline to every surface.
         self.finish_scan(ctx, outcome, WafScorePhase::Accumulating, false)
     }
 
@@ -1693,10 +1705,10 @@ impl Plugin for Waf {
             .run_body_scan_with_budget(|| self.run_request_body_scan(ctx, body, content_type))
             .await;
         outcome.truncated = truncated;
-        // Evaluated only on the timeout path: the same predicate that decides
-        // whether an unscannable body is a protection-mechanism failure or a
-        // lost observation now also decides a body whose scan missed its
-        // deadline (issue #5528).
+        // Read only by `on_scan_timeout: fail_closed`, and evaluated only on the
+        // timeout path: the same question that decides whether an unscannable
+        // body is a protection-mechanism failure or a lost observation also
+        // decides a clean body whose scan missed its deadline (issue #5528).
         let timeout_enforces = outcome.timed_out && self.request_body_policy_enforces(ctx, headers);
         self.finish_scan(ctx, outcome, WafScorePhase::Accumulating, timeout_enforces)
     }
@@ -2073,12 +2085,12 @@ fn parse_global_mode(raw: &str) -> Result<GlobalMode, String> {
 
 fn parse_timeout_action(raw: &str) -> Result<TimeoutAction, String> {
     match raw {
-        "enforce_aware" => Ok(TimeoutAction::EnforceAware),
         "allow" => Ok(TimeoutAction::Allow),
         "block" => Ok(TimeoutAction::Block),
+        "fail_closed" => Ok(TimeoutAction::FailClosed),
         "log_and_allow" => Ok(TimeoutAction::LogAndAllow),
         other => Err(format!(
-            "waf: 'on_scan_timeout' must be enforce_aware, allow, block, or \
+            "waf: 'on_scan_timeout' must be allow, block, fail_closed, or \
              log_and_allow; got {other:?}"
         )),
     }
@@ -2502,13 +2514,34 @@ mod tests {
         })
     }
 
-    /// The published default, pinned here because it is the whole point of
-    /// issue #5528: an omitted `on_scan_timeout` is disposition-aware, not
-    /// fail-open.
+    /// The published default. Issue #5528 removed the pre-scan bail, which
+    /// means a timeout now only ever reports a scan that RAN and found nothing;
+    /// the default therefore stays `log_and_allow` rather than turning a
+    /// latency budget into a rejection lever.
     #[test]
-    fn on_scan_timeout_defaults_to_enforce_aware() {
+    fn on_scan_timeout_defaults_to_log_and_allow() {
         let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
-        assert_eq!(plugin.config.on_scan_timeout, TimeoutAction::EnforceAware);
+        assert_eq!(plugin.config.on_scan_timeout, TimeoutAction::LogAndAllow);
+    }
+
+    /// The budget clock starts AFTER the fairness yield, so `scan_budget_ms`
+    /// measures the scan's own cost and never the scheduler's re-poll delay.
+    /// That delay is attacker-influenceable with a cheap request flood, while
+    /// `O(active_rules × max_scan_bytes)` is the term the operator can size.
+    #[tokio::test]
+    async fn scan_budget_excludes_the_pre_scan_yield_delay() {
+        let plugin = Waf::new(&timeout_config("log_and_allow")).unwrap();
+        // A ready sibling task on this single-threaded runtime is what the
+        // wrapper's fairness yield hands the worker to, and it holds the thread
+        // well past the 1 ms budget. The scan itself is instantaneous.
+        let _blocker = tokio::spawn(async { std::thread::sleep(Duration::from_millis(5)) });
+
+        let outcome = plugin.run_body_scan_with_budget(ScanOutcome::default).await;
+
+        assert!(
+            !outcome.timed_out,
+            "scheduler delay before the scan must not count against scan_budget_ms"
+        );
     }
 
     /// The body-scan wrapper is POST-HOC ONLY (issue #5528): a scan that blows
@@ -2542,8 +2575,8 @@ mod tests {
     #[test]
     fn scan_timeout_disposition_table() {
         for (action, enforces, expect_reject) in [
-            ("enforce_aware", true, true),
-            ("enforce_aware", false, false),
+            ("fail_closed", true, true),
+            ("fail_closed", false, false),
             ("allow", true, false),
             ("log_and_allow", true, false),
             ("block", true, true),

@@ -1133,10 +1133,14 @@ otherwise prefix-scans; `scan_truncated` always prefix-scans; `skip` forwards
 uninspected; `block` closes whenever the instance is globally enforcing. An
 uninspectable message representation closes the connection when the direction
 enforces. A scan that completed over `scan_budget_ms` without a blocking hit is
-decided by `on_scan_timeout`: `enforce_aware` (default) closes when that
-direction carries an enforcing body policy and otherwise forwards, `block`
-always closes, and `allow` / `log_and_allow` forward. The scan itself is never
-skipped, so a hit found over budget still closes.
+decided by `on_scan_timeout`: `log_and_allow` (default) and `allow` forward,
+`fail_closed` closes when that direction carries an enforcing body policy and
+otherwise forwards, and `block` always closes. The session policy resolves
+`fail_closed` through the same disjunction as the HTTP
+`request_body_policy_enforces` / `response_body_policy_enforces` predicates,
+including the `on_body_too_large: block` term, so both paths decide one config
+identically. The scan itself is never skipped, so a hit found over budget still
+closes.
 Every close is a fixed RFC 6455 code 1008 with a compiled-in reason that never
 echoes message bytes.
 

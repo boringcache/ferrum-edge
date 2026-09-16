@@ -109,6 +109,19 @@ pub(super) struct WsSessionPolicy {
     enforcing_client_to_backend: bool,
     /// Backend→client counterpart.
     enforcing_backend_to_client: bool,
+    /// Whether `on_scan_timeout: fail_closed` closes the session on a CLEAN
+    /// client→backend message whose scan missed `scan_budget_ms`.
+    ///
+    /// Mirrors the HTTP `request_body_policy_enforces` disjunction rather than
+    /// reusing `enforcing_client_to_backend`: while globally enforcing,
+    /// `on_body_too_large: block` is itself a blocking body disposition even
+    /// when every applicable body rule is monitor-only, and `fail_closed` must
+    /// decide identically on both paths. It is deliberately NOT folded into
+    /// `enforcing_*`, which answers the narrower "did a body RULE enforce?"
+    /// question that `clamp` and `uninspectable` ask.
+    timeout_enforcing_client_to_backend: bool,
+    /// Backend→client counterpart, mirroring `response_body_policy_enforces`.
+    timeout_enforcing_backend_to_client: bool,
 }
 
 impl WsSessionPolicy {
@@ -124,6 +137,15 @@ impl WsSessionPolicy {
         let exempt = waf.exemptions.request_short_circuits(ctx);
         let inspect_client_to_backend = !exempt && waf.requires_request_body_buffering();
         let inspect_backend_to_client = !exempt && waf.requires_response_body_buffering();
+        let enforcing_client_to_backend = inspect_client_to_backend
+            && waf.has_enforcing_body_policy(BodyDirection::Request, ctx);
+        let enforcing_backend_to_client = inspect_backend_to_client
+            && waf.has_enforcing_body_policy(BodyDirection::Response, ctx);
+        // The `(mode == enforce && on_body_too_large == block)` term both HTTP
+        // body predicates OR in: a strict size cap is a blocking body
+        // disposition on its own, independent of per-rule `action`.
+        let strict_size_cap = waf.config.mode == GlobalMode::Enforce
+            && waf.config.on_body_too_large == TooLargeAction::Block;
         Self {
             suppressed_by_request: waf.exemptions.suppresses_rule_for_request(ctx),
             rule_conditions: waf
@@ -134,10 +156,12 @@ impl WsSessionPolicy {
                 .collect(),
             inspect_client_to_backend,
             inspect_backend_to_client,
-            enforcing_client_to_backend: inspect_client_to_backend
-                && waf.has_enforcing_body_policy(BodyDirection::Request, ctx),
-            enforcing_backend_to_client: inspect_backend_to_client
-                && waf.has_enforcing_body_policy(BodyDirection::Response, ctx),
+            enforcing_client_to_backend,
+            enforcing_backend_to_client,
+            timeout_enforcing_client_to_backend: enforcing_client_to_backend
+                || (inspect_client_to_backend && strict_size_cap),
+            timeout_enforcing_backend_to_client: enforcing_backend_to_client
+                || (inspect_backend_to_client && strict_size_cap),
         }
     }
 
@@ -170,6 +194,15 @@ impl WsSessionPolicy {
         match direction {
             BodyDirection::Request => self.enforcing_client_to_backend,
             BodyDirection::Response => self.enforcing_backend_to_client,
+        }
+    }
+
+    /// The `on_scan_timeout: fail_closed` predicate, mirroring the HTTP
+    /// `request_body_policy_enforces` / `response_body_policy_enforces` pair.
+    fn timeout_enforces(&self, direction: BodyDirection) -> bool {
+        match direction {
+            BodyDirection::Request => self.timeout_enforcing_client_to_backend,
+            BodyDirection::Response => self.timeout_enforcing_backend_to_client,
         }
     }
 }
@@ -394,10 +427,12 @@ impl WafWsSession {
     /// confirmed blocking hit. Mirrors `Waf::finish_timeout`.
     ///
     /// The scan always runs (`run_body_scan_with_budget` is post-hoc only), so
-    /// this decides the clean-but-late message. The `enforce_aware` default
-    /// closes exactly when that direction carries an enforcing body policy —
-    /// the same session-bound predicate `clamp` and `uninspectable` already use
-    /// — so a monitor-only session never starts closing on a slow scan.
+    /// this decides the clean-but-late message: the WAF inspected it end to end
+    /// and nothing matched. The opt-in `fail_closed` closes exactly when that
+    /// direction carries an enforcing body policy, resolved through the
+    /// session-bound `timeout_enforces` mirror of the HTTP body predicates, so
+    /// a monitor-only session never starts closing on a slow scan and the two
+    /// paths decide the same config identically.
     fn finish_timeout(
         &self,
         proxy_id: &str,
@@ -410,7 +445,7 @@ impl WafWsSession {
         }
         let block = match self.waf.config.on_scan_timeout {
             TimeoutAction::Block => true,
-            TimeoutAction::EnforceAware => self.policy.enforces(body_direction(direction)),
+            TimeoutAction::FailClosed => self.policy.timeout_enforces(body_direction(direction)),
             TimeoutAction::Allow | TimeoutAction::LogAndAllow => false,
         };
         // A WebSocket message carries no `waf.*` transaction metadata, so this

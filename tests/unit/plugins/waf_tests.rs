@@ -14,19 +14,18 @@ fn ctx(method: &str, path: &str) -> RequestContext {
 /// Build a WAF for the rule-semantics tests in this file.
 ///
 /// Pins `scan_budget_ms: 0` (unbounded) unless the config sets its own budget.
-/// The production default is a 50 ms wall-clock budget, and since issue #5528
-/// an over-budget scan under an enforcing body policy rejects by default. The
-/// scan itself is never skipped any more, so a recorded hit no longer depends
-/// on machine speed — but a CLEAN body scanned by a starved runner
-/// (an oversubscribed machine, parallel test threads beside busy neighbours)
-/// would still turn an expected `Continue` into `Reject` plus
-/// `waf.scan_timed_out=true`, so a test of rule behaviour would really be
-/// asserting machine speed. The budget and `on_scan_timeout` paths are covered
-/// on their own terms by the `scan_budget_*` / `scan_timeout_*` tests in
-/// `src/plugins/waf/mod.rs`, the issue #5528 section at the end of this file,
-/// and `scan_timeout_block_closes_the_session` in the WebSocket message tests;
-/// the construction-admission tests below call `Waf::new` directly so they
-/// exercise exactly the config they describe.
+/// The production default is a 50 ms wall-clock budget, which since issue #5528
+/// never skips the scan — so a recorded hit no longer depends on machine speed.
+/// A CLEAN body scanned by a starved runner (an oversubscribed machine,
+/// parallel test threads beside busy neighbours) still picks up
+/// `waf.scan_timed_out=true`, and under the opt-in
+/// `on_scan_timeout: fail_closed` would turn an expected `Continue` into
+/// `Reject`, so a test of rule behaviour would really be asserting machine
+/// speed. The budget and `on_scan_timeout` paths are covered on their own terms
+/// by the `scan_budget_*` / `scan_timeout_*` tests in `src/plugins/waf/mod.rs`,
+/// the issue #5528 section at the end of this file, and the `scan_timeout_*`
+/// tests in the WebSocket message tests; the construction-admission tests below
+/// call `Waf::new` directly so they exercise exactly the config they describe.
 fn waf(mut config: serde_json::Value) -> Result<Waf, String> {
     pin_unbounded_scan_budget(&mut config);
     Waf::new(&config)
@@ -8461,13 +8460,12 @@ fn waf_config_schema_and_constructor_admission_agree() {
     }
 }
 
-// ── Issue #5528: the scan budget is post-hoc, and its default is
-// disposition-aware ────────────────────────────────────────────────────────
+// ── Issue #5528: the scan budget is post-hoc; `on_scan_timeout` decides only
+// a clean-but-late scan ───────────────────────────────────────────────────
 
 /// A clean body large enough that normalizing and scanning it cannot finish
-/// inside a 1 ms budget — the same size/budget pair
-/// `scan_timeout_block_closes_the_session` already relies on for WebSocket
-/// messages, which share this wrapper.
+/// inside a 1 ms budget — the same size/budget pair the WebSocket message tests
+/// rely on, which share this wrapper.
 ///
 /// Exactly `max_scan_bytes` (the default), so `on_body_too_large` never
 /// participates in these cases and the whole body is scanned. Every config
@@ -8481,7 +8479,8 @@ fn over_budget_clean_body() -> Vec<u8> {
 /// recorded hit can only come from the configured rule under test.
 const TIMEOUT_TOKEN: &str = "ferrum-prohibited-token";
 
-/// `scan_budget_ms: 1` with an enforcing request-body rule.
+/// `scan_budget_ms: 1` with an enforcing request-body rule, on the DEFAULT
+/// `on_scan_timeout` (`log_and_allow`).
 fn enforcing_body_rule_over_budget() -> serde_json::Value {
     json!({
         "mode": "enforce",
@@ -8499,12 +8498,20 @@ fn enforcing_body_rule_over_budget() -> serde_json::Value {
     })
 }
 
+/// The same instance under the opt-in strict-latency posture.
+fn fail_closed_body_rule_over_budget() -> serde_json::Value {
+    let mut config = enforcing_body_rule_over_budget();
+    config["on_scan_timeout"] = json!("fail_closed");
+    config
+}
+
 /// A body scan is never skipped, whatever the budget did before it started.
 ///
 /// The wrapper used to bail out before the scan when the scheduler alone had
 /// burned `scan_budget_ms` across its `yield_now()`, which discarded the hits
 /// an enforcing rule would have produced. The budget is post-hoc only now, so
-/// this rejects on every machine regardless of how the deadline lands.
+/// this rejects on every machine regardless of how the deadline lands — and on
+/// the fail-open default, where only the hit itself can reject.
 #[tokio::test]
 async fn an_exhausted_scan_budget_never_skips_the_request_body_scan() {
     let plugin = waf(enforcing_body_rule_over_budget()).unwrap();
@@ -8523,20 +8530,53 @@ async fn an_exhausted_scan_budget_never_skips_the_request_body_scan() {
         Some("CUSTOM-TIMEOUT-REQ"),
         "the hits of an over-budget scan must survive the deadline"
     );
+    assert_eq!(
+        ctx.metadata.get("waf.block_reason").map(String::as_str),
+        Some("rule"),
+        "the rule decided this request, not the deadline"
+    );
 }
 
-/// A clean-but-late request body under an enforcing body policy fails closed on
-/// the default `on_scan_timeout`.
+/// The default disposition is unchanged by issue #5528. A body the WAF scanned
+/// end to end and found clean is forwarded with a record of the missed
+/// deadline: the budget is a latency signal, not a coverage gap.
 #[tokio::test]
-async fn an_over_budget_clean_request_body_is_rejected_under_enforcing_policy() {
+async fn an_over_budget_clean_request_body_is_forwarded_by_default() {
     let plugin = waf(enforcing_body_rule_over_budget()).unwrap();
 
     let (result, ctx) =
         scan_body_with_content_type(&plugin, "text/plain", &over_budget_clean_body()).await;
 
     assert!(
+        matches!(result, PluginResult::Continue),
+        "the default on_scan_timeout must not reject a fully scanned clean body"
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.scan_timed_out").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("clean")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.block_reason").map(String::as_str),
+        None
+    );
+}
+
+/// The opt-in `fail_closed` posture rejects a clean-but-late request body when
+/// the governed direction carries an enforcing body policy.
+#[tokio::test]
+async fn an_over_budget_clean_request_body_is_rejected_under_fail_closed() {
+    let plugin = waf(fail_closed_body_rule_over_budget()).unwrap();
+
+    let (result, ctx) =
+        scan_body_with_content_type(&plugin, "text/plain", &over_budget_clean_body()).await;
+
+    assert!(
         matches!(result, PluginResult::Reject { .. }),
-        "the default on_scan_timeout must fail closed under an enforcing body policy"
+        "fail_closed must reject under an enforcing body policy"
     );
     assert_eq!(
         ctx.metadata.get("waf.scan_timed_out").map(String::as_str),
@@ -8558,11 +8598,11 @@ async fn an_over_budget_clean_request_body_is_rejected_under_enforcing_policy() 
     );
 }
 
-/// Monitor-only policy keeps the observational posture: a slow scan is recorded
-/// and forwarded, never blocked.
+/// Monitor-only policy keeps the observational posture even under
+/// `fail_closed`: a slow scan is recorded and forwarded, never blocked.
 #[tokio::test]
 async fn an_over_budget_clean_request_body_is_allowed_under_monitor_only_policy() {
-    let mut config = enforcing_body_rule_over_budget();
+    let mut config = fail_closed_body_rule_over_budget();
     config["mode"] = json!("monitor");
     let plugin = waf(config).unwrap();
 
@@ -8584,7 +8624,7 @@ async fn an_over_budget_clean_request_body_is_allowed_under_monitor_only_policy(
     );
 }
 
-/// The default is scoped to the governed DIRECTION, not to the global mode: a
+/// `fail_closed` is scoped to the governed DIRECTION, not to the global mode: a
 /// globally enforcing WAF whose only enforcing rule reads the URL path forwards
 /// a slow request body, because a hit in that body could not have blocked it
 /// either.
@@ -8593,6 +8633,7 @@ async fn an_over_budget_clean_request_body_is_allowed_when_only_another_target_e
     let plugin = waf(json!({
         "mode": "enforce",
         "scan_budget_ms": 1,
+        "on_scan_timeout": "fail_closed",
         "include_default_rules": false,
         "custom_rules": [
             {
@@ -8627,7 +8668,48 @@ async fn an_over_budget_clean_request_body_is_allowed_when_only_another_target_e
     );
 }
 
-/// `allow` and `log_and_allow` remain available as explicit operator opt-outs.
+/// `fail_closed` resolves the question through `request_body_policy_enforces`,
+/// not `has_enforcing_body_policy` alone: while globally enforcing,
+/// `on_body_too_large: block` is itself a blocking body disposition even when
+/// every applicable body rule is monitor-only. The WebSocket session policy
+/// mirrors this exact case in
+/// `scan_timeout_closes_a_monitor_only_session_under_a_strict_size_cap`.
+#[tokio::test]
+async fn an_over_budget_clean_request_body_is_rejected_under_a_strict_size_cap() {
+    let plugin = waf(json!({
+        "mode": "enforce",
+        "scan_budget_ms": 1,
+        "on_scan_timeout": "fail_closed",
+        "on_body_too_large": "block",
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-TIMEOUT-BODY-MONITOR",
+            "name": "monitored request token",
+            "category": "custom",
+            "target": "body_text",
+            "match_kind": "contains",
+            "pattern": TIMEOUT_TOKEN,
+            "action": "monitor"
+        }]
+    }))
+    .unwrap();
+
+    let (result, ctx) =
+        scan_body_with_content_type(&plugin, "text/plain", &over_budget_clean_body()).await;
+
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "a strict size cap is a blocking body disposition on its own"
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.block_reason").map(String::as_str),
+        Some("scan_timeout")
+    );
+}
+
+/// `allow` and `log_and_allow` forward a clean over-budget body. Both still
+/// record `waf.scan_timed_out`; only the sampled warning is suppressed under
+/// `allow`.
 #[tokio::test]
 async fn explicit_timeout_opt_outs_forward_an_over_budget_clean_request_body() {
     for action in ["allow", "log_and_allow"] {
@@ -8653,10 +8735,11 @@ async fn explicit_timeout_opt_outs_forward_an_over_budget_clean_request_body() {
 /// The response side follows the same table through its own enforcing
 /// predicate.
 #[tokio::test]
-async fn an_over_budget_clean_response_body_is_rejected_under_enforcing_policy() {
+async fn an_over_budget_clean_response_body_is_rejected_under_fail_closed() {
     let plugin = waf(json!({
         "mode": "enforce",
         "scan_budget_ms": 1,
+        "on_scan_timeout": "fail_closed",
         "include_default_rules": false,
         "response_inspection": true,
         "response_body_inspection": true,
@@ -8701,20 +8784,23 @@ async fn an_over_budget_clean_response_body_is_rejected_under_enforcing_policy()
 }
 
 #[test]
-fn on_scan_timeout_accepts_enforce_aware_and_rejects_unknown_values() {
-    let accepted = Waf::new(&json!({ "mode": "monitor", "on_scan_timeout": "enforce_aware" }));
+fn on_scan_timeout_accepts_fail_closed_and_rejects_unknown_values() {
+    let accepted = Waf::new(&json!({ "mode": "monitor", "on_scan_timeout": "fail_closed" }));
     assert!(accepted.is_ok());
 
-    let rejected = Waf::new(&json!({ "mode": "monitor", "on_scan_timeout": "fail_closed" }));
+    // The pre-rename spelling is not an alias: the build-out policy keeps no
+    // compatibility shims for renamed config values.
+    let rejected = Waf::new(&json!({ "mode": "monitor", "on_scan_timeout": "enforce_aware" }));
     let error = rejected.unwrap_err();
     assert!(
-        error.contains("enforce_aware") && error.contains("log_and_allow"),
+        error.contains("fail_closed") && error.contains("log_and_allow"),
         "unknown on_scan_timeout value must name the supported set, got: {error}"
     );
 }
 
 /// `on_scan_timeout` is a security-relevant default, so the published schema
-/// must agree with the runtime parser on both the accepted set and the default.
+/// must agree with the runtime parser on the accepted set, its order, the
+/// default, and nullability.
 #[test]
 fn on_scan_timeout_openapi_runtime_parity() {
     use serde_json::Value as JsonValue;
@@ -8726,8 +8812,8 @@ fn on_scan_timeout_openapi_runtime_parity() {
         .expect("WafPluginConfig.on_scan_timeout schema");
 
     assert_eq!(
-        schema["default"], "enforce_aware",
-        "openapi default must stay the disposition-aware value"
+        schema["default"], "log_and_allow",
+        "a fully scanned clean body must not start rejecting on a latency budget"
     );
     let members = schema["enum"].as_array().expect("on_scan_timeout enum");
     assert!(
@@ -8737,7 +8823,7 @@ fn on_scan_timeout_openapi_runtime_parity() {
     let documented: Vec<&str> = members.iter().filter_map(JsonValue::as_str).collect();
     assert_eq!(
         documented,
-        vec!["enforce_aware", "allow", "block", "log_and_allow"]
+        vec!["allow", "block", "fail_closed", "log_and_allow"]
     );
     for value in &documented {
         assert!(
