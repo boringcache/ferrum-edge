@@ -26,6 +26,18 @@
 //! no locks, allocations, or per-flow labels. Zero samples are ignored;
 //! samples that would overflow `u64` sum are dropped entirely.
 //!
+//! ## Drop-reason accounting
+//!
+//! Capture-bypass decisions are the one family of counters that does NOT
+//! come from the ringbuf records. The kernel bumps a per-CPU
+//! `FERRUM_SOCK_OPS_STATS` slot per reason before publishing the
+//! `SOCK_OPS_EVENT_DROP_REASON` record, and the consumer polls those slots
+//! and feeds the deltas to [`BpfMetricsState::record_drops`]. The ringbuf
+//! record is best-effort — a full ring discards it — so counting records
+//! would drop bypass classifications precisely when the node is busiest,
+//! and `ferrum_mesh_bpf_drops_total` would report an increase that is not
+//! there (or miss one that is).
+//!
 //! ## Ringbuf overrun handling
 //!
 //! [`BpfMetricsState::record_ringbuf_overrun`] increments `ringbuf_overruns`
@@ -155,7 +167,10 @@ pub struct BpfMetricsState {
         [CachePadded<AtomicU64>; BPF_LATENCY_EXCLUSIVE_BUCKET_COUNT],
 
     // BPF drop-reason counters — one bin per reason. Produced by the
-    // connect4/connect6 bypass paths via the shared ringbuf.
+    // connect4/connect6 bypass paths and carried to userspace by the
+    // per-CPU `FERRUM_SOCK_OPS_STATS` drop-reason slots, NOT by the
+    // ringbuf record: a full ring discards the record, and these counters
+    // must stay exact across an overrun.
     pub drop_bypass_uid_hit: AtomicU64,
     pub drop_exclude_cidr_hit: AtomicU64,
     pub drop_not_in_include_cidr: AtomicU64,
@@ -221,14 +236,35 @@ impl BpfMetricsState {
         );
     }
 
-    pub fn record_drop(&self, reason: BpfDropReason) {
-        let target = match reason {
+    fn drop_counter(&self, reason: BpfDropReason) -> &AtomicU64 {
+        match reason {
             BpfDropReason::BypassUidHit => &self.drop_bypass_uid_hit,
             BpfDropReason::ExcludeCidrHit => &self.drop_exclude_cidr_hit,
             BpfDropReason::NotInIncludeCidr => &self.drop_not_in_include_cidr,
             BpfDropReason::ExcludePortHit => &self.drop_exclude_port_hit,
-        };
-        target.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_drop(&self, reason: BpfDropReason) {
+        self.record_drops(reason, 1);
+    }
+
+    /// Add `count` newly-observed bypass decisions for `reason`.
+    ///
+    /// The production consumer calls this with the delta of the kernel's
+    /// per-CPU `FERRUM_SOCK_OPS_STATS` drop-reason slot, which is the
+    /// accounting authority: the `SOCK_OPS_EVENT_DROP_REASON` ringbuf record
+    /// is discarded whenever the ring is full, so counting the ringbuf
+    /// records instead would silently under-report exactly when the node is
+    /// busiest. There is deliberately only ONE writer for these counters —
+    /// mixing a per-record increment with a kernel-delta increment would
+    /// double-count every decision that made it through the ring.
+    pub fn record_drops(&self, reason: BpfDropReason, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.drop_counter(reason)
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     pub fn record_ringbuf_event(&self) {

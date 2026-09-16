@@ -23,6 +23,12 @@
 //!      after each drain. When the sum advances, the consumer is in an
 //!      overrun regime; [`SockOpsConsumer::record_overrun`] handles the
 //!      warn/recover state machine so the log line never spams.
+//!   5. Polls the per-CPU capture-bypass counters in the same stats map on a
+//!      wall-clock timer and publishes their deltas. Those slots — not the
+//!      `SOCK_OPS_EVENT_DROP_REASON` ringbuf records — are the accounting
+//!      authority for `ferrum_mesh_bpf_drops_total`: a full ring discards the
+//!      record while the kernel slot still moves, so counting records lost
+//!      bypass classifications exactly when the node was busiest.
 //!
 //! On Linux `ebpf` builds, [`run_pinned_consumer`] waits for the
 //! node-agent pins with capped exponential backoff (1s → 30s) and
@@ -43,11 +49,43 @@ use ferrum_ebpf_common::{
     SOCK_OPS_DROP_NOT_IN_INCLUDE_CIDR, SOCK_OPS_EVENT_ACCEPT_ESTABLISHED,
     SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY, SOCK_OPS_EVENT_CONNECT,
     SOCK_OPS_EVENT_DROP_REASON, SOCK_OPS_EVENT_FIN, SOCK_OPS_EVENT_RST, SOCK_OPS_EVENT_RTT_SAMPLE,
-    SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY, SockOpsRecord,
+    SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY, SOCK_OPS_STATS_DROP_BYPASS_UID_HIT,
+    SOCK_OPS_STATS_DROP_EXCLUDE_CIDR_HIT, SOCK_OPS_STATS_DROP_EXCLUDE_PORT_HIT,
+    SOCK_OPS_STATS_DROP_NOT_IN_INCLUDE_CIDR, SockOpsRecord,
 };
 use tracing::{info, warn};
 
 use crate::ebpf::bpf_metrics::{BpfDropReason, BpfMetricsState, TcpDirection};
+
+/// Number of advertised capture-bypass reasons.
+pub const BPF_DROP_REASON_COUNT: usize = 4;
+
+/// Fixed `(reason, FERRUM_SOCK_OPS_STATS index)` pairs shared by the kernel
+/// emitter (`emit_drop_reason`) and the userspace poller.
+///
+/// The order is the Prometheus exposition order; the indices are the
+/// accounting authority for `ferrum_mesh_bpf_drops_total`. Slot `0` is
+/// deliberately absent — it is the ringbuf dropped-events counter that drives
+/// the overrun regime, and a drop reason landing there would manufacture a
+/// phantom overrun.
+pub const BPF_DROP_REASON_STATS_SLOTS: [(BpfDropReason, u32); BPF_DROP_REASON_COUNT] = [
+    (
+        BpfDropReason::BypassUidHit,
+        SOCK_OPS_STATS_DROP_BYPASS_UID_HIT,
+    ),
+    (
+        BpfDropReason::ExcludeCidrHit,
+        SOCK_OPS_STATS_DROP_EXCLUDE_CIDR_HIT,
+    ),
+    (
+        BpfDropReason::NotInIncludeCidr,
+        SOCK_OPS_STATS_DROP_NOT_IN_INCLUDE_CIDR,
+    ),
+    (
+        BpfDropReason::ExcludePortHit,
+        SOCK_OPS_STATS_DROP_EXCLUDE_PORT_HIT,
+    ),
+];
 
 /// Number of consecutive `Drained` poll outcomes after an overrun before
 /// the consumer considers the regime recovered. Three is consistent with
@@ -185,8 +223,23 @@ impl SockOpsConsumer {
             SockOpsEvent::AcceptToFirstByteLatency { us, .. } => {
                 self.metrics.record_accept_to_first_byte(us)
             }
-            SockOpsEvent::DropReason(reason) => self.metrics.record_drop(reason),
+            // Drop reasons are NOT counted here. The record still belongs to
+            // the event stream (and is counted as a ringbuf event above), but
+            // the accounting authority is the kernel's per-CPU
+            // `FERRUM_SOCK_OPS_STATS` drop-reason slot, drained by
+            // `publish_drop_reason_deltas`. A full ringbuf discards this
+            // record, so counting it would under-report bypass decisions
+            // exactly when the node is busiest — and counting BOTH would
+            // double-count every decision that survived the ring.
+            SockOpsEvent::DropReason(_) => {}
         }
+    }
+
+    /// Add `count` bypass decisions observed for `reason` on the kernel-side
+    /// per-CPU counters. Sole writer for the drop-reason counters; see
+    /// [`BpfMetricsState::record_drops`].
+    pub fn record_drops(&self, reason: BpfDropReason, count: u64) {
+        self.metrics.record_drops(reason, count);
     }
 
     /// Drive the warn-on-enter / info-on-recover state machine after
@@ -272,6 +325,23 @@ pub fn seed_dropped_baseline(consumer: &SockOpsConsumer, dropped_total: u64) -> 
     dropped_total
 }
 
+/// New bypass decisions to publish for one reason, given the previously
+/// adopted kernel total and the freshly-read one.
+///
+/// The kernel counter is cumulative per map generation. A generation reset —
+/// the node-agent restarted and re-created the map, so the counters are back
+/// near zero — shows up as `current < last`; everything the new generation
+/// reports happened after the rotation, so all of it is new. Without this the
+/// metric would stall until the new generation climbed past the old total,
+/// which is exactly the window an operator is watching after a restart.
+pub fn drop_reason_delta(last: u64, current: u64) -> u64 {
+    if current >= last {
+        current - last
+    } else {
+        current
+    }
+}
+
 /// Production async consumer that opens the pinned SOCK_OPS ringbuf and
 /// drives the [`SockOpsConsumer`] dispatch from kernel events.
 ///
@@ -288,7 +358,7 @@ pub mod production {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    use aya::maps::{Map, MapData, PerCpuArray, RingBuf, SockHash};
+    use aya::maps::{Map, MapData, MapError, PerCpuArray, RingBuf, SockHash};
     use ferrum_ebpf_common::{
         ACCEPT_FIRST_BYTE_MAP_MAX_ENTRIES, SOCK_OPS_STATS_EVENTS_DROPPED, SockOpsRecord,
     };
@@ -297,7 +367,8 @@ pub mod production {
     use tracing::{debug, info, warn};
 
     use super::{
-        PollOutcome, SOCK_OPS_RECOVERY_THRESHOLD, SockOpsConsumer, SockOpsEvent,
+        BPF_DROP_REASON_COUNT, BPF_DROP_REASON_STATS_SLOTS, PollOutcome,
+        SOCK_OPS_RECOVERY_THRESHOLD, SockOpsConsumer, SockOpsEvent, drop_reason_delta,
         seed_dropped_baseline,
     };
     use crate::ebpf::{
@@ -306,9 +377,18 @@ pub mod production {
     };
 
     static MALFORMED_SOCK_OPS_RECORD_WARNED: AtomicBool = AtomicBool::new(false);
+    static DROP_REASON_STATS_READ_WARNED: AtomicBool = AtomicBool::new(false);
     const FIRST_BYTE_HOOK_REMOVAL_GRACE: Duration = Duration::from_millis(250);
     const FIRST_BYTE_HOOK_CLEANUP_INTERVAL: Duration = Duration::from_millis(50);
     const FIRST_BYTE_HOOK_REMOVAL_QUEUE_CAP: usize = ACCEPT_FIRST_BYTE_MAP_MAX_ENTRIES as usize;
+    /// How often the kernel per-CPU drop-reason counters are polled.
+    ///
+    /// Deliberately a timer rather than a per-drain read: the drop-reason
+    /// counters must keep advancing even while the ringbuf produces nothing
+    /// (a quiet node still makes bypass decisions), and four extra
+    /// `bpf_map_lookup_elem` syscalls per ringbuf drain would scale with the
+    /// event rate instead of with wall-clock time.
+    const DROP_REASON_STATS_INTERVAL: Duration = Duration::from_secs(1);
 
     /// Run the consumer until the shutdown signal fires or an unrecoverable
     /// error is observed. Spawn via `tokio::spawn(run_pinned_consumer(...))`.
@@ -341,6 +421,11 @@ pub mod production {
 
         let mut last_dropped_total: u64 =
             seed_dropped_baseline(&consumer, read_dropped_total(&stats));
+        // Adopt the generation's existing per-reason totals as the baseline
+        // rather than replaying them: those bypass decisions predate this
+        // consumer, exactly like `seed_dropped_baseline` treats the kernel
+        // dropped total.
+        let mut last_drop_totals: [u64; BPF_DROP_REASON_COUNT] = read_drop_reason_totals(&stats);
         let mut consecutive_drained: u32 = 0;
         let mut pending_first_byte_removals = VecDeque::new();
 
@@ -369,6 +454,9 @@ pub mod production {
         let mut first_byte_cleanup = tokio::time::interval(FIRST_BYTE_HOOK_CLEANUP_INTERVAL);
         first_byte_cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         first_byte_cleanup.tick().await; // consume the immediate first tick
+        let mut drop_reason_refresh = tokio::time::interval(DROP_REASON_STATS_INTERVAL);
+        drop_reason_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        drop_reason_refresh.tick().await; // consume the immediate first tick
 
         loop {
             tokio::select! {
@@ -416,6 +504,7 @@ pub mod production {
                                     &consumer,
                                     read_dropped_total(&stats),
                                 );
+                                last_drop_totals = read_drop_reason_totals(&stats);
                                 consecutive_drained = 0;
                                 events_inode = pin_inode(BPF_SOCK_OPS_EVENTS_PIN_PATH);
                                 info!(
@@ -439,6 +528,9 @@ pub mod production {
                         &mut pending_first_byte_removals,
                         Instant::now(),
                     );
+                }
+                _ = drop_reason_refresh.tick() => {
+                    publish_drop_reason_deltas(&stats, &consumer, &mut last_drop_totals);
                 }
                 guard = async_fd.readable() => {
                     let mut guard = guard.map_err(|e| anyhow::anyhow!("SOCK_OPS AsyncFd readable failed: {e}"))?;
@@ -771,9 +863,15 @@ pub mod production {
         }
     }
 
+    fn read_stats_slot(stats: &PerCpuArray<MapData, u64>, index: u32) -> Result<u64, MapError> {
+        stats
+            .get(&index, 0)
+            .map(|values| values.iter().copied().sum())
+    }
+
     fn read_dropped_total(stats: &PerCpuArray<MapData, u64>) -> u64 {
-        match stats.get(&SOCK_OPS_STATS_EVENTS_DROPPED, 0) {
-            Ok(values) => values.iter().copied().sum(),
+        match read_stats_slot(stats, SOCK_OPS_STATS_EVENTS_DROPPED) {
+            Ok(total) => total,
             Err(e) => {
                 warn!(
                     pin_path = BPF_SOCK_OPS_STATS_PIN_PATH,
@@ -782,6 +880,64 @@ pub mod production {
                 );
                 0
             }
+        }
+    }
+
+    /// Read every kernel per-CPU drop-reason total for the current map
+    /// generation. Used to adopt a baseline on attach and on pin rotation.
+    ///
+    /// A slot that cannot be read yields `0`, which as a BASELINE is the
+    /// conservative choice: the next successful poll then publishes the whole
+    /// generation rather than silently discarding it. The read failure itself
+    /// is surfaced by [`publish_drop_reason_deltas`].
+    fn read_drop_reason_totals(stats: &PerCpuArray<MapData, u64>) -> [u64; BPF_DROP_REASON_COUNT] {
+        let mut totals = [0u64; BPF_DROP_REASON_COUNT];
+        for (slot, (_, index)) in BPF_DROP_REASON_STATS_SLOTS.iter().enumerate() {
+            totals[slot] = read_stats_slot(stats, *index).unwrap_or(0);
+        }
+        totals
+    }
+
+    /// Publish newly-observed bypass decisions from the kernel per-CPU
+    /// counters.
+    ///
+    /// These counters — not the `SOCK_OPS_EVENT_DROP_REASON` ringbuf records
+    /// — are the accounting authority for `ferrum_mesh_bpf_drops_total`: a
+    /// full ring discards the record while the kernel slot still moves, so
+    /// counting records lost bypass classifications exactly when the node was
+    /// busiest.
+    fn publish_drop_reason_deltas(
+        stats: &PerCpuArray<MapData, u64>,
+        consumer: &SockOpsConsumer,
+        last_totals: &mut [u64; BPF_DROP_REASON_COUNT],
+    ) {
+        for (slot, (reason, index)) in BPF_DROP_REASON_STATS_SLOTS.iter().enumerate() {
+            let current = match read_stats_slot(stats, *index) {
+                Ok(current) => current,
+                Err(e) => {
+                    log_drop_reason_stats_read_failure(*index, &e);
+                    continue;
+                }
+            };
+            consumer.record_drops(*reason, drop_reason_delta(last_totals[slot], current));
+            last_totals[slot] = current;
+        }
+    }
+
+    /// Warn once that the pinned stats map cannot serve the drop-reason
+    /// slots. Repeating this every second would starve the admin log path,
+    /// and the condition is static: a node-agent whose map predates the
+    /// per-reason slots never grows them.
+    fn log_drop_reason_stats_read_failure(index: u32, error: &MapError) {
+        if !DROP_REASON_STATS_READ_WARNED.swap(true, Ordering::Relaxed) {
+            warn!(
+                pin_path = BPF_SOCK_OPS_STATS_PIN_PATH,
+                index,
+                error = %error,
+                "Failed to read SOCK_OPS per-reason bypass counter; \
+                 ferrum_mesh_bpf_drops_total will not advance until the \
+                 pinned stats map exposes the drop-reason slots"
+            );
         }
     }
 
@@ -846,7 +1002,10 @@ mod tests {
         assert_eq!(s.syn_to_ack_us_sum, 60);
         assert_eq!(s.accept_to_first_byte_us_sum, 800);
         assert_eq!(s.accept_to_first_byte_count, 1);
-        assert_eq!(s.drop_bypass_uid_hit, 1);
+        // The drop-reason RECORD is part of the event stream but is not the
+        // accounting authority: `ferrum_mesh_bpf_drops_total` is fed from the
+        // kernel per-CPU counters, which a full ringbuf cannot discard.
+        assert_eq!(s.drop_bypass_uid_hit, 0);
         // Every handled event also bumps the consumed-events counter.
         assert_eq!(s.ringbuf_events_consumed, 10);
     }
@@ -1051,7 +1210,7 @@ mod tests {
     fn seed_dropped_baseline_nonzero_enters_overrun_once() {
         let consumer = SockOpsConsumer::new(BpfMetricsState::new());
         consumer.handle_event(SockOpsEvent::Connect);
-        consumer.handle_event(SockOpsEvent::DropReason(BpfDropReason::ExcludePortHit));
+        consumer.record_drops(BpfDropReason::ExcludePortHit, 1);
         assert_eq!(seed_dropped_baseline(&consumer, 42), 42);
         let s = snap(&consumer);
         assert_eq!(
