@@ -945,8 +945,43 @@ pub const SOCK_OPS_RINGBUF_DEFAULT_BYTES: u32 = 4 * 1024 * 1024;
 /// could not be reserved". Userspace polls this counter periodically; when
 /// it advances between polls, [`SockOpsConsumer::record_overrun`] fires.
 pub const SOCK_OPS_STATS_EVENTS_DROPPED: u32 = 0;
+
+// Per-reason capture-bypass decision counters, one slot per
+// `SOCK_OPS_DROP_*` discriminant.
+//
+// These are the ACCOUNTING authority for `ferrum_mesh_bpf_drops_total`; the
+// `SOCK_OPS_EVENT_DROP_REASON` ringbuf record is the event stream. Splitting
+// the two matters because a full ringbuf silently discards the record, and a
+// discarded record used to mean a discarded classification: the bypass
+// decision vanished from the metric while only the generic
+// `SOCK_OPS_STATS_EVENTS_DROPPED` counter moved. The kernel increments these
+// slots unconditionally, so the drop-reason counters stay exact across a
+// ringbuf overrun.
+pub const SOCK_OPS_STATS_DROP_BYPASS_UID_HIT: u32 = 1;
+pub const SOCK_OPS_STATS_DROP_EXCLUDE_CIDR_HIT: u32 = 2;
+pub const SOCK_OPS_STATS_DROP_NOT_IN_INCLUDE_CIDR: u32 = 3;
+pub const SOCK_OPS_STATS_DROP_EXCLUDE_PORT_HIT: u32 = 4;
+
 /// Length of `FERRUM_SOCK_OPS_STATS` array map.
-pub const SOCK_OPS_STATS_LEN: u32 = 1;
+pub const SOCK_OPS_STATS_LEN: u32 = 5;
+
+/// Map a `SOCK_OPS_DROP_*` discriminant onto its `FERRUM_SOCK_OPS_STATS`
+/// slot.
+///
+/// Returns `None` for an unrecognised discriminant so neither the kernel
+/// emitter nor the userspace reader can fall back onto slot `0` — that slot
+/// is the ringbuf dropped-events counter that drives the overrun regime, and
+/// scribbling on it would manufacture a phantom overrun.
+#[inline(always)]
+pub const fn sock_ops_stats_index_for_drop_reason(reason: u32) -> Option<u32> {
+    match reason {
+        SOCK_OPS_DROP_BYPASS_UID_HIT => Some(SOCK_OPS_STATS_DROP_BYPASS_UID_HIT),
+        SOCK_OPS_DROP_EXCLUDE_CIDR_HIT => Some(SOCK_OPS_STATS_DROP_EXCLUDE_CIDR_HIT),
+        SOCK_OPS_DROP_NOT_IN_INCLUDE_CIDR => Some(SOCK_OPS_STATS_DROP_NOT_IN_INCLUDE_CIDR),
+        SOCK_OPS_DROP_EXCLUDE_PORT_HIT => Some(SOCK_OPS_STATS_DROP_EXCLUDE_PORT_HIT),
+        _ => None,
+    }
+}
 
 /// IPv4 loopback (127.0.0.1) stored as the `u32` the kernel's `user_ip4`
 /// field expects (network byte order in memory).

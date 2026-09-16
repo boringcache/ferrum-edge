@@ -12,7 +12,9 @@ use ferrum_ebpf_common::{
     AcceptFirstByteState, SOCK_OPS_DIRECTION_RECEIVED, SOCK_OPS_DIRECTION_SENT,
     SOCK_OPS_DROP_BYPASS_UID_HIT, SOCK_OPS_DROP_EXCLUDE_CIDR_HIT, SOCK_OPS_DROP_EXCLUDE_PORT_HIT,
     SOCK_OPS_DROP_NOT_IN_INCLUDE_CIDR, SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY,
-    SOCK_OPS_EVENT_DROP_REASON, SOCK_OPS_EVENT_RST, SockOpsRecord, accept_to_first_byte_us,
+    SOCK_OPS_EVENT_DROP_REASON, SOCK_OPS_EVENT_RST, SOCK_OPS_STATS_EVENTS_DROPPED,
+    SOCK_OPS_STATS_LEN, SockOpsRecord, accept_to_first_byte_us,
+    sock_ops_stats_index_for_drop_reason,
 };
 use ferrum_edge::ebpf::bpf_metrics::{
     BPF_LATENCY_BUCKET_BOUNDS_US, BPF_LATENCY_BUCKET_LE_LABELS, BPF_LATENCY_EXCLUSIVE_BUCKET_COUNT,
@@ -20,7 +22,8 @@ use ferrum_edge::ebpf::bpf_metrics::{
     bpf_latency_exclusive_bucket_index,
 };
 use ferrum_edge::ebpf::event_consumer::{
-    PollOutcome, SockOpsConsumer, SockOpsEvent, seed_dropped_baseline,
+    BPF_DROP_REASON_COUNT, BPF_DROP_REASON_STATS_SLOTS, PollOutcome, SockOpsConsumer, SockOpsEvent,
+    drop_reason_delta, seed_dropped_baseline,
 };
 use ferrum_edge::plugins::mesh::bpf_metrics::MeshBpfMetrics;
 use serde_json::json;
@@ -301,7 +304,7 @@ fn pin_rotation_seed_preserves_cumulative_state() {
     consumer.handle_event(SockOpsEvent::Fin {
         direction: TcpDirection::Sent,
     });
-    consumer.handle_event(SockOpsEvent::DropReason(BpfDropReason::BypassUidHit));
+    consumer.record_drops(BpfDropReason::BypassUidHit, 1);
 
     // First map generation with no pre-existing drops.
     assert_eq!(seed_dropped_baseline(&consumer, 0), 0);
@@ -657,4 +660,96 @@ fn latency_histogram_extreme_values_are_deterministic() {
         metric_value(&text, "ferrum_mesh_bpf_srtt_microseconds_count"),
         1
     );
+}
+
+/// Issue #5502 regression guard.
+///
+/// `ferrum_mesh_bpf_drops_total` used to be incremented from the
+/// `SOCK_OPS_EVENT_DROP_REASON` ringbuf record. A full ring discards that
+/// record — only the generic dropped-events counter moves — so a bypass
+/// decision could be classified in-kernel and still never reach the metric.
+/// The kernel per-CPU counters are now the accounting authority, and the
+/// record must not ALSO increment or every decision that survived the ring
+/// would be counted twice.
+#[test]
+fn drop_reason_records_do_not_count_the_bypass_decision() {
+    let consumer = SockOpsConsumer::new(BpfMetricsState::new());
+    consumer.handle_event(SockOpsEvent::DropReason(BpfDropReason::ExcludePortHit));
+    consumer.handle_event(SockOpsEvent::DropReason(BpfDropReason::ExcludePortHit));
+
+    let after_records = consumer.metrics().snapshot();
+    assert_eq!(
+        after_records.drop_exclude_port_hit, 0,
+        "the ringbuf record is the event stream, not the accounting authority"
+    );
+    assert_eq!(
+        after_records.ringbuf_events_consumed, 2,
+        "the record is still a consumed ringbuf event"
+    );
+
+    // Only the kernel-counter path moves the exported counter, and it moves
+    // by the kernel delta rather than by one per record.
+    consumer.record_drops(BpfDropReason::ExcludePortHit, 3);
+    assert_eq!(consumer.metrics().snapshot().drop_exclude_port_hit, 3);
+}
+
+/// The kernel emitter and the userspace poller must agree on which
+/// `FERRUM_SOCK_OPS_STATS` slot carries each reason, and none of them may
+/// alias slot 0 — that slot drives the ringbuf overrun regime, so a bypass
+/// decision landing there would manufacture a phantom overrun.
+#[test]
+fn kernel_drop_reason_slots_are_distinct_disjoint_and_in_bounds() {
+    let expected_wire = [
+        (BpfDropReason::BypassUidHit, SOCK_OPS_DROP_BYPASS_UID_HIT),
+        (
+            BpfDropReason::ExcludeCidrHit,
+            SOCK_OPS_DROP_EXCLUDE_CIDR_HIT,
+        ),
+        (
+            BpfDropReason::NotInIncludeCidr,
+            SOCK_OPS_DROP_NOT_IN_INCLUDE_CIDR,
+        ),
+        (
+            BpfDropReason::ExcludePortHit,
+            SOCK_OPS_DROP_EXCLUDE_PORT_HIT,
+        ),
+    ];
+    assert_eq!(BPF_DROP_REASON_STATS_SLOTS.len(), BPF_DROP_REASON_COUNT);
+    assert_eq!(expected_wire.len(), BPF_DROP_REASON_COUNT);
+
+    let mut seen = Vec::new();
+    for (index, (reason, slot)) in BPF_DROP_REASON_STATS_SLOTS.iter().enumerate() {
+        let (expected_reason, wire) = expected_wire[index];
+        assert_eq!(*reason, expected_reason, "exposition order must be stable");
+        assert_eq!(
+            sock_ops_stats_index_for_drop_reason(wire), Some(*slot),
+            "kernel emitter and userspace poller disagree for {reason:?}"
+        );
+        assert_ne!(
+            *slot, SOCK_OPS_STATS_EVENTS_DROPPED,
+            "a drop reason must never alias the ringbuf dropped-events slot"
+        );
+        assert!(*slot < SOCK_OPS_STATS_LEN, "slot must fit the stats map");
+        assert!(!seen.contains(slot), "each reason needs its own slot");
+        seen.push(*slot);
+    }
+
+    // An unrecognised wire discriminant must not fall back onto slot 0.
+    assert_eq!(sock_ops_stats_index_for_drop_reason(0), None);
+    assert_eq!(sock_ops_stats_index_for_drop_reason(999), None);
+}
+
+/// The kernel counters are cumulative per map generation. A node-agent
+/// restart re-creates the map and the counters start over; the metric must
+/// resume immediately instead of stalling until the new generation climbs
+/// past the old total.
+#[test]
+fn drop_reason_delta_adopts_a_reset_generation_without_stalling() {
+    assert_eq!(drop_reason_delta(0, 0), 0);
+    assert_eq!(drop_reason_delta(0, 7), 7);
+    assert_eq!(drop_reason_delta(7, 7), 0, "a quiet poll publishes nothing");
+    assert_eq!(drop_reason_delta(7, 9), 2);
+    // Generation reset: everything the new map reports is new.
+    assert_eq!(drop_reason_delta(9_000, 3), 3);
+    assert_eq!(drop_reason_delta(u64::MAX, 1), 1);
 }
