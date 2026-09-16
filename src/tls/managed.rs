@@ -21,7 +21,6 @@ use crate::fips::approved::Sha256;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use x509_parser::extensions::{GeneralName, ParsedExtension};
 use x509_parser::prelude::*;
 
 use crate::config::types::validate_resource_id;
@@ -819,21 +818,7 @@ fn certificate_metadata(bytes: &[u8]) -> Result<CertificateMetadata, String> {
     let issuer = Some(parsed.issuer().to_string());
     let not_before = DateTime::<Utc>::from_timestamp(parsed.validity().not_before.timestamp(), 0);
     let not_after = DateTime::<Utc>::from_timestamp(parsed.validity().not_after.timestamp(), 0);
-    let mut sans = Vec::new();
-    for extension in parsed.extensions() {
-        if let ParsedExtension::SubjectAlternativeName(san) = extension.parsed_extension() {
-            for name in &san.general_names {
-                match name {
-                    GeneralName::DNSName(value) => sans.push(value.to_string()),
-                    GeneralName::URI(value) => sans.push(value.to_string()),
-                    GeneralName::IPAddress(bytes) => sans.push(format!("{bytes:?}")),
-                    _ => {}
-                }
-            }
-        }
-    }
-    sans.sort();
-    sans.dedup();
+    let sans = crate::tls::san::certificate_san_strings(&parsed);
     Ok(CertificateMetadata {
         subject,
         issuer,

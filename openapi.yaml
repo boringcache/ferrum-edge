@@ -8052,6 +8052,14 @@ components:
           type: array
           items:
             type: string
+          description: >-
+            Subject Alternative Names from the leaf certificate as plain canonical
+            strings with no type prefix. DNS names are the encoded name; IPv4 uses
+            dotted decimal; IPv6 uses RFC 5952 (`std::net::IpAddr` display); URI and
+            email (rfc822Name) use their string values. Other GeneralName types use an
+            explicit `othername:<oid>`, `directory:<dn>`, `rid:<oid>`, `x400`,
+            `ediparty`, `invalid-ip:<hex>`, or `invalid:<tag>` form. Values are unique
+            and sorted.
         not_before:
           type: string
           format: date-time
@@ -8411,6 +8419,14 @@ components:
           type: array
           items:
             type: string
+          description: >-
+            Subject Alternative Names from the leaf certificate as plain canonical
+            strings with no type prefix. DNS names are the encoded name; IPv4 uses
+            dotted decimal; IPv6 uses RFC 5952 (`std::net::IpAddr` display); URI and
+            email (rfc822Name) use their string values. Other GeneralName types use an
+            explicit `othername:<oid>`, `directory:<dn>`, `rid:<oid>`, `x400`,
+            `ediparty`, `invalid-ip:<hex>`, or `invalid:<tag>` form. Values are unique
+            and sorted.
         not_before:
           type: string
           format: date-time
@@ -8615,6 +8631,14 @@ components:
           type: array
           items:
             type: string
+          description: >-
+            Subject Alternative Names from the leaf certificate as plain canonical
+            strings with no type prefix. DNS names are the encoded name; IPv4 uses
+            dotted decimal; IPv6 uses RFC 5952 (`std::net::IpAddr` display); URI and
+            email (rfc822Name) use their string values. Other GeneralName types use an
+            explicit `othername:<oid>`, `directory:<dn>`, `rid:<oid>`, `x400`,
+            `ediparty`, `invalid-ip:<hex>`, or `invalid:<tag>` form. Values are unique
+            and sorted.
         not_before:
           type: string
           format: date-time
