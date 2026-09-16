@@ -1154,6 +1154,10 @@ fn waf_plugin_config_yaml(target: &str) -> String {
     enabled: true
     config:
       include_default_rules: false
+      # Unbounded scan budget: the default 50 ms deadline now closes the
+      # session under an enforcing body policy, so a descheduled worker on a
+      # loaded runner would otherwise turn a clean message into a Close.
+      scan_budget_ms: 0
       response_inspection: true
       response_body_inspection: true
       custom_rules:

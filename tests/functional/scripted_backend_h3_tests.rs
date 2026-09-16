@@ -104,6 +104,9 @@ async fn assert_h3_forbidden_data_cancelled(body_mode: &str, waf: bool) {
                 "enabled": true,
                 "config": {
                     "include_default_rules": false,
+                    // Unbounded scan budget: the default 50 ms deadline now
+                    // fails closed under an enforcing response-body policy.
+                    "scan_budget_ms": 0,
                     "response_inspection": true,
                     "response_body_inspection": true,
                     "custom_rules": [{

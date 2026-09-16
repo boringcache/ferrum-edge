@@ -1132,7 +1132,11 @@ closes the connection when that direction carries an enforcing body policy and
 otherwise prefix-scans; `scan_truncated` always prefix-scans; `skip` forwards
 uninspected; `block` closes whenever the instance is globally enforcing. An
 uninspectable message representation closes the connection when the direction
-enforces. `on_scan_timeout: block` closes; `allow` / `log_and_allow` forward.
+enforces. A scan that completed over `scan_budget_ms` without a blocking hit is
+decided by `on_scan_timeout`: `enforce_aware` (default) closes when that
+direction carries an enforcing body policy and otherwise forwards, `block`
+always closes, and `allow` / `log_and_allow` forward. The scan itself is never
+skipped, so a hit found over budget still closes.
 Every close is a fixed RFC 6455 code 1008 with a compiled-in reason that never
 echoes message bytes.
 

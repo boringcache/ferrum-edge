@@ -102,8 +102,22 @@ enum GlobalMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimeoutAction {
+    /// Default. A scan that finished over `scan_budget_ms` without a confirmed
+    /// blocking hit rejects when the governed BODY direction carries an
+    /// enforcing body policy, and is logged and allowed otherwise — the
+    /// disposition-aware shape `on_body_too_large: fail_closed` already uses
+    /// (issue #5528). `monitor` mode and monitor-only rule sets never start
+    /// blocking.
+    EnforceAware,
+    /// Explicit fail-open opt-out: forward silently. Weakens enforcement — an
+    /// enforcing body policy that missed its deadline is forwarded with no
+    /// warning at all.
     Allow,
+    /// Strictest: reject on every over-budget scan, on every governed surface,
+    /// independently of global mode and of which rules enforce.
     Block,
+    /// Explicit fail-open opt-out with a record: forward, but warn and write
+    /// `waf.scan_timed_out`. Weakens enforcement the same way `allow` does.
     LogAndAllow,
 }
 
@@ -348,10 +362,14 @@ impl Waf {
         if max_scan_bytes == 0 {
             return Err("waf: 'max_scan_bytes' must be greater than zero".to_string());
         }
+        // Disposition-aware by default (issue #5528): a governed body whose scan
+        // missed its deadline is refused exactly when that direction could have
+        // refused a hit, mirroring `on_body_too_large: fail_closed`. `allow` and
+        // `log_and_allow` remain available as explicit, documented opt-outs.
         let on_scan_timeout = parse_timeout_action(
             optional_string(object, "on_scan_timeout")?
                 .as_deref()
-                .unwrap_or("log_and_allow"),
+                .unwrap_or("enforce_aware"),
         )?;
         // Fail closed by default (GHSA-7jh9-fjqf-jcvf). `scan_truncated` remains
         // available as an explicit, documented prefix-only opt-out.
@@ -586,6 +604,24 @@ impl Waf {
         self.should_inspect_body_content_type(content_type)
     }
 
+    /// Run the body/message scan under the scan budget.
+    ///
+    /// The budget is POST-HOC ONLY: the scan always runs, and an over-budget
+    /// scan is flagged `timed_out` so `on_scan_timeout` decides what to do with
+    /// a CLEAN result. Hits are never discarded, so an enforcing rule that
+    /// matched still rejects.
+    ///
+    /// This deliberately does not bail out before the scan (issue #5528). It
+    /// used to: the pre-scan `elapsed() >= budget` check meant that when the
+    /// scheduler alone took longer than `scan_budget_ms` to re-poll the task
+    /// after the yield below, the body was never inspected at all and the
+    /// then-default fail-open timeout forwarded it. Scheduler latency is
+    /// attacker-influenceable with a cheap request flood, so that turned a
+    /// wall-clock deadline into an on-demand way to retire an enforcing body
+    /// rule. The scan is already cost-bounded without it: Rust's regex crate
+    /// guarantees O(n) matching and the input is capped by `max_scan_bytes`, so
+    /// execution time is bounded by O(active_rules × max_scan_bytes) with no
+    /// pathological backtracking.
     async fn run_body_scan_with_budget<F>(&self, scan: F) -> ScanOutcome
     where
         F: FnOnce() -> ScanOutcome,
@@ -593,26 +629,14 @@ impl Waf {
         if self.config.scan_budget_ms == 0 {
             return scan();
         }
-        let budget = Duration::from_millis(self.config.scan_budget_ms);
         let start = std::time::Instant::now();
-        // Yield to the scheduler before the scan so a timer that has already
-        // elapsed (e.g. due to scheduling congestion) can fire immediately.
-        // The scan itself is synchronous — Rust's regex crate guarantees O(n)
-        // matching, so execution time is bounded by
-        // O(active_rules × max_scan_bytes) without pathological backtracking.
+        // Yield before the (synchronous, uninterruptible) scan so a runtime
+        // worker shared with other connections gets a scheduling point here
+        // rather than only after the scan returns.
         tokio::task::yield_now().await;
-        if start.elapsed() >= budget {
-            return ScanOutcome {
-                timed_out: true,
-                ..ScanOutcome::default()
-            };
-        }
-        let outcome = scan();
-        if start.elapsed() >= budget {
-            return ScanOutcome {
-                timed_out: true,
-                ..outcome
-            };
+        let mut outcome = scan();
+        if start.elapsed() >= Duration::from_millis(self.config.scan_budget_ms) {
+            outcome.timed_out = true;
         }
         outcome
     }
@@ -641,11 +665,19 @@ impl Waf {
     /// `phase` is what decides whether the anomaly contribution accumulates or
     /// supersedes an earlier contribution from the same phase — see
     /// [`WafScorePhase`]. It changes nothing else about the decision.
+    ///
+    /// `timeout_enforces` answers "could this instance actually have REFUSED
+    /// the surface this scan covered?" — the same question
+    /// `on_body_too_large: fail_closed` asks through `has_enforcing_body_policy`.
+    /// It is read only by the `enforce_aware` timeout default, and only when
+    /// `outcome.timed_out` is set, so every caller evaluates the predicate
+    /// behind `outcome.timed_out` and the in-budget path stays free of it.
     fn finish_scan(
         &self,
         ctx: &mut RequestContext,
         outcome: ScanOutcome,
         phase: WafScorePhase,
+        timeout_enforces: bool,
     ) -> PluginResult {
         if outcome.hits.is_empty() {
             // A replaceable phase that re-ran CLEAN retires its own previous
@@ -657,7 +689,7 @@ impl Waf {
                 ctx.set_waf_metadata("waf.scan_truncated", "true");
             }
             if outcome.timed_out {
-                return self.finish_timeout(ctx);
+                return self.finish_timeout(ctx, timeout_enforces);
             }
             if self.config.log_to_metadata {
                 ctx.set_waf_metadata_if_absent("waf.action", "clean");
@@ -678,7 +710,7 @@ impl Waf {
             return self.reject();
         }
         if outcome.timed_out {
-            return self.finish_timeout(ctx);
+            return self.finish_timeout(ctx, timeout_enforces);
         }
         PluginResult::Continue
     }
@@ -996,18 +1028,32 @@ impl Waf {
         ctx.clear_waf_metadata("waf.score");
     }
 
-    fn finish_timeout(&self, ctx: &mut RequestContext) -> PluginResult {
+    /// `on_scan_timeout` for a scan that completed over budget without a
+    /// confirmed blocking hit.
+    ///
+    /// The scan itself always ran (`run_body_scan_with_budget` /
+    /// `run_cheap_with_budget` are both post-hoc), so this decides only the
+    /// CLEAN-but-late case. `enforces` is the caller's answer to "could this
+    /// surface have been refused?"; the `enforce_aware` default rejects exactly
+    /// there and forwards a monitor-only observation, so switching a WAF to
+    /// `monitor` never starts blocking on a slow scan.
+    fn finish_timeout(&self, ctx: &mut RequestContext, enforces: bool) -> PluginResult {
+        let block = match self.config.on_scan_timeout {
+            TimeoutAction::Block => true,
+            TimeoutAction::EnforceAware => enforces,
+            TimeoutAction::Allow | TimeoutAction::LogAndAllow => false,
+        };
         if self.config.log_to_metadata {
             ctx.set_waf_metadata("waf.scan_timed_out", "true");
-            match self.config.on_scan_timeout {
-                TimeoutAction::Block => {
-                    ctx.set_waf_metadata("waf.action", "blocked");
-                }
-                TimeoutAction::Allow | TimeoutAction::LogAndAllow => {
-                    ctx.set_waf_metadata_if_absent("waf.action", "clean");
-                }
+            if block {
+                ctx.set_waf_metadata("waf.action", "blocked");
+                ctx.set_waf_metadata_if_absent("waf.block_reason", "scan_timeout");
+            } else {
+                ctx.set_waf_metadata_if_absent("waf.action", "clean");
             }
         }
+        // `allow` is the documented silent opt-out; every other disposition
+        // records the missed deadline. Fixed-cardinality fields only.
         if !matches!(self.config.on_scan_timeout, TimeoutAction::Allow) {
             warn_sampled!(
                 target: "waf",
@@ -1016,12 +1062,14 @@ impl Waf {
                 path = %ctx.path,
                 method = %ctx.method,
                 action = ?self.config.on_scan_timeout,
+                blocked = block,
                 "WAF scan timed out"
             );
         }
-        match self.config.on_scan_timeout {
-            TimeoutAction::Allow | TimeoutAction::LogAndAllow => PluginResult::Continue,
-            TimeoutAction::Block => self.reject(),
+        if block {
+            self.reject()
+        } else {
+            PluginResult::Continue
         }
     }
 
@@ -1547,7 +1595,15 @@ impl Plugin for Waf {
             return PluginResult::Continue;
         }
         let outcome = self.run_cheap_with_budget(|| self.run_cheap_scan(ctx));
-        self.finish_scan(ctx, outcome, WafScorePhase::Accumulating)
+        // Metadata/header/query/path scans are not disposition-aware on
+        // timeout: `enforce_aware` mirrors `on_body_too_large: fail_closed`,
+        // which is a BODY-coverage control. This surface is bounded by the
+        // frontend's header limits rather than by `max_scan_bytes`, is not
+        // buffered, decoded, or clamped, and cannot be made expensive by a
+        // large payload, so an over-budget clean cheap scan is a latency signal
+        // rather than a coverage risk. `on_scan_timeout: block` applies the
+        // strict deadline to every surface.
+        self.finish_scan(ctx, outcome, WafScorePhase::Accumulating, false)
     }
 
     fn requires_request_body_buffering(&self) -> bool {
@@ -1637,7 +1693,12 @@ impl Plugin for Waf {
             .run_body_scan_with_budget(|| self.run_request_body_scan(ctx, body, content_type))
             .await;
         outcome.truncated = truncated;
-        self.finish_scan(ctx, outcome, WafScorePhase::Accumulating)
+        // Evaluated only on the timeout path: the same predicate that decides
+        // whether an unscannable body is a protection-mechanism failure or a
+        // lost observation now also decides a body whose scan missed its
+        // deadline (issue #5528).
+        let timeout_enforces = outcome.timed_out && self.request_body_policy_enforces(ctx, headers);
+        self.finish_scan(ctx, outcome, WafScorePhase::Accumulating, timeout_enforces)
     }
 
     async fn after_proxy(
@@ -1663,7 +1724,9 @@ impl Plugin for Waf {
             // untouched header set is neither rescanned nor rescored
             // (`GHSA-62jg-v563-4q23`).
             let digest = response_header_map_digest(response_headers);
-            let result = self.finish_scan(ctx, outcome, WafScorePhase::Accumulating);
+            // Cheap response-header scan: post-hoc only and never body-sized,
+            // so it is not disposition-aware on timeout (see `authorize`).
+            let result = self.finish_scan(ctx, outcome, WafScorePhase::Accumulating, false);
             // A rejection can be rebuilt into the same header map and must be
             // scanned again by the bounded fail-closed recheck. Only successful
             // decisions are safe to memoize.
@@ -1870,7 +1933,7 @@ impl Plugin for Waf {
         }
         let outcome =
             self.run_cheap_with_budget(|| self.run_response_header_scan(ctx, response_headers));
-        let result = self.finish_scan(ctx, outcome, WafScorePhase::FinalResponseHeaders);
+        let result = self.finish_scan(ctx, outcome, WafScorePhase::FinalResponseHeaders, false);
         // Do not memoize refused maps: the final response pipeline deliberately
         // rechecks a rebuilt rejection, which can be byte-for-byte identical.
         if matches!(&result, PluginResult::Continue) {
@@ -1915,7 +1978,11 @@ impl Plugin for Waf {
             .run_body_scan_with_budget(|| self.run_response_body_scan(ctx, body, content_type))
             .await;
         outcome.truncated = truncated;
-        self.finish_scan(ctx, outcome, WafScorePhase::FinalResponseBody)
+        // Response-side counterpart of the request-body predicate, evaluated
+        // only on the timeout path.
+        let timeout_enforces =
+            outcome.timed_out && self.response_body_policy_enforces(ctx, content_type);
+        self.finish_scan(ctx, outcome, WafScorePhase::FinalResponseBody, timeout_enforces)
     }
 
     /// Preserve the established final-body hook contract for direct callers.
@@ -2001,11 +2068,13 @@ fn parse_global_mode(raw: &str) -> Result<GlobalMode, String> {
 
 fn parse_timeout_action(raw: &str) -> Result<TimeoutAction, String> {
     match raw {
+        "enforce_aware" => Ok(TimeoutAction::EnforceAware),
         "allow" => Ok(TimeoutAction::Allow),
         "block" => Ok(TimeoutAction::Block),
         "log_and_allow" => Ok(TimeoutAction::LogAndAllow),
         other => Err(format!(
-            "waf: 'on_scan_timeout' must be allow, block, or log_and_allow; got {other:?}"
+            "waf: 'on_scan_timeout' must be enforce_aware, allow, block, or \
+             log_and_allow; got {other:?}"
         )),
     }
 }
@@ -2346,7 +2415,7 @@ mod tests {
         });
 
         assert!(outcome.timed_out);
-        let result = plugin.finish_scan(&mut ctx, outcome, WafScorePhase::Accumulating);
+        let result = plugin.finish_scan(&mut ctx, outcome, WafScorePhase::Accumulating, false);
 
         assert!(matches!(result, PluginResult::Reject { .. }));
         assert_eq!(
@@ -2389,7 +2458,7 @@ mod tests {
                 ScanOutcome::default()
             })
             .await;
-        let result = plugin.finish_scan(&mut ctx, outcome, WafScorePhase::Accumulating);
+        let result = plugin.finish_scan(&mut ctx, outcome, WafScorePhase::Accumulating, false);
 
         assert!(matches!(
             result,
@@ -2406,6 +2475,111 @@ mod tests {
             ctx.metadata.get("waf.action").map(String::as_str),
             Some("blocked")
         );
+    }
+
+    /// A monitor-only body rule set, enough to build a WAF whose timeout
+    /// disposition is the only thing under test.
+    fn timeout_config(on_scan_timeout: &str) -> serde_json::Value {
+        json!({
+            "mode": "monitor",
+            "include_default_rules": false,
+            "scan_budget_ms": 1,
+            "on_scan_timeout": on_scan_timeout,
+            "custom_rules": [{
+                "id": "CUSTOM-SLOW",
+                "name": "slow",
+                "category": "custom",
+                "target": "body_text",
+                "match_kind": "contains",
+                "pattern": "needle",
+                "action": "monitor"
+            }]
+        })
+    }
+
+    /// The published default, pinned here because it is the whole point of
+    /// issue #5528: an omitted `on_scan_timeout` is disposition-aware, not
+    /// fail-open.
+    #[test]
+    fn on_scan_timeout_defaults_to_enforce_aware() {
+        let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
+        assert_eq!(plugin.config.on_scan_timeout, TimeoutAction::EnforceAware);
+    }
+
+    /// The body-scan wrapper is POST-HOC ONLY (issue #5528): a scan that blows
+    /// the budget still runs, and its hits still reach the decision.
+    #[tokio::test]
+    async fn over_budget_body_scan_still_runs_and_keeps_its_hits() {
+        let plugin = Waf::new(&timeout_config("log_and_allow")).unwrap();
+
+        let outcome = plugin
+            .run_body_scan_with_budget(|| {
+                std::thread::sleep(Duration::from_millis(5));
+                let mut outcome = ScanOutcome::default();
+                outcome.push(RuleHit {
+                    rule_index: 0,
+                    target_name: "request_body",
+                });
+                outcome
+            })
+            .await;
+
+        assert!(outcome.timed_out, "an over-budget scan is still flagged");
+        assert_eq!(
+            outcome.hits.len(),
+            1,
+            "the scan ran and its hits survived the deadline"
+        );
+    }
+
+    /// The complete `on_scan_timeout` table for a CLEAN over-budget scan.
+    /// `enforces` is the caller's "could this surface have been refused?".
+    #[test]
+    fn scan_timeout_disposition_table() {
+        for (action, enforces, expect_reject) in [
+            ("enforce_aware", true, true),
+            ("enforce_aware", false, false),
+            ("allow", true, false),
+            ("log_and_allow", true, false),
+            ("block", true, true),
+            ("block", false, true),
+        ] {
+            let plugin = Waf::new(&timeout_config(action)).unwrap();
+            let mut ctx = body_ctx();
+            let outcome = ScanOutcome {
+                timed_out: true,
+                ..ScanOutcome::default()
+            };
+
+            let result =
+                plugin.finish_scan(&mut ctx, outcome, WafScorePhase::Accumulating, enforces);
+
+            assert_eq!(
+                matches!(result, PluginResult::Reject { .. }),
+                expect_reject,
+                "on_scan_timeout={action} enforces={enforces}"
+            );
+            assert_eq!(
+                ctx.metadata.get("waf.scan_timed_out").map(String::as_str),
+                Some("true"),
+                "on_scan_timeout={action} enforces={enforces}"
+            );
+            let (expected_action, expected_reason) = if expect_reject {
+                ("blocked", Some("scan_timeout"))
+            } else {
+                ("clean", None)
+            };
+            assert_eq!(
+                ctx.metadata.get("waf.action").map(String::as_str),
+                Some(expected_action),
+                "on_scan_timeout={action} enforces={enforces}"
+            );
+            assert_eq!(
+                ctx.metadata.get("waf.block_reason").map(String::as_str),
+                expected_reason,
+                "on_scan_timeout={action} enforces={enforces}"
+            );
+        }
     }
 
     #[test]

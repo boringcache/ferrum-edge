@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **WAF scan budget is post-hoc only, and its timeout default now fails closed**
+  (issue #5528). `scan_budget_ms` never skips a scan: the body and
+  WebSocket-message path used to bail out *before* the scan when the tokio
+  scheduler alone had burned the budget across the plugin's pre-scan yield,
+  which discarded an enforcing body rule's verdict entirely and — with the old
+  fail-open default — forwarded the body. The scan now always runs and its hits
+  always decide first, matching the header/query/path path and the documented
+  behaviour. **Breaking:** `on_scan_timeout` gains a new variant
+  `enforce_aware`, which replaces `log_and_allow` as the default. A scan that
+  completes *clean* but over budget is now rejected when the governed body
+  direction carries an enforcing body policy (the predicate
+  `on_body_too_large: fail_closed` already uses), and logged and allowed
+  otherwise; `monitor` mode and monitor-only rule sets never start blocking. Set
+  `on_scan_timeout: log_and_allow` (or `allow`) to keep the previous fail-open
+  posture — both are documented opt-outs that weaken enforcement — or `block`
+  for the strict deadline on every surface. A timeout rejection carries
+  `waf.action=blocked` with the new `waf.block_reason=scan_timeout`. On
+  WebSocket, a missed deadline is now warned about independently of
+  `log_to_stdout`, since messages carry no `waf.*` metadata.
+
 ## [0.9.5] - 2026-09-13
 
 Release from main introducing resource labels in tagged artifacts. Includes the

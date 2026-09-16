@@ -555,8 +555,44 @@ Prefer sizing over rejecting where you can: setting `max_scan_bytes` at or above
 the effective request/response ceiling (including any route-scoped ceiling)
 means no admitted body is ever oversize, and `fail_closed` never fires.
 
-`scan_budget_ms` bounds total scan time; `on_scan_timeout` (`allow`, `block`,
-`log_and_allow`) decides the outcome when the budget is exceeded.
+### Scan budget and `on_scan_timeout`
+
+`scan_budget_ms` bounds total scan time. The deadline is **post-hoc only** on
+every surface — request metadata, headers, query, path, request and response
+bodies, and WebSocket messages alike. The scan always runs to completion and its
+hits always decide first, so an enforcing rule that matched still rejects even
+when the scan finished over budget. A body scan is never skipped: it used to be,
+when the scheduler alone had burned the budget across the plugin's pre-scan
+yield, which let a cheap request flood retire an enforcing body rule on demand.
+
+`on_scan_timeout` therefore decides exactly one case: a scan that completed
+**clean but late**.
+
+| `on_scan_timeout` | Outcome for a clean over-budget scan |
+| --- | --- |
+| `enforce_aware` (default) | Reject when the governed body direction carries an enforcing body policy — the same predicate `on_body_too_large: fail_closed` uses — and log and allow otherwise |
+| `log_and_allow` | Forward, with a sampled warning and `waf.scan_timed_out` metadata |
+| `allow` | Forward silently |
+| `block` | Reject every over-budget scan, on every surface, independently of global mode |
+
+`allow` and `log_and_allow` are explicit operator opt-outs that **weaken
+enforcement**: under them an enforcing body policy that missed its deadline
+forwards the body anyway. `mode: monitor` and monitor-only rule sets never block
+under the default, so switching a WAF to monitor never starts rejecting on a slow
+scan.
+
+Request metadata, header, query, and path scans are deliberately not
+disposition-aware under `enforce_aware`. They are bounded by the frontend's
+header limits rather than by `max_scan_bytes`, are not buffered, decoded, or
+clamped, and cannot be made expensive by a large payload, so a missed deadline
+there is a latency signal rather than a coverage risk. Use `block` to apply the
+strict deadline to every surface.
+
+A rejection on the timeout path sets `waf.action=blocked` with
+`waf.block_reason=scan_timeout`, and never carries `waf.rule_hits` — the
+deadline, not a rule, decided the request.
+
+### Unbounded response streams
 
 For a pristine backend `text/event-stream`, request `Accept` and internal
 streaming markers cannot bypass response-body policy. Because an unbounded
@@ -642,12 +678,21 @@ taking the place of an HTTP rejection response:
 | Per-message anomaly score ≥ `scoring.block_threshold` while enforcing | Close 1008 |
 | Message larger than `max_scan_bytes` | `on_body_too_large`: `fail_closed` (default) closes when that direction carries an enforcing body policy, else prefix-scans; `scan_truncated` prefix-scans; `skip` forwards uninspected; `block` closes whenever globally enforcing |
 | Uninspectable message representation | Closes when that direction carries an enforcing body policy |
-| Scan exceeded `scan_budget_ms` with no confirmed blocking hit | `on_scan_timeout`: `block` closes, `allow` / `log_and_allow` forward |
+| Scan exceeded `scan_budget_ms` with no confirmed blocking hit | `on_scan_timeout`: `enforce_aware` (default) closes when that direction carries an enforcing body policy, else forwards; `block` always closes; `allow` / `log_and_allow` forward |
 
 Every close uses RFC 6455 code 1008 with a compiled-in reason
 (`message rejected by security policy`, `message exceeds inspectable size`,
 `message could not be inspected`). Reasons never echo message bytes, rule ids,
 or any peer-controlled value.
+
+A WebSocket message carries no `waf.*` transaction metadata, so a message whose
+scan missed its deadline is recorded as a sampled `waf`-target warning
+**independently of `log_to_stdout`** — that knob selects per-hit rule
+diagnostics, not lost-coverage signals. Only the explicit `on_scan_timeout:
+allow` opt-out suppresses it. The warning carries the proxy, connection id,
+direction, configured action, and whether the message was blocked; it never
+carries message bytes, and `warn_sampled` bounds it to one event per source site
+per 10 seconds across instances so a message flood cannot amplify it.
 
 **Anomaly scoring is per complete message**, not accumulated across the session.
 A long-lived connection has no request-scoped accumulator, and carrying one
@@ -820,8 +865,8 @@ requests reject before backend dispatch and still produce a transaction summary
 carrying these fields, so blocks are visible in the same per-request log line as
 allowed traffic.
 
-`waf.block_reason` names why a request was blocked: `rule`, `score`, or
-`body_too_large` for HTTP-family traffic, and `tcp_require_tls`,
+`waf.block_reason` names why a request was blocked: `rule`, `score`,
+`body_too_large`, or `scan_timeout` for HTTP-family traffic, and `tcp_require_tls`,
 `first_bytes_unavailable`, or `signature` for stream (TCP/UDP) traffic. Stream
 inspection additionally records `waf.would_block_reason` (the same stream value
 set) on `monitor`-mode connections that *would* have blocked under `enforce`,
@@ -863,7 +908,7 @@ fire, then switch to `enforce`.
 | `scoring` | object | _(off)_ | anomaly scoring (see above) |
 | `global_exemptions` | object | _(none)_ | request short-circuits |
 | `scan_budget_ms` | int | `50` | total scan-time budget (0 = unbounded) |
-| `on_scan_timeout` | enum | `log_and_allow` | `allow` / `block` / `log_and_allow` |
+| `on_scan_timeout` | enum | `enforce_aware` | `enforce_aware` / `allow` / `block` / `log_and_allow` |
 | `max_scan_bytes` | int | `1048576` | body scan cap |
 | `on_body_too_large` | enum | `fail_closed` | `fail_closed` / `scan_truncated` / `skip` / `block` |
 | `body_methods` | string[] | `[POST,PUT,PATCH]` | methods whose bodies are scanned |

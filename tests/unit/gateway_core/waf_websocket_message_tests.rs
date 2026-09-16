@@ -39,13 +39,13 @@ fn upgrade_ctx(path: &str) -> RequestContext {
 }
 
 /// Build the WAF under test with the wall-clock scan budget pinned to
-/// unbounded unless the config sets its own (`scan_timeout_block_closes_the_session`
-/// does). The production default is a 50 ms budget with
-/// `on_scan_timeout: log_and_allow`, and `Waf::run_body_scan_with_budget` skips
-/// the message scan outright when the scheduler alone burns that budget before
-/// the scan starts, which under CPU starvation turns an expected policy Close
-/// into a forwarded message. These tests pin message-rule semantics, not
-/// machine speed.
+/// unbounded unless the config sets its own (the `scan_timeout_*` tests do).
+/// The production default is a 50 ms budget, and since issue #5528 a message
+/// whose scan finished over budget closes the session by default when that
+/// direction carries an enforcing body policy. The scan itself is never
+/// skipped any more, but under CPU starvation an over-budget CLEAN message
+/// would still turn an expected forward into a policy Close. These tests pin
+/// message-rule semantics, not machine speed.
 fn waf(mut config: Value) -> Arc<dyn Plugin> {
     if let Some(object) = config.as_object_mut()
         && !object.contains_key("scan_budget_ms")
@@ -551,6 +551,79 @@ async fn a_message_at_the_scan_ceiling_is_still_fully_inspected() {
     let outgoing = relay_to_backend(&plugins, &ctx, message).await;
 
     assert_policy_close(&outgoing);
+}
+
+/// A clean message large enough that one scan of it cannot finish inside a
+/// 1 ms budget. No built-in or custom rule under test matches it.
+fn over_budget_clean_message() -> Message {
+    Message::Text("a".repeat(1_000_000).into())
+}
+
+/// The `on_scan_timeout` default is disposition-aware on the message path too
+/// (issue #5528): a direction that carries an enforcing body policy closes
+/// rather than forwarding a message its scan could not finish in time.
+#[tokio::test]
+async fn scan_timeout_closes_an_enforcing_session_by_default() {
+    let mut config = enforcing_request_rule();
+    config["scan_budget_ms"] = json!(1);
+    let plugins = vec![waf(config)];
+    let ctx = upgrade_ctx("/ws");
+
+    let outgoing = relay_to_backend(&plugins, &ctx, over_budget_clean_message()).await;
+
+    assert_policy_close(&outgoing);
+}
+
+/// Monitor-only policy keeps the observational posture: the message is
+/// forwarded verbatim, exactly as an unscannable one is.
+#[tokio::test]
+async fn scan_timeout_forwards_a_monitor_only_session_by_default() {
+    let mut config = enforcing_request_rule();
+    config["scan_budget_ms"] = json!(1);
+    config["mode"] = json!("monitor");
+    let plugins = vec![waf(config)];
+    let ctx = upgrade_ctx("/ws");
+    let original = over_budget_clean_message();
+
+    let outgoing = relay_to_backend(&plugins, &ctx, original.clone()).await;
+
+    assert_eq!(outgoing, original);
+}
+
+/// `allow` and `log_and_allow` stay available as explicit operator opt-outs.
+#[tokio::test]
+async fn scan_timeout_explicit_opt_outs_forward_the_message() {
+    for action in ["allow", "log_and_allow"] {
+        let mut config = enforcing_request_rule();
+        config["scan_budget_ms"] = json!(1);
+        config["on_scan_timeout"] = json!(action);
+        let plugins = vec![waf(config)];
+        let ctx = upgrade_ctx("/ws");
+        let original = over_budget_clean_message();
+
+        let outgoing = relay_to_backend(&plugins, &ctx, original.clone()).await;
+
+        assert_eq!(outgoing, original, "on_scan_timeout={action}");
+    }
+}
+
+/// An enforcing hit found by an over-budget scan still closes: the scan is
+/// never skipped, so its hits always decide first.
+#[tokio::test]
+async fn an_exhausted_scan_budget_never_skips_the_message_scan() {
+    let mut config = enforcing_request_rule();
+    config["scan_budget_ms"] = json!(1);
+    let plugins = vec![waf(config)];
+    let ctx = upgrade_ctx("/ws");
+    let message = Message::Text(format!("{}{PROHIBITED}", "a".repeat(1_000_000)).into());
+
+    let outgoing = relay_to_backend(&plugins, &ctx, message).await;
+
+    let reason = assert_policy_close(&outgoing);
+    assert_eq!(
+        reason, "message rejected by security policy",
+        "the rule hit must decide, not the deadline"
+    );
 }
 
 #[tokio::test]

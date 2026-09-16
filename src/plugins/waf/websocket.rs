@@ -392,6 +392,12 @@ impl WafWsSession {
 
     /// `on_scan_timeout` for a message whose scan ran over budget without a
     /// confirmed blocking hit. Mirrors `Waf::finish_timeout`.
+    ///
+    /// The scan always runs (`run_body_scan_with_budget` is post-hoc only), so
+    /// this decides the clean-but-late message. The `enforce_aware` default
+    /// closes exactly when that direction carries an enforcing body policy —
+    /// the same session-bound predicate `clamp` and `uninspectable` already use
+    /// — so a monitor-only session never starts closing on a slow scan.
     fn finish_timeout(
         &self,
         proxy_id: &str,
@@ -402,14 +408,28 @@ impl WafWsSession {
         if !outcome.timed_out {
             return None;
         }
-        let block = matches!(self.waf.config.on_scan_timeout, TimeoutAction::Block);
-        if block || self.waf.config.log_to_stdout {
+        let block = match self.waf.config.on_scan_timeout {
+            TimeoutAction::Block => true,
+            TimeoutAction::EnforceAware => self.policy.enforces(body_direction(direction)),
+            TimeoutAction::Allow | TimeoutAction::LogAndAllow => false,
+        };
+        // A WebSocket message carries no `waf.*` transaction metadata, so this
+        // sampled warning is the ONLY record that policy missed its deadline on
+        // one. It is therefore emitted independently of `log_to_stdout` — that
+        // knob selects per-hit rule diagnostics, not lost-coverage signals — and
+        // is suppressed only by the explicit `on_scan_timeout: allow` opt-out,
+        // matching `Waf::finish_timeout`. `warn_sampled!` bounds it to one
+        // event per source site per 10 s across instances, so a message flood
+        // cannot turn it into a log amplifier. Fixed-cardinality fields only;
+        // no message bytes are logged.
+        if !matches!(self.waf.config.on_scan_timeout, TimeoutAction::Allow) {
             warn_sampled!(
                 target: "waf",
                 plugin = "waf",
                 proxy = %proxy_id,
                 connection_id,
                 direction = direction_label(direction),
+                action = ?self.waf.config.on_scan_timeout,
                 blocked = block,
                 "WAF WebSocket message scan timed out"
             );

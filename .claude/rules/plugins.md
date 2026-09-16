@@ -295,6 +295,16 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     response-size ceiling restate it. The metadata reason beside them is
     plugin-writable and authorizes nothing.
 6. `on_final_request_body`: body validator, gRPC-Web validation, WAF body rules, OpenAPI request schema (backend-final fallback), post-transform request-size ceiling, `ai_prompt_compressor` staged marker-sanitization rejection (4055), and `ai_semantic_cache` exact/semantic lookup (4057). `ai_semantic_cache` looks up here — not in `before_proxy` — so its replay partition binds the finalized outbound headers/query/destination and fully transformed request body, and a hit cannot bypass fail-closed final-body policy.
+   - `waf`'s `scan_budget_ms` is a POST-HOC deadline on EVERY surface: the scan
+     always runs and its hits always decide first, so an enforcing hit found
+     over budget still rejects (issue #5528 — do not reintroduce a pre-scan
+     bail). `on_scan_timeout` decides only a CLEAN over-budget scan, and its
+     default `enforce_aware` rejects exactly when the governed body direction
+     carries an enforcing body policy (`request_body_policy_enforces` /
+     `response_body_policy_enforces`), mirroring
+     `on_body_too_large: fail_closed`. `allow` / `log_and_allow` are documented
+     opt-outs that weaken enforcement; `block` is the strict setting and the
+     only one that also covers the cheap metadata/header scans.
 6b. `dispatch_finalized_request_egress`: irreversible outbound request egress
     (`request_mirror`, `serverless_function`, `ai_federation`) over the immutable
     backend-visible body and finalized pre-egress header snapshot, after every
@@ -457,7 +467,11 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
       response set; Text and Binary are both inspected and the HTTP media-type
       selectors do not apply. Control frames are never scanned as application
       payload, and `max_scan_bytes` / `on_body_too_large` / `on_scan_timeout`
-      fail closed with a fixed 1008 Close that never echoes message bytes.
+      fail closed with a fixed 1008 Close that never echoes message bytes when
+      that direction carries an enforcing body policy. A message whose scan
+      missed its deadline is warned about independently of `log_to_stdout`
+      (messages carry no `waf.*` metadata); only `on_scan_timeout: allow`
+      suppresses it.
     - First terminal Close from an admission/mutating hook wins; later mutating
       plugins are skipped for that frame while observational hooks
       (`observes_ws_frame_decisions`) may still record the final decision.

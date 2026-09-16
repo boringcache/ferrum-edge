@@ -27092,7 +27092,8 @@ components:
         inspect_multipart, inspect_binary_body) do not apply because a WebSocket
         message carries no Content-Type — control frames are never scanned, and
         max_scan_bytes / on_body_too_large / on_scan_timeout fail closed by
-        closing the connection with RFC 6455 code 1008.
+        closing the connection with RFC 6455 code 1008 when that direction
+        carries an enforcing body policy.
       properties:
         mode:
           type: [string, "null"]
@@ -27161,7 +27162,12 @@ components:
           description: >-
             Post-hoc scan deadline in milliseconds; 0 disables the timeout
             wrapper. Parsed as an unsigned 64-bit integer, so a negative or
-            above-u64 value is rejected at construction.
+            above-u64 value is rejected at construction. The deadline is
+            post-hoc only on every surface, including bodies and WebSocket
+            messages: the scan always runs and its hits always decide first, so
+            an enforcing rule that matched still rejects even when the scan
+            finished over budget. on_scan_timeout governs only a scan that
+            completed clean but late.
         max_scan_bytes:
           type: [integer, "null"]
           format: uint64
@@ -27173,8 +27179,28 @@ components:
             zero — construction rejects 0.
         on_scan_timeout:
           type: [string, "null"]
-          enum: [allow, block, log_and_allow, null]
-          default: log_and_allow
+          enum: [enforce_aware, allow, block, log_and_allow, null]
+          default: enforce_aware
+          description: >-
+            Behavior when a scan completes over scan_budget_ms without a
+            confirmed blocking hit. enforce_aware (default) rejects when the
+            governed body direction carries an enforcing body policy — the same
+            predicate on_body_too_large: fail_closed uses — and logs and allows
+            otherwise, so monitor mode and monitor-only rule sets never start
+            blocking. allow forwards silently and log_and_allow forwards with a
+            sampled warning and waf.scan_timed_out metadata; both are explicit
+            opt-outs that weaken enforcement, because an enforcing body policy
+            that missed its deadline is forwarded anyway. block rejects every
+            over-budget scan on every surface, independently of global mode.
+            Request metadata, header, query, and path scans are not
+            disposition-aware under enforce_aware: they are post-hoc only,
+            always complete, and are not sized by max_scan_bytes, so only block
+            applies the strict deadline to them. A rejection sets
+            waf.action=blocked with waf.block_reason=scan_timeout. On a
+            WebSocket session the same table decides the message, with the RFC
+            6455 code 1008 Close taking the place of the HTTP rejection, and a
+            missed deadline is recorded with a sampled warning independently of
+            log_to_stdout because messages carry no waf.* metadata.
         on_body_too_large:
           type: [string, "null"]
           enum: [fail_closed, scan_truncated, skip, block, null]
