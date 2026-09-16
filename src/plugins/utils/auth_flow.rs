@@ -367,10 +367,84 @@ pub(crate) fn credential_deadline_from_claims_at(
     now_unix: u64,
     now_mono: tokio::time::Instant,
 ) -> Option<tokio::time::Instant> {
-    let exp = claims
-        .get("exp")
-        .and_then(|value| value.as_i64().or_else(|| value.as_u64()?.try_into().ok()))?;
+    let exp = numeric_date_seconds(claims.get("exp")?, NumericDateBound::Upper)?;
     credential_deadline_from_unix_seconds_at(exp, leeway_seconds, now_unix, now_mono)
+}
+
+pub(crate) use numeric_date::{NumericDateBound, numeric_date_seconds};
+
+/// RFC 7519 §2 NumericDate normalization, shared by every Ferrum-owned reader
+/// of a validated time claim.
+///
+/// Deliberately crate-private. Ferrum itself only normalizes `exp`
+/// (`credential_deadline_from_claims_at` and the `oidc_relying_party` claim
+/// lifetime); `nbf` presence and validation are delegated to the JWT
+/// validation layer, so `NumericDateBound::Lower` has no production caller
+/// today. Publishing it would advertise a direction this crate does not
+/// implement, so the variant is kept — the truncation contract is only
+/// meaningful as a pair, and the tests cover both ends — but neither name is
+/// part of the public API. External tests reach both through
+/// `crate::_test_support`.
+pub(crate) mod numeric_date {
+    /// Which side of a validity window a NumericDate claim bounds.
+    ///
+    /// RFC 7519 §2 defines a NumericDate as a JSON *number*, not an integer, so
+    /// an `exp` of `1700000000.25` is an ordinary conforming claim that the JWT
+    /// layer validates like any other. Truncating it to whole seconds therefore
+    /// needs a direction, and the conservative one differs per claim role: an
+    /// upper bound rounds toward the past and a lower bound toward the future,
+    /// so the window Ferrum enforces is never wider than the one the token
+    /// states (issue #5521).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum NumericDateBound {
+        /// `exp` — the end of the window. Fractional seconds are dropped, so
+        /// the credential deadline can only land at or before the stated
+        /// expiry.
+        Upper,
+        /// `nbf` / `iat` — the start of the window. Fractional seconds round
+        /// up, so a credential can only become usable at or after the stated
+        /// instant. No Ferrum-owned reader selects this direction yet: the
+        /// `nbf` claim is enforced by the JWT validation layer.
+        Lower,
+    }
+
+    /// Normalize a NumericDate JSON value to whole Unix seconds.
+    ///
+    /// `None` means "no bound this conversion can hold": a non-numeric value, a
+    /// non-finite float, or a magnitude outside `i64`. That is the same answer
+    /// an out-of-range integer has always produced (issue #5420) and is
+    /// deliberately NOT an expiry — each caller decides whether an absent bound
+    /// is admissible. An ordinary fractional value is never folded into it;
+    /// before issue #5521 it was, which silently dropped the credential
+    /// deadline of a valid token.
+    pub fn numeric_date_seconds(value: &serde_json::Value, bound: NumericDateBound) -> Option<i64> {
+        if let Some(seconds) = value.as_i64() {
+            return Some(seconds);
+        }
+        if value.as_u64().is_some() {
+            // A NumericDate above `i64::MAX`. Unchanged pre-existing behaviour:
+            // no representable bound, and not an expiry either.
+            return None;
+        }
+        let seconds = value.as_f64()?;
+        if !seconds.is_finite() {
+            return None;
+        }
+        let rounded = match bound {
+            NumericDateBound::Upper => seconds.floor(),
+            NumericDateBound::Lower => seconds.ceil(),
+        };
+        // `2^63` and `-2^63` are both exactly representable as `f64`, so this
+        // is an exact range test rather than an approximate one. Out of range
+        // is the same unrepresentable far-future/far-past class as the `u64`
+        // branch above.
+        const I64_MIN_AS_F64: f64 = -9_223_372_036_854_775_808.0;
+        const I64_MAX_EXCLUSIVE_AS_F64: f64 = 9_223_372_036_854_775_808.0;
+        if rounded < I64_MIN_AS_F64 || rounded >= I64_MAX_EXCLUSIVE_AS_F64 {
+            return None;
+        }
+        Some(rounded as i64)
+    }
 }
 
 macro_rules! impl_auth_plugin {

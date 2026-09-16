@@ -592,6 +592,67 @@ async fn jwt_verifier_missing_or_empty_kid_requests_no_refetch() {
     assert_eq!(store.kid_miss_refresh_requests(), 0);
 }
 
+/// Issue #5522: the shared verifier is what `jwks_auth` and the
+/// `oidc_relying_party` ID-token path both authenticate through, and
+/// `jsonwebtoken` matches a multi-valued `iss` by set intersection. RFC 7519
+/// §4.1.1 allows exactly one `StringOrURI`, so the claim's shape is re-checked
+/// here, before verified claims become an identity.
+#[tokio::test]
+async fn jwt_verifier_rejects_a_non_string_issuer_claim() {
+    for issuer in [
+        json!(["https://issuer", "https://other"]),
+        json!(["https://issuer"]),
+        json!({"value": "https://issuer"}),
+        json!(1234),
+        json!(true),
+        json!(null),
+    ] {
+        let token = super::jwks_auth_support::create_rs256_token_with_kid(
+            &json!({"sub": "user", "iss": issuer}),
+            include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+            "key-1",
+        );
+        assert!(
+            verify_jwt_with_jwks(&token, &two_key_store(), &jwt_verify_params())
+                .await
+                .is_none(),
+            "non-string iss must fail closed even with no issuer configured: {issuer}"
+        );
+    }
+}
+
+/// The exact configured issuer, and only it, still verifies — including when
+/// several issuers are accepted. Accepting several issuers is a trust decision
+/// about the provider; it never lets one token claim more than one.
+#[tokio::test]
+async fn jwt_verifier_accepts_one_configured_string_issuer() {
+    let matching = JwtVerifyParams {
+        issuer: Some("https://issuer"),
+        ..jwt_verify_params()
+    };
+    let token = super::jwks_auth_support::create_rs256_token_with_kid(
+        &json!({"sub": "user", "iss": "https://issuer"}),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+        "key-1",
+    );
+    let claims = verify_jwt_with_jwks(&token, &two_key_store(), &matching)
+        .await
+        .expect("an exactly matching string issuer must verify");
+    assert_eq!(claims["iss"], "https://issuer");
+
+    let array_claim = super::jwks_auth_support::create_rs256_token_with_kid(
+        &json!({"sub": "user", "iss": ["https://issuer", "https://other"]}),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+        "key-1",
+    );
+    assert!(
+        verify_jwt_with_jwks(&array_claim, &two_key_store(), &matching)
+            .await
+            .is_none(),
+        "an intersecting array must not satisfy the exact configured issuer"
+    );
+}
+
 #[tokio::test]
 async fn jwt_verifier_accepts_matching_kid_and_key() {
     let token = super::jwks_auth_support::create_rs256_token_with_kid(

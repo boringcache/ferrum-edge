@@ -8729,6 +8729,32 @@ pub mod _test_support {
         )
     }
 
+    /// The use-time re-check a CACHED `oauth2_introspection` authorization goes
+    /// through on every hit (issue #5523). `None` means the window admits the
+    /// credential; `Some(status)` is the HTTP status of the rejection. Takes an
+    /// explicit `now_unix` so the boundary cases are deterministic.
+    pub fn introspection_cached_window_status_for_test(
+        expires_at_unix: Option<i64>,
+        not_before_unix: Option<i64>,
+        now_unix: i64,
+    ) -> Option<u16> {
+        crate::plugins::oauth2_introspection::cached_window_status(
+            expires_at_unix,
+            not_before_unix,
+            now_unix,
+        )
+    }
+
+    /// The shared RFC 7519 §2 NumericDate normalization (issue #5521), so the
+    /// conservative truncation direction is covered directly: an upper bound
+    /// (`exp`) rounds toward the past, a lower bound (`nbf`/`iat`) toward the
+    /// future, and neither widens the window the claim states. Both names are
+    /// crate-private — Ferrum normalizes only `exp` today — so this re-export
+    /// is the single mechanism external tests use to reach them.
+    pub use crate::plugins::utils::auth_flow::numeric_date::{
+        NumericDateBound, numeric_date_seconds,
+    };
+
     /// The same conversion driven from already-validated claims, so the `exp`
     /// extraction `jwt_auth` and `jwks_auth` authenticate through is covered at
     /// an injected clock (issue #5420).

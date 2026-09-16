@@ -974,3 +974,133 @@ async fn percent_encoded_query_credentials_authenticate_from_the_decoded_view() 
     assert_continue(result);
     assert!(ctx.identified_consumer.is_some());
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Issue #5522: `iss` is ONE `StringOrURI` (RFC 7519 §4.1.1)
+// ────────────────────────────────────────────────────────────────────
+
+/// `jsonwebtoken` models a multi-valued issuer internally and matches `iss` by
+/// set intersection, so a signed token claiming `["https://issuer", …]`
+/// satisfied an exactly configured `https://issuer`. The configured issuer
+/// check is exact string equality against ONE claimed issuer.
+#[tokio::test]
+async fn issuer_must_be_a_single_string() {
+    let plugin = JwtAuth::new(&json!({"expected_issuer": "https://issuer"})).unwrap();
+    let index = ConsumerIndex::new(&[create_test_consumer()]);
+    let token = create_jwt_token(
+        &json!({"sub": "testuser", "iss": ["https://issuer", "https://other"]}),
+        "test-jwt-secret",
+    );
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".into(), format!("Bearer {token}"));
+
+    assert_reject(plugin.authenticate(&mut ctx, &index).await, Some(401));
+    assert!(ctx.identified_consumer.is_none());
+    assert!(ctx.authenticated_identity.is_none());
+}
+
+/// The same contract for every other non-string JSON shape, and for a token
+/// whose single array element is the configured issuer — an array of one is
+/// still not a `StringOrURI`.
+#[tokio::test]
+async fn malformed_issuer_shapes_reject_regardless_of_content() {
+    let plugin = JwtAuth::new(&json!({"expected_issuer": "https://issuer"})).unwrap();
+    let index = ConsumerIndex::new(&[create_test_consumer()]);
+    for issuer in [
+        json!(["https://issuer"]),
+        json!({"value": "https://issuer"}),
+        json!(1234),
+        json!(true),
+        json!(null),
+    ] {
+        let token = create_jwt_token(
+            &json!({"sub": "testuser", "iss": issuer}),
+            "test-jwt-secret",
+        );
+        let mut ctx = make_ctx();
+        ctx.headers
+            .insert("authorization".into(), format!("Bearer {token}"));
+
+        assert_reject(plugin.authenticate(&mut ctx, &index).await, Some(401));
+        assert!(
+            ctx.identified_consumer.is_none(),
+            "non-string iss must not establish a consumer: {issuer}"
+        );
+    }
+}
+
+/// The shape contract holds even where no issuer is configured, so an array
+/// `iss` can never reach a backend as an authenticated claim. Configuring
+/// several ACCEPTED issuers is an operator decision about trust; it never lets
+/// one token claim more than one.
+#[tokio::test]
+async fn array_issuer_rejects_with_several_accepted_issuers_configured() {
+    let plugin = JwtAuth::new(&json!({
+        "expected_issuers": ["https://issuer", "https://second"]
+    }))
+    .unwrap();
+    let index = ConsumerIndex::new(&[create_test_consumer()]);
+    let token = create_jwt_token(
+        &json!({"sub": "testuser", "iss": ["https://issuer", "https://second"]}),
+        "test-jwt-secret",
+    );
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".into(), format!("Bearer {token}"));
+
+    assert_reject(plugin.authenticate(&mut ctx, &index).await, Some(401));
+
+    // Each accepted issuer still authenticates on its own, as a string.
+    for issuer in ["https://issuer", "https://second"] {
+        let token = create_jwt_token(
+            &json!({"sub": "testuser", "iss": issuer}),
+            "test-jwt-secret",
+        );
+        let mut ctx = make_ctx();
+        ctx.headers
+            .insert("authorization".into(), format!("Bearer {token}"));
+        assert_continue(plugin.authenticate(&mut ctx, &index).await);
+        assert!(
+            ctx.identified_consumer.is_some(),
+            "accepted issuer {issuer}"
+        );
+    }
+}
+
+/// No-regression guard: an unconfigured issuer still admits a token that
+/// carries no `iss` at all, and a plain string `iss` stays acceptable.
+#[tokio::test]
+async fn unconfigured_issuer_still_admits_string_and_absent_claims() {
+    let plugin = JwtAuth::new(&json!({})).unwrap();
+    let index = ConsumerIndex::new(&[create_test_consumer()]);
+    for claims in [
+        json!({"sub": "testuser"}),
+        json!({"sub": "testuser", "iss": "https://anything"}),
+    ] {
+        let token = create_jwt_token(&claims, "test-jwt-secret");
+        let mut ctx = make_ctx();
+        ctx.headers
+            .insert("authorization".into(), format!("Bearer {token}"));
+        assert_continue(plugin.authenticate(&mut ctx, &index).await);
+        assert!(ctx.identified_consumer.is_some(), "claims: {claims}");
+    }
+}
+
+/// With no issuer configured, an array `iss` is still a malformed registered
+/// claim and must not authenticate.
+#[tokio::test]
+async fn array_issuer_rejects_even_with_no_issuer_configured() {
+    let plugin = JwtAuth::new(&json!({})).unwrap();
+    let index = ConsumerIndex::new(&[create_test_consumer()]);
+    let token = create_jwt_token(
+        &json!({"sub": "testuser", "iss": ["a", "b"]}),
+        "test-jwt-secret",
+    );
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".into(), format!("Bearer {token}"));
+
+    assert_reject(plugin.authenticate(&mut ctx, &index).await, Some(401));
+    assert!(ctx.identified_consumer.is_none());
+}

@@ -23,8 +23,9 @@ use crate::consumer_index::ConsumerIndex;
 use super::utils::PluginHttpClient;
 use super::utils::auth_attempt::AuthenticationAttempt;
 use super::utils::auth_flow::{
-    VerifyOutcome, authentication_attempt_can_commit, commit_authentication_attempt,
-    constant_time_eq, credential_deadline_from_unix_seconds, nonblank_identity,
+    NumericDateBound, VerifyOutcome, authentication_attempt_can_commit,
+    commit_authentication_attempt, constant_time_eq, credential_deadline_from_unix_seconds,
+    nonblank_identity, numeric_date_seconds,
 };
 use super::utils::claim_header_fanout::{
     ClaimHeaderDestinations, ClaimHeaderMapping, apply_claim_headers_from_context,
@@ -3956,8 +3957,16 @@ fn expires_at_from_expires_in(expires_in: Option<i64>, now: i64, session_ttl: Du
     now.saturating_add(lifetime.clamp(0, MAX_SESSION_TTL_SECS as i64))
 }
 
+/// The ID token's own `exp`, in whole Unix seconds.
+///
+/// Read through the shared NumericDate contract so a conforming fractional
+/// `exp` bounds the session exactly like an integer one. Reading it as an
+/// integer only made every fractional-expiry ID token fall back to the
+/// configured session/access-token lifetime, which is far longer than the
+/// token's actual validity (issue #5521). Fractional seconds truncate toward
+/// the past, so the session is never live past the claim.
 fn claim_expiry(claims: &Value) -> Option<i64> {
-    claims.get("exp").and_then(Value::as_i64)
+    numeric_date_seconds(claims.get("exp")?, NumericDateBound::Upper)
 }
 
 fn required_subject<'a>(claims: &'a Value, token_kind: &str) -> Result<&'a str, String> {
@@ -4013,11 +4022,24 @@ fn effective_claims_expires_at(payload: &SessionPayload) -> i64 {
     stored_claims_expires_at(payload).min(payload.expires_at_unix)
 }
 
+/// The claim validity a sealed session carries.
+///
+/// The sealed `claims_expires_at_unix` field is authoritative only where it is
+/// not looser than the claims it was derived from. Every path that mints or
+/// refreshes a session already stores the ID token's own `exp` when there is
+/// one, so the `min` is a no-op there; it exists so a cookie sealed with a
+/// longer bound than its claims allow — for instance one minted before the
+/// fractional-`exp` fix, which fell back to the session lifetime (issue #5521)
+/// — cannot keep that validity merely because the field is present.
 fn stored_claims_expires_at(payload: &SessionPayload) -> i64 {
+    let embedded = claim_expiry(&payload.claims);
     if payload.claims_expires_at_unix > 0 {
-        payload.claims_expires_at_unix
+        match embedded {
+            Some(expiry) => payload.claims_expires_at_unix.min(expiry),
+            None => payload.claims_expires_at_unix,
+        }
     } else {
-        claim_expiry(&payload.claims).unwrap_or(payload.expires_at_unix)
+        embedded.unwrap_or(payload.expires_at_unix)
     }
 }
 
