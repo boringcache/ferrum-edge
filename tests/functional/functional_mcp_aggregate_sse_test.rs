@@ -1517,7 +1517,10 @@ async fn functional_mcp_aggregate_sse_endpoint_scope_never_forwards_descendants(
             .timeout(READ_TIMEOUT)
             .build()
             .unwrap();
-        for suffix in ["/", "//", "/child"] {
+        // A single trailing slash is the endpoint's alias (issue #5536) and is
+        // covered by the positive controls below; repeated slashes and
+        // descendants stay unknown endpoints.
+        for suffix in ["//", "/child"] {
             for method in [
                 reqwest::Method::POST,
                 reqwest::Method::GET,
@@ -1537,13 +1540,14 @@ async fn functional_mcp_aggregate_sse_endpoint_scope_never_forwards_descendants(
         }
         assert_eq!(fixture.requests.load(Ordering::SeqCst), 0);
         // Positive controls use the same gateway and backend. A query does
-        // not alter endpoint selection, and the exact endpoint still routes.
+        // not alter endpoint selection, the exact endpoint still routes, and
+        // the single-trailing-slash alias routes through the same mediation.
         let session = if mode == "aggregate_router" {
             initialize_session(&client, port).await
         } else {
             "transparent-session".to_string()
         };
-        for query in ["", "?x=1"] {
+        for query in ["", "?x=1", "/"] {
             let post = tokio::spawn({
                 let client = client.clone();
                 let session = session.clone();
@@ -1564,7 +1568,7 @@ async fn functional_mcp_aggregate_sse_endpoint_scope_never_forwards_descendants(
             assert_eq!(response.status().as_u16(), 200);
             assert_eq!(wire_id(&response.text().await.unwrap()), "\"path-control\"");
         }
-        assert_eq!(fixture.requests.load(Ordering::SeqCst), 2);
+        assert_eq!(fixture.requests.load(Ordering::SeqCst), 3);
         fixture.shutdown().await;
     }
 }
