@@ -46,6 +46,29 @@ fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+#[test]
+fn database_tls_snapshot_and_reload_cover_all_sql_consumers() {
+    let loader = source("src/config/db_loader.rs");
+    assert!(loader.contains("snapshot.pin(options)"));
+    assert!(loader.contains("snapshot.pin(Self::build_pool_options_from_config"));
+    for path in ["src/modes/database.rs", "src/modes/control_plane.rs"] {
+        let mode = source(path);
+        assert!(mode.contains("start_db_tls_reload_task("), "{path}");
+    }
+    let migrate = source("src/modes/migrate.rs");
+    assert_eq!(migrate.matches("connect_any_pool_with_timeout(").count(), 3);
+    assert!(source("src/modes/db_tls_reload.rs").contains("db.reconnect_tls("));
+    for caller in [
+        "pub async fn connect_with_pool_config(",
+        "async fn reconnect_for_topology(",
+        "async fn reconnect_tls_pools(",
+        "pub async fn reconnect_read_replica(",
+    ] {
+        let body = item_body(&loader, caller, "\n    }");
+        assert!(body.contains("connect_any_pool_with_timeout("), "{caller}");
+    }
+}
+
 /// Read one production source by repository-relative path.
 fn source(relative: &str) -> String {
     let path = repository_root().join(relative);

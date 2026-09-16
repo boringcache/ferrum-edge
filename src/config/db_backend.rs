@@ -2179,6 +2179,20 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     /// Atomically replace the admin-read replica pool with a freshly connected one.
     async fn reconnect_read_replica(&self, replica_url: &str) -> Result<(), anyhow::Error>;
 
+    /// Admit a TLS reload. SQL stages both pools before publishing either;
+    /// backends without SQL read replicas retain their normal reconnect path.
+    async fn reconnect_tls(
+        &self,
+        db_url: &str,
+        replica_url: Option<&str>,
+    ) -> Result<(), anyhow::Error> {
+        self.reconnect(db_url).await?;
+        if let Some(replica_url) = replica_url {
+            self.reconnect_read_replica(replica_url).await?;
+        }
+        Ok(())
+    }
+
     /// Try to reconnect to any available database URL (primary first, then failover).
     async fn try_failover_reconnect(&self, primary_url: &str) -> Result<String, anyhow::Error>;
 

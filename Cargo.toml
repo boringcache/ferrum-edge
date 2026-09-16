@@ -610,6 +610,7 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # `[patch.crates-io]` line, drop `vendor/h3-quinn-0.0.10-ferrum-patched/`,
 # and bump the `h3-quinn` floor. See `docs/upstream-h3-quinn-patches/`.
 [patch.crates-io]
+sqlx-core = { path = "vendor/sqlx-core-0.8.6-ferrum-patched" }
 reqwest = { path = "vendor/reqwest-0.13.3-ferrum-patched" }
 h3 = { path = "vendor/h3-0.0.8-ferrum-patched" }
 h3-quinn = { path = "vendor/h3-quinn-0.0.10-ferrum-patched" }

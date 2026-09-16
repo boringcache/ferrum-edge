@@ -45,6 +45,14 @@ For PostgreSQL and MySQL, Ferrum appends TLS query parameters to `FERRUM_DB_URL`
 
 For PostgreSQL, client certificate parameters can be present with `allow` or `prefer`, but those modes may still use plaintext. Client-certificate authentication effectively requires `require`, `verify-ca`, or `verify-full`; use `verify-full` for production.
 
+For PostgreSQL and MySQL, `verify-ca` accepts a trusted certificate whose DNS
+or IP SAN does not match the database URL host. It still rejects an untrusted
+chain, an expired or not-yet-valid server certificate, and invalid TLS handshake
+signatures. `verify-full` adds the hostname check. These semantics share the
+same SQL connection path in database, CP, and migrate modes, including failover
+and admin-read replica connections. MongoDB's supported modes remain `disable`,
+`require`, and `verify-full`; it does not support `verify-ca`.
+
 SQLite is an embedded, file-based database. Because there is no network connection to secure, `FERRUM_DB_TLS_MODE=disable` is accepted as a no-op, while certificate paths and every other TLS mode are rejected when `FERRUM_DB_TYPE=sqlite`.
 
 ## Live Reload
@@ -58,7 +66,28 @@ export FERRUM_DB_TLS_WATCH_INTERVAL_SECONDS=30
 
 When enabled, Ferrum fingerprints `FERRUM_DB_TLS_CA_CERT_PATH`, `FERRUM_DB_TLS_CLIENT_CERT_PATH`, and `FERRUM_DB_TLS_CLIENT_KEY_PATH` after `_SOURCE` overrides are applied. File-backed sources use `FERRUM_DB_TLS_WATCH_INTERVAL_SECONDS`; provider and Kubernetes sources use `FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` unless their source URI includes `?poll=`.
 
-On changed bytes, Ferrum rebuilds the effective database URLs and reconnects the active SQL pool or MongoDB client. SQL admin-read replica pools are reconnected when `FERRUM_DB_READ_REPLICA_URL` is configured. Existing in-flight DB queries keep their current connection; new DB work uses the reconnected pool/client. You can force an immediate source poll with:
+On changed bytes, Ferrum rebuilds the effective database URLs and reconnects the active SQL pool or MongoDB client. SQL admin-read replica pools are reconnected when `FERRUM_DB_READ_REPLICA_URL` is configured. Existing in-flight DB queries keep their current connection; new DB work uses the reconnected pool/client.
+
+Each PostgreSQL/MySQL pool owns immutable, private PEM snapshots of its CA,
+client certificate, and client key. This applies at initial connection and
+reconnection, including failover, replica, and migrate pools, whether paths
+come from the canonical env settings or SQL URL options. Pool replacement
+connections never reread the operator's mutable pathname. A rejected CA or
+identity reload retains the previously accepted material even after the
+database closes sessions or the pool evicts idle connections. New connections
+still perform the configured certificate verification using that material.
+
+SQL reloads stage the primary and any configured replica before publishing
+either candidate. If either fails, both live pools keep their accepted
+snapshots and the watcher retains its existing rejection logging, metrics,
+and retry cadence. An accepted reload publishes the replacement pools under
+the reconnect transition guard; private PEM copies are removed after their
+owning pools are dropped. With live reload disabled, changing the source file
+does not change an existing pool's material. Migrate snapshots its material for
+the command and does not start a watcher. URL-only paths are snapshotted but
+are not added to the env-source watcher.
+
+You can force an immediate source poll with:
 
 ```bash
 curl -X POST -H "Authorization: Bearer $TOKEN" \

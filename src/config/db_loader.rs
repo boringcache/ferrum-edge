@@ -757,8 +757,8 @@ where
 
 /// Connect an `AnyPool` under [`await_pool_connect_with_timeout`].
 ///
-/// Does not mutate the URL: TLS / DSN query parameters are left untouched, and
-/// no ignored `connect_timeout=` query parameter is appended.
+/// Snapshot TLS paths before connecting so a rejected rotation cannot change
+/// the material used by replacement connections in the retained pool.
 pub(crate) async fn connect_any_pool_with_timeout(
     options: AnyPoolOptions,
     url: &str,
@@ -767,7 +767,17 @@ pub(crate) async fn connect_any_pool_with_timeout(
 ) -> Result<AnyPool, sqlx::Error> {
     await_pool_connect_with_timeout(
         effective_pool_connect_timeout_seconds(db_type, connect_timeout_seconds),
-        options.connect(url),
+        async {
+            let url = url.to_string();
+            let db_type = db_type.to_string();
+            let snapshot = tokio::task::spawn_blocking(move || {
+                crate::config::db_tls_snapshot::SqlTlsSnapshot::load(&url, &db_type)
+            })
+            .await
+            .map_err(|error| sqlx::Error::Configuration(error.into()))??;
+            let (options, url) = snapshot.pin(options);
+            options.connect(&url).await
+        },
     )
     .await
 }
@@ -2081,8 +2091,10 @@ impl DatabaseStore {
         // the database becomes reachable and the polling loop drives a
         // successful `reconnect()`. Eager reconnect/failover paths apply
         // `connect_timeout_seconds` via [`connect_any_pool_with_timeout`].
-        let pool =
-            Self::build_pool_options_from_config(&pool_config, db_type).connect_lazy(db_url)?;
+        let snapshot = crate::config::db_tls_snapshot::SqlTlsSnapshot::load(db_url, db_type)?;
+        let (options, snapshot_url) =
+            snapshot.pin(Self::build_pool_options_from_config(&pool_config, db_type));
+        let pool = options.connect_lazy(&snapshot_url)?;
 
         Ok(Self {
             pool: Arc::new(ArcSwap::from_pointee(pool)),
@@ -7933,6 +7945,46 @@ impl DatabaseStore {
         )
         .await?;
 
+        self.publish_reconnected_pool(db_url, topology, new_pool, None)
+            .await
+    }
+
+    async fn reconnect_tls_pools(
+        &self,
+        db_url: &str,
+        replica_url: Option<&str>,
+    ) -> Result<(), anyhow::Error> {
+        let new_pool = connect_any_pool_with_timeout(
+            self.build_pool_options(),
+            db_url,
+            &self.db_type,
+            self.pool_config.connect_timeout_seconds,
+        )
+        .await?;
+        let new_replica = if let Some(replica_url) = replica_url {
+            Some(
+                connect_any_pool_with_timeout(
+                    self.build_pool_options(),
+                    replica_url,
+                    &self.db_type,
+                    self.pool_config.connect_timeout_seconds,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        self.publish_reconnected_pool(db_url, DatabaseTopology::Primary, new_pool, new_replica)
+            .await
+    }
+
+    async fn publish_reconnected_pool(
+        &self,
+        db_url: &str,
+        topology: DatabaseTopology,
+        new_pool: AnyPool,
+        new_replica: Option<AnyPool>,
+    ) -> Result<(), anyhow::Error> {
         let topology_kind = match topology {
             DatabaseTopology::Primary => SqlReconnectTopology::Primary,
             DatabaseTopology::Failover => SqlReconnectTopology::Failover,
@@ -7965,6 +8017,14 @@ impl DatabaseStore {
 
         // Atomic swap — readers that already loaded the old pool keep using it.
         let old_pool = self.pool.swap(Arc::new(new_pool));
+        if let Some(new_replica) = new_replica {
+            let old_replica = self.read_replica_pool.swap(Some(Arc::new(new_replica)));
+            if let Some(old_replica) = old_replica {
+                tokio::spawn(async move {
+                    old_replica.close().await;
+                });
+            }
+        }
         self.topology_epoch
             .store(next_topology_epoch, Ordering::Release);
         info!(
@@ -11864,6 +11924,14 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn reconnect_read_replica(&self, replica_url: &str) -> Result<(), anyhow::Error> {
         DatabaseStore::reconnect_read_replica(self, replica_url).await
+    }
+
+    async fn reconnect_tls(
+        &self,
+        db_url: &str,
+        replica_url: Option<&str>,
+    ) -> Result<(), anyhow::Error> {
+        self.reconnect_tls_pools(db_url, replica_url).await
     }
 
     async fn try_failover_reconnect(&self, primary_url: &str) -> Result<String, anyhow::Error> {
