@@ -1798,6 +1798,257 @@ fn admin_body_timeout_routes_document_request_timeout_in_openapi() {
     );
 }
 
+fn openapi_operations_with_status(
+    spec: &serde_json::Value,
+    status: &str,
+) -> BTreeSet<(String, String)> {
+    let paths = spec["paths"]
+        .as_object()
+        .expect("OpenAPI paths is an object");
+    let mut operations = BTreeSet::new();
+
+    for (path, path_item) in paths {
+        let path_item = path_item
+            .as_object()
+            .unwrap_or_else(|| panic!("path item {path} is an object"));
+        for method in OPENAPI_HTTP_METHODS {
+            let Some(operation) = path_item.get(*method) else {
+                continue;
+            };
+            if operation["responses"].get(status).is_some() {
+                operations.insert((method.to_ascii_uppercase(), path.clone()));
+            }
+        }
+    }
+
+    operations
+}
+
+fn openapi_operations_with_status_ref(
+    spec: &serde_json::Value,
+    status: &str,
+    expected_ref: &str,
+) -> BTreeSet<(String, String)> {
+    let paths = spec["paths"]
+        .as_object()
+        .expect("OpenAPI paths is an object");
+    let mut operations = BTreeSet::new();
+
+    for (path, path_item) in paths {
+        let path_item = path_item
+            .as_object()
+            .unwrap_or_else(|| panic!("path item {path} is an object"));
+        for method in OPENAPI_HTTP_METHODS {
+            let Some(operation) = path_item.get(*method) else {
+                continue;
+            };
+            let Some(response) = operation["responses"].get(status) else {
+                continue;
+            };
+            if response.get("$ref").and_then(|value| value.as_str()) == Some(expected_ref) {
+                operations.insert((method.to_ascii_uppercase(), path.clone()));
+            }
+        }
+    }
+
+    operations
+}
+
+/// GET operations that return `400` from the shared namespace header gate
+/// (`extract_namespace` in `src/admin/mod.rs`) and, for `{id}` / `{proxy_id}`
+/// routes, from `validate_resource_id` (issue #5546).
+fn admin_shared_namespace_or_id_400_inventory() -> BTreeSet<(String, String)> {
+    const OPS: &[(&str, &str)] = &[
+        ("GET", "/admin/metrics"),
+        ("GET", "/admin/tls/acme/certificates/{id}"),
+        ("GET", "/admin/tls/acme/orders/{id}"),
+        ("GET", "/api-specs/by-proxy/{proxy_id}"),
+        ("GET", "/api-specs/{id}"),
+        ("GET", "/backend-capabilities"),
+        ("GET", "/cluster"),
+        ("GET", "/consumers/{id}"),
+        ("GET", "/gateway-trust/status"),
+        ("GET", "/mesh/config-drift"),
+        ("GET", "/mesh/egress-scope"),
+        ("GET", "/mesh/federation"),
+        ("GET", "/mesh/remote-clusters"),
+        ("GET", "/mesh/runtime-overlay"),
+        ("GET", "/mesh/service-graph"),
+        ("GET", "/mesh/slice-drift"),
+        ("GET", "/metrics/runtime"),
+        ("GET", "/node-waypoint/identities"),
+        ("GET", "/plugins"),
+        ("GET", "/plugins/config/{id}"),
+        ("GET", "/proxies/{id}"),
+        ("GET", "/service-waypoint/services"),
+        ("GET", "/upstreams/{id}"),
+    ];
+    OPS.iter()
+        .map(|(method, path)| ((*method).to_string(), (*path).to_string()))
+        .collect()
+}
+
+#[test]
+fn admin_shared_namespace_and_id_gates_document_bad_request() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let documented =
+        openapi_operations_with_status_ref(&spec, "400", "#/components/responses/BadRequest");
+    let missing: Vec<_> = admin_shared_namespace_or_id_400_inventory()
+        .difference(&documented)
+        .cloned()
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "shared namespace/id 400 docs missing: {missing:?}"
+    );
+}
+
+#[test]
+fn operator_gated_refresh_and_egress_test_document_forbidden() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for (operation_id, path) in [
+        (
+            "refreshBackendCapabilities",
+            "/backend-capabilities/refresh",
+        ),
+        ("testMeshEgressScopeCandidate", "/mesh/egress-scope/test"),
+    ] {
+        let (method, documented_path, operation) = openapi_operation_by_id(&spec, operation_id);
+        assert_eq!(documented_path, path);
+        assert_eq!(
+            operation["responses"]["403"]["$ref"], "#/components/responses/Forbidden",
+            "{method} {path} ({operation_id}) must document Forbidden \
+             for the operator role gate"
+        );
+    }
+}
+
+#[test]
+fn admin_body_timeout_routes_document_payload_too_large_in_openapi() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let pinned = admin_body_timeout_408_inventory();
+    let documented = openapi_operations_with_status(&spec, "413");
+    assert_eq!(
+        documented, pinned,
+        "OpenAPI 413 inventory drifted from the admin body-timeout route pin"
+    );
+}
+
+fn example_object_has_required_fields(
+    spec: &serde_json::Value,
+    schema: &serde_json::Value,
+    value: &serde_json::Value,
+    path: &str,
+) {
+    let schema = resolve_openapi_value(spec, schema);
+    if let Some(all_of) = schema.get("allOf").and_then(serde_json::Value::as_array) {
+        for entry in all_of {
+            example_object_has_required_fields(spec, entry, value, path);
+        }
+    }
+
+    let Some(required) = schema.get("required").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    let Some(object) = value.as_object() else {
+        panic!("{path} example must be an object to satisfy required fields");
+    };
+    for field in required {
+        let field = field
+            .as_str()
+            .unwrap_or_else(|| panic!("{path} required entry is a string"));
+        assert!(
+            object.contains_key(field),
+            "{path} example is missing required field `{field}`"
+        );
+        if let Some(properties) = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            && let Some(field_schema) = properties.get(field)
+            && let Some(field_value) = object.get(field)
+        {
+            let field_schema = resolve_openapi_value(spec, field_schema);
+            if field_value.is_object() {
+                example_object_has_required_fields(
+                    spec,
+                    field_schema,
+                    field_value,
+                    &format!("{path}.{field}"),
+                );
+            } else if let Some(items) = field_value.as_array()
+                && let Some(item_schema) = field_schema.get("items")
+            {
+                for (index, item) in items.iter().enumerate() {
+                    example_object_has_required_fields(
+                        spec,
+                        item_schema,
+                        item,
+                        &format!("{path}.{field}[{index}]"),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn mesh_slice_drift_examples_match_schema_and_convergence_semantics() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let media = spec
+        .pointer("/paths/~1mesh~1slice-drift/get/responses/200/content/application~1json")
+        .expect("GET /mesh/slice-drift 200 JSON media type");
+    let schema = media
+        .get("schema")
+        .expect("GET /mesh/slice-drift 200 declares a schema");
+    let examples = media["examples"]
+        .as_object()
+        .expect("GET /mesh/slice-drift 200 declares named examples");
+
+    for (name, example) in examples {
+        let value = example
+            .get("value")
+            .unwrap_or_else(|| panic!("example `{name}` has a value"));
+        example_object_has_required_fields(&spec, schema, value, name);
+    }
+
+    let converged = &examples["converged"]["value"];
+    assert_eq!(converged["summary"]["accepted"], json!(0));
+    assert_eq!(converged["summary"]["converged"], json!(1));
+    assert_eq!(
+        converged["data_planes"][0]["convergence"],
+        json!("converged")
+    );
+    assert_eq!(
+        converged["data_planes"][0]["drift"]["desired_vs_applied"],
+        json!(false)
+    );
+    assert_eq!(
+        converged["data_planes"][0]["applied"]["version"],
+        json!("v2")
+    );
+
+    let accepted = &examples["accepted"]["value"];
+    assert_eq!(accepted["summary"]["accepted"], json!(1));
+    assert_eq!(accepted["summary"]["converged"], json!(0));
+    assert_eq!(accepted["data_planes"][0]["convergence"], json!("accepted"));
+    assert_eq!(
+        accepted["data_planes"][0]["drift"]["desired_vs_applied"],
+        json!(true)
+    );
+    assert!(
+        accepted["data_planes"][0].get("applied").is_none(),
+        "accepted example must not stamp an applied watermark"
+    );
+}
+
 /// Store-backed TLS/ACME admin operations that can return `500 Internal Server Error`
 /// when a shared managed or ACME store is unavailable, unreadable, misconfigured,
 /// or when an offloaded store write cannot complete.
