@@ -4933,8 +4933,9 @@ fn test_env_config_db_tls_rejects_verify_ca_without_a_configured_ca() {
             || {
                 let err = EnvConfig::from_env().unwrap_err();
                 assert!(
-                    err.contains("FERRUM_DB_TLS_MODE=verify-ca requires FERRUM_DB_TLS_CA_CERT_PATH")
-                        && err.contains("FERRUM_DB_TLS_CA_CERT_SOURCE"),
+                    err.contains(
+                        "FERRUM_DB_TLS_MODE=verify-ca requires FERRUM_DB_TLS_CA_CERT_PATH"
+                    ) && err.contains("FERRUM_DB_TLS_CA_CERT_SOURCE"),
                     "{db_type}: {err}"
                 );
             },

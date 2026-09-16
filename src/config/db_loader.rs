@@ -2108,18 +2108,18 @@ impl DatabaseStore {
         // successful `reconnect()`. Eager reconnect/failover paths apply
         // `connect_timeout_seconds` via [`connect_any_pool_with_timeout`].
         let options = Self::build_pool_options_from_config(&pool_config, db_type);
-        let (options, snapshot_url) =
-            match crate::config::db_tls_snapshot::SqlTlsSnapshot::load(db_url, db_type) {
-                Ok(snapshot) => snapshot.pin(options),
-                Err(error) => {
-                    let safe_error =
-                        crate::config::db_backend::redact_error_text(&error, &[db_url]);
-                    warn!(
-                        "Database TLS material could not be snapshotted for the backup-bootstrap pool; starting from the unmodified URL and retrying on reconnect: {safe_error}"
-                    );
-                    (options, db_url.to_string())
-                }
-            };
+        let (options, snapshot_url) = match crate::config::db_tls_snapshot::SqlTlsSnapshot::load(
+            db_url, db_type,
+        ) {
+            Ok(snapshot) => snapshot.pin(options),
+            Err(error) => {
+                let safe_error = crate::config::db_backend::redact_error_text(&error, &[db_url]);
+                warn!(
+                    "Database TLS material could not be snapshotted for the backup-bootstrap pool; starting from the unmodified URL and retrying on reconnect: {safe_error}"
+                );
+                (options, db_url.to_string())
+            }
+        };
         let pool = options.connect_lazy(&snapshot_url)?;
 
         Ok(Self {
