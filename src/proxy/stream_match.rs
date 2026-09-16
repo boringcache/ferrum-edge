@@ -47,6 +47,7 @@ pub const MAX_STREAM_MATCH_GATEWAY_LENGTH: usize = 127;
 #[serde(deny_unknown_fields)]
 pub struct StreamMatchCriteria {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub arms: Vec<StreamMatchArm>,
 }
 

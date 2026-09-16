@@ -3052,7 +3052,7 @@ fn mesh_authz_config_policies(config: &serde_json::Value) -> Vec<MeshPolicy> {
         .unwrap_or_default();
     }
     if let Some(value) = config.get("mesh_policies") {
-        return serde_json::from_value::<Vec<MeshPolicy>>(value.clone()).unwrap_or_default();
+        return crate::util::json_object::deserialize_object_vec(value.clone()).unwrap_or_default();
     }
     Vec::new()
 }
@@ -3979,11 +3979,12 @@ fn decode_virtual_service_l4_proxies(slice: &MeshSlice) -> Result<Vec<Proxy>, an
         .iter()
         .enumerate()
         .map(|(index, value)| {
-            let proxy: Proxy = serde_json::from_value(value.clone()).map_err(|error| {
-                anyhow::anyhow!(
-                    "Mesh slice VirtualService L4 proxy {index} is malformed: {error}"
-                )
-            })?;
+            let proxy: Proxy = crate::util::json_object::deserialize_object(value.clone())
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "Mesh slice VirtualService L4 proxy {index} is malformed: {error}"
+                    )
+                })?;
             if proxy.namespace != slice.namespace
                 || !proxy
                     .id
@@ -4022,12 +4023,13 @@ fn decode_virtual_service_l4_upstreams(
         .iter()
         .enumerate()
         .map(|(index, value)| {
-            let upstream: crate::config::types::Upstream = serde_json::from_value(value.clone())
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "Mesh slice VirtualService L4 upstream {index} is malformed: {error}"
-                    )
-                })?;
+            let upstream: crate::config::types::Upstream =
+                crate::util::json_object::deserialize_object(value.clone())
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "Mesh slice VirtualService L4 upstream {index} is malformed: {error}"
+                        )
+                    })?;
             if upstream.namespace != slice.namespace
                 || !upstream.id.starts_with("istio-vs-l4-upstream-")
                 || !referenced.contains(upstream.id.as_str())

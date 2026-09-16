@@ -398,6 +398,7 @@ struct NodeWaypointRouteUpstreamConfig {
     id: String,
     namespace: String,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     targets: Vec<NodeWaypointRouteTargetConfig>,
 }
 
@@ -589,11 +590,13 @@ fn parse_node_waypoint_route_upstreams(
 ) -> Result<(bool, Vec<NodeWaypointRouteUpstreamConfig>), String> {
     match config.get("node_waypoint_route_upstreams") {
         Some(value) => {
-            serde_json::from_value::<Vec<NodeWaypointRouteUpstreamConfig>>(value.clone())
-                .map(|upstreams| (true, upstreams))
-                .map_err(|error| {
-                    format!("mesh_authz: invalid node_waypoint_route_upstreams: {error}")
-                })
+            crate::util::json_object::deserialize_object_vec::<_, NodeWaypointRouteUpstreamConfig>(
+                value.clone(),
+            )
+            .map(|upstreams| (true, upstreams))
+            .map_err(|error| {
+                format!("mesh_authz: invalid node_waypoint_route_upstreams: {error}")
+            })
         }
         None => Ok((false, Vec::new())),
     }
@@ -1648,7 +1651,7 @@ impl MeshAuthz {
                 .map_err(|e| format!("mesh_authz: invalid mesh_slice: {e}"))?
                 .0
         } else if let Some(value) = config.get("mesh_policies") {
-            let mesh_policies = serde_json::from_value::<Vec<MeshPolicy>>(value.clone())
+            let mesh_policies = crate::util::json_object::deserialize_object_vec(value.clone())
                 .map_err(|e| format!("mesh_authz: invalid mesh_policies: {e}"))?;
             MeshSlice {
                 mesh_policies,

@@ -1275,11 +1275,17 @@ fn admin_typed_body_boundaries_require_a_json_object_envelope() {
 }
 
 // The original three-resource check above remains the regression table for
-// #5538. This inventory checks object-valued fields in the #5557 admission
-// modules below, including private plugin wire structs and mesh-slice carriers.
-// Source discovery requires an admission decision for new Option<Struct>
-// fields within that scope; this is not complete JSON admission coverage.
-// Collection-element admission (including Vec<Struct>) is tracked in #5569.
+// #5538. This source inventory checks derived Deserialize structs/enums in the
+// admission modules below, including private plugin wire and mesh-slice types.
+// It covers named struct fields (direct, Option, Box), Vec<Struct> and
+// Option<Vec<Struct>> elements, and newtype enum variants carrying a named
+// struct. Named fields inside enum struct variants are also checked; the
+// variant payload itself is NOT guarded by that field check. Enum elements,
+// map values, tuples, aliases, arbitrary wrapper nesting, hand-written
+// deserializers and raw serde_json::Value boundaries are not discovered here.
+// Separate behavioral/boundary tests cover the raw-Value sites changed here.
+// Skipped runtime fields are not JSON inputs. Scalar identity parsers and
+// field-specific exceptions below must justify why they need no object guard.
 fn object_admission_source(path: &str) -> bool {
     path.starts_with("src/config/")
         || path.starts_with("src/admin/")
@@ -1295,9 +1301,76 @@ fn object_admission_source(path: &str) -> bool {
 }
 
 /// Field-specific exceptions, never a blanket exception for a config type.
-/// These are persistence/replication records, not admin configuration. Custom scalar
-/// identity types are checked separately below against their string parser.
+/// These are internal records, response-only types or remote-provider responses,
+/// not admin configuration. Custom scalar identity types are checked separately
+/// below against their string parser.
 const OBJECT_ADMISSION_EXCEPTIONS: &[(&str, &str, &str, &str)] = &[
+    (
+        "src/modes/mesh/config.rs",
+        "MeshEgressUdpDestination",
+        "dial_endpoints",
+        "Runtime-only allowlist; MeshConfig.egress_udp_destinations is serde(skip).",
+    ),
+    (
+        "src/config/db_backend.rs",
+        "IncrementalResultDe",
+        "added_or_modified_proxies",
+        "Private CP/DP delta wire record, not an admin body or mesh config file.",
+    ),
+    (
+        "src/config/db_backend.rs",
+        "IncrementalResultDe",
+        "removed_proxy_keys",
+        "Private CP/DP delta wire record, not an admin body or mesh config file.",
+    ),
+    (
+        "src/config/db_backend.rs",
+        "IncrementalResultDe",
+        "added_or_modified_consumers",
+        "Private CP/DP delta wire record, not an admin body or mesh config file.",
+    ),
+    (
+        "src/config/db_backend.rs",
+        "IncrementalResultDe",
+        "added_or_modified_plugin_configs",
+        "Private CP/DP delta wire record, not an admin body or mesh config file.",
+    ),
+    (
+        "src/config/db_backend.rs",
+        "IncrementalResultDe",
+        "removed_plugin_config_keys",
+        "Private CP/DP delta wire record, not an admin body or mesh config file.",
+    ),
+    (
+        "src/config/db_backend.rs",
+        "IncrementalResultDe",
+        "added_or_modified_upstreams",
+        "Private CP/DP delta wire record, not an admin body or mesh config file.",
+    ),
+    (
+        "src/config/db_backend.rs",
+        "IncrementalResultDe",
+        "removed_upstream_keys",
+        "Private CP/DP delta wire record, not an admin body or mesh config file.",
+    ),
+    (
+        "src/admin/mesh_remote_clusters.rs",
+        "MeshRemoteClustersResponse",
+        "discovered",
+        "Response-only diagnostics; no admin request deserializes this type.",
+    ),
+    (
+        "src/admin/mesh_remote_clusters.rs",
+        "MeshRemoteClustersResponse",
+        "configured",
+        "Response-only diagnostics; no admin request deserializes this type.",
+    ),
+    (
+        "src/plugins/utils/jwks_store.rs",
+        "JwksResponse",
+        "keys",
+        "Remote JWKS response, not plugin configuration or a gateway trust bundle.",
+    ),
     (
         "src/config/db_backend.rs",
         "RemovalKeyWire",
@@ -1328,6 +1401,95 @@ const OBJECT_ADMISSION_EXCEPTIONS: &[(&str, &str, &str, &str)] = &[
 /// discovered fields keep the total count above its floor. Discovery still
 /// checks additions without requiring them to be listed here first.
 const EXPECTED_OBJECT_ADMISSION_FIELDS: &[&str] = &[
+    "src/admin/api_specs/external_refs.rs:ExternalRefSnapshot.documents",
+    "src/admin/backup.rs:ApiSpecsBackupSection.items",
+    "src/admin/backup.rs:BatchCreateRequest.consumers",
+    "src/admin/backup.rs:BatchCreateRequest.plugin_configs",
+    "src/admin/backup.rs:BatchCreateRequest.proxies",
+    "src/admin/backup.rs:BatchCreateRequest.upstreams",
+    "src/admin/backup.rs:RestorePayload.consumers",
+    "src/admin/backup.rs:RestorePayload.gateway_trust_bundles",
+    "src/admin/backup.rs:RestorePayload.plugin_configs",
+    "src/admin/backup.rs:RestorePayload.proxies",
+    "src/admin/backup.rs:RestorePayload.upstreams",
+    "src/config/plugin_trigger.rs:PluginTriggerNode.all",
+    "src/config/plugin_trigger.rs:PluginTriggerNode.any",
+    "src/config/types.rs:GatewayConfig.consumers",
+    "src/config/types.rs:GatewayConfig.frontend_tls_certificate_sources",
+    "src/config/types.rs:GatewayConfig.plugin_configs",
+    "src/config/types.rs:GatewayConfig.proxies",
+    "src/config/types.rs:GatewayConfig.upstreams",
+    "src/config/types.rs:Proxy.plugins",
+    "src/config/types.rs:Upstream.subsets",
+    "src/config/types.rs:Upstream.targets",
+    "src/config/types.rs:UpstreamLocalityLbSetting.distribute",
+    "src/config/types.rs:UpstreamLocalityLbSetting.failover",
+    "src/modes/mesh/config.rs:MeshConfig.destination_rules",
+    "src/modes/mesh/config.rs:MeshConfig.ext_authz_providers",
+    "src/modes/mesh/config.rs:MeshConfig.extension_configs",
+    "src/modes/mesh/config.rs:MeshConfig.mesh_policies",
+    "src/modes/mesh/config.rs:MeshConfig.peer_authentications",
+    "src/modes/mesh/config.rs:MeshConfig.proxy_configs",
+    "src/modes/mesh/config.rs:MeshConfig.request_authentications",
+    "src/modes/mesh/config.rs:MeshConfig.service_entries",
+    "src/modes/mesh/config.rs:MeshConfig.services",
+    "src/modes/mesh/config.rs:MeshConfig.sidecars",
+    "src/modes/mesh/config.rs:MeshConfig.telemetry_resources",
+    "src/modes/mesh/config.rs:MeshConfig.virtual_service_cors_policies",
+    "src/modes/mesh/config.rs:MeshConfig.waypoint_bindings",
+    "src/modes/mesh/config.rs:MeshConfig.workloads",
+    "src/modes/mesh/config.rs:MeshDestinationRule.subsets",
+    "src/modes/mesh/config.rs:MeshExtAuthzProvider.include_additional_headers_in_check",
+    "src/modes/mesh/config.rs:MeshJwtRule.from_headers",
+    "src/modes/mesh/config.rs:MeshJwtRule.output_claim_to_headers",
+    "src/modes/mesh/config.rs:MeshLocalityLbSetting.distribute",
+    "src/modes/mesh/config.rs:MeshLocalityLbSetting.failover",
+    "src/modes/mesh/config.rs:MeshMetricsConfig.tag_overrides",
+    "src/modes/mesh/config.rs:MeshPolicy.rules",
+    "src/modes/mesh/config.rs:MeshRequestAuthentication.jwt_rules",
+    "src/modes/mesh/config.rs:MeshRule.from",
+    "src/modes/mesh/config.rs:MeshRule.to",
+    "src/modes/mesh/config.rs:MeshRule.when",
+    "src/modes/mesh/config.rs:MeshService.ports",
+    "src/modes/mesh/config.rs:MeshService.workloads",
+    "src/modes/mesh/config.rs:MeshSidecar.egress",
+    "src/modes/mesh/config.rs:MeshSidecar.ingress",
+    "src/modes/mesh/config.rs:MeshWaypointBinding.services",
+    "src/modes/mesh/config.rs:MultiClusterConfig.east_west_gateways",
+    "src/modes/mesh/config.rs:MultiClusterConfig.remote_clusters",
+    "src/modes/mesh/config.rs:ServiceEntry.endpoints",
+    "src/modes/mesh/config.rs:ServiceEntry.ports",
+    "src/modes/mesh/config.rs:TrustBundle.jwt_authorities",
+    "src/modes/mesh/config.rs:TrustBundleSet.federated",
+    "src/modes/mesh/config.rs:Workload.ports",
+    "src/modes/mesh/slice.rs:MeshEgressScopeSnapshot.destination_rules",
+    "src/modes/mesh/slice.rs:MeshEgressScopeSnapshot.service_entries",
+    "src/modes/mesh/slice.rs:MeshEgressScopeSnapshot.services",
+    "src/modes/mesh/slice.rs:MeshSlice.ambient_udp_source_workloads",
+    "src/modes/mesh/slice.rs:MeshSlice.destination_rules",
+    "src/modes/mesh/slice.rs:MeshSlice.ext_authz_providers",
+    "src/modes/mesh/slice.rs:MeshSlice.extension_configs",
+    "src/modes/mesh/slice.rs:MeshSlice.local_inbound_services",
+    "src/modes/mesh/slice.rs:MeshSlice.local_inbound_workloads",
+    "src/modes/mesh/slice.rs:MeshSlice.local_ingress_listeners",
+    "src/modes/mesh/slice.rs:MeshSlice.mesh_policies",
+    "src/modes/mesh/slice.rs:MeshSlice.node_waypoint_assertors",
+    "src/modes/mesh/slice.rs:MeshSlice.node_waypoint_capture_destinations",
+    "src/modes/mesh/slice.rs:MeshSlice.node_waypoint_capture_peer_authentications",
+    "src/modes/mesh/slice.rs:MeshSlice.peer_authentications",
+    "src/modes/mesh/slice.rs:MeshSlice.proxy_configs",
+    "src/modes/mesh/slice.rs:MeshSlice.request_authentications",
+    "src/modes/mesh/slice.rs:MeshSlice.service_entries",
+    "src/modes/mesh/slice.rs:MeshSlice.service_waypoint_bound_services",
+    "src/modes/mesh/slice.rs:MeshSlice.services",
+    "src/modes/mesh/slice.rs:MeshSlice.telemetry_resources",
+    "src/modes/mesh/slice.rs:MeshSlice.virtual_service_cors_policies",
+    "src/modes/mesh/slice.rs:MeshSlice.workloads",
+    "src/plugins/mesh/authz.rs:NodeWaypointRouteUpstreamConfig.targets",
+    "src/plugins/mesh_route_dispatch.rs:MeshRouteDispatchConfig.rules",
+    "src/plugins/mesh_route_dispatch.rs:RouteRule.request_transform",
+    "src/plugins/mesh_route_dispatch.rs:RouteRule.response_transform",
+    "src/proxy/stream_match.rs:StreamMatchCriteria.arms",
     "src/admin/backup.rs:RestorePayload.api_specs",
     "src/config/gateway_trust.rs:GatewayTrustBundleRecord.bundle",
     "src/config/plugin_trigger.rs:PluginTrigger.when",
@@ -1487,10 +1649,15 @@ fn every_nested_admin_struct_field_has_an_object_admission_decision() {
                 let type_text: String = field[2].split_whitespace().collect();
                 let optional = type_text.starts_with("Option<");
                 let mut inner = type_text.as_str();
-                // Box is transparent to serde; Option<Box<Struct>> is just
-                // as vulnerable as Option<Struct>. Collections themselves
-                // have their own sequence/map wire contract.
+                // Box is transparent to serde. Vec retains its array shape
+                // but each named-struct element must require an object.
                 for wrapper in ["Option<", "Box<"] {
+                    if let Some(wrapped) = inner.strip_prefix(wrapper) {
+                        inner = wrapped.strip_suffix('>').unwrap_or(wrapped);
+                    }
+                }
+                let collection = inner.starts_with("Vec<");
+                for wrapper in ["Vec<", "Box<"] {
                     if let Some(wrapped) = inner.strip_prefix(wrapper) {
                         inner = wrapped.strip_suffix('>').unwrap_or(wrapped);
                     }
@@ -1512,6 +1679,19 @@ fn every_nested_admin_struct_field_has_an_object_admission_decision() {
                     );
                     continue;
                 }
+                if name == "ParsedCidr" {
+                    // CIDRs are strings on the wire despite the named Rust
+                    // struct; arrays fail in this custom scalar parser.
+                    assert!(
+                        item_body(
+                            &source("src/modes/mesh/config.rs"),
+                            "impl<'de> Deserialize<'de> for ParsedCidr",
+                            "\n}",
+                        )
+                        .contains("String::deserialize(deserializer)?")
+                    );
+                    continue;
+                }
                 let field_name = &field[1];
                 let key = format!("{path}:{resource}.{field_name}");
                 if let Some((_, _, _, reason)) = OBJECT_ADMISSION_EXCEPTIONS.iter().find(
@@ -1525,10 +1705,11 @@ fn every_nested_admin_struct_field_has_an_object_admission_decision() {
                     exceptions_seen.insert(key);
                     continue;
                 }
-                let helper = if optional {
-                    "json_object::deserialize_optional_object"
-                } else {
-                    "json_object::deserialize_object"
+                let helper = match (collection, optional) {
+                    (true, true) => "json_object::deserialize_optional_object_vec",
+                    (true, false) => "json_object::deserialize_object_vec",
+                    (false, true) => "json_object::deserialize_optional_object",
+                    (false, false) => "json_object::deserialize_object",
                 };
                 let adapter = match (path.as_str(), resource, field_name) {
                     ("src/plugins/mesh_route_dispatch.rs", "RouteRule", "retry") => {
@@ -1553,7 +1734,7 @@ fn every_nested_admin_struct_field_has_an_object_admission_decision() {
                     assert!(
                         attributes.contains(helper),
                         "{key} ({type_text}) must use {helper}, or have a field-specific \
-                         exception with proof of earlier rejection (issue #5557)"
+                         exception with a justification (issues #5557, #5569)"
                     );
                 }
                 checked.insert(key);
@@ -1590,9 +1771,9 @@ fn every_nested_admin_struct_field_has_an_object_admission_decision() {
         .filter(|key| !checked.contains(*key))
         .collect();
     assert!(
-        checked.len() >= 65 && missing.is_empty(),
+        checked.len() >= 150 && missing.is_empty(),
         "the admission inventory must not silently shrink: checked {} fields \
-         (minimum 65), expected {} baseline keys, missing: {missing:?}",
+         (minimum 150), expected {} baseline keys, missing: {missing:?}",
         checked.len(),
         EXPECTED_OBJECT_ADMISSION_FIELDS.len()
     );
@@ -1971,6 +2152,57 @@ fn plugin_structs_behind_raw_json_values_retain_object_admission() {
         assert!(
             item_body(&text, signature, terminator).contains(guarded_type),
             "{path}: raw JSON must pass the object guard before typed plugin parsing"
+        );
+    }
+}
+
+#[test]
+fn plugin_struct_lists_behind_raw_json_values_retain_element_admission() {
+    for (path, signature, terminator) in [
+        (
+            "src/plugins/mesh/authz.rs",
+            "fn parse_node_waypoint_route_upstreams(",
+            "\n}",
+        ),
+        (
+            "src/plugins/mesh/authz.rs",
+            "pub fn new_with_http_client(",
+            "\n    }",
+        ),
+        (
+            "src/modes/mesh/mod.rs",
+            "fn mesh_authz_config_policies(config: &serde_json::Value)",
+            "\n}",
+        ),
+    ] {
+        let text = admission_source_without_line_comments(&source(path));
+        assert!(
+            item_body(&text, signature, terminator).contains("json_object::deserialize_object_vec"),
+            "{path}: raw JSON lists must guard every typed struct element"
+        );
+    }
+    let text = admission_source_without_line_comments(&source("src/modes/mesh/slice.rs"));
+    for field in ["virtual_service_l4_proxies", "virtual_service_l4_upstreams"] {
+        let helper = "deserialize_object_vec";
+        let guarded_field = format!(
+            "#[serde(deserialize_with = \"crate::util::json_object::{helper}\")]\n    \
+             pub {field}: Vec<serde_json::Value>"
+        );
+        assert!(
+            text.contains(&guarded_field),
+            "MeshSlice.{field}: require objects"
+        );
+    }
+    // xDS can construct a slice without running its Deserialize, so the
+    // subsequent Value-to-resource conversion must retain the same guard.
+    let text = admission_source_without_line_comments(&source("src/modes/mesh/mod.rs"));
+    for signature in [
+        "fn decode_virtual_service_l4_proxies(",
+        "fn decode_virtual_service_l4_upstreams(",
+    ] {
+        assert!(
+            item_body(&text, signature, "\n}").contains("json_object::deserialize_object("),
+            "{signature}: typed L4 resource elements must require objects"
         );
     }
 }
