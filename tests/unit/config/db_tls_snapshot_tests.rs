@@ -67,16 +67,15 @@ fn sql_tls_modes_match_native_drivers_for_every_database_consumer() {
                     urls.push(env.effective_db_url().unwrap().unwrap());
                     urls.push(env.effective_db_read_replica_url().unwrap().unwrap());
                     for url in urls {
+                        // The driver ssl-mode enums do not implement `PartialEq`;
+                        // compare their `Debug` renderings instead.
                         if db_type == "postgres" {
-                            assert_eq!(
-                                PgConnectOptions::from_str(&url).unwrap().get_ssl_mode(),
-                                pg,
-                            );
+                            let actual = PgConnectOptions::from_str(&url).unwrap().get_ssl_mode();
+                            assert_eq!(format!("{actual:?}"), format!("{pg:?}"));
                         } else {
-                            assert_eq!(
-                                MySqlConnectOptions::from_str(&url).unwrap().get_ssl_mode(),
-                                mysql,
-                            );
+                            let actual =
+                                MySqlConnectOptions::from_str(&url).unwrap().get_ssl_mode();
+                            assert_eq!(format!("{actual:?}"), format!("{mysql:?}"));
                         }
                     }
                 }
