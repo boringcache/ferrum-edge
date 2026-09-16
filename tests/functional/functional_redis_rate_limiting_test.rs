@@ -198,6 +198,78 @@ async fn redis_key_count_by_prefix(prefix: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Sum every counter under `prefix` (DB 15): the live charge on the rate-limit
+/// windows once every detached compensation has landed.
+async fn redis_counter_sum_by_prefix(prefix: &str) -> i64 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let Ok(stream) = tokio::net::TcpStream::connect("127.0.0.1:6379").await else {
+        return 0;
+    };
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = reader;
+    let mut buf = vec![0u8; 8192];
+
+    // SELECT 15
+    if writer
+        .write_all(b"*2\r\n$6\r\nSELECT\r\n$2\r\n15\r\n")
+        .await
+        .is_err()
+    {
+        return 0;
+    }
+    let _ = reader.read(&mut buf).await;
+
+    let lua_script = format!(
+        "local total = 0 {} return total",
+        redis_glob_loop(
+            prefix,
+            "for i=1,#keys do local n = tonumber(redis.call('GET',keys[i])) \
+             if n then total = total + n end end",
+        )
+    );
+    let lua_len = lua_script.len();
+    let cmd = format!(
+        "*3\r\n$4\r\nEVAL\r\n${}\r\n{}\r\n$1\r\n0\r\n",
+        lua_len, lua_script
+    );
+    if writer.write_all(cmd.as_bytes()).await.is_err() {
+        return 0;
+    }
+    buf.fill(0);
+    let Ok(n) = reader.read(&mut buf).await else {
+        return 0;
+    };
+    let response = String::from_utf8_lossy(&buf[..n]);
+    response
+        .strip_prefix(':')
+        .and_then(|value| value.split("\r\n").next())
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+/// Wait until the counters under `prefix` sum to `expected`.
+///
+/// A refusal hands its charge back from a DETACHED compensation task, so the
+/// shared counter is only eventually exact after a `429`. A test that resets or
+/// re-reads the budget right after a refusal has to let that compensation land
+/// first, or the `DECR` arrives on the reset counter and hands the next round
+/// one admission more than the budget.
+async fn wait_for_redis_counter_sum(prefix: &str, expected: i64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let total = redis_counter_sum_by_prefix(prefix).await;
+        if total == expected {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "counters under {prefix} settled at {total}, expected {expected}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// Decode every flat request-deduplication record under `prefix` (DB 15).
 ///
 /// Request-deduplication keys are opaque digests, so functional tests cannot
@@ -2689,6 +2761,11 @@ plugin_configs:
     // nor manufacture a contention refusal: there is no optimistic retry to
     // exhaust, and a refused attempt's compensating `DECR` only ever hands back
     // a charge that request itself made.
+    //
+    // The two refusals above compensate from detached tasks. Both must land
+    // before the budget is reset: a `DECR` arriving after the reset would put
+    // the fresh counter below zero and hand the race one extra admission.
+    wait_for_redis_counter_sum(&unique_prefix, 4).await;
     delete_redis_keys_by_prefix(&unique_prefix).await;
     let responses = futures_util::future::join_all((0..32).map(|index| {
         let client = client.clone();
