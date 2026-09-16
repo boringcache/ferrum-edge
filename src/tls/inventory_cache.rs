@@ -138,7 +138,10 @@ impl TlsInventoryCache {
     ) -> Arc<CollectorRegistration> {
         Arc::new(CollectorRegistration {
             collector,
-            generation: self.next_collector_generation.fetch_add(1, Ordering::Relaxed) + 1,
+            generation: self
+                .next_collector_generation
+                .fetch_add(1, Ordering::Relaxed)
+                + 1,
         })
     }
 
