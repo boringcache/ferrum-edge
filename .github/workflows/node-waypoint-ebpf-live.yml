@@ -822,28 +822,12 @@ jobs:
           }
 
           # Greatest common divisor of every cumulative ferrum_mesh_bpf_*
-          # counter in one scrape (issue #5502).
-          #
-          # When the ambient proxy's ringbuf consumer stops making forward
-          # progress it re-counts the same resident records on every wakeup, so
-          # the whole family of counters is `underlying x N` for one N that
-          # climbs with wall-clock time. That common factor is what this
-          # returns; on a healthy consumer ~58 independent counters share no
-          # factor and it is 1. The always-1 gauges are excluded because they
-          # would pin the result at 1 and hide the rescale.
+          # counter in one scrape (issue #5502): the replay factor a stalled
+          # ringbuf consumer multiplies the whole family by, or 1 on a healthy
+          # consumer. Standard-library Python, so the step stays free of the
+          # inline-program surfaces the trusted Cross build policy freezes.
           scrape_scale() {
-            awk '
-              function gcd(a, b,   t) { while (b) { t = a % b; a = b; b = t } return a }
-              $1 ~ /^ferrum_mesh_bpf_/ && $2 ~ /^[0-9]+$/ {
-                if ($1 ~ /drop_reasons|ringbuf_overruns_total|ringbuf_in_overrun_regime/) next
-                value = $2 + 0
-                if (value > 0) scale = (scale == "" ? value : gcd(scale, value))
-              }
-              END {
-                if (scale == "" || scale < 1) scale = 1
-                printf "%d\n", scale
-              }
-            ' "$1"
+            python3 .github/scripts/mesh_bpf_scrape_scale.py "$1"
           }
 
           fetched=false
