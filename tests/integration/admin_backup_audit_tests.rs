@@ -1422,7 +1422,15 @@ async fn restore_and_batch_reject_positional_collection_elements_before_writing(
     // This inner array really is a valid positional Proxy without the
     // element adapter; it is not merely missing required fields.
     let positional = json!([
-        {}, "replacement", null, "ferrum", [], "/replacement", "http", "127.0.0.1", 12345
+        {},
+        "replacement",
+        null,
+        "ferrum",
+        [],
+        "/replacement",
+        "http",
+        "127.0.0.1",
+        12345
     ]);
     let unguarded: Proxy = serde_json::from_value(positional.clone()).unwrap();
     assert_eq!(unguarded.id, "replacement");
@@ -1434,15 +1442,20 @@ async fn restore_and_batch_reject_positional_collection_elements_before_writing(
                 json!([])
             };
             let payload = json!({field: [element]});
-            assert!(!ferrum_edge::_test_support::restore_envelope_admits_for_test(
-                &serde_json::to_vec(&payload).unwrap()
-            ));
+            assert!(
+                !ferrum_edge::_test_support::restore_envelope_admits_for_test(
+                    &serde_json::to_vec(&payload).unwrap()
+                )
+            );
             let (status, body) = post_admin_raw(&base, path, &admin, &payload.to_string()).await;
             assert_eq!(status, 400, "{path} {field}: {body}");
             let (status, after, _) = get_backup(&base, "/backup", &admin, None).await;
             assert_eq!(status, 200);
             for resource in ["proxies", "consumers", "plugin_configs", "upstreams"] {
-                assert_eq!(after[resource], before[resource], "{path} changed {resource}");
+                assert_eq!(
+                    after[resource], before[resource],
+                    "{path} changed {resource}"
+                );
             }
         }
     }

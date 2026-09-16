@@ -589,15 +589,12 @@ fn parse_node_waypoint_route_upstreams(
     config: &Value,
 ) -> Result<(bool, Vec<NodeWaypointRouteUpstreamConfig>), String> {
     match config.get("node_waypoint_route_upstreams") {
-        Some(value) => {
-            crate::util::json_object::deserialize_object_vec::<_, NodeWaypointRouteUpstreamConfig>(
-                value.clone(),
-            )
-            .map(|upstreams| (true, upstreams))
-            .map_err(|error| {
-                format!("mesh_authz: invalid node_waypoint_route_upstreams: {error}")
-            })
-        }
+        Some(value) => crate::util::json_object::deserialize_object_vec::<
+            _,
+            NodeWaypointRouteUpstreamConfig,
+        >(value.clone())
+        .map(|upstreams| (true, upstreams))
+        .map_err(|error| format!("mesh_authz: invalid node_waypoint_route_upstreams: {error}")),
         None => Ok((false, Vec::new())),
     }
 }

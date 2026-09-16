@@ -41,7 +41,10 @@ fn assert_lists<T: DeserializeOwned + Serialize>(base: Value, fields: &[(&str, V
             }
         }
         body[*field] = json!([]);
-        assert!(serde_json::from_value::<T>(body).is_ok(), "{field}: empty list");
+        assert!(
+            serde_json::from_value::<T>(body).is_ok(),
+            "{field}: empty list"
+        );
     }
 }
 
@@ -210,7 +213,10 @@ fn nested_mesh_collection_elements_require_objects() {
     );
     assert_lists::<mesh::ServiceEntry>(
         service_entry(),
-        &[("endpoints", json!({"address": "127.0.0.1"})), ("ports", port)],
+        &[
+            ("endpoints", json!({"address": "127.0.0.1"})),
+            ("ports", port),
+        ],
     );
     assert_lists::<mesh::MeshSidecar>(
         named(),
@@ -291,10 +297,7 @@ fn gateway_resources_and_nested_lists_require_object_elements() {
             ("failover", json!({"from": "east", "to": "west"})),
         ],
     );
-    assert_lists::<config::Proxy>(
-        json!({}),
-        &[("plugins", json!({"plugin_config_id": "p"}))],
-    );
+    assert_lists::<config::Proxy>(json!({}), &[("plugins", json!({"plugin_config_id": "p"}))]);
     assert_lists::<config::GatewayConfig>(
         json!({"version": "1", "proxies": [], "plugin_configs": []}),
         &[
@@ -368,15 +371,14 @@ fn restore_resource_lists_and_api_spec_items_require_objects() {
     ];
     for (field, element) in fields {
         let body = json!({field: [element]});
-        assert!(restore_envelope_admits_for_test(&serde_json::to_vec(&body).unwrap()));
-        for rejected in [
-            json!([]),
-            json!([{}, "positional"]),
-            json!(null),
-            json!(7),
-        ] {
+        assert!(restore_envelope_admits_for_test(
+            &serde_json::to_vec(&body).unwrap()
+        ));
+        for rejected in [json!([]), json!([{}, "positional"]), json!(null), json!(7)] {
             let body = json!({field: [element, rejected]});
-            assert!(!restore_envelope_admits_for_test(&serde_json::to_vec(&body).unwrap()));
+            assert!(!restore_envelope_admits_for_test(
+                &serde_json::to_vec(&body).unwrap()
+            ));
         }
     }
     let item = json!({
@@ -386,10 +388,14 @@ fn restore_resource_lists_and_api_spec_items_require_objects() {
         "updated_at": "2026-09-16T00:00:00Z"
     });
     let body = json!({"api_specs": {"section_version": "2", "items": [item]}});
-    assert!(restore_envelope_admits_for_test(&serde_json::to_vec(&body).unwrap()));
+    assert!(restore_envelope_admits_for_test(
+        &serde_json::to_vec(&body).unwrap()
+    ));
     let mut rejected = body;
     rejected["api_specs"]["items"] = json!([[]]);
-    assert!(!restore_envelope_admits_for_test(&serde_json::to_vec(&rejected).unwrap()));
+    assert!(!restore_envelope_admits_for_test(
+        &serde_json::to_vec(&rejected).unwrap()
+    ));
 }
 
 #[test]
@@ -418,7 +424,10 @@ fn mesh_authz_raw_lists_require_object_elements_before_construction() {
                 Ok(_) => panic!("mesh_authz admitted {pointer}"),
                 Err(error) => error,
             };
-            assert!(error.contains("expected a JSON object"), "{pointer}: {error}");
+            assert!(
+                error.contains("expected a JSON object"),
+                "{pointer}: {error}"
+            );
         }
     }
 }
