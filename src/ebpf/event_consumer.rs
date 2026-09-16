@@ -813,7 +813,9 @@ pub mod production {
         /// aya commits with, so the kernel producer observes the repaired
         /// value before deciding whether its next reserve fits.
         fn publish_consumer_position(&self, pos: u64) {
-            self.consumer.position().store(pos as usize, Ordering::SeqCst);
+            self.consumer
+                .position()
+                .store(pos as usize, Ordering::SeqCst);
         }
     }
 
@@ -931,7 +933,11 @@ pub mod production {
     }
 
     /// Outcome of waiting for the SOCK_OPS pinned maps to appear.
-    type PinnedSockOpsMaps = (PinnedRingBuf, PerCpuArray<MapData, u64>, SockHash<MapData, u64>);
+    type PinnedSockOpsMaps = (
+        PinnedRingBuf,
+        PerCpuArray<MapData, u64>,
+        SockHash<MapData, u64>,
+    );
 
     enum WaitOutcome {
         Found(PinnedSockOpsMaps),

@@ -954,8 +954,7 @@ fn a_prefilled_ring_drains_exactly_once_and_then_stays_quiet() {
     let after_spurious = consumer.metrics().snapshot();
     assert_eq!(after_spurious.ringbuf_events_consumed, 4);
     assert_eq!(
-        after_spurious.srtt_sample_us_sum,
-        after_first_drain.srtt_sample_us_sum,
+        after_spurious.srtt_sample_us_sum, after_first_drain.srtt_sample_us_sum,
         "a replay would rescale every counter at once"
     );
 
