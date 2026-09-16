@@ -1009,13 +1009,19 @@ fn an_uncommitted_record_halts_the_pass_and_the_next_drain_resumes() {
     ring.busy_at = Some(64 + FAKE_RECORD_STRIDE * 2);
 
     let drained = drain_all(&mut ring, |_bytes: &[u8]| {});
-    assert_eq!(drained.records, 2, "the pass stops at the uncommitted record");
+    assert_eq!(
+        drained.records, 2,
+        "the pass stops at the uncommitted record"
+    );
     assert!(!drained.budget_exhausted);
     assert_eq!(ring.consumer_position(), 64 + FAKE_RECORD_STRIDE * 2);
 
     ring.busy_at = None;
     let drained = drain_all(&mut ring, |_bytes: &[u8]| {});
-    assert_eq!(drained.records, 2, "the rest drains once the producer commits");
+    assert_eq!(
+        drained.records, 2,
+        "the rest drains once the producer commits"
+    );
     assert_eq!(ring.delivered.len(), 4, "and nothing was delivered twice");
 }
 

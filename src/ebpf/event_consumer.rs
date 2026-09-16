@@ -560,8 +560,8 @@ pub mod production {
     use super::{
         BPF_DROP_REASON_COUNT, BPF_DROP_REASON_STATS_SLOTS, PollOutcome,
         RINGBUF_DRAIN_RECORD_BUDGET, RingBufAttach, RingBufCursor, SOCK_OPS_RECOVERY_THRESHOLD,
-        SockOpsConsumer, SockOpsEvent, drain_outstanding_records, drop_reason_delta, ringbuf_attach,
-        seed_dropped_baseline,
+        SockOpsConsumer, SockOpsEvent, drain_outstanding_records, drop_reason_delta,
+        ringbuf_attach, seed_dropped_baseline,
     };
     use crate::ebpf::{
         BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH, BPF_SOCK_OPS_EVENTS_PIN_PATH,
@@ -1007,8 +1007,7 @@ pub mod production {
             } else {
                 debug!(
                     pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
-                    ring_bytes,
-                    "Pinned SOCK_OPS ringbuf size is not a non-zero power of two"
+                    ring_bytes, "Pinned SOCK_OPS ringbuf size is not a non-zero power of two"
                 );
             }
             return None;
