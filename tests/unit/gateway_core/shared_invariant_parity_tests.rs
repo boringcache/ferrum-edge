@@ -2006,7 +2006,10 @@ fn mesh_json_file_document_and_mesh_section_require_objects() {
         let error = read_mesh_config_document(&path)
             .expect_err("a mesh document and its mesh section must be objects")
             .to_string();
-        assert!(error.contains("invalid mesh configuration document"), "{error}");
+        assert!(
+            error.contains("invalid mesh configuration document"),
+            "{error}"
+        );
         assert!(
             error.contains("invalid type: sequence, expected a JSON object"),
             "{error}"
@@ -2059,7 +2062,10 @@ fn mesh_config_updates_reject_positional_slice_roots() {
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         ..Default::default()
     };
-    for consumer in [MeshUpdateConsumer::Native, MeshUpdateConsumer::RemoteDiscovery] {
+    for consumer in [
+        MeshUpdateConsumer::Native,
+        MeshUpdateConsumer::RemoteDiscovery,
+    ] {
         update.mesh_slice_json = serde_json::to_string(&positional).unwrap();
         let rejection = validate_mesh_config_update(&update, &expected, consumer)
             .expect_err("a positional slice must fail JSON admission");
