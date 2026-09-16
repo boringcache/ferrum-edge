@@ -2849,8 +2849,9 @@ impl Plugin for MeshAuthz {
         // revoked N tunnels would otherwise look like N denied requests from a
         // principal that sent none. `record_policy_deny` still records the
         // event, tagged `reevaluation: true`, so the drilldown keeps it.
-        let live_admission_reevaluation =
-            ctx.metadata.contains_key(MESH_AUTHZ_REEVALUATION_METADATA_KEY);
+        let live_admission_reevaluation = ctx
+            .metadata
+            .contains_key(MESH_AUTHZ_REEVALUATION_METADATA_KEY);
         let trust_domain_mismatch = baggage_outcome == BaggageOutcome::TrustDomainMismatch;
         let untrusted_assertor = baggage_outcome == BaggageOutcome::UntrustedAssertor;
         let assertion_out_of_scope = baggage_outcome == BaggageOutcome::AssertionOutOfScope;
