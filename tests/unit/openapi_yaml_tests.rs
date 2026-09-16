@@ -2016,7 +2016,7 @@ fn mesh_slice_drift_examples_match_schema_and_convergence_semantics() {
         let value = example
             .get("value")
             .unwrap_or_else(|| panic!("example `{name}` has a value"));
-        example_object_has_required_fields(spec, schema, value, name);
+        example_object_has_required_fields(&spec, schema, value, name);
     }
 
     let converged = &examples["converged"]["value"];
