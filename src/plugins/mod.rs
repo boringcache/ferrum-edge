@@ -3400,7 +3400,8 @@ pub(crate) struct PluginRequestState {
     /// than public `metadata`, which can be serialized into transaction logs.
     /// The outer key is the process-unique cache instance ID, bounding the map
     /// by configured `response_caching` instances.
-    pub(crate) response_cache_request_header_deltas: HashMap<u64, Arc<HashMap<String, Option<String>>>>,
+    pub(crate) response_cache_request_header_deltas:
+        HashMap<u64, Arc<HashMap<String, Option<String>>>>,
     /// Per-`ai_semantic_cache`-instance embedding vectors staged between
     /// `before_proxy` and `on_final_response_body`. Kept out of `metadata` so
     /// high-dimensional vectors cannot enter transaction logs. The outer key is
