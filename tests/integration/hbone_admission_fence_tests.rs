@@ -17,6 +17,9 @@
 //! * the relay-destination gate revokes a synthesized inbound relay whose
 //!   destination left this terminator's inventory, and one whose dialled
 //!   address is loopback after the own-namespace privilege is withdrawn;
+//! * a CONNECT declaring a gRPC content type is refused before it can become a
+//!   tunnel, so a peer cannot steer the fence onto a view it was never admitted
+//!   with;
 //! * a side-effecting operator authorize plugin is NOT re-run by a sweep — no
 //!   consumed budget, no spurious revocation;
 //! * publications coalesce and revoke every live tunnel exactly once;
@@ -179,6 +182,10 @@ fn prepared_config_with(
 /// A globally scoped `rate_limiting` instance keyed by the peer's SPIFFE
 /// identity — an operator authorize plugin whose `authorize` CONSUMES a token.
 /// The fence must never re-run it for a live tunnel.
+///
+/// The windows live inside a `limits` rule: `rate_limiting` rejects the legacy
+/// top-level `window_seconds` / `max_requests` spelling outright, so a fixture
+/// using it would abort gateway startup instead of exercising the budget.
 fn spiffe_rate_limit_plugin(max_requests: u32) -> PluginConfig {
     PluginConfig {
         labels: Default::default(),
@@ -186,9 +193,14 @@ fn spiffe_rate_limit_plugin(max_requests: u32) -> PluginConfig {
         plugin_name: "rate_limiting".to_string(),
         namespace: DEFAULT_NAMESPACE.to_string(),
         config: json!({
-            "window_seconds": 60,
-            "max_requests": max_requests,
-            "limit_by": "spiffe_identity"
+            "limit_by": "spiffe_identity",
+            "limits": [
+                {
+                    "scope": "default",
+                    "window_seconds": 60,
+                    "max_requests": max_requests
+                }
+            ]
         }),
         scope: PluginScope::Global,
         proxy_id: None,
@@ -362,8 +374,22 @@ struct Tunnel {
     response_body: h2::RecvStream,
 }
 
+/// Send a plain HBONE CONNECT and, on a `200`, hand back both halves of the
+/// live tunnel. A non-`200` head is the admission refusal.
+///
+/// Deliberately plain: a CONNECT carrying a gRPC `content-type` classifies as
+/// gRPC before the HBONE branch is reached and is refused as a trailers-only
+/// `200`, which this helper could not tell from an admitted tunnel. Tests that
+/// want that shape use [`send_connect`] and read the `grpc-status` themselves.
 async fn open_tunnel(sender: &mut h2::client::SendRequest<Bytes>) -> Result<Tunnel, StatusCode> {
-    open_tunnel_with_content_type(sender, None).await
+    let (resp, request_body) = send_connect(sender, None).await;
+    if resp.status() != StatusCode::OK {
+        return Err(resp.status());
+    }
+    Ok(Tunnel {
+        request_body,
+        response_body: resp.into_body(),
+    })
 }
 
 /// Send a CONNECT and hand back the response head plus the request-body handle.
@@ -386,24 +412,6 @@ async fn send_connect(
         .expect("CONNECT response within deadline")
         .expect("CONNECT response");
     (resp, request_body)
-}
-
-/// [`open_tunnel`] carrying an optional `content-type`. A CONNECT declaring
-/// `application/grpc` is classified as `HttpFlavor::Grpc`, so the request path
-/// resolves the gRPC authorize view for it — a peer-selectable choice the fence
-/// must mirror rather than assume plain HTTP.
-async fn open_tunnel_with_content_type(
-    sender: &mut h2::client::SendRequest<Bytes>,
-    content_type: Option<&str>,
-) -> Result<Tunnel, StatusCode> {
-    let (resp, request_body) = send_connect(sender, content_type).await;
-    if resp.status() != StatusCode::OK {
-        return Err(resp.status());
-    }
-    Ok(Tunnel {
-        request_body,
-        response_body: resp.into_body(),
-    })
 }
 
 /// The `grpc-status` a trailers-only refusal carries, if any. An admitted HBONE
@@ -767,6 +775,9 @@ async fn an_admission_that_raced_a_publication_is_reswept_when_it_registers() {
         Some(HboneRevocationReason::RelayDestination),
         "the re-sweep must judge the tunnel against the CURRENT generation"
     );
+    // Read at the cancellation edge, deliberately: the accounting is published
+    // before the token is cancelled, so anything woken by the cancellation
+    // already sees the revocation counted.
     assert_eq!(revocation_counts(&state), [0, 0, 1, 0, 0]);
 }
 
@@ -855,8 +866,23 @@ async fn a_loopback_pinned_inbound_relay_is_revoked_when_the_namespace_privilege
     );
 }
 
+/// A peer cannot steer the fence onto a plugin view the tunnel was never
+/// admitted with, because a CONNECT that declares a gRPC content type is not
+/// admitted at all.
+///
+/// `content-type: application/grpc` classifies the request as
+/// `HttpFlavor::Grpc` well before the HBONE branch, and the gRPC spec's POST
+/// requirement then refuses any other method as trailers-only (`200` + a
+/// non-zero `grpc-status`, END_STREAM) — a refusal, not a tunnel. Every
+/// admitted HBONE tunnel is therefore admitted on the plain-HTTP view, which is
+/// the view a sweep re-resolves. The snapshot still records whichever view the
+/// request path actually used
+/// (`HboneAdmissionSnapshot::request_protocol` / `grpc_web_request`, pinned by
+/// `the_fence_sweep_resolves_the_admitting_plugin_view`) instead of hardcoding
+/// plain HTTP, so the sweep cannot drift from the request path if that gate
+/// ever moves.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_grpc_classified_connect_is_fenced_on_the_admitting_plugin_view() {
+async fn a_grpc_classified_connect_is_refused_before_it_can_become_a_fenced_tunnel() {
     let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
     let (backend_addr, backend_handle) = start_interactive_echo_backend().await;
     let state = build_state(prepared_config(
@@ -868,12 +894,37 @@ async fn a_grpc_classified_connect_is_fenced_on_the_admitting_plugin_view() {
     let (mut sender, conn_task) =
         connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
 
-    // `content-type: application/grpc` is peer-chosen and makes the request path
-    // resolve the gRPC authorize view rather than the plain-HTTP one.
-    let mut tunnel = open_tunnel_with_content_type(&mut sender, Some("application/grpc"))
+    // This generation ALLOWS the principal, so the refusal below is the
+    // protocol gate rather than authorization.
+    let (refused, _refused_request) = send_connect(&mut sender, Some("application/grpc")).await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::OK,
+        "a gRPC-classified refusal is trailers-only, not an HTTP error status"
+    );
+    let refused_grpc_status = grpc_status_of(&refused);
+    assert!(
+        refused_grpc_status
+            .as_deref()
+            .is_some_and(|status| status != "0"),
+        "a gRPC-classified CONNECT must be refused, never admitted as a tunnel; got \
+         grpc-status {refused_grpc_status:?}"
+    );
+    let mut refused_body = refused.into_body();
+    assert_tunnel_closed(&mut refused_body).await;
+    assert_eq!(
+        state.hbone_admission_fence.live_tunnels(),
+        0,
+        "a refused CONNECT must not register a sweepable tunnel"
+    );
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0]);
+
+    // The same peer's plain CONNECT IS admitted, on the plain-HTTP view, and
+    // the fence judges it against exactly that view.
+    let mut tunnel = open_tunnel(&mut sender)
         .await
-        .expect("gRPC-classified CONNECT admitted under the initial generation");
-    echo_round_trip(&mut tunnel, b"grpc-classified").await;
+        .expect("a plain CONNECT is admitted under the same generation");
+    echo_round_trip(&mut tunnel, b"admitting-view").await;
     assert_eq!(state.hbone_admission_fence.live_tunnels(), 1);
     let reevaluations_before = state.hbone_admission_fence.reevaluations();
 
@@ -887,24 +938,9 @@ async fn a_grpc_classified_connect_is_fenced_on_the_admitting_plugin_view() {
     wait_for_no_live_tunnels(&state).await;
     assert!(
         state.hbone_admission_fence.reevaluations() > reevaluations_before,
-        "the sweep must have resolved a non-empty authorize chain for the gRPC view"
+        "the sweep must have resolved a non-empty authorize chain for the admitting view"
     );
     assert_eq!(revocation_counts(&state), [0, 0, 0, 1, 0]);
-
-    // Request-path parity on the same peer-selected view. A gRPC-classified
-    // rejection is shaped as trailers-only (`200` + a non-zero `grpc-status`),
-    // NOT as an HTTP 403 — which is precisely why the sweep must resolve the
-    // view the CONNECT was admitted with instead of assuming plain HTTP.
-    let (refused, _refused_body) = send_connect(&mut sender, Some("application/grpc")).await;
-    assert_eq!(refused.status(), StatusCode::OK);
-    let refused_grpc_status = grpc_status_of(&refused);
-    assert!(
-        refused_grpc_status
-            .as_deref()
-            .is_some_and(|status| status != "0"),
-        "the sweep and the request path must judge the same chain; got grpc-status \
-         {refused_grpc_status:?}"
-    );
 
     let _ = shutdown_tx.send(true);
     backend_handle.abort();

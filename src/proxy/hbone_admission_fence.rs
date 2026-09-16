@@ -221,7 +221,7 @@ impl AdmittedHboneTunnel {
     /// summary and the operator logging chain run.
     ///
     /// A sweep that is already holding this handle skips a retired tunnel, and
-    /// [`Self::revoke`] refuses one, so
+    /// [`Self::claim_revocation`] refuses one, so
     /// `ferrum_mesh_hbone_tunnel_revocations_total` and
     /// [`HboneAdmissionFence::live_tunnels`] count only tunnels that are still
     /// carrying bytes. `Drop` stays the safety net for every path that cannot
@@ -236,19 +236,23 @@ impl AdmittedHboneTunnel {
         }
     }
 
-    fn revoke(&self, reason: HboneRevocationReason) -> bool {
+    /// Claim this tunnel for revocation and record the reason, WITHOUT
+    /// cancelling yet. `true` means this caller won the claim and owns the
+    /// accounting; the cancellation edge is published afterwards by
+    /// [`Self::publish_revocation`].
+    ///
+    /// The reason is recorded before the cancellation because the relay reads
+    /// `revoked_reason()` as soon as it observes the cancellation, and the
+    /// datagram relay has no first-failure record to classify instead, so a
+    /// cancellation the reason has not caught up with would be reported as a
+    /// transport failure. Nothing depends on seeing the cancellation edge
+    /// first: the only `is_cancelled()` reader is the sweep loop, and sweeps
+    /// are serialized by `sweep_serial`.
+    fn claim_revocation(&self, reason: HboneRevocationReason) -> bool {
         if self.inner.retired.load(Ordering::Acquire) {
             return false;
         }
-        // Record the reason BEFORE cancelling. The relay reads
-        // `revoked_reason()` as soon as it observes the cancellation, and the
-        // datagram relay has no first-failure record to classify instead, so a
-        // cancellation the reason has not caught up with would be reported as a
-        // transport failure. Nothing depends on seeing the cancellation edge
-        // first: the only `is_cancelled()` reader is the sweep loop, and sweeps
-        // are serialized by `sweep_serial`.
-        let recorded = self
-            .inner
+        self.inner
             .revoked
             .compare_exchange(
                 NOT_REVOKED,
@@ -256,9 +260,21 @@ impl AdmittedHboneTunnel {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .is_ok();
+            .is_ok()
+    }
+
+    /// Publish the cancellation edge for a tunnel already claimed by
+    /// [`Self::claim_revocation`].
+    ///
+    /// This is the LAST step of a revocation, after the counter, the metric,
+    /// and the log. Cancellation is the only edge anything outside the sweep
+    /// waits on — the relay's revocation bound, and an operator or test reading
+    /// [`HboneAdmissionFence::revocations`] the moment a tunnel ends — so
+    /// anything that observes it must already be able to observe the
+    /// accounting. Cancelling first left a real window in which a revoked
+    /// tunnel was reported by nothing at all.
+    fn publish_revocation(&self) {
         self.inner.token.cancel();
-        recorded
     }
 }
 
@@ -355,8 +371,12 @@ impl HboneAdmissionFence {
     }
 
     /// Revocations recorded for `reason` since process start.
+    ///
+    /// A revoked tunnel is counted here BEFORE its cancellation token fires, so
+    /// anything woken by that cancellation — the relay, an operator poll, a
+    /// test — already observes the increment.
     pub fn revocations(&self, reason: HboneRevocationReason) -> u64 {
-        self.revocations[reason.index()].load(Ordering::Relaxed)
+        self.revocations[reason.index()].load(Ordering::Acquire)
     }
 
     /// Live-tunnel authorize-chain re-evaluations performed by sweeps.
@@ -463,9 +483,14 @@ impl HboneAdmissionFence {
             let Some(reason) = reason else {
                 continue;
             };
-            if tunnel.revoke(reason) {
+            if tunnel.claim_revocation(reason) {
                 revoked += 1;
-                self.revocations[reason.index()].fetch_add(1, Ordering::Relaxed);
+                // Account BEFORE the cancellation edge is published: the relay
+                // and every `revocations()` reader wake on that edge, so a
+                // counter incremented afterwards is observably missing exactly
+                // when someone looks. `Release` pairs with the `Acquire` load in
+                // `revocations()` through the cancellation's own ordering.
+                self.revocations[reason.index()].fetch_add(1, Ordering::Release);
                 crate::plugins::prometheus_metrics::global_registry()
                     .record_hbone_tunnel_revocation(&tunnel.inner.snapshot.proxy.id, reason);
                 warn!(
@@ -475,6 +500,7 @@ impl HboneAdmissionFence {
                     "Revoked a live HBONE tunnel: its CONNECT would no longer be admitted \
                      under the current policy generation"
                 );
+                tunnel.publish_revocation();
             }
         }
         if revoked > 0 {
