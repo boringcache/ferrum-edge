@@ -2882,7 +2882,9 @@ impl Plugin for MeshAuthz {
                 "true".to_string(),
             );
         }
-        if self.per_pod_policy_scoping {
+        // The asserted-identity counters are request-shaped too: a sweep that
+        // re-judges N live tunnels must not read as N identity decisions.
+        if self.per_pod_policy_scoping && !live_admission_reevaluation {
             if unauthenticated_hbone_baggage {
                 crate::modes::mesh::node_waypoint_observability::record_asserted_identity_rejected(
                     crate::modes::mesh::node_waypoint_observability::NodeWaypointAssertedIdentityRejectReason::UnauthenticatedHbone,
