@@ -247,6 +247,50 @@ pub(crate) fn request_protocol_is_grpc(
         .is_some_and(|protocol| protocol == "grpc")
 }
 
+/// The classification the generic HTTP streaming terminal passes to
+/// [`DeferredTransactionLogger::new_with_start_time`].
+///
+/// An ABSENT `request_protocol` is **not** gRPC here. This arm carries every
+/// streamed HTTP-family response — plain HTTP, WebSocket bridges, gRPC-Web —
+/// and the summary it stages carries no header-commit metadata projection, so
+/// the request's own declared protocol is the whole input. That is exactly what
+/// `request_protocol_is_grpc` resolved to when the projection was still built
+/// at header commit: an empty summary map falls through to `ctx.metadata`, and
+/// a missing key there is `is_some_and(..) == false`.
+///
+/// It deliberately differs from [`native_grpc_request_protocol_is_grpc`]; see
+/// that function for why the two defaults are opposites.
+pub fn streaming_request_protocol_is_grpc(
+    request_metadata: &std::collections::HashMap<String, String>,
+) -> bool {
+    request_metadata
+        .get("request_protocol")
+        .is_some_and(|protocol| protocol == "grpc")
+}
+
+/// The classification the native-gRPC streaming terminal passes to
+/// [`DeferredTransactionLogger::new_with_start_time`].
+///
+/// An ABSENT `request_protocol` **is** gRPC here, which is the opposite default
+/// from [`streaming_request_protocol_is_grpc`] and is not an oversight. Only the
+/// native-gRPC branch reaches this, and the summary it used to build ran its
+/// metadata projection through
+/// `metadata.entry("request_protocol").or_insert("grpc")` — "gRPC unless the
+/// request already declared another protocol". `fire_once` then read that
+/// stamped projection back through `request_protocol_is_grpc`, so an absent
+/// key resolved to `true`. Reading `ctx.metadata` directly with
+/// `is_some_and` would classify an unlabelled native-gRPC stream as a clean
+/// HTTP 200 and drop its UNKNOWN terminal status; using this function on the
+/// generic arm would stamp `grpc_status: 2` on every streamed non-gRPC
+/// response. Keep the two apart.
+pub fn native_grpc_request_protocol_is_grpc(
+    request_metadata: &std::collections::HashMap<String, String>,
+) -> bool {
+    request_metadata
+        .get("request_protocol")
+        .is_none_or(|protocol| protocol == "grpc")
+}
+
 impl DeferredTransactionLogger {
     /// Build a new deferred logger without a start-time reference.
     ///

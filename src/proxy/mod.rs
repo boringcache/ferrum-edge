@@ -35678,13 +35678,14 @@ async fn handle_proxy_request_inner(
                     // A gRPC terminal without a trailer status is UNKNOWN, not
                     // an unqualified 200. The deferred arm captures that fact
                     // directly instead of reading it back off a metadata
-                    // projection that its own fire-time rebuild replaces —
-                    // `or_insert` here means "grpc unless the request already
-                    // declared another protocol".
-                    let request_protocol_is_grpc = ctx
-                        .metadata
-                        .get("request_protocol")
-                        .is_none_or(|protocol| protocol == "grpc");
+                    // projection that its own fire-time rebuild replaces. The
+                    // absent-key default is `true` on THIS arm only, because the
+                    // projection it replaces went through
+                    // `entry("request_protocol").or_insert("grpc")`.
+                    let request_protocol_is_grpc =
+                        crate::proxy::deferred_log::native_grpc_request_protocol_is_grpc(
+                            &ctx.metadata,
+                        );
                     // Only the synchronous body-exceeded terminal below reads a
                     // header-commit projection. The streaming arm rebuilds it
                     // from the finalized context at fire time, so building it
@@ -39329,15 +39330,16 @@ async fn handle_proxy_request_inner(
                 // `latency_total_ms` / derived gateway fields are re-derived at
                 // body-completion time — that closes the header-flush snapshot
                 // gap for streaming responses.
+                //
+                // The summary carries no header-commit projection on this arm,
+                // so this is exactly what the fire-time probe used to resolve
+                // to: the request's own declared protocol, with an absent key
+                // meaning "not gRPC".
+                let request_protocol_is_grpc =
+                    crate::proxy::deferred_log::streaming_request_protocol_is_grpc(&ctx.metadata);
                 pending_stream_terminal = Some(Box::new(PendingStreamTerminal {
                     summary,
-                    // The summary carries no header-commit projection on this
-                    // arm, so this is exactly what the fire-time probe used to
-                    // resolve to: the request's own declared protocol.
-                    request_protocol_is_grpc: ctx
-                        .metadata
-                        .get("request_protocol")
-                        .is_some_and(|protocol| protocol == "grpc"),
+                    request_protocol_is_grpc,
                 }));
                 None
             } else {
@@ -58641,6 +58643,22 @@ mod tests {
         hook_ctx.set_waf_metadata("waf.rule_hits", "FE-XSS-001");
         hook_ctx.set_waf_metadata("waf.action", "monitored");
 
+        // `ai_semantic_cache` is the other half of the adopt. It derives its
+        // scope key and query embedding in the final-request-body hook, on the
+        // hook context, and its store hook runs later against the LIVE context —
+        // so a scope key or embedding that does not survive the adopt makes
+        // every semantic miss store as exact-only.
+        const SEMANTIC_INSTANCE: u64 = 7;
+        let staged_embedding: Vec<f32> = vec![0.25, -0.5, 0.75];
+        hook_ctx
+            .plugin_state_mut()
+            .ai_semantic_cache_scope_keys
+            .insert(SEMANTIC_INSTANCE, "tenant-a|chat".to_string());
+        hook_ctx
+            .plugin_state_mut()
+            .ai_semantic_cache_embeddings
+            .insert(SEMANTIC_INSTANCE, staged_embedding.clone());
+
         // Mirror the handler's writeback: take the hook context's metadata + WAF
         // state, carrying the omitted request_body across the swap.
         ctx.adopt_final_request_body_hook_terminals(&hook_ctx);
@@ -58671,6 +58689,54 @@ mod tests {
         assert_eq!(
             metadata.get("waf.action").map(String::as_str),
             Some("monitored")
+        );
+        // The semantic-cache staging reached the live context too.
+        assert_eq!(
+            ctx.plugin_state()
+                .and_then(|state| state.ai_semantic_cache_scope_keys.get(&SEMANTIC_INSTANCE))
+                .map(String::as_str),
+            Some("tenant-a|chat"),
+            "the hook context's scope key must reach the live store hook"
+        );
+        assert_eq!(
+            ctx.plugin_state()
+                .and_then(|state| state.ai_semantic_cache_embeddings.get(&SEMANTIC_INSTANCE)),
+            Some(&staged_embedding),
+            "the hook context's query embedding must reach the live store hook"
+        );
+
+        // A donor that materialized no plugin state means all four adopted
+        // families are empty, so the live context's copies are cleared to match
+        // — exactly what the unconditional field moves this replaced produced.
+        let mut empty_donor =
+            RequestContext::new("203.0.113.10".into(), "POST".into(), "/submit".into());
+        assert!(
+            empty_donor.plugin_state().is_none(),
+            "fixture precondition: the donor stages nothing"
+        );
+        ctx.adopt_final_request_body_hook_plugin_state(&mut empty_donor);
+        let state = ctx
+            .plugin_state()
+            .expect("the live context already materialized its state");
+        assert!(state.ai_semantic_cache_scope_keys.is_empty());
+        assert!(state.ai_semantic_cache_embeddings.is_empty());
+        assert!(state.waf_instance_scores.is_empty());
+        assert!(state.waf_owned_metadata.is_empty());
+        // Observable consequence of the WAF clear: nothing owns `waf.*` any
+        // more, so the fail-closed strip removes it from log metadata.
+        let metadata = clone_log_metadata(&ctx);
+        assert!(!metadata.contains_key("waf.rule_hits"));
+        assert!(!metadata.contains_key("waf.action"));
+
+        // Both sides absent: the adopt has nothing to carry and nothing to
+        // clear, so it must not allocate live state to hold four empty maps.
+        let mut plugin_free = RequestContext::new("203.0.113.10".into(), "GET".into(), "/".into());
+        let mut plugin_free_donor =
+            RequestContext::new("203.0.113.10".into(), "GET".into(), "/".into());
+        plugin_free.adopt_final_request_body_hook_plugin_state(&mut plugin_free_donor);
+        assert!(
+            plugin_free.plugin_state().is_none(),
+            "an adopt with nothing to move must not materialize per-plugin state"
         );
     }
 
