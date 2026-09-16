@@ -722,7 +722,8 @@ fn kernel_drop_reason_slots_are_distinct_disjoint_and_in_bounds() {
         let (expected_reason, wire) = expected_wire[index];
         assert_eq!(*reason, expected_reason, "exposition order must be stable");
         assert_eq!(
-            sock_ops_stats_index_for_drop_reason(wire), Some(*slot),
+            sock_ops_stats_index_for_drop_reason(wire),
+            Some(*slot),
             "kernel emitter and userspace poller disagree for {reason:?}"
         );
         assert_ne!(
