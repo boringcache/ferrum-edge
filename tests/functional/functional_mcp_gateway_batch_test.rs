@@ -211,7 +211,9 @@ async fn functional_mcp_gateway_batch_endpoint_alias_keeps_transparent_mediation
             .unwrap();
         assert_eq!(response.status(), 200);
         assert_eq!(response.json::<Value>().await.unwrap(), initialize);
-        let (headers, body) = requests.try_recv().expect("backend recorded the initialize");
+        let (headers, body) = requests
+            .try_recv()
+            .expect("backend recorded the initialize");
         assert_eq!(headers.lines().next(), Some("POST /mcp HTTP/1.1"));
         assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), initialize);
 
@@ -261,7 +263,11 @@ async fn functional_mcp_gateway_batch_endpoint_alias_keeps_transparent_mediation
             .await
             .unwrap()
             .unwrap();
-        assert!(String::from_utf8(response).unwrap().starts_with("HTTP/1.1 400"));
+        assert!(
+            String::from_utf8(response)
+                .unwrap()
+                .starts_with("HTTP/1.1 400")
+        );
         assert!(requests.try_recv().is_err());
     }
 }
