@@ -827,7 +827,7 @@ jobs:
           # consumer. The always-1 gauges are excluded because they would pin
           # the result at 1 and hide the rescale.
           scrape_scale() {
-            awk 'function gcd(a, b,   t) { while (b) { t = a % b; a = b; b = t } return a } $1 ~ /^ferrum_mesh_bpf_/ && $2 ~ /^[0-9]+$/ && $1 !~ /drop_reasons|ringbuf_overruns_total|ringbuf_in_overrun_regime/ && $2 > 0 { scale = (scale == "" ? $2 + 0 : gcd(scale, $2 + 0)) } END { if (scale == "" || scale < 1) scale = 1; printf "%d\n", scale }' "$1"
+            awk 'function gcd(a, b,   t) { while (b) { t = a % b; a = b; b = t } return a } { series = $1; value = $2; if (series ~ /^ferrum_mesh_bpf_/ && value ~ /^[0-9]+$/ && series !~ /drop_reasons|ringbuf_overruns_total|ringbuf_in_overrun_regime/ && value > 0) { scale = (scale == "" ? value + 0 : gcd(scale, value + 0)) } } END { if (scale == "" || scale < 1) scale = 1; printf "%d\n", scale }' "$1"
           }
 
           fetched=false
@@ -873,14 +873,11 @@ jobs:
           # what the connect4 hook classifies as exclude_port_hit. Any other
           # status (including a kubectl transport failure) means curl never got
           # as far as connect().
-          case "$curl_exit" in
-            0|7|28) ;;
-            *)
-              echo "curl in pod/$source_pod exited $curl_exit without attempting the excluded-port connect()" >&2
-              cat "$exec_err" >&2 || true
-              exit 1
-              ;;
-          esac
+          if [[ "$curl_exit" != 0 && "$curl_exit" != 7 && "$curl_exit" != 28 ]]; then
+            echo "curl in pod/$source_pod exited $curl_exit without attempting the excluded-port connect()" >&2
+            cat "$exec_err" >&2 || true
+            exit 1
+          fi
 
           after="$before"
           after_scale="$before_scale"
