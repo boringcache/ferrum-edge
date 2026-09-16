@@ -359,6 +359,17 @@ Tests that pin `FERRUM_ADMIN_JWT_SECRET` or `FERRUM_METRICS_BEARER_TOKEN`
 identity is then only as unique as the value they chose. The contract is
 covered by `functional_shared_harness_smoke_test`.
 
+Spawned gateways do not inherit the caller's `RUST_LOG`. Production tracing
+prefers `RUST_LOG` over `FERRUM_LOG_LEVEL`, so a developer shell with
+`RUST_LOG=warn` used to hide debug lines that log-asserting tests require
+(issue #5533). `TestGatewayBuilder::log_level` therefore pins both variables.
+Tests that need a target-specific directive still set `.env("RUST_LOG", ...)`.
+To raise verbosity on tests that did **not** request a specific filter, set
+`FERRUM_TEST_GATEWAY_RUST_LOG` in the parent (harness-only; ignored when the
+test already chose `.log_level()`, `FERRUM_LOG_LEVEL`, or `RUST_LOG`). Bespoke
+spawners that do not go through `TestGateway` should call
+`pin_gateway_command_rust_log`.
+
 The same barrier is mandatory for suites that keep a bespoke spawner
 instead of `TestGatewayBuilder`. `functional_websocket_test.rs` reuses the
 exported `probe_gateway_identity` in `wait_for_owned_gateway`, because a
