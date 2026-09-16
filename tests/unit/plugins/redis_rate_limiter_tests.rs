@@ -3078,14 +3078,16 @@ async fn spawn_transaction_redis_server(script: TransactionScript) -> Transactio
                                         }
                                         (_, false) => reply.extend(compensation_reply(windows)),
                                     }
-                                } else if in_transaction {
-                                    queued.push(name);
-                                    reply.extend_from_slice(b"+QUEUED\r\n");
                                 } else if name.eq_ignore_ascii_case(INFO_ARG) {
+                                    // The topology screen runs at connect, never
+                                    // inside a transaction.
                                     let text = "# Cluster\r\ncluster_enabled:0\r\n";
                                     let len = text.len();
                                     let bulk = format!("${len}\r\n{text}\r\n");
                                     reply.extend_from_slice(bulk.as_bytes());
+                                } else if in_transaction {
+                                    queued.push(name);
+                                    reply.extend_from_slice(b"+QUEUED\r\n");
                                 } else {
                                     reply.extend_from_slice(b"+OK\r\n");
                                 }
