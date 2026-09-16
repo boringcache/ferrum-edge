@@ -5935,6 +5935,7 @@ pub mod _test_support {
         DbPoolConfig, SqlReconnectTopology, SqlReconnectTransitionHook,
         SqlReconnectTransitionTestHooks,
     };
+    pub use crate::config::db_tls_snapshot::SqlTlsSnapshot;
 
     /// Install (or clear) SQL reconnect transition test hooks on one store.
     pub fn database_store_set_reconnect_transition_hooks_for_test(
