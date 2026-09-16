@@ -497,6 +497,16 @@ impl DeferredTransactionLogger {
             // decision at body termination. Refresh metadata after the
             // mutable terminal hooks so every log sink sees the finalized
             // per-request values.
+            //
+            // The rfc3339 timestamp is formatted here for the same reason it is
+            // not formatted at header commit: no sink sees the summary before
+            // this point, and `ctx.timestamp_received` is fixed when the
+            // context is built, so the value is identical and the allocation
+            // stays off the request path (issue #5537). A caller that already
+            // formatted one keeps it.
+            if summary.timestamp_received.is_empty() {
+                summary.timestamp_received = ctx.timestamp_received.to_rfc3339();
+            }
             summary.metadata = crate::proxy::clone_log_metadata(&ctx);
             log_with_mirror(plugins.as_slice(), &summary, &ctx).await;
         };

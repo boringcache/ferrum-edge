@@ -35701,7 +35701,15 @@ async fn handle_proxy_request_inner(
                     };
                     let summary = TransactionSummary {
                         namespace: proxy.namespace.clone(),
-                        timestamp_received: ctx.timestamp_received.to_rfc3339(),
+                        // Formatted at fire time on the deferred arm, for the
+                        // same reason its metadata is: no sink reads either
+                        // before the terminal rebuild, and the context that
+                        // carries the instant is owned by the logger.
+                        timestamp_received: if body_exceeded {
+                            ctx.timestamp_received.to_rfc3339()
+                        } else {
+                            String::new()
+                        },
                         client_ip: ctx.client_ip.clone(),
                         consumer_username: ctx.effective_identity().map(str::to_owned),
                         auth_method: ctx.auth_method,
@@ -39191,14 +39199,30 @@ async fn handle_proxy_request_inner(
     // summary below. Response framing still needs the request-method semantic,
     // but the hot path does not need to clone the method string.
     let is_head = method.eq_ignore_ascii_case("HEAD");
-    // A streaming response with no plugin on the proxy still owes the runtime
-    // metrics its terminal accounting, but that is *all* it owes: no `log`,
-    // termination hook, inspector, or mirror exists to receive a summary. Hand
-    // the body a compact terminal that records exactly what the summary path
-    // would have recorded, without the summary, the context clone, or the
-    // delivery task.
-    let compact_terminal_only = plugins.is_empty() && body_will_stream;
+    // Whether ANY consumer of a terminal `TransactionSummary` exists for this
+    // exchange. With no plugin on the chain and no mirror dispatched there is
+    // no `log`, no termination hook, no inspector, and no mirror to receive
+    // one: `log_with_mirror` reaches nothing but
+    // `RuntimeMetrics::record_transaction`, which reads five facts.
+    // `record_terminal_outcome` is that same recording spelled out for a path
+    // that never builds a summary, so building one would exist only to be read
+    // five times and dropped — at the cost of an rfc3339 timestamp string, a
+    // `clone_log_metadata` projection, and a handful of owned clones per
+    // request (issue #5537).
+    let terminal_summary_has_no_consumer = plugins.is_empty() && ctx.mirror_result_rxs.is_empty();
+    // A streaming response still owes the runtime metrics its terminal
+    // accounting after the body ends. Hand the body a compact terminal that
+    // records exactly what the summary path would have recorded, without the
+    // summary, the context, or the delivery task.
+    let compact_terminal_only = terminal_summary_has_no_consumer && body_will_stream;
+    // A buffered response is already terminal here, so its accounting can be
+    // recorded synchronously below. Only an error class produces any counter at
+    // all; a clean buffered response with no consumer records nothing, exactly
+    // as it did when no summary was built for it either.
+    let buffered_terminal_outcome_only =
+        terminal_summary_has_no_consumer && !body_will_stream && backend_error_class.is_some();
     let needs_transaction_summary = !compact_terminal_only
+        && !buffered_terminal_outcome_only
         && (!plugins.is_empty() || body_will_stream || backend_error_class.is_some());
     // A streaming terminal's summary is captured here, at header commit, but
     // its logger is built at the very end of this function: the logger owns a
@@ -39249,7 +39273,17 @@ async fn handle_proxy_request_inner(
                 .load(std::sync::atomic::Ordering::Acquire);
             let mut summary = TransactionSummary {
                 namespace: proxy.namespace.clone(),
-                timestamp_received: ctx.timestamp_received.to_rfc3339(),
+                // A deferred terminal formats this at fire time from the
+                // context it owns. `timestamp_received` is fixed when the
+                // context is built, and no sink sees the summary before that
+                // rebuild, so the value is identical — it just stops costing an
+                // rfc3339 format and a String allocation on the request path of
+                // every streamed response.
+                timestamp_received: if body_will_stream {
+                    String::new()
+                } else {
+                    ctx.timestamp_received.to_rfc3339()
+                },
                 client_ip: ctx.client_ip.clone(),
                 consumer_username: ctx.effective_identity().map(str::to_owned),
                 auth_method: ctx.auth_method,
@@ -39366,6 +39400,23 @@ async fn handle_proxy_request_inner(
                 None
             }
         } else {
+            if buffered_terminal_outcome_only {
+                // Exactly what `record_transaction` would have read off the
+                // summary this arm no longer builds: a buffered terminal has
+                // already ended, so it carries no body error and no client
+                // disconnect, and its `error_class` is the one the summary
+                // would have carried after the gateway output-policy
+                // refinement.
+                crate::runtime_metrics::global_ref().record_terminal_outcome(
+                    crate::runtime_metrics::TerminalOutcome {
+                        proxy_id: Some(proxy.id.as_str()),
+                        grpc: crate::runtime_metrics::terminal_metadata_is_grpc(&ctx.metadata),
+                        error_class: ctx.response_policy_error_class(backend_error_class),
+                        body_error_class: None,
+                        client_disconnected: false,
+                    },
+                );
+            }
             None
         };
 
