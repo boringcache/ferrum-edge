@@ -1336,10 +1336,8 @@ fn every_nested_admin_struct_field_has_an_object_admission_decision() {
     // Named structs are the serde shape that accepts positional sequences.
     // Include definitions outside the admission modules, so an imported or
     // fully qualified struct cannot evade the inventory.
-    let declaration = regex::Regex::new(
-        r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?struct\s+(\w+)[^{;\n]*\{",
-    )
-    .unwrap();
+    let declaration =
+        regex::Regex::new(r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?struct\s+(\w+)[^{;\n]*\{").unwrap();
     let items = regex::Regex::new(concat!(
         r"(?m)^([ \t]*)#\[derive\(([^)]*)\)\]\s*",
         r"(?:#\[[^\]]*\]\s*)*",
@@ -1451,7 +1449,10 @@ fn every_nested_admin_struct_field_has_an_object_admission_decision() {
                     _ => None,
                 };
                 if let Some(adapter) = adapter {
-                    assert!(attributes.contains(adapter), "{key}: retain the wire adapter");
+                    assert!(
+                        attributes.contains(adapter),
+                        "{key}: retain the wire adapter"
+                    );
                     let signature = format!("fn {adapter}<'de, D>(");
                     assert!(
                         item_body(&text, &signature, "\n}").contains(helper),
@@ -1693,14 +1694,18 @@ fn api_spec_restore_section_requires_an_object_and_preserves_absence() {
 
     for rejected in [json!([]), json!(["1", []]), json!([{}])] {
         let body = json!({"api_specs": rejected});
-        assert!(!restore_envelope_admits_for_test(&serde_json::to_vec(&body).unwrap()));
+        assert!(!restore_envelope_admits_for_test(
+            &serde_json::to_vec(&body).unwrap()
+        ));
     }
     for accepted in [
         json!({}),
         json!({"api_specs": null}),
         json!({"api_specs": {"section_version": "1", "items": []}}),
     ] {
-        assert!(restore_envelope_admits_for_test(&serde_json::to_vec(&accepted).unwrap()));
+        assert!(restore_envelope_admits_for_test(
+            &serde_json::to_vec(&accepted).unwrap()
+        ));
     }
 }
 
