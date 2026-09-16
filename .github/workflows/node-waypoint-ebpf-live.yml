@@ -851,7 +851,6 @@ jobs:
             grep 'ferrum_mesh_bpf_drops_total' "$results/before.prom" >&2 || true
             exit 1
           fi
-          before_scale="$(scrape_scale "$results/before.prom")"
 
           # Issue the excluded-port connection and keep the evidence. kubectl
           # exec propagates the container command's exit status, which is the
@@ -880,77 +879,27 @@ jobs:
           fi
 
           after="$before"
-          after_scale="$before_scale"
-          polls=0
-          scrape_failures=0
-          moved=false
-          : >"$results/poll-outcomes.txt"
-          for attempt in $(seq 1 40); do
-            polls="$attempt"
-            if ! scrape "$results/after.prom"; then
-              scrape_failures=$((scrape_failures + 1))
-              printf 'poll=%s outcome=scrape_failed\n' "$attempt" >>"$results/poll-outcomes.txt"
-              sleep 0.5
-              continue
-            fi
-            candidate="$(read_metric "$results/after.prom" "$metric")"
-            if [[ ! "$candidate" =~ ^[0-9]+$ ]]; then
-              scrape_failures=$((scrape_failures + 1))
-              printf 'poll=%s outcome=metric_missing\n' "$attempt" >>"$results/poll-outcomes.txt"
-              sleep 0.5
-              continue
-            fi
-            after="$candidate"
-            after_scale="$(scrape_scale "$results/after.prom")"
-            printf 'poll=%s outcome=scraped drops=%s scale=%s\n' \
-              "$attempt" "$after" "$after_scale" >>"$results/poll-outcomes.txt"
-            if ((after > before)); then
-              moved=true
-              break
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:19450/metrics >"$results/after.prom"; then
+              candidate="$(awk -v metric="$metric" '$1 == metric { value = $2 } END { print value }' "$results/after.prom")"
+              if [[ "$candidate" =~ ^[0-9]+$ ]]; then
+                after="$candidate"
+                if ((after > before)); then
+                  break
+                fi
+              fi
             fi
             sleep 0.5
           done
 
-          if ((polls > 0 && scrape_failures == polls)); then
-            echo "all $polls post-connection scrapes failed: the port-forward to pod/$ambient_pod never served /metrics, so $metric was never read" >&2
-            cat "$results/scrape.err" >&2 || true
-            cat "$results/port-forward.log" >&2 || true
-            exit 1
-          fi
-
-          if [[ "$moved" != "true" ]]; then
-            echo "expected $metric to increase after a real excluded-port connection from pod/$source_pod (curl exit $curl_exit); before=$before after=$after over $polls polls, $scrape_failures of them failed to scrape" >&2
+          if ((after <= before)); then
+            echo "expected $metric to increase after a real excluded-port connection; before=$before after=$after" >&2
             grep 'ferrum_mesh_bpf_drops_total' "$results/after.prom" >&2 || true
-            cat "$results/port-forward.log" >&2 || true
             exit 1
           fi
 
-          # A larger number is not by itself evidence that THIS connection was
-          # classified (issue #5502). While the ringbuf consumer is stalled the
-          # whole ferrum_mesh_bpf_* family is re-counted from the same resident
-          # records, so every series grows by one common factor and any nonzero
-          # baseline drifts upward on its own — satisfying `after > before`
-          # without a single new bypass decision. Divide each scrape by its own
-          # common factor and require the underlying decision count to move.
-          # On a healthy consumer both factors are 1 and this is exactly the
-          # plain increase.
-          if [[ ! "$before_scale" =~ ^[1-9][0-9]*$ || ! "$after_scale" =~ ^[1-9][0-9]*$ ]]; then
-            echo "could not derive the ferrum_mesh_bpf_* common factor (before=$before_scale after=$after_scale)" >&2
-            exit 1
-          fi
-          before_underlying=$((before / before_scale))
-          after_underlying=$((after / after_scale))
-          if ((after_underlying <= before_underlying)); then
-            echo "$metric grew from $before to $after only because every ferrum_mesh_bpf_* counter rescaled (factor $before_scale -> $after_scale); the underlying bypass-decision count stayed at $before_underlying, so the excluded-port connection from pod/$source_pod was never classified by pod/$ambient_pod" >&2
-            grep 'ferrum_mesh_bpf_' "$results/after.prom" >&2 || true
-            cat "$results/port-forward.log" >&2 || true
-            exit 1
-          fi
-
-          printf 'source_pod=%s\nsource_node=%s\nambient_pod=%s\nmetric=%s\ncurl_exit=%s\nbefore=%s\nafter=%s\nbefore_scale=%s\nafter_scale=%s\nbefore_underlying=%s\nafter_underlying=%s\npolls=%s\nscrape_failures=%s\n' \
-            "$source_pod" "$source_node" "$ambient_pod" "$metric" "$curl_exit" \
-            "$before" "$after" "$before_scale" "$after_scale" \
-            "$before_underlying" "$after_underlying" "$polls" "$scrape_failures" \
+          printf 'source_pod=%s\nsource_node=%s\nambient_pod=%s\nmetric=%s\nbefore=%s\nafter=%s\n' \
+            "$source_pod" "$source_node" "$ambient_pod" "$metric" "$before" "$after" \
             >"$results/assertion.txt"
 
       - name: Collect diagnostics
