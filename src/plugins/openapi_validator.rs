@@ -889,10 +889,11 @@ impl OpenapiValidator {
 
     fn mark_operation_entry(&self, ctx: &mut RequestContext, operation: &OperationEntry) {
         self.mark_mode(ctx);
-        if !ctx
-            .plugin_state()
-            .is_some_and(|state| state.openapi_validator_matches.contains_key(&self.instance_id))
-        {
+        if !ctx.plugin_state().is_some_and(|state| {
+            state
+                .openapi_validator_matches
+                .contains_key(&self.instance_id)
+        }) {
             let matched = (ctx.method.clone(), ctx.path.clone());
             ctx.plugin_state_mut()
                 .openapi_validator_matches

@@ -831,8 +831,11 @@ fn take_request_state(
 /// Whether this instance still holds completion state for the request.
 #[inline]
 fn owns_request_state(ctx: &RequestContext, instance_id: u64) -> bool {
-    ctx.plugin_state()
-        .is_some_and(|state| state.request_deduplication_states.contains_key(&instance_id))
+    ctx.plugin_state().is_some_and(|state| {
+        state
+            .request_deduplication_states
+            .contains_key(&instance_id)
+    })
 }
 
 #[allow(dead_code)]

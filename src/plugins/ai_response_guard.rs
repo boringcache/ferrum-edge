@@ -4034,14 +4034,11 @@ impl Plugin for AiResponseGuard {
                 "response content encoding was not decoded before final inspection",
             );
         }
-        if let Some(detected) = ctx
-            .plugin_state_opt_mut()
-            .and_then(|state| {
-                state
-                    .ai_response_guard_pending_redactions
-                    .remove(&self.instance_id)
-            })
-        {
+        if let Some(detected) = ctx.plugin_state_opt_mut().and_then(|state| {
+            state
+                .ai_response_guard_pending_redactions
+                .remove(&self.instance_id)
+        }) {
             warn_sampled!(
                 "ai_response_guard: detected content was not redacted before delivery (types: {}), rejecting response",
                 detected

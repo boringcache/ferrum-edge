@@ -975,7 +975,11 @@ impl AiSemanticFirewall {
 
     fn request_hash<'a>(&self, ctx: &'a RequestContext) -> Option<&'a str> {
         ctx.plugin_state()
-            .and_then(|state| state.ai_semantic_firewall_request_hashes.get(&self.instance_id))
+            .and_then(|state| {
+                state
+                    .ai_semantic_firewall_request_hashes
+                    .get(&self.instance_id)
+            })
             .map(String::as_str)
     }
 

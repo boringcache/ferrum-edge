@@ -1766,7 +1766,11 @@ impl AiToolGovernor {
 
     fn response_hash<'a>(&self, ctx: &'a RequestContext) -> Option<&'a str> {
         ctx.plugin_state()
-            .and_then(|state| state.ai_tool_governor_response_hashes.get(&self.instance_id))
+            .and_then(|state| {
+                state
+                    .ai_tool_governor_response_hashes
+                    .get(&self.instance_id)
+            })
             .map(String::as_str)
     }
 
@@ -3662,9 +3666,9 @@ impl Plugin for AiToolGovernor {
                 .remove(&self.instance_id);
         }
         if !batch.redaction_memos.is_empty()
-            && ctx.plugin_state().is_none_or(|state| {
-                state.ai_tool_governor_redaction_memos.is_empty()
-            })
+            && ctx
+                .plugin_state()
+                .is_none_or(|state| state.ai_tool_governor_redaction_memos.is_empty())
         {
             ctx.plugin_state_mut()
                 .ai_tool_governor_redaction_memos
@@ -3754,13 +3758,11 @@ impl Plugin for AiToolGovernor {
         // Consume the preflight memo with the rewrite attempt so hostile
         // redacted arguments are not retained after the transform installs
         // them (or after AmplificationFailed clears skip state).
-        let redaction_memos = ctx
-            .plugin_state_opt_mut()
-            .and_then(|state| {
-                state
-                    .ai_tool_governor_redaction_memos
-                    .remove(&self.instance_id)
-            });
+        let redaction_memos = ctx.plugin_state_opt_mut().and_then(|state| {
+            state
+                .ai_tool_governor_redaction_memos
+                .remove(&self.instance_id)
+        });
         match self.redact_response(&mut json, redaction_memos.as_ref()) {
             RedactTransform::Changed => {
                 let rewritten = match serialize_json_bounded(&json, retained_ceiling) {
