@@ -30663,6 +30663,11 @@ async fn handle_proxy_request_inner(
     // HBONE gates perform, because both publishers bump this counter AFTER their
     // store: a gate that read stale state necessarily captured a stale counter
     // too, and `HboneAdmissionFence::admit` turns that into a fresh sweep.
+    // Deliberately unconditional even though only an HBONE CONNECT can consume
+    // it: the capture has to precede the epoch load, so it cannot move into the
+    // HBONE branch below, and no mesh/inbound predicate is available this early
+    // that is cheaper than the load it would guard — one uncontended atomic
+    // load (a plain `mov` on x86-64, `ldar` on aarch64).
     let hbone_admission_sweep_epoch = state.hbone_admission_fence.sweep_epoch();
     let epoch = state.request_epoch.load();
     ctx.lb_generation = epoch.lb_generation;

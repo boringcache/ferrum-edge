@@ -3960,14 +3960,22 @@ paths:
       summary: Aggregated recent mesh_authz denies for ad-hoc triage
       description: |
         Returns the top-N most recent `mesh_authz` deny events grouped by the
-        `(rule, source, destination, reason)` tuple. The recorder is
-        process-singleton, bounded FIFO (`FERRUM_MESH_POLICY_DENY_LOG_CAPACITY`,
+        `(rule, source, destination, reason, reevaluation)` tuple. The recorder
+        is process-singleton, bounded FIFO (`FERRUM_MESH_POLICY_DENY_LOG_CAPACITY`,
         default 10000), and exception-path only — the proxy hot path never
         touches it; only the `mesh_authz` deny branch records into it. The
         endpoint reads a one-shot snapshot of the ring, filters by `at >=
-        now - window`, groups by the 4-tuple, sorts by count descending
+        now - window`, groups by the 5-tuple, sorts by count descending
         (tie-break `last_at` descending, then `rule` ascending), and
         truncates to `limit`.
+
+        Rows with `reevaluation: true` are HBONE admission-fence revocations of
+        already-admitted live tunnels (issue #5042), not requests a peer made.
+        They are recorded here so a policy rollout is auditable, but they are
+        deliberately absent from the request-shaped scrape counters
+        (`ferrum_mesh_node_waypoint_destination_policy_rejections_total`,
+        the mesh ext_authz counters); the fence's own
+        `ferrum_mesh_hbone_tunnel_revocations_total` is their metric.
 
         The endpoint complements `ferrum_mesh_requests_total{response_code="403"}`
         from the Prometheus dashboard — that metric counts denies in
@@ -4041,7 +4049,8 @@ paths:
                     type: array
                     items:
                       type: object
-                      required: [rule, reason, count, first_at, last_at]
+                      required:
+                        [rule, reason, reevaluation, count, first_at, last_at]
                       properties:
                         rule:
                           type: string
@@ -4071,6 +4080,15 @@ paths:
                           description: |
                             Categorical reason captured from
                             `ctx.metadata["mesh_authz.deny_policy"]`.
+                        reevaluation:
+                          type: boolean
+                          description: |
+                            `true` when the deny came from an HBONE
+                            admission-fence sweep re-judging an
+                            already-admitted live tunnel rather than from a
+                            request the peer made. Always present. Part of the
+                            grouping key, so swept revocations never merge
+                            into a request-time row.
                         count:
                           type: integer
                           format: int64
@@ -4097,9 +4115,18 @@ paths:
                         source: spiffe://cluster.local/ns/staging/sa/web
                         destination: spiffe://cluster.local/ns/prod/sa/api
                         reason: namespace_mismatch
+                        reevaluation: false
                         count: 87
                         first_at: "2026-05-18T19:32:11Z"
                         last_at: "2026-05-18T19:36:48Z"
+                      - rule: deny-prod-from-staging
+                        source: spiffe://cluster.local/ns/staging/sa/web
+                        destination: spiffe://cluster.local/ns/prod/sa/api
+                        reason: namespace_mismatch
+                        reevaluation: true
+                        count: 4
+                        first_at: "2026-05-18T19:36:02Z"
+                        last_at: "2026-05-18T19:36:02Z"
         "400":
           description: |
             Query parameter rejected. `window` exceeded 1 hour, was `0`, was

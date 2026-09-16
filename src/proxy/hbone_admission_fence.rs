@@ -5,10 +5,12 @@
 //! ownership guard, and the authorize-phase plugin chain (`mesh_authz`) all
 //! judge the CONNECT request, and the relay then byte-copies for as long as the
 //! tunnel lives. Without this fence a tunnel admitted under one policy
-//! generation kept flowing after the operator published a tighter one; only
-//! the admitting credential's lifetime bounded it. That is also what blocks
-//! source-side inner-connection reuse (#5042 step 2): a reused tunnel would
-//! carry later requests under a stale decision.
+//! generation kept flowing after the operator published a tighter one, and
+//! NOTHING bounded it: an established inbound HBONE mTLS session is never
+//! re-handshaked, so neither the peer SVID's expiry nor a later trust decision
+//! ends it. That is also what blocks source-side inner-connection reuse
+//! (#5042 step 2): a reused tunnel would carry later requests under a stale
+//! decision.
 //!
 //! The fence keeps a registry of live admitted tunnels, each holding the
 //! admission snapshot those gates evaluated. Every request-epoch publication
@@ -31,9 +33,19 @@
 //! [`crate::plugins::mesh::authz::MESH_AUTHZ_REEVALUATION_METADATA_KEY`]): the
 //! provider's admission-time verdict stands for the tunnel's life, exactly as
 //! before, while the local DENY/ALLOW tiers are re-applied.
+//!
+//! The dimension this fence bounds is POLICY, not credentials. A sweep
+//! re-applies the proxy lifecycle, PeerAuthentication transport,
+//! relay-destination and authorize gates; it does NOT consult the mesh trust
+//! bundle, the peer SVID's validity or rotation, or a federated trust domain
+//! that was withdrawn, and `ProxyState::update_gateway_trust` schedules no
+//! sweep at all. Removing a CA or retiring a federated trust domain therefore
+//! leaves tunnels from peers under it flowing until their relays end. Issue
+//! #5568 tracks that credential dimension and blocks #5042 step 2; see
+//! `docs/mesh.md` → "HBONE Admission Fence" → "What is NOT re-evaluated".
 
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use dashmap::DashMap;
@@ -170,17 +182,32 @@ pub struct HboneAdmissionSnapshot {
 struct AdmittedHboneTunnelInner {
     id: u64,
     token: CancellationToken,
-    /// `u8::MAX` until revoked; then `HboneRevocationReason::index()`.
-    revoked: AtomicU8,
-    /// Set by [`AdmittedHboneTunnel::retire`] the moment the relay ends, so a
-    /// sweep already holding this handle neither re-evaluates nor revokes a
-    /// tunnel that is no longer carrying bytes.
-    retired: AtomicBool,
+    /// ONE terminal-state word: `TUNNEL_LIVE`, `TUNNEL_RETIRED`, or
+    /// `TUNNEL_REVOKED_BASE + HboneRevocationReason::index()`. See those
+    /// constants for why retirement and revocation share it.
+    state: AtomicU8,
     snapshot: HboneAdmissionSnapshot,
     fence: Weak<HboneAdmissionFence>,
 }
 
-const NOT_REVOKED: u8 = u8::MAX;
+/// The relay is still carrying bytes and no sweep has claimed the tunnel.
+///
+/// `AdmittedHboneTunnel::retire` and `AdmittedHboneTunnel::claim_revocation`
+/// are the ONLY writers and each is a single compare-exchange out of this
+/// value, so exactly one of them wins. Two separate atomics could not give
+/// that: a sweep that read "not retired" microseconds before the relay ended
+/// still counted, logged and metered a revocation for a tunnel carrying no
+/// bytes, and the datagram relay — which reads `revoked_reason()` after
+/// `retire()` and has no `first_failure` to cross-check against — then reported
+/// an ordinary idle/EOF close as an admission revocation.
+const TUNNEL_LIVE: u8 = 0;
+/// The relay ended first. The tunnel is neither swept, counted, nor classified
+/// as revoked.
+const TUNNEL_RETIRED: u8 = 1;
+/// A sweep claimed the tunnel; the value is this base plus
+/// `HboneRevocationReason::index()`. The reason stays readable after the relay
+/// calls `retire()`, which is how the datagram relay classifies its own close.
+const TUNNEL_REVOKED_BASE: u8 = 2;
 
 impl Drop for AdmittedHboneTunnelInner {
     fn drop(&mut self) {
@@ -212,34 +239,44 @@ impl AdmittedHboneTunnel {
         self.inner.token.clone()
     }
 
-    /// Whether a sweep revoked this tunnel, and why.
+    /// Whether a sweep revoked this tunnel, and why. `None` for a tunnel that
+    /// is still live and for one whose relay retired it first.
     pub fn revoked_reason(&self) -> Option<HboneRevocationReason> {
-        HboneRevocationReason::from_index(self.inner.revoked.load(Ordering::Acquire))
+        self.inner
+            .state
+            .load(Ordering::Acquire)
+            .checked_sub(TUNNEL_REVOKED_BASE)
+            .and_then(HboneRevocationReason::from_index)
     }
 
     /// Deregister the tunnel the instant its relay ends, before the transaction
-    /// summary and the operator logging chain run.
+    /// summary and the operator logging chain run. `true` means this call won
+    /// the terminal transition — the relay ended before any sweep claimed the
+    /// tunnel; `false` means a sweep had already claimed it and its reason
+    /// stays readable through [`Self::revoked_reason`].
     ///
-    /// A sweep that is already holding this handle skips a retired tunnel, and
-    /// [`Self::claim_revocation`] refuses one, so
-    /// `ferrum_mesh_hbone_tunnel_revocations_total` and
-    /// [`HboneAdmissionFence::live_tunnels`] count only tunnels that are still
-    /// carrying bytes. `Drop` stays the safety net for every path that cannot
-    /// reach this call.
-    pub fn retire(&self) {
-        self.inner.retired.store(true, Ordering::Release);
+    /// The transition is ONE compare-exchange against the same word
+    /// [`Self::claim_revocation`] uses, so a sweep judging this tunnel and the
+    /// relay ending cannot both win: `ferrum_mesh_hbone_tunnel_revocations_total`
+    /// and [`HboneAdmissionFence::live_tunnels`] count only tunnels that were
+    /// still carrying bytes. `Drop` stays the safety net for every path that
+    /// cannot reach this call.
+    pub fn retire(&self) -> bool {
+        let won = self.transition_from_live(TUNNEL_RETIRED);
         if let Some(fence) = self.inner.fence.upgrade() {
             let ptr = Arc::as_ptr(&self.inner);
             fence
                 .tunnels
                 .remove_if(&self.inner.id, |_, weak| std::ptr::eq(weak.as_ptr(), ptr));
         }
+        won
     }
 
     /// Claim this tunnel for revocation and record the reason, WITHOUT
     /// cancelling yet. `true` means this caller won the claim and owns the
     /// accounting; the cancellation edge is published afterwards by
-    /// [`Self::publish_revocation`].
+    /// [`Self::publish_revocation`]. A tunnel the relay already retired, or one
+    /// a previous sweep already claimed, refuses the claim.
     ///
     /// The reason is recorded before the cancellation because the relay reads
     /// `revoked_reason()` as soon as it observes the cancellation, and the
@@ -249,17 +286,15 @@ impl AdmittedHboneTunnel {
     /// first: the only `is_cancelled()` reader is the sweep loop, and sweeps
     /// are serialized by `sweep_serial`.
     fn claim_revocation(&self, reason: HboneRevocationReason) -> bool {
-        if self.inner.retired.load(Ordering::Acquire) {
-            return false;
-        }
+        self.transition_from_live(TUNNEL_REVOKED_BASE + reason.index() as u8)
+    }
+
+    /// The ONE write that ends a tunnel: a single compare-exchange out of
+    /// [`TUNNEL_LIVE`]. `true` means this caller won.
+    fn transition_from_live(&self, terminal: u8) -> bool {
         self.inner
-            .revoked
-            .compare_exchange(
-                NOT_REVOKED,
-                reason.index() as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
+            .state
+            .compare_exchange(TUNNEL_LIVE, terminal, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
 
@@ -340,8 +375,7 @@ impl HboneAdmissionFence {
         let inner = Arc::new(AdmittedHboneTunnelInner {
             id,
             token: CancellationToken::new(),
-            revoked: AtomicU8::new(NOT_REVOKED),
-            retired: AtomicBool::new(false),
+            state: AtomicU8::new(TUNNEL_LIVE),
             snapshot,
             fence: Arc::downgrade(self),
         });
@@ -453,7 +487,11 @@ impl HboneAdmissionFence {
             .collect();
         let mut revoked = 0usize;
         for tunnel in live {
-            if tunnel.inner.token.is_cancelled() || tunnel.inner.retired.load(Ordering::Acquire) {
+            // Cheap pre-filter only: a tunnel that retires or is claimed after
+            // this load is refused by `claim_revocation`'s compare-exchange
+            // against the same word, so nothing depends on the check being
+            // current.
+            if tunnel.inner.state.load(Ordering::Acquire) != TUNNEL_LIVE {
                 continue;
             }
             // One authorize plugin that unwinds must not take the rest of the
@@ -493,7 +531,11 @@ impl HboneAdmissionFence {
                 self.revocations[reason.index()].fetch_add(1, Ordering::Release);
                 crate::plugins::prometheus_metrics::global_registry()
                     .record_hbone_tunnel_revocation(&tunnel.inner.snapshot.proxy.id, reason);
-                warn!(
+                // Per-TUNNEL record at `debug`: a namespace-wide DENY across a
+                // few thousand live tunnels emits one of these each, which is
+                // drill-down, not an operator event. The per-SWEEP `info!`
+                // summary below is the operator line.
+                debug!(
                     proxy_id = %tunnel.inner.snapshot.proxy.id,
                     reason = reason.as_str(),
                     config_generation = epoch.config_generation(),
@@ -518,9 +560,19 @@ impl HboneAdmissionFence {
     }
 
     /// Re-apply the CONNECT admission gates to one snapshot. `Some(reason)`
-    /// means the tunnel must be revoked. Gate order mirrors
-    /// `handle_hbone_request`: transport, destination ownership, then the
-    /// authorize chain.
+    /// means the tunnel must be revoked.
+    ///
+    /// Gate order is the CONNECT path's order, because the `reason` label on
+    /// `ferrum_mesh_hbone_tunnel_revocations_total` and the sweep's log line
+    /// are an operator's only attribution: a tunnel that fails two gates must
+    /// be attributed the one the peer's next CONNECT would actually be refused
+    /// with, or the rollout dashboard and the client-visible failure disagree.
+    /// The request path authorizes in `handle_proxy_request_inner` BEFORE it
+    /// branches into `handle_hbone_request`, which checks the PeerAuthentication
+    /// transport mode and only then the relay-destination ownership guard — so
+    /// the order here is authorize, transport, destination. The proxy lifecycle
+    /// check below is not one of those gates: a withdrawn proxy is never routed
+    /// to at all, so it necessarily precedes every one of them.
     async fn reevaluate(
         &self,
         snapshot: &HboneAdmissionSnapshot,
@@ -538,6 +590,10 @@ impl HboneAdmissionFence {
                 != Some(admitted_generation)
         {
             return Some(HboneRevocationReason::ProxyWithdrawn);
+        }
+
+        if self.authorize_chain_denies(snapshot, epoch).await {
+            return Some(HboneRevocationReason::AuthorizationDenied);
         }
 
         if mesh_inbound_peer_auth_transport_mismatch_for_policy(
@@ -595,6 +651,18 @@ impl HboneAdmissionFence {
             return Some(HboneRevocationReason::RelayDestination);
         }
 
+        None
+    }
+
+    /// Re-run the re-evaluation-safe part of the admitting authorize chain.
+    /// `true` denies, which the caller turns into
+    /// [`HboneRevocationReason::AuthorizationDenied`].
+    async fn authorize_chain_denies(
+        &self,
+        snapshot: &HboneAdmissionSnapshot,
+        epoch: &RequestEpoch,
+    ) -> bool {
+        let proxy = &snapshot.proxy;
         // The authorize chain is protocol-scoped and the admitting view is
         // peer-selectable: an HBONE CONNECT carrying `content-type:
         // application/grpc` classifies as gRPC, and a gRPC-Web request resolves
@@ -621,7 +689,7 @@ impl HboneAdmissionFence {
             .filter(|plugin| plugin.reevaluates_live_admission())
             .collect();
         if reevaluated.is_empty() {
-            return None;
+            return false;
         }
         self.reevaluations.fetch_add(1, Ordering::Relaxed);
         let mut ctx = snapshot.ctx.clone();
@@ -644,11 +712,11 @@ impl HboneAdmissionFence {
                         "Authorize chain denies a live HBONE tunnel's CONNECT under the current \
                          generation"
                     );
-                    return Some(HboneRevocationReason::AuthorizationDenied);
+                    return true;
                 }
             }
         }
-        None
+        false
     }
 }
 

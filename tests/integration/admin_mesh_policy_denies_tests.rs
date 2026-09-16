@@ -252,6 +252,7 @@ async fn mesh_policy_denies_endpoint_returns_grouped_recent_denies() {
         destination: Some("spiffe://cluster.local/ns/prod/sa/api".to_string()),
         reason: "namespace_mismatch".to_string(),
         at: now - ChronoDuration::seconds(30),
+        reevaluation: false,
     });
     policy_deny_log::record_global(PolicyDenyEvent {
         rule: rule_a.clone(),
@@ -259,6 +260,7 @@ async fn mesh_policy_denies_endpoint_returns_grouped_recent_denies() {
         destination: Some("spiffe://cluster.local/ns/prod/sa/api".to_string()),
         reason: "namespace_mismatch".to_string(),
         at: now - ChronoDuration::seconds(5),
+        reevaluation: false,
     });
     policy_deny_log::record_global(PolicyDenyEvent {
         rule: rule_b.clone(),
@@ -266,6 +268,7 @@ async fn mesh_policy_denies_endpoint_returns_grouped_recent_denies() {
         destination: Some("spiffe://cluster.local/ns/prod/sa/api".to_string()),
         reason: "namespace_mismatch".to_string(),
         at: now - ChronoDuration::seconds(2),
+        reevaluation: false,
     });
 
     let state = build_admin_state(create_test_jwt_manager(&tc), Some(active_mesh_runtime()));
@@ -336,6 +339,7 @@ async fn mesh_policy_denies_endpoint_window_filter_drops_old_records() {
         destination: None,
         reason: "ancient".to_string(),
         at: now - ChronoDuration::seconds(3600),
+        reevaluation: false,
     });
     policy_deny_log::record_global(PolicyDenyEvent {
         rule: recent.clone(),
@@ -343,6 +347,7 @@ async fn mesh_policy_denies_endpoint_window_filter_drops_old_records() {
         destination: None,
         reason: "recent".to_string(),
         at: now - ChronoDuration::seconds(10),
+        reevaluation: false,
     });
 
     let state = build_admin_state(create_test_jwt_manager(&tc), Some(active_mesh_runtime()));
@@ -420,6 +425,7 @@ async fn mesh_policy_denies_endpoint_honours_custom_window_and_limit() {
         destination: None,
         reason: "a".to_string(),
         at: now - ChronoDuration::seconds(2),
+        reevaluation: false,
     });
     policy_deny_log::record_global(PolicyDenyEvent {
         rule: rule_b.clone(),
@@ -427,6 +433,7 @@ async fn mesh_policy_denies_endpoint_honours_custom_window_and_limit() {
         destination: None,
         reason: "b".to_string(),
         at: now - ChronoDuration::seconds(1),
+        reevaluation: false,
     });
 
     let state = build_admin_state(create_test_jwt_manager(&tc), Some(active_mesh_runtime()));
@@ -457,6 +464,68 @@ async fn mesh_policy_denies_endpoint_honours_custom_window_and_limit() {
     );
 }
 
+/// An HBONE admission-fence sweep re-judging an already-admitted live tunnel
+/// records a real deny, but it is NOT a request the peer made. `reevaluation`
+/// is part of the grouping key, so two otherwise byte-identical records stay in
+/// separate rows and an operator can tell "N denied requests" from "N revoked
+/// live tunnels" instead of reading the second as the first.
+#[tokio::test]
+async fn mesh_policy_denies_endpoint_separates_live_tunnel_reevaluations() {
+    let tc = TestConfig::default();
+    let token = generate_test_token(&tc);
+    let rule = unique_rule("deny-reevaluated");
+
+    let now = Utc::now();
+    // Same rule, same source, same destination, same reason — only the origin
+    // differs.
+    for (reevaluation, count) in [(false, 2), (true, 1)] {
+        for _ in 0..count {
+            policy_deny_log::record_global(PolicyDenyEvent {
+                rule: rule.clone(),
+                source: Some("spiffe://cluster.local/ns/staging/sa/web".to_string()),
+                destination: Some("spiffe://cluster.local/ns/prod/sa/api".to_string()),
+                reason: "namespace_mismatch".to_string(),
+                at: now - ChronoDuration::seconds(5),
+                reevaluation,
+            });
+        }
+    }
+
+    let state = build_admin_state(create_test_jwt_manager(&tc), Some(active_mesh_runtime()));
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let body: Value = reqwest::Client::new()
+        .get(format!(
+            "{base_url}/mesh/policy-denies/recent?window=5m&limit=1000"
+        ))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let groups = groups_with_tag(&body, &rule);
+    assert_eq!(
+        groups.len(),
+        2,
+        "reevaluation must not merge swept revocations into the request-time row: {body}"
+    );
+    let request_time = groups
+        .iter()
+        .find(|g| g["reevaluation"].as_bool() == Some(false))
+        .unwrap_or_else(|| panic!("missing request-time group: {body}"));
+    let swept = groups
+        .iter()
+        .find(|g| g["reevaluation"].as_bool() == Some(true))
+        .unwrap_or_else(|| panic!("missing re-evaluation group: {body}"));
+    assert_eq!(request_time["count"], 2);
+    assert_eq!(swept["count"], 1);
+    // Always serialized, never omitted: an operator filtering request-time
+    // denials must not have to treat an absent field as `false`.
+    assert!(request_time["reevaluation"].is_boolean());
+}
+
 #[tokio::test]
 async fn recorder_unit_smoke_test_via_admin_payload() {
     // Sanity-check that a fresh `PolicyDenyRecorder` (not the global) still
@@ -471,11 +540,13 @@ async fn recorder_unit_smoke_test_via_admin_payload() {
         destination: Some("spiffe://cluster.local/ns/prod/sa/api".to_string()),
         reason: "namespace_mismatch".to_string(),
         at: now,
+        reevaluation: false,
     });
     let aggregate = recorder.aggregate_recent(now - ChronoDuration::seconds(60), 10);
     let serialised = serde_json::to_value(&aggregate).unwrap();
     assert_eq!(serialised["total_denies"], 1);
     assert_eq!(serialised["grouped"][0]["rule"], "deny-foo");
+    assert_eq!(serialised["grouped"][0]["reevaluation"], false);
     let first_at = serialised["grouped"][0]["first_at"]
         .as_str()
         .expect("first_at");

@@ -22,6 +22,13 @@
 //!   with;
 //! * a side-effecting operator authorize plugin is NOT re-run by a sweep — no
 //!   consumed budget, no spurious revocation;
+//! * a tunnel failing BOTH the authorize gate and the transport gate is
+//!   attributed `authorization_denied`, because that is the gate order the
+//!   CONNECT path applies and the `reason` label is the operator's only
+//!   attribution;
+//! * retirement and revocation are one atomic transition: a relay that ends
+//!   first is never counted or classified as revoked, and a sweep that wins
+//!   first leaves its reason readable after the relay retires;
 //! * publications coalesce and revoke every live tunnel exactly once;
 //! * a revocation never lands on `ferrum_mesh_hbone_relay_failures_total`.
 
@@ -42,6 +49,7 @@ use crate::scaffolding::port_registry::TestSocket;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope, Proxy};
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
+use ferrum_edge::identity::SpiffeId;
 use ferrum_edge::modes::mesh::config::{
     MeshConfig, MeshInboundRelayDestination, MeshInboundRelayHost, MeshPolicy,
     MeshRelayEnrollmentEvidence, MtlsMode, PolicyScope,
@@ -281,6 +289,42 @@ fn synthetic_snapshot(
         mesh_inbound_pre_handshake_app_port: None,
         destination_gate,
         resolved_ip,
+        proxy_lifecycle_generation: None,
+        request_protocol: ProxyProtocol::Http,
+        grpc_web_request: false,
+        admission_sweep_epoch,
+    }
+}
+
+/// An admission snapshot that arms BOTH the authorize gate and the post-route
+/// PeerAuthentication transport gate, so one sweep sees two failing gates and
+/// has to choose which one it attributes the revocation to.
+///
+/// `mesh_direction: Inbound` is what arms the transport gate at all; the peer
+/// SPIFFE id is what the authorize chain judges; and plaintext transport
+/// (`is_tls: false`) satisfies the default PERMISSIVE posture while failing
+/// STRICT, so the transport gate can be armed by a later publication without
+/// touching the authorize side. The proxy is a CONFIGURED one, so the
+/// destination gate does not apply and no lifecycle generation is recorded —
+/// exactly two gates are live.
+fn dual_gate_snapshot(proxy: Arc<Proxy>, admission_sweep_epoch: u64) -> HboneAdmissionSnapshot {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "CONNECT".to_string(),
+        "/".to_string(),
+    );
+    ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
+    ctx.peer_spiffe_id = Some(SpiffeId::new(CLIENT_SPIFFE).expect("client spiffe id"));
+    ctx.matched_proxy = Some(Arc::clone(&proxy));
+    HboneAdmissionSnapshot {
+        ctx,
+        proxy,
+        upstream_target: None,
+        is_tls: false,
+        has_verified_peer_certificate: false,
+        mesh_inbound_pre_handshake_app_port: None,
+        destination_gate: HboneRelayDestinationGate::Configured,
+        resolved_ip: None,
         proxy_lifecycle_generation: None,
         request_protocol: ProxyProtocol::Http,
         grpc_web_request: false,
@@ -1121,4 +1165,131 @@ async fn a_revoked_tunnel_never_counts_as_an_hbone_relay_failure() {
     let _ = shutdown_tx.send(true);
     backend_handle.abort();
     conn_task.abort();
+}
+
+/// Gate ORDER, not just gate coverage: the sweep's `reason` label and the
+/// operator log line are the only attribution a revocation carries, so a tunnel
+/// that fails two gates must be attributed the one its peer's next CONNECT
+/// would actually be refused with. The request path authorizes in
+/// `handle_proxy_request_inner` BEFORE it branches into `handle_hbone_request`,
+/// which only then checks the PeerAuthentication transport mode — so
+/// `authorization_denied` outranks `peer_auth_transport`, and a rollout
+/// dashboard watching `ferrum_mesh_hbone_tunnel_revocations_total` by `reason`
+/// agrees with what the client sees on its next CONNECT.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_authorization_denial_outranks_a_transport_mismatch_in_one_sweep() {
+    const APP_PORT: u16 = 8080;
+    // The published generation already DENIES this principal, so the authorize
+    // gate is armed before the tunnel is ever registered.
+    let state = build_state(prepared_config(Some(APP_PORT), vec![deny_client()]));
+    let fence = &state.hbone_admission_fence;
+    let proxy = Arc::new(create_mesh_proxy(APP_PORT));
+
+    let tunnel = fence.admit(dual_gate_snapshot(proxy, fence.sweep_epoch()));
+    assert_eq!(tunnel.revoked_reason(), None);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0]);
+
+    // STRICT arms the transport gate for this plaintext tunnel AND is what
+    // schedules the single sweep that now sees both gates failing.
+    state.publish_mesh_inbound_tls_policy(MeshInboundTlsPolicy {
+        default_mode: MtlsMode::Strict,
+        ..MeshInboundTlsPolicy::default()
+    });
+
+    wait_for_revocation(&tunnel).await;
+    assert_eq!(
+        tunnel.revoked_reason(),
+        Some(HboneRevocationReason::AuthorizationDenied),
+        "a tunnel failing both gates must carry the reason the CONNECT path would refuse it \
+         with, not the reason the sweep happened to evaluate first"
+    );
+    assert_eq!(
+        revocation_counts(&state),
+        [0, 0, 0, 1, 0],
+        "exactly one authorization_denied revocation, and no peer_auth_transport one"
+    );
+    assert!(
+        fence.reevaluations() >= 1,
+        "the authorize chain must actually have run for the live tunnel"
+    );
+}
+
+/// Retirement and revocation are ONE compare-exchange against the same terminal
+/// state, so exactly one wins. When the relay wins, the tunnel is neither
+/// counted, metered, nor classified as revoked: two separate atomics let a
+/// sweep that read "not retired" microseconds before the relay ended still
+/// increment `revocations[..]` and log a revocation for a tunnel carrying no
+/// bytes — and the datagram relay, which reads `revoked_reason()` AFTER
+/// `retire()` and has no `first_failure` to cross-check against, then reported
+/// an ordinary idle/EOF close as an admission revocation.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tunnel_the_relay_retired_first_is_never_counted_or_classified_as_revoked() {
+    let destination = relay_destination(RELAY_APP_HOST, RELAY_APP_PORT);
+    let state = build_state(relay_destination_config(vec![destination], false, 9501));
+    let fence = &state.hbone_admission_fence;
+
+    let tunnel = fence.admit(synthetic_snapshot(
+        inbound_relay_proxy(RELAY_APP_HOST, RELAY_APP_PORT),
+        HboneRelayDestinationGate::InboundRelay,
+        None,
+        fence.sweep_epoch(),
+    ));
+    assert!(
+        tunnel.retire(),
+        "the relay ended first, so it owns the terminal transition"
+    );
+    assert!(!tunnel.retire(), "the terminal transition is one-shot");
+    assert_eq!(fence.live_tunnels(), 0);
+
+    // Exactly the publication that WOULD have revoked this tunnel.
+    let outcome = state.update_config(relay_destination_config(Vec::new(), false, 9502));
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+    wait_for_settled_sweeps(&state).await;
+
+    assert_eq!(
+        tunnel.revoked_reason(),
+        None,
+        "a retired tunnel must never be classified as revoked"
+    );
+    assert_eq!(
+        revocation_counts(&state),
+        [0, 0, 0, 0, 0],
+        "a retired tunnel must never be counted as a revocation"
+    );
+    assert!(
+        !tunnel.revocation_token().is_cancelled(),
+        "a retired tunnel's relay must not be told the fence cut it"
+    );
+}
+
+/// The other side of the same transition. Once a sweep has claimed a tunnel,
+/// the relay's `retire()` loses and the recorded reason stays readable — which
+/// is exactly what the datagram relay depends on, because it calls `retire()`
+/// and THEN reads `revoked_reason()` to classify its own close.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revoked_tunnels_reason_survives_the_relays_retire() {
+    let destination = relay_destination(RELAY_APP_HOST, RELAY_APP_PORT);
+    let state = build_state(relay_destination_config(vec![destination], false, 9601));
+    let fence = &state.hbone_admission_fence;
+
+    let tunnel = fence.admit(synthetic_snapshot(
+        inbound_relay_proxy(RELAY_APP_HOST, RELAY_APP_PORT),
+        HboneRelayDestinationGate::InboundRelay,
+        None,
+        fence.sweep_epoch(),
+    ));
+    let outcome = state.update_config(relay_destination_config(Vec::new(), false, 9602));
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+    wait_for_revocation(&tunnel).await;
+
+    assert!(
+        !tunnel.retire(),
+        "a sweep already owns the terminal transition for this tunnel"
+    );
+    assert_eq!(
+        tunnel.revoked_reason(),
+        Some(HboneRevocationReason::RelayDestination),
+        "the reason must outlive the relay's retire(), or the datagram relay misreports it"
+    );
+    assert_eq!(revocation_counts(&state), [0, 0, 1, 0, 0]);
 }

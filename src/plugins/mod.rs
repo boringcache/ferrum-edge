@@ -11177,6 +11177,15 @@ pub trait Plugin: Send + Sync {
     /// re-check" rather than toward a spurious revocation. Override to `true`
     /// only when `authorize` is a pure function of the request context and the
     /// plugin's own immutable configuration.
+    ///
+    /// Recording the verdict is not a side effect in that sense — the ban is on
+    /// anything that CONSUMES or MUTATES state a future request depends on. An
+    /// opting-in plugin that writes an observability surface must still keep a
+    /// swept verdict distinguishable from a request-time one, because those
+    /// surfaces describe requests and a sweep is not one: `mesh_authz` tags its
+    /// policy-deny record `reevaluation: true` and withholds the request-shaped
+    /// NodeWaypoint and ext_authz counters
+    /// ([`crate::plugins::mesh::authz::MESH_AUTHZ_REEVALUATION_METADATA_KEY`]).
     fn reevaluates_live_admission(&self) -> bool {
         false
     }

@@ -1781,9 +1781,14 @@ pub(super) async fn handle_hbone_udp_request(
                 let io = TokioIo::new(upgraded);
                 let (bytes_to_app, bytes_to_tunnel) =
                     relay_hbone_udp(io, socket, idle, tunnel.revocation_token()).await;
-                // Deregister before the summary and the logging chain; the
-                // reason a sweep already recorded stays readable (the fence
-                // records it before cancelling), so classification is unchanged.
+                // Deregister before the summary and the logging chain. This
+                // relay has no per-direction failure record to classify from
+                // (unlike the byte-stream copy), so it reads the fence's own
+                // verdict AFTER retiring — sound because retirement and
+                // revocation are one atomic terminal transition: either a sweep
+                // claimed this tunnel (reason still readable) or this retire
+                // won and there is no reason to read. A relay that simply ran
+                // to idle/EOF can therefore never be reported as revoked.
                 tunnel.retire();
                 let revoked_reason = tunnel.revoked_reason();
                 if let Some(reason) = revoked_reason {
