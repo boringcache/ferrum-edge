@@ -23,6 +23,7 @@ mod audit_pipeline_tests;
 mod mesh_remote_clusters_tests;
 mod mesh_slice_drift_tests;
 mod namespace_admission_lease_renewal_tests;
+mod openapi_resource_constraints_tests;
 mod openapi_validator_generated_config_contract_tests;
 mod plugin_config_projection_tests;
 mod tls_managed_kind_overwrite_tests;
