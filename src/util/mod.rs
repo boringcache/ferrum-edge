@@ -12,6 +12,7 @@ pub mod conn_limit;
 pub mod endpointslice;
 pub mod http_headers;
 pub mod json_dup_keys;
+pub mod json_object;
 pub mod media_type;
 pub mod mesh_enrollment;
 pub mod sharding;

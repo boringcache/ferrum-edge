@@ -23,7 +23,7 @@ Returns the entire gateway configuration as a single JSON document. The output f
 - **Credential bounds**: Credential string maxima use Unicode character counts. Basic passwords, API keys, HMAC secrets, JWT secrets, and mTLS identities are limited to 4096 characters and reject disallowed ASCII control bytes; HMAC secrets must contain at least 32 non-whitespace characters on input and restore.
 - **Database-first with cached fallback**: Reads from the database when available. If the database is unreachable, falls back to the in-memory cached config and sets the `X-Data-Source: cached` response header. The backup audit path above does not use that same unavailable database as its sole record sink.
 - **Content-Disposition header**: Includes `attachment; filename="ferrum-backup.json"` for browser-friendly downloads.
-- **Resource filtering**: Use `?resources=proxies,consumers` to export only specific resource types. Valid values: `proxies`, `consumers`, `plugin_configs`, `upstreams`, `api_specs`. Omit the parameter to export everything. The parameter must appear at most once as `resources=<csv>`; a key-only `?resources`, duplicate/ambiguous occurrences, or other structurally malformed forms fail closed with `400` and the static `Unsupported backup resource filter` message (audit records the fixed `invalid` sentinel) — they never widen to an unfiltered credential-bearing export. Unknown tokens are rejected the same way. When the filter includes `api_specs`, it must also include `proxies`, `upstreams`, and `plugin_configs` so the export stays directly restorable (owning proxy plus generated upstream/plugin relationships). Otherwise `GET /backup` fails closed with `400` and does not emit a partial artifact. `consumers` is not required. Gateway trust bundles are included only in full, unfiltered database exports; every `?resources=` export omits that section, so replaying a partial artifact cannot rotate or revoke trust outside the selected resource classes.
+- **Resource filtering**: Use `?resources=proxies,consumers` to export only specific resource types. Valid values: `proxies`, `consumers`, `plugin_configs`, `upstreams`, `api_specs`. Omit the parameter to export everything. Query keys and values are strictly percent-decoded **before** the parameter is identified, before duplicate detection, and before the comma split, so a standard client's `resources=proxies%2Cconsumers` is the documented two-token filter and an encoded spelling of the key (`%72esources=proxies`) is the same parameter rather than an unrecognized one that silently widens the export back to everything, credentials included. Decoding is strict and never lossy: `+` (a backup query is not `application/x-www-form-urlencoded`, so `+` is neither a space nor a token), decoded whitespace, an incomplete or non-hex `%` escape, and byte sequences that are not valid UTF-8 are each rejected with `400` and no attachment. The parameter must appear at most once as `resources=<csv>`; a key-only `?resources`, duplicate/ambiguous occurrences — including duplicates that differ only in encoding, such as `?resources=proxies&%72esources=consumers` — or other structurally malformed forms fail closed with `400` and the static `Unsupported backup resource filter` message (audit records the fixed `invalid` sentinel) — they never widen to an unfiltered credential-bearing export. Unknown tokens are rejected the same way, and no raw rejected text is echoed to the client or persisted in the audit record. When the filter includes `api_specs`, it must also include `proxies`, `upstreams`, and `plugin_configs` so the export stays directly restorable (owning proxy plus generated upstream/plugin relationships). Otherwise `GET /backup` fails closed with `400` and does not emit a partial artifact. `consumers` is not required. Gateway trust bundles are included only in full, unfiltered database exports; every `?resources=` export omits that section, so replaying a partial artifact cannot rotate or revoke trust outside the selected resource classes.
 
 ### Example
 
@@ -93,6 +93,38 @@ Replaces the entire gateway configuration with the provided backup payload. This
 4. **Deletes** all existing proxies, consumers, plugin configs, upstreams, junction table entries, and API specs
 5. **Imports** the provided resources in dependency order (consumers & upstreams → proxies → plugin configs → associations → API specs)
 6. **Rolls back** to the snapshot if the delete or any import persistence step fails
+
+### The restore envelope is closed
+
+Because every resource collection is optional and defaults to empty, a body that
+Ferrum *misreads* as "an empty backup" is a request to delete the namespace.
+The envelope is therefore closed on both axes, and both checks run before the
+snapshot and the clear:
+
+- **It must be a JSON object.** A top-level array (`[]`), a positional sequence
+  (`["1",[],[],[],[]]`), or a scalar is `400`. Serde's derived struct visitors
+  otherwise accept a sequence *positionally*, filling each declared field in
+  turn and defaulting the rest — which is how `[]` used to parse as a backup
+  with every collection empty.
+- **Unknown top-level keys are rejected.** A misspelled collection
+  (`{"proxise": [ ... ]}`) is `400`, not "restore zero proxies". The accepted
+  keys are `version`, `proxies`, `consumers`, `plugin_configs`, `upstreams`,
+  `api_specs`, `gateway_trust_bundles`, and the `GET /backup` metadata members
+  `ferrum_version`, `exported_at`, `source`, and `counts`, which are accepted
+  and ignored so an unmodified backup artifact round-trips.
+
+An explicit `{}` and explicit empty collections keep their documented meaning:
+that is the deliberate way to ask for an empty namespace.
+
+`version`, when present and non-empty, must match the configuration version this
+gateway expects; an incompatible value is `400` and nothing is deleted.
+
+The same object-shape requirement applies to `POST /batch` and to the ordinary
+single-resource admin `POST`/`PUT` bodies, and nested object-valued fields are
+held to it too: `circuit_breaker`, `retry`, `stream_match`, `trigger`,
+`health_checks`, `hash_on_cookie_config`, `service_discovery`, and
+`locality_lb_setting` accept an object or `null`, never an array that would
+otherwise become a default-constructed configuration object.
 
 Build-out compatibility note: legacy backups whose `basicauth` entries contain fields other than exactly one `password` or `password_hash` no longer pass restore validation. Remove obsolete fields (for example an entry-local `username`) before restore. Ferrum intentionally does not add a legacy restore shim during active build-out.
 

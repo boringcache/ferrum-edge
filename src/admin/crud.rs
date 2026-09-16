@@ -5407,7 +5407,11 @@ async fn handle_write<R: AdminResource>(
         ));
     }
 
-    let mut resource: R = match serde_json::from_slice(body) {
+    // Sibling of the restore/batch envelope guard (issue #5538): a derived
+    // struct visitor accepts a JSON array positionally, so `[]` would parse as
+    // a fully defaulted resource. Every admin resource body is documented as a
+    // JSON object, so require one here rather than at each call site.
+    let mut resource: R = match crate::util::json_object::from_json_object_slice(body) {
         Ok(resource) => resource,
         Err(error) => {
             return Ok(super::json_response(
@@ -5469,8 +5473,8 @@ async fn handle_write<R: AdminResource>(
         WriteAction::Update { id } => {
             resource.set_id(id.to_string());
             if let Some(existing) = existing.as_ref() {
-                // `from_slice::<R>` already succeeded, so this only skips
-                // bodies that are not a JSON object.
+                // The object-shape guard above already rejected any body
+                // that is not a JSON object, so this re-parse always matches.
                 if let Ok(Value::Object(raw)) = serde_json::from_slice::<Value>(body) {
                     resource.restore_absent_update_fields(existing, &raw);
                 }

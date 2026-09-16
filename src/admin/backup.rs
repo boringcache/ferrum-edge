@@ -21,36 +21,106 @@ pub(crate) const API_SPECS_BACKUP_SECTION_VERSION: &str = "2";
 pub(crate) const BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR: &str =
     "Unsupported backup resource filter";
 
-/// Structurally malformed `resources` query parameter (key-only, duplicate, or
-/// otherwise ambiguous). Distinct from an absent parameter and from a present
-/// filter that merely contains unknown allow-list tokens.
+/// Structurally malformed `resources` query parameter (key-only, duplicate,
+/// undecodable, or otherwise ambiguous). Distinct from an absent parameter and
+/// from a present filter that merely contains unknown allow-list tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BackupResourcesQueryMalformed;
 
+/// Strictly percent-decode one query key or value (issue #5539).
+///
+/// The `resources` filter is identified and split **after** decoding, so a
+/// standard client's `resources=proxies%2Cconsumers` is the documented
+/// comma-separated filter and an encoded spelling of the key
+/// (`%72esources=...`) is the same parameter rather than an unrecognized one
+/// that silently widens the export back to everything.
+///
+/// Decoding is deliberately strict and never lossy:
+///
+/// - `+` is rejected. A query string is not `application/x-www-form-urlencoded`
+///   here, so `+` is neither a space nor a filter token, and guessing either
+///   way would change the requested export scope.
+/// - An incomplete or non-hex `%` escape is rejected rather than passed through
+///   as literal bytes, so `%zz` cannot masquerade as a token.
+/// - Bytes that do not form valid UTF-8 are rejected.
+/// - Decoded whitespace is rejected; the allow-list tokens never contain any.
+///
+/// Every rejection is the same fail-closed [`BackupResourcesQueryMalformed`]
+/// the caller already maps to `400` with static client text and the fixed
+/// `invalid` audit sentinel, so no raw rejected text is echoed or persisted.
+fn decode_backup_query_component(raw: &str) -> Result<String, BackupResourcesQueryMalformed> {
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => return Err(BackupResourcesQueryMalformed),
+            b'%' => {
+                let (Some(high), Some(low)) = (bytes.get(index + 1), bytes.get(index + 2)) else {
+                    return Err(BackupResourcesQueryMalformed);
+                };
+                let (Some(high), Some(low)) = (hex_nibble(*high), hex_nibble(*low)) else {
+                    return Err(BackupResourcesQueryMalformed);
+                };
+                decoded.push((high << 4) | low);
+                index += 3;
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    let decoded = String::from_utf8(decoded).map_err(|_| BackupResourcesQueryMalformed)?;
+    if decoded.chars().any(char::is_whitespace) {
+        return Err(BackupResourcesQueryMalformed);
+    }
+    Ok(decoded)
+}
+
+/// Value of one hexadecimal digit, or `None` when `byte` is not one.
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Parse the optional `resources` query parameter.
+///
+/// Keys and values are percent-decoded ([`decode_backup_query_component`])
+/// before the parameter is identified, before duplicate detection, and before
+/// the CSV split, so encoding choices cannot change the requested scope.
 ///
 /// - Parameter absent → `Ok(None)` (unfiltered export)
 /// - Single well-formed `resources=<csv>` → `Ok(Some(set))` (may still fail
 ///   allow-list / dependency validation later)
-/// - Key-only (`?resources`), duplicate/ambiguous occurrences, or other
-///   structural malformation → `Err` (fail closed; never widen to unfiltered)
+/// - Key-only (`?resources`), duplicate/ambiguous occurrences (including
+///   duplicates that differ only in encoding), an undecodable key or
+///   `resources` value, or other structural malformation → `Err` (fail closed;
+///   never widen to unfiltered)
 pub(crate) fn parse_backup_resources(
     query: Option<&str>,
-) -> Result<Option<HashSet<&str>>, BackupResourcesQueryMalformed> {
+) -> Result<Option<HashSet<String>>, BackupResourcesQueryMalformed> {
     let Some(query) = query else {
         return Ok(None);
     };
 
-    let mut found_value: Option<&str> = None;
+    let mut found_value: Option<String> = None;
     for pair in query.split('&') {
-        let mut parts = pair.splitn(2, '=');
-        let Some(key) = parts.next() else {
-            continue;
-        };
-        if key != "resources" {
+        if pair.is_empty() {
             continue;
         }
-        let Some(val) = parts.next() else {
+        let (raw_key, raw_value) = match pair.split_once('=') {
+            Some((key, value)) => (key, Some(value)),
+            None => (pair, None),
+        };
+        if decode_backup_query_component(raw_key)? != "resources" {
+            continue;
+        }
+        let Some(raw_value) = raw_value else {
             // Key-only `resources` (no `=`) is structurally malformed.
             return Err(BackupResourcesQueryMalformed);
         };
@@ -58,18 +128,29 @@ pub(crate) fn parse_backup_resources(
             // Duplicate/ambiguous `resources` occurrences fail closed.
             return Err(BackupResourcesQueryMalformed);
         }
-        found_value = Some(val);
+        found_value = Some(decode_backup_query_component(raw_value)?);
     }
 
     match found_value {
         None => Ok(None),
-        Some(val) => Ok(Some(
-            val.split(',')
-                .map(str::trim)
+        Some(value) => Ok(Some(
+            value
+                .split(',')
                 .filter(|resource| !resource.is_empty())
+                .map(str::to_string)
                 .collect(),
         )),
     }
+}
+
+/// Borrowed view of a decoded `resources` filter.
+///
+/// [`parse_backup_resources`] owns its decoded tokens (percent-decoding cannot
+/// borrow from the raw query), while the allow-list, dependency, inclusion and
+/// audit helpers all key on `&str`. Build the borrowed set once per request and
+/// pass it down.
+pub(crate) fn borrow_backup_resources(filter: Option<&HashSet<String>>) -> Option<HashSet<&str>> {
+    filter.map(|filter| filter.iter().map(String::as_str).collect())
 }
 
 /// Fail closed when any `resources=` token is outside the closed allow-list.
@@ -192,6 +273,7 @@ pub(crate) struct BackupCounts {
 /// Versioned backup/restore section for raw API spec documents and ownership
 /// metadata required to reproduce generated-resource relationships.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ApiSpecsBackupSection {
     pub(crate) section_version: String,
     pub(crate) items: Vec<ApiSpecBackupItem>,
@@ -225,6 +307,7 @@ impl ApiSpecsBackupSection {
 /// `spec_content_base64` carries the gzip-compressed original document so JSON
 /// backups stay compact and never emit a hostile multi-megabyte number array.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ApiSpecBackupItem {
     pub(crate) id: String,
     #[serde(default = "default_namespace")]
@@ -416,6 +499,7 @@ impl From<BatchCreateRequest> for RestorePayload {
             upstreams: request.upstreams,
             api_specs: None,
             gateway_trust_bundles: None,
+            ..Default::default()
         }
     }
 }
@@ -448,7 +532,25 @@ pub(crate) fn restore_missing_resource_id_errors(payload: &RestorePayload) -> Ve
     errors
 }
 
-#[derive(Deserialize)]
+/// Destructive `POST /restore` envelope.
+///
+/// Closed shape (issue #5538). Every collection defaults to empty so an
+/// explicit `{}` keeps its documented "replace this namespace with nothing"
+/// semantics, but an *unrecognized* key must not silently reach that same
+/// outcome: `{"proxise": [...]}` would otherwise read as "restore zero
+/// proxies" and delete the namespace. `deny_unknown_fields` closes that, so
+/// the accepted-and-ignored metadata members [`BackupPayload`] emits
+/// (`ferrum_version`, `exported_at`, `source`, `counts`) are declared here
+/// explicitly — exactly as [`BatchCreateRequest`] does — and a round trip of a
+/// real `GET /backup` artifact keeps working.
+///
+/// Rejecting a non-object envelope (a JSON array, a positional sequence, or a
+/// scalar) is not expressible as a serde attribute: derived struct visitors
+/// accept sequences positionally. The handler therefore parses through
+/// [`crate::util::json_object::from_json_object_slice`], which forces the map
+/// branch before any deletion.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RestorePayload {
     #[serde(default)]
     pub version: String,
@@ -470,6 +572,16 @@ pub(crate) struct RestorePayload {
     /// trust resource" and revokes.
     #[serde(default)]
     pub gateway_trust_bundles: Option<Vec<GatewayTrustBundleRecord>>,
+    /// Accepted-and-ignored `GET /backup` metadata. Declared so
+    /// `deny_unknown_fields` still admits an unmodified backup artifact.
+    #[serde(default, rename = "ferrum_version")]
+    pub(crate) _ferrum_version: Option<String>,
+    #[serde(default, rename = "exported_at")]
+    pub(crate) _exported_at: Option<String>,
+    #[serde(default, rename = "source")]
+    pub(crate) _source: Option<String>,
+    #[serde(default, rename = "counts")]
+    pub(crate) _counts: Option<serde_json::Value>,
 }
 
 /// Project a cached multi-namespace snapshot onto one namespace for a
@@ -976,16 +1088,86 @@ mod tests {
         assert_eq!(parse_backup_resources(Some("page=1")), Ok(None));
     }
 
+    /// Borrowed view of a parsed filter for the `&str`-keyed validators.
+    fn borrowed_filter(filter: &HashSet<String>) -> HashSet<&str> {
+        borrow_backup_resources(Some(filter)).expect("present")
+    }
+
+    /// Parse a well-formed present filter.
+    fn parsed_filter(query: &str) -> HashSet<String> {
+        parse_backup_resources(Some(query))
+            .expect("resources filter should parse")
+            .expect("resources filter should be present")
+    }
+
     #[test]
-    fn parse_backup_resources_trims_and_ignores_empty_tokens() {
-        let resources =
-            parse_backup_resources(Some("download=true&resources=proxies, upstreams,,"))
-                .expect("resources filter should parse")
-                .expect("resources filter should be present");
+    fn parse_backup_resources_ignores_empty_tokens() {
+        let resources = parsed_filter("download=true&resources=proxies,upstreams,,");
 
         assert!(resources.contains("proxies"));
         assert!(resources.contains("upstreams"));
         assert_eq!(resources.len(), 2);
+    }
+
+    #[test]
+    fn parse_backup_resources_decodes_percent_encoded_commas_and_keys() {
+        // A standard client encodes the documented comma (issue #5539); the
+        // decoded value is the same two-token filter as the raw form.
+        let encoded_comma = parsed_filter("resources=proxies%2Cconsumers");
+        assert_eq!(encoded_comma, parsed_filter("resources=proxies,consumers"));
+
+        // An encoded spelling of the key is the same parameter, so it filters
+        // instead of silently widening the export back to everything.
+        let encoded_key = parsed_filter("%72esources=proxies");
+        assert_eq!(encoded_key, parsed_filter("resources=proxies"));
+
+        // Mixed-case escapes decode identically.
+        assert_eq!(
+            parsed_filter("resources=proxies%2cconsumers"),
+            encoded_comma
+        );
+    }
+
+    #[test]
+    fn parse_backup_resources_rejects_duplicates_that_differ_only_in_encoding() {
+        assert_eq!(
+            parse_backup_resources(Some("resources=proxies&%72esources=consumers")),
+            Err(BackupResourcesQueryMalformed)
+        );
+        assert_eq!(
+            parse_backup_resources(Some("%72esources=proxies&resources")),
+            Err(BackupResourcesQueryMalformed)
+        );
+    }
+
+    #[test]
+    fn parse_backup_resources_rejects_undecodable_and_whitespace_forms() {
+        for malformed in [
+            // `+` is not a space here and is not a token.
+            "resources=proxies+consumers",
+            "resources=proxies,+upstreams",
+            // Encoded and raw whitespace both fail closed.
+            "resources=proxies,%20upstreams",
+            "resources=proxies, upstreams",
+            "resources=proxies%09",
+            // Truncated and non-hex escapes are never passed through raw.
+            "resources=proxies%2",
+            "resources=%",
+            "resources=proxies%zz",
+            // Invalid UTF-8 never becomes a lossy replacement character.
+            "resources=%ff",
+            "resources=proxies%c3%28",
+            // A malformed key cannot silently become "some other parameter".
+            "%7=proxies&resources=proxies",
+            // `+` in the key is rejected for the same reason as in the value.
+            "resour+ces=proxies",
+        ] {
+            assert_eq!(
+                parse_backup_resources(Some(malformed)),
+                Err(BackupResourcesQueryMalformed),
+                "{malformed} must fail closed"
+            );
+        }
     }
 
     #[test]
@@ -1031,17 +1213,19 @@ mod tests {
     #[test]
     fn validate_backup_resources_allowlist_rejects_unknown_without_echoing() {
         assert!(validate_backup_resources_allowlist(None).is_ok());
-        let known = parse_backup_resources(Some("resources=proxies,consumers"))
-            .expect("parse known")
-            .expect("present");
-        assert!(validate_backup_resources_allowlist(Some(&known)).is_ok());
+        let known = parsed_filter("resources=proxies,consumers");
+        assert!(validate_backup_resources_allowlist(Some(&borrowed_filter(&known))).is_ok());
 
-        let unknown =
-            parse_backup_resources(Some("resources=proxies,canary-secret-token-never-echoed"))
-                .expect("parse unknown")
-                .expect("present");
+        let unknown = parsed_filter("resources=proxies,canary-secret-token-never-echoed");
         assert_eq!(
-            validate_backup_resources_allowlist(Some(&unknown)),
+            validate_backup_resources_allowlist(Some(&borrowed_filter(&unknown))),
+            Err(BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR)
+        );
+        // An encoded unknown token is rejected the same way, and the static
+        // client text still never echoes it.
+        let encoded_unknown = parsed_filter("resources=%63anary-secret-token-never-echoed");
+        assert_eq!(
+            validate_backup_resources_allowlist(Some(&borrowed_filter(&encoded_unknown))),
             Err(BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR)
         );
         assert!(!BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR.contains("canary"));
@@ -1051,70 +1235,53 @@ mod tests {
     fn validate_backup_api_specs_resource_filter_accepts_no_filter_and_non_spec_filters() {
         assert!(validate_backup_api_specs_resource_filter(None).is_ok());
 
-        let proxies_only = parse_backup_resources(Some("resources=proxies"))
-            .expect("parse proxies")
-            .expect("present");
-        assert!(validate_backup_api_specs_resource_filter(Some(&proxies_only)).is_ok());
+        let proxies_only = parsed_filter("resources=proxies");
+        assert!(
+            validate_backup_api_specs_resource_filter(Some(&borrowed_filter(&proxies_only)))
+                .is_ok()
+        );
 
-        let without_specs =
-            parse_backup_resources(Some("resources=proxies,consumers,plugin_configs,upstreams"))
-                .expect("parse without api_specs")
-                .expect("present");
-        assert!(validate_backup_api_specs_resource_filter(Some(&without_specs)).is_ok());
+        let without_specs = parsed_filter("resources=proxies,consumers,plugin_configs,upstreams");
+        assert!(
+            validate_backup_api_specs_resource_filter(Some(&borrowed_filter(&without_specs)))
+                .is_ok()
+        );
     }
 
     #[test]
     fn validate_backup_api_specs_resource_filter_requires_owning_resource_classes() {
-        let api_specs_only = parse_backup_resources(Some("resources=api_specs"))
-            .expect("parse api_specs")
-            .expect("present");
-        assert_eq!(
-            validate_backup_api_specs_resource_filter(Some(&api_specs_only)),
-            Err(BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR)
-        );
-
-        let missing_plugins = parse_backup_resources(Some("resources=api_specs,proxies,upstreams"))
-            .expect("parse missing plugin_configs")
-            .expect("present");
-        assert_eq!(
-            validate_backup_api_specs_resource_filter(Some(&missing_plugins)),
-            Err(BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR)
-        );
-
-        let missing_upstreams =
-            parse_backup_resources(Some("resources=api_specs,proxies,plugin_configs"))
-                .expect("parse missing upstreams")
-                .expect("present");
-        assert_eq!(
-            validate_backup_api_specs_resource_filter(Some(&missing_upstreams)),
-            Err(BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR)
-        );
-
-        let missing_proxies =
-            parse_backup_resources(Some("resources=api_specs,upstreams,plugin_configs"))
-                .expect("parse missing proxies")
-                .expect("present");
-        assert_eq!(
-            validate_backup_api_specs_resource_filter(Some(&missing_proxies)),
-            Err(BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR)
-        );
+        for incomplete in [
+            "resources=api_specs",
+            "resources=api_specs,proxies,upstreams",
+            "resources=api_specs,proxies,plugin_configs",
+            "resources=api_specs,upstreams,plugin_configs",
+        ] {
+            let filter = parsed_filter(incomplete);
+            assert_eq!(
+                validate_backup_api_specs_resource_filter(Some(&borrowed_filter(&filter))),
+                Err(BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR),
+                "{incomplete} must fail closed"
+            );
+        }
     }
 
     #[test]
     fn validate_backup_api_specs_resource_filter_accepts_complete_combination_any_order() {
-        let complete = parse_backup_resources(Some(
-            "resources= plugin_configs ,api_specs, proxies , upstreams ",
-        ))
-        .expect("parse complete filter with whitespace")
-        .expect("present");
-        assert!(validate_backup_api_specs_resource_filter(Some(&complete)).is_ok());
+        let complete = parsed_filter("resources=plugin_configs,api_specs,proxies,upstreams");
+        assert!(
+            validate_backup_api_specs_resource_filter(Some(&borrowed_filter(&complete))).is_ok()
+        );
 
-        let with_consumers = parse_backup_resources(Some(
-            "resources=api_specs,proxies,upstreams,plugin_configs,consumers",
-        ))
-        .expect("parse with optional consumers")
-        .expect("present");
-        assert!(validate_backup_api_specs_resource_filter(Some(&with_consumers)).is_ok());
+        // Percent-encoded separators describe the same complete filter.
+        let encoded = parsed_filter("resources=plugin_configs%2Capi_specs%2Cproxies%2Cupstreams");
+        assert_eq!(encoded, complete);
+
+        let with_consumers =
+            parsed_filter("resources=api_specs,proxies,upstreams,plugin_configs,consumers");
+        assert!(
+            validate_backup_api_specs_resource_filter(Some(&borrowed_filter(&with_consumers)))
+                .is_ok()
+        );
     }
 
     #[test]

@@ -1234,3 +1234,257 @@ async fn resource_labels_spec_edit_keeps_unknown_origins_and_attributes_new_plug
         "ferrum-foundry"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Restore envelope admission (issue #5538) and backup filter decoding (#5539)
+// ---------------------------------------------------------------------------
+
+/// `GET <path>` returning `(status, body)`.
+async fn get_admin_json(base: &str, path: &str, bearer: &str) -> (u16, Value) {
+    let response = reqwest::Client::new()
+        .get(format!("{base}{path}"))
+        .bearer_auth(bearer)
+        .send()
+        .await
+        .expect("GET admin resource");
+    let status = response.status().as_u16();
+    let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    (status, body)
+}
+
+/// `POST <path>` with an already-serialized body, so a deliberately malformed
+/// envelope reaches the dispatcher verbatim.
+async fn post_admin_raw(base: &str, path: &str, bearer: &str, body: &str) -> (u16, Value) {
+    let response = reqwest::Client::new()
+        .post(format!("{base}{path}"))
+        .bearer_auth(bearer)
+        .header("Content-Type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .expect("POST admin resource");
+    let status = response.status().as_u16();
+    let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    (status, body)
+}
+
+/// Seed one proxy, consumer, and upstream through the real admin write path.
+async fn seed_sentinel_resources(base: &str, admin: &str) {
+    let (status, body) = post_admin_raw(
+        base,
+        "/proxies",
+        admin,
+        &json!({
+            "id": "sentinel",
+            "listen_path": "/sentinel",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": 12345,
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, 201, "seed proxy: {body}");
+
+    let (status, body) = post_admin_raw(
+        base,
+        "/consumers",
+        admin,
+        &json!({"id": "sentinel-consumer", "username": "sentinel"}).to_string(),
+    )
+    .await;
+    assert_eq!(status, 201, "seed consumer: {body}");
+
+    let (status, body) = post_admin_raw(
+        base,
+        "/upstreams",
+        admin,
+        &json!({
+            "id": "sentinel-upstream",
+            "name": "sentinel-upstream",
+            "targets": [{"host": "127.0.0.1", "port": 12345}],
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, 201, "seed upstream: {body}");
+}
+
+#[tokio::test]
+async fn restore_rejects_non_object_envelopes_before_deleting_configuration() {
+    let tmp = TempDir::new().unwrap();
+    let (base, _shutdown) = start_admin(admin_state(make_store(&tmp).await)).await;
+    let admin = token("restore-admin", Some("admin"));
+    seed_sentinel_resources(&base, &admin).await;
+
+    // Each of these used to parse as "a backup whose collections are all
+    // empty" and commit the destructive replacement.
+    for hostile in [
+        "[]",
+        r#"["1",[],[],[],[]]"#,
+        r#"[{"id":"p","listen_path":"/p","backend_host":"h","backend_port":1}]"#,
+        r#""a string""#,
+        "5",
+        "true",
+        "null",
+        // Unknown / misspelled collection keys are not "restore zero proxies".
+        concat!(
+            r#"{"proxise":[{"id":"new","listen_path":"/new","#,
+            r#""backend_host":"localhost","backend_port":8080}]}"#
+        ),
+        r#"{"proxies":[],"unknown_top_level":true}"#,
+        r#"{"Proxies":[]}"#,
+    ] {
+        let (status, body) = post_admin_raw(&base, "/restore?confirm=true", &admin, hostile).await;
+        assert_eq!(status, 400, "{hostile} must be rejected, got {body}");
+        assert!(
+            body.get("restored").is_none(),
+            "{hostile} must not report a completed restore: {body}"
+        );
+
+        let (status, proxy) = get_admin_json(&base, "/proxies/sentinel", &admin).await;
+        assert_eq!(
+            status, 200,
+            "sentinel proxy must survive {hostile}: {proxy}"
+        );
+        let (status, consumer) =
+            get_admin_json(&base, "/consumers/sentinel-consumer", &admin).await;
+        assert_eq!(
+            status, 200,
+            "sentinel consumer must survive {hostile}: {consumer}"
+        );
+        let (status, upstream) =
+            get_admin_json(&base, "/upstreams/sentinel-upstream", &admin).await;
+        assert_eq!(
+            status, 200,
+            "sentinel upstream must survive {hostile}: {upstream}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn restore_round_trips_a_backup_and_keeps_explicit_empty_semantics() {
+    let tmp = TempDir::new().unwrap();
+    let (base, _shutdown) = start_admin(admin_state(make_store(&tmp).await)).await;
+    let admin = token("restore-admin", Some("admin"));
+    seed_sentinel_resources(&base, &admin).await;
+
+    // A real, unmodified `GET /backup` artifact — metadata members included —
+    // still restores through the closed envelope.
+    let (status, backup, _) = get_backup(&base, "/backup", &admin, None).await;
+    assert_eq!(status, 200, "backup: {backup}");
+    for metadata in [
+        "version",
+        "ferrum_version",
+        "exported_at",
+        "source",
+        "counts",
+    ] {
+        assert!(
+            backup.get(metadata).is_some(),
+            "backup must carry {metadata}: {backup}"
+        );
+    }
+    let (status, restored) =
+        post_admin_raw(&base, "/restore?confirm=true", &admin, &backup.to_string()).await;
+    assert_eq!(status, 200, "backup round trip must restore: {restored}");
+    assert_eq!(restored["restored"]["proxies"], 1);
+    assert_eq!(restored["restored"]["consumers"], 1);
+    assert_eq!(restored["restored"]["upstreams"], 1);
+    let (status, _) = get_admin_json(&base, "/proxies/sentinel", &admin).await;
+    assert_eq!(status, 200);
+
+    // An explicit empty object keeps its documented destructive meaning.
+    let (status, restored) = post_admin_raw(&base, "/restore?confirm=true", &admin, "{}").await;
+    assert_eq!(status, 200, "explicit empty restore: {restored}");
+    assert_eq!(restored["restored"]["proxies"], 0);
+    let (status, _) = get_admin_json(&base, "/proxies/sentinel", &admin).await;
+    assert_eq!(status, 404, "an explicit empty restore still replaces all");
+}
+
+#[tokio::test]
+async fn backup_resource_filter_decodes_percent_encoded_keys_and_values() {
+    let tmp = TempDir::new().unwrap();
+    let (base, _shutdown) = start_admin(admin_state(make_store(&tmp).await)).await;
+    let admin = token("backup-admin", Some("admin"));
+    seed_sentinel_resources(&base, &admin).await;
+
+    // A standard client's encoding of the documented comma is the same filter.
+    let (status, raw_comma, _) =
+        get_backup(&base, "/backup?resources=proxies,consumers", &admin, None).await;
+    assert_eq!(status, 200, "raw comma filter: {raw_comma}");
+    let (status, encoded_comma, _) =
+        get_backup(&base, "/backup?resources=proxies%2Cconsumers", &admin, None).await;
+    assert_eq!(status, 200, "encoded comma filter: {encoded_comma}");
+    assert_eq!(encoded_comma["proxies"], raw_comma["proxies"]);
+    assert_eq!(encoded_comma["consumers"], raw_comma["consumers"]);
+    assert_eq!(encoded_comma["upstreams"], json!([]));
+
+    // An encoded key is the same parameter, so it filters instead of silently
+    // widening the export back to every resource class.
+    let (status, encoded_key, _) =
+        get_backup(&base, "/backup?%72esources=proxies", &admin, None).await;
+    assert_eq!(status, 200, "encoded key filter: {encoded_key}");
+    assert_eq!(
+        encoded_key["consumers"],
+        json!([]),
+        "an encoded key must not widen the export to unredacted consumers: {encoded_key}"
+    );
+    assert_eq!(encoded_key["upstreams"], json!([]));
+    assert_eq!(encoded_key["proxies"][0]["id"], "sentinel");
+}
+
+#[tokio::test]
+async fn backup_rejects_undecodable_duplicate_and_whitespace_filters() {
+    let tmp = TempDir::new().unwrap();
+    let (base, _shutdown) = start_admin(admin_state(make_store(&tmp).await)).await;
+    let admin = token("backup-admin", Some("admin"));
+    seed_sentinel_resources(&base, &admin).await;
+
+    for query in [
+        // Duplicate keys that differ only in encoding.
+        "/backup?resources=proxies&%72esources=consumers",
+        "/backup?%72esources=proxies&resources=consumers",
+        // `+` is not a space and is not a token.
+        "/backup?resources=proxies+consumers",
+        // Encoded and raw whitespace.
+        "/backup?resources=proxies,%20consumers",
+        "/backup?resources=proxies,+consumers",
+        // Truncated / non-hex escapes.
+        "/backup?resources=proxies%2",
+        "/backup?resources=proxies%zz",
+        // Invalid UTF-8 must not decode lossily into a replacement character.
+        "/backup?resources=%ff",
+    ] {
+        let (status, body, source) = get_backup(&base, query, &admin, None).await;
+        assert_eq!(status, 400, "{query} must fail closed, got {body}");
+        assert_eq!(
+            body["error"], "Unsupported backup resource filter",
+            "{query} must use the static no-echo client text: {body}"
+        );
+        assert!(
+            source.is_none(),
+            "{query} must not emit a backup attachment"
+        );
+    }
+
+    // Every rejection is audited with the fixed `invalid` sentinel and never
+    // the raw rejected text.
+    let (audit_status, audit_body) = get_audit(&base, &admin).await;
+    assert_eq!(audit_status, 200, "audit: {audit_body}");
+    let items = audit_body["items"].as_array().expect("audit items");
+    assert!(!items.is_empty(), "rejected filters must be audited");
+    for event in items {
+        assert_eq!(
+            event["diff"]["resources"], "invalid",
+            "rejected filters must persist the fixed sentinel only: {event}"
+        );
+    }
+    let rendered = audit_body.to_string();
+    for raw in ["%ff", "%zz", "proxies+consumers", "%72esources"] {
+        assert!(
+            !rendered.contains(raw),
+            "audit must not persist raw rejected filter text {raw}: {rendered}"
+        );
+    }
+}
