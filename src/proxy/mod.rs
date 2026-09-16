@@ -35675,10 +35675,30 @@ async fn handle_proxy_request_inner(
                     let bytes_sent = ctx
                         .bytes_sent_observed
                         .load(std::sync::atomic::Ordering::Acquire);
-                    let mut metadata = clone_log_metadata(&ctx);
-                    metadata
-                        .entry("request_protocol".to_string())
-                        .or_insert_with(|| "grpc".to_string());
+                    // A gRPC terminal without a trailer status is UNKNOWN, not
+                    // an unqualified 200. The deferred arm captures that fact
+                    // directly instead of reading it back off a metadata
+                    // projection that its own fire-time rebuild replaces —
+                    // `or_insert` here means "grpc unless the request already
+                    // declared another protocol".
+                    let request_protocol_is_grpc = ctx
+                        .metadata
+                        .get("request_protocol")
+                        .is_none_or(|protocol| protocol == "grpc");
+                    // Only the synchronous body-exceeded terminal below reads a
+                    // header-commit projection. The streaming arm rebuilds it
+                    // from the finalized context at fire time, so building it
+                    // here would be the second of two `clone_log_metadata`
+                    // calls per streamed request (issue #5537).
+                    let metadata = if body_exceeded {
+                        let mut metadata = clone_log_metadata(&ctx);
+                        metadata
+                            .entry("request_protocol".to_string())
+                            .or_insert_with(|| "grpc".to_string());
+                        metadata
+                    } else {
+                        HashMap::new()
+                    };
                     let summary = TransactionSummary {
                         namespace: proxy.namespace.clone(),
                         timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -35736,6 +35756,7 @@ async fn handle_proxy_request_inner(
                             Arc::clone(&plugins),
                             ctx.clone(),
                             start_time,
+                            request_protocol_is_grpc,
                         ))
                     }
                 } else {
@@ -39179,6 +39200,12 @@ async fn handle_proxy_request_inner(
     let compact_terminal_only = plugins.is_empty() && body_will_stream;
     let needs_transaction_summary = !compact_terminal_only
         && (!plugins.is_empty() || body_will_stream || backend_error_class.is_some());
+    // A streaming terminal's summary is captured here, at header commit, but
+    // its logger is built at the very end of this function: the logger owns a
+    // `RequestContext`, and every remaining handler read of `ctx` happens
+    // before then, so the context is MOVED into it instead of cloned whole for
+    // each streamed request (issue #5537).
+    let mut pending_stream_terminal: Option<Box<PendingStreamTerminal>> = None;
     let deferred_logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>> =
         if compact_terminal_only {
             Some(
@@ -39247,25 +39274,38 @@ async fn handle_proxy_request_inner(
                 bytes_received: bytes_received_buffered,
                 grpc_request_messages,
                 grpc_response_messages,
-                metadata: clone_log_metadata(&ctx),
+                // Only a buffered terminal consumes a header-commit projection.
+                // The deferred terminal rebuilds this map from the finalized
+                // context at fire time and overwrites whatever is here, so
+                // projecting it now would be the second of two
+                // `clone_log_metadata` calls per streamed request.
+                metadata: if body_will_stream {
+                    HashMap::new()
+                } else {
+                    clone_log_metadata(&ctx)
+                },
                 ai_usage_export: ctx.ai_usage_export.clone(),
                 proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
                 ..TransactionSummary::default()
             };
 
             if body_will_stream {
-                // Thread `start_time` so `latency_total_ms` / derived gateway
-                // fields are re-derived at body-completion time — closes the
-                // header-flush snapshot gap for streaming responses.
-                Some(
-                    crate::proxy::deferred_log::DeferredTransactionLogger::new_with_start_time(
-                        summary,
-                        Arc::clone(&plugins),
-                        ctx.clone(),
-                        start_time,
-                    )
-                    .with_passthrough_request_bytes_latch(passthrough_request_bytes_latch.clone()),
-                )
+                // Deferred: hold the summary until every handler read of `ctx`
+                // is done. `start_time` is threaded at construction so
+                // `latency_total_ms` / derived gateway fields are re-derived at
+                // body-completion time — that closes the header-flush snapshot
+                // gap for streaming responses.
+                pending_stream_terminal = Some(Box::new(PendingStreamTerminal {
+                    summary,
+                    // The summary carries no header-commit projection on this
+                    // arm, so this is exactly what the fire-time probe used to
+                    // resolve to: the request's own declared protocol.
+                    request_protocol_is_grpc: ctx
+                        .metadata
+                        .get("request_protocol")
+                        .is_some_and(|protocol| protocol == "grpc"),
+                }));
+                None
             } else {
                 // ── Buffered commitment / audit boundary (#3815) ─────────────
                 //
@@ -40165,6 +40205,35 @@ async fn handle_proxy_request_inner(
         body
     };
 
+    // Build the streaming terminal's logger LAST. Every handler read of `ctx`
+    // is behind us and nothing above mutated it after the summary was
+    // captured, so the logger takes the context by MOVE rather than forcing a
+    // whole `RequestContext` clone on every streamed request (issue #5537).
+    let deferred_logger = match pending_stream_terminal {
+        Some(pending) => {
+            // The clone this replaces never carried the bounded response-buffer
+            // permit, the mirror admission leases, or the hmac prebuffer stage.
+            // Release them here so the move does not extend a bounded admission
+            // to body-termination time.
+            ctx.release_leases_before_terminal_handoff();
+            let PendingStreamTerminal {
+                summary,
+                request_protocol_is_grpc,
+            } = *pending;
+            Some(
+                crate::proxy::deferred_log::DeferredTransactionLogger::new_with_start_time(
+                    summary,
+                    Arc::clone(&plugins),
+                    ctx,
+                    start_time,
+                    request_protocol_is_grpc,
+                )
+                .with_passthrough_request_bytes_latch(passthrough_request_bytes_latch.clone()),
+            )
+        }
+        None => deferred_logger,
+    };
+
     // Attach deferred logger to the body so `log_with_mirror` fires when the
     // body reaches a terminal state (completion, streaming error, or client
     // disconnect via the Drop safety net) rather than at header-flush time.
@@ -40207,6 +40276,23 @@ async fn handle_proxy_request_inner(
             )))
         }
     }
+}
+
+/// A streaming terminal's transaction summary, captured at header commit and
+/// held until the handler is done reading the request context.
+///
+/// [`crate::proxy::deferred_log::DeferredTransactionLogger`] owns a
+/// `RequestContext` from the moment it is constructed. Constructing it at
+/// header commit therefore cost a full `RequestContext` clone per streamed
+/// request, purely so the handler could keep reading `grpc_deadline_at`, the
+/// frontend listen port, the H3 method, and the gRPC message-counter handle
+/// from the original. Holding the summary in this two-field box instead lets
+/// the context be moved into the logger after the last of those reads
+/// (issue #5537).
+struct PendingStreamTerminal {
+    summary: TransactionSummary,
+    /// See [`crate::proxy::deferred_log::request_protocol_is_grpc`].
+    request_protocol_is_grpc: bool,
 }
 
 /// Build the backend URL based on proxy config and path forwarding logic.

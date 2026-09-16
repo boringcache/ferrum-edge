@@ -221,6 +221,30 @@ struct LogState {
     /// in hyper's detached pipe. Wait for the latch before emitting so
     /// `TransactionSummary.bytes_sent` / `api_chargeback` see forwarded bytes.
     request_bytes_latch: Option<Arc<DirectH2BytesLatch>>,
+    /// Whether a terminal that carries no trailer `grpc-status` must be
+    /// recorded as gRPC UNKNOWN rather than an unqualified HTTP 200.
+    ///
+    /// Captured at header commit from exactly the inputs `fire_once` used to
+    /// read: the caller's summary protocol when it set one, otherwise the
+    /// request's. Neither can change after construction — the context is moved
+    /// or cloned in here — so deciding early is decision-identical, and it is
+    /// what lets the streaming terminal skip projecting the summary's log
+    /// metadata at header commit when the fire-time rebuild replaces it
+    /// wholesale anyway (issue #5537).
+    request_protocol_is_grpc: bool,
+}
+
+/// The gRPC terminal-status classification a deferred logger captures at
+/// header commit. `summary_metadata` is the projection the caller put on the
+/// summary, which may be empty when that caller defers it to fire time.
+pub(crate) fn request_protocol_is_grpc(
+    summary_metadata: &std::collections::HashMap<String, String>,
+    ctx: &RequestContext,
+) -> bool {
+    summary_metadata
+        .get("request_protocol")
+        .or_else(|| ctx.metadata.get("request_protocol"))
+        .is_some_and(|protocol| protocol == "grpc")
 }
 
 impl DeferredTransactionLogger {
@@ -242,6 +266,7 @@ impl DeferredTransactionLogger {
         plugins: Arc<Vec<Arc<dyn Plugin>>>,
         ctx: RequestContext,
     ) -> Arc<Self> {
+        let request_protocol_is_grpc = request_protocol_is_grpc(&summary.metadata, &ctx);
         Arc::new(Self {
             state: Mutex::new(Some(Captured::Full(Box::new(LogState {
                 summary,
@@ -249,6 +274,7 @@ impl DeferredTransactionLogger {
                 ctx,
                 start_time: None,
                 request_bytes_latch: None,
+                request_protocol_is_grpc,
             })))),
             fired: AtomicBool::new(false),
             #[cfg(test)]
@@ -312,6 +338,7 @@ impl DeferredTransactionLogger {
         plugins: Arc<Vec<Arc<dyn Plugin>>>,
         ctx: RequestContext,
         start_time: Instant,
+        request_protocol_is_grpc: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(Some(Captured::Full(Box::new(LogState {
@@ -320,6 +347,7 @@ impl DeferredTransactionLogger {
                 ctx,
                 start_time: Some(start_time),
                 request_bytes_latch: None,
+                request_protocol_is_grpc,
             })))),
             fired: AtomicBool::new(false),
             #[cfg(test)]
@@ -393,6 +421,7 @@ impl DeferredTransactionLogger {
             mut ctx,
             start_time,
             request_bytes_latch,
+            request_protocol_is_grpc,
         } = state;
         summary.body_completed = outcome.body_completed;
         summary.body_error_class = outcome.body_error_class;
@@ -413,12 +442,7 @@ impl DeferredTransactionLogger {
         if let Some(grpc_status) = outcome.grpc_status {
             ctx.metadata
                 .insert("grpc_status".to_string(), grpc_status.to_string());
-        } else if summary
-            .metadata
-            .get("request_protocol")
-            .or_else(|| ctx.metadata.get("request_protocol"))
-            .is_some_and(|protocol| protocol == "grpc")
-        {
+        } else if request_protocol_is_grpc {
             // A gRPC stream that ends without terminal status is UNKNOWN, not
             // an unqualified successful HTTP 200. Preserve a Trailers-Only
             // header status when one was captured; otherwise seed code 2.
@@ -514,6 +538,7 @@ impl DeferredTransactionLogger {
         ctx: RequestContext,
         start_time: Option<Instant>,
     ) -> Arc<Self> {
+        let request_protocol_is_grpc = request_protocol_is_grpc(&summary.metadata, &ctx);
         Arc::new(Self {
             state: Mutex::new(Some(Captured::Full(Box::new(LogState {
                 summary,
@@ -521,6 +546,7 @@ impl DeferredTransactionLogger {
                 ctx,
                 start_time,
                 request_bytes_latch: None,
+                request_protocol_is_grpc,
             })))),
             fired: AtomicBool::new(false),
             delivery: Some(delivery),

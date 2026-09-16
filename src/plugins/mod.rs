@@ -3659,6 +3659,26 @@ impl RequestContext {
         state.ai_semantic_cache_scope_keys = ai_semantic_cache_scope_keys;
     }
 
+    /// Release the request-scoped leases a deferred terminal never owned.
+    ///
+    /// The streaming terminal used to be handed a CLONE of this context, and
+    /// exactly three fields deliberately do not survive a clone: the bounded
+    /// response-buffer permit, the `request_mirror` admission leases, and the
+    /// `hmac_auth` prebuffer staging. They are the crate's only `Clone` impls
+    /// that reset rather than duplicate, precisely because duplicating them
+    /// would double-release a bounded admission.
+    ///
+    /// Moving the context into the logger instead would hand it all three and
+    /// hold each until the body terminates and the terminal task finishes.
+    /// Dropping them here releases them where the handler has always released
+    /// them — at the end of request handling — so the move carries exactly what
+    /// the clone carried.
+    pub(crate) fn release_leases_before_terminal_handoff(&mut self) {
+        drop(self.compression_response_buffer_permit.take());
+        self.request_mirror_admissions = request_mirror::RequestMirrorAdmissions::default();
+        self.hmac_prebuffer_state = hmac_auth::HmacPrebufferState::default();
+    }
+
     /// Read the per-plugin working state, if any family has staged anything.
     ///
     /// `None` is the common case and means "every collection in
