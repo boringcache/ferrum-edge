@@ -863,9 +863,7 @@ jobs:
           exec_out="$results/excluded-port-exec.out"
           exec_err="$results/excluded-port-exec.err"
           set +e
-          kubectl -n ferrum-ebpf-live exec "pod/$source_pod" -- sh -c \
-            'curl -sS --connect-timeout 2 --max-time 5 -o /dev/null http://127.0.0.1:15020/; echo "curl_exit=$?"' \
-            >"$exec_out" 2>"$exec_err"
+          kubectl -n ferrum-ebpf-live exec "pod/$source_pod" -- sh -c 'curl -sS --connect-timeout 2 --max-time 5 -o /dev/null http://127.0.0.1:15020/; echo "curl_exit=$?"' >"$exec_out" 2>"$exec_err"
           exec_status=$?
           set -e
           printf '%s\n' "$exec_status" >"$results/excluded-port-exec.status"
