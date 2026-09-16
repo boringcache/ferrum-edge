@@ -12946,9 +12946,11 @@ mod tests {
             ),
             "H3 server must gate the streaming gRPC bridge on flavor + can_stream_request_body"
         );
+        // The relay is constructed out of line and boxed so it is not a frame
+        // slot in `handle_h3_request` (see `boxed_dispatch_grpc_streaming`).
         assert!(
-            src.contains("cross_protocol::dispatch_grpc_streaming("),
-            "H3 server must dispatch streaming-safe gRPC through dispatch_grpc_streaming"
+            src.contains("cross_protocol::boxed_dispatch_grpc_streaming("),
+            "H3 server must dispatch streaming-safe gRPC through boxed_dispatch_grpc_streaming"
         );
     }
 
