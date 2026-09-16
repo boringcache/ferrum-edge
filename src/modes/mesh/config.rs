@@ -74,6 +74,7 @@ pub enum AppProtocol {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Workload {
     pub spiffe_id: SpiffeId,
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
     pub selector: WorkloadSelector,
     pub service_name: String,
     /// Namespace of the [`MeshService`] this workload attaches to when it
@@ -132,6 +133,7 @@ pub struct Workload {
     /// address/app port. Missing metadata must fail closed once the secured
     /// NodeWaypoint transport is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub node_waypoint: Option<NodeWaypointEndpoint>,
     /// Runtime-only RESERVED remote-cluster provenance marker: `true` iff this
     /// workload was ingested from a REMOTE cluster's discovery slice. Set by
@@ -374,6 +376,7 @@ pub struct MeshPolicy {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PolicyScope {
     WorkloadSelector {
+        #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
         selector: WorkloadSelector,
     },
     Namespace {
@@ -484,6 +487,7 @@ pub struct MeshRule {
     /// Defaults empty so the common case (positive principals only) and old
     /// slices round-trip unchanged.
     #[serde(default, skip_serializing_if = "source_negation_is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
     pub source_negation: SourceNegationMatch,
     /// Synthetic marker for rules that should affect policy accounting but
     /// never match traffic, e.g. Istio ALLOW-without-rules allow-nothing.
@@ -637,6 +641,7 @@ pub struct MeshExtAuthzProvider {
     /// Istio `includeRequestBodyInCheck`. `None` means the check carries no
     /// request body at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub include_request_body_in_check: Option<MeshExtAuthzBodyCheck>,
     /// Istio `headersToUpstreamOnAllow` — provider response headers copied
     /// onto the backend-bound request when the check allows.
@@ -2343,6 +2348,7 @@ pub struct MeshTelemetryResource {
     pub namespace: String,
     #[serde(default)]
     pub scope: PolicyScope,
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
     pub config: MeshTelemetryConfig,
 }
 
@@ -2350,10 +2356,13 @@ pub struct MeshTelemetryResource {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct MeshTelemetryConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub tracing: Option<MeshTracingConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub metrics: Option<MeshMetricsConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub access_logging: Option<MeshAccessLoggingConfig>,
 }
 
@@ -2581,6 +2590,7 @@ pub struct MeshAccessLoggingConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub filter: Option<AccessLogFilter>,
 }
 
@@ -2850,6 +2860,7 @@ pub struct PeerAuthentication {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<PolicyScope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub selector: Option<WorkloadSelector>,
     #[serde(default)]
     pub mtls_mode: MtlsMode,
@@ -2923,6 +2934,7 @@ pub struct ServiceEntry {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub export_to: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub workload_selector: Option<WorkloadSelector>,
 }
 
@@ -2989,6 +3001,7 @@ pub struct MeshEndpoint {
 /// representations so the config can be persisted to file/DB.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrustBundleSet {
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
     pub local: TrustBundle,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub federated: Vec<TrustBundle>,
@@ -3086,6 +3099,7 @@ pub struct MeshSidecar {
     pub namespace: String,
     /// Empty / `None` = namespace-default; non-empty = workload-scoped via labels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub workload_selector: Option<WorkloadSelector>,
     /// `true` when Kubernetes `spec.egress` was omitted and the Sidecar should
     /// inherit the namespace default outbound scope instead of treating the
@@ -3893,6 +3907,7 @@ pub struct MeshDestinationRule {
     pub host: String,
     /// Top-level traffic policy applied to all targets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub traffic_policy: Option<MeshTrafficPolicy>,
     /// Per-destination-port traffic policy overrides. Keyed by destination
     /// port number; values override the corresponding fields of
@@ -3943,6 +3958,7 @@ pub struct MeshTrafficPolicy {
     pub connect_timeout_ms: Option<u64>,
     /// Outlier detection (maps to Ferrum PassiveHealthCheck).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub outlier_detection: Option<MeshOutlierDetection>,
     /// Load balancer configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3956,6 +3972,7 @@ pub struct MeshTrafficPolicy {
     /// Old DPs reading new slices see this as a no-op (serde defaults to
     /// `None`); new DPs reading old slices behave identically to today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub tls: Option<MeshTrafficPolicyTls>,
     /// Optional `DestinationRule.trafficPolicy.localityLbSetting`. When
     /// present, the mesh apply layer projects this onto the resolved
@@ -3966,6 +3983,7 @@ pub struct MeshTrafficPolicy {
     /// active/passive health enables failover; otherwise they remain inert.
     /// Old DPs reading new slices see this as a no-op via the serde default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub locality_lb_setting: Option<MeshLocalityLbSetting>,
     /// Cap on concurrent OPEN backend connections per destination, mapped from
     /// Istio `connectionPool.tcp.maxConnections`. Enforced by every transport
@@ -3984,6 +4002,7 @@ pub struct MeshTrafficPolicy {
     /// follow-on PR). Old DPs reading new slices see this as a no-op via
     /// the serde default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub tcp_keepalive: Option<crate::config::types::TcpKeepaliveCfg>,
     /// Bidirectional TCP idle bound mapped from Istio
     /// `connectionPool.tcp.idleTimeout`, stored as whole seconds.
@@ -4015,6 +4034,7 @@ pub struct MeshTrafficPolicy {
     /// compatibility, but new K8s translation warns, reports it as deferred, and
     /// does not populate this overlay field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub connection_pool_http: Option<MeshConnectionPoolHttp>,
 }
 
@@ -4213,7 +4233,10 @@ pub enum MeshLoadBalancer {
     /// Simple algorithm selection.
     Simple(MeshSimpleLb),
     /// Consistent hash configuration.
-    ConsistentHash(MeshConsistentHash),
+    ConsistentHash(
+        #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
+        MeshConsistentHash,
+    ),
 }
 
 /// Simple LB algorithm names matching Istio's enum.
@@ -4320,6 +4343,7 @@ pub struct MeshSubset {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub labels: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub traffic_policy: Option<MeshTrafficPolicy>,
 }
 
@@ -4359,6 +4383,7 @@ pub struct MeshVirtualServiceCorsPolicy {
     /// `spec.exportTo` so Istio's public default is preserved explicitly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub export_to: Vec<String>,
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
     pub cors: MeshCorsPolicy,
 }
 
@@ -4601,8 +4626,10 @@ pub struct MeshConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waypoint_bindings: Vec<MeshWaypointBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub trust_bundles: Option<TrustBundleSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub multi_cluster: Option<MultiClusterConfig>,
     /// Mirrors Istio `MeshConfig.outboundTrafficPolicy.mode`. `None` keeps
     /// the legacy `AllowAny` behavior (no gate). When set to `RegistryOnly`,
@@ -8703,7 +8730,10 @@ pub enum RuntimeValue {
     Number(f64),
     String(String),
     Bool(bool),
-    FractionalPercent(RuntimeFractionalPercent),
+    FractionalPercent(
+        #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
+        RuntimeFractionalPercent,
+    ),
 }
 
 /// Envoy `type.v3.FractionalPercent`-shaped runtime value. RTDS layers

@@ -565,6 +565,7 @@ pub(crate) struct RestorePayload {
     /// Present when the backup includes the versioned `api_specs` section.
     /// `None` means a legacy backup that omitted the section entirely.
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub api_specs: Option<ApiSpecsBackupSection>,
     /// Gateway trust bundles (issue #3727). `None` means the backup predates
     /// the resource (or was a cached-fallback export) and trust must be left
