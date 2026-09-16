@@ -30,7 +30,10 @@ fn ca() -> Result<(String, Issuer<'static, KeyPair>), BoxError> {
     let key = KeyPair::generate()?;
     let mut params = CertificateParams::new(Vec::<String>::new())?;
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::DigitalSignature];
+    params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
     let pem = params.self_signed(&key)?.pem();
     Ok((pem, Issuer::new(params, key)))
 }
@@ -124,7 +127,11 @@ async fn start_fixture(db_type: &str, expired: bool) -> Result<SqlTlsFixture, Bo
         Ok((container, port))
     })
     .await?;
-    let username = if db_type == "postgres" { "ferrum" } else { "root" };
+    let username = if db_type == "postgres" {
+        "ferrum"
+    } else {
+        "root"
+    };
     let fixture = SqlTlsFixture {
         _container: container,
         _certificates: certificates,

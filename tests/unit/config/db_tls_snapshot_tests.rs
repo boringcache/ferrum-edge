@@ -26,10 +26,26 @@ fn sql_tls_modes_match_native_drivers_for_every_database_consumer() {
             OperatingMode::Migrate,
         ] {
             for (tls, pg, mysql) in [
-                (DbTlsMode::Disable, PgSslMode::Disable, MySqlSslMode::Disabled),
-                (DbTlsMode::Prefer, PgSslMode::Prefer, MySqlSslMode::Preferred),
-                (DbTlsMode::Require, PgSslMode::Require, MySqlSslMode::Required),
-                (DbTlsMode::VerifyCa, PgSslMode::VerifyCa, MySqlSslMode::VerifyCa),
+                (
+                    DbTlsMode::Disable,
+                    PgSslMode::Disable,
+                    MySqlSslMode::Disabled,
+                ),
+                (
+                    DbTlsMode::Prefer,
+                    PgSslMode::Prefer,
+                    MySqlSslMode::Preferred,
+                ),
+                (
+                    DbTlsMode::Require,
+                    PgSslMode::Require,
+                    MySqlSslMode::Required,
+                ),
+                (
+                    DbTlsMode::VerifyCa,
+                    PgSslMode::VerifyCa,
+                    MySqlSslMode::VerifyCa,
+                ),
                 (
                     DbTlsMode::VerifyFull,
                     PgSslMode::VerifyFull,
@@ -81,7 +97,8 @@ fn sql_tls_snapshot_keeps_all_accepted_material_after_source_replacement() {
             for key in [ca_key, cert_key, key_key] {
                 let path = dir.path().join(format!("{key} & material.pem"));
                 std::fs::write(&path, format!("accepted {key}")).unwrap();
-                url.query_pairs_mut().append_pair(key, path.to_str().unwrap());
+                url.query_pairs_mut()
+                    .append_pair(key, path.to_str().unwrap());
             }
             let accepted = SqlTlsSnapshot::load(url.as_str(), db_type).unwrap();
             let retained = material_path(&accepted, ca_key);
