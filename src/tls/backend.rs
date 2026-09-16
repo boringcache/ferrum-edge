@@ -1,6 +1,6 @@
 use dashmap::DashMap;
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,6 +18,7 @@ use thiserror::Error;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
 
 use crate::config::types::{BackendTlsConfig, Proxy, validate_backend_tls_san_allow_list_entry};
+use crate::tls::san::ip_addr_from_san_bytes;
 use crate::tls::source::{
     CertSource, CertSourceUri, MaterialError, MaterialKind, SourceScheme, load_material_blocking,
 };
@@ -679,22 +680,6 @@ fn general_name_matches_allowed(name: &GeneralName<'_>, allowed: &SanAllowListEn
             ip_addr_from_san_bytes(actual).is_some_and(|actual| actual == *expected)
         }
         _ => false,
-    }
-}
-
-fn ip_addr_from_san_bytes(bytes: &[u8]) -> Option<IpAddr> {
-    match bytes.len() {
-        4 => {
-            let mut octets = [0_u8; 4];
-            octets.copy_from_slice(bytes);
-            Some(IpAddr::V4(Ipv4Addr::from(octets)))
-        }
-        16 => {
-            let mut octets = [0_u8; 16];
-            octets.copy_from_slice(bytes);
-            Some(IpAddr::V6(Ipv6Addr::from(octets)))
-        }
-        _ => None,
     }
 }
 

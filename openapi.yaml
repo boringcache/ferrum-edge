@@ -97,18 +97,13 @@ info:
     authorization-scoping `namespace` follows the tenant so a later reuse of
     the old name cannot expose the renamed tenant's `GET /audit` history, while
     immutable `namespace_at_event` keeps the namespace recorded when the event
-    occurred. The one-time
-    connect/migrate compatibility backfill of pre-existing derived names takes
-    that same global registry lease and commits as one transaction — on SQL the
-    lease row is verified and locked (`FOR UPDATE`, or SQLite's writer lock)
-    before the derived-name scan and stays locked through the commit, so the
-    pass neither resurrects a namespace a concurrent confirmed `DELETE` removed
-    nor rolls itself back merely for outrunning the lease TTL. Standalone
-    MongoDB has no multi-document transactions and therefore refuses these
-    three operations with `501` before mutating anything, and for the same
-    reason the compatibility backfill writes nothing on that topology; `GET`
-    remains available and still returns the union of registry names and derived
-    resource names.
+    occurred. Fresh database initialization seeds canonical `ferrum`; startup
+    does not backfill derived names into registry rows. Live registry mutations
+    preserve at least one row, so later startups do not reseed a deleted default.
+    Standalone MongoDB has no multi-document transactions and therefore refuses
+    these three operations with `501` before mutating anything. Single-document
+    initialization still seeds an empty registry; `GET` remains available and
+    returns the union of registry names and derived resource names.
 
     ## Caching and read-only mode
 
@@ -8057,6 +8052,14 @@ components:
           type: array
           items:
             type: string
+          description: >-
+            Subject Alternative Names from the leaf certificate as plain canonical
+            strings with no type prefix. DNS names are the encoded name; IPv4 uses
+            dotted decimal; IPv6 uses RFC 5952 (`std::net::IpAddr` display); URI and
+            email (rfc822Name) use their string values. Other GeneralName types use an
+            explicit `othername:<oid>`, `directory:<dn>`, `rid:<oid>`, `x400`,
+            `ediparty`, `invalid-ip:<hex>`, or `invalid:<tag>` form. Values are unique
+            and sorted.
         not_before:
           type: string
           format: date-time
@@ -8416,6 +8419,14 @@ components:
           type: array
           items:
             type: string
+          description: >-
+            Subject Alternative Names from the leaf certificate as plain canonical
+            strings with no type prefix. DNS names are the encoded name; IPv4 uses
+            dotted decimal; IPv6 uses RFC 5952 (`std::net::IpAddr` display); URI and
+            email (rfc822Name) use their string values. Other GeneralName types use an
+            explicit `othername:<oid>`, `directory:<dn>`, `rid:<oid>`, `x400`,
+            `ediparty`, `invalid-ip:<hex>`, or `invalid:<tag>` form. Values are unique
+            and sorted.
         not_before:
           type: string
           format: date-time
@@ -8620,6 +8631,14 @@ components:
           type: array
           items:
             type: string
+          description: >-
+            Subject Alternative Names from the leaf certificate as plain canonical
+            strings with no type prefix. DNS names are the encoded name; IPv4 uses
+            dotted decimal; IPv6 uses RFC 5952 (`std::net::IpAddr` display); URI and
+            email (rfc822Name) use their string values. Other GeneralName types use an
+            explicit `othername:<oid>`, `directory:<dn>`, `rid:<oid>`, `x400`,
+            `ediparty`, `invalid-ip:<hex>`, or `invalid:<tag>` form. Values are unique
+            and sorted.
         not_before:
           type: string
           format: date-time
@@ -8998,6 +9017,7 @@ components:
             Optional friendly name. Must be unique across all proxies when set.
         listen_path:
           type: [string, "null"]
+          minLength: 1
           description: >-
             URL path prefix, `=/exact-path`, or `~regex` this proxy matches.
             Must start with `/` for literal prefix matching, `=/` for exact
@@ -9132,6 +9152,8 @@ components:
         backend_port:
           type: integer
           format: uint16
+          minimum: 0
+          maximum: 65535
           default: 0
           description: >-
             Backend server port. Required (>= 1) when `upstream_id` is not set.
@@ -9155,12 +9177,15 @@ components:
         backend_connect_timeout_ms:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 86400000
           default: 5000
           description: TCP connect timeout in milliseconds
         backend_read_timeout_ms:
           type: integer
           format: uint64
           minimum: 0
+          maximum: 86400000
           default: 30000
           description: >-
             Backend read timeout in milliseconds (default 30000). For HTTP/gRPC
@@ -9175,6 +9200,7 @@ components:
           type: integer
           format: uint64
           minimum: 0
+          maximum: 86400000
           default: 30000
           description: Backend write timeout in milliseconds. For TCP proxies, this is a per-direction inactivity timeout on the backend write path. 0 = disabled.
         backend_tls_client_cert_path:
@@ -9217,6 +9243,8 @@ components:
         dns_cache_ttl_seconds:
           type: [integer, "null"]
           format: uint64
+          minimum: 1
+          maximum: 86400
           description: DNS cache TTL override in seconds
         auth_mode:
           $ref: "#/components/schemas/AuthMode"
@@ -9235,6 +9263,8 @@ components:
         pool_idle_timeout_seconds:
           type: [integer, "null"]
           format: uint64
+          minimum: 1
+          maximum: 3600
           description: Idle connection timeout in seconds (overrides global)
         pool_enable_http_keep_alive:
           type: [boolean, "null"]
@@ -9245,14 +9275,20 @@ components:
         pool_tcp_keepalive_seconds:
           type: [integer, "null"]
           format: uint64
+          minimum: 1
+          maximum: 86400
           description: TCP keep-alive probe interval (overrides global)
         pool_http2_keep_alive_interval_seconds:
           type: [integer, "null"]
           format: uint64
+          minimum: 1
+          maximum: 86400
           description: HTTP/2 PING interval in seconds (overrides global)
         pool_http2_keep_alive_timeout_seconds:
           type: [integer, "null"]
           format: uint64
+          minimum: 1
+          maximum: 86400
           description: HTTP/2 PING timeout in seconds (overrides global)
         pool_http2_initial_stream_window_size:
           type: [integer, "null"]
@@ -9342,6 +9378,7 @@ components:
           type: [integer, "null"]
           format: uint16
           minimum: 1
+          maximum: 65535
           description: |
             Listen-port identity for this proxy (must be >= 1 when set).
 
@@ -9390,6 +9427,8 @@ components:
         tcp_idle_timeout_seconds:
           type: [integer, "null"]
           format: uint64
+          minimum: 0
+          maximum: 86400
           description: |
             TCP stream idle timeout in seconds. After this duration of no data transfer
             in either direction, the connection is closed. When omitted, uses the global
@@ -9503,6 +9542,8 @@ components:
         udp_idle_timeout_seconds:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 3600
           default: 60
           description: |
             UDP session idle timeout in seconds. After this duration of inactivity,
@@ -9538,6 +9579,7 @@ components:
         allowed_methods:
           oneOf:
             - type: array
+              minItems: 1
               items:
                 type: string
                 enum: [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS, TRACE, CONNECT]
@@ -9614,6 +9656,104 @@ components:
           format: date-time
           description: Last modification timestamp (set by server)
 
+      allOf:
+        - anyOf:
+            - required: [upstream_id]
+              properties:
+                upstream_id:
+                  type: string
+                  minLength: 1
+            - required: [backend_host, backend_port]
+              properties:
+                backend_host:
+                  type: string
+                  minLength: 1
+                backend_port:
+                  type: integer
+                  format: uint16
+                  minimum: 1
+        - if:
+            required: [backend_scheme]
+            properties:
+              backend_scheme:
+                enum: [tcp, tcps, udp, dtls]
+          then:
+            required: [listen_port]
+            properties:
+              listen_port:
+                type: integer
+              listen_path:
+                type: "null"
+              response_body_mode:
+                const: stream
+          else:
+            anyOf:
+              - required: [hosts]
+                properties:
+                  hosts:
+                    minItems: 1
+              - required: [listen_path]
+                properties:
+                  listen_path:
+                    type: string
+                    minLength: 1
+            properties:
+              passthrough:
+                const: false
+              stream_proxy_protocol:
+                enum: [false, null]
+              backend_proxy_protocol:
+                type: "null"
+              stream_match:
+                type: "null"
+        - if:
+            required: [backend_scheme]
+            properties:
+              backend_scheme:
+                enum: [udp, dtls]
+          then:
+            properties:
+              backend_proxy_protocol:
+                type: "null"
+              stream_match:
+                type: "null"
+              upstream_subset:
+                type: "null"
+          else:
+            properties:
+              udp_max_response_amplification_factor:
+                exclusiveMinimum: 0
+        - if:
+            required: [passthrough]
+            properties:
+              passthrough:
+                const: true
+          then:
+            properties:
+              frontend_tls:
+                const: false
+        - if:
+            required: [upstream_subset]
+            properties:
+              upstream_subset:
+                type: string
+          then:
+            required: [upstream_id]
+            properties:
+              upstream_id:
+                type: string
+                minLength: 1
+        - if:
+            required: [listen_port]
+            properties:
+              listen_port:
+                type: integer
+          then:
+            required: [backend_scheme]
+            properties:
+              backend_scheme:
+                type: string
+
     ProxyCreate:
       description: |
         Request body for creating or updating a proxy. Same schema as Proxy
@@ -9635,21 +9775,20 @@ components:
           is set. They remain required for a direct-backend proxy.
       allOf:
         - $ref: "#/components/schemas/Proxy"
-        - anyOf:
-            - required: [upstream_id]
-              properties:
-                upstream_id:
-                  type: string
-                  minLength: 1
-            - required: [backend_host, backend_port]
-              properties:
-                backend_host:
-                  type: string
-                  minLength: 1
-                backend_port:
-                  type: integer
-                  format: uint16
-                  minimum: 1
+      examples:
+        - listen_path: /api
+          backend_scheme: http
+          backend_host: backend.example.com
+          backend_port: 8080
+        - hosts: [api.example.com]
+          listen_path: null
+          upstream_id: api-pool
+          backend_port: 0
+          allowed_methods: null
+        - backend_scheme: tcp
+          listen_port: 5432
+          backend_host: db.internal
+          backend_port: 5432
 
     StreamMatchCriteria:
       type: object
@@ -10867,6 +11006,9 @@ components:
             is ignored.
         plugin_name:
           type: string
+          minLength: 1
+          maxLength: 255
+          pattern: '\S'
           description: >-
             Plugin type name. Must be one of the available built-in plugins
             (e.g., key_auth, rate_limiting, cors, stdout_logging). Use
@@ -11780,6 +11922,19 @@ components:
             properties:
               scope:
                 const: global
+        - if:
+            required: [scope]
+            properties:
+              scope:
+                const: proxy
+          then:
+            required: [proxy_id]
+            properties:
+              proxy_id:
+                type: string
+                minLength: 1
+                maxLength: 254
+                pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
 
     PluginConfig:
       description: >-
@@ -11805,6 +11960,15 @@ components:
         - $ref: "#/components/schemas/PluginConfigBase"
         - type: object
           required: [plugin_name, scope]
+      examples:
+        - plugin_name: stdout_logging
+          scope: global
+          config: {}
+        - plugin_name: stdout_logging
+          scope: proxy
+          proxy_id: api-proxy
+          enabled: false
+          config: {}
 
     PluginConfigReplace:
       description: >-
@@ -12264,16 +12428,22 @@ components:
         failure_threshold:
           type: integer
           format: uint32
+          minimum: 1
+          maximum: 10000
           default: 5
           description: Consecutive failures to trip the circuit open
         success_threshold:
           type: integer
           format: uint32
+          minimum: 1
+          maximum: 10000
           default: 3
           description: Consecutive successes in half-open to close the circuit
         timeout_seconds:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 86400
           default: 30
           description: >
             Seconds to wait in open state before transitioning to half-open.
@@ -12283,6 +12453,8 @@ components:
         cooldown_seconds:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 86400
           writeOnly: true
           deprecated: true
           description: >
@@ -12292,14 +12464,19 @@ components:
             in one object is rejected as a duplicate field.
         failure_status_codes:
           type: array
+          maxItems: 500
           items:
             type: integer
             format: uint16
+            minimum: 100
+            maximum: 599
           default: [500, 502, 503, 504]
           description: HTTP status codes that count as failures
         half_open_max_requests:
           type: integer
           format: uint32
+          minimum: 1
+          maximum: 10000
           default: 1
           description: Maximum concurrent probe requests allowed in half-open state
         trip_on_connection_errors:
@@ -12319,13 +12496,18 @@ components:
         max_retries:
           type: integer
           format: uint32
+          minimum: 0
+          maximum: 100
           default: 3
           description: Maximum retry attempts
         retryable_status_codes:
           type: array
+          maxItems: 500
           items:
             type: integer
             format: uint16
+            minimum: 100
+            maximum: 599
           default: [502, 503, 504]
           description: HTTP status codes eligible for retry
         retryable_methods:
@@ -12359,6 +12541,8 @@ components:
                 delay_ms:
                   type: integer
                   format: uint64
+                  minimum: 0
+                  maximum: 300000
                   default: 100
                   description: Fixed delay between retries in milliseconds
         - type: object
@@ -12372,10 +12556,14 @@ components:
                 base_ms:
                   type: integer
                   format: uint64
+                  minimum: 0
+                  maximum: 300000
                   description: Base delay in milliseconds (doubled each attempt)
                 max_ms:
                   type: integer
                   format: uint64
+                  minimum: 0
+                  maximum: 300000
                   description: Maximum delay cap in milliseconds
       default:
         fixed:
@@ -12391,6 +12579,17 @@ components:
         - $ref: "#/components/schemas/Upstream"
       required:
         - targets
+      examples:
+        - targets:
+            - host: backend.example.com
+              port: 8080
+              weight: 1
+          subsets: null
+        - targets: []
+          service_discovery:
+            provider: dns_sd
+            dns_sd:
+              service_name: _http._tcp.backend.example.com
 
     GatewayTrustBundle:
       type: object
@@ -12671,6 +12870,14 @@ components:
     Upstream:
       type: object
       required: [targets]
+      anyOf:
+        - properties:
+            targets:
+              minItems: 1
+        - required: [service_discovery]
+          properties:
+            service_discovery:
+              type: object
       properties:
         labels:
           $ref: "#/components/schemas/ResourceLabels"
@@ -12699,6 +12906,7 @@ components:
             Optional friendly name. Must be unique across all upstreams when set.
         targets:
           type: array
+          maxItems: 1000
           items:
             $ref: "#/components/schemas/UpstreamTarget"
           description: >-
@@ -12737,6 +12945,8 @@ components:
             source (allowing `targets` to be empty).
         subsets:
           type: [array, "null"]
+          minItems: 1
+          maxItems: 100
           items:
             $ref: "#/components/schemas/SubsetDefinition"
           description: |
@@ -12819,6 +13029,7 @@ components:
             exactly, with no path or query options.
         backend_tls_sni:
           type: [string, "null"]
+          minLength: 1
           maxLength: 253
           description: >-
             Optional backend TLS Server Name Indication override. Mesh
@@ -12891,13 +13102,19 @@ components:
       properties:
         host:
           type: string
+          minLength: 1
+          maxLength: 255
           description: Backend hostname or IP
         port:
           type: integer
           format: uint16
+          minimum: 1
+          maximum: 65535
         weight:
           type: integer
           format: uint32
+          minimum: 1
+          maximum: 65535
           default: 1
           description: Relative weight for weighted round-robin
         tags:
@@ -13430,12 +13647,16 @@ components:
       properties:
         path:
           type: string
+          minLength: 1
+          maxLength: 2048
           default: "/"
           description: >-
             Cookie `Path` attribute. Must start with `/` and must not contain
             control bytes or `;`.
         ttl_seconds:
           type: integer
+          minimum: 0
+          maximum: 86400
           default: 3600
           description: >-
             Cookie `Max-Age` in seconds (default 1 hour). Ignored when
@@ -13450,6 +13671,8 @@ components:
             `Permanent` lifetime keeps `ttl_seconds` from `absoluteTimeout`.
         domain:
           type: [string, "null"]
+          minLength: 1
+          maxLength: 253
           description: >-
             Optional ASCII domain name. An optional leading dot is accepted.
         http_only:
@@ -13488,28 +13711,39 @@ components:
         interval_seconds:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 3600
           default: 10
           description: Seconds between probes
         timeout_ms:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 86400000
           default: 5000
           description: Probe timeout in milliseconds
         healthy_threshold:
           type: integer
           format: uint32
+          minimum: 1
+          maximum: 10000
           default: 3
           description: Consecutive healthy probes to mark target healthy
         unhealthy_threshold:
           type: integer
           format: uint32
+          minimum: 1
+          maximum: 10000
           default: 3
           description: Consecutive unhealthy probes to mark target unhealthy
         healthy_status_codes:
           type: array
+          maxItems: 500
           items:
             type: integer
             format: uint16
+            minimum: 100
+            maximum: 599
           default: [200, 302]
           description: Status codes considered healthy (HTTP probe only)
         probe_type:
@@ -13543,24 +13777,33 @@ components:
       properties:
         unhealthy_status_codes:
           type: array
+          maxItems: 500
           items:
             type: integer
             format: uint16
+            minimum: 100
+            maximum: 599
           default: [500, 502, 503, 504]
           description: Status codes that count toward the unhealthy threshold
         unhealthy_threshold:
           type: integer
           format: uint32
+          minimum: 1
+          maximum: 1000
           default: 3
           description: Failures within the window to mark target unhealthy
         unhealthy_window_seconds:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 86400
           default: 30
           description: Sliding window for counting failures
         healthy_after_seconds:
           type: integer
           format: uint64
+          minimum: 0
+          maximum: 86400
           default: 30
           description: |
             Seconds after which an unhealthy target is automatically restored
@@ -13580,9 +13823,12 @@ components:
             passive ejections are re-admitted first. Null means no cap.
         gateway_error_codes:
           type: [array, "null"]
+          maxItems: 500
           items:
             type: integer
             format: uint16
+            minimum: 100
+            maximum: 599
           description: |
             Reserved for DestinationRule parity. Validated and persisted, but
             not yet applied by passive health at runtime.
@@ -13619,6 +13865,11 @@ components:
     ServiceDiscoveryConfig:
       type: object
       required: [provider]
+      description: >-
+        The selected provider requires its matching configuration object. Its
+        poll interval must be 1–3600 seconds, and a selected mesh port must be
+        1–65535. Configuration objects for inactive providers are ignored;
+        their numeric fields still have to fit their unsigned integer types.
       properties:
         provider:
           type: string
@@ -13650,6 +13901,8 @@ components:
             poll_interval_seconds:
               type: integer
               format: uint64
+              minimum: 0
+              maximum: 18446744073709551615
               default: 30
               description: Re-query interval in seconds
         kubernetes:
@@ -13686,6 +13939,8 @@ components:
             poll_interval_seconds:
               type: integer
               format: uint64
+              minimum: 0
+              maximum: 18446744073709551615
               default: 30
         consul:
           type: [object, "null"]
@@ -13714,6 +13969,8 @@ components:
             poll_interval_seconds:
               type: integer
               format: uint64
+              minimum: 0
+              maximum: 18446744073709551615
               default: 30
         mesh:
           type: [object, "null"]
@@ -13729,10 +13986,14 @@ components:
             port:
               type: [integer, "null"]
               format: uint16
+              minimum: 0
+              maximum: 65535
               description: Mesh service port to select. Defaults to the first service/workload port.
             poll_interval_seconds:
               type: integer
               format: uint64
+              minimum: 0
+              maximum: 18446744073709551615
               default: 30
             topology:
               type: string
@@ -13750,6 +14011,8 @@ components:
         default_weight:
           type: integer
           format: uint32
+          minimum: 1
+          maximum: 65535
           default: 1
           description: Default weight assigned to discovered targets
         max_stale_seconds:
@@ -13794,6 +14057,10 @@ components:
             properties:
               dns_sd:
                 type: object
+                properties:
+                  poll_interval_seconds:
+                    minimum: 1
+                    maximum: 3600
         - if:
             required: [provider]
             properties:
@@ -13804,6 +14071,10 @@ components:
             properties:
               kubernetes:
                 type: object
+                properties:
+                  poll_interval_seconds:
+                    minimum: 1
+                    maximum: 3600
         - if:
             required: [provider]
             properties:
@@ -13814,6 +14085,10 @@ components:
             properties:
               consul:
                 type: object
+                properties:
+                  poll_interval_seconds:
+                    minimum: 1
+                    maximum: 3600
         - if:
             required: [provider]
             properties:
@@ -13824,6 +14099,12 @@ components:
             properties:
               mesh:
                 type: object
+                properties:
+                  port:
+                    minimum: 1
+                  poll_interval_seconds:
+                    minimum: 1
+                    maximum: 3600
 
     MeshEgressScopeResponse:
       type: object

@@ -27,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Redis URL database selectors now require canonical decimal integers in
   `0..=2147483647`, without zero-padding, signs, or extra path segments. Runtime
   admission and all shared-parser OpenAPI URL fields use the same rule (#5518).
+- **Build-out database initialization:** keep all core SQL schema in `V001` and
+  remove startup column/index repairs, namespace backfills, and the internal
+  compatibility marker. MongoDB uses its current index plan without replacing
+  conflicting indexes and seeds only an empty namespace registry. Recreate
+  development databases after baseline changes; custom-plugin migrations are
+  unchanged. The external ClickHouse baseline is now
+  `schemas/clickhouse/charges.sql`.
 
 ## [0.9.5] - 2026-09-13
 

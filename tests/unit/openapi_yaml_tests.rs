@@ -1355,7 +1355,7 @@ fn proxy_create_schema_requires_upstream_or_direct_backend() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
     let choices = spec
-        .pointer("/components/schemas/ProxyCreate/allOf/1/anyOf")
+        .pointer("/components/schemas/Proxy/allOf/0/anyOf")
         .and_then(serde_json::Value::as_array)
         .expect("ProxyCreate must require an upstream or direct backend");
 
@@ -9539,7 +9539,10 @@ fn config_schemas_reject_nulls_that_rust_does_not_accept() {
     assert_component_validity(
         &spec,
         "Proxy",
-        &json!({"id": "", "backend_host": "", "backend_port": 0}),
+        &json!({
+            "id": "", "listen_path": "/api", "upstream_id": "pool",
+            "backend_host": "", "backend_port": 0
+        }),
         true,
     );
 }
