@@ -1841,11 +1841,21 @@ pub struct Upstream {
     pub hash_on: Option<String>,
     /// Cookie attributes for `hash_on: "cookie:<name>"` sticky sessions.
     /// Ignored when `hash_on` is not cookie-based.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::util::json_object::deserialize_optional_object"
+    )]
     pub hash_on_cookie_config: Option<HashOnCookieConfig>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::util::json_object::deserialize_optional_object"
+    )]
     pub health_checks: Option<HealthCheckConfig>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::util::json_object::deserialize_optional_object"
+    )]
     pub service_discovery: Option<ServiceDiscoveryConfig>,
     /// Named subsets of targets identified by label selectors.
     /// Used for Istio DestinationRule subset routing. Targets whose `tags`
@@ -1888,7 +1898,11 @@ pub struct Upstream {
     /// time to honour weighted `distribute`, region-`failover`, and
     /// health-gated label-ordered `failover_priority` overrides on top of (or
     /// instead of) the priority-tier preference driven by `source_locality`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::util::json_object::deserialize_optional_object"
+    )]
     pub locality_lb_setting: Option<UpstreamLocalityLbSetting>,
     /// Path to a PEM client certificate for mTLS with backend targets.
     #[serde(default)]
@@ -2843,10 +2857,16 @@ pub struct Proxy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_spec_id: Option<String>,
     /// Circuit breaker configuration.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::util::json_object::deserialize_optional_object"
+    )]
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     /// Retry configuration.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::util::json_object::deserialize_optional_object"
+    )]
     pub retry: Option<RetryConfig>,
     /// Response body mode: `stream` (default) or `buffer`.
     /// Streaming forwards response chunks as they arrive from the backend.
@@ -2969,7 +2989,11 @@ pub struct Proxy {
     /// from trustworthy connection / workload metadata before the stream route
     /// is selected. `None` / empty arms = port (and SNI for passthrough) alone.
     /// Compiled into [`compiled_stream_match`] during `normalize_fields`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::util::json_object::deserialize_optional_object"
+    )]
     pub stream_match: Option<crate::proxy::stream_match::StreamMatchCriteria>,
     /// Hot-path compiled form of [`stream_match`]. Populated by
     /// `normalize_fields`; never serialized.
@@ -3086,7 +3110,11 @@ pub struct PluginConfig {
     /// See [`crate::config::plugin_trigger`] and
     /// `docs/plugin_execution_order.md` for the phase model and the
     /// fail-closed composition rules.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::util::json_object::deserialize_optional_object"
+    )]
     pub trigger: Option<PluginTrigger>,
     /// ID of the `ApiSpec` that created this plugin config via the spec-import admin API.
     /// `None` for hand-crafted plugin configs. Used to scope cascading DELETE when a

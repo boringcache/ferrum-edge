@@ -4519,8 +4519,18 @@ paths:
             Comma-separated list of resource types to include.
             Valid values: `proxies`, `consumers`, `plugin_configs`, `upstreams`, `api_specs`.
             When omitted, all resource types are included.
+            Keys and values are strictly percent-decoded before the parameter
+            is identified, before duplicate detection, and before the CSV
+            split, so `resources=proxies%2Cconsumers` is the same filter as
+            `resources=proxies,consumers` and `%72esources=proxies` is the same
+            parameter as `resources=proxies` rather than an unrecognized one
+            that widens the export. Decoding is strict and never lossy: `+`
+            (this is not `application/x-www-form-urlencoded`), decoded
+            whitespace, an incomplete or non-hex `%` escape, and bytes that are
+            not valid UTF-8 are all rejected with `400`.
             The parameter must appear at most once as `resources=<csv>`. A
-            key-only `resources` (no `=`), duplicate/ambiguous occurrences, or
+            key-only `resources` (no `=`), duplicate/ambiguous occurrences
+            (including duplicates that differ only in encoding), or
             other structurally malformed forms are rejected with `400` and the
             same static error message — they never widen to an unfiltered
             export. Unknown tokens are likewise rejected with `400` and a
@@ -18043,7 +18053,12 @@ components:
         restore as legacy backups; database-backed exports always include it
         (possibly with an empty `items` array). The aggregate decompressed
         API-spec content is bounded by the configured restore body limit.
+
+        Closed on restore: an unknown member is rejected with `400` rather
+        than silently ignored, so a misspelled section key cannot read as an
+        empty API-spec wipe.
       required: [section_version, items]
+      additionalProperties: false
       properties:
         section_version:
           type: string
@@ -18063,6 +18078,10 @@ components:
         One API spec document in a backup/restore payload. `spec_content_base64`
         is the gzip-compressed original document (standard Base64). Do not log
         this field; it may contain proprietary API definitions.
+
+        Closed on restore: an unknown member is rejected with `400` rather than
+        silently ignored.
+      additionalProperties: false
       required:
         - id
         - proxy_id
@@ -18148,37 +18167,148 @@ components:
           type: string
           format: date-time
 
+    ProxyRestoreItem:
+      description: >-
+        Proxy item accepted by `POST /restore`. Identical to `Proxy` except
+        that `id` is required and must be non-empty: `GET /backup` always emits
+        ids, and restore refuses to mint one because repeating the same body
+        would invent a different identity on a destructive replacement. The
+        create surfaces that generate ids are unaffected.
+      allOf:
+        - $ref: "#/components/schemas/Proxy"
+        - type: object
+          required: [id]
+          properties:
+            id:
+              type: string
+              minLength: 1
+
+    UpstreamRestoreItem:
+      description: >-
+        Upstream item accepted by `POST /restore`. Identical to `Upstream`
+        except that `id` is required and must be non-empty.
+      allOf:
+        - $ref: "#/components/schemas/Upstream"
+        - type: object
+          required: [id]
+          properties:
+            id:
+              type: string
+              minLength: 1
+
+    PluginConfigRestoreItem:
+      description: >-
+        Plugin configuration item accepted by `POST /restore`. Identical to
+        `PluginConfig` except that `id` is required and must be non-empty.
+      allOf:
+        - $ref: "#/components/schemas/PluginConfig"
+        - type: object
+          required: [id]
+          properties:
+            id:
+              type: string
+              minLength: 1
+
+    ConsumerRestoreItem:
+      description: >-
+        Consumer item accepted by `POST /restore`: the `ConsumerRestore`
+        credential contract plus restore's required non-empty `id`.
+      allOf:
+        - $ref: "#/components/schemas/ConsumerRestore"
+        - type: object
+          required: [id]
+          properties:
+            id:
+              type: string
+              minLength: 1
+
     RestoreRequest:
       type: object
       description: |
-        Same format as the backup output. All resource arrays are optional —
-        omitted types are treated as empty. Every included proxy, consumer,
-        plugin config, and upstream must carry a non-empty `id` (`GET /backup`
-        always includes them). A batch-shaped body that omits ids is not
-        restorable. Omitting `api_specs` entirely means a legacy backup
-        (preflight may require `confirm_api_spec_deletion=true`). An empty
-        `api_specs.items` array is an intentional wipe of API specs.
-        Backup metadata (`exported_at`, `source`, `counts`, `ferrum_version`)
-        is ignored if present.
+        Same format as the backup output, and a **closed** envelope: the body
+        must be a JSON object and unknown top-level keys are rejected with
+        `400` before anything is deleted. A JSON array, a positional sequence,
+        a scalar, or a misspelled collection key (for example `proxise`) is not
+        "a restore with that collection empty" — accepting it would delete the
+        namespace.
+
+        All resource arrays are optional — omitted types are treated as empty,
+        so an explicit `{}` is a deliberate "replace this namespace with
+        nothing". Every included proxy, consumer, plugin config, and upstream
+        must carry a non-empty `id` (`GET /backup` always includes them). A
+        batch-shaped body that omits ids is not restorable. Omitting
+        `api_specs` entirely means a legacy backup (preflight may require
+        `confirm_api_spec_deletion=true`). An empty `api_specs.items` array is
+        an intentional wipe of API specs.
+
+        Backup metadata emitted by `GET /backup` (`exported_at`, `source`,
+        `counts`, `ferrum_version`) is accepted and ignored, so an unmodified
+        backup artifact round-trips.
+      additionalProperties: false
       properties:
+        version:
+          type: string
+          description: |
+            Configuration schema version carried by the backup. When present
+            and non-empty it must equal the version this gateway expects;
+            an incompatible value is rejected with `400` and nothing is
+            deleted. Omitted or empty skips the check.
+          example: "1"
         proxies:
           type: array
           items:
-            $ref: "#/components/schemas/Proxy"
+            $ref: "#/components/schemas/ProxyRestoreItem"
         consumers:
           type: array
           items:
-            $ref: "#/components/schemas/ConsumerRestore"
+            $ref: "#/components/schemas/ConsumerRestoreItem"
         plugin_configs:
           type: array
           items:
-            $ref: "#/components/schemas/PluginConfig"
+            $ref: "#/components/schemas/PluginConfigRestoreItem"
         upstreams:
           type: array
           items:
-            $ref: "#/components/schemas/Upstream"
+            $ref: "#/components/schemas/UpstreamRestoreItem"
         api_specs:
           $ref: "#/components/schemas/ApiSpecsBackupSection"
+        gateway_trust_bundles:
+          type: array
+          description: |
+            Namespace-keyed gateway trust bundles (issue #3727). Three-valued
+            on purpose, so a restore can never *accidentally* change trust:
+
+            - **Absent** — trust is left exactly as it is. An older config
+              artifact that predates the resource (and every cached-fallback or
+              `?resources=` filtered export, which omit the section) must not
+              silently revoke a namespace's roots.
+            - **Present and empty (`[]`)** — an explicit revocation; the
+              namespace's record is deleted.
+            - **Present and non-empty** — authoritative; the namespace
+              reconciles to exactly what is listed. The resource is a namespace
+              singleton, so more than one record for the target namespace is
+              refused rather than silently reduced to the first.
+          items:
+            $ref: "#/components/schemas/GatewayTrustBundle"
+        ferrum_version:
+          type: string
+          description: >-
+            Backup metadata from `GET /backup`. Accepted and ignored.
+        exported_at:
+          type: string
+          description: >-
+            Backup metadata from `GET /backup`. Accepted and ignored.
+        source:
+          type: string
+          description: >-
+            Backup metadata from `GET /backup`. Accepted and ignored.
+        counts:
+          type: object
+          description: |
+            Backup metadata from `GET /backup`. Accepted and ignored, but the
+            declared `type: object` is enforced: a non-object `counts` is a
+            `400` like every other shape mismatch, so a malformed artifact
+            cannot reach the destructive clear.
 
     RestoreResponse:
       type: object

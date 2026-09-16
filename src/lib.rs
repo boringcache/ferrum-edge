@@ -86,6 +86,25 @@ pub use router_cache::{RouteMatch, RouterCache};
 /// The leading underscore signals that this module is not part of the public API.
 #[doc(hidden)]
 pub mod _test_support {
+    /// Structural admission of a `POST /restore` envelope (issue #5538).
+    ///
+    /// `true` when the body is a JSON object whose keys are all recognized
+    /// restore/backup members; `false` for a JSON array, a positional
+    /// sequence, a scalar, or an unknown/misspelled key.
+    pub fn restore_envelope_admits_for_test(body: &[u8]) -> bool {
+        crate::admin::restore_envelope_admits_for_test(body)
+    }
+
+    /// Serde-accepted member names of the `POST /restore` envelope
+    /// (issue #5542).
+    ///
+    /// Recovered from the derived `Deserialize` itself, so a new Rust member
+    /// appears here without anyone updating a manifest. The OpenAPI contract
+    /// test compares this inventory with `RestoreRequest.properties`.
+    pub fn restore_envelope_field_names_for_test() -> Vec<String> {
+        crate::admin::restore_envelope_field_names_for_test()
+    }
+
     /// Exercise the dispatch coordinate rebase and its cloned diagnostic context.
     pub fn rebase_backend_path_for_test(
         ctx: &mut crate::plugins::RequestContext,
