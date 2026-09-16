@@ -86,6 +86,15 @@ pub use router_cache::{RouteMatch, RouterCache};
 /// The leading underscore signals that this module is not part of the public API.
 #[doc(hidden)]
 pub mod _test_support {
+    /// Structural admission of a `POST /restore` envelope (issue #5538).
+    ///
+    /// `true` when the body is a JSON object whose keys are all recognized
+    /// restore/backup members; `false` for a JSON array, a positional
+    /// sequence, a scalar, or an unknown/misspelled key.
+    pub fn restore_envelope_admits_for_test(body: &[u8]) -> bool {
+        crate::admin::restore_envelope_admits_for_test(body)
+    }
+
     /// Exercise the dispatch coordinate rebase and its cloned diagnostic context.
     pub fn rebase_backend_path_for_test(
         ctx: &mut crate::plugins::RequestContext,

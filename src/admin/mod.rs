@@ -37,10 +37,11 @@ use crate::admin::audit::AuditActor;
 use crate::admin::backup::{
     ApiSpecsBackupSection, BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR,
     BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR, BackupCounts, BackupPayload, BatchCreateRequest,
-    RestorePayload, clear_api_spec_ownership_tags, filter_config_by_namespace,
-    parse_backup_resources, parse_confirm_api_spec_deletion, parse_restore_confirm,
-    restore_missing_resource_id_errors, validate_backup_api_specs_resource_filter,
-    validate_backup_resources_allowlist, validate_restore_api_specs_section_with_total_limit,
+    RestorePayload, borrow_backup_resources, clear_api_spec_ownership_tags,
+    filter_config_by_namespace, parse_backup_resources, parse_confirm_api_spec_deletion,
+    parse_restore_confirm, restore_missing_resource_id_errors,
+    validate_backup_api_specs_resource_filter, validate_backup_resources_allowlist,
+    validate_restore_api_specs_section_with_total_limit,
 };
 use crate::admin::jwt_auth::{AdminRole, JwtError, JwtManager};
 use crate::config::db_backend::{
@@ -6160,6 +6161,7 @@ fn restore_payload_from_config(config: GatewayConfig) -> RestorePayload {
         // generation rather than leaving whatever the failed import wrote
         // (issue #3727).
         gateway_trust_bundles: Some(config.gateway_trust_bundles),
+        ..Default::default()
     }
 }
 
@@ -6198,6 +6200,7 @@ impl RestoreSnapshot {
             upstreams: self.payload.upstreams.clone(),
             api_specs: None,
             gateway_trust_bundles: self.payload.gateway_trust_bundles.clone(),
+            ..Default::default()
         };
         if !self.api_specs.is_empty() || self.payload.api_specs.is_some() {
             payload.api_specs = Some(ApiSpecsBackupSection::from_specs(&self.api_specs));
@@ -6656,6 +6659,7 @@ fn snapshot_resources_missing_after_intervening_write(
         // concurrency, so replaying it here could clobber a rotation that
         // intervening writer committed; leave it to the explicit rollback path.
         gateway_trust_bundles: None,
+        ..Default::default()
     }
 }
 
@@ -8009,6 +8013,20 @@ fn batch_ref_faults() -> std::sync::MutexGuard<'static, BatchRefFaultMap> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Whether the closed `POST /restore` envelope admits `body` (issue #5538).
+///
+/// Lets the OpenAPI contract test prove that the published `RestoreRequest`
+/// property inventory is exactly what serde accepts, without making the
+/// crate-private payload type public. Structural admission only: this is the
+/// same parse the handler runs before any deletion, not the later semantic
+/// validation.
+///
+/// Reached through `_test_support`; the binary target has no consumer.
+#[allow(dead_code)]
+pub(crate) fn restore_envelope_admits_for_test(body: &[u8]) -> bool {
+    crate::util::json_object::from_json_object_slice::<RestorePayload>(body).is_ok()
+}
+
 /// Install (or clear, with `None`) a deterministic reference-check failure
 /// for `namespace`. Keyed per namespace so tests sharing a process cannot
 /// perturb each other. Always clear the fault when the test finishes.
@@ -8256,7 +8274,8 @@ async fn handle_batch_create(
             }
         };
 
-    let mut batch: RestorePayload = match serde_json::from_slice::<BatchCreateRequest>(body) {
+    let parsed = crate::util::json_object::from_json_object_slice::<BatchCreateRequest>(body);
+    let mut batch: RestorePayload = match parsed {
         Ok(request) => request.into(),
         Err(e) => {
             return Ok(json_response(
@@ -8990,7 +9009,9 @@ async fn audit_backup_failure_with_resources(
 /// allow-listed names → sorted array. Never persists raw hostile tokens.
 fn backup_resources_query_audit_value(query: Option<&str>) -> serde_json::Value {
     match parse_backup_resources(query) {
-        Ok(ref filter) => audit::backup_resources_audit_value(filter.as_ref()),
+        Ok(filter) => {
+            audit::backup_resources_audit_value(borrow_backup_resources(filter.as_ref()).as_ref())
+        }
         Err(_) => json!(audit::BACKUP_RESOURCES_INVALID_SENTINEL),
     }
 }
@@ -9238,7 +9259,7 @@ async fn handle_backup(
     namespace: &str,
     request_ctx: &audit::AuditRequestContext,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let resource_filter = match parse_backup_resources(query) {
+    let decoded_resource_filter = match parse_backup_resources(query) {
         Ok(filter) => filter,
         Err(_) => {
             // Key-only / duplicate / ambiguous `resources` must fail closed with
@@ -9260,6 +9281,9 @@ async fn handle_backup(
             ));
         }
     };
+    // Decoding owns its tokens; build the borrowed view the allow-list,
+    // dependency, inclusion and audit helpers key on exactly once.
+    let resource_filter = borrow_backup_resources(decoded_resource_filter.as_ref());
     // Reject unknown resources= tokens fail-closed with static client text
     // that never echoes the rejected token.
     if let Err(_error) = validate_backup_resources_allowlist(resource_filter.as_ref()) {
@@ -9647,7 +9671,14 @@ async fn handle_restore(
     // Phase 1: Parse all resources directly into typed structs before deleting
     // anything. This avoids an intermediate serde_json::Value copy (~50% less
     // peak memory at scale).
-    let mut payload: RestorePayload = match serde_json::from_slice(body) {
+    //
+    // `from_json_object_slice` forces the JSON-object branch, and
+    // `RestorePayload` denies unknown fields (issue #5538): a top-level array,
+    // a positional sequence, a scalar, or a misspelled collection key is a
+    // `400` here rather than an envelope whose collections all defaulted to
+    // empty and whose "successful" restore deleted the namespace.
+    let parsed = crate::util::json_object::from_json_object_slice::<RestorePayload>(body);
+    let mut payload: RestorePayload = match parsed {
         Ok(v) => v,
         Err(e) => {
             return Ok(json_response(
@@ -12502,10 +12533,10 @@ mod tests {
 
     #[test]
     fn normalize_restore_payload_timestamps_sets_uniform_updated_at() {
-        // `Proxy`, `Consumer`, `PluginConfig`, `Upstream`, and `RestorePayload`
-        // do not impl `Default`, so build the test payload through serde — the
-        // domain structs already carry `#[serde(default)]` on every field we
-        // don't care about for this test.
+        // `Proxy`, `Consumer`, `PluginConfig`, and `Upstream` do not impl
+        // `Default`, so build the test payload through serde — the domain
+        // structs already carry `#[serde(default)]` on every field we don't
+        // care about for this test.
         let old = Utc::now() - chrono::Duration::days(90);
         let restored_at = Utc::now();
         let old_ts = old.to_rfc3339();

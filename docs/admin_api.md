@@ -1343,6 +1343,7 @@ curl -H "Authorization: Bearer $TOKEN" \
   http://localhost:9000/backup > ferrum-backup.json
 
 # Partial backup — only proxies and upstreams
+# (percent-encoded commas and keys decode to the same filter)
 curl -H "Authorization: Bearer $TOKEN" \
   "http://localhost:9000/backup?resources=proxies,upstreams" > partial-backup.json
 
@@ -1354,6 +1355,32 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 ```
 
 The backup output is directly compatible with `POST /batch` (additive) and `POST /restore` (full replacement). Backup resources always include `id`s; restore requires them, while batch will auto-generate them if a caller strips them. Successful exports and authenticated denied/failed attempts are always audited with request context before (or instead of) releasing unredacted bytes — independent of `FERRUM_ADMIN_AUDIT_ENABLED`, which gates ordinary mutation audit events only — see [Audit Log](#audit-log) and [admin_backup_restore.md](admin_backup_restore.md). Before replacement, restore acquires a persistent namespace guard and snapshots the current namespace with a non-validating raw load from the primary, so an already-invalid-but-present config still snapshots and keeps rollback available while it is repaired. If that snapshot cannot be taken at all — a genuine database/connectivity failure — restore **aborts with `503` before deleting anything** and leaves the prior config intact (retry once the database is reachable). Database inserts are chunked into 1,000-record transactions for large-scale imports. Conditional mTLS DNS-identity uniqueness is checked under the same namespace-scoped datastore admission guard used by ordinary Consumer, plugin, proxy-association, upstream, and API-spec writes, so a concurrent admin process cannot race a batch/restore policy activation with a case-variant credential. Restore retains one persistent guard owner from before its snapshot through the clear and every import or compensating-replay batch. All non-owning namespace resource writers and replays fail closed for that full interval, so no concurrent resource can be lost merely because it was absent from the restore payload. The compensating replay intentionally does not apply newly introduced mTLS DNS admission to the old snapshot: otherwise a pre-existing ambiguity would be deleted successfully and then become impossible to restore. Normal batch/restore admission never receives this rollback-only bypass. The endpoint returns `500 Internal Server Error` with a `rollback` field (`completed` / `incomplete` / `not_needed` / `unknown_outcome`). `not_needed` means the clear definitively aborted atomically (SQL / replica-set MongoDB), so nothing was deleted and the prior config was retained without any re-import. An unknown MongoDB commit remains `unknown_outcome` with the guard retained even when immediate verification still sees the prior counts, because the clear can become visible later. API specs are included in backup and restore as a versioned `api_specs` section (`section_version: "2"`). Legacy backups that omit the section require `?confirm_api_spec_deletion=true` (in addition to `?confirm=true`) when the target namespace still holds specs. `api_specs_not_restored` / `api_specs_note` appear only when rollback is `incomplete` and the prior namespace carried specs — see [admin_backup_restore.md](admin_backup_restore.md).
+
+`GET /backup` parses the `resources` filter from **percent-decoded** query keys
+and values, so `?resources=proxies%2Cconsumers` is the documented two-token
+filter and `?%72esources=proxies` is the same parameter rather than an
+unrecognized one that silently widens the export to everything, credentials
+included. Decoding is strict: `+`, decoded whitespace, incomplete/non-hex `%`
+escapes, invalid UTF-8, duplicate keys that differ only in encoding, and a
+key-only `?resources` all fail closed with `400`, the static
+`Unsupported backup resource filter` text, no attachment, and the fixed
+`invalid` audit sentinel — raw rejected text is never echoed or persisted.
+
+`POST /restore` requires a **JSON object** envelope and rejects unknown
+top-level keys with `400` before the recovery snapshot and the destructive
+clear. A top-level array, a positional sequence, a scalar, or a misspelled
+collection key (`proxise`) is not "a restore with that collection empty"; an
+explicit `{}` or explicit empty arrays keep their documented "replace this
+namespace with nothing" meaning. Accepted keys are `version`, `proxies`,
+`consumers`, `plugin_configs`, `upstreams`, `api_specs`,
+`gateway_trust_bundles`, plus the `GET /backup` metadata members
+`ferrum_version`, `exported_at`, `source`, and `counts`, which are accepted and
+ignored so an unmodified backup round-trips. `POST /batch` and the ordinary
+single-resource admin write bodies require a JSON object the same way, and
+object-valued resource fields (`circuit_breaker`, `retry`, `stream_match`,
+`trigger`, `health_checks`, `hash_on_cookie_config`, `service_discovery`,
+`locality_lb_setting`) accept an object or `null` rather than coercing an array
+into a default-constructed object.
 
 Gateway trust bundles ride along as a `gateway_trust_bundles` array on full,
 unfiltered database-backed exports (possibly empty). Resource-filtered and
