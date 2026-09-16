@@ -27,7 +27,10 @@
 //!   sent vs received.
 //! - **`ferrum_mesh_bpf_drops_total{reason="bypass_uid_hit"|...}`**:
 //!   how often each BPF capture-bypass decision fired (produced by
-//!   connect4/connect6).
+//!   connect4/connect6). Counted in-kernel on per-CPU counters rather
+//!   than from the ringbuf records, so the series stays exact across a
+//!   ringbuf overrun — a discarded record must not look like a decision
+//!   that never happened.
 //! - **`ferrum_mesh_bpf_ringbuf_overruns_total`**: ringbuf overruns. The
 //!   `_in_overrun_regime` companion gauge stays at 1 between the warn
 //!   and recovery transitions so dashboards can alert without scraping
@@ -216,7 +219,9 @@ fn render_prometheus_snapshot(prefix: &str, snap: &BpfMetricsSnapshot) -> String
     let _ = writeln!(
         out,
         "# HELP {p}_drops_total Connection-bypass decisions by reason, \
-            produced by the connect4/connect6 capture hooks."
+            produced by the connect4/connect6 capture hooks and counted on \
+            per-CPU kernel counters, so an overrun of the event ringbuf \
+            cannot silently lose a decision."
     );
     let _ = writeln!(out, "# TYPE {p}_drops_total counter");
     for (reason, count) in snap.drop_reasons() {

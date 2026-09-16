@@ -268,6 +268,23 @@ The optional ignored harness in
 an external broker via `FERRUM_TEST_KAFKA_BOOTSTRAP`; hosted CI does **not**
 rely on it.
 
+## Database TLS regressions
+
+`db_tls` provisions PostgreSQL 17 and MySQL 8.4 with generated CA-signed server
+certificates whose only SAN is `localhost`. The hosted Service Integration filter
+includes this module. Both dialects cover matching names, `verify-ca` hostname
+mismatch success, `verify-full` hostname mismatch refusal, unrelated/malformed CA
+refusal, and expired-server refusal. The reload test closes the only primary
+connection, proves the server session ID changed, and performs fresh consumer
+writes after rejection. It also checks replica-candidate rejection preserves the
+primary, then accepts a valid reload and reconnects after removing the source CA.
+Fixtures prove readiness through their published host ports, and fail in CI when
+unavailable.
+
+Run this module through `cargo test --test service_integration db_tls` on a
+Docker-enabled test host. These tests were added without executing project code
+or tooling locally; validation for this change is the pushed head's hosted CI.
+
 ## Adding another external service
 
 Follow `common/containers.rs` (and `tests/secrets_functional/` for the

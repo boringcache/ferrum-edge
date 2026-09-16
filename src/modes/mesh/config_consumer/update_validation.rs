@@ -261,7 +261,9 @@ pub fn validate_mesh_config_update(
         return rejected(consumer, Reason::UnexpectedHeartbeat, detail);
     }
 
-    let slice = match serde_json::from_str::<MeshSlice>(&update.mesh_slice_json) {
+    let slice = match crate::util::json_object::from_json_object_slice::<MeshSlice>(
+        update.mesh_slice_json.as_bytes(),
+    ) {
         Ok(slice) => slice,
         Err(e) => {
             // serde's message can quote the offending input, so it is bounded

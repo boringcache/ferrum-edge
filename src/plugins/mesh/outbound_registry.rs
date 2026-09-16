@@ -64,6 +64,7 @@ use serde_json::Value;
 use crate::plugins::{
     HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, priority,
 };
+use crate::util::json_object::JsonObject;
 
 thread_local! {
     /// Scratch buffer for normalised host lookups. Reused across requests on
@@ -163,8 +164,9 @@ impl OutboundRegistry {
     }
 
     pub fn new(config: &Value) -> Result<Self, String> {
-        let parsed: OutboundRegistryConfig = serde_json::from_value(config.clone())
-            .map_err(|e| format!("mesh_outbound_registry: {e}"))?;
+        let parsed = serde_json::from_value::<JsonObject<OutboundRegistryConfig>>(config.clone())
+            .map_err(|e| format!("mesh_outbound_registry: {e}"))?
+            .0;
         if !(400..=599).contains(&parsed.reject_status) {
             return Err(format!(
                 "mesh_outbound_registry: reject_status must be 4xx/5xx (got {})",

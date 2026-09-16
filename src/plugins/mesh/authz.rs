@@ -1653,8 +1653,9 @@ impl MeshAuthz {
         // would then treat as allow-by-default).
         let from_slice = config.get("mesh_slice").is_some();
         let mut slice = if let Some(value) = config.get("mesh_slice") {
-            serde_json::from_value::<MeshSlice>(value.clone())
+            serde_json::from_value::<crate::util::json_object::JsonObject<MeshSlice>>(value.clone())
                 .map_err(|e| format!("mesh_authz: invalid mesh_slice: {e}"))?
+                .0
         } else if let Some(value) = config.get("mesh_policies") {
             let mesh_policies = serde_json::from_value::<Vec<MeshPolicy>>(value.clone())
                 .map_err(|e| format!("mesh_authz: invalid mesh_policies: {e}"))?;
