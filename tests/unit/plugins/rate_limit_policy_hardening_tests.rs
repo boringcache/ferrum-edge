@@ -882,6 +882,9 @@ fn http_windows_charge_only_admissions_under_sustained_overload() {
                 admitted += 1;
             }
         }
-        assert_eq!(admitted, 12, "window={seconds}: denials must consume no budget");
+        assert_eq!(
+            admitted, 12,
+            "window={seconds}: denials must consume no budget"
+        );
     }
 }

@@ -1269,10 +1269,13 @@ async fn test_rate_limiting_redis_sustained_load_keeps_admitting_at_the_configur
             // A healthy store may never answer through the fallback budget.
             policy["redis_failure_policy"] = json!("fail_closed");
         }
-        config["plugin_configs"].as_array_mut().unwrap().push(json!({
-            "id": mode, "plugin_name": "rate_limiting", "scope": "proxy",
-            "proxy_id": mode, "enabled": true, "config": policy
-        }));
+        config["plugin_configs"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "id": mode, "plugin_name": "rate_limiting", "scope": "proxy",
+                "proxy_id": mode, "enabled": true, "config": policy
+            }));
     }
     let mut gateway = spawn_file_gateway(config.to_string(), vec![]).await;
     let client = reqwest::Client::new();
@@ -1507,7 +1510,11 @@ async fn test_rate_limiting_redis_multi_window_rejections_leave_state_unchanged(
 
 /// A controllable transport boundary for a LIVE Redis instance. Closing the
 /// gate tears down existing sockets as well as rejecting newly accepted ones.
-async fn gated_redis() -> (String, tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+async fn gated_redis() -> (
+    String,
+    tokio::sync::watch::Sender<bool>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .unwrap();
@@ -1599,7 +1606,11 @@ async fn test_rate_limiting_redis_default_outage_two_pods_and_recovery() {
             )
             .await
             .unwrap();
-        assert_eq!(logs.matches("falling back to local in-memory state").count(), 1);
+        assert_eq!(
+            logs.matches("falling back to local in-memory state")
+                .count(),
+            1
+        );
     }
     enabled.send(true).unwrap();
     // The fallback allowance is exhausted. Only a successful centralized
@@ -1616,7 +1627,10 @@ async fn test_rate_limiting_redis_default_outage_two_pods_and_recovery() {
             429 => {}
             status => panic!("unexpected recovery response: {status}"),
         }
-        assert!(tokio::time::Instant::now() < deadline, "Redis did not recover");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Redis did not recover"
+        );
         sleep(Duration::from_millis(50)).await;
     }
     for gateway in [&first, &second] {

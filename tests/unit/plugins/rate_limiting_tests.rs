@@ -1792,7 +1792,10 @@ fn redis_failure_policy_is_accepted_by_every_rate_limit_consumer() {
             Some(RedisFailurePolicy::LocalFallback),
             "{plugin} must honor the configured redis_failure_policy"
         );
-        config.as_object_mut().unwrap().remove("redis_failure_policy");
+        config
+            .as_object_mut()
+            .unwrap()
+            .remove("redis_failure_policy");
         assert_eq!(
             rate_limit_redis_failure_policy(plugin, &config).unwrap(),
             Some(if plugin == "rate_limiting" {

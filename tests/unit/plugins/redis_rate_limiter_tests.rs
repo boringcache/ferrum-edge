@@ -3286,7 +3286,10 @@ async fn a_refused_window_hands_its_charge_back_on_the_pooled_connection() {
             )
             .await
             .expect("outcome");
-        assert!(!outcome.allowed, "attempt {attempt}: the window is exhausted");
+        assert!(
+            !outcome.allowed,
+            "attempt {attempt}: the window is exhausted"
+        );
         assert!(
             !outcome.enforcement_unavailable,
             "attempt {attempt}: a quota refusal is a decision, not an outage"
@@ -3439,7 +3442,10 @@ fn http_window_admission_is_pooled_plain_resp_and_hands_back_a_refused_charge() 
         .find("async fn check_http_windows_redis(")
         .expect("Redis admission entry point");
     let rest = &limiter[start..];
-    let end = rest.find("\n}\n").map(|index| index + 2).unwrap_or(rest.len());
+    let end = rest
+        .find("\n}\n")
+        .map(|index| index + 2)
+        .unwrap_or(rest.len());
     let body = &rest[..end];
     let charge = body
         .find("redis.charge_rate_limit_windows(&charges)")
