@@ -5502,3 +5502,95 @@ fn assert_plain_relay_authorization_first(relay: &str, recv_data: &str) {
         "a spent captured plan must abort before finish_h3_response_with_backend_trailers"
     );
 }
+
+/// Stack-budget invariant for the one generic H3 request future.
+///
+/// `handle_h3_request` is what every HTTP/3 stream — Plain, gRPC, WebSocket,
+/// CONNECT-UDP — is polled through. At `opt-level = 0` each future awaited
+/// inline in it gets its own fixed frame slot with no sharing between
+/// branches, so the frame is the SUM of those futures and is charged to every
+/// request whether or not its branch runs. The largest dispatch relays must
+/// therefore stay behind `#[inline(never)]` boxing factories, exactly as
+/// `boxed_handle_h3_connect_udp`, `boxed_proxy_h3_plain_http_mesh_buffered`
+/// and `cross_protocol::run` already do. Re-inlining one of them overflowed a
+/// 2 MiB Tokio worker on the `functional_h3_plain_*` mesh-mTLS tests.
+#[test]
+fn h3_request_handler_boxes_its_largest_dispatch_relays() {
+    let src = include_str!("../../../src/http3/server.rs");
+    let handler = src
+        .split("async fn handle_h3_request(")
+        .nth(1)
+        .expect("handle_h3_request must exist")
+        .split("async fn run_h3_backend_path_plugins_or_send_reject(")
+        .next()
+        .expect("handle_h3_request must remain bounded");
+
+    for name in [
+        "boxed_dispatch_grpc_native_h3",
+        "boxed_proxy_to_backend_h3_streaming",
+    ] {
+        let relay = name.strip_prefix("boxed_").expect("factory naming");
+        let relay_call = format!("{relay}(");
+        let factory_call = format!("{name}(");
+        assert!(
+            handler.contains(factory_call.as_str()),
+            "{factory_call} must remain the call shape inside handle_h3_request"
+        );
+        // Every relay call inside the handler must be the tail of a factory
+        // call; equal counts is exactly that statement.
+        assert_eq!(
+            handler.matches(relay_call.as_str()).count(),
+            handler.matches(factory_call.as_str()).count(),
+            "{relay_call} must not be awaited inline in handle_h3_request"
+        );
+
+        let attributed = format!("#[inline(never)]\nfn {name}<");
+        assert!(
+            src.contains(attributed.as_str()),
+            "{name} must stay an out-of-line boxing factory"
+        );
+
+        // The factory boxes a thin `async move` trampoline, not the relay
+        // future itself: `Box::pin(relay(..))` would still materialize the
+        // relay as a stack temporary in the factory's own frame.
+        let signature = format!("fn {name}<");
+        let body = src
+            .split(signature.as_str())
+            .nth(1)
+            .expect("boxing factory must exist")
+            .split("\n}\n")
+            .next()
+            .expect("boxing factory must be bounded");
+        assert!(
+            body.contains("Box::pin(async move {"),
+            "{name} must box an async trampoline, not a directly built relay future"
+        );
+    }
+
+    // The streaming gRPC bridge is awaited from `handle_h3_request` as well;
+    // its factory lives beside the bridge in `cross_protocol.rs`.
+    let bridge = include_str!("../../../src/http3/cross_protocol.rs");
+    assert!(
+        handler.contains("cross_protocol::boxed_dispatch_grpc_streaming("),
+        "the streaming gRPC bridge must be entered through its boxing factory"
+    );
+    assert!(
+        !handler.contains("cross_protocol::dispatch_grpc_streaming("),
+        "dispatch_grpc_streaming must not be awaited inline in handle_h3_request"
+    );
+    assert!(
+        bridge.contains("#[inline(never)]\npub(crate) fn boxed_dispatch_grpc_streaming<"),
+        "boxed_dispatch_grpc_streaming must stay an out-of-line boxing factory"
+    );
+    let streaming_factory = bridge
+        .split("fn boxed_dispatch_grpc_streaming<")
+        .nth(1)
+        .expect("streaming gRPC boxing factory must exist")
+        .split("\n}\n")
+        .next()
+        .expect("streaming gRPC boxing factory must be bounded");
+    assert!(
+        streaming_factory.contains("Box::pin(async move {"),
+        "boxed_dispatch_grpc_streaming must box an async trampoline"
+    );
+}

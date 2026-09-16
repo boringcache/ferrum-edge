@@ -426,7 +426,7 @@ fn h3_websocket_bridge_keeps_unresolved_base_proxy_for_retries() {
 fn h3_grpc_streaming_bridge_keeps_unresolved_base_proxy_for_selected_target() {
     let source = include_str!("../../../src/http3/server.rs");
     let streaming_call = source
-        .find("crate::http3::cross_protocol::dispatch_grpc_streaming(")
+        .find("crate::http3::cross_protocol::boxed_dispatch_grpc_streaming(")
         .expect("H3 streaming gRPC bridge call must remain present");
     let streaming_args = &source[streaming_call..];
     let base_proxy_arg = streaming_args

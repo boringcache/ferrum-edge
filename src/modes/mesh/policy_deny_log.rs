@@ -12,8 +12,8 @@
 //! deny burst the contention envelope is small.
 //!
 //! The admin query path filters by `at >= now - window`, groups by the
-//! `(rule, source, destination, reason)` tuple, then sorts by count
-//! descending (tie-breaking on `last_at` descending) and truncates to
+//! `(rule, source, destination, reason, reevaluation)` tuple, then sorts by
+//! count descending (tie-breaking on `last_at` descending) and truncates to
 //! `limit`. This is a cold path — admin operators poll at human cadence.
 
 use std::collections::VecDeque;
@@ -69,6 +69,16 @@ pub struct PolicyDenyEvent {
     /// admin payloads can render RFC 3339 without re-deriving from an
     /// `Instant`.
     pub at: DateTime<Utc>,
+    /// `true` when this deny came from an HBONE admission-fence sweep
+    /// re-judging an ALREADY-ADMITTED live tunnel (the `mesh_authz.reevaluation`
+    /// metadata marker), not from a request the peer just made.
+    ///
+    /// Load-bearing for triage: a swept revocation is one record per revoked
+    /// tunnel for a principal that issued no new request, and without this flag
+    /// it is byte-identical to a request-time denial — an operator would read
+    /// "denied requests" for traffic that never arrived. Part of the grouping
+    /// key so the two never merge into one row.
+    pub reevaluation: bool,
 }
 
 #[derive(Default, Debug)]
@@ -143,8 +153,8 @@ impl PolicyDenyRecorder {
     }
 
     /// Snapshot events whose timestamp is `>= cutoff`, group by the
-    /// `(rule, source, destination, reason)` tuple, sort by count descending
-    /// (tie-break by `last_at` descending), and truncate to `limit`.
+    /// `(rule, source, destination, reason, reevaluation)` tuple, sort by count
+    /// descending (tie-break by `last_at` descending), and truncate to `limit`.
     ///
     /// `limit == 0` is treated as "no grouped output" and returns an empty
     /// grouping slice with the total filtered count preserved so the admin
@@ -184,6 +194,7 @@ impl PolicyDenyRecorder {
                     && group.source == event.source
                     && group.destination == event.destination
                     && group.reason == event.reason
+                    && group.reevaluation == event.reevaluation
             });
             match existing {
                 Some(group) => {
@@ -201,6 +212,7 @@ impl PolicyDenyRecorder {
                         source: event.source.clone(),
                         destination: event.destination.clone(),
                         reason: event.reason.clone(),
+                        reevaluation: event.reevaluation,
                         count: 1,
                         first_at: event.at,
                         last_at: event.at,
@@ -291,6 +303,10 @@ pub struct PolicyDenyGroup {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub destination: Option<String>,
     pub reason: String,
+    /// Always serialized, never omitted: an operator filtering request-time
+    /// denials must not have to treat an absent field as `false`. See
+    /// [`PolicyDenyEvent::reevaluation`].
+    pub reevaluation: bool,
     pub count: u64,
     pub first_at: DateTime<Utc>,
     pub last_at: DateTime<Utc>,
@@ -371,6 +387,7 @@ mod tests {
             destination: destination.map(str::to_string),
             reason: reason.to_string(),
             at,
+            reevaluation: false,
         }
     }
 
