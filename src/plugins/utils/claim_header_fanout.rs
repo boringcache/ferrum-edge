@@ -327,7 +327,10 @@ pub fn apply_claim_headers_from_context(
     }
     sanitize_owned_claim_header_destinations(ctx, headers, destinations);
     for (metadata_key, header_name) in destinations.entries() {
-        if let Some(value) = ctx.pending_claim_headers.remove(metadata_key) {
+        if let Some(value) = ctx
+            .plugin_state_opt_mut()
+            .and_then(|state| state.pending_claim_headers.remove(metadata_key))
+        {
             headers.insert(header_name.to_string(), value);
         }
     }
@@ -349,19 +352,22 @@ fn sanitize_owned_claim_header_destinations(
     if destinations.is_empty() {
         return;
     }
+    let sanitized = ctx.plugin_state_mut();
     headers.retain(|name, _| {
         !destinations.names().any(|destination| {
-            !ctx.sanitized_claim_header_destinations
+            !sanitized
+                .sanitized_claim_header_destinations
                 .contains(destination)
                 && name.eq_ignore_ascii_case(destination)
         })
     });
     for destination in destinations.names() {
-        if !ctx
+        if !sanitized
             .sanitized_claim_header_destinations
             .contains(destination)
         {
-            ctx.sanitized_claim_header_destinations
+            sanitized
+                .sanitized_claim_header_destinations
                 .insert(destination.to_string());
         }
     }
@@ -522,14 +528,14 @@ mod tests {
         )
         .expect("attempt commits");
         assert_eq!(
-            ctx.pending_claim_headers
-                .get("p.x-user-email")
+            ctx.plugin_state()
+                .and_then(|state| state.pending_claim_headers.get("p.x-user-email"))
                 .map(String::as_str),
             Some("a@example.com")
         );
         assert_eq!(
-            ctx.pending_claim_headers
-                .get("p.x-user-roles")
+            ctx.plugin_state()
+                .and_then(|state| state.pending_claim_headers.get("p.x-user-roles"))
                 .map(String::as_str),
             Some("admin,editor")
         );

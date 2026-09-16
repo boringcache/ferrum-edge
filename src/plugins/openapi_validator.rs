@@ -871,7 +871,10 @@ impl OpenapiValidator {
     }
 
     fn operation_for_context<'a>(&'a self, ctx: &RequestContext) -> Option<&'a OperationEntry> {
-        if let Some((method, path)) = ctx.openapi_validator_matches.get(&self.instance_id) {
+        if let Some((method, path)) = ctx
+            .plugin_state()
+            .and_then(|state| state.openapi_validator_matches.get(&self.instance_id))
+        {
             return self
                 .match_operation(method, path)
                 .map(|matched| matched.entry);
@@ -886,9 +889,15 @@ impl OpenapiValidator {
 
     fn mark_operation_entry(&self, ctx: &mut RequestContext, operation: &OperationEntry) {
         self.mark_mode(ctx);
-        ctx.openapi_validator_matches
-            .entry(self.instance_id)
-            .or_insert_with(|| (ctx.method.clone(), ctx.path.clone()));
+        if !ctx
+            .plugin_state()
+            .is_some_and(|state| state.openapi_validator_matches.contains_key(&self.instance_id))
+        {
+            let matched = (ctx.method.clone(), ctx.path.clone());
+            ctx.plugin_state_mut()
+                .openapi_validator_matches
+                .insert(self.instance_id, matched);
+        }
         ctx.metadata.insert(
             "openapi_validator.matched_operation".to_string(),
             operation.operation_label.clone(),
@@ -944,7 +953,9 @@ impl OpenapiValidator {
 
     fn mark_skip(&self, ctx: &mut RequestContext, reason: &'static str) {
         self.mark_mode(ctx);
-        ctx.openapi_validator_matches.remove(&self.instance_id);
+        if let Some(state) = ctx.plugin_state_opt_mut() {
+            state.openapi_validator_matches.remove(&self.instance_id);
+        }
         // Public key for loggers/observability (last writer wins across
         // instances; this is output only).
         ctx.metadata
@@ -1105,7 +1116,8 @@ impl OpenapiValidator {
     /// process-unique instance ID: sibling instances never share the entry.
     fn mark_decided(&self, ctx: &mut RequestContext, phase: RequestContractPhase) {
         if phase == RequestContractPhase::Client {
-            ctx.openapi_validator_client_contract_enforced
+            ctx.plugin_state_mut()
+                .openapi_validator_client_contract_enforced
                 .insert(self.instance_id);
         }
     }
@@ -1343,10 +1355,11 @@ impl Plugin for OpenapiValidator {
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if ctx
-            .openapi_validator_client_contract_enforced
-            .contains(&self.instance_id)
-        {
+        if ctx.plugin_state().is_some_and(|state| {
+            state
+                .openapi_validator_client_contract_enforced
+                .contains(&self.instance_id)
+        }) {
             // This instance already decided the contract over the original
             // client representation. Deciding again here would validate
             // gateway-synthesized data and double-charge the rejection.

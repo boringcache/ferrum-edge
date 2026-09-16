@@ -1765,29 +1765,34 @@ impl AiToolGovernor {
     }
 
     fn response_hash<'a>(&self, ctx: &'a RequestContext) -> Option<&'a str> {
-        ctx.ai_tool_governor_response_hashes
-            .get(&self.instance_id)
+        ctx.plugin_state()
+            .and_then(|state| state.ai_tool_governor_response_hashes.get(&self.instance_id))
             .map(String::as_str)
     }
 
     fn set_response_hash(&self, ctx: &mut RequestContext, hash: String) {
-        ctx.ai_tool_governor_response_hashes
+        ctx.plugin_state_mut()
+            .ai_tool_governor_response_hashes
             .insert(self.instance_id, hash);
     }
 
     fn clear_response_hash(&self, ctx: &mut RequestContext) {
-        ctx.ai_tool_governor_response_hashes
-            .remove(&self.instance_id);
+        if let Some(state) = ctx.plugin_state_opt_mut() {
+            state
+                .ai_tool_governor_response_hashes
+                .remove(&self.instance_id);
+        }
     }
 
     fn request_hash<'a>(&self, ctx: &'a RequestContext) -> Option<&'a str> {
-        ctx.ai_tool_governor_request_hashes
-            .get(&self.instance_id)
+        ctx.plugin_state()
+            .and_then(|state| state.ai_tool_governor_request_hashes.get(&self.instance_id))
             .map(String::as_str)
     }
 
     fn set_request_hash(&self, ctx: &mut RequestContext, hash: String) {
-        ctx.ai_tool_governor_request_hashes
+        ctx.plugin_state_mut()
+            .ai_tool_governor_request_hashes
             .insert(self.instance_id, hash);
     }
 
@@ -3626,8 +3631,11 @@ impl Plugin for AiToolGovernor {
                 "rejecting response: {}",
                 batch.deny_reason.as_deref().unwrap_or("blocked")
             );
-            ctx.ai_tool_governor_redaction_memos
-                .remove(&self.instance_id);
+            if let Some(state) = ctx.plugin_state_opt_mut() {
+                state
+                    .ai_tool_governor_redaction_memos
+                    .remove(&self.instance_id);
+            }
             return self.reject(&batch);
         }
         if ctx.finalized_response_replay
@@ -3637,7 +3645,8 @@ impl Plugin for AiToolGovernor {
                 .iter()
                 .any(|decision| !decision.redact_patterns.is_empty())
         {
-            ctx.ai_tool_governor_replay_redactions
+            ctx.plugin_state_mut()
+                .ai_tool_governor_replay_redactions
                 .insert(self.instance_id);
         }
         // Stage preflighted redaction rewrites for the transform hook. One
@@ -3647,10 +3656,18 @@ impl Plugin for AiToolGovernor {
         // stage another inspectable window before any transform hook runs.
         // Instances that do not win this bounded slot safely recompute during
         // their transform instead of multiplying per-request memory.
-        ctx.ai_tool_governor_redaction_memos
-            .remove(&self.instance_id);
-        if !batch.redaction_memos.is_empty() && ctx.ai_tool_governor_redaction_memos.is_empty() {
-            ctx.ai_tool_governor_redaction_memos
+        if let Some(state) = ctx.plugin_state_opt_mut() {
+            state
+                .ai_tool_governor_redaction_memos
+                .remove(&self.instance_id);
+        }
+        if !batch.redaction_memos.is_empty()
+            && ctx.plugin_state().is_none_or(|state| {
+                state.ai_tool_governor_redaction_memos.is_empty()
+            })
+        {
+            ctx.plugin_state_mut()
+                .ai_tool_governor_redaction_memos
                 .insert(self.instance_id, batch.redaction_memos);
         }
         // Record the governed calls with multiset counts so the final re-check
@@ -3723,7 +3740,9 @@ impl Plugin for AiToolGovernor {
         // context-bearing screen on this plugin.
         if ctx.json_scan_memo.ambiguity(strip_json_bom(body)).is_some() {
             self.clear_response_hash(ctx);
-            ctx.ai_tool_governor_call_hashes.remove(&self.instance_id);
+            if let Some(state) = ctx.plugin_state_opt_mut() {
+                state.ai_tool_governor_call_hashes.remove(&self.instance_id);
+            }
             return None;
         }
         let mut json: Value = serde_json::from_slice(strip_json_bom(body)).ok()?;
@@ -3736,8 +3755,12 @@ impl Plugin for AiToolGovernor {
         // redacted arguments are not retained after the transform installs
         // them (or after AmplificationFailed clears skip state).
         let redaction_memos = ctx
-            .ai_tool_governor_redaction_memos
-            .remove(&self.instance_id);
+            .plugin_state_opt_mut()
+            .and_then(|state| {
+                state
+                    .ai_tool_governor_redaction_memos
+                    .remove(&self.instance_id)
+            });
         match self.redact_response(&mut json, redaction_memos.as_ref()) {
             RedactTransform::Changed => {
                 let rewritten = match serialize_json_bounded(&json, retained_ceiling) {
@@ -3748,7 +3771,9 @@ impl Plugin for AiToolGovernor {
                         // can exceed the final body limit. Clear the skip state
                         // and let the terminal re-check fail closed.
                         self.clear_response_hash(ctx);
-                        ctx.ai_tool_governor_call_hashes.remove(&self.instance_id);
+                        if let Some(state) = ctx.plugin_state_opt_mut() {
+                            state.ai_tool_governor_call_hashes.remove(&self.instance_id);
+                        }
                         return None;
                     }
                 };
@@ -3777,7 +3802,9 @@ impl Plugin for AiToolGovernor {
                 // `on_final_response_body` re-evaluates with redaction
                 // unavailable and fails closed.
                 self.clear_response_hash(ctx);
-                ctx.ai_tool_governor_call_hashes.remove(&self.instance_id);
+                if let Some(state) = ctx.plugin_state_opt_mut() {
+                    state.ai_tool_governor_call_hashes.remove(&self.instance_id);
+                }
                 None
             }
             RedactTransform::Unchanged => None,
@@ -3798,8 +3825,11 @@ impl Plugin for AiToolGovernor {
     }
 
     fn requires_replay_response_body_transform(&self, ctx: &RequestContext) -> bool {
-        ctx.ai_tool_governor_replay_redactions
-            .contains(&self.instance_id)
+        ctx.plugin_state().is_some_and(|state| {
+            state
+                .ai_tool_governor_replay_redactions
+                .contains(&self.instance_id)
+        })
     }
 
     /// Re-run the deterministic response policy on the FINAL client-visible body.
@@ -6950,6 +6980,7 @@ fn record_governed_identities(ctx: &mut RequestContext, instance_id: u64, identi
         return;
     }
     let counts = ctx
+        .plugin_state_mut()
         .ai_tool_governor_call_hashes
         .entry(instance_id)
         .or_default();
@@ -6961,8 +6992,8 @@ fn record_governed_identities(ctx: &mut RequestContext, instance_id: u64, identi
 
 /// Read the recorded governed-call identity counts from the request context.
 fn governed_call_counts(ctx: &RequestContext, instance_id: u64) -> HashMap<String, usize> {
-    ctx.ai_tool_governor_call_hashes
-        .get(&instance_id)
+    ctx.plugin_state()
+        .and_then(|state| state.ai_tool_governor_call_hashes.get(&instance_id))
         .cloned()
         .unwrap_or_default()
 }

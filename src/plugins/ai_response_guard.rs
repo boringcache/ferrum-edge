@@ -1479,10 +1479,14 @@ impl AiResponseGuard {
                 // original detected body (GHSA-pwcm-6rh8-f2gh). The instance
                 // discharges its own entry when it installs bytes;
                 // `on_final_response_body` rejects anything still outstanding.
-                ctx.ai_response_guard_pending_redactions
+                let replay = ctx.finalized_response_replay;
+                let state = ctx.plugin_state_mut();
+                state
+                    .ai_response_guard_pending_redactions
                     .insert(self.instance_id, detected.join(","));
-                if ctx.finalized_response_replay {
-                    ctx.ai_response_guard_replay_redactions
+                if replay {
+                    state
+                        .ai_response_guard_replay_redactions
                         .insert(self.instance_id);
                 }
                 PluginResult::Continue
@@ -3871,17 +3875,22 @@ impl Plugin for AiResponseGuard {
             }
         } else if content_type.is_some_and(is_text_event_stream_media_type)
             && body.len() <= self.max_scan_bytes
-            && ctx
-                .ai_response_guard_pending_redactions
-                .contains_key(&self.instance_id)
+            && ctx.plugin_state().is_some_and(|state| {
+                state
+                    .ai_response_guard_pending_redactions
+                    .contains_key(&self.instance_id)
+            })
             && !self.sse_body_has_residual(body)
         {
             // Structural-only SSE matches deliberately leave the exact event
             // bytes untouched. A clean residual scan discharges that promise
             // without pretending a replacement was installed.
             self.record_verified_redaction(ctx, body, content_type);
-            ctx.ai_response_guard_pending_redactions
-                .remove(&self.instance_id);
+            if let Some(state) = ctx.plugin_state_opt_mut() {
+                state
+                    .ai_response_guard_pending_redactions
+                    .remove(&self.instance_id);
+            }
         }
         self.discharge_pending_redaction(ctx, replacement)
     }
@@ -3905,8 +3914,11 @@ impl Plugin for AiResponseGuard {
     }
 
     fn requires_replay_response_body_transform(&self, ctx: &RequestContext) -> bool {
-        ctx.ai_response_guard_replay_redactions
-            .contains(&self.instance_id)
+        ctx.plugin_state().is_some_and(|state| {
+            state
+                .ai_response_guard_replay_redactions
+                .contains(&self.instance_id)
+        })
     }
 
     /// The final verification seam for a promised redaction.
@@ -4023,8 +4035,12 @@ impl Plugin for AiResponseGuard {
             );
         }
         if let Some(detected) = ctx
-            .ai_response_guard_pending_redactions
-            .remove(&self.instance_id)
+            .plugin_state_opt_mut()
+            .and_then(|state| {
+                state
+                    .ai_response_guard_pending_redactions
+                    .remove(&self.instance_id)
+            })
         {
             warn_sampled!(
                 "ai_response_guard: detected content was not redacted before delivery (types: {}), rejecting response",
@@ -4046,10 +4062,11 @@ impl Plugin for AiResponseGuard {
         // A `redact` disposition registers a promise instead of rejecting. There
         // is no producer left to discharge it, so an outstanding promise here is
         // residual detected content in the delivered bytes.
-        let Some(detected) = ctx
-            .ai_response_guard_pending_redactions
-            .remove(&self.instance_id)
-        else {
+        let Some(detected) = ctx.plugin_state_opt_mut().and_then(|state| {
+            state
+                .ai_response_guard_pending_redactions
+                .remove(&self.instance_id)
+        }) else {
             return PluginResult::Continue;
         };
         warn_sampled!(
@@ -4109,7 +4126,8 @@ impl AiResponseGuard {
         body: &[u8],
         content_type: Option<&str>,
     ) {
-        ctx.ai_response_guard_verified_redactions
+        ctx.plugin_state_mut()
+            .ai_response_guard_verified_redactions
             .insert(self.instance_id, Self::redaction_digest(body, content_type));
     }
 
@@ -4119,8 +4137,12 @@ impl AiResponseGuard {
         body: &[u8],
         content_type: Option<&str>,
     ) -> bool {
-        ctx.ai_response_guard_verified_redactions
-            .get(&self.instance_id)
+        ctx.plugin_state()
+            .and_then(|state| {
+                state
+                    .ai_response_guard_verified_redactions
+                    .get(&self.instance_id)
+            })
             .is_some_and(|digest| *digest == Self::redaction_digest(body, content_type))
     }
 
@@ -4159,8 +4181,11 @@ impl AiResponseGuard {
         ctx: &mut RequestContext,
         replacement: Option<Vec<u8>>,
     ) -> Option<Vec<u8>> {
-        if replacement.is_some() {
-            ctx.ai_response_guard_pending_redactions
+        if replacement.is_some()
+            && let Some(state) = ctx.plugin_state_opt_mut()
+        {
+            state
+                .ai_response_guard_pending_redactions
                 .remove(&self.instance_id);
         }
         replacement

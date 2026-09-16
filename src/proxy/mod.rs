@@ -32865,26 +32865,19 @@ async fn handle_proxy_request_inner(
                     &transformed,
                 )
                 .await;
-                if let Some(body_hook_ctx) = body_hook_ctx {
+                if let Some(mut body_hook_ctx) = body_hook_ctx {
                     // Typed gateway terminals selected by the representation gate
                     // inside the hook stage. Adopted BEFORE the metadata move so the
                     // finalizer on the real context knows it is publishing a
                     // gateway-authored error payload rather than an application one.
                     ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
+                    ctx.adopt_final_request_body_hook_plugin_state(&mut body_hook_ctx);
                     let request_body = ctx.metadata.remove("request_body");
                     ctx.metadata = body_hook_ctx.metadata;
                     if let Some(body) = request_body {
                         ctx.metadata.insert("request_body".to_string(), body);
                     }
                     ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
-                    ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
-                    ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
-                    // `ai_semantic_cache` stages its semantic miss (scope key +
-                    // embedding) from the final-request-body hook, and its store hook
-                    // runs later against the real context. Without carrying these two
-                    // maps back, every semantic miss would silently store as exact-only.
-                    ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
-                    ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
                 }
                 // Irreversible outbound egress runs here and nowhere earlier:
                 // `transformed` is the backend-visible body and every final
@@ -33321,7 +33314,7 @@ async fn handle_proxy_request_inner(
                     &transformed,
                 )
                 .await;
-                if let Some(body_hook_ctx) = body_hook_ctx {
+                if let Some(mut body_hook_ctx) = body_hook_ctx {
                     if body_hook_ctx.gateway_deadline_response_selected() {
                         ctx.mark_gateway_deadline_response_selected();
                     }
@@ -33330,6 +33323,7 @@ async fn handle_proxy_request_inner(
                     // finalizer on the real context knows it is publishing a
                     // gateway-authored error payload rather than an application one.
                     ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
+                    ctx.adopt_final_request_body_hook_plugin_state(&mut body_hook_ctx);
                     let request_body = ctx.metadata.remove("request_body");
                     ctx.metadata = body_hook_ctx.metadata;
                     ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
@@ -33337,14 +33331,6 @@ async fn handle_proxy_request_inner(
                         ctx.metadata.insert("request_body".to_string(), body);
                     }
                     ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
-                    ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
-                    ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
-                    // `ai_semantic_cache` stages its semantic miss (scope key +
-                    // embedding) from the final-request-body hook, and its store hook
-                    // runs later against the real context. Without carrying these two
-                    // maps back, every semantic miss would silently store as exact-only.
-                    ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
-                    ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
                 }
                 // Finalized-request-egress boundary (GHSA-4vr5-4wm3-x5xv): the
                 // backend-visible body has been transformed and accepted by every
@@ -34150,7 +34136,7 @@ async fn handle_proxy_request_inner(
                 &grpc_req_body,
             )
             .await;
-            if let Some(body_hook_ctx) = body_hook_ctx {
+            if let Some(mut body_hook_ctx) = body_hook_ctx {
                 if body_hook_ctx.gateway_deadline_response_selected() {
                     ctx.mark_gateway_deadline_response_selected();
                 }
@@ -34162,6 +34148,7 @@ async fn handle_proxy_request_inner(
                 // finalizer on the real context knows it is publishing a
                 // gateway-authored error payload rather than an application one.
                 ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
+                ctx.adopt_final_request_body_hook_plugin_state(&mut body_hook_ctx);
                 let request_body = ctx.metadata.remove("request_body");
                 ctx.metadata = body_hook_ctx.metadata;
                 ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
@@ -34169,14 +34156,6 @@ async fn handle_proxy_request_inner(
                     ctx.metadata.insert("request_body".to_string(), body);
                 }
                 ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
-                ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
-                ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
-                // `ai_semantic_cache` stages its semantic miss (scope key +
-                // embedding) from the final-request-body hook, and its store hook
-                // runs later against the real context. Without carrying these two
-                // maps back, every semantic miss would silently store as exact-only.
-                ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
-                ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
             }
             // Finalized-request-egress boundary for native gRPC
             // (GHSA-4vr5-4wm3-x5xv). `grpc_req_body` is the transformed,
@@ -37432,7 +37411,7 @@ async fn handle_proxy_request_inner(
             &mut backend_admission_started_at,
         )
         .await;
-        if let Some(body_hook_ctx) = body_hook_ctx.take() {
+        if let Some(mut body_hook_ctx) = body_hook_ctx.take() {
             if body_hook_ctx.gateway_deadline_response_selected() {
                 ctx.mark_gateway_deadline_response_selected();
             }
@@ -37444,6 +37423,7 @@ async fn handle_proxy_request_inner(
             // finalizer on the real context knows it is publishing a
             // gateway-authored error payload rather than an application one.
             ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
+            ctx.adopt_final_request_body_hook_plugin_state(&mut body_hook_ctx);
             let request_body = ctx.metadata.remove("request_body");
             ctx.metadata = body_hook_ctx.metadata;
             ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
@@ -37451,14 +37431,6 @@ async fn handle_proxy_request_inner(
                 ctx.metadata.insert("request_body".to_string(), body);
             }
             ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
-            ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
-            ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
-            // `ai_semantic_cache` stages its semantic miss (scope key +
-            // embedding) from the final-request-body hook, and its store hook
-            // runs later against the real context. Without carrying these two
-            // maps back, every semantic miss would silently store as exact-only.
-            ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
-            ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
         }
         let (mut result, retained_body) = match initial_dispatch {
             BackendDispatchResult::Response {
@@ -38138,7 +38110,7 @@ async fn handle_proxy_request_inner(
             &mut backend_admission_started_at,
         )
         .await;
-        if let Some(body_hook_ctx) = body_hook_ctx {
+        if let Some(mut body_hook_ctx) = body_hook_ctx {
             if body_hook_ctx.gateway_deadline_response_selected() {
                 ctx.mark_gateway_deadline_response_selected();
             }
@@ -38150,6 +38122,7 @@ async fn handle_proxy_request_inner(
             // finalizer on the real context knows it is publishing a
             // gateway-authored error payload rather than an application one.
             ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
+            ctx.adopt_final_request_body_hook_plugin_state(&mut body_hook_ctx);
             let request_body = ctx.metadata.remove("request_body");
             ctx.metadata = body_hook_ctx.metadata;
             ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
@@ -38157,14 +38130,6 @@ async fn handle_proxy_request_inner(
                 ctx.metadata.insert("request_body".to_string(), body);
             }
             ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
-            ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
-            ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
-            // `ai_semantic_cache` stages its semantic miss (scope key +
-            // embedding) from the final-request-body hook, and its store hook
-            // runs later against the real context. Without carrying these two
-            // maps back, every semantic miss would silently store as exact-only.
-            ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
-            ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
         }
         let resp = match dispatch {
             BackendDispatchResult::Response {
@@ -58542,14 +58507,13 @@ mod tests {
         // Mirror the handler's writeback: take the hook context's metadata + WAF
         // state, carrying the omitted request_body across the swap.
         ctx.adopt_final_request_body_hook_terminals(&hook_ctx);
+        ctx.adopt_final_request_body_hook_plugin_state(&mut hook_ctx);
         let request_body = ctx.metadata.remove("request_body");
         ctx.metadata = hook_ctx.metadata;
         if let Some(body) = request_body {
             ctx.metadata.insert("request_body".to_string(), body);
         }
         ctx.waf_metadata_initialized = hook_ctx.waf_metadata_initialized;
-        ctx.waf_owned_metadata = hook_ctx.waf_owned_metadata;
-        ctx.waf_instance_scores = hook_ctx.waf_instance_scores;
 
         // The hook's metadata write propagated back to the live context.
         assert_eq!(

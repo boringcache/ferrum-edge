@@ -551,3 +551,94 @@ fn direct_headers_set_works_without_materialization() {
     ctx.headers.insert("x-test".into(), "value".into());
     assert_eq!(ctx.headers.get("x-test").unwrap(), "value");
 }
+
+// ── Issue #5537: per-plugin request state is allocated lazily ────────────────
+//
+// `RequestContext` used to inline every plugin family's staging collection, so
+// the plugin-free edge request built, moved, cloned, and dropped two dozen
+// hashers per request for state nothing on the proxy could ever read. The
+// collections now live in one `Option<Box<PluginRequestState>>`; these tests
+// pin both halves of that contract — the plugin-free path never materializes
+// the box, and a family that does stage something still projects identically
+// into transaction-log metadata.
+
+fn has_plugin_state(ctx: &RequestContext) -> bool {
+    ferrum_edge::_test_support::request_context_has_plugin_state(ctx)
+}
+
+#[test]
+fn plugin_free_request_context_never_materializes_plugin_state() {
+    let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/echo".into());
+    assert!(
+        !has_plugin_state(&ctx),
+        "a freshly constructed context must not allocate per-plugin state"
+    );
+
+    // Everything a plugin-free H1 POST actually does to its context: headers
+    // materialize, metadata is written, the terminal projects log metadata, and
+    // the context is cloned for a deferred consumer.
+    let mut raw = HeaderMap::new();
+    raw.insert("content-type", "application/octet-stream".parse().unwrap());
+    ctx.set_raw_headers(raw);
+    ctx.materialize_headers();
+    ctx.metadata
+        .insert("request_protocol".into(), "http".into());
+
+    let metadata = ferrum_edge::_test_support::clone_log_metadata(&ctx);
+    assert_eq!(
+        metadata.get("request_protocol").map(String::as_str),
+        Some("http")
+    );
+    let cloned = ctx.clone();
+    assert!(
+        !has_plugin_state(&cloned),
+        "cloning a plugin-free context must not allocate per-plugin state"
+    );
+    drop(cloned);
+    assert!(
+        !has_plugin_state(&ctx),
+        "no plugin-free read may materialize per-plugin state"
+    );
+}
+
+#[test]
+fn staged_waf_metadata_materializes_plugin_state_and_reaches_log_metadata() {
+    let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/echo".into());
+    ferrum_edge::_test_support::set_waf_metadata_for_test(&mut ctx, "waf.action", "monitored");
+    assert!(
+        has_plugin_state(&ctx),
+        "a staging plugin family materializes the boxed state"
+    );
+
+    let metadata = ferrum_edge::_test_support::clone_log_metadata(&ctx);
+    assert_eq!(
+        metadata.get("waf.action").map(String::as_str),
+        Some("monitored"),
+        "WAF-owned metadata still projects into the transaction log"
+    );
+
+    let cloned = ctx.clone();
+    assert_eq!(
+        ferrum_edge::_test_support::clone_log_metadata(&cloned),
+        metadata,
+        "a cloned context projects byte-identical log metadata"
+    );
+}
+
+#[test]
+fn absent_plugin_state_still_strips_unowned_waf_log_metadata() {
+    let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/echo".into());
+    // No `waf` instance ran, so nothing owns this field. The fail-closed strip
+    // must still happen with no per-plugin state allocated.
+    ctx.metadata.insert("waf.score".into(), "99".into());
+
+    let metadata = ferrum_edge::_test_support::clone_log_metadata(&ctx);
+    assert!(
+        !metadata.contains_key("waf.score"),
+        "an unowned waf.* field must never reach transaction logs"
+    );
+    assert!(
+        !has_plugin_state(&ctx),
+        "the strip must not materialize per-plugin state"
+    );
+}
