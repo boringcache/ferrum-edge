@@ -18311,6 +18311,8 @@ fn batch_create_request_publishes_the_complete_closed_envelope() {
         assert_component_validity(&spec, "BatchCreateRequest", &rejected, false);
     }
 
-    assert!(ferrum_edge::_test_support::batch_envelope_admits_for_test(b"{}"));
+    assert!(ferrum_edge::_test_support::batch_envelope_admits_for_test(
+        b"{}"
+    ));
     assert_component_validity(&spec, "BatchCreateRequest", &json!({}), true);
 }
