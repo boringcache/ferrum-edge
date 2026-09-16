@@ -1981,16 +1981,16 @@ fn example_object_has_required_fields(
                     field_value,
                     &format!("{path}.{field}"),
                 );
-            } else if let Some(items) = field_value.as_array() {
-                if let Some(item_schema) = field_schema.get("items") {
-                    for (index, item) in items.iter().enumerate() {
-                        example_object_has_required_fields(
-                            spec,
-                            item_schema,
-                            item,
-                            &format!("{path}.{field}[{index}]"),
-                        );
-                    }
+            } else if let Some(items) = field_value.as_array()
+                && let Some(item_schema) = field_schema.get("items")
+            {
+                for (index, item) in items.iter().enumerate() {
+                    example_object_has_required_fields(
+                        spec,
+                        item_schema,
+                        item,
+                        &format!("{path}.{field}[{index}]"),
+                    );
                 }
             }
         }
