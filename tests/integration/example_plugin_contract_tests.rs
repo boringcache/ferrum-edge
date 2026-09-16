@@ -103,6 +103,15 @@ fn h1_h2_buffered_terminal_logging_precedes_response_construction() {
             "let mut resp_builder = Response::builder()",
             // Last: every handler read of `ctx` is behind this point, which is
             // what lets the deferred logger own the context outright.
+            //
+            // The move is lease-safe only because of the release immediately
+            // before it: the clone it replaces deliberately reset the bounded
+            // response-buffer permit, the `request_mirror` admissions and the
+            // `hmac_auth` prebuffer stage (the crate's only three reset-on-clone
+            // impls), so without this call the moved context would hold each of
+            // them until the body terminates AND the terminal task finishes —
+            // a silent bounded-admission extension nothing else detects.
+            "ctx.release_leases_before_terminal_handoff();",
             "DeferredTransactionLogger::new_with_start_time(",
         ],
     );
