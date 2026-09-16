@@ -10551,6 +10551,25 @@ pub mod _test_support {
             }
         }
 
+        /// Race the dispatcher's response-header wait against the relay's
+        /// backend write watermark, exactly as `proxy_to_backend` does.
+        ///
+        /// The mirror of [`BufferedUploadPumpProbe::write_watermark_wins_header_wait`]
+        /// for a STREAMING client body: `true` means the watermark won, which
+        /// is what makes the request end as 504 / `ReadWriteTimeout` at
+        /// `backend_write_timeout_ms` rather than running on to
+        /// `backend_read_timeout_ms`.
+        pub async fn write_watermark_wins_header_wait(&mut self, header_wait: Duration) -> bool {
+            let Some(join) = self.join.as_mut() else {
+                return false;
+            };
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep(header_wait) => false,
+                () = join.backend_write_watermark_expired() => true,
+            }
+        }
+
         /// Wait for the pump to finish on its own — no cancellation — which is
         /// what an authorization expiry must produce even though the transport
         /// side is never polled.

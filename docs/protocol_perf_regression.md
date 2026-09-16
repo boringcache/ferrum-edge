@@ -175,6 +175,169 @@ python3 .github/scripts/h1_tls_post_comparison.py self-test
 bash -n .github/scripts/run_h1_tls_post_comparison.sh
 ```
 
+## Request-upload hand-off on the H1 TLS POST path
+
+Issue [#5537](https://github.com/ferrum-edge/ferrum-edge/issues/5537) item 4
+asks what the gateway-owned request-upload relay costs on this workload, and
+whether a fully buffered upload can be handed to the backend transport without
+it. This section records the answer, derived by static inspection of
+`src/proxy/mod.rs`, `src/proxy/body.rs`, `src/proxy/upload_pump.rs` and the
+harness, so a later attribution round does not have to re-derive it.
+
+### Which classification the benchmark exercises
+
+The workload's POST body is **streamed**, not buffered. Four facts decide it:
+
+- `configs/http1_tls_e2e_perf.yaml` declares `plugins: []` and no `retry`, so
+  `requires_request_body_buffering` and `has_effective_http_retries` are both
+  false and `stream_request_body` is true.
+- `proto_backend`'s HTTPS listener on port 3447 advertises only `http/1.1` in
+  ALPN, so the backend capability registry can never mark it direct-H2 or H3;
+  the dispatch runs through the reqwest pool.
+- `.github/scripts/h1_tls_post_comparison.py` sets
+  `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0`, so that dispatch takes the
+  `CountingIncoming` arm rather than `SizeLimitedIncoming`.
+- `backend_write_timeout_ms: 30000` is live, so
+  `install_counting_upload_authorization` installs a gateway-owned pump.
+
+The relay this benchmark pays is therefore the **bridged** one
+(`UploadFrames::Bridged`, `run_upload_pump`). The direct hand-off built for
+fully buffered uploads in
+[#5510](https://github.com/ferrum-edge/ferrum-edge/pull/5510) is not on this
+path at all — a point worth keeping in mind when reading that PR's neutral
+paired result.
+
+### The buffered classification already has the direct hand-off
+
+Every classification whose bytes the gateway already owns reaches
+`spawn_direct_upload_watch`, which relays nothing: the transport takes
+refcounted `Bytes::split_to` slices of the collected buffer synchronously and
+records each take, and a watcher future judges the watermark from that record.
+
+| Dispatch | Entry point |
+|---|---|
+| Buffered reqwest (and its protocol-NACK replay) | `install_buffered_upload_write_watermark` → `spawn_buffered_upload_pump` |
+| H3 → plain cross-protocol bridge | `install_buffered_upload_write_watermark` |
+| HBONE / Unix / sidecar-mTLS replayable bodies | `ReplayableRequestBody::with_gateway_upload_pump` → `spawn_replayable_upload_pump` |
+| Buffered native gRPC | `spawn_replayable_upload_pump_with_deferred_write` |
+
+`only_streaming_uploads_pay_the_bridged_relay` in
+`tests/unit/gateway_core/stream_auth_lifetime_tests.rs` pins that table from
+both ends: the bridge channel is built in exactly one installer, the direct
+source in exactly one other, and no buffered dispatch site reaches the relay.
+
+Per request, with a non-empty body and a live `backend_write_timeout_ms`, that
+hand-off costs six heap allocations — two control `oneshot`s, the terminal
+`AtomicU8`, the backend-socket slot, the shared `DirectUploadProgress`, and one
+boxed watcher future — plus one timer arm for the whole request. There is no
+channel, no relay, no copy, and no task spawn on the ordinary path: the watcher
+is driven inline by `await_upload_write_watermark_first` and is handed a task
+only if that race ends while it is still live. Per frame it costs one clock
+read, one atomic store, one refcount bump and one counter add; frames are
+`min(64 KiB, remaining)`, so 10 KiB is one frame and 70 KiB is two.
+`backend_write_timeout_ms == 0`, and an upload with nothing to write, keep the
+allocation-, task- and timer-free path.
+
+What remains is exactly the watermark, and it cannot be shed. The specialized
+H1/H2 transports park **outside** a body poll precisely when a backend accepts
+and stops reading, so a bound delivered through the body alone can never fire
+there; removing the watcher reopens
+[#4055](https://github.com/ferrum-edge/ferrum-edge/issues/4055). There is no
+further direct hand-off to take on this classification.
+
+### What the streaming relay costs
+
+Relative to handing `UploadSource::Direct(incoming)` straight to the transport,
+which is the shape the pinned June reference had, the bridged relay adds per
+request:
+
+- **At install: seven heap allocations.** Tokio's bounded channel (its shared
+  state plus the first block of its intrusive list, a fixed number of
+  `Frame<Bytes>` slots), the two control `oneshot`s, the terminal `AtomicU8`,
+  the backend-socket slot, and the boxed relay future — which owns the client
+  `Incoming`, both optional `Sleep`s and the `select!` state.
+- **Per DATA frame: one task hand-off the direct body does not have.** The
+  relay is polled by the frontend connection task (inline, through the
+  dispatcher's header race) while the body is polled by reqwest's connection
+  task, so every frame crosses a semaphore acquire/release pair, an
+  intrusive-list push and pop, and both wakers.
+- **Per relay-loop iteration while the watermark is armed:** one clock read and
+  one `Sleep::reset()` — a timer-wheel deregistration and reinsertion — plus one
+  `Sleep` poll, because the `biased` `select!` polls the idle arm before
+  `sender.reserve()`.
+- **Per frame: one extra `http_body::Body` layer**, `UploadPumpSource::poll_frame`
+  between `CountingIncoming` and `Incoming`.
+- **Once, on the way out of the race:** a `settle_inline()` poll through a no-op
+  waker, or a `tokio::spawn` if the relay is still live.
+
+Frame count for this workload: the frontend HTTP/1 parser buffer is
+`max(FERRUM_MAX_HEADER_SIZE_BYTES, 8 KiB)` — 32 KiB with the shipped default —
+and a TLS record carries at most 16 KiB of plaintext, so a 10 KiB upload arrives
+as one DATA frame and a 70 KiB upload as at least three. That puts the relay at
+roughly seven allocations plus three task hand-offs at 10 KiB, and seven plus
+seven or more at 70 KiB, which is the right order of magnitude for the +3.8
+June-normalised CPU units the issue attributes to it.
+
+### Why the streaming relay is not convertible
+
+The relay's one-frame lookahead is the **only** evidence the gateway has that a
+transport has stopped consuming *while bytes were available*. Four alternatives
+were considered and all of them weaken a standing invariant:
+
+1. **Poll the client body in place from the transport.** The gateway then learns
+   nothing between polls. A transport whose peer stopped reading simply stops
+   polling, and "stopped polling" is indistinguishable from "the client sent
+   nothing to hand over" — which must *not* trip the watermark
+   (`an_inline_pump_waiting_on_the_client_keeps_the_write_watermark_dormant`).
+2. **Record the last poll's outcome in the body and judge from that.** It does
+   not close the gap. When the transport's last body poll reported "nothing
+   available" and the client then delivers, the transport is woken but a
+   connection whose write buffer is already full flushes rather than polling the
+   body again; the body never observes the arrival, the watermark stays dormant,
+   and the request runs on to `backend_read_timeout_ms` — exactly the #4055
+   regression. Closing it requires waking the *gateway* when the client delivers
+   while the transport is not polling, which means the gateway must own a
+   lookahead, which means either a channel (what the relay is) or a lock shared
+   between the two tasks on the request path. Hot-path invariants forbid the
+   lock.
+3. **Collect the upload opportunistically so it becomes the buffered case.**
+   Refused by the standing rule: buffer only when a plugin requires request or
+   response body buffering, or retry needs replay.
+4. **Substitute the post-EOS socket send-queue judgment
+   ([#4411](https://github.com/ferrum-edge/ferrum-edge/issues/4411)) for the
+   relay.** That judgment is disarmed whenever no backend socket was published,
+   which is the ordinary case for a request served on an already-pooled reqwest
+   connection — the steady state of this benchmark's 200 keep-alive
+   connections. It would leave the watermark unenforced for nearly every
+   request.
+
+Independently of the watermark, the #3815 ownership boundary ("after expiry the
+gateway owns and polls no part of the inbound client body") is only satisfiable
+while the gateway holds the `Incoming`. A direct streaming source hands that
+ownership to the transport, so an authenticated streaming upload could not be
+given one at all.
+
+`the_backend_write_watermark_ends_a_streaming_upload_the_transport_stopped_taking`
+is the positive proof that the relay is load-bearing here: a client that keeps
+producing while the transport stops taking ends on `backend_write_timeout_ms`,
+with the frame the relay had already read discarded rather than forwarded.
+
+### Candidate left on the table
+
+`run_upload_pump` re-arms its idle `Sleep` at the top of every loop iteration and
+the `biased` `select!` polls it before `sender.reserve()`, so a healthy backend
+pays a timer-wheel deregistration and reinsertion per DATA frame for a timer that
+never fires. Trying `sender.try_reserve()` first and arming the timer only when
+capacity is genuinely unavailable would remove it; `run_direct_upload_watch`
+already uses the equivalent recompute-on-fire shape.
+
+It is deliberately not taken here. It also changes which arm wins when the idle
+deadline and a freed capacity slot are ready in the same poll — today the timer
+wins and reports `WriteTimeout` even though the transport did consume — and that
+is a behaviour change that deserves its own attributable measurement rather than
+being folded in. Its ceiling is two timer-wheel operations and one clock read per
+DATA frame: about one frame's worth at 10 KiB and three or more at 70 KiB.
+
 ## Native harness cert paths
 
 The scheduled workflow runs `run_protocol_test.sh` **natively** (not in Docker).
@@ -233,6 +396,8 @@ instead of rewriting that protected README.
 - Manual exploratory matrix: `.github/workflows/perf-benchmark.yml`
 - PR overhead gate: `tests/performance/ci_overhead_bench.py` via `ci.yml`
 - Connection saturation headlines: `docs/connection_saturation_benchmark.md`
+- Request-upload hand-off contracts (the section above):
+  `tests/unit/gateway_core/stream_auth_lifetime_tests.rs`
 - Suite index: `tests/performance/README.md`
 - Scheduled lane details: this document (performance suite READMEs stay
   unchanged so trusted Cross automation digests are not rewritten)
