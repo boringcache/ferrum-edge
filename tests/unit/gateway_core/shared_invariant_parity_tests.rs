@@ -1275,14 +1275,16 @@ fn admin_typed_body_boundaries_require_a_json_object_envelope() {
 }
 
 // The original three-resource check above remains the regression table for
-// #5538. This inventory covers the descendants and sibling admission types
-// from #5557, including private plugin wire structs and mesh-slice carriers.
-// Discover types from source instead of maintaining a list of struct names:
-// adding a new Option<Struct> must require an explicit admission decision.
+// #5538. This inventory checks object-valued fields in the #5557 admission
+// modules below, including private plugin wire structs and mesh-slice carriers.
+// Source discovery requires an admission decision for new Option<Struct>
+// fields within that scope; this is not complete JSON admission coverage.
+// Collection-element admission (including Vec<Struct>) is tracked in #5569.
 fn object_admission_source(path: &str) -> bool {
     path.starts_with("src/config/")
         || path.starts_with("src/admin/")
         || path.starts_with("src/plugins/")
+        || path.starts_with("src/modes/mesh/config_consumer/")
         || matches!(
             path,
             "src/modes/mesh/config.rs"
@@ -1320,6 +1322,95 @@ const OBJECT_ADMISSION_EXCEPTIONS: &[(&str, &str, &str, &str)] = &[
         "replay",
         "Private Redis deduplication record, not plugin configuration.",
     ),
+];
+
+/// Baseline field keys make a discovery regression actionable even if newly
+/// discovered fields keep the total count above its floor. Discovery still
+/// checks additions without requiring them to be listed here first.
+const EXPECTED_OBJECT_ADMISSION_FIELDS: &[&str] = &[
+    "src/admin/backup.rs:RestorePayload.api_specs",
+    "src/config/gateway_trust.rs:GatewayTrustBundleRecord.bundle",
+    "src/config/plugin_trigger.rs:PluginTrigger.when",
+    "src/config/plugin_trigger.rs:PluginTriggerFieldMatch.value",
+    "src/config/plugin_trigger.rs:PluginTriggerIdentityMatch.value",
+    "src/config/plugin_trigger.rs:PluginTriggerMatch.consumer",
+    "src/config/plugin_trigger.rs:PluginTriggerMatch.cookie",
+    "src/config/plugin_trigger.rs:PluginTriggerMatch.header",
+    "src/config/plugin_trigger.rs:PluginTriggerMatch.host",
+    "src/config/plugin_trigger.rs:PluginTriggerMatch.path",
+    "src/config/plugin_trigger.rs:PluginTriggerMatch.query",
+    "src/config/plugin_trigger.rs:PluginTriggerMatch.sni",
+    "src/config/plugin_trigger.rs:PluginTriggerMatch.spiffe_id",
+    "src/config/plugin_trigger.rs:PluginTriggerNode.match_",
+    "src/config/plugin_trigger.rs:PluginTriggerNode.not",
+    "src/config/types.rs:GatewayConfig.mesh",
+    "src/config/types.rs:GatewayConfig.trust_bundles",
+    "src/config/types.rs:HealthCheckConfig.active",
+    "src/config/types.rs:HealthCheckConfig.passive",
+    "src/config/types.rs:PluginConfig.trigger",
+    "src/config/types.rs:Proxy.circuit_breaker",
+    "src/config/types.rs:Proxy.retry",
+    "src/config/types.rs:Proxy.stream_match",
+    "src/config/types.rs:ServiceDiscoveryConfig.consul",
+    "src/config/types.rs:ServiceDiscoveryConfig.dns_sd",
+    "src/config/types.rs:ServiceDiscoveryConfig.kubernetes",
+    "src/config/types.rs:ServiceDiscoveryConfig.mesh",
+    "src/config/types.rs:SubsetDefinition.traffic_policy",
+    "src/config/types.rs:SubsetTrafficPolicy.passive_health_check",
+    "src/config/types.rs:SubsetTrafficPolicy.tls",
+    "src/config/types.rs:Upstream.hash_on_cookie_config",
+    "src/config/types.rs:Upstream.health_checks",
+    "src/config/types.rs:Upstream.locality_lb_setting",
+    "src/config/types.rs:Upstream.service_discovery",
+    "src/config/types.rs:UpstreamPortOverride.locality_lb_setting",
+    "src/config/types.rs:UpstreamPortOverride.passive_health_check",
+    "src/config/types.rs:UpstreamPortOverride.tcp_keepalive",
+    "src/config/types.rs:UpstreamPortOverride.tls",
+    "src/modes/mesh/config.rs:MeshAccessLoggingConfig.filter",
+    "src/modes/mesh/config.rs:MeshConfig.multi_cluster",
+    "src/modes/mesh/config.rs:MeshConfig.trust_bundles",
+    "src/modes/mesh/config.rs:MeshDestinationRule.traffic_policy",
+    "src/modes/mesh/config.rs:MeshExtAuthzProvider.include_request_body_in_check",
+    "src/modes/mesh/config.rs:MeshRule.source_negation",
+    "src/modes/mesh/config.rs:MeshSidecar.workload_selector",
+    "src/modes/mesh/config.rs:MeshSubset.traffic_policy",
+    "src/modes/mesh/config.rs:MeshTelemetryConfig.access_logging",
+    "src/modes/mesh/config.rs:MeshTelemetryConfig.metrics",
+    "src/modes/mesh/config.rs:MeshTelemetryConfig.tracing",
+    "src/modes/mesh/config.rs:MeshTelemetryResource.config",
+    "src/modes/mesh/config.rs:MeshTrafficPolicy.connection_pool_http",
+    "src/modes/mesh/config.rs:MeshTrafficPolicy.locality_lb_setting",
+    "src/modes/mesh/config.rs:MeshTrafficPolicy.outlier_detection",
+    "src/modes/mesh/config.rs:MeshTrafficPolicy.tcp_keepalive",
+    "src/modes/mesh/config.rs:MeshTrafficPolicy.tls",
+    "src/modes/mesh/config.rs:MeshVirtualServiceCorsPolicy.cors",
+    "src/modes/mesh/config.rs:PeerAuthentication.selector",
+    "src/modes/mesh/config.rs:PolicyScope.selector",
+    "src/modes/mesh/config.rs:ServiceEntry.workload_selector",
+    "src/modes/mesh/config.rs:TrustBundleSet.local",
+    "src/modes/mesh/config.rs:Workload.node_waypoint",
+    "src/modes/mesh/config.rs:Workload.selector",
+    "src/modes/mesh/config_consumer/file_source.rs:MeshFileDocument.mesh",
+    "src/modes/mesh/slice.rs:MeshSlice.multi_cluster",
+    "src/modes/mesh/slice.rs:MeshSlice.revision",
+    "src/modes/mesh/slice.rs:MeshSlice.runtime_overlay",
+    "src/modes/mesh/slice.rs:MeshSlice.sidecar_egress_scope",
+    "src/modes/mesh/slice.rs:MeshSlice.trust_bundles",
+    "src/plugins/api_chargeback_sink.rs:ApiChargebackSinkConfig.batch",
+    "src/plugins/api_chargeback_sink.rs:ApiChargebackSinkConfig.clickhouse",
+    "src/plugins/api_chargeback_sink.rs:ApiChargebackSinkConfig.retry",
+    "src/plugins/api_chargeback_sink.rs:ApiChargebackSinkConfig.snapshot",
+    "src/plugins/api_chargeback_sink.rs:ApiChargebackSinkConfig.spool",
+    "src/plugins/api_chargeback_sink.rs:ClickHouseConfig.tls",
+    "src/plugins/mesh_route_dispatch.rs:FaultActionConfig.abort",
+    "src/plugins/mesh_route_dispatch.rs:FaultActionConfig.delay",
+    "src/plugins/mesh_route_dispatch.rs:RouteDestination.backend_tls",
+    "src/plugins/mesh_route_dispatch.rs:RouteRule.destination",
+    "src/plugins/mesh_route_dispatch.rs:RouteRule.fault",
+    "src/plugins/mesh_route_dispatch.rs:RouteRule.match_",
+    "src/plugins/mesh_route_dispatch.rs:RouteRule.redirect",
+    "src/plugins/mesh_route_dispatch.rs:RouteRule.retry",
+    "src/plugins/mesh_route_dispatch.rs:RouteRule.rewrite",
 ];
 
 /// Strip comments before interpreting attributes so a comment mentioning a
@@ -1493,9 +1584,17 @@ fn every_nested_admin_struct_field_has_an_object_admission_decision() {
             }
         }
     }
+    let missing: Vec<_> = EXPECTED_OBJECT_ADMISSION_FIELDS
+        .iter()
+        .copied()
+        .filter(|key| !checked.contains(*key))
+        .collect();
     assert!(
-        checked.len() >= 65,
-        "the admission inventory must not silently shrink"
+        checked.len() >= 65 && missing.is_empty(),
+        "the admission inventory must not silently shrink: checked {} fields \
+         (minimum 65), expected {} baseline keys, missing: {missing:?}",
+        checked.len(),
+        EXPECTED_OBJECT_ADMISSION_FIELDS.len()
     );
     assert_eq!(
         exceptions_seen,
@@ -1710,8 +1809,98 @@ fn api_spec_restore_section_requires_an_object_and_preserves_absence() {
 }
 
 #[test]
+fn mesh_json_file_document_and_mesh_section_require_objects() {
+    use ferrum_edge::modes::mesh::config_consumer::file_source::read_mesh_config_document;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mesh.json");
+    for rejected in [
+        json!({"mesh": []}),
+        json!({"mesh": [{}]}),
+        json!([]),
+        json!([null, []]),
+        json!([null, {}]),
+    ] {
+        std::fs::write(&path, serde_json::to_vec(&rejected).unwrap()).unwrap();
+        let error = read_mesh_config_document(&path)
+            .expect_err("a mesh document and its mesh section must be objects")
+            .to_string();
+        assert!(error.contains("invalid mesh configuration document"), "{error}");
+        assert!(
+            error.contains("invalid type: sequence, expected a JSON object"),
+            "{error}"
+        );
+    }
+
+    std::fs::write(&path, br#"{"mesh": {}}"#).unwrap();
+    let mesh = read_mesh_config_document(&path).expect("an empty mesh object remains valid");
+    assert!(mesh.mesh_policies.is_empty());
+    assert!(mesh.peer_authentications.is_empty());
+    assert!(mesh.trust_bundles.is_none());
+}
+
+#[test]
+fn mesh_config_updates_reject_positional_slice_roots() {
+    use ferrum_edge::grpc::proto::{MeshConfigUpdate, MeshSubscribeRequest};
+    use ferrum_edge::modes::mesh::config_consumer::update_validation::{
+        MeshUpdateConsumer, MeshUpdateExpectation, MeshUpdateRejectReason,
+        validate_mesh_config_update,
+    };
+    use ferrum_edge::modes::mesh::slice::MeshSlice;
+
+    let request = MeshSubscribeRequest {
+        node_id: "object-admission-node".to_string(),
+        namespace: "object-admission".to_string(),
+        ..Default::default()
+    };
+    let expected = MeshUpdateExpectation::from_subscribe_request(&request);
+    // Supply every positional field through the required version; remaining
+    // fields have serde defaults. An empty array alone already failed before
+    // the root guard and would not catch this regression.
+    let positional = json!([
+        request.node_id,
+        request.namespace,
+        "",
+        null,
+        null,
+        null,
+        [],
+        {},
+        false,
+        [],
+        [],
+        "v1",
+    ]);
+    let slice: MeshSlice = serde_json::from_value(positional.clone())
+        .expect("the fixture must exercise serde's positional struct representation");
+    let mut update = MeshConfigUpdate {
+        version: slice.version.clone(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        ..Default::default()
+    };
+    for consumer in [MeshUpdateConsumer::Native, MeshUpdateConsumer::RemoteDiscovery] {
+        update.mesh_slice_json = serde_json::to_string(&positional).unwrap();
+        let rejection = validate_mesh_config_update(&update, &expected, consumer)
+            .expect_err("a positional slice must fail JSON admission");
+        assert_eq!(rejection.reason(), MeshUpdateRejectReason::InvalidSliceJson);
+        assert!(!rejection.terminates_stream());
+        assert!(
+            rejection
+                .detail()
+                .contains("invalid type: sequence, expected a JSON object"),
+            "{rejection}"
+        );
+
+        update.mesh_slice_json = serde_json::to_string(&slice).unwrap();
+        assert!(validate_mesh_config_update(&update, &expected, consumer).is_ok());
+    }
+}
+
+#[test]
 fn typed_plugin_config_value_boundaries_require_objects() {
+    use ferrum_edge::plugins::mesh::authz::MeshAuthz;
     use ferrum_edge::plugins::mesh::outbound_registry::OutboundRegistry;
+    use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
     use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 
     for rejected in [json!([]), json!([[], false])] {
@@ -1725,35 +1914,62 @@ fn typed_plugin_config_value_boundaries_require_objects() {
     }
     assert!(MeshRouteDispatchConfig::from_value(&json!({})).is_ok());
     assert!(OutboundRegistry::new(&json!({})).is_ok());
+
+    let authz_error = match MeshAuthz::new(&json!({"mesh_slice": []})) {
+        Ok(_) => panic!("mesh_authz accepted a positional mesh_slice"),
+        Err(error) => error,
+    };
+    assert!(
+        authz_error.contains("invalid type: sequence, expected a JSON object"),
+        "{authz_error}"
+    );
+    let metrics_error = match WorkloadMetrics::new(&json!({"direction_emit": []})) {
+        Ok(_) => panic!("workload_metrics accepted a positional direction_emit"),
+        Err(error) => error,
+    };
+    assert!(
+        metrics_error.contains("invalid type: sequence, expected a JSON object"),
+        "{metrics_error}"
+    );
 }
 
 #[test]
 fn plugin_structs_behind_raw_json_values_retain_object_admission() {
-    for (path, signature, guarded_type) in [
+    for (path, signature, terminator, guarded_type) in [
         (
             "src/plugins/mesh_route_dispatch.rs",
             "pub fn from_value(config: &Value)",
+            "\n    }",
             "json_object::JsonObject<Self>",
         ),
         (
             "src/plugins/mesh/outbound_registry.rs",
             "pub fn new(config: &Value)",
+            "\n    }",
             "JsonObject<OutboundRegistryConfig>",
         ),
         (
             "src/plugins/mesh/authz.rs",
             "pub fn new(config: &Value)",
+            "\n    }",
             "json_object::JsonObject<MeshSlice>",
         ),
         (
             "src/plugins/mesh/workload_metrics.rs",
             "fn parse_direction_emit(config: &Value)",
+            "\n}",
             "json_object::JsonObject<DirectionEmit>",
+        ),
+        (
+            "src/modes/mesh/mod.rs",
+            "fn mesh_authz_config_policies(config: &serde_json::Value)",
+            "\n}",
+            "json_object::JsonObject<MeshSlice>",
         ),
     ] {
         let text = admission_source_without_line_comments(&source(path));
         assert!(
-            item_body(&text, signature, "\n}").contains(guarded_type),
+            item_body(&text, signature, terminator).contains(guarded_type),
             "{path}: raw JSON must pass the object guard before typed plugin parsing"
         );
     }
