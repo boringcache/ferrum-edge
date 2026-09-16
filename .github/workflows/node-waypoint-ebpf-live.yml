@@ -757,27 +757,82 @@ jobs:
           results="target/node-waypoint-ebpf-live/mesh-bpf-metrics"
           mkdir -p "$results"
 
-          source_pod="$(kubectl -n ferrum-ebpf-live get pod -l app=src-a -o jsonpath='{.items[0].metadata.name}')"
+          # Select the Running, non-terminating src-a pod explicitly. run.sh
+          # deletes and rescales src-a earlier in this job, so `items[0]` of a
+          # bare label selector can name the pod that is on its way out: the
+          # excluded-port connection would then be issued into a container that
+          # is already tearing down, and the counter would legitimately stand
+          # still. The field selector drops non-Running pods; the go-template
+          # drops anything already carrying a deletion timestamp.
+          running_template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}'
+          source_pod="$(
+            kubectl -n ferrum-ebpf-live get pod -l app=src-a \
+              --field-selector status.phase=Running \
+              -o go-template="$running_template" | sort | awk 'NR == 1'
+          )"
+          if [[ -z "$source_pod" ]]; then
+            echo "no Running, non-terminating src-a pod to source the excluded-port connection from" >&2
+            kubectl -n ferrum-ebpf-live get pod -l app=src-a -o wide >&2 || true
+            exit 1
+          fi
+          kubectl -n ferrum-ebpf-live wait --for=condition=Ready "pod/$source_pod" --timeout=60s
+
           source_node="$(kubectl -n ferrum-ebpf-live get "pod/$source_pod" -o jsonpath='{.spec.nodeName}')"
+          if [[ -z "$source_node" ]]; then
+            echo "src-a pod $source_pod is not scheduled onto a node" >&2
+            exit 1
+          fi
+
+          # The bypass decision is taken by the connect4 hook inside the source
+          # pod's cgroup and accounted on that node's per-CPU counters, so the
+          # only proxy that can observe it is the ambient pod sharing the node.
+          # Same Running/non-terminating filter: run.sh restarts the ambient
+          # DaemonSet earlier, so a terminating predecessor can still be listed
+          # for the node and would export a frozen, pre-restart counter.
           ambient_pod="$(
             kubectl -n ferrum get pod \
               -l app.kubernetes.io/name=ferrum-mesh-ambient \
-              --field-selector "spec.nodeName=$source_node" \
-              -o jsonpath='{.items[0].metadata.name}'
+              --field-selector "spec.nodeName=$source_node,status.phase=Running" \
+              -o go-template="$running_template" | sort | awk 'NR == 1'
           )"
-          if [[ -z "$source_pod" || -z "$source_node" || -z "$ambient_pod" ]]; then
-            echo "could not resolve the source workload and same-node ambient proxy" >&2
+          if [[ -z "$ambient_pod" ]]; then
+            echo "no Running, non-terminating ferrum-mesh-ambient pod on node $source_node" >&2
+            kubectl -n ferrum get pod -l app.kubernetes.io/name=ferrum-mesh-ambient -o wide >&2 || true
             exit 1
           fi
+          kubectl -n ferrum wait --for=condition=Ready "pod/$ambient_pod" --timeout=60s
 
           kubectl -n ferrum port-forward "pod/$ambient_pod" 19450:19010 \
             >"$results/port-forward.log" 2>&1 &
           port_forward_pid=$!
           trap 'kill "$port_forward_pid" 2>/dev/null || true; wait "$port_forward_pid" 2>/dev/null || true' EXIT
 
+          metric='ferrum_mesh_bpf_drops_total{reason="exclude_port_hit"}'
+
+          # Scrape once. Non-zero means the port-forward could not serve
+          # /metrics, which is a different failure from a counter that did not
+          # move and must never be reported as one.
+          scrape() {
+            curl -fsS --max-time 10 http://127.0.0.1:19450/metrics \
+              >"$1" 2>"$results/scrape.err"
+          }
+
+          read_metric() {
+            awk -v metric="$2" '$1 == metric { value = $2 } END { print value }' "$1"
+          }
+
+          # Greatest common divisor of every cumulative ferrum_mesh_bpf_*
+          # counter in one scrape (issue #5502): the replay factor a stalled
+          # ringbuf consumer multiplies the whole family by, or 1 on a healthy
+          # consumer. The always-1 gauges are excluded because they would pin
+          # the result at 1 and hide the rescale.
+          scrape_scale() {
+            awk 'function gcd(a, b,   t) { while (b) { t = a % b; a = b; b = t } return a } $1 ~ /^ferrum_mesh_bpf_/ && $2 ~ /^[0-9]+$/ && $1 !~ /drop_reasons|ringbuf_overruns_total|ringbuf_in_overrun_regime/ && $2 > 0 { scale = (scale == "" ? $2 + 0 : gcd(scale, $2 + 0)) } END { if (scale == "" || scale < 1) scale = 1; printf "%d\n", scale }' "$1"
+          }
+
           fetched=false
           for _ in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:19450/metrics >"$results/before.prom"; then
+            if scrape "$results/before.prom"; then
               fetched=true
               break
             fi
@@ -785,45 +840,120 @@ jobs:
           done
           if [[ "$fetched" != "true" ]]; then
             echo "failed to fetch same-node ambient metrics before the bypass" >&2
+            cat "$results/scrape.err" >&2 || true
             cat "$results/port-forward.log" >&2 || true
             exit 1
           fi
 
-          # Kernel-sourced per-reason counter (issue #5502).
-          metric='ferrum_mesh_bpf_drops_total{reason="exclude_port_hit"}'
-          before="$(awk -v metric="$metric" '$1 == metric { value = $2 } END { print value }' "$results/before.prom")"
+          before="$(read_metric "$results/before.prom" "$metric")"
           if [[ ! "$before" =~ ^[0-9]+$ ]]; then
             echo "missing integer $metric baseline in ambient metrics" >&2
             grep 'ferrum_mesh_bpf_drops_total' "$results/before.prom" >&2 || true
             exit 1
           fi
+          before_scale="$(scrape_scale "$results/before.prom")"
 
-          kubectl -n ferrum-ebpf-live exec "pod/$source_pod" -- \
-            curl -fsS --connect-timeout 1 --max-time 1 \
-            http://127.0.0.1:15020/ >/dev/null 2>&1 || true
+          # Issue the excluded-port connection and keep the evidence. kubectl
+          # exec propagates the container command's exit status, which is the
+          # only unambiguous way to tell "curl ran and the connection was
+          # refused" (expected; the hook still classified the connect) from
+          # "curl never got as far as connect()" (a flat counter then proves
+          # nothing). Swallowing both with `|| true` is what made this
+          # assertion undiagnosable.
+          exec_out="$results/excluded-port-exec.out"
+          exec_err="$results/excluded-port-exec.err"
+          set +e
+          kubectl -n ferrum-ebpf-live exec "pod/$source_pod" -- curl -sS --connect-timeout 2 --max-time 5 -o /dev/null http://127.0.0.1:15020/ >"$exec_out" 2>"$exec_err"
+          curl_exit=$?
+          set -e
+          printf '%s\n' "$curl_exit" >"$results/excluded-port-exec.status"
+
+          # 0 = something answered, 7 = connection refused, 28 = timed out.
+          # Each proves a connect() to the excluded port left the pod, which is
+          # what the connect4 hook classifies as exclude_port_hit. Any other
+          # status (including a kubectl transport failure) means curl never got
+          # as far as connect().
+          case "$curl_exit" in
+            0|7|28) ;;
+            *)
+              echo "curl in pod/$source_pod exited $curl_exit without attempting the excluded-port connect()" >&2
+              cat "$exec_err" >&2 || true
+              exit 1
+              ;;
+          esac
 
           after="$before"
-          for _ in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:19450/metrics >"$results/after.prom"; then
-              candidate="$(awk -v metric="$metric" '$1 == metric { value = $2 } END { print value }' "$results/after.prom")"
-              if [[ "$candidate" =~ ^[0-9]+$ ]]; then
-                after="$candidate"
-                if ((after > before)); then
-                  break
-                fi
-              fi
+          after_scale="$before_scale"
+          polls=0
+          scrape_failures=0
+          moved=false
+          : >"$results/poll-outcomes.txt"
+          for attempt in $(seq 1 40); do
+            polls="$attempt"
+            if ! scrape "$results/after.prom"; then
+              scrape_failures=$((scrape_failures + 1))
+              printf 'poll=%s outcome=scrape_failed\n' "$attempt" >>"$results/poll-outcomes.txt"
+              sleep 0.5
+              continue
+            fi
+            candidate="$(read_metric "$results/after.prom" "$metric")"
+            if [[ ! "$candidate" =~ ^[0-9]+$ ]]; then
+              scrape_failures=$((scrape_failures + 1))
+              printf 'poll=%s outcome=metric_missing\n' "$attempt" >>"$results/poll-outcomes.txt"
+              sleep 0.5
+              continue
+            fi
+            after="$candidate"
+            after_scale="$(scrape_scale "$results/after.prom")"
+            printf 'poll=%s outcome=scraped drops=%s scale=%s\n' \
+              "$attempt" "$after" "$after_scale" >>"$results/poll-outcomes.txt"
+            if ((after > before)); then
+              moved=true
+              break
             fi
             sleep 0.5
           done
 
-          if ((after <= before)); then
-            echo "expected $metric to increase after a real excluded-port connection; before=$before after=$after" >&2
-            grep 'ferrum_mesh_bpf_drops_total' "$results/after.prom" >&2 || true
+          if ((polls > 0 && scrape_failures == polls)); then
+            echo "all $polls post-connection scrapes failed: the port-forward to pod/$ambient_pod never served /metrics, so $metric was never read" >&2
+            cat "$results/scrape.err" >&2 || true
+            cat "$results/port-forward.log" >&2 || true
             exit 1
           fi
 
-          printf 'source_pod=%s\nsource_node=%s\nambient_pod=%s\nmetric=%s\nbefore=%s\nafter=%s\n' \
-            "$source_pod" "$source_node" "$ambient_pod" "$metric" "$before" "$after" \
+          if [[ "$moved" != "true" ]]; then
+            echo "expected $metric to increase after a real excluded-port connection from pod/$source_pod (curl exit $curl_exit); before=$before after=$after over $polls polls, $scrape_failures of them failed to scrape" >&2
+            grep 'ferrum_mesh_bpf_drops_total' "$results/after.prom" >&2 || true
+            cat "$results/port-forward.log" >&2 || true
+            exit 1
+          fi
+
+          # A larger number is not by itself evidence that THIS connection was
+          # classified (issue #5502). While the ringbuf consumer is stalled the
+          # whole ferrum_mesh_bpf_* family is re-counted from the same resident
+          # records, so every series grows by one common factor and any nonzero
+          # baseline drifts upward on its own — satisfying `after > before`
+          # without a single new bypass decision. Divide each scrape by its own
+          # common factor and require the underlying decision count to move.
+          # On a healthy consumer both factors are 1 and this is exactly the
+          # plain increase.
+          if [[ ! "$before_scale" =~ ^[1-9][0-9]*$ || ! "$after_scale" =~ ^[1-9][0-9]*$ ]]; then
+            echo "could not derive the ferrum_mesh_bpf_* common factor (before=$before_scale after=$after_scale)" >&2
+            exit 1
+          fi
+          before_underlying=$((before / before_scale))
+          after_underlying=$((after / after_scale))
+          if ((after_underlying <= before_underlying)); then
+            echo "$metric grew from $before to $after only because every ferrum_mesh_bpf_* counter rescaled (factor $before_scale -> $after_scale); the underlying bypass-decision count stayed at $before_underlying, so the excluded-port connection from pod/$source_pod was never classified by pod/$ambient_pod" >&2
+            grep 'ferrum_mesh_bpf_' "$results/after.prom" >&2 || true
+            cat "$results/port-forward.log" >&2 || true
+            exit 1
+          fi
+
+          printf 'source_pod=%s\nsource_node=%s\nambient_pod=%s\nmetric=%s\ncurl_exit=%s\nbefore=%s\nafter=%s\nbefore_scale=%s\nafter_scale=%s\nbefore_underlying=%s\nafter_underlying=%s\npolls=%s\nscrape_failures=%s\n' \
+            "$source_pod" "$source_node" "$ambient_pod" "$metric" "$curl_exit" \
+            "$before" "$after" "$before_scale" "$after_scale" \
+            "$before_underlying" "$after_underlying" "$polls" "$scrape_failures" \
             >"$results/assertion.txt"
 
       - name: Collect diagnostics
