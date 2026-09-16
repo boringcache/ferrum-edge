@@ -628,8 +628,14 @@ on a native-gRPC request.
 - `rate_limiting`, `graphql`, `grpc_method_router`, `ai_rate_limiter`,
   `ws_rate_limiting`, and `udp_rate_limiting` support `sync_mode: "redis"`.
 - Shared Redis client lives in `src/plugins/utils/redis_rate_limiter.rs`.
-- Algorithm is two-window weighted with pipelined `INCR`/`GET`/`EXPIRE`; no Lua.
-- Key format is `{escaped-prefix:escaped-rate-key}:{window_index}` — the braces
+- HTTP/GraphQL/gRPC windows use the local algorithms (token buckets up to 5s,
+  bounded 64-bucket sliding windows otherwise), atomically charged together
+  through bounded `WATCH`/`MULTI`/`EXEC` snapshots and Redis `TIME`; no Lua.
+  Rejections never charge a window or renew its TTL. AI/WS/UDP keep their own
+  existing counter algorithms.
+- Key format is `{escaped-prefix:escaped-rate-key}:suffix` — HTTP window
+  snapshots bind the effective window list in the suffix; weighted counters use
+  the window index. The braces
   are a Redis Cluster hash tag so every key of one atomic operation shares a
   slot; `%`, braces, and `:` are percent-escaped inside it. Default prefix is
   `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` — the config-id component
@@ -653,8 +659,9 @@ on a native-gRPC request.
   `rate_limiter_configs_are_closed_and_bounded_in_openapi` and
   `graphql_config_schema_matches_runtime_validation` in
   `tests/unit/openapi_yaml_tests.rs`.
-- Redis outage behavior is `redis_failure_policy` (`fail_closed` default,
-  `local_fallback` opt-in); only the opt-in falls back to in-memory. The client
+- Redis outage behavior is `redis_failure_policy`: `rate_limiting` defaults to
+  `local_fallback`; the other five rate-limit plugins default to `fail_closed`.
+  Explicit settings retain either behavior. The client
   reconnects in the background either way. `request_deduplication` expresses the
   same choice as `on_redis_unavailable` and does NOT accept
   `redis_failure_policy`; `ai_semantic_cache` has neither.

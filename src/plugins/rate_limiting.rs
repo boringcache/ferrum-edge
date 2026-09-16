@@ -677,6 +677,12 @@ impl RateLimiting {
             self.claim_published_headers(ctx, HeaderAuthority::Refused);
             return self.reject_capacity();
         };
+        if outcome.local_fallback {
+            // Sticky across composed instances: any fallback is operationally
+            // relevant, even when another limiter owns the public headers.
+            ctx.metadata
+                .insert("ratelimit_local_fallback".to_string(), "true".to_string());
+        }
         if !outcome.allowed {
             // The refusing limiter owns the client-visible telemetry from here
             // on; see `claim_refusal_headers`.

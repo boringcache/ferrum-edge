@@ -325,6 +325,14 @@ fn from_plugin_config_rejects_an_unusable_database_selector() {
         // Out of range in both directions.
         "redis://cache.internal:6379/-1",
         "redis://cache.internal:6379/2147483648",
+        "redis://cache.internal:6379/9999999999",
+        "redis://cache.internal:6379/00000000000",
+        "redis://cache.internal:6379/00",
+        "redis://cache.internal:6379/01",
+        "redis://cache.internal:6379/+1",
+        "redis://cache.internal:6379/1/",
+        "redis://cache.internal:6379//1",
+        "redis://cache.internal:6379/./1",
         "redis://cache.internal:6379/99999999999999999999",
     ] {
         let config = json!({
@@ -1248,9 +1256,9 @@ fn redis_one_second_prior_bucket_decays_instead_of_full_suppression() {
 }
 
 #[test]
-fn shared_consumers_use_same_window_progress_helper() {
-    // rate_limiting, GraphQL type/named-operation limits, and grpc_method_router
-    // per-method limits all reach check_http_windows_redis → window_progress.
+fn weighted_counter_consumers_use_same_window_progress_helper() {
+    // AI token and WebSocket frame counters still use window_progress; HTTP,
+    // GraphQL, and gRPC quotas share the local algorithms with Redis TIME.
     // Prove the shared helper (not a per-plugin copy) is what the test support
     // and live clock path expose.
     use ferrum_edge::_test_support::{redis_window_progress, redis_window_progress_at};
@@ -2897,12 +2905,9 @@ async fn a_recovery_probe_proving_cluster_topology_clears_every_cached_pool_slot
 // routine socket recycling into roughly two intervals of blanket refusals.
 // `is_available()` is now the only admission gate.
 
-/// One RESP round trip of the limiter's sliding window: the client sends
-/// `MULTI` / `GET` / `INCRBY` / `EXPIRE` / `EXEC` as a single pipeline, so a
-/// well-formed answer is `+OK`, three `+QUEUED`s, and the `EXEC` array.
-const TRANSACTION_PREAMBLE: &[u8] = b"+OK\r\n+QUEUED\r\n+QUEUED\r\n+QUEUED\r\n";
-/// `EXEC` array for a first-request window: `GET` nil, `INCRBY` → 1, `EXPIRE` → 1.
-const TRANSACTION_SUCCESS: &[u8] = b"*3\r\n$-1\r\n:1\r\n:1\r\n";
+/// The HTTP-window transaction commits a single snapshot with SET EX.
+const TRANSACTION_PREAMBLE: &[u8] = b"+OK\r\n+QUEUED\r\n";
+const TRANSACTION_SUCCESS: &[u8] = b"*1\r\n+OK\r\n";
 /// A plain (non-Cluster) server error on `EXEC` — the ordinary retryable
 /// failure a recycled socket produces, not a topology proof.
 const TRANSACTION_FAILURE: &[u8] = b"-ERR simulated transient backend failure\r\n";
@@ -2915,7 +2920,7 @@ struct TransactionServer {
     transactions: Arc<AtomicUsize>,
 }
 
-/// Screens clean on every connection, fails the FIRST sliding-window
+/// Screens clean on every connection, fails the FIRST HTTP-window
 /// transaction with a plain server error, and answers every later transaction
 /// normally.
 async fn spawn_first_transaction_fails_redis_server() -> TransactionServer {
@@ -2950,6 +2955,8 @@ async fn spawn_first_transaction_fails_redis_server() -> TransactionServer {
                                 reply.extend_from_slice(
                                     format!("${len}\r\n{text}\r\n").as_bytes(),
                                 );
+                            } else if chunk_contains(chunk, b"$8\r\nGETRANGE\r\n") {
+                                reply.extend_from_slice(b"$0\r\n\r\n*2\r\n:1000000\r\n:0\r\n");
                             } else if chunk_contains(chunk, MULTI_CMD) {
                                 let index = transactions.fetch_add(1, Ordering::Relaxed);
                                 reply.extend_from_slice(TRANSACTION_PREAMBLE);
@@ -3003,6 +3010,7 @@ async fn failover_admission_resumes_on_client_recovery_without_an_observer_tick(
                 "sync_mode": "redis",
                 "redis_url": format!("redis://127.0.0.1:{}/0", server.port),
                 "redis_pool_size": 1,
+                "redis_failure_policy": "fail_closed",
                 // Long enough that neither the client's recovery checker nor the
                 // failover observer can tick during this test: every transition
                 // below is one this test performs explicitly.
@@ -3015,7 +3023,7 @@ async fn failover_admission_resumes_on_client_recovery_without_an_observer_tick(
     assert_eq!(
         backend.redis_failure_policy(),
         Some(RedisFailurePolicy::FailClosed),
-        "this coverage is about the fail-closed default's recovery latency"
+        "this coverage is about explicit fail-closed recovery latency"
     );
     let client = backend
         .redis_client_arc_for_test()

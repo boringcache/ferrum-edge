@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking default:** `rate_limiting` now defaults `redis_failure_policy` to
+  `local_fallback`, enforcing the configured quota independently in each pod
+  during a Redis outage. Set `fail_closed` explicitly to require centralized
+  enforcement. Other rate-limit plugins retain their existing defaults (#5519).
+- Redis HTTP, GraphQL, and gRPC method quotas use the same token-bucket and
+  bounded sliding-window algorithms as local mode. Atomic multi-window admission
+  charges only accepted requests, eliminating sustained-overload lockout (#5517).
+  The Redis state format changes; upgrading starts fresh centralized budgets,
+  and mixed old/new gateways do not share counters. Upgrade replicas together.
+- Redis URL database selectors now require canonical decimal integers in
+  `0..=2147483647`, without zero-padding, signs, or extra path segments. Runtime
+  admission and all shared-parser OpenAPI URL fields use the same rule (#5518).
+
 ## [0.9.5] - 2026-09-13
 
 Release from main introducing resource labels in tagged artifacts. Includes the

@@ -93,7 +93,11 @@
 //!
 //! # Algorithm
 //!
-//! Uses a **two-window weighted approximation** for sliding window rate limiting:
+//! HTTP/GraphQL/gRPC quotas use the local token-bucket and bounded sliding-window
+//! algorithms, persisted as one snapshot via `WATCH`/`MULTI`/`EXEC`. Redis `TIME`
+//! supplies their shared clock and rejected requests never mutate that snapshot.
+//!
+//! Weighted-counter consumers use a **two-window weighted approximation**:
 //!
 //! 1. Two fixed windows are maintained: the current window and the previous window.
 //! 2. The effective count = `prev_count * (1 - elapsed_fraction) + current_count`.
@@ -157,8 +161,8 @@
 //! and local fallback through `redis_failure_policy` (see
 //! [`crate::plugins::utils::rate_limit::RedisFailurePolicy`]), and
 //! `request_deduplication` through `on_redis_unavailable`. Local fallback means
-//! one independent enforcement domain per gateway process, so it is an explicit
-//! opt-in rather than the default.
+//! one independent enforcement domain per gateway process. It is the default
+//! for `rate_limiting` and an explicit opt-in for the other enforcement plugins.
 //!
 //! Every transition to unavailable arms that task, because
 //! [`RedisRateLimitClient::mark_unavailable`] owns both halves. Not every
@@ -596,6 +600,9 @@ pub(crate) fn redact_url_userinfo(raw_url: &str) -> String {
 fn validate_redis_url(raw_url: &str) -> Result<(), String> {
     // Never echo the rejected URL (or parse detail that might restate it): the
     // field can carry userinfo credentials, query tokens, or fragments.
+    if raw_url.chars().any(char::is_whitespace) {
+        return Err("redis rate limiter: 'redis_url' must not contain whitespace".to_string());
+    }
     let parsed = Url::parse(raw_url).map_err(|_| {
         "redis rate limiter: 'redis_url' must be a valid URL with scheme redis or rediss"
             .to_string()
@@ -624,15 +631,13 @@ fn validate_redis_url(raw_url: &str) -> Result<(), String> {
                 .to_string(),
         );
     }
-    validate_redis_database_selector(&parsed)?;
+    validate_redis_database_selector(raw_url)?;
     Ok(())
 }
 
-/// Largest database index any Redis-family server can name.
-///
-/// The server's `databases` setting is a C `int` and `SELECT` refuses
-/// `id >= server.dbnum`, so nothing above this bound can ever address a
-/// database. A selector inside the bound may still exceed a particular
+/// Ferrum's portable database-selector ceiling. redis-rs stores an i64, but
+/// Redis SELECT and the server's database count use signed 32-bit indexes.
+/// Admission therefore uses 0..=i32::MAX. An index inside this bound may exceed a
 /// server's configured `databases` count; only the server can decide that, and
 /// it does so on the `SELECT` issued during the connection handshake.
 const MAX_REDIS_DATABASE_INDEX: i64 = i32::MAX as i64;
@@ -649,15 +654,24 @@ const MAX_REDIS_DATABASE_INDEX: i64 = i32::MAX as i64;
 /// misconfiguration is now an admission error instead.
 ///
 /// Never echoes the value: `redis_url` may carry userinfo credentials.
-fn validate_redis_database_selector(url: &Url) -> Result<(), String> {
-    let selector = url.path().trim_matches('/');
+fn validate_redis_database_selector(raw_url: &str) -> Result<(), String> {
+    // Inspect the original path: URL parsing normalizes dot segments, whereas
+    // the published schema admits only an absent path, '/', or '/<integer>'.
+    let selector = raw_url
+        .split(['?', '#'])
+        .next()
+        .and_then(|base| base.split_once("://"))
+        .and_then(|(_, authority)| authority.split_once('/'))
+        .map_or("", |(_, path)| path);
     if selector.is_empty() {
         return Ok(());
     }
-    if selector.contains('/') {
+    if !selector.bytes().all(|byte| byte.is_ascii_digit())
+        || (selector.len() > 1 && selector.starts_with('0'))
+    {
         return Err(
-            "redis rate limiter: 'redis_url' path must be a single database number \
-             (for example '/0')"
+            "redis rate limiter: 'redis_url' path must be a canonical database number \
+             (for example '/0'), without a sign, zero-padding, or extra path segments"
                 .to_string(),
         );
     }
@@ -3488,24 +3502,8 @@ impl RedisRateLimitClient {
         }
     }
 
-    /// Read the previous sliding-window bucket, increment the current bucket,
-    /// and set the current bucket expiry in one Redis transaction.
-    ///
-    /// The caller makes its allow/deny decision from the returned post-INCR
-    /// current count, tying admission to the mutation even when many gateway
-    /// instances race on the same key.
-    #[allow(clippy::result_unit_err)]
-    pub async fn sliding_window_increment(
-        &self,
-        previous_key: &str,
-        current_key: &str,
-        ttl_seconds: u64,
-    ) -> Result<(i64, i64), ()> {
-        self.sliding_window_increment_by(previous_key, current_key, 1, ttl_seconds)
-            .await
-    }
-
-    /// [`Self::sliding_window_increment`] with an explicit charge.
+    /// Read the previous weighted-window bucket, charge the current bucket,
+    /// and set its expiry in one Redis transaction.
     ///
     /// Used where one admission decision covers several units of work — the
     /// WebSocket frame limiter charges every physical fragment of a reassembled
@@ -4188,6 +4186,86 @@ impl RedisRateLimitClient {
                 self.note_command_failure(&e);
                 Err(())
             }
+        }
+    }
+
+    /// Atomically evaluate a bounded rate-limit snapshot on one dedicated,
+    /// non-reconnecting socket. All windows live in one value, so EXEC either
+    /// charges all of them or none. Refusals do not refresh the key's TTL.
+    /// `None` means contention exhausted the retry/deadline budget, not a Redis
+    /// outage: callers must refuse without switching to independent budgets.
+    pub(super) async fn update_rate_limit_state<T>(
+        &self,
+        key: &str,
+        ttl_seconds: u64,
+        max_bytes: usize,
+        mut update: impl FnMut(Option<&[u8]>, Duration) -> Result<(T, Option<Vec<u8>>), ()>,
+    ) -> Result<Option<T>, ()> {
+        let mut conn = self.get_dedicated_connection().await.ok_or(())?;
+        let transaction = async {
+            for _ in 0..32 {
+                let result: Result<_, redis::RedisError> = async {
+                    redis::cmd("WATCH")
+                        .arg(key)
+                        .query_async::<()>(&mut conn)
+                        .await?;
+                    // GETRANGE caps both the response allocation and decoding
+                    // work even if an external writer corrupts the stored key.
+                    let (bytes, (seconds, micros)): (Vec<u8>, (u64, u32)) = redis::pipe()
+                        .cmd("GETRANGE")
+                        .arg(key)
+                        .arg(0)
+                        .arg(max_bytes)
+                        .cmd("TIME")
+                        .query_async(&mut conn)
+                        .await?;
+                    Ok((bytes, seconds, micros))
+                }
+                .await;
+                let (bytes, seconds, micros) = result.map_err(|error| {
+                    self.note_command_failure(&error);
+                })?;
+                if bytes.len() > max_bytes || micros >= 1_000_000 {
+                    return Err(());
+                }
+                let sampled_at = Duration::new(seconds, micros * 1000);
+                let stored = (!bytes.is_empty()).then_some(bytes.as_slice());
+                let (outcome, replacement) = update(stored, sampled_at)?;
+                let Some(replacement) = replacement else {
+                    redis::cmd("UNWATCH")
+                        .query_async::<()>(&mut conn)
+                        .await
+                        .map_err(|error| self.note_command_failure(&error))?;
+                    self.note_command_success()?;
+                    return Ok(Some(outcome));
+                };
+                if replacement.len() > max_bytes {
+                    return Err(());
+                }
+                let committed: Option<(String,)> = redis::pipe()
+                    .atomic()
+                    .cmd("SET")
+                    .arg(key)
+                    .arg(replacement)
+                    .arg("EX")
+                    .arg(expire_seconds(ttl_seconds))
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|error| self.note_command_failure(&error))?;
+                self.note_command_success()?;
+                if committed.is_some() {
+                    return Ok(Some(outcome));
+                }
+                tokio::task::yield_now().await;
+            }
+            Ok(None)
+        };
+        // Dropping this privately owned connection also drops any WATCH state.
+        // An ambiguous timed-out commit is conservatively refused, never retried
+        // on a new socket and never admitted through local fallback.
+        match tokio::time::timeout(Duration::from_secs(2), transaction).await {
+            Ok(result) => result,
+            Err(_) => Ok(None),
         }
     }
 
