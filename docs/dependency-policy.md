@@ -56,7 +56,7 @@ surface drifts.
 
 | Lifecycle ID | Crate | Vendored ver. | Patch | Upstream issue / PR | Owner | Reason | Removal trigger | Docs |
 |---|---|---|---|---|---|---|---|---|
-| `sqlx-core-001-verify-ca-name-context` | `sqlx-core` | 0.8.6 | Handle rustls context-bearing hostname errors in verify-ca | **Deliberate fork** — unfiled upstream | Ferrum Edge maintainers | PostgreSQL and MySQL verify-ca otherwise reject trusted chains on hostname mismatch (#5534) | A compatible SQLx release handles both rustls hostname-error variants while retaining chain and signature verification | [Patch and retirement plan](upstream-sqlx-patches/001-verify-ca-name-context/README.md) |
+| `sqlx-core-001-verify-ca-name-context` | `sqlx-core` | 0.8.6 | Exclusive configured root CA, provider-pinned verify-ca verifier, and rustls context-bearing hostname errors | **Deliberate fork** — unfiled upstream | Ferrum Edge maintainers | PostgreSQL and MySQL verify-ca otherwise reject trusted chains on hostname mismatch (#5534); upstream also UNIONS the configured CA with the bundled public roots, so a name-waived verify-ca would trust any public certificate | A compatible SQLx release treats a configured root CA as exclusive and handles both rustls hostname-error variants while retaining chain and signature verification | [Patch and retirement plan](upstream-sqlx-patches/001-verify-ca-name-context/README.md) |
 | `reqwest-001-per-request-connect-timeout` | `reqwest` | 0.13.3 | Per-request `RequestBuilder::connect_timeout` | [seanmonstar/reqwest#3017](https://github.com/seanmonstar/reqwest/pull/3017) (OPEN) | Ferrum Edge maintainers | Pool keys exclude request-only connect/read timeouts, so sibling proxies can share one client; without per-request connect timeout the first proxy's timeout leaks to all | PR #3017 merges and ships in a release we consume | [docs/upstream-reqwest-patches/001-…](upstream-reqwest-patches/001-per-request-connect-timeout/README.md) |
 | `reqwest-002-selectable-rustls-provider` | `reqwest` | 0.13.3 | Selectable Ring/AWS-LC rustls fallback | **Deliberate fork** — unfiled upstream | Ferrum Edge maintainers | Library/test reqwest clients run before binary bootstrap; upstream's only built-in fallback hard-wires AWS-LC and cannot preserve Ferrum's mutually exclusive backend pair | Reqwest ships a provider-neutral selectable fallback, or the vendored crate is retired | [docs/upstream-reqwest-patches/002-…](upstream-reqwest-patches/002-selectable-rustls-provider/README.md) |
 | `reqwest-003-connection-admission-hook` | `reqwest` | 0.13.3 | `ClientBuilder::connection_admission` physical-connection admission hook | **Deliberate fork** — unfiled upstream | Ferrum Edge maintainers | DestinationRule `connectionPool.tcp.maxConnections` is a physical-connection ceiling; reqwest owns its socket pool and exposes no connection-lifetime hook, so no public API can admit a new socket and release on its close | Reqwest exposes a connection-lifecycle/admission hook (or a non-sealed connector connection type a `connector_layer` can wrap), or the vendored crate is retired | [docs/upstream-reqwest-patches/003-…](upstream-reqwest-patches/003-connection-admission-hook/README.md) |
@@ -302,6 +302,17 @@ a governance-doc-only pull request cannot skip the gate that guards it.
 The patches fix runtime behavior; these tests guard that behavior independently
 of the vendor copy and must keep passing after retirement:
 
+- A configured database root CA is the ONLY trust anchor under `verify-ca` and
+  `verify-full` — the vendored sqlx-core regressions
+  (`net::tls::tls_rustls::tests::root_store_with_configured_ca_replaces_the_default_trust_store`,
+  `net::tls::tls_rustls::tests::verify_ca_refuses_a_certificate_from_an_unconfigured_ca`),
+  run with
+  `cargo test --manifest-path vendor/sqlx-core-0.8.6-ferrum-patched/Cargo.toml --no-default-features --features _rt-tokio,_tls-rustls-ring-webpki --lib tls_rustls::tests`,
+  plus `tests/service_integration/db_tls.rs` and the
+  `FERRUM_DB_TLS_MODE=verify-ca` without-CA rejection in
+  `tests/unit/config/env_config_tests.rs`. Upstream ADDS the configured CA to
+  the bundled public roots, which combined with the `verify-ca` hostname waiver
+  accepts any publicly-trusted certificate for any name.
 - Per-request connect timeout across shared pool keys —
   `tests/integration/connection_pool_tests.rs`
   (`test_connect_timeout_does_not_fragment_pool`,

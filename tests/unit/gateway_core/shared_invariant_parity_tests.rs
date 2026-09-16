@@ -56,16 +56,32 @@ fn database_tls_snapshot_and_reload_cover_all_sql_consumers() {
         assert!(mode.contains("start_db_tls_reload_task("), "{path}");
     }
     let migrate = source("src/modes/migrate.rs");
-    assert_eq!(migrate.matches("connect_any_pool_with_timeout(").count(), 3);
+    // Floor, not an exact count: two production call sites plus the in-crate
+    // SQLite pragma test. A new migrate pool must not bypass the helper, but
+    // adding one must not need this number edited.
+    assert!(
+        migrate.matches("connect_any_pool_with_timeout(").count() >= 3,
+        "every migrate SQL pool must be opened through connect_any_pool_with_timeout"
+    );
+    for caller in ["async fn run_db_migrations(", "async fn show_db_status("] {
+        let body = item_body(&migrate, caller, "\n}");
+        assert!(body.contains("connect_any_pool_with_timeout("), "{caller}");
+    }
     assert!(source("src/modes/db_tls_reload.rs").contains("db.reconnect_tls("));
     for caller in [
         "pub async fn connect_with_pool_config(",
+        "pub async fn connect_with_failover(",
         "async fn reconnect_for_topology(",
         "async fn reconnect_tls_pools(",
+        "pub async fn connect_read_replica(",
         "pub async fn reconnect_read_replica(",
     ] {
         let body = item_body(&loader, caller, "\n    }");
-        assert!(body.contains("connect_any_pool_with_timeout("), "{caller}");
+        assert!(
+            body.contains("connect_any_pool_with_timeout(")
+                || body.contains("Self::connect_with_pool_config("),
+            "{caller}"
+        );
     }
 }
 

@@ -222,22 +222,17 @@ optional = true
 version = "0.26"
 optional = true
 
-[dev-dependencies.sqlx]
-version = "=0.8.6"
-features = [
-    "postgres",
-    "sqlite",
-    "mysql",
-    "migrate",
-    "macros",
-    "time",
-    "uuid",
-]
-default-features = false
-
-[dev-dependencies.tokio]
-version = "1"
-features = ["rt"]
+# Ferrum patch: upstream's `[dev-dependencies]` (the whole `sqlx` facade with
+# the postgres/sqlite/mysql/migrate/macros drivers, plus tokio) served only
+# this crate's doctests, which reference `sqlx::` paths. They are dropped here
+# because the vendored copy is consumed through `[patch.crates-io]`, where a
+# dependency's dev-dependencies are never resolved, while `cargo test
+# --manifest-path ... --lib` DOES build them: keeping them would compile three
+# SQL drivers, a bundled SQLite C library, and a proc-macro crate (in a feature
+# combination upstream only ever resolves from its own workspace) just to run
+# two `src/net/tls/tls_rustls.rs` unit tests in the `test-vendor-patches` CI
+# job. No `#[cfg(test)]` module in this crate uses them. `cargo test --doc` on
+# the vendored copy is correspondingly not supported.
 
 [features]
 _rt-async-std = [

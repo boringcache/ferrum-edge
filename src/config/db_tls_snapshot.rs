@@ -3,13 +3,29 @@
 //! Private PEM copies keep both CA and client identity fixed for that pool's
 //! entire lifetime, including idle eviction and server-initiated disconnects.
 
-use std::io::Write;
-use std::sync::Arc;
+use std::io::{Seek, SeekFrom, Write};
+use std::sync::{Arc, OnceLock};
 
 use sqlx::any::AnyPoolOptions;
 use tempfile::NamedTempFile;
+use tokio::sync::Semaphore;
 
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
+
+/// One snapshot read may stay blocked in the kernel after its async caller's
+/// connect timeout drops the receiving future. The permit moves INTO the
+/// detached OS thread, so a persistent mount outage admits at most one blocked
+/// reader process-wide instead of one per reconnect attempt
+/// (`.claude/rules/tls-security.md`: `_FILE`-class reads never run on
+/// `spawn_blocking`, whose pool pins runtime teardown).
+static SQL_TLS_SNAPSHOT_READ_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn sql_tls_snapshot_read_limit() -> Arc<Semaphore> {
+    Arc::clone(SQL_TLS_SNAPSHOT_READ_LIMIT.get_or_init(|| Arc::new(Semaphore::new(1))))
+}
+
+/// Zeroing buffer size for the pre-unlink scrub of a private PEM copy.
+const SNAPSHOT_SCRUB_CHUNK_BYTES: usize = 4096;
 
 pub struct SqlTlsSnapshot {
     url: String,
@@ -76,6 +92,50 @@ impl SqlTlsSnapshot {
         })
     }
 
+    /// [`Self::load`] on a **detached OS thread**, fenced by a process-wide
+    /// one-permit semaphore.
+    ///
+    /// `load` opens operator-controlled pathnames with blocking `std::fs`, so a
+    /// FIFO or stalled NFS mount blocks uninterruptibly. Running it under
+    /// `tokio::task::spawn_blocking` would return on schedule when the caller's
+    /// connect timeout fires but leave the blocking-pool thread pinned, and
+    /// runtime teardown then waits for that pool — the hazard
+    /// `.claude/rules/tls-security.md` documents for `_FILE` reads. A detached
+    /// thread is owned by no runtime and is never joined, and because the
+    /// permit moves into it, a persistent outage admits at most one blocked
+    /// reader no matter how fast the reload watcher retries.
+    ///
+    /// Dropping the returned future does not interrupt the kernel read; the
+    /// snapshot the abandoned thread eventually produces is dropped on the
+    /// spot, which unlinks any private file it created.
+    pub(crate) async fn load_detached(db_url: &str, db_type: &str) -> Result<Self, sqlx::Error> {
+        let db_url = db_url.to_string();
+        let db_type = db_type.to_string();
+        let permit = sql_tls_snapshot_read_limit()
+            .acquire_owned()
+            .await
+            .map_err(|_| snapshot_error("SQL TLS snapshot reader unavailable"))?;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let join_handle = std::thread::Builder::new()
+            .name("ferrum-sql-tls-snapshot".to_string())
+            .spawn(move || {
+                // The permit belongs to the blocking read, not to the awaiting
+                // future: later attempts stay fenced until this one really
+                // exits.
+                let _permit = permit;
+                let _ = sender.send(Self::load(&db_url, &db_type));
+            })
+            .map_err(|error| sqlx::Error::Configuration(error.into()))?;
+
+        // Dropping the handle detaches the thread. Never join: a blocked read
+        // must not pin shutdown after the caller's timeout.
+        drop(join_handle);
+
+        receiver
+            .await
+            .map_err(|_| snapshot_error("SQL TLS snapshot read produced no result"))?
+    }
+
     pub fn url(&self) -> &str {
         &self.url
     }
@@ -92,6 +152,43 @@ impl SqlTlsSnapshot {
         });
         (options, url)
     }
+}
+
+impl Drop for SqlTlsSnapshot {
+    /// Overwrite each private PEM copy before `NamedTempFile` unlinks it.
+    ///
+    /// The in-memory material is already zeroizing
+    /// (`tls::source::SecretBytes`), so the temp file is the only remaining
+    /// plaintext copy of the database client key, and an unlink alone leaves
+    /// its blocks readable until the filesystem reuses them. Best effort: a
+    /// read-only or already-removed file simply skips, and the unlink still
+    /// happens.
+    fn drop(&mut self) {
+        for file in &mut self.files {
+            let handle = file.as_file_mut();
+            let Ok(metadata) = handle.metadata() else {
+                continue;
+            };
+            let mut remaining = metadata.len();
+            if remaining == 0 || handle.seek(SeekFrom::Start(0)).is_err() {
+                continue;
+            }
+            let zeros = [0u8; SNAPSHOT_SCRUB_CHUNK_BYTES];
+            while remaining > 0 {
+                let chunk = std::cmp::min(remaining, SNAPSHOT_SCRUB_CHUNK_BYTES as u64) as usize;
+                if handle.write_all(&zeros[..chunk]).is_err() {
+                    break;
+                }
+                remaining -= chunk as u64;
+            }
+            let _ = handle.flush();
+            let _ = handle.sync_data();
+        }
+    }
+}
+
+fn snapshot_error(message: &'static str) -> sqlx::Error {
+    sqlx::Error::Configuration(message.into())
 }
 
 fn material_kind(db_type: &str, key: &str) -> Option<MaterialKind> {

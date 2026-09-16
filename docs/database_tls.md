@@ -40,17 +40,28 @@ For PostgreSQL and MySQL, Ferrum appends TLS query parameters to `FERRUM_DB_URL`
 | `allow` | `sslmode=allow` | N/A | N/A | Maybe | No | No | PostgreSQL-only. Tries plaintext first, then retries TLS if plaintext fails. Not a production-safe setting. |
 | `prefer` | `sslmode=prefer` | `ssl-mode=PREFERRED` | N/A | Maybe | No | No | Tries TLS first, but may fall back to plaintext when the server does not support TLS. |
 | `require` | `sslmode=require` | `ssl-mode=REQUIRED` | TLS enabled with invalid certificates allowed | Yes | No | No | Requires encryption but does not verify the server certificate or hostname. Use only for testing or separately authenticated private networks. |
-| `verify-ca` | `sslmode=verify-ca` | `ssl-mode=VERIFY_CA` | N/A | Yes | Yes | No | Requires TLS and verifies that the certificate chains to the configured CA, but does not verify the requested hostname. |
-| `verify-full` | `sslmode=verify-full` | `ssl-mode=VERIFY_IDENTITY` | TLS enabled with certificate validation | Yes | Yes | Yes | Requires TLS, validates the CA chain, and verifies the requested hostname. This is the recommended production mode. |
+| `verify-ca` | `sslmode=verify-ca` | `ssl-mode=VERIFY_CA` | N/A | Yes | Yes | No | Requires TLS and verifies that the certificate chain ends at the CONFIGURED CA only, but does not verify the requested hostname. `FERRUM_DB_TLS_CA_CERT_PATH` (or `FERRUM_DB_TLS_CA_CERT_SOURCE`) is mandatory for this mode. |
+| `verify-full` | `sslmode=verify-full` | `ssl-mode=VERIFY_IDENTITY` | TLS enabled with certificate validation | Yes | Yes | Yes | Requires TLS, validates the CA chain, and verifies the requested hostname. A configured CA is the only trust anchor; with no configured CA the platform's bundled public roots are used. This is the recommended production mode. |
 
 For PostgreSQL, client certificate parameters can be present with `allow` or `prefer`, but those modes may still use plaintext. Client-certificate authentication effectively requires `require`, `verify-ca`, or `verify-full`; use `verify-full` for production.
 
-For PostgreSQL and MySQL, `verify-ca` accepts a trusted certificate whose DNS
-or IP SAN does not match the database URL host. It still rejects an untrusted
-chain, an expired or not-yet-valid server certificate, and invalid TLS handshake
-signatures. `verify-full` adds the hostname check. These semantics share the
-same SQL connection path in database, CP, and migrate modes, including failover
-and admin-read replica connections. MongoDB's supported modes remain `disable`,
+A configured CA is **exclusive**. When `FERRUM_DB_TLS_CA_CERT_PATH` (or its
+`FERRUM_DB_TLS_CA_CERT_SOURCE` override) is set, that CA *replaces* the
+platform's bundled public root store for PostgreSQL and MySQL connections
+under both `verify-ca` and `verify-full`; it is never added to it, which is the
+same meaning libpq gives `sslrootcert`. When no CA is configured, the bundled
+public roots are used unchanged — which is valid only for `verify-full`, where
+the hostname check still binds the certificate to the database host.
+`FERRUM_DB_TLS_MODE=verify-ca` with no configured CA is refused at startup,
+because a name-waived mode over a public root store authenticates nothing.
+
+For PostgreSQL and MySQL, `verify-ca` accepts a certificate issued by the
+configured CA whose DNS or IP SAN does not match the database URL host. It
+still rejects a chain that does not end at the configured CA, an expired or
+not-yet-valid server certificate, and invalid TLS handshake signatures.
+`verify-full` adds the hostname check. These semantics share the same SQL
+connection path in database, CP, and migrate modes, including failover and
+admin-read replica connections. MongoDB's supported modes remain `disable`,
 `require`, and `verify-full`; it does not support `verify-ca`.
 
 SQLite is an embedded, file-based database. Because there is no network connection to secure, `FERRUM_DB_TLS_MODE=disable` is accepted as a no-op, while certificate paths and every other TLS mode are rejected when `FERRUM_DB_TYPE=sqlite`.
@@ -76,6 +87,13 @@ connections never reread the operator's mutable pathname. A rejected CA or
 identity reload retains the previously accepted material even after the
 database closes sessions or the pool evicts idle connections. New connections
 still perform the configured certificate verification using that material.
+
+Each snapshot is a private temporary file, so PostgreSQL/MySQL pools now
+require a writable temporary directory (`TMPDIR`, or `/tmp` when it is unset)
+even when all TLS material is file-backed; the files are created mode `0600`,
+overwritten with zeros before they are unlinked, and the in-memory PEM buffer
+is zeroizing. Container images with a read-only root filesystem must mount a
+writable `/tmp` (the shipped charts already do).
 
 SQL reloads stage the primary and any configured replica before publishing
 either candidate. If either fails, both live pools keep their accepted

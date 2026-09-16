@@ -609,6 +609,28 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # expose an equivalent `&self` + `'static` `stopped` watch, remove the
 # `[patch.crates-io]` line, drop `vendor/h3-quinn-0.0.10-ferrum-patched/`,
 # and bump the `h3-quinn` floor. See `docs/upstream-h3-quinn-patches/`.
+#
+# We also carry a vendored copy of sqlx-core 0.8.6 whose rustls handshake
+# treats a configured root CA as EXCLUSIVE and accepts rustls 0.23's
+# context-bearing hostname error under `verify-ca`. Upstream unions the
+# configured CA with the ~150 bundled WebPKI roots, so a `verify-ca`
+# connection — which deliberately waives the hostname check — would accept any
+# publicly-trusted certificate for any name; and upstream waives only
+# `CertificateError::NotValidForName`, so `verify-ca` rejects every trusted
+# chain whose SAN does not match once rustls reports
+# `NotValidForNameContext`. The verify-ca WebPKI verifier is also pinned to
+# the provider the handshake already selected, because the provider-less
+# builder panics when both `ring` and `aws-lc-rs` are compiled in and no
+# process default was installed. A gateway-side TLS option cannot reach SQLx
+# Any's internal verifier, and a SQLx 0.9 migration would change the whole
+# database dependency graph for a compatibility fix.
+#
+# Retirement plan: when a compatible SQLx release treats a configured root CA
+# as exclusive and handles both rustls hostname-error variants while keeping
+# chain, validity, and signature verification, remove the `[patch.crates-io]`
+# line, drop `vendor/sqlx-core-0.8.6-ferrum-patched/`, and update both
+# lockfiles and the drift manifest. See
+# `docs/upstream-sqlx-patches/001-verify-ca-name-context/README.md`.
 [patch.crates-io]
 sqlx-core = { path = "vendor/sqlx-core-0.8.6-ferrum-patched" }
 reqwest = { path = "vendor/reqwest-0.13.3-ferrum-patched" }

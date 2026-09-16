@@ -82,7 +82,9 @@
         }
       },
       "regression_tests": [
+        "vendor/sqlx-core-0.8.6-ferrum-patched (tls_rustls::tests)",
         "tests/unit/config/db_tls_snapshot_tests.rs",
+        "tests/unit/config/env_config_tests.rs",
         "tests/service_integration/db_tls.rs"
       ]
     },

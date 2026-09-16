@@ -1495,6 +1495,15 @@ jobs:
       - name: Run vendored dimpl credential security regressions
         run: cargo test --manifest-path vendor/dimpl-0.6.1-ferrum-patched/Cargo.toml --features test-hooks --test auto credential_security
 
+      - name: Run vendored sqlx-core exclusive-root-CA regressions
+        # `verify-ca` waives only the hostname check, so a configured
+        # FERRUM_DB_TLS_CA_CERT_PATH must REPLACE the bundled public roots
+        # rather than join them; otherwise any publicly-trusted certificate for
+        # any name is accepted on a SQL connection. sqlx-core's default feature
+        # list is empty, so the rustls TLS module is only built when a runtime
+        # and a rustls backend are named explicitly.
+        run: cargo test --manifest-path vendor/sqlx-core-0.8.6-ferrum-patched/Cargo.toml --no-default-features --features _rt-tokio,_tls-rustls-ring-webpki --lib tls_rustls::tests
+
       - name: Download integration tests archive
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:

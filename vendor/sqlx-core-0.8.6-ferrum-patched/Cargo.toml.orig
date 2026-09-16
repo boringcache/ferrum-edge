@@ -84,9 +84,11 @@ indexmap = "2.0"
 event-listener = "5.2.0"
 hashbrown = "0.15.0"
 
-[dev-dependencies]
-sqlx = { workspace = true, features = ["postgres", "sqlite", "mysql", "migrate", "macros", "time", "uuid"] }
-tokio = { version = "1", features = ["rt"] }
+# Ferrum patch: upstream's `[dev-dependencies]` served only this crate's
+# doctests. They are dropped so `cargo test --manifest-path ... --lib` in the
+# `test-vendor-patches` CI job does not build three SQL drivers, a bundled
+# SQLite C library, and a proc-macro crate for two unit tests. See the note in
+# the packaged `Cargo.toml`.
 
 [lints]
 workspace = true

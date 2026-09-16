@@ -4914,6 +4914,87 @@ fn test_env_config_db_tls_rejects_sqlite_disable_with_cert_paths() {
 }
 
 #[test]
+fn test_env_config_db_tls_rejects_verify_ca_without_a_configured_ca() {
+    // `verify-ca` waives the hostname check AND a configured CA replaces the
+    // bundled public roots, so verify-ca with no CA pins nothing at all.
+    for db_type in ["postgres", "mysql"] {
+        let db_url = format!("{db_type}://localhost/ferrum");
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "database"),
+                (
+                    "FERRUM_ADMIN_JWT_SECRET",
+                    "secret-padding-for-32-characters!!",
+                ),
+                ("FERRUM_DB_TYPE", db_type),
+                ("FERRUM_DB_URL", db_url.as_str()),
+                ("FERRUM_DB_TLS_MODE", "verify-ca"),
+            ],
+            || {
+                let err = EnvConfig::from_env().unwrap_err();
+                assert!(
+                    err.contains("FERRUM_DB_TLS_MODE=verify-ca requires FERRUM_DB_TLS_CA_CERT_PATH")
+                        && err.contains("FERRUM_DB_TLS_CA_CERT_SOURCE"),
+                    "{db_type}: {err}"
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn test_env_config_db_tls_accepts_verify_ca_with_a_source_override_only() {
+    // The `_SOURCE` override populates `db_tls_ca_cert_path`, so it satisfies
+    // the requirement on its own.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+            ("FERRUM_DB_TLS_MODE", "verify-ca"),
+            ("FERRUM_DB_TLS_CA_CERT_SOURCE", "/certs/source-ca.pem"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.effective_db_url().unwrap().unwrap(),
+                "postgres://localhost/ferrum?sslmode=verify-ca&sslrootcert=/certs/source-ca.pem"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_db_tls_accepts_verify_full_without_a_configured_ca() {
+    // `verify-full` over the bundled public roots still binds the certificate
+    // to the database host through the hostname check, so it stays valid.
+    for db_type in ["postgres", "mysql"] {
+        let db_url = format!("{db_type}://localhost/ferrum");
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "database"),
+                (
+                    "FERRUM_ADMIN_JWT_SECRET",
+                    "secret-padding-for-32-characters!!",
+                ),
+                ("FERRUM_DB_TYPE", db_type),
+                ("FERRUM_DB_URL", db_url.as_str()),
+                ("FERRUM_DB_TLS_MODE", "verify-full"),
+            ],
+            || {
+                let config = EnvConfig::from_env().unwrap();
+                assert_eq!(config.db_tls_mode, Some(DbTlsMode::VerifyFull));
+                assert!(config.db_tls_ca_cert_path.is_none());
+            },
+        );
+    }
+}
+
+#[test]
 fn test_env_config_db_tls_rejects_mysql_allow_mode() {
     with_env_vars(
         &[

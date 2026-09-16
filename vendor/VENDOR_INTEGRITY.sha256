@@ -305,8 +305,8 @@ e0698e952a6b11b2411e7784175c9943d8f321e2c8753fe7f49141b9f3f9c6b9  vendor/tungste
 48d0da233482cfa7e5d880632711ca6b0e45d8d7a2ff84f83d6ee70a38fd879a  vendor/tungstenite-0.29.0-ferrum-patched/src/util.rs
 afbf9d0f3560b0fd7795e81c42a0a79ee6b6fc67e064f77826aee642cad28d91  vendor/sqlx-core-0.8.6-ferrum-patched/.cargo-ok
 d47653a9c872e6148a2a9eca040a76494d79b374500b97b4e9364dceb02c173c  vendor/sqlx-core-0.8.6-ferrum-patched/.cargo_vcs_info.json
-5adbc5d72a551014a50558beb8d12043c3667f7b7ba0a38b955c73f887a14801  vendor/sqlx-core-0.8.6-ferrum-patched/Cargo.toml
-b7407194ded2854f7d5e5009f072a18e842c81fde59ca99ca4113e410046eebb  vendor/sqlx-core-0.8.6-ferrum-patched/Cargo.toml.orig
+984781b292c997d72f09c6ff4ac0602eccf65e199ab3ed4e6c34b6a69e706947  vendor/sqlx-core-0.8.6-ferrum-patched/Cargo.toml
+a749ac71046e68f2e184399e160d04d71aa99c089b2e3a4f8353c406552bd6f5  vendor/sqlx-core-0.8.6-ferrum-patched/Cargo.toml.orig
 9be39331309bc958aab10457c1a8459c038ae95662f26dfcf6c9088e2b3d653f  vendor/sqlx-core-0.8.6-ferrum-patched/LICENSE-APACHE
 44b1600a26039a75b28e1ce154a5dd163b16549f50e34fa577d9efe9c1bae179  vendor/sqlx-core-0.8.6-ferrum-patched/LICENSE-MIT
 541492016d684f29d9a9f4e8f70d4bda7fc457e1e136097563ed443248a6dcb5  vendor/sqlx-core-0.8.6-ferrum-patched/src/acquire.rs
@@ -372,7 +372,7 @@ fc9ce11d0a2542a9f3a9e50d210b678670001edf8fe1d3e6c1cb37ccbb7fdb0c  vendor/sqlx-co
 1e0e49cd0f61682bcbcfc9785e33dce8d929da8acd914e175b43c6cb0c9676fe  vendor/sqlx-core-0.8.6-ferrum-patched/src/net/socket/mod.rs
 01696d72da790695731b565f9473e3047ff5651b4d71781ef38e9e53fe104c81  vendor/sqlx-core-0.8.6-ferrum-patched/src/net/tls/mod.rs
 fe42160bf1ec62dd44a079d2f7c682780138633dea0dc1fff161213d4a4639fd  vendor/sqlx-core-0.8.6-ferrum-patched/src/net/tls/tls_native_tls.rs
-aaf3eb19b03d803656046cd72b5b777615840c3e36ba252fa85cd6188d95cf4e  vendor/sqlx-core-0.8.6-ferrum-patched/src/net/tls/tls_rustls.rs
+a5ff2130c2f56f30cca3f1aa234903a376ce14369132ed18efcd757d9b43b579  vendor/sqlx-core-0.8.6-ferrum-patched/src/net/tls/tls_rustls.rs
 ae6f34c61e86c84e57c36576a2000f8fa4643c57fc9810ee28065aee46a44ab6  vendor/sqlx-core-0.8.6-ferrum-patched/src/net/tls/util.rs
 e67d3755b3f9d57154658b1f898bb863d5fd553cdf089d86cd653ba5952bafa2  vendor/sqlx-core-0.8.6-ferrum-patched/src/pool/connection.rs
 5ea07b96227abe4ba8c9f04960034bece961c1d47938dd72fd665fdb6ff49c3d  vendor/sqlx-core-0.8.6-ferrum-patched/src/pool/executor.rs

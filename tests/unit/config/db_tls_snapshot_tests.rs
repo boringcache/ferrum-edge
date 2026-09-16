@@ -158,3 +158,61 @@ fn sql_tls_snapshot_selects_last_driver_alias_without_reading_shadowed_paths() {
         assert_eq!(SqlTlsSnapshot::load(url, "sqlite").unwrap().url(), url);
     });
 }
+
+#[cfg(unix)]
+#[test]
+fn sql_tls_snapshot_files_are_owner_only_and_scrubbed_before_unlink() {
+    use std::os::unix::fs::PermissionsExt;
+
+    with_env_vars(&[], || {
+        for (db_type, ca_key, cert_key, key_key) in [
+            ("postgres", "sslrootcert", "sslcert", "sslkey"),
+            ("mysql", "ssl-ca", "ssl-cert", "ssl-key"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut url = url::Url::parse(&format!("{db_type}://localhost/ferrum")).unwrap();
+            for key in [ca_key, cert_key, key_key] {
+                let path = dir.path().join(format!("{key}.pem"));
+                // Deliberately world-readable at the source: the private copy
+                // must not inherit it.
+                std::fs::write(&path, format!("secret {key} material")).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+                url.query_pairs_mut()
+                    .append_pair(key, path.to_str().unwrap());
+            }
+
+            let snapshot = SqlTlsSnapshot::load(url.as_str(), db_type).unwrap();
+            let mut snapshot_paths = Vec::new();
+            for key in [ca_key, cert_key, key_key] {
+                let path = material_path(&snapshot, key);
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(
+                    mode, 0o600,
+                    "{db_type} {key} snapshot must be owner-read/write only, got {mode:#o}"
+                );
+                snapshot_paths.push(path);
+            }
+
+            // Hard-link one copy so the bytes stay reachable after the snapshot
+            // unlinks its own name; the scrub must have zeroed them first.
+            let key_index = 2;
+            let observer = dir.path().join("observer.pem");
+            std::fs::hard_link(&snapshot_paths[key_index], &observer).unwrap();
+            assert_eq!(
+                std::fs::read(&observer).unwrap(),
+                format!("secret {key_key} material").into_bytes(),
+            );
+
+            drop(snapshot);
+            for path in &snapshot_paths {
+                assert!(!path.exists(), "snapshot file must be unlinked on drop");
+            }
+            let scrubbed = std::fs::read(&observer).unwrap();
+            assert!(
+                scrubbed.iter().all(|byte| *byte == 0),
+                "{db_type} private key copy must be zeroed before unlink, got {scrubbed:?}"
+            );
+            assert_eq!(scrubbed.len(), format!("secret {key_key} material").len());
+        }
+    });
+}
