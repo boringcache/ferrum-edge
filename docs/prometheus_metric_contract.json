@@ -2669,7 +2669,7 @@
   {
     "name": "ferrum_mesh_bpf_drops_total",
     "type": "counter",
-    "help": "Connection-bypass decisions by reason, produced by the connect4/connect6 capture hooks.",
+    "help": "Connection-bypass decisions by reason, produced by the connect4/connect6 capture hooks and counted on per-CPU kernel counters, so an overrun of the event ringbuf cannot silently lose a decision.",
     "labels": [
       "reason"
     ],
