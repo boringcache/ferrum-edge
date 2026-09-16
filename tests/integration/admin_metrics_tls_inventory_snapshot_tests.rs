@@ -442,9 +442,10 @@ async fn admin_inventory_fixtures_keep_collectors_snapshots_and_invalidations_is
     let (first_base, first_shutdown) = start_admin(admin_state_with_proxy(first_proxy)).await;
     assert!(scrape(&client, &first_base).await.contains(first.cert_id));
     let release = first.block_next_fetch();
-    // Zero TTL deterministically exercises expiry without moving wall clocks.
+    // A 1 ns TTL is always expired without moving wall clocks and stays inside
+    // the positive domain production passes (both call sites gate on ttl > 0).
     let pending = first_cache
-        .schedule_refresh_if_due(Duration::ZERO)
+        .schedule_refresh_if_due(Duration::from_nanos(1))
         .expect("expired snapshot must refresh");
     first.wait_for_fetches(2).await;
 

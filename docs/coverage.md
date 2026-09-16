@@ -93,8 +93,10 @@ serving-cycle generation fencing, and invalidation during collection. Two active
 admin fixtures own separate caches, collectors, and metrics registries, including
 while one collector is blocked and the other fixture reloads. They use channel
 barriers and refresh-task completion rather than sleeps or scrape retries, so
-`cargo test --test integration_tests admin` remains supported with parallel test
-threads (#5544).
+`cargo test --test integration_tests admin` keeps working with parallel test
+threads (#5544). Hosted CI runs integration tests under nextest, one process per
+test, so that single-process property holds by construction rather than by a
+CI gate.
 
 ## CI Baseline And Gates
 

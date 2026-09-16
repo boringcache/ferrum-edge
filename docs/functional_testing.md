@@ -16,8 +16,10 @@ Each counting fixture owns its inventory cache and metrics registry. The suite
 checks concurrent fixtures, config reload invalidation, serving-cycle replacement,
 single-flight collection, and fetch-free cached scrapes. Collector channels and
 joined refresh tasks provide synchronization without sleeps or retries; the broad
-Cargo invocation uses its normal parallel test threads. Production retains the
-process-wide cache, TTL, and TLS-event invalidation behavior.
+Cargo invocation uses its normal parallel test threads, which hosted CI does not
+exercise (it runs integration tests under nextest, one process per test).
+Production retains the process-wide cache, TTL, and TLS-event invalidation
+behavior.
 
 ### cp_dp_grpc_tests.rs
 
