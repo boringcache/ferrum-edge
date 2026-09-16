@@ -22,8 +22,9 @@ use ferrum_edge::ebpf::bpf_metrics::{
     bpf_latency_exclusive_bucket_index,
 };
 use ferrum_edge::ebpf::event_consumer::{
-    BPF_DROP_REASON_COUNT, BPF_DROP_REASON_STATS_SLOTS, PollOutcome, SockOpsConsumer, SockOpsEvent,
-    drop_reason_delta, seed_dropped_baseline,
+    BPF_DROP_REASON_COUNT, BPF_DROP_REASON_STATS_SLOTS, PollOutcome, RingBufAttach, RingBufCursor,
+    SockOpsConsumer, SockOpsEvent, drain_outstanding_records, drop_reason_delta, ringbuf_attach,
+    ringbuf_outstanding_bytes, seed_dropped_baseline,
 };
 use ferrum_edge::plugins::mesh::bpf_metrics::MeshBpfMetrics;
 use serde_json::json;
@@ -753,4 +754,277 @@ fn drop_reason_delta_adopts_a_reset_generation_without_stalling() {
     // Generation reset: everything the new map reports is new.
     assert_eq!(drop_reason_delta(9_000, 3), 3);
     assert_eq!(drop_reason_delta(u64::MAX, 1), 1);
+}
+
+/// Ringbuf record stride used by the fake cursor: the kernel's 8-byte record
+/// header plus a `SockOpsRecord`, rounded up to the 8-byte boundary the
+/// kernel reserves on.
+const FAKE_RECORD_STRIDE: u64 = 32;
+
+/// Default ringbuf size (`FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES`).
+const FAKE_RING_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Fake ringbuf cursor that reproduces the defect behind issue #5563.
+///
+/// `with_next_record` never checks the producer position — exactly like aya
+/// 0.13's `RingBuf`, whose cached producer position starts at `0` and is only
+/// refreshed once its own consumer position catches that cache up, a
+/// condition a pinned ring opened with a non-zero consumer position can never
+/// reach. Left unbounded it wraps around the resident records forever, which
+/// is what made every `ferrum_mesh_bpf_*` counter on an ambient pod a pure
+/// rescale of one replayed record multiset. Only the producer-position bound
+/// stops it.
+struct ReplayingRingBuf {
+    /// Resident records, in ring order.
+    records: Vec<Vec<u8>>,
+    /// Consumer position of `records[0]`.
+    base: u64,
+    consumer_pos: u64,
+    producer_pos: u64,
+    /// Consumer position of a record the producer has not committed yet.
+    busy_at: Option<u64>,
+    /// Publish `count` more records right after the `nth` record is taken,
+    /// modelling a producer that commits while a drain pass is running.
+    publish_after_take: Option<(usize, u64)>,
+    /// Every record ever handed out, in delivery order.
+    delivered: Vec<Vec<u8>>,
+}
+
+impl ReplayingRingBuf {
+    fn with_resident(base: u64, records: Vec<Vec<u8>>) -> Self {
+        let producer_pos = base + FAKE_RECORD_STRIDE * records.len() as u64;
+        Self {
+            records,
+            base,
+            consumer_pos: base,
+            producer_pos,
+            busy_at: None,
+            publish_after_take: None,
+            delivered: Vec::new(),
+        }
+    }
+
+    /// Publish `count` more records without changing the resident set, so a
+    /// replay and a genuinely new record differ only by position.
+    fn publish(&mut self, count: u64) {
+        self.producer_pos += FAKE_RECORD_STRIDE * count;
+    }
+}
+
+impl RingBufCursor for ReplayingRingBuf {
+    fn producer_position(&self) -> u64 {
+        self.producer_pos
+    }
+
+    fn consumer_position(&self) -> u64 {
+        self.consumer_pos
+    }
+
+    fn with_next_record<R, F: FnOnce(&[u8]) -> R>(&mut self, f: F) -> Option<R> {
+        if self.busy_at == Some(self.consumer_pos) {
+            return None;
+        }
+        let slot = ((self.consumer_pos - self.base) / FAKE_RECORD_STRIDE) as usize;
+        let record = self.records[slot % self.records.len()].clone();
+        self.consumer_pos += FAKE_RECORD_STRIDE;
+        let result = f(record.as_slice());
+        self.delivered.push(record);
+        if let Some((nth, count)) = self.publish_after_take
+            && self.delivered.len() == nth
+        {
+            self.publish(count);
+        }
+        Some(result)
+    }
+}
+
+fn rtt_record_bytes(srtt_us: u64) -> Vec<u8> {
+    use ferrum_ebpf_common::SOCK_OPS_EVENT_RTT_SAMPLE;
+
+    let record = SockOpsRecord {
+        event_type: SOCK_OPS_EVENT_RTT_SAMPLE,
+        direction: 0,
+        drop_reason: 0,
+        _pad: 0,
+        value: srtt_us,
+    };
+    // SAFETY: `SockOpsRecord` is `#[repr(C)]` with an explicit `_pad`, so its
+    // byte layout is the ringbuf wire format.
+    let bytes: [u8; std::mem::size_of::<SockOpsRecord>()] = unsafe { std::mem::transmute(record) };
+    bytes.to_vec()
+}
+
+fn resume(outstanding_bytes: u64) -> RingBufAttach {
+    RingBufAttach::Resume { outstanding_bytes }
+}
+
+fn drain_into(ring: &mut ReplayingRingBuf, consumer: &SockOpsConsumer) -> u32 {
+    drain_outstanding_records(ring, FAKE_RING_BYTES, |bytes: &[u8]| {
+        if let Some(event) = SockOpsEvent::from_record_bytes(bytes) {
+            consumer.handle_event(event);
+        }
+    })
+}
+
+#[test]
+fn outstanding_bytes_accepts_only_positions_a_live_ring_can_hold() {
+    // A ring nobody has written yet.
+    assert_eq!(ringbuf_outstanding_bytes(0, 0, FAKE_RING_BYTES), Some(0));
+    // Caught up part-way through the ring's life.
+    assert_eq!(
+        ringbuf_outstanding_bytes(9_000, 9_000, FAKE_RING_BYTES),
+        Some(0)
+    );
+    // An ordinary backlog.
+    assert_eq!(
+        ringbuf_outstanding_bytes(9_000, 8_968, FAKE_RING_BYTES),
+        Some(32)
+    );
+    // Exactly full: the kernel drops rather than overwrite unconsumed data,
+    // so this is the largest backlog a live ring can present.
+    assert_eq!(
+        ringbuf_outstanding_bytes(FAKE_RING_BYTES, 0, FAKE_RING_BYTES),
+        Some(FAKE_RING_BYTES)
+    );
+    // Behind by more than a whole ring — impossible for a live producer.
+    assert_eq!(
+        ringbuf_outstanding_bytes(FAKE_RING_BYTES + 32, 0, FAKE_RING_BYTES),
+        None
+    );
+    // Ahead of the producer: the state a replaying consumer leaves behind,
+    // and the state that makes every kernel reserve underflow and drop.
+    assert_eq!(
+        ringbuf_outstanding_bytes(9_000, 9_032, FAKE_RING_BYTES),
+        None
+    );
+}
+
+#[test]
+fn attach_resynchronizes_only_an_unusable_consumer_position() {
+    assert_eq!(
+        ringbuf_attach(0, 0, FAKE_RING_BYTES),
+        resume(0),
+        "a freshly pinned ring is resumable"
+    );
+    assert_eq!(
+        ringbuf_attach(123_456, 123_424, FAKE_RING_BYTES),
+        resume(32),
+        "a predecessor's position with a real backlog is resumable"
+    );
+    assert_eq!(
+        ringbuf_attach(123_456, 123_488, FAKE_RING_BYTES),
+        RingBufAttach::Resynchronize,
+        "a consumer position past the producer must be repaired"
+    );
+    assert_eq!(
+        ringbuf_attach(FAKE_RING_BYTES * 2, 0, FAKE_RING_BYTES),
+        RingBufAttach::Resynchronize,
+        "a position stale by more than a whole ring must be repaired"
+    );
+}
+
+/// The headline regression for issue #5563: a consumer attaching to a
+/// pre-filled ring drains it exactly once, a wakeup that finds nothing new
+/// adds nothing, and records published afterwards are still observed.
+#[test]
+fn a_prefilled_ring_drains_exactly_once_and_then_stays_quiet() {
+    let consumer = SockOpsConsumer::new(BpfMetricsState::new());
+    let resident: Vec<Vec<u8>> = (1..=4).map(|i| rtt_record_bytes(i * 100)).collect();
+    // A predecessor pod left the consumer position well past zero, and the
+    // ring filled up behind it before this consumer attached.
+    let mut ring = ReplayingRingBuf::with_resident(1_000_000, resident.clone());
+
+    let drained = drain_into(&mut ring, &consumer);
+
+    assert_eq!(drained, 4, "every resident record is delivered");
+    assert_eq!(ring.delivered, resident, "and delivered exactly once");
+    assert_eq!(ring.consumer_position(), ring.producer_position());
+    let after_first_drain = consumer.metrics().snapshot();
+    assert_eq!(after_first_drain.ringbuf_events_consumed, 4);
+    assert_eq!(after_first_drain.srtt_count, 4);
+    assert_eq!(after_first_drain.srtt_sample_us_sum, 100 + 200 + 300 + 400);
+
+    // A wakeup with nothing new behind the producer must add nothing, even
+    // though the cursor would happily keep handing back resident records.
+    for _ in 0..3 {
+        let drained = drain_into(&mut ring, &consumer);
+        assert_eq!(drained, 0, "a spurious wakeup must not replay the ring");
+    }
+    assert_eq!(ring.delivered.len(), 4);
+    let after_spurious = consumer.metrics().snapshot();
+    assert_eq!(after_spurious.ringbuf_events_consumed, 4);
+    assert_eq!(
+        after_spurious.srtt_sample_us_sum,
+        after_first_drain.srtt_sample_us_sum,
+        "a replay would rescale every counter at once"
+    );
+
+    // Forward progress survives the overflow: new records are still drained.
+    ring.publish(2);
+    let drained = drain_into(&mut ring, &consumer);
+    assert_eq!(drained, 2, "the consumer keeps making forward progress");
+    assert_eq!(consumer.metrics().snapshot().ringbuf_events_consumed, 6);
+}
+
+/// The producer may commit more while a pass is running, and a ringbuf wakeup
+/// only fires on commit. A pass that made progress therefore has to re-read
+/// the producer position before concluding the ring is empty.
+#[test]
+fn a_pass_re_reads_the_producer_position_after_making_progress() {
+    let resident: Vec<Vec<u8>> = (1..=2).map(rtt_record_bytes).collect();
+    let mut ring = ReplayingRingBuf::with_resident(4_096, resident);
+    ring.publish_after_take = Some((1, 2));
+    let mut seen = 0u32;
+
+    let drained = drain_outstanding_records(&mut ring, FAKE_RING_BYTES, |_bytes: &[u8]| {
+        seen += 1;
+    });
+
+    assert_eq!(drained, 4, "late records drain in the same wakeup");
+    assert_eq!(seen, 4);
+    assert_eq!(ring.consumer_position(), ring.producer_position());
+}
+
+/// A record the producer has not committed yet halts the pass without losing
+/// the consumer position; the next drain resumes from exactly there.
+#[test]
+fn an_uncommitted_record_halts_the_pass_and_the_next_drain_resumes() {
+    let resident: Vec<Vec<u8>> = (1..=4).map(rtt_record_bytes).collect();
+    let mut ring = ReplayingRingBuf::with_resident(64, resident);
+    ring.busy_at = Some(64 + FAKE_RECORD_STRIDE * 2);
+
+    let drained = drain_outstanding_records(&mut ring, FAKE_RING_BYTES, |_bytes: &[u8]| {});
+    assert_eq!(drained, 2, "the pass stops at the uncommitted record");
+    assert_eq!(ring.consumer_position(), 64 + FAKE_RECORD_STRIDE * 2);
+
+    ring.busy_at = None;
+    let drained = drain_outstanding_records(&mut ring, FAKE_RING_BYTES, |_bytes: &[u8]| {});
+    assert_eq!(drained, 2, "the rest drains once the producer commits");
+    assert_eq!(ring.delivered.len(), 4, "and nothing was delivered twice");
+}
+
+/// A consumer position that already ran past the producer — the state the
+/// replay defect leaves on a pinned map, and the state in which the kernel
+/// drops every record it tries to reserve — must deliver nothing, and attach
+/// must classify it as needing repair.
+#[test]
+fn a_consumer_position_past_the_producer_drains_nothing() {
+    let consumer = SockOpsConsumer::new(BpfMetricsState::new());
+    let resident: Vec<Vec<u8>> = (1..=4).map(rtt_record_bytes).collect();
+    let mut ring = ReplayingRingBuf::with_resident(0, resident);
+    ring.consumer_pos = ring.producer_pos + FAKE_RECORD_STRIDE;
+
+    let drained = drain_into(&mut ring, &consumer);
+
+    assert_eq!(drained, 0);
+    assert!(ring.delivered.is_empty());
+    assert_eq!(consumer.metrics().snapshot().ringbuf_events_consumed, 0);
+
+    let producer_pos = ring.producer_position();
+    let consumer_pos = ring.consumer_position();
+    assert_eq!(
+        ringbuf_attach(producer_pos, consumer_pos, FAKE_RING_BYTES),
+        RingBufAttach::Resynchronize,
+        "attach must republish the producer position to un-wedge the ring"
+    );
 }

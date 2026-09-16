@@ -12,8 +12,10 @@
 //! proxy opens the pinned ringbuf at
 //! [`BPF_SOCK_OPS_EVENTS_PIN_PATH`](crate::ebpf::BPF_SOCK_OPS_EVENTS_PIN_PATH)
 //! and runs [`run_pinned_consumer`] as a background task that:
-//!   1. Drives the kernel ringbuf with `tokio::io::unix::AsyncFd`,
-//!      draining all available records on each wakeup.
+//!   1. Drives the kernel ringbuf with `tokio::io::unix::AsyncFd`, draining
+//!      every record the kernel has published on each wakeup — and nothing
+//!      past the producer position, which is what keeps a record from being
+//!      counted twice (see [`RingBufCursor`] and issue #5563).
 //!   2. Decodes each record via [`SockOpsEvent::from_record_bytes`] and
 //!      hands it to [`SockOpsConsumer::handle_event`].
 //!   3. Queues first-data SockHash removal behind a bounded grace period, so
@@ -342,6 +344,122 @@ pub fn drop_reason_delta(last: u64, current: u64) -> u64 {
     }
 }
 
+/// Bytes of committed, unconsumed ringbuf data implied by a kernel
+/// `(producer_pos, consumer_pos)` pair, or `None` when the pair cannot
+/// describe a ring of `ring_bytes`.
+///
+/// The kernel never overwrites unconsumed data — a full ring fails the
+/// producer's `bpf_ringbuf_reserve` instead — so a healthy ring always
+/// satisfies `0 <= producer_pos - consumer_pos <= ring_bytes` in wrapping
+/// arithmetic. Anything else means the retained consumer position is not a
+/// point this consumer may resume from: either it ran past the producer, or
+/// it is stale by more than a whole ring.
+///
+/// A consumer position ahead of the producer is not merely a userspace
+/// bookkeeping error — the kernel's own reserve test (`new_prod_pos -
+/// cons_pos > ring_bytes`) then underflows, so *every* subsequent record is
+/// dropped and the ring never delivers anything again (issue #5563).
+pub fn ringbuf_outstanding_bytes(
+    producer_pos: u64,
+    consumer_pos: u64,
+    ring_bytes: u64,
+) -> Option<u64> {
+    let outstanding = producer_pos.wrapping_sub(consumer_pos);
+    (outstanding <= ring_bytes).then_some(outstanding)
+}
+
+/// What a consumer must do with the consumer position a pinned ringbuf
+/// retained from whoever drained it last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RingBufAttach {
+    /// The retained position is a valid resume point; `outstanding_bytes`
+    /// of committed records are still waiting behind the producer.
+    Resume { outstanding_bytes: u64 },
+    /// The retained position cannot be resumed from. Republish the producer
+    /// position as the consumer position before draining: that is the only
+    /// value known to be consistent with the kernel, and it un-wedges a
+    /// producer that has been failing every reserve.
+    Resynchronize,
+}
+
+/// Classify a pinned ringbuf's retained consumer position at attach time.
+///
+/// Must be consulted *before* the ring is handed to aya, because
+/// `RingBuf::new` adopts whatever the consumer page holds.
+pub fn ringbuf_attach(producer_pos: u64, consumer_pos: u64, ring_bytes: u64) -> RingBufAttach {
+    match ringbuf_outstanding_bytes(producer_pos, consumer_pos, ring_bytes) {
+        Some(outstanding_bytes) => RingBufAttach::Resume { outstanding_bytes },
+        None => RingBufAttach::Resynchronize,
+    }
+}
+
+/// A ringbuf a drain can walk, plus the two kernel positions that bound it.
+///
+/// The bound is not optional bookkeeping. aya 0.13's `RingBuf` caches the
+/// producer position, initialises that cache to `0`, and only refreshes it
+/// once its own consumer position catches up to the cache. A pinned ring
+/// opened with a non-zero consumer position — every ambient proxy that
+/// replaces a predecessor on a node whose node-agent still owns the pin —
+/// can never satisfy that condition, so `next()` keeps handing back bytes
+/// the producer never published and the same resident records are replayed
+/// on every wakeup. Reading the producer position ourselves is what makes
+/// the drain stop in the right place (issue #5563).
+pub trait RingBufCursor {
+    /// Position the kernel has published records up to.
+    fn producer_position(&self) -> u64;
+
+    /// Position this consumer has committed back to the kernel. Must reflect
+    /// every record already taken through [`Self::with_next_record`].
+    fn consumer_position(&self) -> u64;
+
+    /// Take the next record and hand its bytes to `f`, committing the
+    /// consumer position afterwards. `None` when no record is available
+    /// right now (the next one is still being written by the producer).
+    fn with_next_record<R, F: FnOnce(&[u8]) -> R>(&mut self, f: F) -> Option<R>;
+}
+
+/// Drain every record the kernel has published, and not one byte more.
+///
+/// Each pass takes a producer snapshot and consumes records while the
+/// cursor's committed consumer position is still behind it; a pass that
+/// made progress re-snapshots, because the producer may have published more
+/// while the pass ran and a ringbuf wakeup only fires on commit. Returns the
+/// number of records handed to `on_record`.
+///
+/// The bound is what gives the exactly-once contract: a record can only be
+/// delivered while the consumer position is behind the producer, and taking
+/// it advances that position past the record.
+pub fn drain_outstanding_records<C, F>(cursor: &mut C, ring_bytes: u64, mut on_record: F) -> u32
+where
+    C: RingBufCursor,
+    F: FnMut(&[u8]),
+{
+    let mut records: u32 = 0;
+    loop {
+        let producer_pos = cursor.producer_position();
+        let mut made_progress = false;
+        loop {
+            let consumer_pos = cursor.consumer_position();
+            match ringbuf_outstanding_bytes(producer_pos, consumer_pos, ring_bytes) {
+                // Caught up with this snapshot, or a position pair that is
+                // not resumable — either way, stop walking the ring.
+                Some(0) | None => break,
+                Some(_) => {}
+            }
+            if cursor.with_next_record(&mut on_record).is_none() {
+                // The next record is still uncommitted. The producer's commit
+                // delivers the wakeup that resumes this drain.
+                return records;
+            }
+            records = records.saturating_add(1);
+            made_progress = true;
+        }
+        if !made_progress {
+            return records;
+        }
+    }
+}
+
 /// Production async consumer that opens the pinned SOCK_OPS ringbuf and
 /// drives the [`SockOpsConsumer`] dispatch from kernel events.
 ///
@@ -354,8 +472,11 @@ pub fn drop_reason_delta(last: u64, current: u64) -> u64 {
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub mod production {
     use std::collections::VecDeque;
-    use std::os::fd::AsRawFd;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::ffi::c_void;
+    use std::io;
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+    use std::ptr::NonNull;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use aya::maps::{Map, MapData, MapError, PerCpuArray, RingBuf, SockHash};
@@ -367,9 +488,9 @@ pub mod production {
     use tracing::{debug, info, warn};
 
     use super::{
-        BPF_DROP_REASON_COUNT, BPF_DROP_REASON_STATS_SLOTS, PollOutcome,
-        SOCK_OPS_RECOVERY_THRESHOLD, SockOpsConsumer, SockOpsEvent, drop_reason_delta,
-        seed_dropped_baseline,
+        BPF_DROP_REASON_COUNT, BPF_DROP_REASON_STATS_SLOTS, PollOutcome, RingBufAttach,
+        RingBufCursor, SOCK_OPS_RECOVERY_THRESHOLD, SockOpsConsumer, SockOpsEvent,
+        drain_outstanding_records, drop_reason_delta, ringbuf_attach, seed_dropped_baseline,
     };
     use crate::ebpf::{
         BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH, BPF_SOCK_OPS_EVENTS_PIN_PATH,
@@ -441,6 +562,9 @@ pub mod production {
             pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
             initial_dropped_total = last_dropped_total,
             inode = events_inode,
+            ring_bytes = ring_buf.ring_bytes(),
+            producer_pos = ring_buf.producer_position(),
+            consumer_pos = ring_buf.consumer_position(),
             "SOCK_OPS ringbuf consumer attached; draining events"
         );
 
@@ -586,12 +710,228 @@ pub mod production {
         }
     }
 
+    /// One mapped metadata page of a pinned ringbuf.
+    ///
+    /// The kernel lays a BPF ringbuf out as `[consumer page][producer page]
+    /// [data pages][data pages again]`; the first machine word of each
+    /// metadata page is that side's position. aya maps both pages for its
+    /// own use but never exposes them, so the drain bound maps them again.
+    struct MappedPage {
+        ptr: NonNull<c_void>,
+        len: usize,
+    }
+
+    // SAFETY: the mapping is owned by this value, is never handed out as a
+    // reference that outlives it, and the only word ever touched through it
+    // is read and written atomically.
+    unsafe impl Send for MappedPage {}
+    // SAFETY: as above — shared access is atomic-only.
+    unsafe impl Sync for MappedPage {}
+
+    impl MappedPage {
+        fn map(
+            fd: BorrowedFd<'_>,
+            offset: usize,
+            len: usize,
+            prot: libc::c_int,
+        ) -> io::Result<Self> {
+            let Ok(offset) = libc::off_t::try_from(offset) else {
+                return Err(io::Error::other("ringbuf page offset does not fit off_t"));
+            };
+            // SAFETY: `fd` is a live BPF ringbuf map fd, and `offset`/`len`
+            // are the page-aligned metadata extents the kernel defines for
+            // that map type. A failed mapping is reported as MAP_FAILED.
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    prot,
+                    libc::MAP_SHARED,
+                    fd.as_raw_fd(),
+                    offset,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                return Err(io::Error::last_os_error());
+            }
+            match NonNull::new(ptr) {
+                Some(ptr) => Ok(Self { ptr, len }),
+                None => Err(io::Error::other("mmap returned a null pointer")),
+            }
+        }
+
+        /// The position word the kernel publishes at the head of the page.
+        fn position(&self) -> &AtomicUsize {
+            // SAFETY: both ringbuf metadata pages begin with one
+            // naturally-aligned `unsigned long` position word, and the
+            // mapping is at least a page long and outlives the borrow.
+            unsafe { self.ptr.cast::<AtomicUsize>().as_ref() }
+        }
+    }
+
+    impl Drop for MappedPage {
+        fn drop(&mut self) {
+            // SAFETY: `ptr` and `len` are exactly what `mmap` returned.
+            unsafe { libc::munmap(self.ptr.as_ptr(), self.len) };
+        }
+    }
+
+    fn page_size() -> io::Result<usize> {
+        // SAFETY: `sysconf` takes an integer name and has no preconditions.
+        let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        match usize::try_from(size) {
+            Ok(size) if size > 0 => Ok(size),
+            _ => Err(io::Error::other("sysconf(_SC_PAGESIZE) gave no page size")),
+        }
+    }
+
+    /// The kernel-published producer/consumer positions of a pinned ringbuf.
+    struct RingBufPositions {
+        consumer: MappedPage,
+        producer: MappedPage,
+    }
+
+    impl RingBufPositions {
+        fn open(fd: BorrowedFd<'_>) -> io::Result<Self> {
+            let page = page_size()?;
+            let consumer = MappedPage::map(fd, 0, page, libc::PROT_READ | libc::PROT_WRITE)?;
+            let producer = MappedPage::map(fd, page, page, libc::PROT_READ)?;
+            Ok(Self { consumer, producer })
+        }
+
+        fn producer_position(&self) -> u64 {
+            // Acquire pairs with the kernel's release store of the producer
+            // position, so the record header behind it is visible.
+            self.producer.position().load(Ordering::Acquire) as u64
+        }
+
+        fn consumer_position(&self) -> u64 {
+            self.consumer.position().load(Ordering::Acquire) as u64
+        }
+
+        /// Republish the consumer position. `SeqCst` matches the ordering
+        /// aya commits with, so the kernel producer observes the repaired
+        /// value before deciding whether its next reserve fits.
+        fn publish_consumer_position(&self, pos: u64) {
+            self.consumer.position().store(pos as usize, Ordering::SeqCst);
+        }
+    }
+
+    /// A pinned SOCK_OPS ringbuf together with the positions that bound each
+    /// drain. See [`RingBufCursor`] for why the bound exists.
+    struct PinnedRingBuf {
+        ring_buf: RingBuf<MapData>,
+        positions: RingBufPositions,
+        ring_bytes: u64,
+    }
+
+    impl PinnedRingBuf {
+        fn ring_bytes(&self) -> u64 {
+            self.ring_bytes
+        }
+    }
+
+    impl AsRawFd for PinnedRingBuf {
+        fn as_raw_fd(&self) -> std::os::fd::RawFd {
+            self.ring_buf.as_raw_fd()
+        }
+    }
+
+    impl RingBufCursor for PinnedRingBuf {
+        fn producer_position(&self) -> u64 {
+            self.positions.producer_position()
+        }
+
+        fn consumer_position(&self) -> u64 {
+            self.positions.consumer_position()
+        }
+
+        fn with_next_record<R, F: FnOnce(&[u8]) -> R>(&mut self, f: F) -> Option<R> {
+            // Dropping the item is what commits the consumer position, so
+            // `consumer_position()` is accurate again by the time this
+            // returns.
+            let item = self.ring_buf.next()?;
+            let bytes: &[u8] = &item;
+            Some(f(bytes))
+        }
+    }
+
+    /// Wrap a freshly-opened events map in a drain cursor, repairing a
+    /// retained consumer position that cannot be resumed from.
+    ///
+    /// The repair has to happen before the map reaches aya: `RingBuf::new`
+    /// adopts whatever the consumer page holds at construction.
+    fn attach_events_ring(events_map: MapData) -> Option<PinnedRingBuf> {
+        let ring_bytes = match events_map.info() {
+            Ok(info) => u64::from(info.max_entries()),
+            Err(e) => {
+                warn!(
+                    pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
+                    error = %e,
+                    "Failed to read pinned SOCK_OPS ringbuf size; refusing to attach consumer"
+                );
+                return None;
+            }
+        };
+        if ring_bytes == 0 || !ring_bytes.is_power_of_two() {
+            warn!(
+                pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
+                ring_bytes,
+                "Pinned SOCK_OPS ringbuf size is not a non-zero power of two; refusing to attach \
+                 consumer because the drain bound cannot be trusted"
+            );
+            return None;
+        }
+
+        let positions = match RingBufPositions::open(events_map.fd().as_fd()) {
+            Ok(positions) => positions,
+            Err(e) => {
+                warn!(
+                    pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
+                    error = %e,
+                    "Failed to map SOCK_OPS ringbuf position pages; refusing to attach consumer"
+                );
+                return None;
+            }
+        };
+
+        let producer_pos = positions.producer_position();
+        let consumer_pos = positions.consumer_position();
+        if ringbuf_attach(producer_pos, consumer_pos, ring_bytes) == RingBufAttach::Resynchronize {
+            warn!(
+                pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
+                producer_pos,
+                consumer_pos,
+                ring_bytes,
+                "Pinned SOCK_OPS ringbuf retained a consumer position that cannot be resumed \
+                 from; resynchronizing to the producer position. While the consumer position is \
+                 ahead of the producer the kernel drops every record it tries to reserve, so the \
+                 ring delivers nothing until this is repaired."
+            );
+            positions.publish_consumer_position(producer_pos);
+        }
+
+        let ring_buf = match RingBuf::try_from(Map::RingBuf(events_map)) {
+            Ok(ring_buf) => ring_buf,
+            Err(e) => {
+                warn!(
+                    pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
+                    error = %e,
+                    "Pinned SOCK_OPS map is not a RingBuf; refusing to attach consumer"
+                );
+                return None;
+            }
+        };
+
+        Some(PinnedRingBuf {
+            ring_buf,
+            positions,
+            ring_bytes,
+        })
+    }
+
     /// Outcome of waiting for the SOCK_OPS pinned maps to appear.
-    type PinnedSockOpsMaps = (
-        RingBuf<MapData>,
-        PerCpuArray<MapData, u64>,
-        SockHash<MapData, u64>,
-    );
+    type PinnedSockOpsMaps = (PinnedRingBuf, PerCpuArray<MapData, u64>, SockHash<MapData, u64>);
 
     enum WaitOutcome {
         Found(PinnedSockOpsMaps),
@@ -643,17 +983,7 @@ pub mod production {
     /// errors (type mismatch on pinned map).
     fn open_pinned_maps_quiet() -> Option<PinnedSockOpsMaps> {
         let events_map = MapData::from_pin(BPF_SOCK_OPS_EVENTS_PIN_PATH).ok()?;
-        let ring_buf = match RingBuf::try_from(Map::RingBuf(events_map)) {
-            Ok(rb) => rb,
-            Err(e) => {
-                warn!(
-                    pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
-                    error = %e,
-                    "Pinned SOCK_OPS map is not a RingBuf; refusing to attach consumer"
-                );
-                return None;
-            }
-        };
+        let ring_buf = attach_events_ring(events_map)?;
 
         let stats_map = MapData::from_pin(BPF_SOCK_OPS_STATS_PIN_PATH).ok()?;
         let stats: PerCpuArray<MapData, u64> = match PerCpuArray::try_from(Map::PerCpuArray(
@@ -699,17 +1029,7 @@ pub mod production {
                 return None;
             }
         };
-        let ring_buf = match RingBuf::try_from(Map::RingBuf(events_map)) {
-            Ok(rb) => rb,
-            Err(e) => {
-                warn!(
-                    pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
-                    error = %e,
-                    "Pinned SOCK_OPS map is not a RingBuf; refusing to attach consumer"
-                );
-                return None;
-            }
-        };
+        let ring_buf = attach_events_ring(events_map)?;
 
         let stats_map = match MapData::from_pin(BPF_SOCK_OPS_STATS_PIN_PATH) {
             Ok(m) => m,
@@ -771,21 +1091,24 @@ pub mod production {
     /// a spurious wakeup with zero events must NOT advance
     /// `consecutive_drained` (which would falsely trigger recovery while
     /// the kernel is still dropping events on another CPU).
+    ///
+    /// The walk is bounded by the kernel producer position rather than by
+    /// aya deciding the ring looks empty; see [`drain_outstanding_records`].
     fn drain_ringbuf(
-        ring_buf: &mut RingBuf<MapData>,
+        ring_buf: &mut PinnedRingBuf,
         pending_first_byte_removals: &mut VecDeque<(Instant, u64)>,
         consumer: &SockOpsConsumer,
     ) -> u32 {
+        let ring_bytes = ring_buf.ring_bytes();
         let mut events_handled: u32 = 0;
-        while let Some(item) = ring_buf.next() {
-            let bytes: &[u8] = &item;
+        drain_outstanding_records(ring_buf, ring_bytes, |bytes: &[u8]| {
             if bytes.len() < std::mem::size_of::<SockOpsRecord>() {
                 log_malformed_sock_ops_record(
                     "short_read",
                     std::mem::size_of::<SockOpsRecord>(),
                     bytes.len(),
                 );
-                continue;
+                return;
             }
             match SockOpsEvent::from_record_bytes(bytes) {
                 Some(event) => {
@@ -813,7 +1136,7 @@ pub mod production {
                     log_malformed_sock_ops_record("unknown_discriminant", bytes.len(), bytes.len());
                 }
             }
-        }
+        });
         events_handled
     }
 
