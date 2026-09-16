@@ -6685,6 +6685,8 @@ fn nesting_mcp_gateway_endpoint_scopes_on_one_proxy_are_rejected() {
         ("/mcp/v2", "/mcp"),
         ("/mcp", "/mcp"),
         ("/mcp/", "/mcp"),
+        ("/mcp", "/MCP"),
+        ("/mcp/", "/Mcp/v2"),
     ] {
         let mut config = empty_config();
         config.plugin_configs = vec![

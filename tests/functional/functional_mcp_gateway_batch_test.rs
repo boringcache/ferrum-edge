@@ -23,8 +23,8 @@ const MAX_REQUEST_BYTES: usize = 256 * 1024;
 const BAD_REQUEST_RESPONSE: &str =
     "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
-/// Read one complete HTTP/1.1 request: headers up to `\r\n\r\n`, then exactly
-/// `Content-Length` body bytes.
+/// Read one complete HTTP/1.1 request: return the headers before `\r\n\r\n`
+/// and exactly `Content-Length` body bytes.
 ///
 /// TCP does not guarantee that a single `read` returns the whole request, so a
 /// single-read server can echo a truncated body under runner load. This loops
@@ -32,7 +32,9 @@ const BAD_REQUEST_RESPONSE: &str =
 /// echo) on EOF-before-complete, a missing/invalid `Content-Length`, or an
 /// oversized request. There are no sleeps or retries: termination is decided
 /// entirely by the bytes on the wire.
-async fn read_complete_http_request(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+async fn read_complete_http_request(
+    stream: &mut tokio::net::TcpStream,
+) -> Option<(String, Vec<u8>)> {
     let mut buf = Vec::with_capacity(8192);
     let mut chunk = [0u8; 8192];
     let mut header_end = None;
@@ -42,7 +44,8 @@ async fn read_complete_http_request(stream: &mut tokio::net::TcpStream) -> Optio
         if let Some(end) = header_end {
             let need = end + content_length?;
             if buf.len() >= need {
-                return Some(buf[end..need].to_vec());
+                let headers = std::str::from_utf8(&buf[..end - 4]).ok()?.to_string();
+                return Some((headers, buf[end..need].to_vec()));
             }
         } else if let Some(offset) = find_header_terminator(&buf) {
             let headers = std::str::from_utf8(&buf[..offset]).ok()?;
@@ -87,10 +90,18 @@ fn parse_content_length(headers: &str) -> Option<usize> {
 }
 
 async fn start_mcp_echo_server_on(listener: TcpListener) {
+    start_mcp_recording_echo_server_on(listener, None).await;
+}
+
+async fn start_mcp_recording_echo_server_on(
+    listener: TcpListener,
+    requests: Option<tokio::sync::mpsc::UnboundedSender<(String, Vec<u8>)>>,
+) {
     loop {
         if let Ok((mut stream, _)) = listener.accept().await {
+            let requests = requests.clone();
             tokio::spawn(async move {
-                let Some(body) = read_complete_http_request(&mut stream).await else {
+                let Some((headers, body)) = read_complete_http_request(&mut stream).await else {
                     // Malformed, oversized, or truncated request: answer 400
                     // rather than echoing a partial or defaulted body.
                     let _ = stream.write_all(BAD_REQUEST_RESPONSE.as_bytes()).await;
@@ -105,6 +116,9 @@ async fn start_mcp_echo_server_on(listener: TcpListener) {
                 )
                 .into_bytes();
                 response.extend_from_slice(&body);
+                if let Some(requests) = requests {
+                    let _ = requests.send((headers, body));
+                }
                 let _ = stream.write_all(&response).await;
                 let _ = stream.shutdown().await;
             });
@@ -113,12 +127,16 @@ async fn start_mcp_echo_server_on(listener: TcpListener) {
 }
 
 async fn start_gateway_with_mcp(backend_port: u16) -> TestGateway {
+    start_gateway_with_mcp_at(backend_port, "/mcp").await
+}
+
+async fn start_gateway_with_mcp_at(backend_port: u16, listen_path: &str) -> TestGateway {
     let config = format!(
         r#"
 version: "1"
 proxies:
   - id: "mcp-batch"
-    listen_path: "/mcp"
+    listen_path: "{listen_path}"
     backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
@@ -164,6 +182,88 @@ plugin_configs:
         .spawn()
         .await
         .expect("start mcp_gateway batch gateway")
+}
+
+#[tokio::test]
+#[ignore]
+async fn functional_mcp_gateway_batch_endpoint_alias_keeps_transparent_mediation() {
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (sender, mut requests) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(start_mcp_recording_echo_server_on(listener, Some(sender)));
+    // The whole origin routes to this proxy, as in #5536: the plugin itself
+    // must refuse aliases it cannot mediate, even with a permissive backend.
+    let gateway = start_gateway_with_mcp_at(port, "/").await;
+    let client = reqwest::Client::new();
+    let initialize = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25", "capabilities": {},
+            "clientInfo": {"name": "slash-test", "version": "1"}
+        }
+    });
+    for path in ["/mcp", "/mcp/"] {
+        let response = client
+            .post(gateway.proxy_url(path))
+            .json(&initialize)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.json::<Value>().await.unwrap(), initialize);
+        let (headers, body) = requests.try_recv().expect("backend recorded the initialize");
+        assert_eq!(headers.lines().next(), Some("POST /mcp HTTP/1.1"));
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), initialize);
+
+        // A request rejected by exact-path mediation must also be rejected at
+        // the alias, rather than being forwarded to the echo server raw.
+        let response = client
+            .post(gateway.proxy_url(path))
+            .header("content-type", "application/json")
+            .body("not-json")
+            .send()
+            .await
+            .unwrap();
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], -32600);
+        assert!(requests.try_recv().is_err());
+    }
+    for path in ["/mcp//", "/mcp/tools", "/mcp/tools/", "/MCP", "/mCp/"] {
+        let response = client
+            .post(gateway.proxy_url(path))
+            .json(&initialize)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "{path}");
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], -32600);
+        assert_eq!(body["error"]["message"], "Unknown MCP endpoint");
+        assert!(requests.try_recv().is_err());
+    }
+    // Use raw HTTP so a client URL parser cannot erase the dot segment. The
+    // shared frontend rejects these before any plugin runs (HTTP 400); direct
+    // plugin tests separately assert the Unknown MCP endpoint backstop.
+    for path in ["/mcp%2F", "/mcp/."] {
+        let body = initialize.to_string();
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", gateway.proxy_port))
+            .await
+            .unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8(response).unwrap().starts_with("HTTP/1.1 400"));
+        assert!(requests.try_recv().is_err());
+    }
 }
 
 #[tokio::test]
