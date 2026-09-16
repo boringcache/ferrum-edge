@@ -27,7 +27,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -297,6 +297,70 @@ async fn redis_sum_counters_by_prefix(prefix: &str) -> i64 {
         .and_then(|value| value.split("\r\n").next())
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(0)
+}
+
+async fn set_redis_counter(key: &str, value: u64, ttl_seconds: u64) {
+    let client = redis::Client::open(REDIS_URL).expect("valid Redis test URL");
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect to Redis test instance");
+    let result: String = redis::cmd("SET")
+        .arg(key)
+        .arg(value)
+        .arg("EX")
+        .arg(ttl_seconds)
+        .query_async(&mut connection)
+        .await
+        .expect("seed Redis rate-limit counter");
+    assert_eq!(result, "OK");
+}
+
+async fn redis_counter_value(key: &str) -> Option<u64> {
+    let client = redis::Client::open(REDIS_URL).expect("valid Redis test URL");
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect to Redis test instance");
+    redis::cmd("GET")
+        .arg(key)
+        .query_async(&mut connection)
+        .await
+        .expect("read Redis rate-limit counter")
+}
+
+/// Every key under `tag` with its raw value and remaining TTL, sorted by key.
+///
+/// `tag` is the hash tag a rate identity's counters share, built through the
+/// production key builder, so a layout change cannot make a caller's comparison
+/// vacuous.
+async fn redis_counter_snapshot(tag: &str) -> Vec<(String, Option<String>, i64)> {
+    let client = redis::Client::open(REDIS_URL).expect("valid Redis test URL");
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect to Redis test instance");
+    let mut keys: Vec<String> = redis::cmd("KEYS")
+        .arg(format!("{tag}*"))
+        .query_async(&mut connection)
+        .await
+        .expect("list Redis rate-limit counters");
+    keys.sort();
+    let mut snapshot = Vec::with_capacity(keys.len());
+    for key in keys {
+        let value: Option<String> = redis::cmd("GET")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await
+            .expect("read Redis rate-limit counter");
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await
+            .expect("read Redis rate-limit counter TTL");
+        snapshot.push((key, value, ttl));
+    }
+    snapshot
 }
 
 /// Remaining TTL, in seconds, for `key`. `None` when the key is absent or has
@@ -1048,15 +1112,134 @@ async fn test_rate_limiting_redis_centralized() {
     println!("test_rate_limiting_redis_centralized PASSED");
 }
 
+/// A full previous one-second Redis bucket must decay during the current
+/// bucket. The old whole-second fraction stayed at zero and rejected this
+/// candidate for the entire second.
+#[tokio::test]
+#[ignore]
+async fn test_rate_limiting_redis_one_second_previous_bucket_decays() {
+    if !redis_is_available().await {
+        return;
+    }
+
+    let harness = RedisRateLimitHarness::new()
+        .await
+        .expect("Failed to create harness");
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    drop(backend_listener);
+    let _backend = start_header_echo_backend(backend_port).await.unwrap();
+
+    let client = reqwest::Client::new();
+    let unique_prefix = format!("ferrum:test:rl-decay:{}", Uuid::new_v4().simple());
+    setup_proxy_with_plugins(
+        &harness,
+        &client,
+        "proxy-redis-rl-decay",
+        "/redis-rl-decay",
+        backend_port,
+        "http",
+        vec![json!({
+            "id": "plugin-redis-rl-decay",
+            "plugin_name": "rate_limiting",
+            "scope": "proxy",
+            "proxy_id": "proxy-redis-rl-decay",
+            "enabled": true,
+            "config": {
+                "expose_headers": true,
+                "limits": [{"scope": "default", "window_seconds": 1, "max_requests": 10}],
+                "sync_mode": "redis",
+                "redis_url": REDIS_URL,
+                "redis_key_prefix": unique_prefix
+            }
+        })],
+    )
+    .await
+    .unwrap();
+    harness
+        .wait_for_response_header("/redis-rl-decay/test", "x-ratelimit-limit")
+        .await;
+
+    let url = format!("{}/redis-rl-decay/test", harness.proxy_base_url);
+    let mut verified_without_boundary_cross = false;
+    for _ in 0..3 {
+        delete_redis_keys_by_prefix(&unique_prefix).await;
+
+        // Leave at least ~450ms before the next boundary so the Redis seed and
+        // HTTP request use the same current bucket even on a busy hosted runner.
+        let current_index = loop {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after Unix epoch");
+            let fraction_nanos = now.subsec_nanos();
+            if (300_000_000..=500_000_000).contains(&fraction_nanos) {
+                break now.as_secs();
+            }
+            sleep(Duration::from_millis(5)).await;
+        };
+
+        let previous_key = redis_bucket_key(
+            &unique_prefix,
+            "ip:127.0.0.1",
+            &[&current_index.saturating_sub(1).to_string()],
+        );
+        let current_key = redis_bucket_key(
+            &unique_prefix,
+            "ip:127.0.0.1",
+            &[&current_index.to_string()],
+        );
+        set_redis_counter(&previous_key, 10, 3).await;
+
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .expect("one-second Redis decay request");
+        let finished_index = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_secs();
+        if finished_index != current_index {
+            continue;
+        }
+
+        assert_eq!(
+            redis_counter_value(&current_key).await,
+            Some(1),
+            "request must increment the expected current Redis identity bucket"
+        );
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "a full prior bucket must decay enough to admit a mid-window candidate"
+        );
+        verified_without_boundary_cross = true;
+        break;
+    }
+
+    assert!(
+        verified_without_boundary_cross,
+        "could not complete the Redis decay assertion without crossing a one-second boundary"
+    );
+    delete_redis_keys_by_prefix(&unique_prefix).await;
+}
+
 /// Issue #5517: sustained excess traffic must keep being throttled at the
 /// configured rate instead of locking the client out until it stops trying.
 ///
-/// The Redis admission script charges a window only for an admitted request, so
-/// a one-second budget behaves exactly like the in-memory token bucket of the
-/// `local` route driven side by side with it.
+/// A refused attempt hands its charge straight back, so a one-second budget
+/// keeps admitting close to the configured rate for as long as the client keeps
+/// pushing. Before the fix the Redis route admitted its first allowance and then
+/// nothing at all, while the `local` route driven side by side with it kept
+/// throttling — that is the comparison this test makes. The two are NOT
+/// expected to admit the same number: local mode uses a token bucket that
+/// starts full, Redis uses the two-window weighted approximation, so Redis
+/// trails local by roughly one window's worth of burst.
 #[tokio::test]
 #[ignore]
-async fn test_rate_limiting_redis_sustained_load_matches_local() {
+async fn test_rate_limiting_redis_sustained_load_keeps_admitting_at_the_configured_rate() {
     if !redis_is_available().await {
         return;
     }
@@ -1105,7 +1288,8 @@ async fn test_rate_limiting_redis_sustained_load_matches_local() {
                 .await
                 .unwrap();
             let status = response.status().as_u16();
-            // 503 would mean the script never decided; this store is healthy.
+            // 503 would mean the limiter never reached a decision; this store
+            // is healthy and both routes are quota-enforced.
             assert!(matches!(status, 200 | 429), "{mode}: {status}");
             if status == 200 {
                 admitted[index][attempt / 20] += 1;
@@ -1114,8 +1298,12 @@ async fn test_rate_limiting_redis_sustained_load_matches_local() {
     }
     let local: u64 = admitted[0].iter().sum();
     let redis: u64 = admitted[1].iter().sum();
-    assert!(local >= 30 && redis >= 30, "admissions: {admitted:?}");
-    assert!(local.abs_diff(redis) <= 4, "admissions: {admitted:?}");
+    // 120 attempts per route at 5/second. Local keeps its documented full-bucket
+    // burst; Redis sustains roughly four per second once its previous window is
+    // full, and must never approach the 120 attempts it was offered.
+    assert!(local >= 30, "local admissions: {admitted:?}");
+    assert!(redis >= 18, "Redis must keep admitting: {admitted:?}");
+    assert!(redis <= 36, "Redis must keep throttling: {admitted:?}");
     for count in admitted[1].iter().skip(1) {
         assert!(
             *count >= 3,
@@ -1179,7 +1367,7 @@ async fn test_rate_limiting_redis_sustained_multi_window_keeps_admitting() {
             "refused attempts must not consume the per-minute budget: {admitted:?}"
         );
     }
-    assert!(total >= 15, "sustained admissions: {admitted:?}");
+    assert!(total >= 12, "sustained admissions: {admitted:?}");
     assert!(
         total <= 24,
         "the looser per-minute window must still bind: {admitted:?}"
@@ -1225,7 +1413,13 @@ async fn test_rate_limiting_redis_database_selector_handshake() {
     }
 }
 
-/// Refusal by a later window must preserve every earlier window and the TTL.
+/// Issue #5517: a refusal by a later window must leave EVERY window's counter
+/// exactly where it was — the tight window it refused on and the looser window
+/// it had already charged on the way there.
+///
+/// This is the regression for the documented multi-window "phantom increment":
+/// the per-day cap refuses while the per-hour cap still has 98 requests left,
+/// and twenty refused attempts used to consume all of them.
 #[tokio::test]
 #[ignore]
 async fn test_rate_limiting_redis_multi_window_rejections_leave_state_unchanged() {
@@ -1246,60 +1440,68 @@ async fn test_rate_limiting_redis_multi_window_rejections_leave_state_unchanged(
     .unwrap();
     let redis = RedisRateLimitClient::new(config, None, false, None).unwrap();
     let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    // Hour/day windows rather than minute/hour: neither index can roll over
+    // inside a sub-second test, so the counter snapshots below are stable.
     let op = DynamicRateLimitOp::new(vec![
         RateLimitWindowSpec {
             limit: 100,
-            duration: Duration::from_secs(60),
+            duration: Duration::from_secs(3600),
         },
         RateLimitWindowSpec {
             limit: 2,
-            duration: Duration::from_secs(3600),
+            duration: Duration::from_secs(86_400),
         },
     ]);
     for _ in 0..2 {
         let outcome = algorithm.check_redis(&redis, "client", &op).await.unwrap();
         assert!(outcome.allowed);
     }
-    let mut connection = redis::Client::open(REDIS_URL)
-        .unwrap()
-        .get_multiplexed_async_connection()
-        .await
-        .unwrap();
-    let keys: Vec<String> = redis::cmd("KEYS")
-        .arg(format!("{}*", redis.make_slot_key("client", &["http-windows"])))
-        .query_async(&mut connection)
-        .await
-        .unwrap();
-    assert_eq!(keys.len(), 1, "all windows must commit as one state value");
-    let before: Vec<u8> = redis::cmd("GET")
-        .arg(&keys[0])
-        .query_async(&mut connection)
-        .await
-        .unwrap();
-    let ttl_before: i64 = redis::cmd("PTTL")
-        .arg(&keys[0])
-        .query_async(&mut connection)
-        .await
-        .unwrap();
-    sleep(Duration::from_millis(20)).await;
+
+    let tag = redis.make_slot_key("client", &[]);
+    let before = redis_counter_snapshot(&tag).await;
+    assert_eq!(
+        before.len(),
+        2,
+        "both windows must carry their own counter: {before:?}"
+    );
+    assert!(
+        before
+            .iter()
+            .all(|(_, value, _)| value.as_deref() == Some("2")),
+        "each window must be charged exactly twice: {before:?}"
+    );
+    // The compensating transaction re-asserts EXPIRE on the keys it decrements,
+    // because DECR on a key whose TTL elapsed in between would otherwise
+    // recreate it with no expiry at all. Retention must stay bounded, so this
+    // captures it rather than asserting a TTL is never refreshed.
+    assert!(
+        before.iter().all(|(_, _, ttl)| *ttl > 0),
+        "every counter must carry a bounded retention: {before:?}"
+    );
+
     for _ in 0..20 {
         let outcome = algorithm.check_redis(&redis, "client", &op).await.unwrap();
         assert!(!outcome.allowed);
         assert_eq!(outcome.limit, Some(2));
-        assert_eq!(outcome.window_seconds, Some(3600));
+        assert_eq!(outcome.window_seconds, Some(86_400));
     }
-    let after: Vec<u8> = redis::cmd("GET")
-        .arg(&keys[0])
-        .query_async(&mut connection)
-        .await
-        .unwrap();
-    let ttl_after: i64 = redis::cmd("PTTL")
-        .arg(&keys[0])
-        .query_async(&mut connection)
-        .await
-        .unwrap();
-    assert_eq!(before, after, "a later-window rejection must charge no window");
-    assert!(ttl_after < ttl_before, "a rejection must not renew the TTL");
+
+    let after = redis_counter_snapshot(&tag).await;
+    let values = |snapshot: &[(String, Option<String>, i64)]| {
+        snapshot
+            .iter()
+            .map(|(key, value, _)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        values(&before),
+        values(&after),
+        "twenty refusals must leave every window's counter untouched"
+    );
+    assert!(
+        after.iter().all(|(_, _, ttl)| *ttl > 0),
+        "a compensated counter must keep a bounded retention: {after:?}"
+    );
     delete_redis_keys_by_prefix(&prefix).await;
 }
 
@@ -2432,9 +2634,11 @@ plugin_configs:
         "6th request (to GW2) should also be rate limited — shared Redis counter"
     );
 
-    // Race two independent gateways on the same fresh budget. The admission
-    // script is serialised by Redis, so concurrency neither over-admits nor
-    // manufactures a contention refusal: every answer is a real decision.
+    // Race two independent gateways on the same fresh budget. Each admission is
+    // decided by its own atomic `INCR`, so concurrency can neither over-admit
+    // nor manufacture a contention refusal: there is no optimistic retry to
+    // exhaust, and a refused attempt's compensating `DECR` only ever hands back
+    // a charge that request itself made.
     delete_redis_keys_by_prefix(&unique_prefix).await;
     let responses = futures_util::future::join_all((0..32).map(|index| {
         let client = client.clone();
@@ -2450,7 +2654,11 @@ plugin_configs:
         }
     }))
     .await;
-    assert_eq!(responses.iter().filter(|status| **status == 200).count(), 4);
+    assert_eq!(
+        responses.iter().filter(|status| **status == 200).count(),
+        4,
+        "exactly the shared budget may be admitted under contention: {responses:?}"
+    );
     assert!(
         responses.iter().all(|status| matches!(status, 200 | 429)),
         "a healthy store must never answer a concurrent race with 503: {responses:?}"

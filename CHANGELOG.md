@@ -13,17 +13,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `local_fallback`, enforcing the configured quota independently in each pod
   during a Redis outage. Set `fail_closed` explicitly to require centralized
   enforcement. Other rate-limit plugins retain their existing defaults (#5519).
-- Redis HTTP, GraphQL, and gRPC method quotas now admit through one atomic
-  server-side script per request (a single `EVALSHA` on the existing pooled
-  connections). It evaluates every configured window against the Redis clock and
-  charges all of them or none, so a refused request no longer consumes budget or
-  renews a TTL and sustained overload can no longer lock a client out (#5517).
-  Windows up to five seconds keep local mode's token bucket; longer windows use
-  the documented previous/current weighted approximation. **The connecting Redis
-  user now needs the `@scripting` ACL category** (`EVALSHA`, `SCRIPT LOAD`,
-  `EVAL`) in addition to `GETRANGE`/`SET` on the configured key prefix. The Redis
-  state format changes; upgrading starts fresh centralized budgets, and mixed
-  old/new gateways do not share counters. Upgrade replicas together.
+- Redis HTTP, GraphQL, and gRPC method quotas now admit through
+  charge-then-compensate accounting. One atomic `MULTI`/`EXEC` charges every
+  configured window (`GET` previous, `INCR` current, `EXPIRE` current) so the
+  decision is still tied to the caller's own increment, and any refusal issues
+  one compensating atomic `MULTI`/`EXEC` (`DECR` + `EXPIRE`) over every window it
+  charged. A refused request no longer leaves a lasting charge on any window, so
+  sustained overload can no longer lock a client out, and a tighter window's
+  refusal no longer consumes a looser window's budget — the previously
+  documented multi-window "phantom increment" is retired (#5517). Admission
+  stays native RESP on the existing pooled connections: no Lua, no `WATCH`, no
+  per-request connection, and no retry budget. The key layout and the two-window
+  weighted approximation are unchanged, so an in-place upgrade keeps its
+  counters and no Redis ACL change is required. Between a refused attempt's
+  `INCR` and its compensating `DECR` the transient charge is visible to
+  concurrent requests for the same identity, which can refuse slightly early
+  under contention and never over-admits; a refused request costs two round trips
+  instead of one.
 - Redis URL database selectors now require canonical decimal integers in
   `0..=2147483647`, without zero-padding, signs, or extra path segments. Runtime
   admission and all shared-parser OpenAPI URL fields use the same rule (#5518).

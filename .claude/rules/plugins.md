@@ -628,18 +628,24 @@ on a native-gRPC request.
 - `rate_limiting`, `graphql`, `grpc_method_router`, `ai_rate_limiter`,
   `ws_rate_limiting`, and `udp_rate_limiting` support `sync_mode: "redis"`.
 - Shared Redis client lives in `src/plugins/utils/redis_rate_limiter.rs`.
-- HTTP/GraphQL/gRPC quota admission is ONE atomic server-side Lua script per
-  decision (`EVALSHA` on the shared pooled connections; `SCRIPT LOAD` only on
-  `NOSCRIPT`). It evaluates every configured window against Redis `TIME` and
-  charges all of them or none — a rejection charges no window and renews no
-  TTL, and there is no `WATCH`/retry budget to exhaust on a hot key. Windows
-  <= 5s use the local token bucket; longer windows use the two-window weighted
-  approximation. The Redis user needs the `@scripting` ACL category plus
-  `GETRANGE`/`SET`. AI/WS/UDP keep their own pipelined counter algorithms; all
-  other Redis operations stay plain RESP.
-- Key format is `{escaped-prefix:escaped-rate-key}:suffix` — the HTTP window
-  state value binds the effective window list in the suffix; weighted counters
-  use the window index. The braces
+- Algorithm is two-window weighted with pipelined `INCR`/`GET`/`EXPIRE`; no Lua.
+- HTTP/GraphQL/gRPC quota admission is CHARGE-THEN-COMPENSATE over that
+  algorithm, on the shared pooled multiplexed connections: ONE atomic
+  `MULTI`/`EXEC` charges every configured window (`GET` previous, `INCR`
+  current, `EXPIRE` current) so the decision is tied to the caller's own
+  increment, and any refusal issues ONE compensating atomic `MULTI`/`EXEC`
+  (`DECR` + `EXPIRE`) over every window it charged. A refusal therefore leaves
+  no lasting charge on any window (issue #5517) and a tighter window's refusal
+  never consumes a looser window's budget. Never reintroduce `WATCH`, a
+  dedicated per-request connection, a retry budget, or `EVAL`/`EVALSHA`/`SCRIPT`
+  — every command must be plain RESP. Between an `INCR` and its compensating
+  `DECR` the transient charge is visible to concurrent requests, which is a
+  documented conservative refusal, never an over-admit; a negative counter reads
+  as zero usage. A compensation that fails goes through `note_command_failure`
+  so `redis_failure_policy` governs the NEXT decision, and the refusal still
+  stands. The local token bucket / 64-bucket sliding aggregate are deliberately
+  NOT replicated in Redis.
+- Key format is `{escaped-prefix:escaped-rate-key}:{window_index}` — the braces
   are a Redis Cluster hash tag so every key of one atomic operation shares a
   slot; `%`, braces, and `:` are percent-escaped inside it. Default prefix is
   `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` — the config-id component
