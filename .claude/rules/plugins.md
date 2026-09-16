@@ -641,9 +641,17 @@ on a native-gRPC request.
   — every command must be plain RESP. Between an `INCR` and its compensating
   `DECR` the transient charge is visible to concurrent requests, which is a
   documented conservative refusal, never an over-admit; a negative counter reads
-  as zero usage. A compensation that fails goes through `note_command_failure`
+  as zero usage. The compensation is issued from a DETACHED task holding the
+  shared client `Arc`, so a dropped request future (gRPC deadline under
+  `timeout_at`, client disconnect, reload retiring the instance) cannot strand
+  the charge, and the refused caller does not pay the second round trip inline.
+  A compensation that fails goes through `note_command_failure`
   so `redis_failure_policy` governs the NEXT decision, and the refusal still
-  stands. The local token bucket / 64-bucket sliding aggregate are deliberately
+  stands. The ONLY remaining way a refusal leaves a lasting charge is a process
+  exit between the charge and its compensation. Both transaction helpers carry
+  their own `MAX_REDIS_ADMISSION_WINDOWS` (3) bound and fail closed above it;
+  the per-request window and counter buffers are fixed-capacity and inline, not
+  `Vec`s. The local token bucket / 64-bucket sliding aggregate are deliberately
   NOT replicated in Redis.
 - Key format is `{escaped-prefix:escaped-rate-key}:{window_index}` — the braces
   are a Redis Cluster hash tag so every key of one atomic operation shares a
@@ -671,7 +679,14 @@ on a native-gRPC request.
   `tests/unit/openapi_yaml_tests.rs`.
 - Redis outage behavior is `redis_failure_policy`: `rate_limiting` defaults to
   `local_fallback`; the other five rate-limit plugins default to `fail_closed`.
-  Explicit settings retain either behavior. The client
+  Explicit settings retain either behavior. `rate_limiting` attributes every
+  decision it serves on the fallback budget — admissions, quota refusals, AND
+  the capacity `429` a previously unseen key gets at `MAX_STATE_ENTRIES` — with
+  `ratelimit_local_fallback: true` metadata plus
+  `ferrum_rate_limit_local_fallback_decisions_total`; `fail_closed` `503`s count
+  in `ferrum_rate_limit_enforcement_unavailable_total`. Fallback is now the
+  DEFAULT posture for this plugin, so the silent case is the common case: do not
+  regress those signals back to the once-per-outage latched warning. The client
   reconnects in the background either way. `request_deduplication` expresses the
   same choice as `on_redis_unavailable` and does NOT accept
   `redis_failure_policy`; `ai_semantic_cache` has neither.
