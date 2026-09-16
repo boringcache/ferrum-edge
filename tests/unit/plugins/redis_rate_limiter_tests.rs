@@ -2930,6 +2930,11 @@ enum TransactionScript {
     /// The charge reports an exhausted window and the compensating transaction
     /// that follows fails with a plain server error.
     CompensationFails,
+    /// The charge's `EXEC` array carries one element more than the client can
+    /// pair with a window. A RESP-compatible server that frames a transaction
+    /// differently — or a future change to how an ignored command is filtered
+    /// out of an atomic pipeline's reply — lands here.
+    ChargeReplyIsUnpairable,
 }
 
 /// `EXEC` array for a charge: per window `GET` (nil or an exhausted count),
@@ -2944,6 +2949,24 @@ fn charge_reply(windows: usize, exhausted: bool) -> Vec<u8> {
         }
     }
     reply
+}
+
+/// Wait until every detached compensation this client issued has completed.
+///
+/// A refusal hands its charge back from a task holding the client `Arc`, not
+/// from the request future, so the refusal returns before the `DECR` reaches
+/// the server. Coverage that reads the server's counters — or the client's
+/// availability — straight afterwards must wait for the hand-back instead of
+/// racing it.
+async fn await_compensations(client: &Arc<RedisRateLimitClient>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while client.pending_compensations_for_test() > 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "detached compensations did not drain"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 /// `EXEC` array for a compensation: per window `DECR` and `EXPIRE`. Both are
@@ -3071,6 +3094,19 @@ async fn spawn_transaction_redis_server(script: TransactionScript) -> Transactio
                                         }
                                         (TransactionScript::FirstChargeFails, false) => {
                                             reply.extend(compensation_reply(windows));
+                                        }
+                                        (TransactionScript::ChargeReplyIsUnpairable, true) => {
+                                            // One extra integer: the client
+                                            // filters the ignored `EXPIRE`
+                                            // slots by index, so the surviving
+                                            // count no longer divides into
+                                            // (previous, current) pairs.
+                                            let mut unpairable =
+                                                format!("*{}\r\n", windows * 3 + 1).into_bytes();
+                                            for _ in 0..windows * 3 + 1 {
+                                                unpairable.extend_from_slice(b":1\r\n");
+                                            }
+                                            reply.extend(unpairable);
                                         }
                                         (_, true) => reply.extend(charge_reply(windows, true)),
                                         (TransactionScript::CompensationFails, false) => {
@@ -3303,6 +3339,7 @@ async fn a_refused_window_hands_its_charge_back_on_the_pooled_connection() {
             attempt,
             "attempt {attempt}: exactly one charge per decision"
         );
+        await_compensations(&client).await;
         assert_eq!(
             server.compensations.load(Ordering::Relaxed),
             attempt,
@@ -3364,6 +3401,7 @@ async fn a_failed_compensation_is_reported_as_a_redis_failure() {
         "the charge decided this request; only the hand-back failed"
     );
     assert_eq!(server.transactions.load(Ordering::Relaxed), 1);
+    await_compensations(&client).await;
     assert_eq!(server.compensations.load(Ordering::Relaxed), 1);
     assert!(
         !client.is_available(),
@@ -3372,6 +3410,91 @@ async fn a_failed_compensation_is_reported_as_a_redis_failure() {
 
     // The NEXT decision is the one the failure policy governs, and it must not
     // redial the endpoint the client has already marked unavailable.
+    let next = backend
+        .check_with_redis_key_and_local_capacity(
+            "identity-a".to_string(),
+            || "{ferrum%3Atest:identity-a}".to_string(),
+            &op,
+            1_000,
+        )
+        .await
+        .expect("outcome");
+    assert!(!next.allowed && next.enforcement_unavailable);
+    assert_eq!(
+        server.transactions.load(Ordering::Relaxed),
+        1,
+        "an unavailable client must not charge another window"
+    );
+    assert_eq!(server.accepts.load(Ordering::Relaxed), 1);
+
+    let _ = server.shutdown.send(());
+}
+
+/// A charge reply this code cannot pair with its windows is an UNUSABLE
+/// endpoint, not a quota decision, and the `INCR`s have already landed.
+///
+/// The caller returns `Err` before it can reach its own refusal branch, so
+/// nothing compensates that charge. Without marking the client unavailable the
+/// counters would climb monotonically to the key TTL while every request
+/// re-charged a reply this code still cannot pair, `is_available()` would never
+/// flip, and there would be neither backoff nor an availability transition —
+/// just a permanent loop. Marking it matches the `Err` arm's accounting and
+/// hands the next decision to `redis_failure_policy`.
+#[tokio::test]
+async fn an_unpairable_charge_reply_marks_the_client_unavailable() {
+    use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitBackend, RateLimitWindowSpec,
+    };
+
+    let server = spawn_transaction_redis_server(TransactionScript::ChargeReplyIsUnpairable).await;
+    let backend: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm> =
+        RateLimitBackend::from_plugin_config(
+            "rate_limiting",
+            &transaction_backend_config(server.port),
+            &PluginHttpClient::default(),
+            DynamicHttpRateLimitAlgorithm::new(),
+        )
+        .expect("failover backend");
+    let client = backend
+        .redis_client_arc_for_test()
+        .expect("backend must own a Redis client");
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 1,
+        duration: Duration::from_secs(60),
+    }]);
+
+    let first = backend
+        .check_with_redis_key_and_local_capacity(
+            "identity-a".to_string(),
+            || "{ferrum%3Atest:identity-a}".to_string(),
+            &op,
+            1_000,
+        )
+        .await
+        .expect("outcome");
+    assert!(
+        !first.allowed && first.enforcement_unavailable,
+        "an unusable reply shape is an outage, governed by redis_failure_policy"
+    );
+    assert!(
+        !client.is_available(),
+        "an unpairable reply must mark the client unavailable, exactly as a \
+         command error does"
+    );
+    assert_eq!(
+        server.transactions.load(Ordering::Relaxed),
+        1,
+        "the charge that could not be paired is the only one issued"
+    );
+    assert_eq!(
+        server.compensations.load(Ordering::Relaxed),
+        0,
+        "the caller never reached its refusal branch, so nothing compensates"
+    );
+
+    // No backoff is the failure this closes: an unavailable client must not
+    // charge the endpoint again on the next request.
     let next = backend
         .check_with_redis_key_and_local_capacity(
             "identity-a".to_string(),
@@ -3448,13 +3571,13 @@ fn http_window_admission_is_pooled_plain_resp_and_hands_back_a_refused_charge() 
         .unwrap_or(rest.len());
     let body = &rest[..end];
     let charge = body
-        .find("redis.charge_rate_limit_windows(&charges)")
+        .find("redis.charge_rate_limit_windows(charges.as_slice())")
         .expect("admission must charge every window in one transaction");
     let refusal = body
         .find("if let Some(spec) = refused {")
         .expect("admission must have a single refusal branch");
     let compensation = body
-        .find("redis.uncharge_rate_limit_windows(&charges)")
+        .find(".spawn_uncharge_rate_limit_windows(charges)")
         .expect("a refusal must hand the charge back");
     assert!(
         charge < refusal && refusal < compensation,
@@ -3465,6 +3588,34 @@ fn http_window_admission_is_pooled_plain_resp_and_hands_back_a_refused_charge() 
         body.matches("uncharge_rate_limit_windows").count(),
         1,
         "an admitted request must never compensate"
+    );
+    // The hand-back must NOT be tied to the request future. Plugin hooks run
+    // under `tokio::time::timeout_at`, so a gRPC deadline or a client
+    // disconnect drops the hook future; awaiting the compensation inline let
+    // that cancellation strand the charge until the window's TTL elapsed, with
+    // no failure accounting and no `redis_failure_policy` involvement.
+    let spawner = redis
+        .find("pub async fn spawn_uncharge_rate_limit_windows(")
+        .expect("the detached compensation entry point must exist");
+    let spawner_body = {
+        let rest = &redis[spawner..];
+        let end = rest[1..]
+            .find("\n    /// ")
+            .map(|index| index + 1)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    };
+    assert!(
+        spawner_body.contains("self: Arc<Self>"),
+        "the compensation task must own the client Arc, not borrow the caller's"
+    );
+    assert!(
+        spawner_body.contains("handle.spawn(compensate)"),
+        "the compensation must be detached from the request future"
+    );
+    assert!(
+        spawner_body.contains("uncharge_rate_limit_windows(charges.as_slice())"),
+        "the detached task must issue the compensating transaction"
     );
 
     for forbidden in [

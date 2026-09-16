@@ -23,6 +23,7 @@ use crate::scaffolding::port_registry::TestSocket;
 
 use crate::common::TestGateway;
 
+use ferrum_edge::plugins::utils::redis_rate_limiter::RedisRateLimitClient;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::sync::Arc;
@@ -1056,7 +1057,13 @@ async fn test_rate_limiting_redis_centralized() {
                 "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 3}],
                 "sync_mode": "redis",
                 "redis_url": REDIS_URL,
-                "redis_key_prefix": unique_prefix
+                "redis_key_prefix": unique_prefix,
+                // Every assertion below reads a CENTRALIZED counter. The
+                // `rate_limiting` default is `local_fallback`, so a Redis
+                // hiccup would hand this gateway its own per-process budget and
+                // the counts would pass or fail for the wrong reason. Pinned so
+                // an outage shows up as a clean 503 instead.
+                "redis_failure_policy": "fail_closed"
             }
         })],
     )
@@ -1152,7 +1159,11 @@ async fn test_rate_limiting_redis_one_second_previous_bucket_decays() {
                 "limits": [{"scope": "default", "window_seconds": 1, "max_requests": 10}],
                 "sync_mode": "redis",
                 "redis_url": REDIS_URL,
-                "redis_key_prefix": unique_prefix
+                "redis_key_prefix": unique_prefix,
+                // The decay assertions read the seeded centralized buckets; a
+                // per-process fallback budget would answer from a map this test
+                // never seeded. See `test_rate_limiting_redis_centralized`.
+                "redis_failure_policy": "fail_closed"
             }
         })],
     )
@@ -1341,7 +1352,7 @@ async fn test_rate_limiting_redis_sustained_multi_window_keeps_admitting() {
     )
     .unwrap()
     .unwrap();
-    let redis = RedisRateLimitClient::new(config, None, false, None).unwrap();
+    let redis = Arc::new(RedisRateLimitClient::new(config, None, false, None).unwrap());
     let algorithm = DynamicHttpRateLimitAlgorithm::new();
     let op = DynamicRateLimitOp::new(vec![
         RateLimitWindowSpec {
@@ -1403,7 +1414,7 @@ async fn test_rate_limiting_redis_database_selector_handshake() {
         )
         .unwrap()
         .unwrap();
-        let redis = RedisRateLimitClient::new(config, None, false, None).unwrap();
+        let redis = Arc::new(RedisRateLimitClient::new(config, None, false, None).unwrap());
         let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
             limit: 1,
             duration: Duration::from_secs(6),
@@ -1441,7 +1452,7 @@ async fn test_rate_limiting_redis_multi_window_rejections_leave_state_unchanged(
     )
     .unwrap()
     .unwrap();
-    let redis = RedisRateLimitClient::new(config, None, false, None).unwrap();
+    let redis = Arc::new(RedisRateLimitClient::new(config, None, false, None).unwrap());
     let algorithm = DynamicHttpRateLimitAlgorithm::new();
     // Hour/day windows rather than minute/hour: neither index can roll over
     // inside a sub-second test, so the counter snapshots below are stable.
@@ -1489,6 +1500,7 @@ async fn test_rate_limiting_redis_multi_window_rejections_leave_state_unchanged(
         assert_eq!(outcome.window_seconds, Some(86_400));
     }
 
+    await_compensations(&redis).await;
     let after = redis_counter_snapshot(&tag).await;
     let values = |snapshot: &[(String, Option<String>, i64)]| {
         snapshot
@@ -1506,6 +1518,24 @@ async fn test_rate_limiting_redis_multi_window_rejections_leave_state_unchanged(
         "a compensated counter must keep a bounded retention: {after:?}"
     );
     delete_redis_keys_by_prefix(&prefix).await;
+}
+
+/// Wait until every detached rate-limit compensation this client issued has
+/// completed.
+///
+/// A refusal hands its charge back from a task that owns the client `Arc`, not
+/// from the request future (issue #5517 review): the refusal returns first, so
+/// coverage that reads a counter straight afterwards must wait for the
+/// hand-back instead of racing it.
+async fn await_compensations(redis: &Arc<RedisRateLimitClient>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while redis.pending_compensations_for_test() > 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "detached rate-limit compensations did not drain"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// A controllable transport boundary for a LIVE Redis instance. Closing the
@@ -2568,6 +2598,12 @@ plugin_configs:
       sync_mode: "redis"
       redis_url: "{REDIS_URL}"
       redis_key_prefix: "{prefix}"
+      # Both gateways must answer from ONE centralized budget for the
+      # "exactly 4 admitted out of 32 concurrent" assertion to mean anything.
+      # Under the `local_fallback` default a Redis hiccup gives each pod its
+      # own budget, so the shared-budget assertions could pass for the wrong
+      # reason; fail closed instead.
+      redis_failure_policy: "fail_closed"
 "#,
         )
     };
@@ -3685,6 +3721,9 @@ plugin_configs:
           max_requests: 2
       sync_mode: "redis"
       redis_url: "{REDIS_URL}"
+      # Isolation is proven by the centralized per-namespace counters; a
+      # per-process fallback budget would isolate for the wrong reason.
+      redis_failure_policy: "fail_closed"
 "#
         )
     };

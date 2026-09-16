@@ -13,7 +13,10 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use super::http_client::PluginHttpClient;
-use super::redis_rate_limiter::{RedisConfig, RedisRateLimitClient, RedisWindowCharge};
+use super::redis_rate_limiter::{
+    MAX_REDIS_ADMISSION_WINDOWS, RedisConfig, RedisRateLimitClient, RedisWindowCharge,
+    RedisWindowCharges,
+};
 
 /// Root config keys every Redis-backed rate-limit plugin accepts.
 ///
@@ -358,7 +361,7 @@ pub trait RateLimitAlgorithm: Send + Sync + 'static {
 
     async fn check_redis(
         &self,
-        redis: &RedisRateLimitClient,
+        redis: &Arc<RedisRateLimitClient>,
         key: &str,
         op: &Self::Op,
     ) -> Result<RateLimitOutcome, ()>;
@@ -787,6 +790,18 @@ where
                 outcome.local_fallback = true;
                 outcome
             })
+    }
+
+    /// See [`RateLimitBackend::local_fallback_active`].
+    fn local_fallback_active(&self) -> bool {
+        // `is_available()` is the same authoritative signal admission gates on,
+        // and it already reads false for a terminal topology rejection, so a
+        // refused endpoint counts as "in fallback" too. Under `fail_closed`
+        // there is no fallback budget to attribute a refusal to: that path
+        // returns `deny_enforcement_unavailable` and never reaches a capacity
+        // denial.
+        matches!(self.failure_policy, RedisFailurePolicy::LocalFallback)
+            && !self.primary.is_available()
     }
 
     pub fn tracked_keys_count(&self) -> usize {
@@ -1440,12 +1455,29 @@ where
     /// Effective `redis_failure_policy`, or `None` when this backend is
     /// local-only (no centralized store to lose).
     ///
-    /// Exposed so external coverage can prove the default is fail-closed and
-    /// that `local_fallback` is only reached by explicit configuration.
+    /// Exposed so external coverage can pin each plugin's effective default —
+    /// `local_fallback` for `rate_limiting`, `fail_closed` for the other five
+    /// rate-limit roots — and that an explicit setting reaches the backend.
     pub fn redis_failure_policy(&self) -> Option<RedisFailurePolicy> {
         match self {
             Self::Local(_) => None,
             Self::Failover(failover) => Some(failover.failure_policy),
+        }
+    }
+
+    /// Whether admission is CURRENTLY being served from the per-process
+    /// fallback budget: a Redis-backed policy whose centralized store cannot be
+    /// consulted and whose `redis_failure_policy` admits locally.
+    ///
+    /// A capacity denial carries no outcome of its own, so the caller reads
+    /// this to decide whether that refusal belongs to the outage rather than to
+    /// the client: a Redis-backed policy suddenly hitting the local key cap is
+    /// an outage symptom. A local-only backend has no centralized store to
+    /// lose and reads `false`.
+    pub fn local_fallback_active(&self) -> bool {
+        match self {
+            Self::Local(_) => false,
+            Self::Failover(failover) => failover.local_fallback_active(),
         }
     }
 
@@ -1641,6 +1673,16 @@ pub struct FixedWindow {
     window_seconds: u64,
 }
 
+/// The documented two-window weighted approximation
+/// (`previous * (1 - elapsed_fraction) + current`).
+///
+/// One definition shared by [`FixedWindow::weighted_count`] and the Redis
+/// admission path, which reads its counters out of a fixed-capacity buffer and
+/// never materializes a `FixedWindow` per request.
+fn weighted_window_count(previous: u64, current: u64, elapsed_fraction: f64) -> f64 {
+    previous as f64 * (1.0 - elapsed_fraction.clamp(0.0, 1.0)) + current as f64
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 impl FixedWindow {
     pub fn new(limit: u64, window_seconds: u64) -> Self {
@@ -1651,7 +1693,7 @@ impl FixedWindow {
     }
 
     pub fn weighted_count(&self, previous: u64, current: u64, elapsed_fraction: f64) -> f64 {
-        previous as f64 * (1.0 - elapsed_fraction.clamp(0.0, 1.0)) + current as f64
+        weighted_window_count(previous, current, elapsed_fraction)
     }
 
     pub fn outcome(&self, previous: u64, current: u64, elapsed_fraction: f64) -> RateLimitOutcome {
@@ -2027,7 +2069,10 @@ fn check_http_windows(
 ///    remaining budget is reported.
 /// 3. If ANY window refuses, ONE compensating atomic `MULTI`/`EXEC` hands back
 ///    the charge on EVERY window this request incremented — the ones that fit
-///    included — and the refusal names the first refusing window.
+///    included — and the refusal names the first refusing window. That
+///    compensation is issued from a DETACHED task holding the client `Arc`, so
+///    it is not tied to the lifetime of the request future that made the
+///    charge.
 ///
 /// Step 3 is what closes issue #5517. Previously a refused attempt kept the
 /// increment it had just made, so a client above its rate re-armed its own
@@ -2048,6 +2093,15 @@ fn check_http_windows(
 /// the window's TTL elapses and is reported as a Redis failure, so the
 /// configured `redis_failure_policy` governs the next decision.
 ///
+/// Cancelling this request does NOT strand a charge. The hand-back runs on its
+/// own task owning the client `Arc`
+/// ([`RedisRateLimitClient::spawn_uncharge_rate_limit_windows`]), so a dropped
+/// plugin future — a gRPC deadline elapsing under `timeout_at`, a client
+/// disconnect, a config reload retiring this instance — cannot take the
+/// compensation with it. The one remaining exception is a process exit between
+/// the charge and the compensation: the increment is already on the server and
+/// stays until its window's TTL elapses.
+///
 /// # Algorithm
 ///
 /// Every window uses the documented previous/current two-window weighted
@@ -2061,7 +2115,7 @@ fn check_http_windows(
 /// at the configured cap, and no charge left behind by a refusal.
 async fn check_http_windows_redis(
     specs: &[RateLimitWindowSpec],
-    redis: &RedisRateLimitClient,
+    redis: &Arc<RedisRateLimitClient>,
     key: &str,
 ) -> Result<RateLimitOutcome, ()> {
     if specs.is_empty() {
@@ -2069,25 +2123,43 @@ async fn check_http_windows_redis(
         // than manufacturing an outage for a policy that limits nothing.
         return Ok(RateLimitOutcome::allow());
     }
-
-    let mut windows = Vec::with_capacity(specs.len());
-    let mut charges = Vec::with_capacity(specs.len());
-    for spec in specs {
-        let window = FixedWindow::new(spec.limit, spec.duration.as_secs());
-        // One timestamp sample per window, so a boundary straddle cannot pair
-        // an index from one instant with a fraction from another.
-        let progress = RedisRateLimitClient::window_progress(window.window_seconds);
-        let current_index = progress.index.to_string();
-        let previous_index = progress.index.saturating_sub(1).to_string();
-        charges.push(RedisWindowCharge {
-            previous_key: redis.make_slot_key(key, &[&previous_index]),
-            current_key: redis.make_slot_key(key, &[&current_index]),
-            ttl_seconds: two_window_ttl_seconds(window.window_seconds),
-        });
-        windows.push((window, progress.elapsed_fraction));
+    if specs.len() > MAX_REDIS_ADMISSION_WINDOWS {
+        // Config validation already caps the presets at three windows; this is
+        // the fail-closed backstop for the fixed-capacity buffers below.
+        warn_sampled!(
+            windows = specs.len(),
+            max_windows = MAX_REDIS_ADMISSION_WINDOWS,
+            "Redis rate-limit policy exceeds the supported window count"
+        );
+        return Err(());
     }
 
-    let counts = redis.charge_rate_limit_windows(&charges).await?;
+    // Fixed-capacity, allocated inline: at most `MAX_REDIS_ADMISSION_WINDOWS`
+    // windows by construction, on a proxy hot path.
+    let mut elapsed_fractions = [0.0_f64; MAX_REDIS_ADMISSION_WINDOWS];
+    let mut charges = RedisWindowCharges::default();
+    for (index, spec) in specs.iter().enumerate() {
+        let window_seconds = spec.duration.as_secs().max(1);
+        // One timestamp sample per window, so a boundary straddle cannot pair
+        // an index from one instant with a fraction from another.
+        let progress = RedisRateLimitClient::window_progress(window_seconds);
+        let current_index = progress.index.to_string();
+        let previous_index = progress.index.saturating_sub(1).to_string();
+        let charge = RedisWindowCharge {
+            previous_key: redis.make_slot_key(key, &[&previous_index]),
+            current_key: redis.make_slot_key(key, &[&current_index]),
+            ttl_seconds: two_window_ttl_seconds(window_seconds),
+        };
+        if !charges.push(charge) {
+            // Unreachable behind the bound above; still fail closed rather than
+            // charge a subset of the configured windows.
+            return Err(());
+        }
+        elapsed_fractions[index] = progress.elapsed_fraction;
+    }
+
+    let charged = redis.charge_rate_limit_windows(charges.as_slice()).await?;
+    let counts = charged.as_slice();
     if counts.len() != specs.len() {
         // `charge_rate_limit_windows` already refused a short reply; this keeps
         // the indexing below total rather than trusting that a second time.
@@ -2097,13 +2169,12 @@ async fn check_http_windows_redis(
     let mut tightest: Option<(u64, u64, u64)> = None;
     let mut refused: Option<&RateLimitWindowSpec> = None;
     for (index, spec) in specs.iter().enumerate() {
-        let (window, elapsed_fraction) = &windows[index];
         let (previous, current) = counts[index];
         // A counter can only be negative when a compensation raced this key's
         // expiry; read that as zero usage rather than as negative budget.
         let previous = previous.max(0) as u64;
         let current = current.max(0) as u64;
-        let weighted = window.weighted_count(previous, current, *elapsed_fraction);
+        let weighted = weighted_window_count(previous, current, elapsed_fractions[index]);
         if weighted > spec.limit as f64 {
             refused = Some(spec);
             break;
@@ -2120,10 +2191,15 @@ async fn check_http_windows_redis(
 
     if let Some(spec) = refused {
         // Hand back every window this request charged, including the ones that
-        // fit. A failed compensation is already reported through the client's
+        // fit — from a DETACHED task holding the client `Arc`, so dropping this
+        // request future (a gRPC deadline, a client disconnect) cannot strand
+        // the charge, and the refused caller does not pay the second round trip
+        // inline. A failed compensation is still reported through the client's
         // ordinary failure path, so `redis_failure_policy` governs the NEXT
         // decision; this one is a correct refusal either way and is returned.
-        let _ = redis.uncharge_rate_limit_windows(&charges).await;
+        Arc::clone(redis)
+            .spawn_uncharge_rate_limit_windows(charges)
+            .await;
         return Ok(RateLimitOutcome::deny()
             .with_limit(spec.limit)
             .with_window(spec.duration.as_secs()));
@@ -2179,7 +2255,7 @@ impl RateLimitAlgorithm for HttpRateLimitAlgorithm {
 
     async fn check_redis(
         &self,
-        redis: &RedisRateLimitClient,
+        redis: &Arc<RedisRateLimitClient>,
         key: &str,
         _op: &Self::Op,
     ) -> Result<RateLimitOutcome, ()> {
@@ -2271,7 +2347,7 @@ impl RateLimitAlgorithm for DynamicHttpRateLimitAlgorithm {
 
     async fn check_redis(
         &self,
-        redis: &RedisRateLimitClient,
+        redis: &Arc<RedisRateLimitClient>,
         key: &str,
         op: &Self::Op,
     ) -> Result<RateLimitOutcome, ()> {
@@ -2749,7 +2825,7 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
 
     async fn check_redis(
         &self,
-        redis: &RedisRateLimitClient,
+        redis: &Arc<RedisRateLimitClient>,
         key: &str,
         op: &Self::Op,
     ) -> Result<RateLimitOutcome, ()> {
@@ -3101,7 +3177,7 @@ impl RateLimitAlgorithm for WsFrameRateAlgorithm {
 
     async fn check_redis(
         &self,
-        redis: &RedisRateLimitClient,
+        redis: &Arc<RedisRateLimitClient>,
         key: &str,
         op: &Self::Op,
     ) -> Result<RateLimitOutcome, ()> {
@@ -3269,7 +3345,7 @@ impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
 
     async fn check_redis(
         &self,
-        redis: &RedisRateLimitClient,
+        redis: &Arc<RedisRateLimitClient>,
         key: &str,
         op: &Self::Op,
     ) -> Result<RateLimitOutcome, ()> {
@@ -3404,7 +3480,7 @@ mod tests {
 
         async fn check_redis(
             &self,
-            _redis: &RedisRateLimitClient,
+            _redis: &Arc<RedisRateLimitClient>,
             _key: &str,
             _op: &Self::Op,
         ) -> Result<RateLimitOutcome, ()> {

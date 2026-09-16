@@ -209,6 +209,7 @@
 //! screened before it can carry a policy command.
 
 use crate::dns::DnsCache;
+use crate::plugins::utils::log_sampling::warn_sampled;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use arc_swap::ArcSwap;
 use std::sync::Arc;
@@ -1943,6 +1944,12 @@ pub struct RedisRateLimitClient {
     /// connections, endpoints, and credentials. Drop of this client drops the
     /// registration and retires the precomputed counts immediately.
     shared_replay_health: OnceLock<Arc<SharedReplayHealthRegistration>>,
+    /// Detached rate-limit compensations issued but not yet completed.
+    ///
+    /// Bounded by the in-flight refusals of this client's policies. Read only
+    /// by coverage that must observe a hand-back landing instead of racing it;
+    /// admission never reads it.
+    pending_compensations: AtomicUsize,
 }
 
 /// Logging policy for one Redis client.
@@ -2183,7 +2190,7 @@ pub fn classify_replay_set_nx_reply(reply: Option<&str>) -> Result<bool, ReplayS
 /// mixing a one-second and a one-hour window would otherwise retain every
 /// per-second counter for the longest window's lifetime, which grows the key
 /// space with the request rate instead of with the configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RedisWindowCharge {
     /// Counter of the window that precedes the current one; read, never written.
     pub previous_key: String,
@@ -2191,6 +2198,92 @@ pub struct RedisWindowCharge {
     pub current_key: String,
     /// Retention asserted on [`Self::current_key`] by both transactions.
     pub ttl_seconds: u64,
+}
+
+/// Hard ceiling on the windows one atomic rate-limit charge may cover.
+///
+/// Three is the widest shape the HTTP-family limiters produce: `rate_limiting`
+/// presets top out at per-second + per-minute + per-hour, and `graphql` and
+/// `grpc_method_router` are single-window. The bound lives on the transaction
+/// helpers themselves — not only in each caller's config validation — so a
+/// caller whose own bound is relaxed, bypassed, or newly added cannot silently
+/// widen an atomic operation past the fixed-capacity buffers the admission hot
+/// path is built on. Over the ceiling both helpers fail closed.
+pub const MAX_REDIS_ADMISSION_WINDOWS: usize = 3;
+
+/// Fixed-capacity inline list of the windows one atomic charge covers.
+///
+/// The admission path is a proxy hot path, so the per-request window list is
+/// carried inline rather than in a `Vec`: at most [`MAX_REDIS_ADMISSION_WINDOWS`]
+/// entries by construction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RedisWindowCharges {
+    charges: [RedisWindowCharge; MAX_REDIS_ADMISSION_WINDOWS],
+    len: usize,
+}
+
+impl RedisWindowCharges {
+    /// Append one window, or report that the fixed capacity is full.
+    ///
+    /// `false` is a fail-closed signal, never a silent truncation: charging a
+    /// subset of the configured windows would admit against a budget nobody
+    /// configured.
+    pub fn push(&mut self, charge: RedisWindowCharge) -> bool {
+        if self.len >= MAX_REDIS_ADMISSION_WINDOWS {
+            return false;
+        }
+        self.charges[self.len] = charge;
+        self.len += 1;
+        true
+    }
+
+    pub fn as_slice(&self) -> &[RedisWindowCharge] {
+        &self.charges[..self.len]
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// Per-window `(previous_count, post-increment current_count)` pairs returned
+/// by one [`RedisRateLimitClient::charge_rate_limit_windows`].
+///
+/// Held inline for the same reason as [`RedisWindowCharges`]: the reply is
+/// bounded by [`MAX_REDIS_ADMISSION_WINDOWS`], so the decision the caller reads
+/// off it costs no allocation of its own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RedisWindowCounts {
+    counts: [(i64, i64); MAX_REDIS_ADMISSION_WINDOWS],
+    len: usize,
+}
+
+impl RedisWindowCounts {
+    /// Append one window's counters. `false` when the fixed capacity is full.
+    fn push(&mut self, previous: i64, current: i64) -> bool {
+        if self.len >= MAX_REDIS_ADMISSION_WINDOWS {
+            return false;
+        }
+        self.counts[self.len] = (previous, current);
+        self.len += 1;
+        true
+    }
+
+    pub fn as_slice(&self) -> &[(i64, i64)] {
+        &self.counts[..self.len]
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 impl RedisRateLimitClient {
@@ -2319,6 +2412,7 @@ impl RedisRateLimitClient {
             log_policy,
             retention,
             shared_replay_health: OnceLock::new(),
+            pending_compensations: AtomicUsize::new(0),
         })
     }
 
@@ -4248,14 +4342,29 @@ impl RedisRateLimitClient {
     /// expiry (see [`Self::uncharge_rate_limit_windows`]); callers read a
     /// negative counter as zero usage rather than paying a round trip to
     /// normalize it.
+    ///
+    /// More than [`MAX_REDIS_ADMISSION_WINDOWS`] windows fails closed here
+    /// rather than at the caller: this helper is `pub`, so it carries its own
+    /// bound instead of trusting every present and future caller's config
+    /// validation to keep an atomic operation inside the fixed buffers.
     // Redis command failures are intentionally collapsed to () at this boundary.
     #[allow(clippy::result_unit_err)]
     pub async fn charge_rate_limit_windows(
         &self,
         windows: &[RedisWindowCharge],
-    ) -> Result<Vec<(i64, i64)>, ()> {
+    ) -> Result<RedisWindowCounts, ()> {
         if windows.is_empty() {
-            return Ok(Vec::new());
+            return Ok(RedisWindowCounts::default());
+        }
+        if windows.len() > MAX_REDIS_ADMISSION_WINDOWS {
+            warn_sampled!(
+                redis_url = %self.config.redacted_url(),
+                operation = "GET+INCR+EXPIRE",
+                windows = windows.len(),
+                max_windows = MAX_REDIS_ADMISSION_WINDOWS,
+                "Redis rate-limit charge exceeds the supported window count"
+            );
+            return Err(());
         }
         let mut conn = self.get_connection().await.ok_or(())?;
 
@@ -4278,22 +4387,34 @@ impl RedisRateLimitClient {
         let result: Result<Vec<Option<i64>>, redis::RedisError> =
             pipeline.query_async(&mut conn).await;
         match result {
-            Ok(counts) if counts.len() == windows.len() * 2 => {
+            Ok(reply) if reply.len() == windows.len() * 2 => {
                 self.note_command_success()?;
-                Ok(counts
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|pair| (pair[0].unwrap_or(0), pair[1].unwrap_or(0)))
-                    .collect())
+                // Decoded straight into the fixed-capacity buffer: the reply
+                // `Vec` is redis-rs's own decode allocation, and the admission
+                // path adds none of its own on top of it.
+                let mut counts = RedisWindowCounts::default();
+                for pair in reply.as_chunks::<2>().0 {
+                    counts.push(pair[0].unwrap_or(0), pair[1].unwrap_or(0));
+                }
+                Ok(counts)
             }
-            Ok(counts) => {
+            Ok(reply) => {
                 // A short reply would silently pair one window's counter with
                 // another window's limit, so refuse instead of guessing.
-                warn!(
+                //
+                // This is an unusable endpoint, not a quota decision, and the
+                // `INCR`s have already landed. Mark the client unavailable
+                // exactly as the `Err` arm's `note_command_failure` would: the
+                // caller returns before it can reach its own refusal branch, so
+                // nothing compensates the charge, and without this the counters
+                // would climb to the key TTL while every request re-charged a
+                // reply this code cannot pair. Unavailability hands the next
+                // decision to `redis_failure_policy` and stops the hammering.
+                self.mark_unavailable();
+                warn_sampled!(
                     redis_url = %self.config.redacted_url(),
                     operation = "GET+INCR+EXPIRE",
-                    fields = counts.len(),
+                    fields = reply.len(),
                     "Redis rate-limit charge returned an unexpected reply shape"
                 );
                 Err(())
@@ -4349,6 +4470,16 @@ impl RedisRateLimitClient {
         if windows.is_empty() {
             return Ok(());
         }
+        if windows.len() > MAX_REDIS_ADMISSION_WINDOWS {
+            warn_sampled!(
+                redis_url = %self.config.redacted_url(),
+                operation = "DECR+EXPIRE",
+                windows = windows.len(),
+                max_windows = MAX_REDIS_ADMISSION_WINDOWS,
+                "Redis rate-limit compensation exceeds the supported window count"
+            );
+            return Err(());
+        }
         let mut conn = self.get_connection().await.ok_or(())?;
 
         let mut pipeline = redis::pipe();
@@ -4382,6 +4513,64 @@ impl RedisRateLimitClient {
                 Err(())
             }
         }
+    }
+
+    /// Issue a refusal's compensation from a DETACHED task that owns a clone
+    /// of this client's `Arc`, so cancelling the request cannot strand the
+    /// charge.
+    ///
+    /// Plugin hooks are driven under `tokio::time::timeout_at`, and a gRPC
+    /// deadline or a client disconnect drops the hook future outright. Awaiting
+    /// the hand-back inline meant a drop between the charge and the `DECR` left
+    /// the charge on its windows until their TTL elapsed, with no
+    /// `note_command_failure`, no log, and no `redis_failure_policy`
+    /// involvement — issue #5517's lockout shape re-entered through a different
+    /// door, and worst where `limit_by: "ip"` collapses a whole ingress behind
+    /// one key. The task holds the client `Arc`, so it outlives both the
+    /// request future and a config reload that retires the plugin instance.
+    /// Detaching also takes the second round trip off the refused request's
+    /// latency; the refusal itself is already decided and is returned
+    /// immediately.
+    ///
+    /// The failure accounting is unchanged: a compensation that cannot be
+    /// delivered still goes through [`Self::note_command_failure`], so
+    /// `redis_failure_policy` governs the NEXT decision.
+    ///
+    /// One exception remains, and it is the only one: a process exit between
+    /// the charge and the compensation leaves the charge until its window's TTL
+    /// elapses. Nothing in-process can close that — the increment is already on
+    /// the server.
+    ///
+    /// Without a Tokio runtime (direct construction in tests, or a non-Tokio
+    /// executor) the compensation is awaited inline rather than dropped;
+    /// spawning would panic, and a proxy path never panics.
+    pub async fn spawn_uncharge_rate_limit_windows(self: Arc<Self>, charges: RedisWindowCharges) {
+        if charges.is_empty() {
+            return;
+        }
+        self.pending_compensations.fetch_add(1, Ordering::AcqRel);
+        let client = self;
+        let compensate = async move {
+            let _ = client.uncharge_rate_limit_windows(charges.as_slice()).await;
+            client.pending_compensations.fetch_sub(1, Ordering::AcqRel);
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(compensate);
+            }
+            Err(_) => compensate.await,
+        }
+    }
+
+    /// Detached compensations issued by
+    /// [`Self::spawn_uncharge_rate_limit_windows`] that have not completed yet.
+    ///
+    /// Test support only: coverage that asserts a counter after a refusal waits
+    /// for this to reach zero instead of racing the detached task. Admission
+    /// never reads it.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub fn pending_compensations_for_test(&self) -> usize {
+        self.pending_compensations.load(Ordering::Acquire)
     }
 
     /// Replace a key's value with a TTL **only** when its current byte value
