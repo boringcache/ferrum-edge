@@ -3,7 +3,8 @@
 //! `ConfigSync` and xDS ADS are separate services, but both enforce the same
 //! CP/DP security boundary: HS256 JWT in `authorization` metadata, required
 //! `exp`/`iat` plus a present `nbf` when the token carries one, and issuer
-//! pinned to `FERRUM_CP_DP_GRPC_JWT_ISSUER`.
+//! pinned to `FERRUM_CP_DP_GRPC_JWT_ISSUER` as a single string (RFC 7519
+//! §4.1.1).
 //!
 //! # Audience binding (issue #2475)
 //!
@@ -253,6 +254,18 @@ fn enforce_audience(
             }
             Some(_) => Err(AudienceRejectReason::UnexpectedAudience),
         },
+    }
+}
+
+/// RFC 7519 §4.1.1: `iss` is a StringOrURI. `jsonwebtoken` matches a
+/// multi-valued issuer by set intersection, so a present non-string claim
+/// (array, object, number, boolean, or null) must be refused after a
+/// successful decode even when it contains the expected issuer. An absent
+/// `iss` is left to `required_spec_claims`; this predicate only checks shape.
+fn issuer_claim_is_single_string(claims: &Value) -> bool {
+    match claims.get("iss") {
+        None => true,
+        Some(value) => value.is_string(),
     }
 }
 
@@ -1045,6 +1058,14 @@ pub(crate) fn verify_grpc_jwt_metadata_with_audience(
             None::<AudienceRejectReason>,
         )
     })?;
+
+    // Same `Unauthenticated` / `token_validation` label as an issuer mismatch:
+    // a non-string `iss` is a standard-claim failure, not a distinct metric
+    // class. The claim value is never logged or echoed.
+    if !issuer_claim_is_single_string(&token_data.claims) {
+        let reason = TenantAuthRejectReason::TokenValidation;
+        return Err((Status::unauthenticated(reason.as_status_message()), None));
+    }
 
     if let Err(reason) = enforce_audience(&token_data.claims, audience_policy) {
         return Err((
