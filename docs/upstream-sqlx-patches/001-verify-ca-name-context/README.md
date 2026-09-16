@@ -19,7 +19,11 @@ SQLx correctly maps PostgreSQL `VerifyCa` and MySQL `VerifyCa` to
 `CertificateError::NotValidForName`; rustls now returns
 `CertificateError::NotValidForNameContext` for the same name mismatch.
 Handle both variants after WebPKI has verified the chain and certificate
-validity. All other errors propagate. TLS 1.2 and 1.3 handshake signature
+validity. All other errors propagate. The verify-ca WebPKI verifier is also
+built with the crypto provider the handshake already selected
+(`builder_with_provider`) instead of the provider-less builder, which resolves
+the process default from crate features and panics when both `ring` and
+`aws-lc-rs` are compiled in and nothing installed a default. TLS 1.2 and 1.3 handshake signature
 verification still delegates to the original WebPKI verifier. `verify-full`
 does not use this wrapper and keeps hostname verification.
 

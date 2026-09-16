@@ -155,9 +155,15 @@ where
         }
 
         if tls_config.accept_invalid_hostnames {
-            let verifier = WebPkiServerVerifier::builder(Arc::new(cert_store))
-                .build()
-                .map_err(|err| Error::Tls(err.into()))?;
+            // Pin the verifier to the provider selected above. The provider-less
+            // builder resolves the process default from crate features and
+            // panics when both `ring` and `aws-lc-rs` are compiled in and no
+            // default was installed, which is the state of a test binary that
+            // never started the gateway.
+            let verifier =
+                WebPkiServerVerifier::builder_with_provider(Arc::new(cert_store), provider)
+                    .build()
+                    .map_err(|err| Error::Tls(err.into()))?;
 
             if let Some(user_auth) = user_auth {
                 config
