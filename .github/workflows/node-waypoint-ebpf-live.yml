@@ -809,30 +809,16 @@ jobs:
 
           metric='ferrum_mesh_bpf_drops_total{reason="exclude_port_hit"}'
 
-          # Scrape once. Non-zero means the port-forward could not serve
-          # /metrics, which is a different failure from a counter that did not
-          # move and must never be reported as one.
-          scrape() {
-            curl -fsS --max-time 10 http://127.0.0.1:19450/metrics \
-              >"$1" 2>"$results/scrape.err"
-          }
-
-          read_metric() {
-            awk -v metric="$2" '$1 == metric { value = $2 } END { print value }' "$1"
-          }
-
-          # Greatest common divisor of every cumulative ferrum_mesh_bpf_*
+          # Every scrape below tolerates a port-forward that cannot serve
+          # /metrics: that is a different failure from a counter that did not
+          # move and must never be reported as one. The rescale factor is the
+          # greatest common divisor of every cumulative ferrum_mesh_bpf_*
           # counter in one scrape (issue #5502): the replay factor a stalled
           # ringbuf consumer multiplies the whole family by, or 1 on a healthy
-          # consumer. Standard-library Python, so the step stays free of the
-          # inline-program surfaces the trusted Cross build policy freezes.
-          scrape_scale() {
-            python3 .github/scripts/mesh_bpf_scrape_scale.py "$1"
-          }
-
+          # consumer; the always-1 gauges are excluded so they cannot pin it.
           fetched=false
           for _ in $(seq 1 30); do
-            if scrape "$results/before.prom"; then
+            if curl -fsS --max-time 10 http://127.0.0.1:19450/metrics >"$results/before.prom" 2>"$results/scrape.err"; then
               fetched=true
               break
             fi
@@ -845,47 +831,39 @@ jobs:
             exit 1
           fi
 
-          before="$(read_metric "$results/before.prom" "$metric")"
+          before="$(awk -v metric="$metric" '$1 == metric { value = $2 } END { print value }' "$results/before.prom")"
           if [[ ! "$before" =~ ^[0-9]+$ ]]; then
             echo "missing integer $metric baseline in ambient metrics" >&2
             grep 'ferrum_mesh_bpf_drops_total' "$results/before.prom" >&2 || true
             exit 1
           fi
-          before_scale="$(scrape_scale "$results/before.prom")"
+          before_scale="$(awk 'function gcd(a, b,   t) { while (b) { t = a % b; a = b; b = t } return a } { series = $1; value = $2; if (series ~ /^ferrum_mesh_bpf_/ && value ~ /^[0-9]+$/ && series !~ /drop_reasons|ringbuf_overruns_total|ringbuf_in_overrun_regime/ && value > 0) { scale = (scale == "" ? value + 0 : gcd(scale, value + 0)) } } END { if (scale == "" || scale < 1) scale = 1; printf "%d\n", scale }' "$results/before.prom")"
 
-          # Issue the excluded-port connection and keep the evidence. The
-          # remote shell reports curl's own exit status on stdout, which is the
+          # Issue the excluded-port connection and keep the evidence. kubectl
+          # exec propagates the container command's exit status, which is the
           # only unambiguous way to tell "curl ran and the connection was
           # refused" (expected; the hook still classified the connect) from
-          # "kubectl exec never reached the container" (no connect() happened,
-          # so a flat counter proves nothing). Swallowing both with `|| true`
-          # is what made this assertion undiagnosable.
+          # "curl never got as far as connect()" (a flat counter then proves
+          # nothing). Swallowing both with `|| true` is what made this
+          # assertion undiagnosable.
           exec_out="$results/excluded-port-exec.out"
           exec_err="$results/excluded-port-exec.err"
           set +e
-          kubectl -n ferrum-ebpf-live exec "pod/$source_pod" -- sh -c 'curl -sS --connect-timeout 2 --max-time 5 -o /dev/null http://127.0.0.1:15020/; echo "curl_exit=$?"' >"$exec_out" 2>"$exec_err"
-          exec_status=$?
+          kubectl -n ferrum-ebpf-live exec "pod/$source_pod" -- curl -sS --connect-timeout 2 --max-time 5 -o /dev/null http://127.0.0.1:15020/ >"$exec_out" 2>"$exec_err"
+          curl_exit=$?
           set -e
-          printf '%s\n' "$exec_status" >"$results/excluded-port-exec.status"
-          curl_exit="$(sed -n 's/^curl_exit=\([0-9][0-9]*\)$/\1/p' "$exec_out" | tail -n 1)"
+          printf '%s\n' "$curl_exit" >"$results/excluded-port-exec.status"
 
-          if [[ "$exec_status" -ne 0 || -z "$curl_exit" ]]; then
-            echo "kubectl exec into pod/$source_pod failed (exit $exec_status); the excluded-port connect() was never attempted" >&2
-            cat "$exec_err" >&2 || true
-            exit 1
-          fi
           # 0 = something answered, 7 = connection refused, 28 = timed out.
           # Each proves a connect() to the excluded port left the pod, which is
           # what the connect4 hook classifies as exclude_port_hit. Any other
-          # status means curl never got as far as connect().
-          case "$curl_exit" in
-            0|7|28) ;;
-            *)
-              echo "curl in pod/$source_pod exited $curl_exit without attempting the excluded-port connect()" >&2
-              cat "$exec_err" >&2 || true
-              exit 1
-              ;;
-          esac
+          # status (including a kubectl transport failure) means curl never got
+          # as far as connect().
+          if [[ ! "$curl_exit" =~ ^(0|7|28)$ ]]; then
+            echo "curl in pod/$source_pod exited $curl_exit without attempting the excluded-port connect()" >&2
+            cat "$exec_err" >&2 || true
+            exit 1
+          fi
 
           after="$before"
           after_scale="$before_scale"
@@ -895,13 +873,13 @@ jobs:
           : >"$results/poll-outcomes.txt"
           for attempt in $(seq 1 40); do
             polls="$attempt"
-            if ! scrape "$results/after.prom"; then
+            if ! curl -fsS --max-time 10 http://127.0.0.1:19450/metrics >"$results/after.prom" 2>"$results/scrape.err"; then
               scrape_failures=$((scrape_failures + 1))
               printf 'poll=%s outcome=scrape_failed\n' "$attempt" >>"$results/poll-outcomes.txt"
               sleep 0.5
               continue
             fi
-            candidate="$(read_metric "$results/after.prom" "$metric")"
+            candidate="$(awk -v metric="$metric" '$1 == metric { value = $2 } END { print value }' "$results/after.prom")"
             if [[ ! "$candidate" =~ ^[0-9]+$ ]]; then
               scrape_failures=$((scrape_failures + 1))
               printf 'poll=%s outcome=metric_missing\n' "$attempt" >>"$results/poll-outcomes.txt"
@@ -909,7 +887,7 @@ jobs:
               continue
             fi
             after="$candidate"
-            after_scale="$(scrape_scale "$results/after.prom")"
+            after_scale="$(awk 'function gcd(a, b,   t) { while (b) { t = a % b; a = b; b = t } return a } { series = $1; value = $2; if (series ~ /^ferrum_mesh_bpf_/ && value ~ /^[0-9]+$/ && series !~ /drop_reasons|ringbuf_overruns_total|ringbuf_in_overrun_regime/ && value > 0) { scale = (scale == "" ? value + 0 : gcd(scale, value + 0)) } } END { if (scale == "" || scale < 1) scale = 1; printf "%d\n", scale }' "$results/after.prom")"
             printf 'poll=%s outcome=scraped drops=%s scale=%s\n' \
               "$attempt" "$after" "$after_scale" >>"$results/poll-outcomes.txt"
             if ((after > before)); then
@@ -942,10 +920,12 @@ jobs:
           # common factor and require the underlying decision count to move.
           # On a healthy consumer both factors are 1 and this is exactly the
           # plain increase.
-          if [[ ! "$before_scale" =~ ^[1-9][0-9]*$ || ! "$after_scale" =~ ^[1-9][0-9]*$ ]]; then
-            echo "could not derive the ferrum_mesh_bpf_* common factor (before=$before_scale after=$after_scale)" >&2
-            exit 1
-          fi
+          for scale in "$before_scale" "$after_scale"; do
+            if [[ ! "$scale" =~ ^[1-9][0-9]*$ ]]; then
+              echo "could not derive the ferrum_mesh_bpf_* common factor (before=$before_scale after=$after_scale)" >&2
+              exit 1
+            fi
+          done
           before_underlying=$((before / before_scale))
           after_underlying=$((after / after_scale))
           if ((after_underlying <= before_underlying)); then
