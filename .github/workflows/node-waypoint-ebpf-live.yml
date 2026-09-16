@@ -809,30 +809,16 @@ jobs:
 
           metric='ferrum_mesh_bpf_drops_total{reason="exclude_port_hit"}'
 
-          # Scrape once. Non-zero means the port-forward could not serve
-          # /metrics, which is a different failure from a counter that did not
-          # move and must never be reported as one.
-          scrape() {
-            curl -fsS --max-time 10 http://127.0.0.1:19450/metrics \
-              >"$1" 2>"$results/scrape.err"
-          }
-
-          read_metric() {
-            awk -v metric="$2" '$1 == metric { value = $2 } END { print value }' "$1"
-          }
-
-          # Greatest common divisor of every cumulative ferrum_mesh_bpf_*
+          # Every scrape below tolerates a port-forward that cannot serve
+          # /metrics: that is a different failure from a counter that did not
+          # move and must never be reported as one. The rescale factor is the
+          # greatest common divisor of every cumulative ferrum_mesh_bpf_*
           # counter in one scrape (issue #5502): the replay factor a stalled
           # ringbuf consumer multiplies the whole family by, or 1 on a healthy
-          # consumer. The always-1 gauges are excluded because they would pin
-          # the result at 1 and hide the rescale.
-          scrape_scale() {
-            awk 'function gcd(a, b,   t) { while (b) { t = a % b; a = b; b = t } return a } { series = $1; value = $2; if (series ~ /^ferrum_mesh_bpf_/ && value ~ /^[0-9]+$/ && series !~ /drop_reasons|ringbuf_overruns_total|ringbuf_in_overrun_regime/ && value > 0) { scale = (scale == "" ? value + 0 : gcd(scale, value + 0)) } } END { if (scale == "" || scale < 1) scale = 1; printf "%d\n", scale }' "$1"
-          }
-
+          # consumer; the always-1 gauges are excluded so they cannot pin it.
           fetched=false
           for _ in $(seq 1 30); do
-            if scrape "$results/before.prom"; then
+            if curl -fsS --max-time 10 http://127.0.0.1:19450/metrics >"$results/before.prom" 2>"$results/scrape.err"; then
               fetched=true
               break
             fi
@@ -845,39 +831,112 @@ jobs:
             exit 1
           fi
 
-          before="$(read_metric "$results/before.prom" "$metric")"
+          before="$(awk -v metric="$metric" '$1 == metric { value = $2 } END { print value }' "$results/before.prom")"
           if [[ ! "$before" =~ ^[0-9]+$ ]]; then
             echo "missing integer $metric baseline in ambient metrics" >&2
             grep 'ferrum_mesh_bpf_drops_total' "$results/before.prom" >&2 || true
             exit 1
           fi
+          before_scale="$(awk 'function gcd(a, b,   t) { while (b) { t = a % b; a = b; b = t } return a } { series = $1; value = $2; if (series ~ /^ferrum_mesh_bpf_/ && value ~ /^[0-9]+$/ && series !~ /drop_reasons|ringbuf_overruns_total|ringbuf_in_overrun_regime/ && value > 0) { scale = (scale == "" ? value + 0 : gcd(scale, value + 0)) } } END { if (scale == "" || scale < 1) scale = 1; printf "%d\n", scale }' "$results/before.prom")"
 
-          kubectl -n ferrum-ebpf-live exec "pod/$source_pod" -- \
-            curl -fsS --connect-timeout 1 --max-time 1 \
-            http://127.0.0.1:15020/ >/dev/null 2>&1 || true
+          # Issue the excluded-port connection and keep the evidence. kubectl
+          # exec propagates the container command's exit status, which is the
+          # only unambiguous way to tell "curl ran and the connection was
+          # refused" (expected; the hook still classified the connect) from
+          # "curl never got as far as connect()" (a flat counter then proves
+          # nothing). Swallowing both with `|| true` is what made this
+          # assertion undiagnosable.
+          exec_out="$results/excluded-port-exec.out"
+          exec_err="$results/excluded-port-exec.err"
+          set +e
+          kubectl -n ferrum-ebpf-live exec "pod/$source_pod" -- curl -sS --connect-timeout 2 --max-time 5 -o /dev/null http://127.0.0.1:15020/ >"$exec_out" 2>"$exec_err"
+          curl_exit=$?
+          set -e
+          printf '%s\n' "$curl_exit" >"$results/excluded-port-exec.status"
+
+          # 0 = something answered, 7 = connection refused, 28 = timed out.
+          # Each proves a connect() to the excluded port left the pod, which is
+          # what the connect4 hook classifies as exclude_port_hit. Any other
+          # status (including a kubectl transport failure) means curl never got
+          # as far as connect().
+          if [[ "$curl_exit" != 0 && "$curl_exit" != 7 && "$curl_exit" != 28 ]]; then
+            echo "curl in pod/$source_pod exited $curl_exit without attempting the excluded-port connect()" >&2
+            cat "$exec_err" >&2 || true
+            exit 1
+          fi
 
           after="$before"
-          for _ in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:19450/metrics >"$results/after.prom"; then
-              candidate="$(awk -v metric="$metric" '$1 == metric { value = $2 } END { print value }' "$results/after.prom")"
-              if [[ "$candidate" =~ ^[0-9]+$ ]]; then
-                after="$candidate"
-                if ((after > before)); then
-                  break
-                fi
-              fi
+          after_scale="$before_scale"
+          polls=0
+          scrape_failures=0
+          moved=false
+          : >"$results/poll-outcomes.txt"
+          for attempt in $(seq 1 40); do
+            polls="$attempt"
+            if ! curl -fsS --max-time 10 http://127.0.0.1:19450/metrics >"$results/after.prom" 2>"$results/scrape.err"; then
+              scrape_failures=$((scrape_failures + 1))
+              printf 'poll=%s outcome=scrape_failed\n' "$attempt" >>"$results/poll-outcomes.txt"
+              sleep 0.5
+              continue
+            fi
+            candidate="$(awk -v metric="$metric" '$1 == metric { value = $2 } END { print value }' "$results/after.prom")"
+            if [[ ! "$candidate" =~ ^[0-9]+$ ]]; then
+              scrape_failures=$((scrape_failures + 1))
+              printf 'poll=%s outcome=metric_missing\n' "$attempt" >>"$results/poll-outcomes.txt"
+              sleep 0.5
+              continue
+            fi
+            after="$candidate"
+            after_scale="$(awk 'function gcd(a, b,   t) { while (b) { t = a % b; a = b; b = t } return a } { series = $1; value = $2; if (series ~ /^ferrum_mesh_bpf_/ && value ~ /^[0-9]+$/ && series !~ /drop_reasons|ringbuf_overruns_total|ringbuf_in_overrun_regime/ && value > 0) { scale = (scale == "" ? value + 0 : gcd(scale, value + 0)) } } END { if (scale == "" || scale < 1) scale = 1; printf "%d\n", scale }' "$results/after.prom")"
+            printf 'poll=%s outcome=scraped drops=%s scale=%s\n' \
+              "$attempt" "$after" "$after_scale" >>"$results/poll-outcomes.txt"
+            if ((after > before)); then
+              moved=true
+              break
             fi
             sleep 0.5
           done
 
-          if ((after <= before)); then
-            echo "expected $metric to increase after a real excluded-port connection; before=$before after=$after" >&2
-            grep 'ferrum_mesh_bpf_drops_total' "$results/after.prom" >&2 || true
+          if ((polls > 0 && scrape_failures == polls)); then
+            echo "all $polls post-connection scrapes failed: the port-forward to pod/$ambient_pod never served /metrics, so $metric was never read" >&2
+            cat "$results/scrape.err" >&2 || true
+            cat "$results/port-forward.log" >&2 || true
             exit 1
           fi
 
-          printf 'source_pod=%s\nsource_node=%s\nambient_pod=%s\nmetric=%s\nbefore=%s\nafter=%s\n' \
-            "$source_pod" "$source_node" "$ambient_pod" "$metric" "$before" "$after" \
+          if [[ "$moved" != "true" ]]; then
+            echo "expected $metric to increase after a real excluded-port connection from pod/$source_pod (curl exit $curl_exit); before=$before after=$after over $polls polls, $scrape_failures of them failed to scrape" >&2
+            grep 'ferrum_mesh_bpf_drops_total' "$results/after.prom" >&2 || true
+            cat "$results/port-forward.log" >&2 || true
+            exit 1
+          fi
+
+          # A larger number is not by itself evidence that THIS connection was
+          # classified (issue #5502). While the ringbuf consumer is stalled the
+          # whole ferrum_mesh_bpf_* family is re-counted from the same resident
+          # records, so every series grows by one common factor and any nonzero
+          # baseline drifts upward on its own — satisfying `after > before`
+          # without a single new bypass decision. Divide each scrape by its own
+          # common factor and require the underlying decision count to move.
+          # On a healthy consumer both factors are 1 and this is exactly the
+          # plain increase.
+          if [[ ! "$before_scale" =~ ^[1-9][0-9]*$ || ! "$after_scale" =~ ^[1-9][0-9]*$ ]]; then
+            echo "could not derive the ferrum_mesh_bpf_* common factor (before=$before_scale after=$after_scale)" >&2
+            exit 1
+          fi
+          before_underlying=$((before / before_scale))
+          after_underlying=$((after / after_scale))
+          if ((after_underlying <= before_underlying)); then
+            echo "$metric grew from $before to $after only because every ferrum_mesh_bpf_* counter rescaled (factor $before_scale -> $after_scale); the underlying bypass-decision count stayed at $before_underlying, so the excluded-port connection from pod/$source_pod was never classified by pod/$ambient_pod" >&2
+            grep 'ferrum_mesh_bpf_' "$results/after.prom" >&2 || true
+            cat "$results/port-forward.log" >&2 || true
+            exit 1
+          fi
+
+          printf 'source_pod=%s\nsource_node=%s\nambient_pod=%s\nmetric=%s\ncurl_exit=%s\nbefore=%s\nafter=%s\nbefore_scale=%s\nafter_scale=%s\nbefore_underlying=%s\nafter_underlying=%s\npolls=%s\nscrape_failures=%s\n' \
+            "$source_pod" "$source_node" "$ambient_pod" "$metric" "$curl_exit" \
+            "$before" "$after" "$before_scale" "$after_scale" \
+            "$before_underlying" "$after_underlying" "$polls" "$scrape_failures" \
             >"$results/assertion.txt"
 
       - name: Collect diagnostics
