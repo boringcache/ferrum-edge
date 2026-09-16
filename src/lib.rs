@@ -8748,20 +8748,12 @@ pub mod _test_support {
     /// The shared RFC 7519 §2 NumericDate normalization (issue #5521), so the
     /// conservative truncation direction is covered directly: an upper bound
     /// (`exp`) rounds toward the past, a lower bound (`nbf`/`iat`) toward the
-    /// future, and neither widens the window the claim states.
-    pub fn numeric_date_seconds_for_test(
-        value: &serde_json::Value,
-        upper_bound: bool,
-    ) -> Option<i64> {
-        crate::plugins::utils::auth_flow::numeric_date_seconds(
-            value,
-            if upper_bound {
-                crate::plugins::utils::auth_flow::NumericDateBound::Upper
-            } else {
-                crate::plugins::utils::auth_flow::NumericDateBound::Lower
-            },
-        )
-    }
+    /// future, and neither widens the window the claim states. Both names are
+    /// crate-private — Ferrum normalizes only `exp` today — so this re-export
+    /// is the single mechanism external tests use to reach them.
+    pub use crate::plugins::utils::auth_flow::numeric_date::{
+        NumericDateBound, numeric_date_seconds,
+    };
 
     /// The same conversion driven from already-validated claims, so the `exp`
     /// extraction `jwt_auth` and `jwks_auth` authenticate through is covered at

@@ -2179,7 +2179,9 @@ async fn future_introspection_nbf_must_not_authenticate() {
 }
 
 /// An inverted window — the token's not-before is after its own expiry — is
-/// rejected on the expiry end first, and still never authenticates.
+/// rejected on the not-before end first (the `nbf` check runs before the expiry
+/// check), and still never authenticates. Both ends map to the same bearer
+/// `401`, so the body is what pins the ordering.
 #[tokio::test]
 async fn an_inverted_introspection_window_never_authenticates() {
     let server = MockServer::start().await;
@@ -2205,18 +2207,33 @@ async fn an_inverted_introspection_window_never_authenticates() {
         .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
         .await;
 
+    let body = match &result {
+        PluginResult::Reject { body, .. } => body.clone(),
+        other => panic!("expected rejection, got {other:?}"),
+    };
+    assert_eq!(
+        body,
+        r#"{"error":"Token is not yet valid"}"#,
+        "the not-before end must decide an inverted window, not the expiry end"
+    );
     assert_bearer_reject(result, 401, "invalid_token");
     assert!(ctx.authenticated_identity.is_none());
 }
 
 /// An omitted `nbf` stays supported, and a past or exactly-current one still
 /// authenticates: the check closes only the window that has not opened yet.
+///
+/// A JSON `null` is the same case. Many authorization servers serialize an
+/// optional member they did not set rather than omitting it, so reading `null`
+/// as malformed would turn a provider that authenticates today into a permanent
+/// `503` — with no cache, and therefore a provider round trip per request.
 #[tokio::test]
-async fn absent_past_and_current_nbf_still_authenticate() {
+async fn absent_null_past_and_current_nbf_still_authenticate() {
     let server = MockServer::start().await;
     let now = chrono::Utc::now().timestamp();
     let responses = Arc::new([
         json!({"active": true, "username": "no-nbf"}),
+        json!({"active": true, "username": "null-nbf", "nbf": null}),
         json!({"active": true, "username": "past-nbf", "nbf": now - 3600}),
         json!({"active": true, "username": "current-nbf", "nbf": now}),
     ]);
@@ -2243,6 +2260,7 @@ async fn absent_past_and_current_nbf_still_authenticate() {
 
     for (token, expected) in [
         ("absent-nbf", "no-nbf"),
+        ("null-nbf", "null-nbf"),
         ("past-nbf", "past-nbf"),
         ("current-nbf", "current-nbf"),
     ] {
@@ -2259,6 +2277,9 @@ async fn absent_past_and_current_nbf_still_authenticate() {
 /// A present but malformed `nbf` is a broken dependency response, classified
 /// like malformed expiry data: a fixed plain `503`, never a bearer challenge
 /// and never cached in either direction.
+///
+/// A JSON `null` is deliberately NOT in this set — it is read as an omitted
+/// member and covered by `absent_null_past_and_current_nbf_still_authenticate`.
 #[tokio::test]
 async fn malformed_introspection_nbf_is_a_503_and_never_cached() {
     let server = MockServer::start().await;
@@ -2266,8 +2287,8 @@ async fn malformed_introspection_nbf_is_a_503_and_never_cached() {
         json!({"active": true, "username": "u", "nbf": "1700000000"}),
         json!({"active": true, "username": "u", "nbf": 1_700_000_000.5}),
         json!({"active": true, "username": "u", "nbf": true}),
-        json!({"active": true, "username": "u", "nbf": null}),
         json!({"active": true, "username": "u", "nbf": [1_700_000_000]}),
+        json!({"active": true, "username": "u", "nbf": {"iat": 1_700_000_000}}),
         json!({"active": true, "username": "recovered"}),
     ]);
     let calls = Arc::new(AtomicUsize::new(0));
@@ -2291,7 +2312,7 @@ async fn malformed_introspection_nbf_is_a_503_and_never_cached() {
     )
     .unwrap();
 
-    for token in ["string", "fraction", "boolean", "null", "array"] {
+    for token in ["string", "fraction", "boolean", "array", "object"] {
         assert_plain_reject(
             plugin
                 .authenticate(&mut make_ctx(token), &ConsumerIndex::new(&[]))

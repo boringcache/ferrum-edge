@@ -1263,6 +1263,17 @@ pub(crate) fn cached_window_status(
 /// A malformed value is a broken dependency response, classified like malformed
 /// expiry data ([`IntrospectionDecision::Unavailable`], 503). A well-formed
 /// future value is an ordinary bearer rejection.
+///
+/// A JSON `null` is how a large family of authorization servers serializes an
+/// optional member it did not set, so it is read as "no `nbf` in this response"
+/// rather than as malformed data: an omitted `nbf` is fully supported, and
+/// serializing that omission explicitly must not turn a provider that
+/// authenticates today into a permanent 503. Every other present non-integer
+/// shape is still a broken dependency response.
+///
+/// The comparison carries no clock leeway, matching this plugin's
+/// long-standing `exp` handling; it has no skew knob, so operators keep the
+/// authorization server and the gateway synchronized.
 fn validated_introspection_not_before(
     claims: &Value,
 ) -> Result<Option<i64>, IntrospectionDecision> {
@@ -1273,7 +1284,7 @@ fn validated_introspection_not_before_at(
     claims: &Value,
     now: i64,
 ) -> Result<Option<i64>, IntrospectionDecision> {
-    let Some(value) = claims.get("nbf") else {
+    let Some(value) = claims.get("nbf").filter(|value| !value.is_null()) else {
         return Ok(None);
     };
     let not_before = value

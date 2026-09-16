@@ -26,10 +26,15 @@
 //! landing in the "no bound" class above. The truncation direction is
 //! conservative per claim role — `exp` toward the past, `nbf`/`iat` toward the
 //! future — so the enforced window is never wider than the token states.
+//! Ferrum only selects the upper bound today (`nbf` is enforced by the JWT
+//! validation layer), so the helper is crate-private and reached here through
+//! `_test_support`; the lower direction is still covered because the
+//! truncation contract is only meaningful as a pair.
 
 use ferrum_edge::_test_support::{
-    credential_deadline_from_claims_at_for_test, credential_deadline_from_unix_seconds_at_for_test,
-    numeric_date_seconds_for_test, request_credential_deadline_at,
+    NumericDateBound, credential_deadline_from_claims_at_for_test,
+    credential_deadline_from_unix_seconds_at_for_test, numeric_date_seconds,
+    request_credential_deadline_at,
 };
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::plugins::{Plugin, RequestContext, jwks_auth::JwksAuth, jwt_auth::JwtAuth};
@@ -367,7 +372,9 @@ fn a_fractional_claims_expiry_still_bounds_the_credential() {
 /// The truncation direction is the conservative one for each claim role: an
 /// upper bound (`exp`) can only move toward the past and a lower bound
 /// (`nbf`/`iat`) only toward the future, so a fractional value never widens
-/// the window the token states.
+/// the window the token states. Only the upper bound has a production caller;
+/// the lower one is pinned here so the pair cannot drift if one is ever wired
+/// up.
 #[test]
 fn numeric_dates_truncate_toward_the_narrower_window() {
     for (value, upper, lower) in [
@@ -379,12 +386,12 @@ fn numeric_dates_truncate_toward_the_narrower_window() {
         (json!(0), Some(0), Some(0)),
     ] {
         assert_eq!(
-            numeric_date_seconds_for_test(&value, true),
+            numeric_date_seconds(&value, NumericDateBound::Upper),
             upper,
             "upper bound of {value}"
         );
         assert_eq!(
-            numeric_date_seconds_for_test(&value, false),
+            numeric_date_seconds(&value, NumericDateBound::Lower),
             lower,
             "lower bound of {value}"
         );
@@ -408,12 +415,12 @@ fn unrepresentable_and_non_numeric_dates_publish_no_bound() {
         json!(-1e30),
     ] {
         assert_eq!(
-            numeric_date_seconds_for_test(&value, true),
+            numeric_date_seconds(&value, NumericDateBound::Upper),
             None,
             "upper bound of {value}"
         );
         assert_eq!(
-            numeric_date_seconds_for_test(&value, false),
+            numeric_date_seconds(&value, NumericDateBound::Lower),
             None,
             "lower bound of {value}"
         );
