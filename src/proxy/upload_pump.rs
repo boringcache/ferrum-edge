@@ -1560,6 +1560,19 @@ async fn run_direct_upload_watch(task: DirectUploadWatch) -> UploadPumpOutcome {
     // polls after that is idle from the arming instant.
     let mut write_armed_at: Option<tokio::time::Instant> = None;
     let outcome = loop {
+        // The direct transport can send the arm and take the final frame in
+        // one synchronous body poll. Consume an already-queued arm before
+        // observing that terminal so clean completion cannot skip the
+        // post-EOS send-queue judgment.
+        if write_configured && write_armed_at.is_none() {
+            match write_start.as_mut().map(|receiver| receiver.try_recv()) {
+                Some(Ok(())) => write_armed_at = Some(tokio::time::Instant::now()),
+                Some(Err(tokio::sync::oneshot::error::TryRecvError::Closed)) => {
+                    write_start = None;
+                }
+                Some(Err(tokio::sync::oneshot::error::TryRecvError::Empty)) | None => {}
+            }
+        }
         match progress.consumer.load(Ordering::Acquire) {
             DIRECT_DONE => break UploadPumpOutcome::Completed,
             DIRECT_RELEASED => break UploadPumpOutcome::ConsumerGone,

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Build-out database initialization:** keep all core SQL schema in `V001` and
+  remove startup column/index repairs, namespace backfills, and the internal
+  compatibility marker. MongoDB uses its current index plan without replacing
+  conflicting indexes and seeds only an empty namespace registry. Recreate
+  development databases after baseline changes; custom-plugin migrations are
+  unchanged. The external ClickHouse baseline is now
+  `schemas/clickhouse/charges.sql`.
 - **WAF scan budget is post-hoc only, and its timeout default now fails closed**
   (issue #5528). `scan_budget_ms` never skips a scan: the body and
   WebSocket-message path used to bail out *before* the scan when the tokio
