@@ -743,7 +743,7 @@ continue past the negotiated suite's `CipherSuiteCommon::confidentiality_limit`.
 `dangerous_into_kernel_connection` ends that accounting: rustls's own `kernel`
 module states that a `KernelConnection` cannot track it and that aborting before
 the limit becomes the caller's responsibility. In the pinned providers
-(`rustls 0.23.40`, aws-lc-rs and ring alike) the TLS 1.2 AES-GCM suites carry
+(`rustls 0.23.45`, aws-lc-rs and ring alike) the TLS 1.2 AES-GCM suites carry
 `confidentiality_limit: 1 << 24` and ChaCha20-Poly1305 carries `u64::MAX`.
 
 Ferrum does not hand finite-limit suites to kTLS. Linux does not expose a

@@ -368,6 +368,7 @@ async fn waf_scans_the_staged_plaintext_not_the_wire_octets() {
     let plugin = Waf::new(&json!({
         "mode": "enforce",
         "include_default_rules": false,
+        "scan_budget_ms": 0,
         "request_body_inspection": true,
         "custom_rules": [{
             "id": "TEST-STAGED-PLAINTEXT",

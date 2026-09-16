@@ -5,6 +5,7 @@ use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, DispatchKind, PluginAssociation, PluginConfig, PluginScope,
     Proxy, default_namespace,
 };
+use ferrum_edge::plugins::utils::log_schema::registry;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use hmac::{KeyInit, Mac};
 use http::HeaderMap;
@@ -548,12 +549,21 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
 }
 
 /// A global `tracing` dispatcher whose only job is to keep callsite interest
-/// from collapsing to `never`. `tracing::subscriber::set_default` installs a
-/// thread-local dispatcher and does NOT rebuild the global interest cache, so a
-/// callsite that some other test hit first (before any dispatcher existed) can
-/// stay cached as disabled and a later thread-local capture sees nothing. With
-/// this floor registered, `rebuild_interest_cache()` yields `sometimes` for
-/// every callsite and captures work regardless of test ordering. The unit suite
+/// from collapsing to `never` and the process max level at `TRACE`.
+///
+/// `tracing::subscriber::set_default` installs a thread-local dispatcher.
+/// Creating it does register the dispatcher and rebuild every known callsite
+/// under the dispatcher-registry lock, but tracing-core takes a lock-free
+/// shortcut whenever at most one dispatcher is registered: a callsite hit for
+/// the first time recomputes its interest from the *hitting thread's* current
+/// dispatcher only. A sibling test with no subscriber therefore caches `never`
+/// for that callsite, and under load that store can land after (or straddle)
+/// the capturing test's rebuild, so the `debug!` macro skips the event before
+/// the thread-local capture is ever consulted and the capture comes back empty.
+/// With this floor registered, the registry never drops below two live
+/// dispatchers once a capture exists, every rebuild takes the lock, every
+/// callsite is `sometimes` (a per-event `enabled()` check against the current
+/// thread's dispatcher), and the max-level hint stays `TRACE`. The unit suite
 /// is split across several test binaries, so no test may rely on another
 /// module having installed a global subscriber earlier in the process.
 struct InterestFloorSubscriber;
@@ -582,15 +592,25 @@ impl tracing::Subscriber for InterestFloorSubscriber {
 }
 
 /// Install [`InterestFloorSubscriber`] as the global default exactly once for
-/// this test binary. Idempotent and tolerant of an already-set global default.
-/// Call it before installing a thread-local capturing subscriber, then run
-/// `tracing::callsite::rebuild_interest_cache()` after `set_default`.
+/// this test binary. Call it before installing a thread-local capturing
+/// subscriber, then run `tracing::callsite::rebuild_interest_cache()` after
+/// `set_default`.
+///
+/// Panics when some other global subscriber won the race: the floor is what
+/// makes thread-local captures deterministic, and a foreign global default (a
+/// stray `try_init()`, say) would silently reintroduce the load-sensitive
+/// empty-capture race this helper exists to close.
 #[allow(dead_code)]
 pub fn install_interest_floor() {
-    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    INSTALLED.get_or_init(|| {
-        let _ = tracing::subscriber::set_global_default(InterestFloorSubscriber);
-    });
+    static INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let owned = *INSTALLED
+        .get_or_init(|| tracing::subscriber::set_global_default(InterestFloorSubscriber).is_ok());
+    assert!(
+        owned,
+        "a global tracing subscriber was installed before the interest floor; \
+         log-capture tests need `InterestFloorSubscriber` as the process-wide default, \
+         so route every global install through plugin_utils::install_interest_floor"
+    );
 }
 
 /// Guarantee `FERRUM_BASIC_AUTH_HMAC_SECRET` is set for tests that construct
@@ -614,18 +634,67 @@ pub fn ensure_basic_auth_test_secret() {
     }
 }
 
-/// Install a thread-local capturing subscriber for the duration of the returned
-/// guard. Use `flavor = "current_thread"` so plugin flush workers stay on the
-/// thread the subscriber is installed for.
+/// Hold the named log-schema registry's reload-bracket serializer for the
+/// guard's lifetime, so a bare `create_plugin("transaction_log_schema", ..)`
+/// is the validation-mode no-op it is documented to be.
+///
+/// `TransactionLogSchema::new` registers every schema it compiles whenever a
+/// staging map is open, and "open" is read from the PROCESS-GLOBAL staging
+/// slot rather than from the calling thread's bracket. Every plugin-cache
+/// build opens a bracket on its own thread, so an unbracketed construction on
+/// another thread is a no-op only while no sibling test happens to be
+/// mid-build; otherwise it writes into that sibling's staging map, or fails
+/// with `named schema 'default' registered more than once` when the sibling
+/// (or a third bare constructor) staged the same name first. Holding the
+/// serializer guarantees no other thread has a bracket open.
+///
+/// The bracket is reentrant on this thread and its state is thread-local:
+/// bind the guard first in the test body and keep the body on one thread
+/// (`#[tokio::test]`'s current-thread runtime qualifies). Tests that assert
+/// registry contents additionally call `registry::reset_for_tests()` under
+/// the guard, as `transaction_log_schema_tests` and `plugin_cache_tests` do.
+#[allow(dead_code)]
+#[must_use = "bind the guard so the serializer stays held for the test body"]
+pub(crate) fn log_schema_registry_guard() -> registry::ReloadBracketTestGuard {
+    registry::lock_for_tests()
+}
+
+/// Install a thread-local capturing subscriber (INFO and above) for the
+/// duration of the returned guard. Use `flavor = "current_thread"` so plugin
+/// flush workers stay on the thread the subscriber is installed for.
+///
+/// This is the only supported way to capture `tracing` output in the unit
+/// suites: it owns the process-global interest floor and the interest-cache
+/// rebuild that a bare `tracing::subscriber::set_default` lacks. A private
+/// `set_default` helper works in isolation and drops events under parallel
+/// load (see [`InterestFloorSubscriber`]).
 #[allow(dead_code)]
 pub fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
     capture_logs_at_level(tracing::Level::INFO)
 }
 
-/// Capture every event when a diagnostic's warning is shared and sampled.
+/// [`capture_logs`] at DEBUG, for diagnostics that only emit at that level.
 #[allow(dead_code)]
 pub fn capture_debug_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
     capture_logs_at_level(tracing::Level::DEBUG)
+}
+
+/// Run `operation` with a DEBUG-level thread-local capture installed for its
+/// whole body and return everything it logged.
+///
+/// The capture is thread-local, so the caller must run on a
+/// `flavor = "current_thread"` runtime and `operation` must emit from the task
+/// it runs on: an event logged from a spawned task or a worker thread is not
+/// captured. The guard is held across every `.await` inside `operation`.
+#[allow(dead_code)]
+pub async fn capture_debug_logs_during<F, Fut>(operation: F) -> String
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let (logs, _guard) = capture_debug_logs();
+    operation().await;
+    logs.contents()
 }
 
 fn capture_logs_at_level(

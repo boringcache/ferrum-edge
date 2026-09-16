@@ -205,21 +205,33 @@ pub fn begin_reload() -> Result<(), String> {
 
 /// Register a named schema into the in-progress reload staging area.
 ///
-/// When called between [`begin_reload`] and [`commit_reload`] (the normal
-/// loader path), writes to the staging map and rejects duplicates.
+/// Stages only when the CALLING THREAD owns the open reload bracket, between
+/// its [`begin_reload`] and its [`commit_reload`] / [`abort_reload`]: the
+/// normal loader path, and prospective graph validation (which opens an
+/// abort-only bracket explicitly, so it detects duplicates and resolves
+/// referrers without changing the live registry). Within the bracket this
+/// writes to the staging map and rejects duplicates.
 ///
-/// When called outside a reload pass (for example, isolated constructor
-/// validation via `validate_plugin_config`), this is a no-op. Prospective
-/// graph validation opens an abort-only bracket explicitly, so it detects
-/// duplicates and resolves referrers without changing the live registry.
+/// Every other call is a no-op: isolated constructor validation via
+/// `validate_plugin_config`, and a constructor running on a thread that does
+/// not own the bracket while another thread is mid-reload. Ownership is the
+/// thread-local test [`lookup_entry`] already applies, not "is a staging map
+/// open anywhere": the latter let a bare `TransactionLogSchema::new` on one
+/// thread write into a concurrent reload's staging map on another, or fail
+/// either side with a spurious duplicate.
 pub fn register_named(
     name: &str,
     raw: Arc<Value>,
     compiled: Arc<SummarySchema>,
 ) -> Result<(), String> {
+    if !KEEPER.with(|keeper| keeper.borrow().reload_open) {
+        return Ok(()); // validation-mode no-op, or another thread's reload
+    }
     let mut state = write_lock();
     let Some(staging) = state.staging.as_mut() else {
-        return Ok(()); // validation-mode no-op
+        // Unreachable while brackets stay paired (`begin_reload` opens the
+        // map before setting `reload_open`); kept as the safe direction.
+        return Ok(());
     };
     if staging.contains_key(name) {
         return Err(format!(
@@ -508,5 +520,55 @@ mod tests {
         register_named("mango", raw_schema(), empty_schema()).unwrap();
         commit_reload().expect("reload bracket commits");
         assert_eq!(registered_names(), vec!["alpha", "mango", "zebra"]);
+    }
+
+    #[test]
+    fn registration_from_a_thread_that_does_not_own_the_bracket_is_a_no_op() {
+        let _g = lock();
+        reset_for_tests();
+        begin_reload().expect("reload bracket opens");
+        register_named("owned", raw_schema(), empty_schema()).unwrap();
+        // A bare constructor on another thread has no bracket of its own, so
+        // its registration must neither land in this reload's staging map
+        // nor fail.
+        let foreign =
+            std::thread::spawn(|| register_named("foreign", raw_schema(), empty_schema()))
+                .join()
+                .unwrap();
+        assert!(
+            foreign.is_ok(),
+            "a cross-thread registration must not error"
+        );
+        assert!(
+            lookup_named("foreign").is_none(),
+            "a cross-thread registration must not reach the reload's staging map"
+        );
+        commit_reload().expect("reload bracket commits");
+        assert_eq!(registered_names(), vec!["owned"]);
+    }
+
+    #[test]
+    fn same_name_from_another_thread_neither_fails_nor_blocks_the_reload_owner() {
+        let _g = lock();
+        reset_for_tests();
+        begin_reload().expect("reload bracket opens");
+        // Foreign registration first: it must not pre-empt the owner's name.
+        let first = std::thread::spawn(|| register_named("shared", raw_schema(), empty_schema()))
+            .join()
+            .unwrap();
+        assert!(first.is_ok());
+        register_named("shared", raw_schema(), empty_schema())
+            .expect("the bracket owner registers its own name exactly once");
+        // Foreign registration second: it must not observe the owner's entry
+        // as a duplicate.
+        let second = std::thread::spawn(|| register_named("shared", raw_schema(), empty_schema()))
+            .join()
+            .unwrap();
+        assert!(
+            second.is_ok(),
+            "a cross-thread registration must not see a duplicate"
+        );
+        commit_reload().expect("reload bracket commits");
+        assert_eq!(registered_names(), vec!["shared"]);
     }
 }

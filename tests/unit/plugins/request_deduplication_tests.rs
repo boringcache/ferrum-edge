@@ -174,6 +174,24 @@ fn make_plugin(config: serde_json::Value) -> RequestDeduplication {
     RequestDeduplication::new(&config, PluginHttpClient::default()).unwrap()
 }
 
+/// Hold the runtime-overlay serializer for a case that stores a completion and
+/// later asserts on its replay or retention.
+///
+/// `RequestContext::response_policy_provenance` fingerprints the process-global
+/// `response_transformer::runtime_overlay` gate stamp, pinned per request, and
+/// `before_proxy` refuses a stored completion whose stamp no longer matches
+/// (`409 ... superseded response policy`); `on_response_committed` likewise
+/// publishes only a non-replayable barrier when the stamp moved during the
+/// request. Sibling tests that `apply_overlay` / `reset_for_test` do so under
+/// `runtime_overlay_consumers::test_lock()`, so a case holding the same lock
+/// across its store and its replay can never observe their publication in
+/// between. The lock is a `std` mutex and the cases are `#[tokio::test]`
+/// bodies on a current-thread runtime, hence the per-case
+/// `allow(clippy::await_holding_lock)`.
+fn pinned_policy_guard() -> std::sync::MutexGuard<'static, ()> {
+    ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock()
+}
+
 fn request_identity(
     plugin: &RequestDeduplication,
     ctx: &RequestContext,
@@ -1183,7 +1201,9 @@ async fn test_enforce_required_rejects_missing_key() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_first_request_passes_then_replay() {
+    let _policy = pinned_policy_guard();
     let config = json!({});
     let plugin = make_plugin(config);
 
@@ -1888,7 +1908,9 @@ fn redis_persistence_is_refused_without_complete_provenance() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn committed_replay_skips_second_response_body_transform() {
+    let _policy = pinned_policy_guard();
     let dedup = make_plugin(json!({}));
     let mut first_ctx = new_ctx("POST", "/api");
     let mut first_headers =
@@ -1944,7 +1966,9 @@ async fn committed_replay_skips_second_response_body_transform() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn committed_replay_runs_current_ai_response_redaction() {
+    let _policy = pinned_policy_guard();
     let dedup = make_plugin(json!({}));
     let response_headers =
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
@@ -1994,7 +2018,9 @@ async fn committed_replay_runs_current_ai_response_redaction() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn committed_replay_runs_current_tool_argument_redaction() {
+    let _policy = pinned_policy_guard();
     let dedup = make_plugin(json!({}));
     let response_headers =
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
@@ -2074,7 +2100,9 @@ async fn committed_replay_runs_current_tool_argument_redaction() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn committed_replay_fails_closed_when_required_transform_cannot_rewrite() {
+    let _policy = pinned_policy_guard();
     let dedup = make_plugin(json!({}));
     let mut first_ctx = new_ctx("POST", "/api");
     let mut first_headers = HashMap::from([(
@@ -2137,7 +2165,9 @@ const EXTERNAL_OPERATION_COMPLETED_METADATA_KEY: &str = "ferrum:external_operati
 // A subsequent request with the same key must be treated as a brand-new request
 // (Continue), not replayed from a poisoned cache entry.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn synthetic_short_circuit_2xx_is_not_stored_under_dedup_key() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({}));
 
     // First request acquires the in-flight marker and a dedup key.
@@ -2255,7 +2285,9 @@ async fn synthetic_204_releases_dedup_inflight_via_finalized_signal() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn h3_deferred_committed_hooks_keep_finalized_signal_for_empty_synthetic_success() {
+    let _policy = pinned_policy_guard();
     let dedup = Arc::new(make_plugin(json!({})));
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(&dedup) as Arc<dyn Plugin>];
 
@@ -2466,7 +2498,9 @@ async fn late_finalized_synthetic_release_does_not_clear_successor_marker() {
 // lifecycle exercised end-to-end by the `ai_federation` suite, without the
 // federation plugin, so a future dedup refactor cannot silently drop it again.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn external_operation_completed_publishes_non_replayable_tombstone_at_commit() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({}));
 
     // First request acquires the in-flight marker and a dedup key.
@@ -2547,7 +2581,9 @@ async fn external_operation_completed_publishes_non_replayable_tombstone_at_comm
 /// already-performed billable operation executable again EARLIER than the bare
 /// marker did.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn external_operation_tombstone_outlives_a_shorter_ttl_than_the_inflight_lease() {
+    let _policy = pinned_policy_guard();
     // Short replay retention, long in-flight protection.
     let plugin = make_plugin(json!({
         "ttl_seconds": 1,
@@ -2614,7 +2650,9 @@ async fn external_operation_tombstone_outlives_a_shorter_ttl_than_the_inflight_l
 /// fallback barrier owns the longer completion deadline and consumes no
 /// completed-response byte budget.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn external_operation_barrier_survives_tiny_entry_and_total_byte_budgets() {
+    let _policy = pinned_policy_guard();
     for (label, config) in [
         (
             "entry",
@@ -2718,7 +2756,9 @@ async fn external_operation_barrier_survives_tiny_entry_and_total_byte_budgets()
 /// A response-byte admission skip must not shorten an external operation's
 /// protection when the replay TTL is shorter than the in-flight lease.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn oversized_external_operation_barrier_outlives_short_replay_ttl() {
+    let _policy = pinned_policy_guard();
     for (label, config) in [
         (
             "entry",
@@ -2782,7 +2822,9 @@ async fn oversized_external_operation_barrier_outlives_short_replay_ttl() {
 /// Total-capacity skip overflow must also retain the in-flight lease when replay
 /// TTL is shorter than `inflight_ttl_seconds`.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn total_capacity_barrier_overflow_outlives_short_replay_ttl() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({
         "max_entries": 1,
         "ttl_seconds": 1,
@@ -2839,7 +2881,9 @@ async fn total_capacity_barrier_overflow_outlives_short_replay_ttl() {
 /// collapse into one fixed process-global refusal deadline rather than growing
 /// attacker-influenced key storage or failing open.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn execution_barrier_capacity_overflow_is_bounded_and_fail_closed() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({
         "max_entries": 1,
         "ttl_seconds": 60,
@@ -2902,7 +2946,9 @@ async fn execution_barrier_capacity_overflow_is_bounded_and_fail_closed() {
 /// A stale terminal hook must not publish over or clear the successor that
 /// acquired after the execution barrier's authoritative deadline.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn expired_execution_barrier_stale_owner_cannot_touch_successor() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({
         "ttl_seconds": 60,
         "inflight_ttl_seconds": 1,
@@ -2976,7 +3022,9 @@ async fn expired_execution_barrier_stale_owner_cannot_touch_successor() {
 /// retention clock. Starting a fresh in-flight clock at eviction would shorten
 /// a `ttl_seconds > inflight_ttl_seconds` completion under later pressure.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn protected_completion_eviction_preserves_original_barrier_deadline() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({
         "max_entries": 1,
         "ttl_seconds": 60,
@@ -3051,7 +3099,9 @@ async fn protected_completion_eviction_preserves_original_barrier_deadline() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn terminal_serverless_remote_502_is_stored_at_response_commit() {
+    let _policy = pinned_policy_guard();
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -3386,7 +3436,9 @@ async fn serverless_commit_with_provable_policy_stays_replayable() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn terminal_serverless_completion_is_owned_by_every_dedup_instance() {
+    let _policy = pinned_policy_guard();
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -3482,7 +3534,9 @@ async fn terminal_serverless_completion_is_owned_by_every_dedup_instance() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn terminal_serverless_ambiguous_query_releases_every_dedup_owner() {
+    let _policy = pinned_policy_guard();
     let first = make_plugin(json!({}));
     let second = make_plugin(json!({}));
     let serverless = ServerlessFunction::new(
@@ -3533,7 +3587,9 @@ async fn terminal_serverless_ambiguous_query_releases_every_dedup_owner() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn terminal_serverless_encoded_body_releases_dedup_owner() {
+    let _policy = pinned_policy_guard();
     let dedup = make_plugin(json!({}));
     let serverless = ServerlessFunction::new(
         &json!({
@@ -3585,7 +3641,9 @@ async fn terminal_serverless_encoded_body_releases_dedup_owner() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn terminal_serverless_origin_encoded_marker_releases_dedup_owner() {
+    let _policy = pinned_policy_guard();
     // A header-only request_transformer that stripped Content-Encoding leaves
     // the live header map identity-clean, but the init-time marker preserves the
     // original non-identity coding, so the serverless egress still fails closed —
@@ -3640,7 +3698,9 @@ async fn terminal_serverless_origin_encoded_marker_releases_dedup_owner() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn terminal_serverless_ambiguous_query_releases_dedup_owner() {
+    let _policy = pinned_policy_guard();
     // A governed query ambiguity (`+`) fails closed before any external call,
     // so the dedup in-flight lock is released for an identical retry.
     let dedup = make_plugin(json!({}));
@@ -3686,7 +3746,9 @@ async fn terminal_serverless_ambiguous_query_releases_dedup_owner() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn terminal_serverless_pre_wire_invocation_failure_releases_dedup_owner() {
+    let _policy = pinned_policy_guard();
     // A proven pre-wire transport failure (connection refused: nothing reached
     // the function) must release the dedup in-flight lock rather than retain the
     // anticipatory side-effect marker, so an identical retry is not blocked/
@@ -3739,7 +3801,9 @@ async fn terminal_serverless_pre_wire_invocation_failure_releases_dedup_owner() 
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn terminal_serverless_literal_ip_egress_denial_releases_dedup_owner() {
+    let _policy = pinned_policy_guard();
     let policy = BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).unwrap();
     let dedup = make_plugin(json!({}));
     let serverless = ServerlessFunction::new(
@@ -3783,7 +3847,9 @@ async fn terminal_serverless_literal_ip_egress_denial_releases_dedup_owner() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn terminal_replay_survives_active_capacity_then_becomes_tombstone() {
+    let _policy = pinned_policy_guard();
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -3890,7 +3956,9 @@ async fn terminal_replay_survives_active_capacity_then_becomes_tombstone() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn oversized_terminal_serverless_response_retains_inflight_protection() {
+    let _policy = pinned_policy_guard();
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -3945,7 +4013,9 @@ async fn oversized_terminal_serverless_response_retains_inflight_protection() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn oversized_buffered_fallback_retains_uncertain_serverless_protection() {
+    let _policy = pinned_policy_guard();
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -4008,7 +4078,9 @@ async fn oversized_buffered_fallback_retains_uncertain_serverless_protection() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn multiple_instances_release_only_their_own_inflight_ownership() {
+    let _policy = pinned_policy_guard();
     let first = make_plugin(json!({"header_name": "Idempotency-Key"}));
     let second = make_plugin(json!({"header_name": "Idempotency-Key"}));
     let mut ctx = body_ctx("POST", "/api", br#"{"value":1}"#);
@@ -4470,7 +4542,9 @@ async fn test_response_buffering_only_for_fresh_dedup_keys() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_response_buffering_releases_event_stream_content_type() {
+    let _policy = pinned_policy_guard();
     let config = json!({});
     let plugin = make_plugin(config);
 
@@ -4748,7 +4822,9 @@ async fn test_streamed_event_stream_retains_inflight_marker_on_client_disconnect
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_stale_stream_end_does_not_clear_successor_inflight_marker() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({
         "inflight_ttl_seconds": 1
     }));
@@ -4810,7 +4886,9 @@ async fn test_stale_stream_end_does_not_clear_successor_inflight_marker() {
 /// header phase and transitions it to a cached `Completed` entry via
 /// `on_final_response_body`, which only runs on the buffered path.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_buffered_response_transitions_inflight_to_completed() {
+    let _policy = pinned_policy_guard();
     let config = json!({});
     let plugin = make_plugin(config);
 
@@ -4846,7 +4924,9 @@ fn test_tracked_keys_count() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_completion_clears_inflight_then_replays() {
+    let _policy = pinned_policy_guard();
     // Verify normal lifecycle: in-flight → completed → replay works correctly
     // and does not return 409 Conflict after the response is captured.
     let config = json!({});
@@ -4886,7 +4966,9 @@ async fn test_completion_clears_inflight_then_replays() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_response_below_entry_limit_is_retained() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({
         "max_entry_size_bytes": 2048,
         "max_total_size_bytes": 8192
@@ -4920,7 +5002,9 @@ async fn test_response_below_entry_limit_is_retained() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_oversized_response_is_not_retained_and_clears_inflight() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({
         "max_entry_size_bytes": 1,
         "max_total_size_bytes": 8192
@@ -4947,7 +5031,9 @@ async fn test_oversized_response_is_not_retained_and_clears_inflight() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_total_retained_bytes_cap_skips_new_completion() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({
         "max_entry_size_bytes": 2048,
         "max_total_size_bytes": 768
@@ -5001,7 +5087,9 @@ async fn test_total_retained_bytes_cap_skips_new_completion() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_unowned_redis_total_cap_skip_clears_inflight() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({
         "sync_mode": "redis",
         "redis_url": "redis://127.0.0.1:1/0",
@@ -5061,7 +5149,9 @@ async fn test_unowned_redis_total_cap_skip_clears_inflight() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_unowned_redis_entry_too_large_skip_clears_inflight() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({
         "sync_mode": "redis",
         "redis_url": "redis://127.0.0.1:1/0",
@@ -5126,7 +5216,9 @@ async fn test_inflight_marker_carries_timestamp() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_completed_entries_evict_over_capacity_on_insert() {
+    let _policy = pinned_policy_guard();
     let config = json!({
         "ttl_seconds": 300,
         "max_entries": 2
@@ -5152,7 +5244,9 @@ async fn test_completed_entries_evict_over_capacity_on_insert() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_expired_completed_entries_release_retained_bytes() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({
         "ttl_seconds": 300,
         "max_entry_size_bytes": 2048,
@@ -5218,7 +5312,9 @@ async fn test_active_inflight_entries_survive_capacity_pressure() {
 /// surface the `x-idempotent-replayed: true` marker so operators can tell a
 /// replay apart from a fresh response.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_replay_strips_set_cookie_session_hijack_protection() {
+    let _policy = pinned_policy_guard();
     let config = json!({});
     let plugin = make_plugin(config);
 
@@ -5290,7 +5386,9 @@ async fn test_replay_strips_set_cookie_session_hijack_protection() {
 /// vector, and replaying the original `traceparent` would splice every cache
 /// hit into the original transaction's trace.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_replay_strips_authorization_and_trace_headers() {
+    let _policy = pinned_policy_guard();
     let config = json!({});
     let plugin = make_plugin(config);
 
@@ -5377,7 +5475,9 @@ async fn test_replay_strips_authorization_and_trace_headers() {
 /// many casings (`Set-Cookie`, `set-cookie`, `SET-COOKIE`); a case-sensitive
 /// strip would silently leak sessions.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_replay_strips_set_cookie_case_insensitively() {
+    let _policy = pinned_policy_guard();
     let config = json!({});
     let plugin = make_plugin(config);
 
@@ -5489,7 +5589,9 @@ async fn test_keyed_idempotency_header_buffers_implicit_http2_body() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_identical_request_bodies_replay_cached_response() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({}));
 
     let mut ctx1 = body_ctx("POST", "/api/orders", b"{\"order\":1}");
@@ -5640,7 +5742,9 @@ async fn test_reused_key_different_route_affecting_header_returns_409() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_reused_key_different_client_trace_headers_replays() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({}));
 
     let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
@@ -5714,7 +5818,9 @@ async fn test_reused_key_different_client_trace_headers_replays() {
 /// is the stronger outcome: it neither replays nor reports another caller's key
 /// as taken.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_scoped_credential_rotation_cannot_replay() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({}));
 
     let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
@@ -5762,7 +5868,9 @@ async fn test_scoped_credential_rotation_cannot_replay() {
 /// Same boundary with `scope_by_consumer` disabled: the display identity leaves
 /// the key, but the credential digests in the caller partition remain.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_unscoped_credential_rotation_cannot_replay() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({
         "scope_by_consumer": false
     }));
@@ -5796,7 +5904,9 @@ async fn test_unscoped_credential_rotation_cannot_replay() {
 /// Same boundary for a caller Ferrum never authenticated: the presented
 /// credential headers are still the caller's authorization context.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_anonymous_credential_rotation_cannot_replay() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({}));
 
     let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
@@ -5826,7 +5936,9 @@ async fn test_anonymous_credential_rotation_cannot_replay() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_reused_key_different_connection_listed_header_returns_409() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({}));
 
     let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
@@ -5853,7 +5965,9 @@ async fn test_reused_key_different_connection_listed_header_returns_409() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_reused_key_different_content_length_replays() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({}));
 
     let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
@@ -5877,7 +5991,9 @@ async fn test_reused_key_different_content_length_replays() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_reused_key_equivalent_gzip_body_replays() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({}));
     let logical_body = br#"{"order":1}"#;
     let compressed_body = gzip_body(logical_body);
@@ -5904,7 +6020,9 @@ async fn test_reused_key_equivalent_gzip_body_replays() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_large_gzip_body_uses_wire_fingerprint_fallback() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({}));
     let logical_body = vec![b'a'; 1024 * 1024 + 1];
     let compressed_body = gzip_body(&logical_body);
@@ -5933,7 +6051,9 @@ async fn test_large_gzip_body_uses_wire_fingerprint_fallback() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_unsupported_content_encoding_stays_in_fingerprint() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({}));
     let body = b"same wire bytes";
 
@@ -5957,7 +6077,9 @@ async fn test_unsupported_content_encoding_stays_in_fingerprint() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn test_malformed_supported_content_encoding_stays_in_fingerprint() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({}));
     let body = b"not actually gzip";
 
@@ -6470,7 +6592,9 @@ fn dedup_ctx(client_ip: &str, key: &str) -> RequestContext {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn dedup_isolates_same_subject_different_credential_scope() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({ "ttl_seconds": 60 }));
 
     let mut narrow = dedup_ctx("127.0.0.1", "order-1");
@@ -6502,7 +6626,9 @@ async fn dedup_isolates_same_subject_different_credential_scope() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn dedup_isolates_anonymous_callers_by_canonical_address() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({ "ttl_seconds": 60 }));
 
     let mut first = dedup_ctx("203.0.113.7", "order-2");
@@ -6532,7 +6658,9 @@ async fn dedup_isolates_anonymous_callers_by_canonical_address() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn dedup_anonymous_caller_scope_shared_is_an_explicit_opt_out() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({
         "ttl_seconds": 60,
         "anonymous_caller_scope": "shared"
@@ -6565,7 +6693,9 @@ async fn dedup_anonymous_caller_scope_shared_is_an_explicit_opt_out() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn dedup_isolates_effective_route_destination() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({ "ttl_seconds": 60 }));
 
     let mut tenant_a = dedup_ctx("127.0.0.1", "order-4");
@@ -6593,7 +6723,9 @@ async fn dedup_isolates_effective_route_destination() {
 /// authenticated caller too, so an idempotent operation claimed from one
 /// address must not be replayable from another.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn dedup_isolates_authenticated_callers_by_canonical_address() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({ "ttl_seconds": 60 }));
 
     let mut office = dedup_ctx("203.0.113.7", "order-addr-1");
@@ -6625,7 +6757,9 @@ async fn dedup_isolates_authenticated_callers_by_canonical_address() {
 
 /// `anonymous_caller_scope: shared` attests about anonymous callers only.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn dedup_shared_anonymous_scope_does_not_relax_authenticated_callers() {
+    let _policy = pinned_policy_guard();
     let plugin = make_plugin(json!({
         "ttl_seconds": 60,
         "anonymous_caller_scope": "shared"

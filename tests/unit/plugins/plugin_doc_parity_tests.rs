@@ -217,6 +217,7 @@ fn builtin_parity_meta_matches_registry_set() {
 
 #[tokio::test]
 async fn complete_order_table_matches_parity_meta_and_runtime_priority() {
+    let _registry = super::plugin_utils::log_schema_registry_guard();
     super::plugin_utils::ensure_basic_auth_test_secret();
     let rows = parse_complete_order_table(EXECUTION_ORDER_DOC);
     assert_unique_names("complete-order table", rows.iter().map(|r| r.name.clone()));
@@ -306,6 +307,7 @@ async fn complete_order_table_matches_parity_meta_and_runtime_priority() {
 
 #[tokio::test]
 async fn protocol_matrix_matches_parity_meta_and_runtime_protocols() {
+    let _registry = super::plugin_utils::log_schema_registry_guard();
     super::plugin_utils::ensure_basic_auth_test_secret();
     let rows = parse_protocol_matrix(EXECUTION_ORDER_DOC);
     assert_unique_names("protocol matrix", rows.iter().map(|r| r.name.clone()));
@@ -499,6 +501,7 @@ fn special_inventory_classifications_are_documented() {
 
 #[tokio::test]
 async fn response_body_production_declarations_match_the_built_in_producers() {
+    let _registry = super::plugin_utils::log_schema_registry_guard();
     use ferrum_edge::plugins::ResponseBodyProduction;
     use ferrum_edge::plugins::builtin_parity::{
         BUILTIN_RESPONSE_BODY_PRODUCERS, declared_response_body_production,

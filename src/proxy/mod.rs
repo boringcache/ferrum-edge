@@ -3220,6 +3220,14 @@ pub fn websocket_origin_allowed(allowed_origins: &[String], origin: &str) -> boo
 }
 
 fn websocket_origin_matches(allowed: &str, origin: &str) -> bool {
+    // Opaque origins from unrelated sandboxed and local documents all serialize
+    // as `null`, so treating it as a trusted literal would defeat CSWSH isolation.
+    // Keep this runtime guard for configurations loaded through legacy paths that
+    // warn instead of applying admission validation.
+    if allowed.trim().eq_ignore_ascii_case("null") {
+        return false;
+    }
+
     if allowed.eq_ignore_ascii_case(origin) {
         return true;
     }
@@ -35759,7 +35767,19 @@ async fn handle_proxy_request_inner(
                 // body wrapper (non-exceeded streaming path).
                 let deferred_grpc_logger: Option<
                     Arc<crate::proxy::deferred_log::DeferredTransactionLogger>,
-                > = if !plugins.is_empty() || streamed || final_error_class.is_some() {
+                > = if plugins.is_empty() && streamed {
+                    // No plugin observes this stream: record the terminal
+                    // accounting alone (the summary below would exist only for
+                    // `record_transaction`). This is a gRPC response by
+                    // construction, as the summary's `request_protocol` says.
+                    Some(
+                        crate::proxy::deferred_log::DeferredTransactionLogger::compact(
+                            proxy.id.clone(),
+                            true,
+                            ctx.response_policy_error_class(final_error_class),
+                        ),
+                    )
+                } else if !plugins.is_empty() || streamed || final_error_class.is_some() {
                     let grpc_resolved_ip = if !plugins.is_empty() {
                         state
                             .dns_cache
@@ -39293,10 +39313,25 @@ async fn handle_proxy_request_inner(
     // summary below. Response framing still needs the request-method semantic,
     // but the hot path does not need to clone the method string.
     let is_head = method.eq_ignore_ascii_case("HEAD");
-    let needs_transaction_summary =
-        !plugins.is_empty() || body_will_stream || backend_error_class.is_some();
+    // A streaming response with no plugin on the proxy still owes the runtime
+    // metrics its terminal accounting, but that is *all* it owes: no `log`,
+    // termination hook, inspector, or mirror exists to receive a summary. Hand
+    // the body a compact terminal that records exactly what the summary path
+    // would have recorded, without the summary, the context clone, or the
+    // delivery task.
+    let compact_terminal_only = plugins.is_empty() && body_will_stream;
+    let needs_transaction_summary = !compact_terminal_only
+        && (!plugins.is_empty() || body_will_stream || backend_error_class.is_some());
     let deferred_logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>> =
-        if needs_transaction_summary {
+        if compact_terminal_only {
+            Some(
+                crate::proxy::deferred_log::DeferredTransactionLogger::compact(
+                    proxy.id.clone(),
+                    crate::runtime_metrics::terminal_metadata_is_grpc(&ctx.metadata),
+                    ctx.response_policy_error_class(backend_error_class),
+                ),
+            )
+        } else if needs_transaction_summary {
             // Request bytes: SizeLimitedIncoming / CountingIncoming publish
             // per DATA frame, so this load is the total once those adapters
             // have finished. Unlimited direct-H2 passthrough publishes only
@@ -40276,7 +40311,8 @@ async fn handle_proxy_request_inner(
     // Attach deferred logger to the body so `log_with_mirror` fires when the
     // body reaches a terminal state (completion, streaming error, or client
     // disconnect via the Drop safety net) rather than at header-flush time.
-    // `deferred_logger` is `Some` only for streaming responses with plugins.
+    // `deferred_logger` is `Some` only for streaming responses; without a
+    // plugin it is the compact terminal that records runtime metrics alone.
     let body = if let Some(guard) = per_ip_guard {
         body.with_per_ip_request_guard(guard)
     } else {
@@ -48273,6 +48309,16 @@ pub(crate) async fn optional_sleep_elapsed(sleep: std::pin::Pin<&mut Option<toki
 /// `Err(())` means the watermark fired first. The wrapped future is polled
 /// FIRST, so a backend that answered in the same poll still wins the race and a
 /// completed exchange is never reclassified as a write stall.
+///
+/// For a watermark-only pump this race is also what DRIVES the upload (issue
+/// #5505): the pump runs inline on this task rather than on one of its own,
+/// so an ordinary request/response upload costs no spawn and no cross-task
+/// hop per frame. When the race ends before the pump has resolved — the
+/// backend answered before consuming the upload, or the post-EOS drain watch
+/// is still running — the pump is handed to its own task before this returns,
+/// so a caller that goes on to await the response body, join the pump later,
+/// or race it again never leaves it unpolled. Cancellation (dropping this
+/// future) leaves the pump inside the join, whose `Drop` does the same.
 pub(crate) async fn await_upload_write_watermark_first<F>(
     fut: F,
     pump: Option<&mut upload_pump::UploadPumpJoin>,
@@ -48292,15 +48338,20 @@ where
     // already filled the slot; it is write-once, so they still win. The future
     // is pinned once, here, and the scope borrows it: wrapping it by value
     // copied the gateway's largest state machine onto a worker stack that an
-    // HTTP/3 → plain dispatch already fills to the brim.
+    // HTTP/3 → plain dispatch already fills to the brim. For the same reason
+    // the race and the hand-off below live in THIS function rather than in a
+    // nested `async fn`: a nested future would carry its own copy of `fut`
+    // alongside this one, doubling that footprint.
     tokio::pin!(fut);
     let mut fut =
         backend_send_queue::ReqwestBackendSocketScope::new(fut, pump.backend_socket_slot());
-    tokio::select! {
+    let raced = tokio::select! {
         biased;
         output = &mut fut => Ok(output),
         () = pump.backend_write_watermark_expired() => Err(()),
-    }
+    };
+    pump.detach_if_live();
+    raced
 }
 
 /// Install the FULL upload lifecycle on a size-limited streaming client body
@@ -52812,7 +52863,7 @@ async fn proxy_to_backend_http2(
                 proxy.backend_write_timeout_ms,
             );
             (
-                body::DirectH2RequestBody::Limited(body),
+                body::DirectH2RequestBody::Limited(Box::new(body)),
                 Some(completion_rx),
                 upload_pump.map(crate::proxy::upload_pump::UploadPumpJoin::cancel_on_drop),
             )
@@ -52836,7 +52887,11 @@ async fn proxy_to_backend_http2(
             // response.
             let (body, upload_pump) =
                 install_streaming_upload_authorization(body, None, proxy.backend_write_timeout_ms);
-            (body::DirectH2RequestBody::Limited(body), None, upload_pump)
+            (
+                body::DirectH2RequestBody::Limited(Box::new(body)),
+                None,
+                upload_pump,
+            )
         } else {
             // Unlimited, unauthenticated, no gRPC observation: forward
             // `Incoming` directly. Cancel stays armed so an early return after

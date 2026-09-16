@@ -41,11 +41,9 @@ use ferrum_edge::plugins::{
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use std::time::Duration;
-use tracing_subscriber::fmt::MakeWriter;
 use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -54,42 +52,6 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 // `crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY`, which is `pub(crate)` and
 // therefore not reachable from this external test crate).
 const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
-
-#[derive(Clone, Default)]
-struct SharedWriter {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
-
-impl SharedWriter {
-    fn contents(&self) -> String {
-        String::from_utf8(self.buffer.lock().unwrap().clone()).unwrap_or_default()
-    }
-}
-
-struct SharedWriterGuard {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
-
-impl io::Write for SharedWriterGuard {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buffer.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for SharedWriter {
-    type Writer = SharedWriterGuard;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        SharedWriterGuard {
-            buffer: Arc::clone(&self.buffer),
-        }
-    }
-}
 
 fn semantic_request_body() -> Value {
     json!({
@@ -1129,15 +1091,7 @@ async fn test_semantic_embedding_signed_query_endpoint_still_reaches_provider() 
 async fn test_semantic_embedding_transport_diagnostics_redact_endpoint_secrets() {
     use tokio::net::TcpListener;
 
-    let writer = SharedWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_target(false)
-        .without_time()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_writer(writer.clone())
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
+    let (writer, guard) = super::plugin_utils::capture_debug_logs();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1179,14 +1133,7 @@ async fn test_semantic_embedding_transport_diagnostics_redact_endpoint_secrets()
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_semantic_embedding_slow_call_diagnostics_redact_endpoint_secrets() {
-    let writer = SharedWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_target(false)
-        .without_time()
-        .with_writer(writer.clone())
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
+    let (writer, guard) = super::plugin_utils::capture_logs();
 
     let mock_server = MockServer::start().await;
     let path_secret = "path-token-secret-canary";

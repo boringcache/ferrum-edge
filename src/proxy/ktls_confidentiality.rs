@@ -11,7 +11,7 @@
 //! track this" and that tracking approximately how many messages have been
 //! sent — and aborting before the limit — becomes the caller's job.
 //!
-//! In the pinned providers (`rustls 0.23.40`, aws-lc-rs and ring alike) the
+//! In the pinned providers (`rustls 0.23.45`, aws-lc-rs and ring alike) the
 //! TLS 1.2 AES-GCM suites carry `confidentiality_limit: 1 << 24` and
 //! ChaCha20-Poly1305 carries `u64::MAX`. So an AES-GCM kTLS session must be
 //! torn down before 2^24 records in **either** direction, while ChaCha keeps

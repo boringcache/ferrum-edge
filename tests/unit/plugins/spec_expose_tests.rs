@@ -7,9 +7,7 @@ use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
 };
 use serde_json::json;
-use std::io;
-use std::sync::{Arc, Mutex};
-use tracing_subscriber::fmt::MakeWriter;
+use std::sync::Arc;
 
 use super::plugin_utils::create_test_proxy;
 
@@ -60,42 +58,6 @@ fn plugin_http_client_with_ca(ca_path: &str, tls_no_verify: bool) -> PluginHttpC
         Arc::new(Vec::new()),
         0,
     )
-}
-
-#[derive(Clone, Default)]
-struct SharedWriter {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
-
-impl SharedWriter {
-    fn contents(&self) -> String {
-        String::from_utf8(self.buffer.lock().unwrap().clone()).unwrap_or_default()
-    }
-}
-
-struct SharedGuard {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
-
-impl io::Write for SharedGuard {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buffer.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for SharedWriter {
-    type Writer = SharedGuard;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        SharedGuard {
-            buffer: Arc::clone(&self.buffer),
-        }
-    }
 }
 
 fn gzip_bytes(plaintext: &[u8]) -> Vec<u8> {
@@ -393,17 +355,7 @@ async fn test_specz_request_with_unreachable_url_returns_502() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_failure_diagnostics_never_include_spec_path_query_or_fragment() {
-    // Thread-local captures need the global interest floor; see plugin_utils.
-    super::plugin_utils::install_interest_floor();
-    let writer = SharedWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_target(false)
-        .without_time()
-        .with_writer(writer.clone())
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
-    tracing::callsite::rebuild_interest_cache();
+    let (writer, _guard) = super::plugin_utils::capture_logs();
 
     let secret_path = "private-never-log-this";
     let secret_query = "signed-token-never-log-this";

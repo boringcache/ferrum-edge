@@ -564,15 +564,15 @@ When reviewing an actions Dependabot PR:
    to.
 3. Do not accept a PR that reintroduces a mutable tag ref.
 
-The setup-python v7 update is limited to eligible jobs: all uses in
-`native-cache-envelope.yml`, the `contracts`, `publish`, and `anonymous-reader`
-jobs in `native-compiler-store.yml`, and `contracts` in
-`release-platform-study.yml`. The compiler-store `produce` and platform-study
-`study` jobs retain their trusted v6 pins because their Cross-sensitive job
-bodies are frozen. The v7 action still runs on Node 24 and accepts the existing
-`python-version: '3.13'` input; its removed `pip-install` input is not used here.
-Keep future Dependabot updates scoped to eligible jobs instead of changing the
-trusted policy to admit an action bump.
+The setup-python v7.0.0 pin (`5fda3b95…`) now covers every use, including the
+previously frozen compiler-store `produce` and platform-study `study` jobs.
+Those two jobs were rotated in a coordinated trusted-policy update because their
+Cross-sensitive bodies cannot change through an ordinary pull request. The v7
+action still runs on Node 24 and accepts the existing `python-version: '3.13'`
+input; its removed `pip-install` input is not used here. Future Dependabot
+updates that only retarget already-v7 uses can land via ordinary PR; a SHA
+change inside a Cross-frozen job still requires a coordinated trusted-policy
+rotation.
 
 The ARM64 Cross build and publication contracts are deliberately frozen by the
 trusted `pull_request_target` verifier. Existing checkout uses on the guarded
@@ -583,14 +583,16 @@ request cannot normalize those comments. Correct them only as part of an
 authorized, coordinated rotation of the trusted policy; do not copy the legacy
 annotation onto new uses.
 
-The install-action v2.87.5 update applies to `ci.yml` and
-`dependency-audit.yml`. The ARM64 release producer and the coverage workflow
-retain the trusted v2.87.2 SHA, including their existing `# v2` comments.
-Dependabot updates must preserve those frozen surfaces; even a patch release
-with unchanged action inputs cannot rotate them through an ordinary PR. The
-v2.87.5 action retains the composite runtime, checksum verification default,
-and existing `tool`/`fallback` inputs. No policy digest is refreshed for this
-dependency update.
+The install-action v2.87.11 pin (`9534c846…`) now covers `ci.yml`,
+`dependency-audit.yml`, the coverage workflow, and the ARM64 release producer.
+The previously frozen coverage and `build-release-arm64-cross` uses were
+rotated in the same trusted-policy update, and `WORKFLOW_CONTRACTS` job digests
+for `main-linux-image` and `build-release-arm64-cross` were recomputed over the
+resulting text (the Linux CI image job also moved onto the current distroless
+digest). The v2.87.11 action retains the composite runtime, checksum verification
+default, and existing `tool`/`fallback` inputs. Dependabot updates that retarget
+already-rotated uses can land via ordinary PR; a SHA change inside a Cross-frozen
+job still requires a coordinated trusted-policy rotation.
 
 #### Scope of the repository-script (automation) freeze
 
@@ -698,7 +700,7 @@ Build-matrix review for this feature:
 | --- | --- |
 | GNU x86_64 sysroot | The pinned AlmaLinux producer installs Perl, make, GCC, and CMake already; OpenSSL comes from the locked source crate. |
 | ARM64 Cross | `Cross.toml` already supplies Perl/make and the target C compiler/archiver. `rdkafka-sys` registers the OpenSSL dependency with CMake, which consumes the target build's root. No Cross command, image, or passthrough change is needed. |
-| Native macOS / Linux | Vendored OpenSSL needs Perl, make, and a C compiler, available in the existing native build environments. |
+| Native macOS / Linux | Vendored OpenSSL needs Perl, make, and a C compiler, available in the existing native build environments. `rdkafka-sys` also needs `cmake` and curl development headers (`libcurl4-openssl-dev` / `libcurl-devel` / Homebrew `curl`); `scripts/install-build-deps.sh` installs those on apt, dnf, and Homebrew hosts. |
 | Windows MSVC | Vendored OpenSSL uses Perl and nmake; the [hosted Windows image](https://github.com/actions/runner-images/blob/main/images/windows/Windows2025-Readme.md) supplies Perl and Visual Studio, and the producers already install NASM. Keep the Windows build in the merge-group/release matrix. |
 | Docker | The Rust builder includes the native toolchain; only static OpenSSL code goes into the distroless runtime. |
 | musl | The locked `openssl-src` supports x86_64/aarch64 musl target configuration. Ferrum currently publishes GNU Linux binaries, not musl gateway binaries; a musl feature-graph resolve is not a claim of a tested release target. |

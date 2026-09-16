@@ -11,8 +11,45 @@ fn ctx(method: &str, path: &str) -> RequestContext {
     RequestContext::new("203.0.113.10".into(), method.into(), path.into())
 }
 
+/// Build a WAF for the rule-semantics tests in this file.
+///
+/// Pins `scan_budget_ms: 0` (unbounded) unless the config sets its own budget.
+/// The production default is a 50 ms wall-clock budget with
+/// `on_scan_timeout: log_and_allow`, and `Waf::run_body_scan_with_budget`
+/// skips the body scan outright when the scheduler alone has burned that
+/// budget before the scan starts. Under CPU starvation (an oversubscribed
+/// runner, parallel test threads beside busy neighbours) that turns an
+/// expected `Reject` or recorded hit into `Continue` plus
+/// `waf.scan_timed_out=true`, so a test of rule behaviour would really be
+/// asserting machine speed. The budget and `on_scan_timeout` paths are covered
+/// on their own terms by the `scan_budget_*` tests in `src/plugins/waf/mod.rs`
+/// and `scan_timeout_block_closes_the_session` in the WebSocket message tests;
+/// the construction-admission tests below call `Waf::new` directly so they
+/// exercise exactly the config they describe.
+fn waf(mut config: serde_json::Value) -> Result<Waf, String> {
+    pin_unbounded_scan_budget(&mut config);
+    Waf::new(&config)
+}
+
+/// [`waf`] for the multi-instance scoring tests that need a stable config id.
+fn waf_with_config_id(
+    mut config: serde_json::Value,
+    config_id: Option<&str>,
+) -> Result<Waf, String> {
+    pin_unbounded_scan_budget(&mut config);
+    Waf::new_with_config_id(&config, config_id)
+}
+
+fn pin_unbounded_scan_budget(config: &mut serde_json::Value) {
+    if let Some(object) = config.as_object_mut()
+        && !object.contains_key("scan_budget_ms")
+    {
+        object.insert("scan_budget_ms".to_string(), json!(0));
+    }
+}
+
 fn recommended_enforcing_waf() -> Waf {
-    Waf::new(&json!({
+    waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
         "paranoia_level": 1
@@ -75,7 +112,7 @@ async fn scan_body_with_content_type(
 
 #[tokio::test]
 async fn default_waf_monitors_sqli_query_without_blocking() {
-    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
+    let plugin = waf(json!({ "mode": "monitor" })).unwrap();
     let mut ctx = ctx("GET", "/search");
     ctx.set_raw_query_string("q=%27%20OR%201%3D1".into());
 
@@ -95,7 +132,7 @@ async fn default_waf_monitors_sqli_query_without_blocking() {
 
 #[tokio::test]
 async fn clean_waf_evaluation_records_clean_action_for_metrics() {
-    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
+    let plugin = waf(json!({ "mode": "monitor" })).unwrap();
     let mut ctx = ctx("GET", "/search");
     ctx.set_raw_query_string("q=ordinary".into());
 
@@ -111,7 +148,7 @@ async fn clean_waf_evaluation_records_clean_action_for_metrics() {
 
 #[tokio::test]
 async fn rule_mode_can_enforce_default_rule() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "rule_modes": { "FE-XSS-001": "enforce" }
     }))
     .unwrap();
@@ -143,7 +180,7 @@ async fn rule_mode_can_enforce_default_rule() {
 
 #[tokio::test]
 async fn path_exemption_short_circuits_and_writes_no_waf_metadata() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "global_exemptions": { "paths": ["/health*"] },
         "rule_modes": { "FE-SQLI-002": "enforce" }
     }))
@@ -164,7 +201,7 @@ async fn short_regex_exemption_does_not_disable_waf_on_unintended_paths() {
     // entire WAF on) ANY path merely containing "api" — e.g. `/v1/api-keys`.
     // After start-anchoring, the exemption only applies to paths that BEGIN
     // with "api", so a SQLi payload on `/v1/api-keys` is still enforced.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "global_exemptions": { "paths": ["~api"] },
         "rule_modes": { "FE-SQLI-002": "enforce" }
     }))
@@ -205,7 +242,7 @@ async fn regex_alternation_exemption_anchors_all_branches() {
     // (metrics)`, leaving the `metrics` branch UNANCHORED — so it exempted (and
     // silently disabled the WAF on) any path merely containing "metrics", e.g.
     // `/v1/metrics-internal`.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "global_exemptions": { "paths": ["~health|metrics"] },
         "rule_modes": { "FE-SQLI-002": "enforce" }
     }))
@@ -242,7 +279,7 @@ async fn regex_alternation_exemption_anchors_all_branches() {
 
 #[tokio::test]
 async fn waf_clears_preexisting_reserved_metadata_before_evaluation() {
-    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
+    let plugin = waf(json!({ "mode": "monitor" })).unwrap();
     let mut ctx = ctx("GET", "/search");
     ctx.metadata
         .insert("waf.rule_hits".to_string(), "SPOOFED".to_string());
@@ -265,7 +302,7 @@ async fn waf_clears_preexisting_reserved_metadata_before_evaluation() {
 
 #[tokio::test]
 async fn consumer_scoped_request_rule_uses_authenticated_identity() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "custom_rules": [{
             "id": "CUSTOM-CONSUMER-QUERY",
@@ -309,7 +346,7 @@ async fn consumer_scoped_request_rule_uses_authenticated_identity() {
 
 #[tokio::test]
 async fn custom_rule_path_conditions_are_exact_unless_marked_as_prefix_or_regex() {
-    let exact_plugin = Waf::new(&json!({
+    let exact_plugin = waf(json!({
         "include_default_rules": false,
         "custom_rules": [{
             "id": "CUSTOM-ADMIN-QUERY",
@@ -336,7 +373,7 @@ async fn custom_rule_path_conditions_are_exact_unless_marked_as_prefix_or_regex(
     let result = exact_plugin.authorize(&mut exact_ctx).await;
     assert!(matches!(result, PluginResult::Reject { .. }));
 
-    let prefix_plugin = Waf::new(&json!({
+    let prefix_plugin = waf(json!({
         "include_default_rules": false,
         "custom_rules": [{
             "id": "CUSTOM-ADMIN-PREFIX",
@@ -360,7 +397,7 @@ async fn custom_rule_path_conditions_are_exact_unless_marked_as_prefix_or_regex(
 
 #[tokio::test]
 async fn custom_rule_regex_path_conditions_remain_unanchored() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "custom_rules": [{
             "id": "CUSTOM-API-QUERY",
@@ -395,7 +432,7 @@ async fn custom_rule_regex_path_conditions_remain_unanchored() {
 
 #[tokio::test]
 async fn request_body_scan_uses_context_aware_final_body_hook() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "rule_modes": { "FE-CMD-002": "enforce" }
     }))
     .unwrap();
@@ -424,7 +461,7 @@ async fn request_body_scan_uses_context_aware_final_body_hook() {
 
 #[tokio::test]
 async fn body_encoding_specials_trigger_buffering_without_body_rules() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "response_inspection": true,
         "response_body_inspection": true,
@@ -499,7 +536,7 @@ async fn body_encoding_specials_trigger_buffering_without_body_rules() {
 
 #[tokio::test]
 async fn highest_severity_is_preserved_across_scan_phases() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "monitor",
         "include_default_rules": false,
         "custom_rules": [
@@ -554,7 +591,7 @@ async fn highest_severity_is_preserved_across_scan_phases() {
 
 #[tokio::test]
 async fn custom_body_json_path_rule_scans_only_selected_value() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "custom_rules": [{
             "id": "CUSTOM-JSON-1",
@@ -590,7 +627,7 @@ async fn custom_body_json_path_rule_scans_only_selected_value() {
 
 #[tokio::test]
 async fn body_json_path_rule_scans_decoded_variants() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "custom_rules": [{
             "id": "CUSTOM-JSON-DECODED",
@@ -628,7 +665,7 @@ async fn body_json_path_rule_scans_decoded_variants() {
 async fn custom_body_json_path_fp_filter_suppresses_json_ld_script() {
     // Issue #3938: per-rule fp_filters must be evaluated against the complete
     // JSON-path value after the rule matcher hits, not only the matched token.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "custom_rules": [{
             "id": "ACME-1",
@@ -681,7 +718,7 @@ async fn custom_body_json_path_fp_filter_suppresses_json_ld_script() {
 
 #[tokio::test]
 async fn body_luhn_and_cidr_rules_scan_decoded_variants() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "custom_rules": [
             {
@@ -749,7 +786,7 @@ async fn body_luhn_and_cidr_rules_scan_decoded_variants() {
 
 #[tokio::test]
 async fn decoded_body_rules_scan_lossy_utf8_bodies() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "custom_rules": [
             {
@@ -816,7 +853,7 @@ async fn body_overlong_utf8_marker_is_flagged_as_encoding_evasion() {
     // than the dangerous char and previously raised no signal. The body
     // encoding-evasion check now flags it via the dedicated FE-ENCODING-002
     // overlong marker rule, so rule_modes and overrides for that rule apply.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "custom_rules": [{
             "id": "FE-ENCODING-002",
@@ -855,7 +892,7 @@ async fn body_overlong_utf8_marker_is_flagged_as_encoding_evasion() {
 async fn body_double_encoding_marker_is_flagged_as_encoding_evasion() {
     // Companion to #40: a double-encoded marker (`%252e`) in a body — which
     // the URL-only check never inspected — is now flagged.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "rule_modes": { "FE-ENCODING-001": "enforce" }
     }))
     .unwrap();
@@ -882,7 +919,7 @@ async fn body_beyond_cap_stacked_encoding_is_flagged_as_encoding_evasion() {
     // decode round cap never reduces to its literal payload, so the body regex
     // set could not see it. The residual-encoding check now surfaces it as an
     // encoding-evasion signal instead of forwarding it silently.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "rule_modes": { "FE-ENCODING-001": "enforce" }
     }))
     .unwrap();
@@ -962,7 +999,7 @@ async fn body_beyond_cap_stacked_encoding_is_flagged_as_encoding_evasion() {
 
 #[tokio::test]
 async fn cidr_text_rules_are_scoped_to_their_configured_target() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "custom_rules": [{
             "id": "CUSTOM-CIDR-HEADER",
@@ -1004,7 +1041,7 @@ async fn cidr_text_rules_are_scoped_to_their_configured_target() {
 
 #[tokio::test]
 async fn cidr_rules_match_common_ip_with_port_forms() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "custom_rules": [
             {
@@ -1056,7 +1093,7 @@ async fn cidr_rules_match_common_ip_with_port_forms() {
 
 #[tokio::test]
 async fn response_header_cidr_rule_matches_without_regex_header_rules() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "response_inspection": true,
         "custom_rules": [{
@@ -1085,7 +1122,7 @@ async fn response_header_cidr_rule_matches_without_regex_header_rules() {
 
 #[tokio::test]
 async fn response_header_rules_request_buffered_grpc_web_trailer_policy() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "response_inspection": true,
         "custom_rules": [{
@@ -1112,7 +1149,7 @@ async fn response_header_rules_request_buffered_grpc_web_trailer_policy() {
 
 #[test]
 fn inactive_response_header_inspection_does_not_govern_native_h3_trailers() {
-    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
+    let plugin = waf(json!({ "mode": "monitor" })).unwrap();
 
     assert!(matches!(
         plugin.response_trailer_policy(),
@@ -1122,7 +1159,7 @@ fn inactive_response_header_inspection_does_not_govern_native_h3_trailers() {
 
 #[test]
 fn monitor_only_response_header_rules_do_not_drop_native_h3_trailers() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "monitor",
         "include_default_rules": false,
         "response_inspection": true,
@@ -1170,7 +1207,7 @@ fn enforce_mode_rejects_monitor_only_response_header_rules() {
 
 #[test]
 fn response_header_anomaly_scoring_governs_native_h3_trailers() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "include_default_rules": false,
         "response_inspection": true,
@@ -1204,7 +1241,7 @@ fn response_header_anomaly_scoring_governs_native_h3_trailers() {
 /// predicate `requires_buffered_grpc_web_trailer_policy` already uses.
 #[test]
 fn request_exempt_from_waf_keeps_its_backend_trailers() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "include_default_rules": false,
         "response_inspection": true,
@@ -1272,7 +1309,7 @@ fn request_exempt_from_waf_keeps_its_backend_trailers() {
 /// identically and no trailer is ever dropped.
 #[test]
 fn monitor_only_waf_declares_no_conditional_trailer_policy() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "monitor",
         "include_default_rules": false,
         "response_inspection": true,
@@ -1298,7 +1335,7 @@ fn monitor_only_waf_declares_no_conditional_trailer_policy() {
 
 #[tokio::test]
 async fn response_header_rules_do_not_request_grpc_web_trailer_policy_when_exempt() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "response_inspection": true,
         "global_exemptions": { "paths": ["/grpc.Service/*"] },
@@ -1321,7 +1358,7 @@ async fn response_header_rules_do_not_request_grpc_web_trailer_policy_when_exemp
 
 #[tokio::test]
 async fn response_body_inspection_is_off_by_default() {
-    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
+    let plugin = waf(json!({ "mode": "monitor" })).unwrap();
     let ctx = ctx("GET", "/");
     assert!(!plugin.requires_response_body_buffering());
     assert!(!plugin.should_buffer_response_body(&ctx));
@@ -1329,7 +1366,7 @@ async fn response_body_inspection_is_off_by_default() {
 
 #[tokio::test]
 async fn response_body_scan_detects_sensitive_data_when_enabled() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "response_inspection": true,
         "response_body_inspection": true,
         "rule_modes": { "FE-DATA-LEAK-006": "enforce" }
@@ -1357,7 +1394,7 @@ async fn response_body_scan_detects_sensitive_data_when_enabled() {
 
 #[tokio::test]
 async fn response_luhn_and_cidr_rules_scan_decoded_variants() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "response_inspection": true,
         "response_body_inspection": true,
@@ -1425,7 +1462,7 @@ async fn response_luhn_and_cidr_rules_scan_decoded_variants() {
 
 #[tokio::test]
 async fn decoded_response_body_rules_scan_lossy_utf8_bodies() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "response_inspection": true,
         "response_body_inspection": true,
@@ -1458,7 +1495,7 @@ async fn decoded_response_body_rules_scan_lossy_utf8_bodies() {
 
 #[tokio::test]
 async fn uppercase_html_entities_are_decoded_for_body_rules() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "rule_modes": { "FE-XSS-001-B": "enforce" }
     }))
     .unwrap();
@@ -1485,7 +1522,7 @@ async fn uppercase_html_entities_are_decoded_for_body_rules() {
 
 #[tokio::test]
 async fn decoded_body_rules_scan_leading_zero_numeric_html_entities() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "rule_modes": { "FE-XSS-001-B": "enforce" }
     }))
     .unwrap();
@@ -1512,7 +1549,7 @@ async fn decoded_body_rules_scan_leading_zero_numeric_html_entities() {
 
 #[tokio::test]
 async fn literal_match_kind_is_case_sensitive_substring_on_body() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "custom_rules": [{
             "id": "CUSTOM-LIT",
@@ -1575,7 +1612,7 @@ async fn literal_match_kind_is_case_sensitive_substring_on_body() {
 
 #[tokio::test]
 async fn contains_match_kind_stays_case_insensitive_substring() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "custom_rules": [{
             "id": "CUSTOM-CONTAINS",
@@ -1607,7 +1644,7 @@ async fn contains_match_kind_stays_case_insensitive_substring() {
 
 #[tokio::test]
 async fn regex_match_kind_honors_explicit_case_insensitive_flag() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "custom_rules": [{
             "id": "CUSTOM-REGEX-I",
@@ -2033,7 +2070,7 @@ async fn duplicate_query_key_cannot_smuggle_payload_past_query_values_rule() {
     // pipeline and the XSS payload slipped past an enforced query_values rule.
     // The fix preserves the raw query string after materialization and scans
     // each raw pair.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "rule_modes": { "FE-XSS-001": "enforce" }
     }))
     .unwrap();
@@ -2066,7 +2103,7 @@ async fn duplicate_query_key_cannot_smuggle_payload_past_query_values_rule() {
 
 #[tokio::test]
 async fn parsed_query_params_are_scanned_when_raw_query_is_absent() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "rule_modes": {
             "FE-XSS-001": "enforce",
             "FE-PATHTRAV-001": "enforce"
@@ -2107,7 +2144,7 @@ async fn parsed_query_params_are_scanned_when_raw_query_is_absent() {
 
 #[tokio::test]
 async fn plus_encoded_query_space_is_detected_by_query_value_rules() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "rule_modes": { "FE-SQLI-001": "enforce" }
     }))
     .unwrap();
@@ -2130,7 +2167,7 @@ async fn plus_encoded_query_space_is_detected_by_query_value_rules() {
 }
 
 fn pathtrav_lfi_enforced_waf() -> Waf {
-    Waf::new(&json!({
+    waf(json!({
         "mode": "enforce",
         "rule_modes": {
             "FE-PATHTRAV-001": "enforce",
@@ -2311,7 +2348,7 @@ async fn query_malformed_percent_plus_and_benign_literals_are_not_traversal() {
 
 #[tokio::test]
 async fn query_xss_percent_decode_is_unchanged() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "rule_modes": { "FE-XSS-001": "enforce" }
     }))
@@ -2334,7 +2371,7 @@ async fn query_xss_percent_decode_is_unchanged() {
 
 #[tokio::test]
 async fn encoded_ampersand_does_not_smuggle_an_extra_query_key() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "mode": "enforce",
         "custom_rules": [{
@@ -2382,7 +2419,7 @@ async fn h3_style_raw_query_params_still_decode_slash_for_lfi() {
 }
 
 fn custom_full_url_waf(id: &str, category: &str, pattern: &str) -> Waf {
-    Waf::new(&json!({
+    waf(json!({
         "include_default_rules": false,
         "mode": "enforce",
         "custom_rules": [{
@@ -2524,7 +2561,7 @@ async fn changing_waf_rule_category_cannot_alter_scan_targets() {
 
 #[tokio::test]
 async fn disabled_default_rules_are_skipped() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "monitor",
         "disabled_default_rules": ["FE-XSS-001"],
         "rule_modes": { "FE-XSS-001": "enforce" }
@@ -2571,7 +2608,7 @@ async fn paranoia_level_filters_custom_rules() {
         ]
     });
 
-    let plugin = Waf::new(&config).unwrap();
+    let plugin = waf(config.clone()).unwrap();
     let mut low_ctx = ctx("GET", "/search");
     low_ctx.set_raw_query_string("q=needle".into());
     let result = plugin.authorize(&mut low_ctx).await;
@@ -2585,7 +2622,7 @@ async fn paranoia_level_filters_custom_rules() {
 
     let mut high_config = config;
     high_config["paranoia_level"] = json!(2);
-    let plugin = Waf::new(&high_config).unwrap();
+    let plugin = waf(high_config).unwrap();
     let mut high_ctx = ctx("GET", "/search");
     high_ctx.set_raw_query_string("q=needle".into());
     let result = plugin.authorize(&mut high_ctx).await;
@@ -2602,7 +2639,7 @@ async fn paranoia_level_filters_custom_rules() {
 
 #[tokio::test]
 async fn inspect_multipart_gates_body_scanning() {
-    let default_plugin = Waf::new(&json!({
+    let default_plugin = waf(json!({
         "rule_modes": { "FE-CMD-002": "enforce" }
     }))
     .unwrap();
@@ -2618,7 +2655,7 @@ async fn inspect_multipart_gates_body_scanning() {
         .await;
     assert!(matches!(result, PluginResult::Continue));
 
-    let multipart_plugin = Waf::new(&json!({
+    let multipart_plugin = waf(json!({
         "inspect_multipart": true,
         "rule_modes": { "FE-CMD-002": "enforce" }
     }))
@@ -2760,7 +2797,7 @@ async fn level_one_sqli_comment_separator_keeps_benign_comment_bodies_passing() 
 
 #[tokio::test]
 async fn paranoia_two_records_sql_comment_token_in_body() {
-    let plugin = Waf::new(&json!({ "mode": "monitor", "paranoia_level": 2 })).unwrap();
+    let plugin = waf(json!({ "mode": "monitor", "paranoia_level": 2 })).unwrap();
 
     let (_result, comment_ctx) =
         scan_body_with_content_type(&plugin, "text/plain", b"style /* comment */ block").await;
@@ -2927,7 +2964,7 @@ async fn whatwg_utf16le_charset_labels_transcode_like_utf16le() {
 async fn uninspectable_declared_charset_records_encoding_special() {
     // FE-ENCODING-001 is opt-in-enforce, so name it explicitly to assert on
     // the reject rather than only on the monitored hit.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "rule_modes": { "FE-ENCODING-001": "enforce" }
     }))
     .unwrap();
@@ -2986,7 +3023,7 @@ async fn utf16_transcoding_does_not_widen_binary_or_multipart_body_gates() {
     assert!(matches!(multipart_result, PluginResult::Continue));
     assert!(!monitored(&multipart_ctx, "FE-SSRF-001"));
 
-    let multipart_plugin = Waf::new(&json!({
+    let multipart_plugin = waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
         "paranoia_level": 1,
@@ -3308,7 +3345,7 @@ fn response_body_buffering_narrows_to_inspectable_content_types() {
     // content-type is known it only needs the body for inspectable
     // (allowlisted) types. The proxy uses this to stream non-allowlisted/binary
     // responses instead of buffering-then-skipping them.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "monitor",
         "response_inspection": true,
         "response_body_inspection": true,
@@ -3377,7 +3414,7 @@ fn response_body_buffering_narrows_to_inspectable_content_types() {
 
 #[tokio::test]
 async fn enforcing_waf_fails_closed_on_unbounded_event_stream() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "response_inspection": true,
         "response_body_inspection": true,
@@ -3414,7 +3451,7 @@ async fn enforcing_waf_fails_closed_on_unbounded_event_stream() {
 
 #[tokio::test]
 async fn explicit_skip_allows_unbounded_event_stream_with_metadata() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "response_inspection": true,
         "response_body_inspection": true,
@@ -3455,7 +3492,7 @@ async fn explicit_skip_allows_unbounded_event_stream_with_metadata() {
 
 #[tokio::test]
 async fn monitor_only_waf_allows_unbounded_event_stream_with_metadata() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "mode": "monitor",
         "response_inspection": true,
@@ -3496,7 +3533,7 @@ async fn monitor_only_waf_allows_unbounded_event_stream_with_metadata() {
 
 #[tokio::test]
 async fn oversized_body_skip_mode_does_not_scan_truncated_prefix() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "max_scan_bytes": 4,
         "on_body_too_large": "skip",
         "rule_modes": { "FE-CMD-002": "enforce" }
@@ -3519,7 +3556,7 @@ async fn oversized_body_skip_mode_does_not_scan_truncated_prefix() {
 
 #[tokio::test]
 async fn clean_truncated_scan_preserves_owned_log_metadata() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "monitor",
         "include_default_rules": false,
         "max_scan_bytes": 4,
@@ -3555,7 +3592,7 @@ async fn clean_truncated_scan_preserves_owned_log_metadata() {
 
 #[tokio::test]
 async fn per_rule_false_positive_filters_suppress_hits() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "custom_rules": [{
             "id": "CUSTOM-FP",
@@ -3584,7 +3621,7 @@ async fn per_rule_false_positive_filters_suppress_hits() {
 
 #[tokio::test]
 async fn global_exemptions_cover_ips_headers_and_capture_filters() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "rule_modes": { "FE-XSS-001": "enforce" },
         "global_exemptions": {
             "ips": ["10.0.0.0/8"],
@@ -3653,7 +3690,7 @@ async fn body_normalization_catches_escaped_payload_the_raw_scan_misses() {
     // A custom body rule matches `<script`. The payload arrives `\x`-escaped,
     // so the raw byte scan never sees the tag — only the decode/normalization
     // pass recovers it. Regression guard for the body-evasion gap.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "custom_rules": [{
             "id": "CUSTOM-XSS-BODY",
@@ -3689,7 +3726,7 @@ async fn body_normalization_catches_escaped_payload_the_raw_scan_misses() {
 
 #[tokio::test]
 async fn body_normalization_redecodes_unicode_escaped_html_entities() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "rule_modes": { "FE-XSS-001-B": "enforce" }
     }))
     .unwrap();
@@ -3717,7 +3754,7 @@ fn monitored(ctx: &RequestContext, rule_id: &str) -> bool {
 
 #[tokio::test]
 async fn jndi_log4shell_detected_in_header_query_and_body() {
-    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
+    let plugin = waf(json!({ "mode": "monitor" })).unwrap();
 
     // Header delivery — the original rule pack never scanned header values
     // for injection payloads, the primary Log4Shell channel.
@@ -3752,7 +3789,7 @@ async fn jndi_log4shell_detected_in_header_query_and_body() {
 
 #[tokio::test]
 async fn prototype_pollution_and_spring4shell_detected_in_body() {
-    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
+    let plugin = waf(json!({ "mode": "monitor" })).unwrap();
 
     let mut proto_ctx = ctx("POST", "/submit");
     proto_ctx
@@ -3786,7 +3823,7 @@ async fn prototype_pollution_and_spring4shell_detected_in_body() {
 
 #[tokio::test]
 async fn xss_and_traversal_now_covered_in_request_body() {
-    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
+    let plugin = waf(json!({ "mode": "monitor" })).unwrap();
 
     let mut xss_ctx = ctx("POST", "/submit");
     xss_ctx
@@ -3819,7 +3856,7 @@ async fn xss_and_traversal_now_covered_in_request_body() {
 }
 
 fn enforce_l1_waf() -> Waf {
-    Waf::new(&json!({
+    waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
         "paranoia_level": 1
@@ -3852,7 +3889,7 @@ async fn ssrf_query_mirrors_fire_at_default_paranoia() {
     // separately. A bare `{}` is no longer admissible because `mode` defaults to
     // `enforce` and the built-in pack is monitor-only (issue #3928), so state the
     // monitor posture these assertions already assume.
-    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
+    let plugin = waf(json!({ "mode": "monitor" })).unwrap();
 
     let metadata = authorize_query(
         &plugin,
@@ -3914,7 +3951,7 @@ async fn ssrf_query_benign_urls_and_unclaimed_forms_are_clean() {
     // separately. A bare `{}` is no longer admissible because `mode` defaults to
     // `enforce` and the built-in pack is monitor-only (issue #3928), so state the
     // monitor posture these assertions already assume.
-    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
+    let plugin = waf(json!({ "mode": "monitor" })).unwrap();
 
     let https = authorize_query(&plugin, "/redirect", "next=https://example.com/path").await;
     assert!(!monitored(&https, "FE-SSRF-001-Q"));
@@ -3949,7 +3986,7 @@ async fn ssrf_encoded_query_values_match_after_layered_decode() {
     // separately. A bare `{}` is no longer admissible because `mode` defaults to
     // `enforce` and the built-in pack is monitor-only (issue #3928), so state the
     // monitor posture these assertions already assume.
-    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
+    let plugin = waf(json!({ "mode": "monitor" })).unwrap();
 
     let percent = authorize_query(
         &plugin,
@@ -3981,7 +4018,7 @@ async fn ssrf_body_and_query_parity_for_metadata_and_gopher() {
     // separately. A bare `{}` is no longer admissible because `mode` defaults to
     // `enforce` and the built-in pack is monitor-only (issue #3928), so state the
     // monitor posture these assertions already assume.
-    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
+    let plugin = waf(json!({ "mode": "monitor" })).unwrap();
 
     let body_metadata =
         scan_text_plain_body(&plugin, b"http://169.254.169.254/latest/meta-data/").await;
@@ -4006,7 +4043,7 @@ async fn ssrf_body_and_query_parity_for_metadata_and_gopher() {
 
 #[tokio::test]
 async fn ssti_arithmetic_probe_fires_but_plain_template_does_not_at_default_paranoia() {
-    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
+    let plugin = waf(json!({ "mode": "monitor" })).unwrap();
 
     let mut probe_ctx = ctx("POST", "/submit");
     probe_ctx
@@ -4037,7 +4074,7 @@ async fn ssti_arithmetic_probe_fires_but_plain_template_does_not_at_default_para
 
 #[tokio::test]
 async fn retuned_loud_rules_are_silent_at_default_paranoia() {
-    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
+    let plugin = waf(json!({ "mode": "monitor" })).unwrap();
 
     // Hex color `#fff` previously tripped the SQL-comment-token rule
     // (FE-SQLI-004), now gated to paranoia_level >= 2.
@@ -4058,7 +4095,7 @@ async fn retuned_loud_rules_are_silent_at_default_paranoia() {
 
 #[tokio::test]
 async fn raised_paranoia_level_reactivates_retuned_rules() {
-    let plugin = Waf::new(&json!({ "mode": "monitor", "paranoia_level": 2 })).unwrap();
+    let plugin = waf(json!({ "mode": "monitor", "paranoia_level": 2 })).unwrap();
     let mut url_ctx = ctx("GET", "/redirect");
     url_ctx.set_raw_query_string("next=https://example.com/path".into());
     let _ = plugin.authorize(&mut url_ctx).await;
@@ -4088,7 +4125,7 @@ fn enforce_mode_rejects_monitor_only_default_ruleset() {
 
 #[test]
 fn monitor_mode_allows_monitor_only_default_ruleset() {
-    Waf::new(&json!({
+    waf(json!({
         "mode": "monitor",
         "include_default_rules": true
     }))
@@ -4097,7 +4134,7 @@ fn monitor_mode_allows_monitor_only_default_ruleset() {
 
 #[test]
 fn enforce_mode_allows_default_rule_action_enforce() {
-    Waf::new(&json!({
+    waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce"
     }))
@@ -4106,7 +4143,7 @@ fn enforce_mode_allows_default_rule_action_enforce() {
 
 #[test]
 fn enforce_mode_allows_rule_modes_opt_in() {
-    Waf::new(&json!({
+    waf(json!({
         "mode": "enforce",
         "rule_modes": { "FE-XSS-001": "enforce" }
     }))
@@ -4126,7 +4163,7 @@ fn enforce_mode_rejects_when_only_enforce_rule_is_disabled() {
 
 #[test]
 fn enforce_mode_allows_scoring_without_enforce_rules() {
-    Waf::new(&json!({
+    waf(json!({
         "mode": "enforce",
         "scoring": { "enabled": true, "block_threshold": 5 }
     }))
@@ -4197,7 +4234,7 @@ fn enforce_mode_rejects_unreachable_stream_enforce_signature() {
 fn enforce_mode_allows_on_body_too_large_block_with_monitor_only_rules() {
     // Resource-bound enforcement with observation-only rules is a real
     // posture: `block` rejects oversize bodies because the mode is enforce.
-    Waf::new(&json!({
+    waf(json!({
         "mode": "enforce",
         "on_body_too_large": "block"
     }))
@@ -4206,7 +4243,7 @@ fn enforce_mode_allows_on_body_too_large_block_with_monitor_only_rules() {
 
 #[test]
 fn enforce_mode_allows_on_body_too_large_block_with_monitor_body_rule() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "include_default_rules": false,
         "on_body_too_large": "block",
@@ -4233,7 +4270,7 @@ fn monitor_mode_with_on_body_too_large_block_does_not_claim_encoded_bodies() {
     // observation, never a protection-mechanism failure — claiming it would
     // convert a non-blocking configuration into a fail-closed 400 on an
     // ordinary compressed upload.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "monitor",
         "include_default_rules": false,
         "on_body_too_large": "block",
@@ -4312,7 +4349,7 @@ fn enforce_mode_rejects_on_body_too_large_block_without_body_rules() {
 async fn default_rule_action_enforce_blocks_built_in_rules() {
     // The crux of gap 1.1: a single switch flips the built-in pack from
     // monitor-only to enforcing, instead of one rule_modes entry per rule.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce"
     }))
@@ -4333,7 +4370,7 @@ async fn default_rule_action_enforce_blocks_built_in_rules() {
 
 #[tokio::test]
 async fn default_rule_action_enforce_monitors_when_global_mode_is_monitor() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "monitor",
         "default_rule_action": "enforce"
     }))
@@ -4371,7 +4408,7 @@ fn assert_waf_stdout_hit_action(logs: &str, effective: &str, configured: &str) {
 #[tokio::test]
 async fn log_to_stdout_monitor_mode_logs_monitored_effective_action() {
     let (logs, guard) = super::plugin_utils::capture_debug_logs();
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "monitor",
         "default_rule_action": "enforce",
         "log_to_stdout": true
@@ -4399,7 +4436,7 @@ async fn log_to_stdout_monitor_mode_logs_monitored_effective_action() {
 #[tokio::test]
 async fn log_to_stdout_enforce_mode_logs_blocked_effective_action() {
     let (logs, guard) = super::plugin_utils::capture_debug_logs();
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "rule_modes": { "FE-SQLI-002": "enforce" },
         "log_to_stdout": true
     }))
@@ -4426,7 +4463,7 @@ async fn log_to_stdout_enforce_mode_logs_blocked_effective_action() {
 #[tokio::test]
 async fn log_to_stdout_stream_monitor_mode_logs_monitored_effective_action() {
     let (logs, guard) = super::plugin_utils::capture_debug_logs();
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "monitor",
         "include_default_rules": false,
         "log_to_stdout": true,
@@ -4458,7 +4495,7 @@ async fn log_to_stdout_stream_monitor_mode_logs_monitored_effective_action() {
 
 #[tokio::test]
 async fn rule_modes_still_overrides_default_rule_action() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
         "rule_modes": { "FE-SQLI-001": "monitor" }
@@ -4477,7 +4514,7 @@ async fn rule_modes_still_overrides_default_rule_action() {
 }
 
 fn bulk_enforce_waf() -> Waf {
-    Waf::new(&json!({
+    waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
         "paranoia_level": 1
@@ -4517,7 +4554,7 @@ fn assert_encoding_monitored(result: &PluginResult, ctx: &RequestContext, rule_i
 
 #[tokio::test]
 async fn default_posture_monitors_encoding_heuristics() {
-    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
+    let plugin = waf(json!({ "mode": "monitor" })).unwrap();
     let (result, ctx) = scan_form_body(&plugin, b"code=SAVE50%25").await;
     assert_encoding_monitored(&result, &ctx, "FE-ENCODING-001");
 }
@@ -4554,7 +4591,7 @@ async fn bulk_enforce_monitors_overlong_utf8_encoding() {
 
 #[tokio::test]
 async fn rule_modes_promotes_encoding_double_encode_to_enforce() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
         "rule_modes": { "FE-ENCODING-001": "enforce" }
@@ -4576,7 +4613,7 @@ async fn rule_modes_promotes_encoding_double_encode_to_enforce() {
 
 #[tokio::test]
 async fn rule_modes_promotes_encoding_overlong_to_enforce() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
         "rule_modes": { "FE-ENCODING-002": "enforce" }
@@ -4598,7 +4635,7 @@ async fn rule_modes_promotes_encoding_overlong_to_enforce() {
 
 #[tokio::test]
 async fn rule_override_action_promotes_encoding_to_enforce() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
         "rule_overrides": { "FE-ENCODING-001": { "action": "enforce" } }
@@ -4616,7 +4653,7 @@ async fn rule_override_action_promotes_encoding_to_enforce() {
 
 #[tokio::test]
 async fn rule_modes_can_disable_encoding_heuristic() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
         "rule_modes": { "FE-ENCODING-001": "disabled" }
@@ -4636,7 +4673,7 @@ async fn rule_modes_can_disable_encoding_heuristic() {
 
 #[tokio::test]
 async fn bulk_disabled_still_drops_encoding_heuristics() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "default_rule_action": "disabled",
         "rule_modes": { "FE-SQLI-001": "enforce" }
@@ -4665,7 +4702,7 @@ async fn bulk_disabled_still_drops_encoding_heuristics() {
 
 #[tokio::test]
 async fn encoding_rule_modes_enforce_monitors_when_global_mode_is_monitor() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "monitor",
         "default_rule_action": "enforce",
         "rule_modes": { "FE-ENCODING-001": "enforce" }
@@ -4677,7 +4714,7 @@ async fn encoding_rule_modes_enforce_monitors_when_global_mode_is_monitor() {
 
 #[tokio::test]
 async fn global_disabled_mode_skips_encoding_evaluation() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "disabled",
         "default_rule_action": "enforce",
         "rule_modes": { "FE-ENCODING-001": "enforce" }
@@ -4691,7 +4728,7 @@ async fn global_disabled_mode_skips_encoding_evaluation() {
 
 #[tokio::test]
 async fn bulk_enforce_encoding_hit_scores_as_monitor() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
         "scoring": { "enabled": true, "block_threshold": 10 }
@@ -4727,7 +4764,7 @@ async fn bulk_enforce_still_blocks_encoded_null_path_traversal() {
 #[tokio::test]
 async fn rule_override_attaches_fp_filter_to_built_in_rule() {
     // Gap 1.6: tune a noisy built-in without forking the rule pack.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
         "rule_overrides": { "FE-SQLI-001": { "fp_filters": ["union select version_id"] } }
@@ -4751,7 +4788,7 @@ async fn rule_override_attaches_fp_filter_to_built_in_rule() {
 
 #[tokio::test]
 async fn rule_override_fp_filter_suppresses_special_encoding_rule() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
         "rule_modes": { "FE-ENCODING-001": "enforce" },
@@ -4784,7 +4821,7 @@ async fn rule_override_fp_filter_suppresses_special_encoding_rule() {
 
 #[tokio::test]
 async fn rule_override_fp_filter_suppresses_special_hpp_rule() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
         "rule_overrides": {
@@ -4818,7 +4855,7 @@ async fn rule_override_fp_filter_suppresses_special_hpp_rule() {
 
 #[tokio::test]
 async fn hpp_rule_blocks_plus_and_percent_space_key_aliases() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce"
     }))
@@ -4841,7 +4878,7 @@ async fn hpp_rule_blocks_plus_and_percent_space_key_aliases() {
 
 #[tokio::test]
 async fn rule_override_scopes_built_in_rule_to_paths() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
         "rule_overrides": { "FE-SQLI-001": { "conditions": { "paths": ["/api*"] } } }
@@ -4865,7 +4902,7 @@ async fn rule_override_scopes_built_in_rule_to_paths() {
 
 #[tokio::test]
 async fn rule_override_can_lower_paranoia_to_reactivate_rule() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "monitor",
         "rule_overrides": { "FE-RFI-001": { "paranoia_min": 1 } }
     }))
@@ -4878,7 +4915,7 @@ async fn rule_override_can_lower_paranoia_to_reactivate_rule() {
 
 #[tokio::test]
 async fn rule_override_action_enforces_rule() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "rule_overrides": { "FE-SQLI-001": { "action": "enforce" } }
     }))
@@ -4899,7 +4936,7 @@ async fn rule_override_action_enforces_rule() {
 
 #[tokio::test]
 async fn rule_override_action_enforce_monitors_when_global_mode_is_monitor() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "monitor",
         "rule_overrides": { "FE-SQLI-001": { "action": "enforce" } }
     }))
@@ -4941,7 +4978,7 @@ fn unknown_rule_override_field_fails_construction() {
 async fn scoring_blocks_on_aggregate_without_any_enforce_rule() {
     // Two monitor-only High hits (5 + 5) cross the threshold of 8. Nothing is
     // set to enforce — the block comes purely from the aggregate score.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "scoring": { "enabled": true, "block_threshold": 8 }
     }))
@@ -4968,7 +5005,7 @@ async fn scoring_blocks_on_aggregate_without_any_enforce_rule() {
 
 #[tokio::test]
 async fn scoring_records_but_does_not_block_in_monitor_mode() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "monitor",
         "scoring": { "enabled": true, "block_threshold": 1 }
     }))
@@ -4988,7 +5025,7 @@ async fn scoring_records_but_does_not_block_in_monitor_mode() {
 
 #[tokio::test]
 async fn scoring_accumulates_across_query_and_body_phases() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "scoring": { "enabled": true, "block_threshold": 8 }
     }))
@@ -5025,7 +5062,7 @@ async fn scoring_accumulates_across_query_and_body_phases() {
 
 #[tokio::test]
 async fn scoring_ignores_preexisting_public_score_metadata() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "scoring": { "enabled": true, "block_threshold": 8 }
     }))
@@ -5043,7 +5080,7 @@ async fn scoring_ignores_preexisting_public_score_metadata() {
 
 #[tokio::test]
 async fn scoring_with_metadata_disabled_uses_private_state() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "log_to_metadata": false,
         "scoring": { "enabled": true, "block_threshold": 8 }
@@ -5074,7 +5111,7 @@ async fn scoring_with_metadata_disabled_uses_private_state() {
 async fn on_body_too_large_block_rejects_when_enforcing() {
     // Fail closed: an oversize body that can't be fully scanned is rejected
     // rather than passed through unscanned.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
         "max_scan_bytes": 4,
@@ -5107,7 +5144,7 @@ async fn on_body_too_large_block_rejects_when_enforcing() {
 
 #[tokio::test]
 async fn on_body_too_large_block_in_monitor_mode_does_not_reject() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "monitor",
         "max_scan_bytes": 4,
         "on_body_too_large": "block"
@@ -5136,7 +5173,7 @@ async fn on_body_too_large_block_in_monitor_mode_does_not_reject() {
 #[tokio::test]
 async fn per_rule_score_override_drives_blocking() {
     // A low-severity rule with an explicit high score blocks on its own.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "scoring": { "enabled": true, "block_threshold": 8 },
         "include_default_rules": false,
@@ -5167,8 +5204,8 @@ async fn per_rule_score_override_drives_blocking() {
 }
 
 fn scoring_instance(config_id: &str, pattern: &str, score: u32, threshold: u32) -> Waf {
-    Waf::new_with_config_id(
-        &json!({
+    waf_with_config_id(
+        json!({
             "mode": "enforce",
             "include_default_rules": false,
             "scoring": {
@@ -5309,7 +5346,7 @@ async fn scoring_direct_construction_uses_standalone_fallback() {
     // Direct/test construction has no plugin_configs[].id. Sibling Waf::new
     // calls must still isolate accumulators under distinct standalone-N labels,
     // and that fallback must not be used once a configured id is supplied.
-    let first = Waf::new(&json!({
+    let first = waf(json!({
         "mode": "enforce",
         "include_default_rules": false,
         "scoring": { "enabled": true, "block_threshold": 10 },
@@ -5325,7 +5362,7 @@ async fn scoring_direct_construction_uses_standalone_fallback() {
         }]
     }))
     .unwrap();
-    let second = Waf::new(&json!({
+    let second = waf(json!({
         "mode": "enforce",
         "include_default_rules": false,
         "scoring": { "enabled": true, "block_threshold": 10 },
@@ -5394,8 +5431,8 @@ async fn scoring_direct_construction_uses_standalone_fallback() {
 async fn scoring_instances_use_own_weights_and_thresholds() {
     // Different weights/thresholds: first stays sub-threshold; second crosses
     // only its own threshold from its own contribution.
-    let soft = Waf::new_with_config_id(
-        &json!({
+    let soft = waf_with_config_id(
+        json!({
             "mode": "enforce",
             "include_default_rules": false,
             "scoring": {
@@ -5416,8 +5453,8 @@ async fn scoring_instances_use_own_weights_and_thresholds() {
         Some("waf-soft"),
     )
     .unwrap();
-    let hard = Waf::new_with_config_id(
-        &json!({
+    let hard = waf_with_config_id(
+        json!({
             "mode": "enforce",
             "include_default_rules": false,
             "scoring": {
@@ -5479,8 +5516,8 @@ async fn scoring_preserves_same_instance_accumulation_across_lifecycle_phases() 
     // Same instance must still accumulate across request metadata, final
     // request body, response headers, and final response body — the shared
     // H1/H2/H3 plugin lifecycle surfaces.
-    let plugin = Waf::new_with_config_id(
-        &json!({
+    let plugin = waf_with_config_id(
+        json!({
             "mode": "enforce",
             "include_default_rules": false,
             "response_inspection": true,
@@ -5670,7 +5707,7 @@ fn udp_ctx(payload: &[u8], kind: StreamBytesKind) -> UdpDatagramContext<'_> {
 }
 
 fn sig_waf(mode: &str) -> Waf {
-    Waf::new(&json!({
+    waf(json!({
         "mode": mode,
         "include_default_rules": false,
         "stream": {
@@ -5701,7 +5738,7 @@ fn stream_ctx_absent_kind(kind: StreamBytesKind) -> StreamConnectionContext {
 }
 
 fn require_tls_waf(mode: &str) -> Waf {
-    Waf::new(&json!({
+    waf(json!({
         "mode": mode,
         "include_default_rules": false,
         "stream": { "tcp_require_tls": true }
@@ -5759,7 +5796,7 @@ async fn stream_waf_monitor_action_signature_is_not_a_would_block() {
     // would-block count reflects only signatures that would actually reject. The
     // second signature never matches this payload; it only supplies the enforce
     // action `mode: enforce` now requires, without changing the assertions.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "include_default_rules": false,
         "stream": {
@@ -5829,7 +5866,7 @@ async fn stream_waf_clean_payload_is_allowed() {
 
 #[tokio::test]
 async fn stream_waf_tcp_require_tls_blocks_non_tls() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "include_default_rules": false,
         "stream": { "tcp_require_tls": true }
@@ -5849,7 +5886,7 @@ async fn stream_waf_tcp_require_tls_blocks_non_tls() {
 
 #[tokio::test]
 async fn stream_waf_tcp_require_tls_allows_client_hello() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "include_default_rules": false,
         "stream": { "tcp_require_tls": true }
@@ -5870,7 +5907,7 @@ async fn stream_waf_tcp_require_tls_allows_client_hello() {
 async fn stream_waf_tcp_require_tls_is_noop_after_termination() {
     // On a TLS-terminating frontend the bytes are DecryptedApp; the handshake
     // already proved TLS, so the shape guard must not fire.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "include_default_rules": false,
         "stream": { "tcp_require_tls": true }
@@ -5931,7 +5968,7 @@ fn stream_waf_attaches_to_stream_protocols_when_configured() {
 
 #[test]
 fn http_only_waf_does_not_attach_to_stream_protocols() {
-    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
+    let plugin = waf(json!({ "mode": "monitor" })).unwrap();
     let protocols = plugin.supported_protocols();
     assert!(!protocols.contains(&ProxyProtocol::Tcp));
     assert!(!protocols.contains(&ProxyProtocol::Udp));
@@ -5979,7 +6016,7 @@ fn stream_waf_first_bytes_min_len_only_set_for_tls_shape_guard() {
     assert_eq!(sig_waf("enforce").stream_first_bytes_min_len(), 0);
     // An HTTP-only WAF never captures stream first bytes at all.
     assert_eq!(
-        Waf::new(&json!({ "mode": "monitor" }))
+        waf(json!({ "mode": "monitor" }))
             .unwrap()
             .stream_first_bytes_min_len(),
         0
@@ -6073,7 +6110,7 @@ async fn stream_waf_udp_metadata_merges_across_datagrams_and_keeps_max_severity(
     // recorded severity must be the highest seen — a later, lower-severity hit
     // must not erase the earlier rule id or downgrade the summary (regression for
     // the last-hit-wins behavior).
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "monitor",
         "include_default_rules": false,
         "stream": {
@@ -6203,7 +6240,7 @@ async fn stream_waf_monitor_only_signatures_do_not_fail_closed_on_missing_bytes(
     // signature is enforce-action there is nothing to fail closed for, so missing bytes
     // must record nothing — not a block, not a would-block — instead of phantom
     // rejecting idle / server-first clients.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "monitor",
         "include_default_rules": false,
         "stream": {
@@ -6232,7 +6269,7 @@ async fn stream_waf_mixed_signatures_still_fail_closed_on_missing_bytes() {
     // bytes could have matched it, so the missing-bytes path must still fail
     // closed under global `enforce` even though a monitor-action signature is
     // also present.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "include_default_rules": false,
         "stream": {
@@ -6306,7 +6343,7 @@ async fn stream_waf_tcp_require_tls_rejects_forged_tls_prefix() {
 
 #[tokio::test]
 async fn stream_waf_disabled_signature_is_dropped() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "include_default_rules": false,
         "stream": {
@@ -6556,7 +6593,7 @@ async fn padded_request_body_suffix_fails_closed_by_default() {
     // The advisory repro: an enforced custom body rule, a body padded past
     // `max_scan_bytes`, and the blocked token in the unscanned suffix. Defaults
     // everywhere else — no `on_body_too_large` override.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "max_scan_bytes": SCAN_CAP,
         "custom_rules": [enforcing_request_body_rule()]
@@ -6602,7 +6639,7 @@ async fn padded_request_body_suffix_fails_closed_by_default() {
 async fn exact_boundary_request_body_is_fully_scanned() {
     // A body of exactly `max_scan_bytes` is completely inspected: it blocks on
     // the rule itself, not on size, and records no truncation.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "max_scan_bytes": SCAN_CAP,
         "custom_rules": [enforcing_request_body_rule()]
@@ -6629,7 +6666,7 @@ async fn exact_boundary_request_body_is_fully_scanned() {
 
 #[tokio::test]
 async fn exact_boundary_clean_request_body_is_not_truncated() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "max_scan_bytes": SCAN_CAP,
         "custom_rules": [enforcing_request_body_rule()]
@@ -6655,7 +6692,7 @@ async fn exact_boundary_clean_request_body_is_not_truncated() {
 async fn one_byte_over_boundary_request_body_fails_closed() {
     // Immediately over the cap, with a clean prefix and no hidden payload at
     // all: the block is about unscannability, not about a match.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "max_scan_bytes": SCAN_CAP,
         "reject_status_code": 422,
@@ -6687,7 +6724,7 @@ async fn one_byte_over_boundary_request_body_fails_closed() {
 #[tokio::test]
 async fn builtin_body_rule_enforced_by_rule_modes_fails_closed_on_oversize_body() {
     // Same posture through the built-in pack rather than a custom rule.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "max_scan_bytes": SCAN_CAP,
         "rule_modes": { "FE-CMD-002": "enforce" }
     }))
@@ -6710,7 +6747,7 @@ async fn builtin_body_rule_enforced_by_rule_modes_fails_closed_on_oversize_body(
 async fn anomaly_scoring_fails_closed_on_oversize_request_body() {
     // Scoring can block on accumulated monitored hits, so an unscanned suffix
     // is a real enforcement gap even with no `action: enforce` rule.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "max_scan_bytes": SCAN_CAP,
         "scoring": { "enabled": true, "block_threshold": 5 },
@@ -6735,7 +6772,7 @@ async fn anomaly_scoring_fails_closed_on_oversize_request_body() {
 async fn scoped_enforcing_body_rule_only_fails_closed_when_conditions_match() {
     let mut rule = enforcing_request_body_rule();
     rule["conditions"] = json!({ "paths": ["/admin"] });
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "max_scan_bytes": SCAN_CAP,
         "custom_rules": [rule]
@@ -6785,7 +6822,7 @@ async fn scoped_enforcing_body_rule_only_fails_closed_when_conditions_match() {
 async fn scoped_scoring_body_rule_only_fails_closed_when_conditions_match() {
     let mut rule = monitor_request_body_rule();
     rule["conditions"] = json!({ "methods": ["PUT"] });
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "max_scan_bytes": SCAN_CAP,
         "scoring": { "enabled": true, "block_threshold": 5 },
@@ -6820,7 +6857,7 @@ async fn scoped_scoring_body_rule_only_fails_closed_when_conditions_match() {
 
 #[tokio::test]
 async fn request_wide_header_exemption_prevents_oversize_fail_closed_block() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "max_scan_bytes": SCAN_CAP,
         "global_exemptions": {
@@ -6849,7 +6886,7 @@ async fn request_wide_header_exemption_prevents_oversize_fail_closed_block() {
 #[tokio::test]
 async fn monitor_only_body_rules_still_prefix_scan_oversize_request_body() {
     // No enforcing body policy: the oversize body is observed, not blocked.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "monitor",
         "include_default_rules": false,
         "max_scan_bytes": SCAN_CAP,
@@ -6882,7 +6919,7 @@ async fn monitor_only_body_rules_still_prefix_scan_oversize_request_body() {
 async fn default_builtin_pack_does_not_block_oversize_body() {
     // The stock config (built-ins, which are monitor-only unless opted in) must
     // not start rejecting large uploads because of the new default.
-    let plugin = Waf::new(&json!({ "mode": "monitor", "max_scan_bytes": SCAN_CAP })).unwrap();
+    let plugin = waf(json!({ "mode": "monitor", "max_scan_bytes": SCAN_CAP })).unwrap();
     let mut ctx = body_ctx();
     let headers = ctx.headers.clone();
 
@@ -6903,7 +6940,7 @@ async fn default_builtin_pack_does_not_block_oversize_body() {
 
 #[tokio::test]
 async fn monitor_mode_never_blocks_oversize_body_with_enforcing_rule() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "monitor",
         "include_default_rules": false,
         "max_scan_bytes": SCAN_CAP,
@@ -6932,7 +6969,7 @@ async fn monitor_mode_never_blocks_oversize_body_with_enforcing_rule() {
 async fn scan_truncated_opt_out_preserves_prefix_only_inspection() {
     // The documented compatibility escape hatch: operators who accept
     // prefix-only inspection keep the pre-fix behavior verbatim.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "max_scan_bytes": SCAN_CAP,
         "on_body_too_large": "scan_truncated",
@@ -6959,7 +6996,7 @@ async fn explicit_block_still_rejects_oversize_body_without_enforcing_body_rule(
     // enforcing-policy predicate that `fail_closed` uses. Admission counts
     // `on_body_too_large: block` itself as the enforcement path, so a
     // monitor-only body rule is enough to enter the hook.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "max_scan_bytes": SCAN_CAP,
         "on_body_too_large": "block",
@@ -6985,7 +7022,7 @@ async fn finalized_request_body_over_cap_fails_closed_despite_small_content_leng
     // The final request-body hook decides on the exact backend-visible bytes, so
     // a transformer (or a lying `Content-Length`) that grows the body past the
     // cap is still governed — the declared length is never the input.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "max_scan_bytes": SCAN_CAP,
         "custom_rules": [enforcing_request_body_rule()]
@@ -7009,7 +7046,7 @@ async fn finalized_request_body_over_cap_fails_closed_despite_small_content_leng
 #[tokio::test]
 async fn oversize_response_body_fails_closed_by_default() {
     // Backend-controlled disclosure content placed past the scan cap.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "max_scan_bytes": SCAN_CAP,
         "response_inspection": true,
@@ -7048,7 +7085,7 @@ async fn oversize_response_body_fails_closed_by_default() {
 
 #[tokio::test]
 async fn monitor_only_response_body_rule_prefix_scans_oversize_response_body() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "monitor",
         "include_default_rules": false,
         "max_scan_bytes": SCAN_CAP,
@@ -7086,7 +7123,7 @@ async fn enforcing_request_body_rule_does_not_fail_close_the_response_body() {
     // Direction isolation: the size decision consults only the rules that read
     // the body being decided about, so a request-only policy cannot start
     // rejecting large responses.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "max_scan_bytes": SCAN_CAP,
         "response_inspection": true,
@@ -7116,7 +7153,7 @@ async fn enforcing_request_body_rule_does_not_fail_close_the_response_body() {
 
 #[tokio::test]
 async fn enforcing_response_body_rule_does_not_fail_close_the_request_body() {
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "include_default_rules": false,
         "max_scan_bytes": SCAN_CAP,
         "response_inspection": true,
@@ -7316,7 +7353,7 @@ async fn structured_syntax_xml_suffix_content_types_are_inspected() {
 #[tokio::test]
 async fn suffix_mapping_only_admits_xml_when_an_xml_family_entry_is_configured() {
     // `text/xml` alone still means "XML" to an operator, so `+xml` is admitted.
-    let text_xml_only = Waf::new(&json!({
+    let text_xml_only = waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
         "paranoia_level": 1,
@@ -7353,7 +7390,7 @@ async fn opaque_binary_content_type_still_skips_body_inspection() {
 async fn suffix_mapping_reuses_the_configured_allowlist_and_adds_no_hidden_types() {
     // The suffix rule maps onto `application/json` / `application/xml` /
     // `text/xml`; none of those is configured here, so `+json` stays excluded.
-    let text_plain_only = Waf::new(&json!({
+    let text_plain_only = waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
         "paranoia_level": 1,
@@ -7395,7 +7432,7 @@ async fn multipart_gate_is_unchanged_by_the_suffix_rule() {
     assert!(matches!(result, PluginResult::Continue));
     assert!(!monitored(&request_ctx, "FE-SQLI-001-B"));
 
-    let multipart_plugin = Waf::new(&json!({
+    let multipart_plugin = waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
         "paranoia_level": 1,
@@ -7436,7 +7473,7 @@ async fn scan_wide_direction(
 }
 
 fn wide_parity_waf() -> Waf {
-    Waf::new(&json!({
+    waf(json!({
         "include_default_rules": false,
         "response_inspection": true,
         "response_body_inspection": true,
@@ -7509,7 +7546,7 @@ async fn wide_body_view_policy_matches_in_both_directions() {
 #[tokio::test]
 async fn undeclared_wide_requests_match_the_default_pack_at_both_paranoia_levels() {
     for level in [1, 4] {
-        let plugin = Waf::new(&json!({
+        let plugin = waf(json!({
             "mode": "enforce", "default_rule_action": "enforce", "paranoia_level": level
         }))
         .unwrap();
@@ -7580,7 +7617,7 @@ async fn wide_encoding_only_packs_share_specials_and_rule_modes() {
             // be admitted. Oversize-body blocking is reachable here because
             // the encoding specials pull bodies into inspection on their own,
             // and no fixture body comes near the 1 MiB scan cap.
-            let plugin = Waf::new(&json!({
+            let plugin = waf(json!({
                 "include_default_rules": false, "on_body_too_large": "block",
                 "response_inspection": true, "response_body_inspection": true,
                 "custom_rules": [{
@@ -7654,7 +7691,7 @@ async fn wide_response_conflicts_malformed_units_and_specialized_rules_keep_cove
         ("luhn", json!(null), "card=4111 1111 1111 111&#49;"),
         ("cidr", json!("10.0.0.0/8"), "address=10&#46;2&#46;3&#46;4"),
     ] {
-        let plugin = Waf::new(&json!({
+        let plugin = waf(json!({
             "include_default_rules": false,
             "response_inspection": true, "response_body_inspection": true,
             "custom_rules": [{
@@ -7706,7 +7743,7 @@ async fn wide_body_filters_and_wire_size_limits_still_apply() {
         } else {
             "body_text"
         };
-        let plugin = Waf::new(&json!({
+        let plugin = waf(json!({
             "include_default_rules": false, "max_scan_bytes": 128,
             "response_inspection": true, "response_body_inspection": true,
             "custom_rules": [{
@@ -7843,7 +7880,7 @@ async fn tcp_missing_first_bytes_still_fails_closed() {
 // ── Issue #5121: stream enforce admission mirrors runtime reachability ──────
 
 fn stream_only_waf(stream: serde_json::Value) -> Result<Waf, String> {
-    Waf::new(&json!({
+    waf(json!({
         "mode": "enforce",
         "include_default_rules": false,
         "stream": stream,
@@ -8083,7 +8120,7 @@ const ORIGIN_ENCODED_RESPONSE_METADATA_KEY: &str = "ferrum:origin_encoded_respon
 /// `on_body_too_large: block`. Nothing here can refuse a response except the
 /// cap — which is exactly why the cap must be measured against plaintext.
 fn size_only_enforcing_response_waf(mode: &str) -> Waf {
-    Waf::new(&json!({
+    waf(json!({
         "mode": mode,
         "include_default_rules": false,
         "scan_budget_ms": 0,
@@ -8154,7 +8191,7 @@ fn an_identity_coded_response_is_never_claimed_by_the_size_policy() {
 fn request_and_response_size_only_claims_agree() {
     // The request side has claimed a size-only enforcing posture since #4006;
     // this pins the two directions to the same rule.
-    let plugin = Waf::new(&json!({
+    let plugin = waf(json!({
         "mode": "enforce",
         "include_default_rules": false,
         "scan_budget_ms": 0,

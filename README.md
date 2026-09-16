@@ -55,16 +55,26 @@ On Kubernetes, map each mode to its chart or external contract in
 - **protoc** (Protocol Buffers compiler) for gRPC code generation — install `protobuf-compiler` or set `PROTOC` to the executable path
 - **sccache and platform linker tools** — required by `.cargo/config.toml`; complete the
   [one-time bootstrap](CONTRIBUTING.md#one-time-local-bootstrap) before building.
+- **cmake and curl development headers** — required by `rdkafka-sys` to compile
+  librdkafka from source (`kafka_logging` vendored TLS). The bootstrap script
+  installs `cmake` plus `libcurl4-openssl-dev` (Debian/Ubuntu), `libcurl-devel`
+  (Fedora/RHEL), or Homebrew `curl` (macOS). A missing `curl/curl.h` still fails
+  the native build even with `-DWITH_CURL=0`.
 - **Database** (optional): PostgreSQL, MySQL, SQLite, or MongoDB (for database and CP modes)
+
+A full-debuginfo `codegen-units=1` `dev` build can OOM rustc on a 15 GiB host
+with no swap. If rustc is killed for memory, retry with `CARGO_PROFILE_DEV_DEBUG=0`
+and more codegen units (for example `CARGO_PROFILE_DEV_CODEGEN_UNITS=16`). That is
+host sizing, not a missing package; do not change `[profile.dev]` for it.
 
 ## Installation
 
 ### From Source
 
-The bootstrap below requires Homebrew on macOS or apt-based Linux. The fast-linker
-configuration covers x86_64 and ARM64 GNU/Linux and macOS. For other platforms, manual
-installation, or building without sccache and fast linkers, follow the
-[platform limits and fallback instructions](CONTRIBUTING.md#one-time-local-bootstrap).
+The bootstrap below requires Homebrew on macOS or apt- or dnf-based Linux. The
+fast-linker configuration covers x86_64 and ARM64 GNU/Linux and macOS. For other
+platforms, manual installation, or building without sccache and fast linkers,
+follow the [platform limits and fallback instructions](CONTRIBUTING.md#one-time-local-bootstrap).
 
 ```bash
 git clone https://github.com/ferrum-edge/ferrum-edge.git
@@ -82,6 +92,8 @@ ferrum-edge version
 Download from [GitHub Releases](https://github.com/ferrum-edge/ferrum-edge/releases) for Linux x86_64/ARM64 and macOS x86_64/ARM64. Releases ship raw platform binaries plus adjacent `.sha256` checksum files (for example `ferrum-edge-linux-x86_64` and `ferrum-edge-linux-x86_64.sha256`).
 
 Pin an explicit release tag in download URLs. Production artifacts are published only for version tags; merging main no longer refreshes a moving `latest` build. GitHub's `/releases/latest` endpoint skips prereleases. Use `/releases/download/<tag>/…` or `gh release download <tag>` instead. Pick the current immutable `vX.Y.Z` semver tag from the [Releases](https://github.com/ferrum-edge/ferrum-edge/releases) page, and pin deployments to that version.
+
+Feature availability by release: resource labels (`labels` / `ResourceLabels` on Proxy, Consumer, Upstream, and PluginConfig) landed on `main` in [#5483](https://github.com/ferrum-edge/ferrum-edge/pull/5483) on 2026-09-12. Published artifacts through **v0.9.4** reject `labels` with ``unknown field `labels` ``. **v0.9.5 is the first tagged release with resource labels**; use v0.9.5 or later. See the [upgrade guidance](docs/upgrade_guide.md#upgrading-to-095) for database and CP/DP rollout requirements. Companion clients that inject `labels.provisioned-by` require matching gateway builds: Git Forge Ops ≥ [#218](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/pull/218), Nexus ≥ [#245](https://github.com/ferrum-edge/ferrum-nexus/pull/245), and Foundry ≥ [#340](https://github.com/ferrum-edge/ferrum-foundry/pull/340).
 
 ```bash
 # Example: Linux x86_64
@@ -336,7 +348,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -d @backup.json "http://localhost
 
 Submit an OpenAPI/Swagger spec to atomically provision a proxy, upstream, and plugins in one call — see [docs/api_specs.md](docs/api_specs.md).
 
-See [docs/admin_api.md](docs/admin_api.md) for the full endpoint reference, and [openapi.yaml](openapi.yaml) for the OpenAPI specification.
+See [docs/admin_api.md](docs/admin_api.md) for the full endpoint reference, including [first-create minimal requests](docs/admin_api.md#admin-api-first-create--minimal-working-requests), and [openapi.yaml](openapi.yaml) for the OpenAPI specification.
 
 ## Plugin System
 
