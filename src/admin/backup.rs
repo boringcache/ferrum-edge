@@ -575,13 +575,13 @@ pub(crate) struct RestorePayload {
     /// Accepted-and-ignored `GET /backup` metadata. Declared so
     /// `deny_unknown_fields` still admits an unmodified backup artifact.
     #[serde(default, rename = "ferrum_version")]
-    _ferrum_version: Option<String>,
+    pub(crate) _ferrum_version: Option<String>,
     #[serde(default, rename = "exported_at")]
-    _exported_at: Option<String>,
+    pub(crate) _exported_at: Option<String>,
     #[serde(default, rename = "source")]
-    _source: Option<String>,
+    pub(crate) _source: Option<String>,
     #[serde(default, rename = "counts")]
-    _counts: Option<serde_json::Value>,
+    pub(crate) _counts: Option<serde_json::Value>,
 }
 
 /// Project a cached multi-namespace snapshot onto one namespace for a
