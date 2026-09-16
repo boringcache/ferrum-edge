@@ -2758,7 +2758,14 @@ pub enum DirectH2RequestBody {
         /// built after an early backend response can wait for the real tally.
         latch: Arc<DirectH2BytesLatch>,
     },
-    Limited(SizeLimitedIncoming),
+    /// Boxed so the enum stays the size of the passthrough arm: that arm is
+    /// the common unlimited-upload path and is moved into hyper's detached
+    /// pipe task per request, while `SizeLimitedIncoming` carries the upload
+    /// source, its watermark controls and the authorization deadline and is
+    /// several times larger. The box costs one allocation only on requests
+    /// that actually configure a size cap, an upload gate or gRPC message
+    /// counting, which already allocate their shared counters.
+    Limited(Box<SizeLimitedIncoming>),
 }
 
 impl Drop for DirectH2RequestBody {

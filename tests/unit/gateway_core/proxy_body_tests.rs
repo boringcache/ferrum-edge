@@ -869,7 +869,7 @@ fn test_direct_h2_request_body_passthrough_skips_size_limited_incoming() {
         "ordinary direct-H2 pool body must be DirectH2RequestBody"
     );
     assert!(
-        source.contains("Limited(SizeLimitedIncoming)"),
+        source.contains("Limited(Box<SizeLimitedIncoming>)"),
         "nonzero caps / upload gate / gRPC observation must still wrap SizeLimitedIncoming"
     );
     assert!(

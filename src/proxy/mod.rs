@@ -52755,7 +52755,7 @@ async fn proxy_to_backend_http2(
                 proxy.backend_write_timeout_ms,
             );
             (
-                body::DirectH2RequestBody::Limited(body),
+                body::DirectH2RequestBody::Limited(Box::new(body)),
                 Some(completion_rx),
                 upload_pump.map(crate::proxy::upload_pump::UploadPumpJoin::cancel_on_drop),
             )
@@ -52779,7 +52779,11 @@ async fn proxy_to_backend_http2(
             // response.
             let (body, upload_pump) =
                 install_streaming_upload_authorization(body, None, proxy.backend_write_timeout_ms);
-            (body::DirectH2RequestBody::Limited(body), None, upload_pump)
+            (
+                body::DirectH2RequestBody::Limited(Box::new(body)),
+                None,
+                upload_pump,
+            )
         } else {
             // Unlimited, unauthenticated, no gRPC observation: forward
             // `Incoming` directly. Cancel stays armed so an early return after
