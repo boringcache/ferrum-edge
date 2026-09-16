@@ -1473,7 +1473,8 @@ async fn batch_object_elements_round_trip_through_backup_and_restore() {
         }],
         "consumers": [{"id": "list-consumer", "username": "list-user"}],
         "plugin_configs": [{
-            "id": "list-plugin", "plugin_name": "cors", "scope": "global", "config": {}
+            "id": "list-plugin", "plugin_name": "cors", "scope": "global",
+            "config": {"allowed_origins": ["https://example.com"]}
         }],
         "upstreams": [{"id": "list-upstream", "targets": [{"host": "127.0.0.1", "port": 12345}]}]
     });
