@@ -1893,11 +1893,8 @@ fn admin_shared_namespace_and_id_gates_document_bad_request() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
 
-    let documented = openapi_operations_with_status_ref(
-        &spec,
-        "400",
-        "#/components/responses/BadRequest",
-    );
+    let documented =
+        openapi_operations_with_status_ref(&spec, "400", "#/components/responses/BadRequest");
     let missing: Vec<_> = admin_shared_namespace_or_id_400_inventory()
         .difference(&documented)
         .cloned()
@@ -1914,14 +1911,16 @@ fn operator_gated_refresh_and_egress_test_document_forbidden() {
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
 
     for (operation_id, path) in [
-        ("refreshBackendCapabilities", "/backend-capabilities/refresh"),
+        (
+            "refreshBackendCapabilities",
+            "/backend-capabilities/refresh",
+        ),
         ("testMeshEgressScopeCandidate", "/mesh/egress-scope/test"),
     ] {
         let (method, documented_path, operation) = openapi_operation_by_id(&spec, operation_id);
         assert_eq!(documented_path, path);
         assert_eq!(
-            operation["responses"]["403"]["$ref"],
-            "#/components/responses/Forbidden",
+            operation["responses"]["403"]["$ref"], "#/components/responses/Forbidden",
             "{method} {path} ({operation_id}) must document Forbidden \
              for the operator role gate"
         );
@@ -2023,12 +2022,18 @@ fn mesh_slice_drift_examples_match_schema_and_convergence_semantics() {
     let converged = &examples["converged"]["value"];
     assert_eq!(converged["summary"]["accepted"], json!(0));
     assert_eq!(converged["summary"]["converged"], json!(1));
-    assert_eq!(converged["data_planes"][0]["convergence"], json!("converged"));
+    assert_eq!(
+        converged["data_planes"][0]["convergence"],
+        json!("converged")
+    );
     assert_eq!(
         converged["data_planes"][0]["drift"]["desired_vs_applied"],
         json!(false)
     );
-    assert_eq!(converged["data_planes"][0]["applied"]["version"], json!("v2"));
+    assert_eq!(
+        converged["data_planes"][0]["applied"]["version"],
+        json!("v2")
+    );
 
     let accepted = &examples["accepted"]["value"];
     assert_eq!(accepted["summary"]["accepted"], json!(1));
