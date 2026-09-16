@@ -1122,7 +1122,10 @@ mod tests {
         assert_eq!(encoded_key, parsed_filter("resources=proxies"));
 
         // Mixed-case escapes decode identically.
-        assert_eq!(parsed_filter("resources=proxies%2cconsumers"), encoded_comma);
+        assert_eq!(
+            parsed_filter("resources=proxies%2cconsumers"),
+            encoded_comma
+        );
     }
 
     #[test]

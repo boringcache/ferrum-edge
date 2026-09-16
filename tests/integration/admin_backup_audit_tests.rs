@@ -1343,7 +1343,10 @@ async fn restore_rejects_non_object_envelopes_before_deleting_configuration() {
         );
 
         let (status, proxy) = get_admin_json(&base, "/proxies/sentinel", &admin).await;
-        assert_eq!(status, 200, "sentinel proxy must survive {hostile}: {proxy}");
+        assert_eq!(
+            status, 200,
+            "sentinel proxy must survive {hostile}: {proxy}"
+        );
         let (status, consumer) =
             get_admin_json(&base, "/consumers/sentinel-consumer", &admin).await;
         assert_eq!(
@@ -1370,7 +1373,13 @@ async fn restore_round_trips_a_backup_and_keeps_explicit_empty_semantics() {
     // still restores through the closed envelope.
     let (status, backup, _) = get_backup(&base, "/backup", &admin, None).await;
     assert_eq!(status, 200, "backup: {backup}");
-    for metadata in ["version", "ferrum_version", "exported_at", "source", "counts"] {
+    for metadata in [
+        "version",
+        "ferrum_version",
+        "exported_at",
+        "source",
+        "counts",
+    ] {
         assert!(
             backup.get(metadata).is_some(),
             "backup must carry {metadata}: {backup}"
@@ -1453,7 +1462,10 @@ async fn backup_rejects_undecodable_duplicate_and_whitespace_filters() {
             body["error"], "Unsupported backup resource filter",
             "{query} must use the static no-echo client text: {body}"
         );
-        assert!(source.is_none(), "{query} must not emit a backup attachment");
+        assert!(
+            source.is_none(),
+            "{query} must not emit a backup attachment"
+        );
     }
 
     // Every rejection is audited with the fixed `invalid` sentinel and never

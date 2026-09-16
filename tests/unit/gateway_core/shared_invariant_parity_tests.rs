@@ -1244,8 +1244,10 @@ fn every_object_valued_admin_resource_field_carries_the_guard() {
                 assert!(
                     OBJECT_ONLY_RESOURCE_FIELDS
                         .iter()
-                        .any(|(table_resource, table_field, _)| *table_resource == resource
-                            && *table_field == field),
+                        .any(
+                            |(table_resource, table_field, _)| *table_resource == resource
+                                && *table_field == field
+                        ),
                     "{resource}.{field} carries the object-only guard but is missing from \
                      OBJECT_ONLY_RESOURCE_FIELDS"
                 );
