@@ -71,8 +71,7 @@ fn array_iss_containing_expected_issuer_is_rejected() {
         TenantAuthRejectReason::TokenValidation.as_status_message()
     );
     assert!(
-        !status.message().contains(DEFAULT_CP_DP_JWT_ISSUER)
-            && !status.message().contains("other"),
+        !status.message().contains(DEFAULT_CP_DP_JWT_ISSUER) && !status.message().contains("other"),
         "rejection must not echo the iss claim, got: {}",
         status.message()
     );
@@ -84,8 +83,8 @@ fn object_and_number_iss_are_rejected() {
         (json!({"iss": DEFAULT_CP_DP_JWT_ISSUER}), "iss-object"),
         (json!(42), "iss-number"),
     ] {
-        let status = verify(&mint_with_iss(iss, subject))
-            .expect_err("non-string iss must not authenticate");
+        let status =
+            verify(&mint_with_iss(iss, subject)).expect_err("non-string iss must not authenticate");
         assert_eq!(status.code(), tonic::Code::Unauthenticated);
         assert_eq!(
             status.message(),
