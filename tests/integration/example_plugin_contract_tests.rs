@@ -87,7 +87,12 @@ fn h1_h2_buffered_terminal_logging_precedes_response_construction() {
             // and the buffered response builder.
             "let mut summary = TransactionSummary {",
             "if body_will_stream {",
-            "DeferredTransactionLogger::new_with_start_time(",
+            // The streaming arm STAGES its summary here and builds the logger
+            // at the end of the handler, so the logger can take the request
+            // context by move instead of cloning it (issue #5537). The buffered
+            // ordering below is unchanged by that: its terminal still runs
+            // before the response is constructed.
+            "pending_stream_terminal = Some(Box::new(PendingStreamTerminal {",
             "} else {",
             // Authenticated: dispatched to bounded detached delivery, not
             // awaited. Unauthenticated: the historical awaited contract.
@@ -96,6 +101,9 @@ fn h1_h2_buffered_terminal_logging_precedes_response_construction() {
             "record_request(&state, response_status);",
             "// Build final response",
             "let mut resp_builder = Response::builder()",
+            // Last: every handler read of `ctx` is behind this point, which is
+            // what lets the deferred logger own the context outright.
+            "DeferredTransactionLogger::new_with_start_time(",
         ],
     );
 }

@@ -670,8 +670,13 @@ async fn start_time_rederives_gateway_latency_from_backend_total_when_available(
     summary.latency_gateway_overhead_ms = 0.0;
     summary.response_streamed = false;
     let start_time = std::time::Instant::now();
-    let logger =
-        DeferredTransactionLogger::new_with_start_time(summary, plugins, make_ctx(), start_time);
+    let logger = DeferredTransactionLogger::new_with_start_time(
+        summary,
+        plugins,
+        make_ctx(),
+        start_time,
+        false,
+    );
 
     tokio::time::sleep(std::time::Duration::from_millis(45)).await;
     logger.fire(BodyOutcome::success(1));
@@ -709,8 +714,13 @@ async fn start_time_keeps_gateway_sentinel_when_streaming_backend_total_unknown(
     summary.latency_gateway_overhead_ms = -1.0;
     summary.response_streamed = true;
     let start_time = std::time::Instant::now();
-    let logger =
-        DeferredTransactionLogger::new_with_start_time(summary, plugins, make_ctx(), start_time);
+    let logger = DeferredTransactionLogger::new_with_start_time(
+        summary,
+        plugins,
+        make_ctx(),
+        start_time,
+        false,
+    );
 
     tokio::time::sleep(std::time::Duration::from_millis(45)).await;
     logger.fire(BodyOutcome::success(1));
