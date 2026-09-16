@@ -2212,8 +2212,7 @@ async fn an_inverted_introspection_window_never_authenticates() {
         other => panic!("expected rejection, got {other:?}"),
     };
     assert_eq!(
-        body,
-        r#"{"error":"Token is not yet valid"}"#,
+        body, r#"{"error":"Token is not yet valid"}"#,
         "the not-before end must decide an inverted window, not the expiry end"
     );
     assert_bearer_reject(result, 401, "invalid_token");
