@@ -17644,7 +17644,12 @@ components:
         restore as legacy backups; database-backed exports always include it
         (possibly with an empty `items` array). The aggregate decompressed
         API-spec content is bounded by the configured restore body limit.
+
+        Closed on restore: an unknown member is rejected with `400` rather
+        than silently ignored, so a misspelled section key cannot read as an
+        empty API-spec wipe.
       required: [section_version, items]
+      additionalProperties: false
       properties:
         section_version:
           type: string
@@ -17664,6 +17669,10 @@ components:
         One API spec document in a backup/restore payload. `spec_content_base64`
         is the gzip-compressed original document (standard Base64). Do not log
         this field; it may contain proprietary API definitions.
+
+        Closed on restore: an unknown member is rejected with `400` rather than
+        silently ignored.
+      additionalProperties: false
       required:
         - id
         - proxy_id
@@ -17886,8 +17895,11 @@ components:
             Backup metadata from `GET /backup`. Accepted and ignored.
         counts:
           type: object
-          description: >-
-            Backup metadata from `GET /backup`. Accepted and ignored.
+          description: |
+            Backup metadata from `GET /backup`. Accepted and ignored, but the
+            declared `type: object` is enforced: a non-object `counts` is a
+            `400` like every other shape mismatch, so a malformed artifact
+            cannot reach the destructive clear.
 
     RestoreResponse:
       type: object

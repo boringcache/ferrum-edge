@@ -1365,6 +1365,9 @@ escapes, invalid UTF-8, duplicate keys that differ only in encoding, and a
 key-only `?resources` all fail closed with `400`, the static
 `Unsupported backup resource filter` text, no attachment, and the fixed
 `invalid` audit sentinel — raw rejected text is never echoed or persisted.
+Raw whitespace inside the value (`?resources=proxies, upstreams`) was
+previously trimmed and accepted and is now `400`, matching the `%20` spelling
+that was already rejected.
 
 `POST /restore` requires a **JSON object** envelope and rejects unknown
 top-level keys with `400` before the recovery snapshot and the destructive
@@ -1375,7 +1378,9 @@ namespace with nothing" meaning. Accepted keys are `version`, `proxies`,
 `consumers`, `plugin_configs`, `upstreams`, `api_specs`,
 `gateway_trust_bundles`, plus the `GET /backup` metadata members
 `ferrum_version`, `exported_at`, `source`, and `counts`, which are accepted and
-ignored so an unmodified backup round-trips. `POST /batch` and the ordinary
+ignored so an unmodified backup round-trips — ignored, but still shape-checked:
+`counts` must be a JSON object, as `openapi.yaml` publishes it, and the three
+others must be strings. `POST /batch` and the ordinary
 single-resource admin write bodies require a JSON object the same way, and
 object-valued resource fields (`circuit_breaker`, `retry`, `stream_match`,
 `trigger`, `health_checks`, `hash_on_cookie_config`, `service_discovery`,

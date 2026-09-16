@@ -17781,6 +17781,29 @@ fn restore_request_publishes_the_complete_closed_envelope() {
         "the restore envelope must reject unknown top-level keys"
     );
 
+    // The nested backup sections carry `deny_unknown_fields` in the runtime
+    // (`src/admin/backup.rs`); the published schemas must be closed the same
+    // way, or a generated client can build a body the gateway `400`s.
+    for nested in ["ApiSpecsBackupSection", "ApiSpecBackupItem"] {
+        assert_eq!(
+            spec["components"]["schemas"][nested]["additionalProperties"],
+            json!(false),
+            "{nested} is closed in the runtime and must publish the same shape"
+        );
+    }
+    assert_component_validity(
+        &spec,
+        "ApiSpecsBackupSection",
+        &json!({"section_version": "2", "items": [], "extra": 1}),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ApiSpecsBackupSection",
+        &json!({"section_version": "2", "items": []}),
+        true,
+    );
+
     // One sample value per published member, used for both schema validity and
     // serde-admission parity.
     let members: BTreeMap<&str, serde_json::Value> = BTreeMap::from([
@@ -17809,6 +17832,17 @@ fn restore_request_publishes_the_complete_closed_envelope() {
         "RestoreRequest must publish exactly the members restore accepts"
     );
 
+    // Parity in the other direction, so a NEW Rust field cannot stay green
+    // while the published schema omits it: the accepted member list is
+    // recovered from the runtime envelope's own derived `Deserialize` rather
+    // than from the hardcoded `members` map above.
+    let runtime_names = ferrum_edge::_test_support::restore_envelope_field_names_for_test();
+    let runtime_members: BTreeSet<&str> = runtime_names.iter().map(String::as_str).collect();
+    assert_eq!(
+        runtime_members, published,
+        "RestoreRequest.properties must equal the serde-accepted restore members"
+    );
+
     // Request-admission parity: every published member is accepted by the
     // runtime envelope, and the whole artifact is accepted together.
     let mut whole = serde_json::Map::new();
@@ -17835,6 +17869,13 @@ fn restore_request_publishes_the_complete_closed_envelope() {
     for rejected in [
         json!({"proxise": []}),
         json!({"proxies": [], "unknown_top_level": true}),
+        // The accepted-and-ignored metadata is still shape-checked: `counts`
+        // is published as `type: object`, so a non-object is a `400` like
+        // every other mismatch rather than a silently tolerated member.
+        json!({"counts": []}),
+        json!({"counts": 5}),
+        json!({"counts": "3"}),
+        json!({"counts": true}),
         json!([]),
         json!(["1", [], [], [], []]),
         json!("a string"),

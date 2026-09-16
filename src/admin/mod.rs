@@ -6161,7 +6161,13 @@ fn restore_payload_from_config(config: GatewayConfig) -> RestorePayload {
         // generation rather than leaving whatever the failed import wrote
         // (issue #3727).
         gateway_trust_bundles: Some(config.gateway_trust_bundles),
-        ..Default::default()
+        // Accepted-and-ignored `GET /backup` metadata. Listed explicitly
+        // rather than spread from `Default` so the literal stays exhaustive:
+        // a new `RestorePayload` section must make a deliberate choice here.
+        _ferrum_version: None,
+        _exported_at: None,
+        _source: None,
+        _counts: None,
     }
 }
 
@@ -6200,7 +6206,13 @@ impl RestoreSnapshot {
             upstreams: self.payload.upstreams.clone(),
             api_specs: None,
             gateway_trust_bundles: self.payload.gateway_trust_bundles.clone(),
-            ..Default::default()
+            // Accepted-and-ignored `GET /backup` metadata. Listed explicitly
+            // rather than spread from `Default` so the literal stays exhaustive:
+            // a new `RestorePayload` section must make a deliberate choice here.
+            _ferrum_version: None,
+            _exported_at: None,
+            _source: None,
+            _counts: None,
         };
         if !self.api_specs.is_empty() || self.payload.api_specs.is_some() {
             payload.api_specs = Some(ApiSpecsBackupSection::from_specs(&self.api_specs));
@@ -6659,7 +6671,13 @@ fn snapshot_resources_missing_after_intervening_write(
         // concurrency, so replaying it here could clobber a rotation that
         // intervening writer committed; leave it to the explicit rollback path.
         gateway_trust_bundles: None,
-        ..Default::default()
+        // Accepted-and-ignored `GET /backup` metadata. Listed explicitly
+        // rather than spread from `Default` so the literal stays exhaustive:
+        // a new `RestorePayload` section must make a deliberate choice here.
+        _ferrum_version: None,
+        _exported_at: None,
+        _source: None,
+        _counts: None,
     }
 }
 
@@ -8025,6 +8043,68 @@ fn batch_ref_faults() -> std::sync::MutexGuard<'static, BatchRefFaultMap> {
 #[allow(dead_code)]
 pub(crate) fn restore_envelope_admits_for_test(body: &[u8]) -> bool {
     crate::util::json_object::from_json_object_slice::<RestorePayload>(body).is_ok()
+}
+
+/// Captures the accepted field list a derived `Deserialize` hands to
+/// `deserialize_struct` before it reads any value.
+///
+/// Test-only support for [`restore_envelope_field_names_for_test`]; nothing in
+/// the serving paths constructs one.
+#[allow(dead_code)]
+#[derive(Default)]
+struct RestoreFieldNameCollector {
+    fields: Vec<String>,
+}
+
+impl<'de> serde::Deserializer<'de> for &mut RestoreFieldNameCollector {
+    type Error = serde::de::value::Error;
+
+    fn deserialize_any<V>(self, _visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        Err(serde::de::Error::custom("expected a derived struct"))
+    }
+
+    fn deserialize_struct<V>(
+        self,
+        _name: &'static str,
+        fields: &'static [&'static str],
+        _visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        self.fields
+            .extend(fields.iter().map(|field| (*field).to_string()));
+        Err(serde::de::Error::custom("field inventory collected"))
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bytes byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct
+        map enum identifier ignored_any
+    }
+}
+
+/// Serde-accepted member names of the closed `POST /restore` envelope
+/// (issue #5542).
+///
+/// The derived `Deserialize` passes its complete accepted field list to
+/// `deserialize_struct` before reading any value, so capturing that slice
+/// recovers the runtime inventory without a second hand-maintained manifest.
+/// The OpenAPI contract test asserts set-equality against
+/// `RestoreRequest.properties`, so adding a Rust member fails that test until
+/// the published schema describes it.
+///
+/// Reached through `_test_support`; the binary target has no consumer.
+#[allow(dead_code)]
+pub(crate) fn restore_envelope_field_names_for_test() -> Vec<String> {
+    let mut collector = RestoreFieldNameCollector::default();
+    // The collector deliberately fails the parse once it has the inventory;
+    // the captured names, not the outcome, are the result.
+    let _ = RestorePayload::deserialize(&mut collector);
+    collector.fields
 }
 
 /// Install (or clear, with `None`) a deterministic reference-check failure

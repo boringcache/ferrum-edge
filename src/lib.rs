@@ -95,6 +95,16 @@ pub mod _test_support {
         crate::admin::restore_envelope_admits_for_test(body)
     }
 
+    /// Serde-accepted member names of the `POST /restore` envelope
+    /// (issue #5542).
+    ///
+    /// Recovered from the derived `Deserialize` itself, so a new Rust member
+    /// appears here without anyone updating a manifest. The OpenAPI contract
+    /// test compares this inventory with `RestoreRequest.properties`.
+    pub fn restore_envelope_field_names_for_test() -> Vec<String> {
+        crate::admin::restore_envelope_field_names_for_test()
+    }
+
     /// Exercise the dispatch coordinate rebase and its cloned diagnostic context.
     pub fn rebase_backend_path_for_test(
         ctx: &mut crate::plugins::RequestContext,
