@@ -2745,21 +2745,26 @@ mod log_filter_isolation_tests {
         assert!(SCRUB_DEFAULTS.contains(&"FERRUM_LOG_LEVEL"));
     }
 
+    /// Count the lines that start with `call`: the needle also appears in
+    /// this test module's own source, so a plain substring count would
+    /// include itself.
+    fn call_sites(src: &str, call: &str) -> usize {
+        src.lines()
+            .filter(|line| line.trim_start().starts_with(call))
+            .count()
+    }
+
     #[test]
     fn both_spawn_paths_isolate_log_filter() {
         let src = include_str!("gateway_harness.rs");
-        let isolate_calls = src
-            .matches("isolate_spawned_gateway_log_env(self, &mut env)")
-            .count();
         assert_eq!(
-            isolate_calls, 2,
+            call_sites(src, "isolate_spawned_gateway_log_env(self, &mut env);"),
+            2,
             "try_spawn and try_spawn_expect_failure must both isolate log filters"
         );
-        let apply_calls = src
-            .matches("apply_builder_env_to_command(&mut cmd, self, &env)")
-            .count();
         assert_eq!(
-            apply_calls, 2,
+            call_sites(src, "apply_builder_env_to_command(&mut cmd, self, &env);"),
+            2,
             "both spawn paths must share apply_builder_env_to_command"
         );
         assert_eq!(
