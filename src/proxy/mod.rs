@@ -6868,6 +6868,15 @@ pub struct ProxyState {
     /// effective-mode snapshot. Captured traffic selects before the handshake;
     /// direct traffic checks the resolved app-port mode after routing.
     pub mesh_inbound_tls_policy: SharedMeshInboundTlsPolicy,
+    /// The CRL set the mesh inbound SPIFFE peer verifier ENFORCES, tagged with
+    /// the generation it was published under (issue #5574).
+    ///
+    /// Distinct from [`Self::shared_crls`], which is the BACKEND list outbound
+    /// pools read: this one is the inbound half, shared by the handshake
+    /// verifier and by the HBONE admission fence's sweep so both police the
+    /// same records. Written only by [`Self::publish_mesh_inbound_crls`],
+    /// which schedules the sweep a rotation implies.
+    pub mesh_inbound_crls: crate::tls::crl_policy::SharedEnforcedCrlSet,
     /// Registry of live admitted HBONE tunnels and the sweep that re-applies
     /// their CONNECT admission gates on every epoch publication and inbound
     /// PeerAuthentication swap (issue #5042 step 1). Publication paths must
@@ -8827,6 +8836,35 @@ impl ProxyState {
         self.hbone_admission_fence.request_sweep();
     }
 
+    /// Publish the CRL set the mesh inbound SPIFFE peer verifier enforces.
+    ///
+    /// This is the ONE writer of [`Self::mesh_inbound_crls`], and it exists for
+    /// the same reason [`Self::publish_mesh_inbound_tls_policy`] does: an
+    /// established inbound mTLS session is never re-handshaked, so a CRL that
+    /// revokes an already-admitted peer leaf would otherwise take effect only
+    /// at that peer's NEXT handshake and leave its live tunnels flowing
+    /// (issue #5574). The store is followed by an admission-fence sweep, which
+    /// re-verifies every retained peer chain against the new records and
+    /// revokes a revoked one with `peer_revoked`.
+    ///
+    /// Publish-then-recheck, in that order: a CONNECT that read the superseded
+    /// set necessarily captured a stale sweep counter too (the counter is read
+    /// before the generation at the request path), and
+    /// `HboneAdmissionFence::admit` turns that into a fresh sweep.
+    ///
+    /// Returns whether the enforced set actually changed. A periodic reload
+    /// that re-reads an UNCHANGED CRL file publishes nothing and schedules no
+    /// sweep, so the reload cadence never turns into per-tunnel certificate
+    /// path building.
+    pub fn publish_mesh_inbound_crls(&self, crls: crate::tls::CrlList) -> bool {
+        let changed =
+            crate::tls::crl_policy::publish_enforced_crl_set(&self.mesh_inbound_crls, crls);
+        if changed {
+            self.hbone_admission_fence.request_sweep();
+        }
+        changed
+    }
+
     /// Republish only the captured-listener-port → application-port alias table,
     /// carrying every other field of the live snapshot forward.
     ///
@@ -9110,6 +9148,12 @@ impl ProxyState {
         // candidate never reaches this store, so previous verifiers,
         // generation, and probe tasks stay in service.
         self.shared_crls.store(active_crls);
+        // The same admitted generation on the INBOUND half: the mesh inbound
+        // SPIFFE peer verifier reads this slot on every handshake, and the
+        // HBONE admission fence re-judges already-admitted peers against it
+        // (issue #5574). Published from the candidate this method just
+        // validated, so a refused candidate never reaches either surface.
+        self.publish_mesh_inbound_crls(self.shared_crls.load_full());
         let pools = self.backend_pool_family();
         pools.clear_tls_config_caches();
         pools.force_drain_all();
@@ -9544,6 +9588,11 @@ impl ProxyState {
             env_config.tls_crl_expiry_warning_days,
         )?;
         let shared_crls = crate::tls::shared_crl_list(crls.clone());
+        // The inbound half of the same startup snapshot (issue #5574). It
+        // advances independently of `shared_crls` because only a rotation that
+        // changes the ENFORCED records may bump the generation: the fence
+        // treats a bump as "re-verify every live tunnel's chain".
+        let mesh_inbound_crls = crate::tls::crl_policy::enforced_crl_set(crls.clone());
         let backend_svid_generation = Arc::new(AtomicU64::new(0));
         let (backend_svid_rotation_tx, backend_svid_rotation_rx) =
             tokio::sync::watch::channel(0u64);
@@ -10024,6 +10073,7 @@ impl ProxyState {
         let hbone_admission_fence = Arc::new(hbone_admission_fence::HboneAdmissionFence::new(
             Arc::clone(&request_epoch),
             Arc::clone(&mesh_inbound_tls_policy),
+            Arc::clone(&mesh_inbound_crls),
         ));
 
         let state = Self {
@@ -10132,6 +10182,7 @@ impl ProxyState {
             mesh_trust_registry,
             mesh_inbound_tls,
             mesh_inbound_tls_policy,
+            mesh_inbound_crls,
             hbone_admission_fence,
             mesh_inbound_spiffe_verifier_active,
             mesh_outbound_enforcement,
@@ -30707,6 +30758,15 @@ async fn handle_proxy_request_inner(
     // HBONE branch below, and no mesh/inbound predicate is available this early
     // that is cheaper than the load it would guard — one uncontended atomic
     // load (a plain `mov` on x86-64, `ldar` on aarch64).
+    // The enforced mesh inbound CRL generation, captured BEFORE the sweep
+    // counter for the same reason (issue #5574): `publish_mesh_inbound_crls`
+    // stores and only then bumps the counter, so reading the generation first
+    // guarantees a CONNECT that records a superseded generation also records a
+    // stale counter. Reading it AFTER would let a CONNECT record the NEW
+    // generation while carrying a stale counter — `admit` would schedule a
+    // sweep, and that sweep's "unchanged ⇒ skip" fast path would then skip the
+    // very tunnel the rotation was published for.
+    let hbone_mesh_inbound_crl_generation = state.mesh_inbound_crls.load().generation();
     let hbone_admission_sweep_epoch = state.hbone_admission_fence.sweep_epoch();
     let epoch = state.request_epoch.load();
     ctx.lb_generation = epoch.lb_generation;
@@ -32359,6 +32419,7 @@ async fn handle_proxy_request_inner(
                 request_protocol,
                 grpc_web_request,
                 sweep_epoch: hbone_admission_sweep_epoch,
+                mesh_inbound_crl_generation: hbone_mesh_inbound_crl_generation,
             },
         )
         .await);
@@ -32384,6 +32445,7 @@ async fn handle_proxy_request_inner(
                 request_protocol,
                 grpc_web_request,
                 sweep_epoch: hbone_admission_sweep_epoch,
+                mesh_inbound_crl_generation: hbone_mesh_inbound_crl_generation,
             },
         )
         .await);

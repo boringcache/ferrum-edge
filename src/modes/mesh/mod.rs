@@ -15432,6 +15432,7 @@ async fn arm_mesh_runtime_startup(
         env_config,
         &tls_policy,
         &crls,
+        &proxy_state.mesh_inbound_crls,
         inbound_mtls_mode,
         runtime.topology,
         mesh_frontend_identity.as_deref(),
@@ -15443,6 +15444,7 @@ async fn arm_mesh_runtime_startup(
             env_config,
             &tls_policy,
             &crls,
+            &proxy_state.mesh_inbound_crls,
             &inbound_mtls_modes_by_port,
             runtime.topology,
             mesh_frontend_identity.as_deref(),
@@ -17641,26 +17643,24 @@ fn stage_gateway_runtime_spiffe_bundle_with_federation(
 /// STRICT requires + validates a peer cert. Returns `None` when no slot is
 /// available or the mode is DISABLE.
 ///
-/// `crls` is threaded into the verifier so inbound mesh peers get end-entity
-/// revocation checking, matching the operator-CA mTLS path. An empty CRL list
-/// disables revocation checking (the pre-CRL behavior).
+/// `crls` is the LIVE enforced mesh inbound CRL slot, not a snapshot: the
+/// verifier reads it on every handshake so an operator's rotation reaches the
+/// next peer without rebinding the listener (issue #5574), and it is the same
+/// slot the HBONE admission fence sweeps already-admitted peers against. An
+/// empty enforced set disables revocation checking (the pre-CRL behavior).
 fn mesh_inbound_spiffe_verifier(
     slot: Option<&tls::SharedBundleSlot>,
     mtls_mode: config::MtlsMode,
-    crls: tls::CrlList,
+    crls: crate::tls::crl_policy::SharedEnforcedCrlSet,
 ) -> Option<Arc<dyn rustls::server::danger::ClientCertVerifier>> {
     let slot = slot?;
     match mtls_mode {
-        config::MtlsMode::Strict => Some(tls::build_spiffe_client_cert_verifier(
-            slot.clone(),
-            true,
-            crls,
-        )),
-        config::MtlsMode::Permissive => Some(tls::build_spiffe_client_cert_verifier(
-            slot.clone(),
-            false,
-            crls,
-        )),
+        config::MtlsMode::Strict => Some(
+            tls::build_spiffe_client_cert_verifier_with_enforced_crls(slot.clone(), true, crls),
+        ),
+        config::MtlsMode::Permissive => Some(
+            tls::build_spiffe_client_cert_verifier_with_enforced_crls(slot.clone(), false, crls),
+        ),
         // DISABLE has no TLS; client-side DR modes never reach here.
         _ => None,
     }
@@ -17923,6 +17923,7 @@ fn load_mesh_frontend_tls(
     env_config: &EnvConfig,
     tls_policy: &TlsPolicy,
     crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
+    mesh_inbound_crls: &crate::tls::crl_policy::SharedEnforcedCrlSet,
     mtls_mode: config::MtlsMode,
     topology: MeshTopology,
     server_identity: Option<&tls::MeshServerIdentity>,
@@ -17953,7 +17954,7 @@ fn load_mesh_frontend_tls(
     // end-entity revocation enforcement the operator-CA path already applies
     // (empty CRLs => no revocation checking, unchanged behavior).
     let spiffe_verifier =
-        mesh_inbound_spiffe_verifier(spiffe_bundle_slot, mtls_mode, Arc::new(crls.to_vec()));
+        mesh_inbound_spiffe_verifier(spiffe_bundle_slot, mtls_mode, Arc::clone(mesh_inbound_crls));
 
     let client_ca_bundle_path = client_ca_bundle
         .map(|bundle| bundle.path.as_str())
@@ -18073,6 +18074,7 @@ fn load_mesh_frontend_tls_by_port(
     env_config: &EnvConfig,
     tls_policy: &TlsPolicy,
     crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
+    mesh_inbound_crls: &crate::tls::crl_policy::SharedEnforcedCrlSet,
     modes: &std::collections::BTreeMap<u16, config::MtlsMode>,
     topology: MeshTopology,
     server_identity: Option<&tls::MeshServerIdentity>,
@@ -18096,6 +18098,7 @@ fn load_mesh_frontend_tls_by_port(
                 env_config,
                 tls_policy,
                 crls,
+                mesh_inbound_crls,
                 mode,
                 topology,
                 server_identity,
@@ -18510,6 +18513,7 @@ fn plan_mesh_inbound_tls_reload_with_federation(
         &proxy_state.env_config,
         tls_policy,
         &proxy_state.crls,
+        &proxy_state.mesh_inbound_crls,
         mtls_mode,
         runtime.topology,
         server_identity,
@@ -18522,6 +18526,7 @@ fn plan_mesh_inbound_tls_reload_with_federation(
                     &proxy_state.env_config,
                     tls_policy,
                     &proxy_state.crls,
+                    &proxy_state.mesh_inbound_crls,
                     &next_snapshot.port_modes,
                     runtime.topology,
                     server_identity,
@@ -21259,6 +21264,14 @@ mod tests {
             .push(rcgen::DnType::CommonName, common_name);
         let cert = params.self_signed(&key).expect("test CA self-signs");
         base64::engine::general_purpose::STANDARD.encode(cert.der())
+    }
+
+    /// An enforced mesh inbound CRL slot carrying no records, i.e. revocation
+    /// checking off — the pre-CRL posture every TLS-shape test here asserts
+    /// against (issue #5574). The rotation behavior itself is pinned where the
+    /// verifier reads the slot, in the SPIFFE and admission-fence suites.
+    fn no_enforced_crls() -> crate::tls::crl_policy::SharedEnforcedCrlSet {
+        crate::tls::crl_policy::enforced_crl_set(Arc::new(Vec::new()))
     }
 
     /// The SVID slot `load_mesh_frontend_server_identity` resolves the
@@ -34912,19 +34925,16 @@ mod tests {
     fn mesh_inbound_spiffe_verifier_respects_mode_and_slot() {
         // No slot → no verifier regardless of mode.
         assert!(
-            mesh_inbound_spiffe_verifier(None, config::MtlsMode::Strict, Arc::new(Vec::new()))
+            mesh_inbound_spiffe_verifier(None, config::MtlsMode::Strict, no_enforced_crls())
                 .is_none()
         );
 
         // A present (even empty) slot yields a verifier for STRICT/PERMISSIVE
         // with the correct client-auth-mandatory posture, and none for DISABLE.
         let slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
-        let strict = mesh_inbound_spiffe_verifier(
-            Some(&slot),
-            config::MtlsMode::Strict,
-            Arc::new(Vec::new()),
-        )
-        .expect("STRICT yields a verifier");
+        let strict =
+            mesh_inbound_spiffe_verifier(Some(&slot), config::MtlsMode::Strict, no_enforced_crls())
+                .expect("STRICT yields a verifier");
         assert!(
             rustls::server::danger::ClientCertVerifier::client_auth_mandatory(strict.as_ref()),
             "STRICT must mandate client auth"
@@ -34932,7 +34942,7 @@ mod tests {
         let permissive = mesh_inbound_spiffe_verifier(
             Some(&slot),
             config::MtlsMode::Permissive,
-            Arc::new(Vec::new()),
+            no_enforced_crls(),
         )
         .expect("PERMISSIVE yields a verifier");
         assert!(
@@ -34940,12 +34950,8 @@ mod tests {
             "PERMISSIVE must not mandate client auth"
         );
         assert!(
-            mesh_inbound_spiffe_verifier(
-                Some(&slot),
-                config::MtlsMode::Disable,
-                Arc::new(Vec::new())
-            )
-            .is_none(),
+            mesh_inbound_spiffe_verifier(Some(&slot), config::MtlsMode::Disable, no_enforced_crls())
+                .is_none(),
             "DISABLE has no TLS, so no verifier"
         );
     }
@@ -36203,6 +36209,7 @@ mod tests {
             &env,
             &tls_policy,
             &[],
+            &no_enforced_crls(),
             config::MtlsMode::Strict,
             MeshTopology::Sidecar,
             None,
@@ -36226,6 +36233,7 @@ mod tests {
             &env,
             &tls_policy,
             &[],
+            &no_enforced_crls(),
             config::MtlsMode::Permissive,
             MeshTopology::Sidecar,
             None,
@@ -36255,6 +36263,7 @@ mod tests {
             &env,
             &tls_policy,
             &[],
+            &no_enforced_crls(),
             config::MtlsMode::Permissive,
             MeshTopology::Sidecar,
             mesh_frontend_identity.as_deref(),
@@ -36434,6 +36443,7 @@ mod tests {
             &env,
             &tls_policy,
             &[],
+            &no_enforced_crls(),
             config::MtlsMode::Permissive,
             MeshTopology::Sidecar,
             Some(identity.as_ref()),
@@ -36573,6 +36583,7 @@ mod tests {
             &env,
             &tls_policy,
             &[],
+            &no_enforced_crls(),
             config::MtlsMode::Permissive,
             MeshTopology::Sidecar,
             identity.as_deref(),
@@ -36800,7 +36811,7 @@ mod tests {
         let verifier = mesh_inbound_spiffe_verifier(
             Some(&slot),
             config::MtlsMode::Permissive,
-            Arc::new(Vec::new()),
+            no_enforced_crls(),
         )
         .expect("PERMISSIVE with an SVID slot must yield a verifier");
         assert!(
@@ -36816,6 +36827,7 @@ mod tests {
             &env,
             &tls_policy,
             &[],
+            &no_enforced_crls(),
             config::MtlsMode::Permissive,
             MeshTopology::Sidecar,
             mesh_frontend_identity.as_deref(),
@@ -36865,6 +36877,7 @@ mod tests {
             &env,
             &tls_policy,
             &[],
+            &no_enforced_crls(),
             config::MtlsMode::Permissive,
             MeshTopology::Sidecar,
             mesh_frontend_identity.as_deref(),
@@ -36905,6 +36918,7 @@ mod tests {
             &env,
             &tls_policy,
             &[],
+            &no_enforced_crls(),
             config::MtlsMode::Strict,
             MeshTopology::Sidecar,
             mesh_frontend_identity.as_deref(),
@@ -36945,6 +36959,7 @@ mod tests {
             &env,
             &tls_policy,
             &[],
+            &no_enforced_crls(),
             config::MtlsMode::Strict,
             MeshTopology::Sidecar,
             mesh_frontend_identity.as_deref(),
@@ -37518,6 +37533,7 @@ mod tests {
             &env,
             &tls_policy,
             &[],
+            &no_enforced_crls(),
             config::MtlsMode::Permissive,
             MeshTopology::Sidecar,
             mesh_frontend_identity.as_deref(),

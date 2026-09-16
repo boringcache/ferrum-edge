@@ -376,6 +376,9 @@ async fn test_http3_proxy_state_creation() {
     let mesh_inbound_tls_policy = Arc::new(arc_swap::ArcSwap::from_pointee(
         ferrum_edge::proxy::MeshInboundTlsPolicy::default(),
     ));
+    // No CRL source in these H3 fixtures: revocation checking off, which is the
+    // generation-1 enforced set the fence and verifier both read (issue #5574).
+    let mesh_inbound_crls = ferrum_edge::tls::crl_policy::enforced_crl_set(Arc::new(Vec::new()));
     let request_epoch_for_fence = request_epoch.clone();
     let proxy_state = ProxyState {
         config: gateway_config,
@@ -491,10 +494,12 @@ async fn test_http3_proxy_state_creation() {
         gateway_trust_authority_unresolved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         mesh_inbound_tls: empty_mesh_inbound_tls(),
         mesh_inbound_tls_policy: mesh_inbound_tls_policy.clone(),
+        mesh_inbound_crls: Arc::clone(&mesh_inbound_crls),
         hbone_admission_fence: Arc::new(
             ferrum_edge::proxy::hbone_admission_fence::HboneAdmissionFence::new(
                 request_epoch_for_fence,
                 mesh_inbound_tls_policy,
+                mesh_inbound_crls,
             ),
         ),
         mesh_inbound_spiffe_verifier_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -715,6 +720,9 @@ async fn test_http3_full_integration() {
     let mesh_inbound_tls_policy = Arc::new(arc_swap::ArcSwap::from_pointee(
         ferrum_edge::proxy::MeshInboundTlsPolicy::default(),
     ));
+    // No CRL source in these H3 fixtures: revocation checking off, which is the
+    // generation-1 enforced set the fence and verifier both read (issue #5574).
+    let mesh_inbound_crls = ferrum_edge::tls::crl_policy::enforced_crl_set(Arc::new(Vec::new()));
     let request_epoch_for_fence = request_epoch.clone();
     let proxy_state = ProxyState {
         config: gateway_config,
@@ -830,10 +838,12 @@ async fn test_http3_full_integration() {
         gateway_trust_authority_unresolved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         mesh_inbound_tls: empty_mesh_inbound_tls(),
         mesh_inbound_tls_policy: mesh_inbound_tls_policy.clone(),
+        mesh_inbound_crls: Arc::clone(&mesh_inbound_crls),
         hbone_admission_fence: Arc::new(
             ferrum_edge::proxy::hbone_admission_fence::HboneAdmissionFence::new(
                 request_epoch_for_fence,
                 mesh_inbound_tls_policy,
+                mesh_inbound_crls,
             ),
         ),
         mesh_inbound_spiffe_verifier_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),

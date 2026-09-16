@@ -584,6 +584,10 @@ pub(super) struct HboneAdmissionView {
     pub(super) request_protocol: crate::plugins::ProxyProtocol,
     pub(super) grpc_web_request: bool,
     pub(super) sweep_epoch: u64,
+    /// The mesh inbound CRL generation enforced when this request entered the
+    /// path, captured immediately BEFORE `sweep_epoch` (issue #5574) so the
+    /// publish-then-recheck ordering holds for the revocation dimension too.
+    pub(super) mesh_inbound_crl_generation: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1065,6 +1069,10 @@ pub(super) async fn handle_hbone_request(
         // gates above judged, so the trust generation and the policy generation
         // this snapshot records can never come from two different loads.
         gateway_trust_generation: epoch.gateway_trust().generation(),
+        // The revocation half of the same credential dimension (issue #5574),
+        // carried from the admission view rather than re-read here so it
+        // precedes `admission_sweep_epoch` in program order.
+        mesh_inbound_crl_generation: admission_view.mesh_inbound_crl_generation,
         peer_credential: HbonePeerCredential::from_admitted_connect(ctx, epoch.gateway_trust()),
     });
     let relay_proxy = proxy.clone();
@@ -1769,6 +1777,10 @@ pub(super) async fn handle_hbone_udp_request(
         // datagram tunnel rides the same inbound mTLS session and is bounded by
         // the same peer SVID, so it carries the same snapshot fields.
         gateway_trust_generation: epoch.gateway_trust().generation(),
+        // The revocation half of the same credential dimension (issue #5574),
+        // carried from the admission view rather than re-read here so it
+        // precedes `admission_sweep_epoch` in program order.
+        mesh_inbound_crl_generation: admission_view.mesh_inbound_crl_generation,
         peer_credential: HbonePeerCredential::from_admitted_connect(ctx, epoch.gateway_trust()),
     });
     let relay_proxy = proxy.clone();

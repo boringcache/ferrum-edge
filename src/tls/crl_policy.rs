@@ -30,13 +30,109 @@
 //! create/update — using exactly the boundary semantics rustls applies at
 //! handshake time, so a candidate that admission accepts is one the handshake
 //! path can also use.
+//!
+//! [`EnforcedCrlSet`] carries an admitted list plus the generation it was
+//! published under (issue #5574). A surface whose verifiers must notice a
+//! rotation — the mesh inbound SPIFFE peer verifier, and the HBONE admission
+//! fence that re-judges already-admitted peers against it — reads the shared
+//! slot rather than a snapshot captured at build time, so both sides of that
+//! decision always police the same records.
 
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 use rustls::client::ServerCertVerifierBuilder;
 use rustls::pki_types::CertificateRevocationListDer;
 use rustls::server::ClientCertVerifierBuilder;
 use x509_parser::prelude::FromDer;
 use x509_parser::revocation_list::CertificateRevocationList;
 use x509_parser::time::ASN1Time;
+
+use crate::tls::CrlList;
+
+/// The CRL set a verifier surface ENFORCES right now, tagged with the
+/// generation it was published under (issue #5574).
+///
+/// A plain [`CrlList`] answers "which records" but not "which publication",
+/// and the HBONE admission fence needs both: it records the generation a
+/// CONNECT was admitted under and re-verifies the retained peer chain only
+/// when that generation has moved, exactly as it does for the gateway trust
+/// generation. Without the tag every sweep would have to rebuild a chain
+/// verifier per live tunnel just to discover the CRL set had not changed.
+///
+/// The bytes are shared, never copied: publishing a new generation is one
+/// `Arc` store.
+#[derive(Debug)]
+pub struct EnforcedCrlSet {
+    crls: CrlList,
+    generation: u64,
+}
+
+impl EnforcedCrlSet {
+    /// The records this generation enforces. Empty means revocation checking
+    /// is off, which is the unchanged behavior of a deployment with no CRL
+    /// source configured.
+    pub fn crls(&self) -> &CrlList {
+        &self.crls
+    }
+
+    /// The publication this set came from. Monotonic within a process; the
+    /// first published set is generation 1, so `0` can never collide with a
+    /// real generation.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// A hot-swappable [`EnforcedCrlSet`], read lock-free by verifiers and by the
+/// admission fence's sweep.
+pub type SharedEnforcedCrlSet = Arc<ArcSwap<EnforcedCrlSet>>;
+
+/// The first generation of an enforced CRL set.
+pub fn enforced_crl_set(crls: CrlList) -> SharedEnforcedCrlSet {
+    Arc::new(ArcSwap::new(Arc::new(EnforcedCrlSet {
+        crls,
+        generation: 1,
+    })))
+}
+
+/// Publish `crls` as the next generation of `slot`, or leave it untouched when
+/// the records are byte-identical to the ones already enforced.
+///
+/// Returns `true` only when the enforced set actually changed. The comparison
+/// is what keeps a periodic reload of an UNCHANGED CRL file from advancing the
+/// generation: a bumped generation makes every live-tunnel sweep re-verify
+/// every retained peer chain, so an unconditional bump would turn the reload
+/// cadence into per-tunnel certificate path building for no decision at all.
+///
+/// This is deliberately a free function rather than a method on the slot: the
+/// caller that owns the surface is the one place allowed to publish, and it
+/// must schedule whatever re-check the change implies (see
+/// `ProxyState::publish_mesh_inbound_crls`).
+pub fn publish_enforced_crl_set(slot: &SharedEnforcedCrlSet, crls: CrlList) -> bool {
+    let current = slot.load();
+    if crl_records_equal(current.crls(), &crls) {
+        return false;
+    }
+    let generation = current.generation().saturating_add(1);
+    slot.store(Arc::new(EnforcedCrlSet { crls, generation }));
+    true
+}
+
+/// Whether two CRL candidate lists carry the same records in the same order.
+///
+/// Byte equality on the DER, not pointer equality: each reload parses the
+/// source afresh, so an unchanged file always produces a different allocation.
+fn crl_records_equal(
+    left: &[CertificateRevocationListDer<'static>],
+    right: &[CertificateRevocationListDer<'static>],
+) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(a, b)| a.as_ref() == b.as_ref())
+}
 
 /// Apply the shared CRL policy to a client-certificate verifier builder.
 ///
