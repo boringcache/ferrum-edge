@@ -123,8 +123,18 @@ fn proxy_numeric_bounds_match_runtime_including_nullable_pool_overrides() {
                 ("/pool_tcp_keepalive_seconds", 1, 86400, true),
                 ("/pool_http2_keep_alive_interval_seconds", 1, 86400, true),
                 ("/pool_http2_keep_alive_timeout_seconds", 1, 86400, true),
-                ("/pool_http2_initial_stream_window_size", 65535, 134217728, true),
-                ("/pool_http2_initial_connection_window_size", 65535, 134217728, true),
+                (
+                    "/pool_http2_initial_stream_window_size",
+                    65535,
+                    134217728,
+                    true,
+                ),
+                (
+                    "/pool_http2_initial_connection_window_size",
+                    65535,
+                    134217728,
+                    true,
+                ),
                 ("/pool_http2_max_frame_size", 16384, 1048576, true),
                 ("/pool_http2_max_concurrent_streams", 1, 2147483647, true),
                 ("/pool_http3_connections_per_backend", 1, 256, true),
@@ -182,8 +192,18 @@ fn upstream_numeric_bounds_match_runtime_for_targets_health_and_discovery() {
                 ("/health_checks/active/healthy_threshold", 1, 10000, false),
                 ("/health_checks/active/unhealthy_threshold", 1, 10000, false),
                 ("/health_checks/passive/unhealthy_threshold", 1, 1000, false),
-                ("/health_checks/passive/unhealthy_window_seconds", 1, 86400, false),
-                ("/health_checks/passive/healthy_after_seconds", 0, 86400, false),
+                (
+                    "/health_checks/passive/unhealthy_window_seconds",
+                    1,
+                    86400,
+                    false,
+                ),
+                (
+                    "/health_checks/passive/healthy_after_seconds",
+                    0,
+                    86400,
+                    false,
+                ),
                 ("/health_checks/passive/max_ejection_percent", 0, 100, true),
             ],
         );
@@ -303,7 +323,10 @@ fn proxy_routing_and_stream_controls_match_runtime() {
             (json!({"stream_match": null}), true),
             (json!({"upstream_subset": ""}), false),
             (json!({"upstream_subset": "v1", "upstream_id": null}), false),
-            (json!({"upstream_subset": "v1", "upstream_id": "pool"}), true),
+            (
+                json!({"upstream_subset": "v1", "upstream_id": "pool"}),
+                true,
+            ),
             (json!({"upstream_subset": null}), true),
             (json!({"udp_max_response_amplification_factor": 0}), false),
             (json!({"udp_max_response_amplification_factor": 0.5}), true),
@@ -478,8 +501,7 @@ fn batch_restore_and_crud_share_resource_constraints() {
         ("/plugins/config/{id}", "put", "PluginConfigReplace"),
     ] {
         assert_eq!(
-            spec["paths"][path][method]["requestBody"]["content"]["application/json"]["schema"]
-                ["$ref"],
+            spec["paths"][path][method]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
             json!(format!("#/components/schemas/{component}"))
         );
     }
@@ -583,5 +605,8 @@ fn tightened_resource_schema_examples_remain_valid() {
             }
         }
     }
-    assert!(checked >= 12, "resource and field examples must be exercised");
+    assert!(
+        checked >= 12,
+        "resource and field examples must be exercised"
+    );
 }
