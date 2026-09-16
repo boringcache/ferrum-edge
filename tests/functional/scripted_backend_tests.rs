@@ -172,7 +172,10 @@ async fn backend_accepts_then_resets_maps_to_connection_reset() {
     let resp = result.expect("response");
     assert_eq!(resp.status, StatusCode::BAD_GATEWAY);
     backend.assert_no_step_errors().await;
-    assert!(backend.reset_connections() > 0, "fixture never executed Reset");
+    assert!(
+        backend.reset_connections() > 0,
+        "fixture never executed Reset"
+    );
 
     // The exact transport message varies across platforms and error phases.
     let observed = logs.contains("reset")
