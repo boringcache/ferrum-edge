@@ -1982,7 +1982,12 @@ impl Plugin for Waf {
         // only on the timeout path.
         let timeout_enforces =
             outcome.timed_out && self.response_body_policy_enforces(ctx, content_type);
-        self.finish_scan(ctx, outcome, WafScorePhase::FinalResponseBody, timeout_enforces)
+        self.finish_scan(
+            ctx,
+            outcome,
+            WafScorePhase::FinalResponseBody,
+            timeout_enforces,
+        )
     }
 
     /// Preserve the established final-body hook contract for direct callers.

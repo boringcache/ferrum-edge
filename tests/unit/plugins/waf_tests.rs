@@ -8685,11 +8685,17 @@ async fn an_over_budget_clean_response_body_is_rejected_under_enforcing_policy()
 
     assert!(matches!(result, PluginResult::Reject { .. }));
     assert_eq!(
-        resp_ctx.metadata.get("waf.scan_timed_out").map(String::as_str),
+        resp_ctx
+            .metadata
+            .get("waf.scan_timed_out")
+            .map(String::as_str),
         Some("true")
     );
     assert_eq!(
-        resp_ctx.metadata.get("waf.block_reason").map(String::as_str),
+        resp_ctx
+            .metadata
+            .get("waf.block_reason")
+            .map(String::as_str),
         Some("scan_timeout")
     );
 }
