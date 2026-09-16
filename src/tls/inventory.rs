@@ -20,7 +20,7 @@
 //!   from the owning validated config/reload state instead (issue #2410).
 //!
 //! `/metrics` itself only ever reads the cached snapshot
-//! ([`crate::tls::inventory_cache::snapshot`]) and performs zero source I/O.
+//! ([`crate::tls::inventory_cache::TlsInventoryCache::snapshot`]) and performs zero source I/O.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;

@@ -375,6 +375,8 @@ async fn test_http3_proxy_state_creation() {
     mesh_mtls_pool.attach_mesh_trust_registry(mesh_trust_registry.clone());
     let proxy_state = ProxyState {
         config: gateway_config,
+        tls_inventory_cache: Arc::clone(ferrum_edge::tls::inventory_cache::process_cache()),
+        admin_metrics_registry: ferrum_edge::plugins::prometheus_metrics::global_registry(),
         request_epoch,
         dns_cache,
         connection_pool,
@@ -704,6 +706,8 @@ async fn test_http3_full_integration() {
     mesh_mtls_pool.attach_mesh_trust_registry(mesh_trust_registry.clone());
     let proxy_state = ProxyState {
         config: gateway_config,
+        tls_inventory_cache: Arc::clone(ferrum_edge::tls::inventory_cache::process_cache()),
+        admin_metrics_registry: ferrum_edge::plugins::prometheus_metrics::global_registry(),
         request_epoch,
         dns_cache,
         connection_pool,

@@ -98,13 +98,14 @@ fn metrics_inventory_collector(
     })
 }
 
-/// Ensure the process-wide collector exists for direct metrics-handler callers
+/// Ensure the selected cache's collector exists for direct metrics-handler callers
 /// that did not start through an admin serving path.
 pub(super) fn install_metrics_inventory_collector(state: &AdminState) {
-    if crate::tls::inventory_cache::collector_installed() {
+    let cache = super::tls_inventory_cache(state);
+    if cache.collector_installed() {
         return;
     }
-    crate::tls::inventory_cache::install_collector(metrics_inventory_collector(state));
+    cache.install_collector(metrics_inventory_collector(state));
 }
 
 /// Install the collector owned by this admin serving cycle.
@@ -113,9 +114,8 @@ pub(super) fn install_metrics_inventory_collector(state: &AdminState) {
 /// replace the prior cycle's captured config handles. The cache marks its
 /// current snapshot stale so the warmup refresh publishes the new cycle.
 pub(super) fn replace_metrics_inventory_collector_for_serving_cycle(state: &AdminState) {
-    crate::tls::inventory_cache::replace_collector_for_serving_cycle(metrics_inventory_collector(
-        state,
-    ));
+    super::tls_inventory_cache(state)
+        .replace_collector_for_serving_cycle(metrics_inventory_collector(state));
 }
 
 pub(super) async fn handle_events(
