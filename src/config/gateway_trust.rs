@@ -177,6 +177,7 @@ pub struct GatewayTrustBundleRecord {
     #[serde(default)]
     pub trust_domain: String,
     /// The admitted trust material, in the same shape mesh config uses.
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
     pub bundle: TrustBundleSet,
     /// Monotonic revision. Backend-assigned on every physical write from the
     /// durable change sequence — never carried over from a request body, a

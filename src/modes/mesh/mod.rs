@@ -3045,9 +3045,11 @@ fn effective_node_waypoint_scoped_authz_policy_labels(config: &GatewayConfig) ->
 
 fn mesh_authz_config_policies(config: &serde_json::Value) -> Vec<MeshPolicy> {
     if let Some(value) = config.get("mesh_slice") {
-        return serde_json::from_value::<MeshSlice>(value.clone())
-            .map(|slice| slice.mesh_policies)
-            .unwrap_or_default();
+        return serde_json::from_value::<crate::util::json_object::JsonObject<MeshSlice>>(
+            value.clone(),
+        )
+        .map(|object| object.0.mesh_policies)
+        .unwrap_or_default();
     }
     if let Some(value) = config.get("mesh_policies") {
         return serde_json::from_value::<Vec<MeshPolicy>>(value.clone()).unwrap_or_default();

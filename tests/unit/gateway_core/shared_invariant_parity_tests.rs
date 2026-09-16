@@ -1323,3 +1323,712 @@ fn admin_typed_body_boundaries_require_a_json_object_envelope() {
         );
     }
 }
+
+// The original three-resource check above remains the regression table for
+// #5538. This inventory checks object-valued fields in the #5557 admission
+// modules below, including private plugin wire structs and mesh-slice carriers.
+// Source discovery requires an admission decision for new Option<Struct>
+// fields within that scope; this is not complete JSON admission coverage.
+// Collection-element admission (including Vec<Struct>) is tracked in #5569.
+fn object_admission_source(path: &str) -> bool {
+    path.starts_with("src/config/")
+        || path.starts_with("src/admin/")
+        || path.starts_with("src/plugins/")
+        || path.starts_with("src/modes/mesh/config_consumer/")
+        || matches!(
+            path,
+            "src/modes/mesh/config.rs"
+                | "src/modes/mesh/revision.rs"
+                | "src/modes/mesh/slice.rs"
+                | "src/proxy/stream_match.rs"
+        )
+}
+
+/// Field-specific exceptions, never a blanket exception for a config type.
+/// These are persistence/replication records, not admin configuration. Custom scalar
+/// identity types are checked separately below against their string parser.
+const OBJECT_ADMISSION_EXCEPTIONS: &[(&str, &str, &str, &str)] = &[
+    (
+        "src/config/db_backend.rs",
+        "RemovalKeyWire",
+        "Qualified",
+        "Private CP/DP incremental removal entry, not an admin configuration body.",
+    ),
+    (
+        "src/admin/audit_spool.rs",
+        "SpooledAuditRecord",
+        "event",
+        "Private audit spool record, read from the gateway's own spool, not an admin body.",
+    ),
+    (
+        "src/plugins/request_deduplication.rs",
+        "SerializableCachedResponse",
+        "response_policy",
+        "Private cached response provenance, not plugin configuration.",
+    ),
+    (
+        "src/plugins/request_deduplication.rs",
+        "SerializableDedupRecord",
+        "replay",
+        "Private Redis deduplication record, not plugin configuration.",
+    ),
+];
+
+/// Baseline field keys make a discovery regression actionable even if newly
+/// discovered fields keep the total count above its floor. Discovery still
+/// checks additions without requiring them to be listed here first.
+const EXPECTED_OBJECT_ADMISSION_FIELDS: &[&str] = &[
+    "src/admin/backup.rs:RestorePayload.api_specs",
+    "src/config/gateway_trust.rs:GatewayTrustBundleRecord.bundle",
+    "src/config/plugin_trigger.rs:PluginTrigger.when",
+    "src/config/plugin_trigger.rs:PluginTriggerFieldMatch.value",
+    "src/config/plugin_trigger.rs:PluginTriggerIdentityMatch.value",
+    "src/config/plugin_trigger.rs:PluginTriggerMatch.consumer",
+    "src/config/plugin_trigger.rs:PluginTriggerMatch.cookie",
+    "src/config/plugin_trigger.rs:PluginTriggerMatch.header",
+    "src/config/plugin_trigger.rs:PluginTriggerMatch.host",
+    "src/config/plugin_trigger.rs:PluginTriggerMatch.path",
+    "src/config/plugin_trigger.rs:PluginTriggerMatch.query",
+    "src/config/plugin_trigger.rs:PluginTriggerMatch.sni",
+    "src/config/plugin_trigger.rs:PluginTriggerMatch.spiffe_id",
+    "src/config/plugin_trigger.rs:PluginTriggerNode.match_",
+    "src/config/plugin_trigger.rs:PluginTriggerNode.not",
+    "src/config/types.rs:GatewayConfig.mesh",
+    "src/config/types.rs:GatewayConfig.trust_bundles",
+    "src/config/types.rs:HealthCheckConfig.active",
+    "src/config/types.rs:HealthCheckConfig.passive",
+    "src/config/types.rs:PluginConfig.trigger",
+    "src/config/types.rs:Proxy.circuit_breaker",
+    "src/config/types.rs:Proxy.retry",
+    "src/config/types.rs:Proxy.stream_match",
+    "src/config/types.rs:ServiceDiscoveryConfig.consul",
+    "src/config/types.rs:ServiceDiscoveryConfig.dns_sd",
+    "src/config/types.rs:ServiceDiscoveryConfig.kubernetes",
+    "src/config/types.rs:ServiceDiscoveryConfig.mesh",
+    "src/config/types.rs:SubsetDefinition.traffic_policy",
+    "src/config/types.rs:SubsetTrafficPolicy.passive_health_check",
+    "src/config/types.rs:SubsetTrafficPolicy.tls",
+    "src/config/types.rs:Upstream.hash_on_cookie_config",
+    "src/config/types.rs:Upstream.health_checks",
+    "src/config/types.rs:Upstream.locality_lb_setting",
+    "src/config/types.rs:Upstream.service_discovery",
+    "src/config/types.rs:UpstreamPortOverride.locality_lb_setting",
+    "src/config/types.rs:UpstreamPortOverride.passive_health_check",
+    "src/config/types.rs:UpstreamPortOverride.tcp_keepalive",
+    "src/config/types.rs:UpstreamPortOverride.tls",
+    "src/modes/mesh/config.rs:MeshAccessLoggingConfig.filter",
+    "src/modes/mesh/config.rs:MeshConfig.multi_cluster",
+    "src/modes/mesh/config.rs:MeshConfig.trust_bundles",
+    "src/modes/mesh/config.rs:MeshDestinationRule.traffic_policy",
+    "src/modes/mesh/config.rs:MeshExtAuthzProvider.include_request_body_in_check",
+    "src/modes/mesh/config.rs:MeshRule.source_negation",
+    "src/modes/mesh/config.rs:MeshSidecar.workload_selector",
+    "src/modes/mesh/config.rs:MeshSubset.traffic_policy",
+    "src/modes/mesh/config.rs:MeshTelemetryConfig.access_logging",
+    "src/modes/mesh/config.rs:MeshTelemetryConfig.metrics",
+    "src/modes/mesh/config.rs:MeshTelemetryConfig.tracing",
+    "src/modes/mesh/config.rs:MeshTelemetryResource.config",
+    "src/modes/mesh/config.rs:MeshTrafficPolicy.connection_pool_http",
+    "src/modes/mesh/config.rs:MeshTrafficPolicy.locality_lb_setting",
+    "src/modes/mesh/config.rs:MeshTrafficPolicy.outlier_detection",
+    "src/modes/mesh/config.rs:MeshTrafficPolicy.tcp_keepalive",
+    "src/modes/mesh/config.rs:MeshTrafficPolicy.tls",
+    "src/modes/mesh/config.rs:MeshVirtualServiceCorsPolicy.cors",
+    "src/modes/mesh/config.rs:PeerAuthentication.selector",
+    "src/modes/mesh/config.rs:PolicyScope.selector",
+    "src/modes/mesh/config.rs:ServiceEntry.workload_selector",
+    "src/modes/mesh/config.rs:TrustBundleSet.local",
+    "src/modes/mesh/config.rs:Workload.node_waypoint",
+    "src/modes/mesh/config.rs:Workload.selector",
+    "src/modes/mesh/config_consumer/file_source.rs:MeshFileDocument.mesh",
+    "src/modes/mesh/slice.rs:MeshSlice.multi_cluster",
+    "src/modes/mesh/slice.rs:MeshSlice.revision",
+    "src/modes/mesh/slice.rs:MeshSlice.runtime_overlay",
+    "src/modes/mesh/slice.rs:MeshSlice.sidecar_egress_scope",
+    "src/modes/mesh/slice.rs:MeshSlice.trust_bundles",
+    "src/plugins/api_chargeback_sink.rs:ApiChargebackSinkConfig.batch",
+    "src/plugins/api_chargeback_sink.rs:ApiChargebackSinkConfig.clickhouse",
+    "src/plugins/api_chargeback_sink.rs:ApiChargebackSinkConfig.retry",
+    "src/plugins/api_chargeback_sink.rs:ApiChargebackSinkConfig.snapshot",
+    "src/plugins/api_chargeback_sink.rs:ApiChargebackSinkConfig.spool",
+    "src/plugins/api_chargeback_sink.rs:ClickHouseConfig.tls",
+    "src/plugins/mesh_route_dispatch.rs:FaultActionConfig.abort",
+    "src/plugins/mesh_route_dispatch.rs:FaultActionConfig.delay",
+    "src/plugins/mesh_route_dispatch.rs:RouteDestination.backend_tls",
+    "src/plugins/mesh_route_dispatch.rs:RouteRule.destination",
+    "src/plugins/mesh_route_dispatch.rs:RouteRule.fault",
+    "src/plugins/mesh_route_dispatch.rs:RouteRule.match_",
+    "src/plugins/mesh_route_dispatch.rs:RouteRule.redirect",
+    "src/plugins/mesh_route_dispatch.rs:RouteRule.retry",
+    "src/plugins/mesh_route_dispatch.rs:RouteRule.rewrite",
+];
+
+/// Strip comments before interpreting attributes so a comment mentioning a
+/// guard or `serde(skip)` can never satisfy the invariant.
+fn admission_source_without_line_comments(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn every_nested_admin_struct_field_has_an_object_admission_decision() {
+    // Named structs are the serde shape that accepts positional sequences.
+    // Include definitions outside the admission modules, so an imported or
+    // fully qualified struct cannot evade the inventory.
+    let declaration =
+        regex::Regex::new(r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?struct\s+(\w+)[^{;\n]*\{").unwrap();
+    let items = regex::Regex::new(concat!(
+        r"(?m)^([ \t]*)#\[derive\(([^)]*)\)\]\s*",
+        r"(?:#\[[^\]]*\]\s*)*",
+        r"(?:pub(?:\([^)]*\))?\s+)?(struct|enum)\s+(\w+)[^{;]*\{",
+    ))
+    .unwrap();
+    let fields = regex::Regex::new(concat!(
+        r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?",
+        r"([a-z_]\w*)\s*:\s*([^,]+),",
+    ))
+    .unwrap();
+    let skip = regex::Regex::new(r"\bskip(?:_deserializing)?\b").unwrap();
+    let field_attributes = regex::Regex::new(r"(?:#\[[^\]]*\]\s*)+$").unwrap();
+    let newtype_variants = regex::Regex::new(concat!(
+        r"(?m)^[ \t]*([A-Z]\w*)\(\s*",
+        r"((?:#\[[^\]]*\]\s*)*)([\w:]+)\s*,?\s*\)",
+    ))
+    .unwrap();
+    let sources = production_sources();
+    let struct_names: BTreeSet<String> = sources
+        .iter()
+        .flat_map(|(_, text)| {
+            declaration
+                .captures_iter(text)
+                .map(|item| item[1].to_string())
+        })
+        .collect();
+    let mut checked = BTreeSet::new();
+    let mut exceptions_seen = BTreeSet::new();
+
+    for (path, text) in &sources {
+        if !object_admission_source(path) {
+            continue;
+        }
+        let text = admission_source_without_line_comments(text);
+        for item in items.captures_iter(&text) {
+            if !item[2]
+                .split(',')
+                .any(|derive| derive.trim().rsplit("::").next() == Some("Deserialize"))
+            {
+                continue;
+            }
+            let resource = &item[4];
+            let body = &text[item.get(0).unwrap().end()..];
+            let terminator = format!("\n{}}}", &item[1]);
+            let body = &body[..body.find(&terminator).unwrap_or_else(|| {
+                panic!("{path}: {resource} must have a terminated declaration")
+            })];
+            let mut previous_field_end = 0;
+            for field in fields.captures_iter(body) {
+                let span = field.get(0).unwrap();
+                let attributes = field_attributes
+                    .find(&body[previous_field_end..span.start()])
+                    .map_or("", |attributes| attributes.as_str());
+                previous_field_end = span.end();
+                let type_text: String = field[2].split_whitespace().collect();
+                let optional = type_text.starts_with("Option<");
+                let mut inner = type_text.as_str();
+                // Box is transparent to serde; Option<Box<Struct>> is just
+                // as vulnerable as Option<Struct>. Collections themselves
+                // have their own sequence/map wire contract.
+                for wrapper in ["Option<", "Box<"] {
+                    if let Some(wrapped) = inner.strip_prefix(wrapper) {
+                        inner = wrapped.strip_suffix('>').unwrap_or(wrapped);
+                    }
+                }
+                let name = inner.rsplit("::").next().unwrap_or(inner);
+                if inner.contains(['<', '>', '&'])
+                    || !struct_names.contains(name)
+                    || skip.is_match(attributes)
+                {
+                    continue;
+                }
+                if name == "SpiffeId" {
+                    // SpiffeId is a hand-written string deserializer, not
+                    // a derived struct visitor (TrustDomain is likewise a
+                    // string newtype and has no named-field declaration).
+                    assert!(
+                        source("src/identity/spiffe/id.rs")
+                            .contains("let raw = String::deserialize(de)?;")
+                    );
+                    continue;
+                }
+                let field_name = &field[1];
+                let key = format!("{path}:{resource}.{field_name}");
+                if let Some((_, _, _, reason)) = OBJECT_ADMISSION_EXCEPTIONS.iter().find(
+                    |(exception_path, exception_resource, exception_field, _)| {
+                        *exception_path == path.as_str()
+                            && *exception_resource == resource
+                            && *exception_field == field_name
+                    },
+                ) {
+                    assert!(!reason.trim().is_empty(), "{key}: justify the exception");
+                    exceptions_seen.insert(key);
+                    continue;
+                }
+                let helper = if optional {
+                    "json_object::deserialize_optional_object"
+                } else {
+                    "json_object::deserialize_object"
+                };
+                let adapter = match (path.as_str(), resource, field_name) {
+                    ("src/plugins/mesh_route_dispatch.rs", "RouteRule", "retry") => {
+                        Some("deserialize_route_retry")
+                    }
+                    ("src/plugins/mesh_route_dispatch.rs", "RouteDestination", "backend_tls") => {
+                        Some("deserialize_route_backend_tls")
+                    }
+                    _ => None,
+                };
+                if let Some(adapter) = adapter {
+                    assert!(
+                        attributes.contains(adapter),
+                        "{key}: retain the wire adapter"
+                    );
+                    let signature = format!("fn {adapter}<'de, D>(");
+                    assert!(
+                        item_body(&text, &signature, "\n}").contains(helper),
+                        "{key}: the wire adapter must reject positional arrays"
+                    );
+                } else {
+                    assert!(
+                        attributes.contains(helper),
+                        "{key} ({type_text}) must use {helper}, or have a field-specific \
+                         exception with proof of earlier rejection (issue #5557)"
+                    );
+                }
+                checked.insert(key);
+            }
+            if &item[3] == "enum" {
+                for variant in newtype_variants.captures_iter(body) {
+                    let name = variant[3].rsplit("::").next().unwrap();
+                    if struct_names.contains(name) {
+                        let key = format!("{path}:{resource}.{}", &variant[1]);
+                        if let Some((_, _, _, reason)) = OBJECT_ADMISSION_EXCEPTIONS.iter().find(
+                            |(exception_path, exception_resource, exception_variant, _)| {
+                                *exception_path == path.as_str()
+                                    && *exception_resource == resource
+                                    && *exception_variant == &variant[1]
+                            },
+                        ) {
+                            assert!(!reason.trim().is_empty(), "{key}: justify the exception");
+                            exceptions_seen.insert(key);
+                            continue;
+                        }
+                        assert!(
+                            variant[2].contains("json_object::deserialize_object"),
+                            "{path}:{resource}::{} must reject a positional struct payload",
+                            &variant[1]
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let missing: Vec<_> = EXPECTED_OBJECT_ADMISSION_FIELDS
+        .iter()
+        .copied()
+        .filter(|key| !checked.contains(*key))
+        .collect();
+    assert!(
+        checked.len() >= 65 && missing.is_empty(),
+        "the admission inventory must not silently shrink: checked {} fields \
+         (minimum 65), expected {} baseline keys, missing: {missing:?}",
+        checked.len(),
+        EXPECTED_OBJECT_ADMISSION_FIELDS.len()
+    );
+    assert_eq!(
+        exceptions_seen,
+        OBJECT_ADMISSION_EXCEPTIONS
+            .iter()
+            .map(|(path, resource, field, _)| format!("{path}:{resource}.{field}"))
+            .collect(),
+        "remove stale admission exceptions"
+    );
+}
+
+fn assert_nested_array_error<T: serde::de::DeserializeOwned>(
+    body: &serde_json::Value,
+    pointer: &str,
+) {
+    for array in [json!([]), json!([{}]), json!([null, {}, 1])] {
+        let mut malformed = body.clone();
+        *malformed.pointer_mut(pointer).expect("test field exists") = array;
+        let bytes = serde_json::to_vec(&malformed).unwrap();
+        let error = match serde_json::from_slice::<T>(&bytes) {
+            Ok(_) => panic!("{pointer} accepted a positional array: {malformed}"),
+            Err(error) => error,
+        };
+        assert!(error.is_data(), "{pointer}: {error}");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid type: sequence, expected a JSON object"),
+            "{pointer} must use the #5555 object-only error shape: {error}"
+        );
+    }
+    assert!(serde_json::from_value::<T>(body.clone()).is_ok());
+}
+
+#[test]
+fn port_policy_objects_reject_arrays_without_changing_values_or_defaults() {
+    use ferrum_edge::config::types::UpstreamPortOverride;
+
+    let body = json!({
+        "locality_lb_setting": {"enabled": false},
+        "passive_health_check": {"unhealthy_threshold": 7},
+        "tcp_keepalive": {"time_seconds": 31},
+        "tls": {"verify_server_cert": false},
+    });
+    for field in [
+        "locality_lb_setting",
+        "passive_health_check",
+        "tcp_keepalive",
+        "tls",
+    ] {
+        assert_nested_array_error::<UpstreamPortOverride>(&body, &format!("/{field}"));
+        let mut null = body.clone();
+        null[field] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<UpstreamPortOverride>(null).is_ok());
+    }
+    assert!(serde_json::from_value::<UpstreamPortOverride>(json!({})).is_ok());
+    let parsed: UpstreamPortOverride = serde_json::from_value(body).unwrap();
+    assert_eq!(parsed.tcp_keepalive.unwrap().time_seconds, Some(31));
+    assert!(!parsed.tls.unwrap().verify_server_cert);
+}
+
+#[test]
+fn upstream_health_discovery_and_subset_objects_reject_arrays() {
+    use ferrum_edge::config::types::Upstream;
+
+    let body = json!({
+        "id": "nested-shapes",
+        "targets": [],
+        "health_checks": {"active": {}, "passive": {}},
+        "service_discovery": {
+            "provider": "dns_sd",
+            "dns_sd": {"service_name": "backend.example"},
+            "kubernetes": {"service_name": "backend"},
+            "consul": {"address": "http://localhost:8500", "service_name": "backend"},
+            "mesh": {"service_name": "backend"},
+        },
+        "subsets": [{
+            "name": "stable", "labels": {},
+            "traffic_policy": {"passive_health_check": {}, "tls": {"mode": "strict"}},
+        }],
+    });
+    for pointer in [
+        "/health_checks/active",
+        "/health_checks/passive",
+        "/service_discovery/dns_sd",
+        "/service_discovery/kubernetes",
+        "/service_discovery/consul",
+        "/service_discovery/mesh",
+        "/subsets/0/traffic_policy",
+        "/subsets/0/traffic_policy/passive_health_check",
+        "/subsets/0/traffic_policy/tls",
+    ] {
+        assert_nested_array_error::<Upstream>(&body, pointer);
+        let mut null = body.clone();
+        *null.pointer_mut(pointer).unwrap() = serde_json::Value::Null;
+        assert!(serde_json::from_value::<Upstream>(null).is_ok());
+    }
+}
+
+#[test]
+fn boxed_trigger_nodes_and_leaf_objects_reject_arrays() {
+    use ferrum_edge::config::plugin_trigger::PluginTrigger;
+
+    let body = json!({"when": {"not": {"match": {
+        "header": {
+            "name": "x-test", "presence": "present", "multi_value": "any",
+            "value": {"exact": ["ok"]},
+        },
+    }}}});
+    for pointer in [
+        "/when",
+        "/when/not",
+        "/when/not/match",
+        "/when/not/match/header",
+        "/when/not/match/header/value",
+    ] {
+        assert_nested_array_error::<PluginTrigger>(&body, pointer);
+    }
+    let parsed: PluginTrigger = serde_json::from_value(body.clone()).unwrap();
+    parsed.validate().unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), body);
+}
+
+#[test]
+fn gateway_trust_and_mesh_telemetry_objects_reject_arrays() {
+    use ferrum_edge::config::gateway_trust::GatewayTrustBundleRecord;
+    use ferrum_edge::modes::mesh::config::MeshTelemetryConfig;
+
+    // Shape-only fixtures: parsing does not attempt certificate admission.
+    let body = json!({"bundle": {"local": {
+        "trust_domain": "example.org", "x509_authorities": [], "jwt_authorities": [],
+    }}});
+    assert_nested_array_error::<GatewayTrustBundleRecord>(&body, "/bundle");
+    assert_nested_array_error::<GatewayTrustBundleRecord>(&body, "/bundle/local");
+
+    let body = json!({"tracing": {}, "metrics": {}, "access_logging": {"filter": {}}});
+    for pointer in [
+        "/tracing",
+        "/metrics",
+        "/access_logging",
+        "/access_logging/filter",
+    ] {
+        assert_nested_array_error::<MeshTelemetryConfig>(&body, pointer);
+        let mut null = body.clone();
+        *null.pointer_mut(pointer).unwrap() = serde_json::Value::Null;
+        assert!(serde_json::from_value::<MeshTelemetryConfig>(null).is_ok());
+    }
+    assert!(serde_json::from_value::<MeshTelemetryConfig>(json!({})).is_ok());
+}
+
+#[test]
+fn plugin_wire_objects_reject_arrays_before_construction() {
+    use ferrum_edge::plugins::api_chargeback_sink::ApiChargebackSinkConfig;
+    use ferrum_edge::plugins::mesh_route_dispatch::RouteRule;
+
+    let body = json!({
+        "match": {}, "destination": {"backend_tls": {}},
+        "retry": {"backoff": {"fixed": {"delay_ms": 2}}},
+        "fault": {"delay": {"percentage": 1.0, "duration_ms": 2},
+                  "abort": {"percentage": 1.0, "status_code": 503}},
+        "rewrite": {}, "redirect": {},
+    });
+    for pointer in [
+        "/match",
+        "/destination",
+        "/destination/backend_tls",
+        "/retry",
+        "/retry/backoff/fixed",
+        "/fault",
+        "/fault/delay",
+        "/fault/abort",
+        "/rewrite",
+        "/redirect",
+    ] {
+        assert_nested_array_error::<RouteRule>(&body, pointer);
+    }
+    let body = json!({
+        "clickhouse": {"tls": {}}, "batch": {}, "retry": {}, "spool": {}, "snapshot": {},
+    });
+    for pointer in [
+        "/clickhouse",
+        "/clickhouse/tls",
+        "/batch",
+        "/retry",
+        "/spool",
+        "/snapshot",
+    ] {
+        assert_nested_array_error::<ApiChargebackSinkConfig>(&body, pointer);
+    }
+    assert!(serde_json::from_value::<ApiChargebackSinkConfig>(json!({})).is_ok());
+}
+
+#[test]
+fn api_spec_restore_section_requires_an_object_and_preserves_absence() {
+    use ferrum_edge::_test_support::restore_envelope_admits_for_test;
+
+    for rejected in [json!([]), json!(["1", []]), json!([{}])] {
+        let body = json!({"api_specs": rejected});
+        assert!(!restore_envelope_admits_for_test(
+            &serde_json::to_vec(&body).unwrap()
+        ));
+    }
+    for accepted in [
+        json!({}),
+        json!({"api_specs": null}),
+        json!({"api_specs": {"section_version": "1", "items": []}}),
+    ] {
+        assert!(restore_envelope_admits_for_test(
+            &serde_json::to_vec(&accepted).unwrap()
+        ));
+    }
+}
+
+#[test]
+fn mesh_json_file_document_and_mesh_section_require_objects() {
+    use ferrum_edge::modes::mesh::config_consumer::file_source::read_mesh_config_document;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mesh.json");
+    for rejected in [
+        json!({"mesh": []}),
+        json!({"mesh": [{}]}),
+        json!([]),
+        json!([null, []]),
+        json!([null, {}]),
+    ] {
+        std::fs::write(&path, serde_json::to_vec(&rejected).unwrap()).unwrap();
+        let error = read_mesh_config_document(&path)
+            .expect_err("a mesh document and its mesh section must be objects")
+            .to_string();
+        assert!(
+            error.contains("invalid mesh configuration document"),
+            "{error}"
+        );
+        assert!(
+            error.contains("invalid type: sequence, expected a JSON object"),
+            "{error}"
+        );
+    }
+
+    std::fs::write(&path, br#"{"mesh": {}}"#).unwrap();
+    let mesh = read_mesh_config_document(&path).expect("an empty mesh object remains valid");
+    assert!(mesh.mesh_policies.is_empty());
+    assert!(mesh.peer_authentications.is_empty());
+    assert!(mesh.trust_bundles.is_none());
+}
+
+#[test]
+fn mesh_config_updates_reject_positional_slice_roots() {
+    use ferrum_edge::grpc::proto::{MeshConfigUpdate, MeshSubscribeRequest};
+    use ferrum_edge::modes::mesh::config_consumer::update_validation::{
+        MeshUpdateConsumer, MeshUpdateExpectation, MeshUpdateRejectReason,
+        validate_mesh_config_update,
+    };
+    use ferrum_edge::modes::mesh::slice::MeshSlice;
+
+    let request = MeshSubscribeRequest {
+        node_id: "object-admission-node".to_string(),
+        namespace: "object-admission".to_string(),
+        ..Default::default()
+    };
+    let expected = MeshUpdateExpectation::from_subscribe_request(&request);
+    // Supply every positional field through the required version; remaining
+    // fields have serde defaults. An empty array alone already failed before
+    // the root guard and would not catch this regression.
+    let positional = json!([
+        request.node_id,
+        request.namespace,
+        "",
+        null,
+        null,
+        null,
+        [],
+        {},
+        false,
+        [],
+        [],
+        "v1",
+    ]);
+    let slice: MeshSlice = serde_json::from_value(positional.clone())
+        .expect("the fixture must exercise serde's positional struct representation");
+    let mut update = MeshConfigUpdate {
+        version: slice.version.clone(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        ..Default::default()
+    };
+    for consumer in [
+        MeshUpdateConsumer::Native,
+        MeshUpdateConsumer::RemoteDiscovery,
+    ] {
+        update.mesh_slice_json = serde_json::to_string(&positional).unwrap();
+        let rejection = validate_mesh_config_update(&update, &expected, consumer)
+            .expect_err("a positional slice must fail JSON admission");
+        assert_eq!(rejection.reason(), MeshUpdateRejectReason::InvalidSliceJson);
+        assert!(!rejection.terminates_stream());
+        assert!(
+            rejection
+                .detail()
+                .contains("invalid type: sequence, expected a JSON object"),
+            "{rejection}"
+        );
+
+        update.mesh_slice_json = serde_json::to_string(&slice).unwrap();
+        assert!(validate_mesh_config_update(&update, &expected, consumer).is_ok());
+    }
+}
+
+#[test]
+fn typed_plugin_config_value_boundaries_require_objects() {
+    use ferrum_edge::plugins::mesh::authz::MeshAuthz;
+    use ferrum_edge::plugins::mesh::outbound_registry::OutboundRegistry;
+    use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
+    use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
+
+    for rejected in [json!([]), json!([[], false])] {
+        let route_error = MeshRouteDispatchConfig::from_value(&rejected).unwrap_err();
+        assert!(route_error.contains("invalid type: sequence, expected a JSON object"));
+        let registry_error = match OutboundRegistry::new(&rejected) {
+            Ok(_) => panic!("mesh_outbound_registry accepted a positional config"),
+            Err(error) => error,
+        };
+        assert!(registry_error.contains("invalid type: sequence, expected a JSON object"));
+    }
+    assert!(MeshRouteDispatchConfig::from_value(&json!({})).is_ok());
+    assert!(OutboundRegistry::new(&json!({})).is_ok());
+
+    let authz_error = match MeshAuthz::new(&json!({"mesh_slice": []})) {
+        Ok(_) => panic!("mesh_authz accepted a positional mesh_slice"),
+        Err(error) => error,
+    };
+    assert!(
+        authz_error.contains("invalid type: sequence, expected a JSON object"),
+        "{authz_error}"
+    );
+    let metrics_error = match WorkloadMetrics::new(&json!({"direction_emit": []})) {
+        Ok(_) => panic!("workload_metrics accepted a positional direction_emit"),
+        Err(error) => error,
+    };
+    assert!(
+        metrics_error.contains("invalid type: sequence, expected a JSON object"),
+        "{metrics_error}"
+    );
+}
+
+#[test]
+fn plugin_structs_behind_raw_json_values_retain_object_admission() {
+    for (path, signature, terminator, guarded_type) in [
+        (
+            "src/plugins/mesh_route_dispatch.rs",
+            "pub fn from_value(config: &Value)",
+            "\n    }",
+            "json_object::JsonObject<Self>",
+        ),
+        (
+            "src/plugins/mesh/outbound_registry.rs",
+            "pub fn new(config: &Value)",
+            "\n    }",
+            "JsonObject<OutboundRegistryConfig>",
+        ),
+        (
+            // `MeshAuthz::new` only forwards; the slice is parsed in
+            // `new_with_http_client`, so the guard must read that body.
+            "src/plugins/mesh/authz.rs",
+            "pub fn new_with_http_client(",
+            "\n    }",
+            "json_object::JsonObject<MeshSlice>",
+        ),
+        (
+            "src/plugins/mesh/workload_metrics.rs",
+            "fn parse_direction_emit(config: &Value)",
+            "\n}",
+            "json_object::JsonObject<DirectionEmit>",
+        ),
+        (
+            "src/modes/mesh/mod.rs",
+            "fn mesh_authz_config_policies(config: &serde_json::Value)",
+            "\n}",
+            "json_object::JsonObject<MeshSlice>",
+        ),
+    ] {
+        let text = admission_source_without_line_comments(&source(path));
+        assert!(
+            item_body(&text, signature, terminator).contains(guarded_type),
+            "{path}: raw JSON must pass the object guard before typed plugin parsing"
+        );
+    }
+}
