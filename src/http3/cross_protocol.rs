@@ -7924,6 +7924,75 @@ where
     }
 }
 
+/// Same output as [`BoxedPlainDispatchFuture`], named for the streaming gRPC
+/// dispatcher so the two boxing factories stay legible side by side.
+type BoxedGrpcStreamingDispatchFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = PlainDispatchResult> + Send + 'a>>;
+
+/// Construct the streaming gRPC bridge dispatcher out of line and keep its
+/// concrete coroutine on the heap.
+///
+/// Same stack-budget invariant as [`boxed_dispatch_plain`], one level up:
+/// [`dispatch_grpc_streaming`] is awaited directly in `handle_h3_request`, the
+/// ONE generic H3 request future every stream is polled through, so at
+/// `opt-level = 0` its split-stream upload pump, channel-backed body, and
+/// response relay occupy a fixed frame slot on every H3 request — including the
+/// Plain-over-mesh-mTLS dispatch that never reaches it.
+///
+/// The thin `async move` trampoline is intentional for the same reason it is in
+/// [`boxed_dispatch_plain`]: `Box::pin(dispatch_grpc_streaming(..))` would still
+/// materialize the concrete future as a stack temporary in this factory.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+pub(crate) fn boxed_dispatch_grpc_streaming<'a>(
+    state: &'a ProxyState,
+    epoch: &'a RequestEpoch,
+    proxy: &'a Proxy,
+    stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    method: &'a str,
+    proxy_headers: &'a HashMap<String, String>,
+    backend_url: &'a str,
+    upstream_target: Option<&'a UpstreamTarget>,
+    upstream_balancer: Option<&'a Arc<LoadBalancer>>,
+    cb_target_key: Option<&'a str>,
+    cb_probe: &'a crate::proxy::HalfOpenProbeGuard,
+    client_ip: &'a str,
+    xff_append_ip: &'a str,
+    backend_start: Instant,
+    ctx: &'a mut RequestContext,
+    plugins: &'a [Arc<dyn Plugin>],
+    initial_response_header_policy_plugins: &'a [Arc<dyn Plugin>],
+    backend_admission_plugins: &'a [Arc<dyn Plugin>],
+    sticky_cookie_needed: bool,
+    response_trailer_governance: ResponseTrailerGovernance<'a>,
+) -> BoxedGrpcStreamingDispatchFuture<'a> {
+    Box::pin(async move {
+        dispatch_grpc_streaming(
+            state,
+            epoch,
+            proxy,
+            stream,
+            method,
+            proxy_headers,
+            backend_url,
+            upstream_target,
+            upstream_balancer,
+            cb_target_key,
+            cb_probe,
+            client_ip,
+            xff_append_ip,
+            backend_start,
+            ctx,
+            plugins,
+            initial_response_header_policy_plugins,
+            backend_admission_plugins,
+            sticky_cookie_needed,
+            response_trailer_governance,
+        )
+        .await
+    })
+}
+
 /// HTTP/3 → non-H3 gRPC backend with a STREAMING request body.
 ///
 /// The streaming-safe counterpart to [`dispatch_grpc`] (which buffers the H3
