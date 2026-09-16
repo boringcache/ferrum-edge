@@ -38,7 +38,10 @@ use ferrum_edge::plugins::{
 };
 use ferrum_edge::proxy::ProxyBody;
 use ferrum_edge::proxy::body::ProxyBodyError;
-use ferrum_edge::proxy::deferred_log::{BodyOutcome, DeferredTransactionLogger};
+use ferrum_edge::proxy::deferred_log::{
+    BodyOutcome, DeferredTransactionLogger, native_grpc_request_protocol_is_grpc,
+    streaming_request_protocol_is_grpc,
+};
 use ferrum_edge::retry::ErrorClass;
 
 /// Bounded authorization-termination class carried in summary metadata.
@@ -670,8 +673,13 @@ async fn start_time_rederives_gateway_latency_from_backend_total_when_available(
     summary.latency_gateway_overhead_ms = 0.0;
     summary.response_streamed = false;
     let start_time = std::time::Instant::now();
-    let logger =
-        DeferredTransactionLogger::new_with_start_time(summary, plugins, make_ctx(), start_time);
+    let logger = DeferredTransactionLogger::new_with_start_time(
+        summary,
+        plugins,
+        make_ctx(),
+        start_time,
+        false,
+    );
 
     tokio::time::sleep(std::time::Duration::from_millis(45)).await;
     logger.fire(BodyOutcome::success(1));
@@ -709,8 +717,13 @@ async fn start_time_keeps_gateway_sentinel_when_streaming_backend_total_unknown(
     summary.latency_gateway_overhead_ms = -1.0;
     summary.response_streamed = true;
     let start_time = std::time::Instant::now();
-    let logger =
-        DeferredTransactionLogger::new_with_start_time(summary, plugins, make_ctx(), start_time);
+    let logger = DeferredTransactionLogger::new_with_start_time(
+        summary,
+        plugins,
+        make_ctx(),
+        start_time,
+        false,
+    );
 
     tokio::time::sleep(std::time::Duration::from_millis(45)).await;
     logger.fire(BodyOutcome::success(1));
@@ -1601,5 +1614,247 @@ async fn a_compact_terminal_on_a_streaming_body_classifies_like_the_summary_path
     assert_eq!(
         proxy_terminal_counts(global, &abandoned),
         vec![("body", ErrorClass::ClientDisconnect, 1)]
+    );
+}
+
+// ── Issue #5537: the streaming terminal projects log metadata exactly once ───
+//
+// The handler used to build `summary.metadata` with `clone_log_metadata` at
+// header commit and then throw it away: `fire_once` rebuilds the projection
+// from the finalized context before handing the summary to the sinks. The only
+// thing that header-commit copy was ever read for was the "is this a gRPC
+// terminal?" probe that decides whether a stream ending without a trailer
+// status is UNKNOWN rather than an unqualified 200, so the streaming arm now
+// captures that one fact and leaves the map empty. These tests pin that the
+// delivered record is unchanged either way.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deferred_terminal_projects_context_metadata_without_a_header_commit_copy() {
+    let (plugin, captured) = CapturingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let mut ctx = make_ctx();
+    ctx.metadata
+        .insert("request_protocol".to_string(), "http".to_string());
+    ctx.metadata
+        .insert("route_id".to_string(), "things".to_string());
+
+    // Exactly what the streaming arm now hands in: no header-commit projection.
+    let mut summary = make_summary_with_status(200);
+    summary.metadata = HashMap::new();
+
+    let logger = DeferredTransactionLogger::new_with_start_time(
+        summary,
+        plugins,
+        ctx,
+        std::time::Instant::now(),
+        false,
+    );
+    logger.fire(BodyOutcome::success(4096));
+
+    let captures = wait_for_captures(&captured, 1).await;
+    assert_eq!(captures.len(), 1, "log should fire exactly once");
+    let got = &captures[0];
+    assert_eq!(
+        got.metadata.get("request_protocol").map(String::as_str),
+        Some("http"),
+        "the fire-time projection carries the request's metadata"
+    );
+    assert_eq!(
+        got.metadata.get("route_id").map(String::as_str),
+        Some("things")
+    );
+    assert!(
+        !got.metadata.contains_key("grpc_status"),
+        "a non-gRPC terminal must not be stamped with a gRPC status"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deferred_grpc_terminal_without_trailer_status_is_unknown_with_empty_summary_metadata() {
+    let (plugin, captured) = CapturingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let mut ctx = make_ctx();
+    ctx.metadata
+        .insert("request_protocol".to_string(), "grpc".to_string());
+
+    let mut summary = make_summary_with_status(200);
+    summary.metadata = HashMap::new();
+
+    let logger = DeferredTransactionLogger::new_with_start_time(
+        summary,
+        plugins,
+        ctx,
+        std::time::Instant::now(),
+        true,
+    );
+    logger.fire(BodyOutcome::success(0));
+
+    let captures = wait_for_captures(&captured, 1).await;
+    assert_eq!(captures.len(), 1, "log should fire exactly once");
+    let got = &captures[0];
+    assert_eq!(
+        got.metadata.get("grpc_status").map(String::as_str),
+        Some("2"),
+        "a gRPC stream ending without a terminal status is UNKNOWN"
+    );
+    assert_eq!(got.grpc_status(), Some(2));
+    assert!(got.is_terminal_failure());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deferred_terminal_without_grpc_classification_leaves_status_unstamped() {
+    let (plugin, captured) = CapturingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let mut ctx = make_ctx();
+    // The request declared gRPC-Web, which the probe has never treated as a
+    // native gRPC terminal: the classification travels with the logger, so the
+    // empty summary projection cannot change the answer either way.
+    ctx.metadata
+        .insert("request_protocol".to_string(), "grpc-web".to_string());
+
+    let mut summary = make_summary_with_status(200);
+    summary.metadata = HashMap::new();
+
+    let logger = DeferredTransactionLogger::new_with_start_time(
+        summary,
+        plugins,
+        ctx,
+        std::time::Instant::now(),
+        false,
+    );
+    logger.fire(BodyOutcome::success(16));
+
+    let captures = wait_for_captures(&captured, 1).await;
+    assert_eq!(captures.len(), 1, "log should fire exactly once");
+    assert!(
+        !captures[0].metadata.contains_key("grpc_status"),
+        "a grpc-web terminal is not stamped with a native gRPC status"
+    );
+}
+
+// ── Issue #5537: the deferred terminal formats its rfc3339 timestamp at fire
+// ── time, not at header commit ───────────────────────────────────────────────
+//
+// `timestamp_received` is fixed when the request context is built and no sink
+// sees the summary before `fire_once` rebuilds it, so the streaming arms hand
+// the logger an EMPTY string and let the fire-time fill format it from the
+// context the logger owns. That one line is the only thing standing between a
+// streamed response and an empty `timestamp_received` on every sink — it is the
+// OTel span start, the Loki timestamp, and the `epoch_ms` source for
+// `transaction_log_schema` renames — so both halves are pinned here.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deferred_terminal_formats_rfc3339_timestamp_at_fire_time() {
+    let (plugin, captured) = CapturingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let ctx = make_ctx();
+    // The context owns the instant; the logger is about to own the context.
+    let expected = ctx.timestamp_received.to_rfc3339();
+
+    // Exactly what both streaming arms now hand in.
+    let mut summary = make_summary_with_status(200);
+    summary.timestamp_received = String::new();
+
+    let logger = DeferredTransactionLogger::new_with_start_time(
+        summary,
+        plugins,
+        ctx,
+        std::time::Instant::now(),
+        false,
+    );
+    logger.fire(BodyOutcome::success(1024));
+
+    let captures = wait_for_captures(&captured, 1).await;
+    assert_eq!(captures.len(), 1, "log should fire exactly once");
+    assert_eq!(
+        captures[0].timestamp_received, expected,
+        "the fire-time fill formats the context's own receipt instant"
+    );
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(&captures[0].timestamp_received).is_ok(),
+        "the delivered timestamp must be parseable rfc3339, not an empty string"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deferred_terminal_keeps_a_timestamp_its_caller_already_formatted() {
+    let (plugin, captured) = CapturingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let ctx = make_ctx();
+    let context_instant = ctx.timestamp_received.to_rfc3339();
+
+    // The gRPC body-exceeded arm and `DeferredTransactionLogger::new` still
+    // format eagerly; the fire-time fill must leave such a value alone.
+    let summary = make_summary_with_status(200);
+    let preformatted = summary.timestamp_received.clone();
+    assert_ne!(
+        preformatted, context_instant,
+        "fixture precondition: the caller's value differs from the context's"
+    );
+
+    let logger = DeferredTransactionLogger::new_with_start_time(
+        summary,
+        plugins,
+        ctx,
+        std::time::Instant::now(),
+        false,
+    );
+    logger.fire(BodyOutcome::success(1024));
+
+    let captures = wait_for_captures(&captured, 1).await;
+    assert_eq!(captures.len(), 1, "log should fire exactly once");
+    assert_eq!(
+        captures[0].timestamp_received, preformatted,
+        "a caller-formatted timestamp is preserved verbatim"
+    );
+}
+
+// ── Issue #5537: the two handler-side gRPC classifications ───────────────────
+//
+// `new_with_start_time` takes the classification as a parameter, and the two
+// production arms disagree on the absent-key case on purpose. Both derivations
+// are named helpers so the asymmetry is pinned in one place rather than
+// re-derived inline at two call sites 3,600 lines apart.
+
+#[test]
+fn streaming_classification_treats_an_absent_protocol_as_not_grpc() {
+    let empty = HashMap::new();
+    assert!(
+        !streaming_request_protocol_is_grpc(&empty),
+        "the generic streaming arm serves every HTTP-family response; an \
+         unlabelled one must not be stamped with a gRPC terminal status"
+    );
+
+    let mut grpc = HashMap::new();
+    grpc.insert("request_protocol".to_string(), "grpc".to_string());
+    assert!(streaming_request_protocol_is_grpc(&grpc));
+
+    let mut grpc_web = HashMap::new();
+    grpc_web.insert("request_protocol".to_string(), "grpc-web".to_string());
+    assert!(
+        !streaming_request_protocol_is_grpc(&grpc_web),
+        "another declared protocol is not a native gRPC terminal"
+    );
+}
+
+#[test]
+fn native_grpc_classification_treats_an_absent_protocol_as_grpc() {
+    let empty = HashMap::new();
+    assert!(
+        native_grpc_request_protocol_is_grpc(&empty),
+        "the native-gRPC arm's summary projection used to run through \
+         `entry(\"request_protocol\").or_insert(\"grpc\")`, so an absent key \
+         resolved to gRPC; a stream without trailers is UNKNOWN, not a 200"
+    );
+
+    let mut grpc = HashMap::new();
+    grpc.insert("request_protocol".to_string(), "grpc".to_string());
+    assert!(native_grpc_request_protocol_is_grpc(&grpc));
+
+    let mut grpc_web = HashMap::new();
+    grpc_web.insert("request_protocol".to_string(), "grpc-web".to_string());
+    assert!(
+        !native_grpc_request_protocol_is_grpc(&grpc_web),
+        "a request that declared another protocol keeps it"
     );
 }

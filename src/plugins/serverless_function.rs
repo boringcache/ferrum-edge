@@ -1090,9 +1090,12 @@ impl ServerlessFunction {
         failure: InvocationFailure,
     ) -> PluginResult {
         let result = self.failure_result(ctx, failure);
-        if !matches!(&result, PluginResult::Continue) {
-            ctx.serverless_pre_invocation_rejection_owners
-                .extend(ctx.request_deduplication_states.keys().copied());
+        if !matches!(&result, PluginResult::Continue)
+            && let Some(state) = ctx.plugin_state_opt_mut()
+        {
+            state
+                .serverless_pre_invocation_rejection_owners
+                .extend(state.request_deduplication_states.keys().copied());
         }
         result
     }
@@ -3167,8 +3170,11 @@ impl Plugin for ServerlessFunction {
                 "serverless_function: terminate mode does not support gRPC-Web requests — \
                  use native application/grpc or HTTP terminate"
             );
-            ctx.serverless_pre_invocation_rejection_owners
-                .extend(ctx.request_deduplication_states.keys().copied());
+            if let Some(state) = ctx.plugin_state_opt_mut() {
+                state
+                    .serverless_pre_invocation_rejection_owners
+                    .extend(state.request_deduplication_states.keys().copied());
+            }
             return PluginResult::Reject {
                 status_code: 500,
                 body: r#"{"error":"serverless_function terminate mode does not support gRPC-Web"}"#
@@ -3190,8 +3196,11 @@ impl Plugin for ServerlessFunction {
             // distinguish an attempted externally executing terminal response
             // from other synthetic short-circuits that must not be cached.
             // Set it only after all plugin-local fail-closed inspection passes.
-            ctx.serverless_external_side_effect_owners
-                .extend(ctx.request_deduplication_states.keys().copied());
+            if let Some(state) = ctx.plugin_state_opt_mut() {
+                state
+                    .serverless_external_side_effect_owners
+                    .extend(state.request_deduplication_states.keys().copied());
+            }
         }
 
         let (status, response_headers, body) = match self.invoke(&payload, ctx).await {
@@ -3202,9 +3211,12 @@ impl Plugin for ServerlessFunction {
                 // side-effect provenance and release the dedup marker like any
                 // other pre-invocation rejection, so an identical retry can
                 // proceed instead of being blocked/replayed until inflight_ttl.
-                let owners: Vec<u64> = ctx.request_deduplication_states.keys().copied().collect();
-                for owner in owners {
-                    ctx.serverless_external_side_effect_owners.remove(&owner);
+                if let Some(state) = ctx.plugin_state_opt_mut() {
+                    let owners: Vec<u64> =
+                        state.request_deduplication_states.keys().copied().collect();
+                    for owner in owners {
+                        state.serverless_external_side_effect_owners.remove(&owner);
+                    }
                 }
                 return self.pre_invocation_failure_result(ctx, failure);
             }

@@ -551,3 +551,231 @@ fn direct_headers_set_works_without_materialization() {
     ctx.headers.insert("x-test".into(), "value".into());
     assert_eq!(ctx.headers.get("x-test").unwrap(), "value");
 }
+
+// ── Issue #5537: per-plugin request state is allocated lazily ────────────────
+//
+// `RequestContext` used to inline every plugin family's staging collection, so
+// the plugin-free edge request built, moved, cloned, and dropped two dozen
+// hashers per request for state nothing on the proxy could ever read. The
+// collections now live in one `Option<Box<PluginRequestState>>`; these tests
+// pin both halves of that contract — the plugin-free path never materializes
+// the box, and a family that does stage something still projects identically
+// into transaction-log metadata.
+
+fn has_plugin_state(ctx: &RequestContext) -> bool {
+    ferrum_edge::_test_support::request_context_has_plugin_state(ctx)
+}
+
+#[test]
+fn plugin_free_request_context_never_materializes_plugin_state() {
+    let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/echo".into());
+    assert!(
+        !has_plugin_state(&ctx),
+        "a freshly constructed context must not allocate per-plugin state"
+    );
+
+    // Everything a plugin-free H1 POST actually does to its context: headers
+    // materialize, metadata is written, the terminal projects log metadata, and
+    // the context is cloned for a deferred consumer.
+    let mut raw = HeaderMap::new();
+    raw.insert("content-type", "application/octet-stream".parse().unwrap());
+    ctx.set_raw_headers(raw);
+    ctx.materialize_headers();
+    ctx.metadata
+        .insert("request_protocol".into(), "http".into());
+
+    let metadata = ferrum_edge::_test_support::clone_log_metadata(&ctx);
+    assert_eq!(
+        metadata.get("request_protocol").map(String::as_str),
+        Some("http")
+    );
+    let cloned = ctx.clone();
+    assert!(
+        !has_plugin_state(&cloned),
+        "cloning a plugin-free context must not allocate per-plugin state"
+    );
+    drop(cloned);
+    assert!(
+        !has_plugin_state(&ctx),
+        "no plugin-free read may materialize per-plugin state"
+    );
+}
+
+#[test]
+fn staged_waf_metadata_materializes_plugin_state_and_reaches_log_metadata() {
+    let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/echo".into());
+    ferrum_edge::_test_support::set_waf_metadata_for_test(&mut ctx, "waf.action", "monitored");
+    assert!(
+        has_plugin_state(&ctx),
+        "a staging plugin family materializes the boxed state"
+    );
+
+    let metadata = ferrum_edge::_test_support::clone_log_metadata(&ctx);
+    assert_eq!(
+        metadata.get("waf.action").map(String::as_str),
+        Some("monitored"),
+        "WAF-owned metadata still projects into the transaction log"
+    );
+
+    let cloned = ctx.clone();
+    assert_eq!(
+        ferrum_edge::_test_support::clone_log_metadata(&cloned),
+        metadata,
+        "a cloned context projects byte-identical log metadata"
+    );
+}
+
+#[test]
+fn absent_plugin_state_still_strips_unowned_waf_log_metadata() {
+    let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/echo".into());
+    // No `waf` instance ran, so nothing owns this field. The fail-closed strip
+    // must still happen with no per-plugin state allocated.
+    ctx.metadata.insert("waf.score".into(), "99".into());
+
+    let metadata = ferrum_edge::_test_support::clone_log_metadata(&ctx);
+    assert!(
+        !metadata.contains_key("waf.score"),
+        "an unowned waf.* field must never reach transaction logs"
+    );
+    assert!(
+        !has_plugin_state(&ctx),
+        "the strip must not materialize per-plugin state"
+    );
+}
+
+// ── Issue #5537: nothing may reach `plugin_state_mut()` on the plugin-free
+// ── request path ─────────────────────────────────────────────────────────────
+//
+// `plugin_free_request_context_never_materializes_plugin_state` above exercises
+// `RequestContext` in isolation: construct, materialize headers, project log
+// metadata, clone. That cannot catch a proxy-core or plugin-core caller that
+// starts reaching `plugin_state_mut()` once per request, which is the failure
+// this half of the contract actually has to survive. There is no in-process
+// fixture that drives a real plugin-free request through
+// `handle_proxy_request_inner` (it is a private future with no test entry
+// point, and the functional suites drive a spawned gateway subprocess whose
+// contexts are unreachable from the harness), so the guard is structural: every
+// `plugin_state_mut()` call site in `src/plugins/mod.rs` is enumerated below
+// with the gate that keeps it off the plugin-free path. Adding one fails this
+// test until its gate is named, the same way the `assert_markers_in_order`
+// source contracts pin control flow elsewhere in the suite.
+//
+// `plugin_state()` and `plugin_state_opt_mut()` never materialize, so they are
+// deliberately unconstrained.
+
+const PLUGINS_SOURCE: &str = include_str!("../../../src/plugins/mod.rs");
+
+const PLUGIN_STATE_MUT: &str = "plugin_state_mut()";
+
+/// `(enclosing method, in-method gate, why a plugin-free request never lands here)`.
+///
+/// A `None` gate means the method body is unconditional and the gate is at the
+/// caller: it runs only because that plugin family is configured on the proxy.
+const PLUGIN_STATE_MUT_CALL_SITES: &[(&str, Option<&str>, &str)] = &[
+    (
+        "adopt_final_request_body_hook_plugin_state",
+        Some("if self.plugin_state.is_none()"),
+        "the final-request-body hook adopt returns before materializing when \
+         the live context has no state and all four adopted families are empty",
+    ),
+    (
+        "stage_response_cache_request_header_delta",
+        Some("if delta.is_empty() {"),
+        "a configured `response_caching` instance stages a delta only when the \
+         backend-visible header map actually differs from the inbound one",
+    ),
+    (
+        "mark_query_credential_partition_digest",
+        None,
+        "reached only from `token_extract::mark_query_credential_metadata`, \
+         which runs for a configured query credential location and only when \
+         that parameter is actually present on the request",
+    ),
+    (
+        "set_waf_metadata",
+        None,
+        "a configured `waf` instance is the only writer of WAF-owned metadata",
+    ),
+    (
+        "accumulate_waf_instance_score",
+        Some("if contribution == 0"),
+        "a configured `waf` instance is the only scorer, and a never-seen zero \
+         contribution returns before materializing",
+    ),
+    (
+        "merge_waf_metadata",
+        Some("if value.is_empty() {"),
+        "a configured `waf` instance is the only writer, and an empty value \
+         returns before materializing",
+    ),
+];
+
+/// The name of the 4-space-indented `fn` this line declares, if it declares one.
+fn declared_method_name(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("    ")?;
+    if rest.starts_with(' ') {
+        return None;
+    }
+    let rest = rest.strip_prefix("pub(crate) ").unwrap_or(rest);
+    let rest = rest.strip_prefix("pub ").unwrap_or(rest);
+    let rest = rest.strip_prefix("async ").unwrap_or(rest);
+    let rest = rest.strip_prefix("fn ")?;
+    Some(rest.split(['(', '<']).next().unwrap_or(rest))
+}
+
+/// The method containing `offset`, as `(name, byte offset of its signature)`.
+fn enclosing_method(source: &str, offset: usize) -> (&str, usize) {
+    let mut enclosing = None;
+    let mut line_start = 0;
+    for line in source.split_inclusive('\n') {
+        if line_start >= offset {
+            break;
+        }
+        if let Some(name) = declared_method_name(line) {
+            enclosing = Some((name, line_start));
+        }
+        line_start += line.len();
+    }
+    enclosing.expect("every plugin_state_mut() call site sits inside a method")
+}
+
+#[test]
+fn every_plugin_state_mut_call_site_is_behind_a_documented_gate() {
+    let mut sites = Vec::new();
+    let mut offset = 0;
+    while let Some(relative) = PLUGINS_SOURCE[offset..].find(PLUGIN_STATE_MUT) {
+        let at = offset + relative;
+        offset = at + PLUGIN_STATE_MUT.len();
+        sites.push(enclosing_method(PLUGINS_SOURCE, at));
+    }
+
+    let found: Vec<&str> = sites.iter().map(|(name, _)| *name).collect();
+    let documented: Vec<&str> = PLUGIN_STATE_MUT_CALL_SITES
+        .iter()
+        .map(|(name, _, _)| *name)
+        .collect();
+    assert_eq!(
+        found, documented,
+        "every `plugin_state_mut()` call site in src/plugins/mod.rs must be \
+         listed in PLUGIN_STATE_MUT_CALL_SITES with the gate that keeps it off \
+         the plugin-free request path; a new one materializes the boxed state \
+         on every request that reaches it"
+    );
+
+    for ((name, signature_at), (_, gate, rationale)) in
+        sites.iter().zip(PLUGIN_STATE_MUT_CALL_SITES.iter())
+    {
+        let Some(gate) = gate else {
+            continue;
+        };
+        let call_at = PLUGINS_SOURCE[*signature_at..]
+            .find(PLUGIN_STATE_MUT)
+            .expect("the call site follows its own signature");
+        let body = &PLUGINS_SOURCE[*signature_at..*signature_at + call_at];
+        assert!(
+            body.contains(gate),
+            "{name} must keep its documented gate `{gate}` before it \
+             materializes per-plugin state ({rationale})"
+        );
+    }
+}

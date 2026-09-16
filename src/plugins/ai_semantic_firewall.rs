@@ -974,24 +974,34 @@ impl AiSemanticFirewall {
     }
 
     fn request_hash<'a>(&self, ctx: &'a RequestContext) -> Option<&'a str> {
-        ctx.ai_semantic_firewall_request_hashes
-            .get(&self.instance_id)
+        ctx.plugin_state()
+            .and_then(|state| {
+                state
+                    .ai_semantic_firewall_request_hashes
+                    .get(&self.instance_id)
+            })
             .map(String::as_str)
     }
 
     fn set_request_hash(&self, ctx: &mut RequestContext, hash: String) {
-        ctx.ai_semantic_firewall_request_hashes
+        ctx.plugin_state_mut()
+            .ai_semantic_firewall_request_hashes
             .insert(self.instance_id, hash);
     }
 
     fn response_hash<'a>(&self, ctx: &'a RequestContext) -> Option<&'a str> {
-        ctx.ai_semantic_firewall_response_hashes
-            .get(&self.instance_id)
+        ctx.plugin_state()
+            .and_then(|state| {
+                state
+                    .ai_semantic_firewall_response_hashes
+                    .get(&self.instance_id)
+            })
             .map(String::as_str)
     }
 
     fn set_response_hash(&self, ctx: &mut RequestContext, hash: String) {
-        ctx.ai_semantic_firewall_response_hashes
+        ctx.plugin_state_mut()
+            .ai_semantic_firewall_response_hashes
             .insert(self.instance_id, hash);
     }
 
