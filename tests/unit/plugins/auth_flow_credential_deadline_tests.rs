@@ -19,10 +19,17 @@
 //! property that actually matters and holds on either clock: the far-future
 //! credential is ADMITTED, with either no deadline or one far beyond any real
 //! session, never one that already elapsed.
+//!
+//! Issue #5521 added the other half of the same extraction contract: a
+//! NumericDate is a JSON *number* (RFC 7519 §2), so an ordinary fractional
+//! `exp` must bound the credential exactly like an integer one instead of
+//! landing in the "no bound" class above. The truncation direction is
+//! conservative per claim role — `exp` toward the past, `nbf`/`iat` toward the
+//! future — so the enforced window is never wider than the token states.
 
 use ferrum_edge::_test_support::{
     credential_deadline_from_claims_at_for_test, credential_deadline_from_unix_seconds_at_for_test,
-    request_credential_deadline_at,
+    numeric_date_seconds_for_test, request_credential_deadline_at,
 };
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::plugins::{Plugin, RequestContext, jwks_auth::JwksAuth, jwt_auth::JwtAuth};
@@ -313,5 +320,165 @@ async fn jwks_auth_still_publishes_a_representable_exp_as_a_deadline() {
     assert!(
         request_credential_deadline_at(&ctx).is_some(),
         "an ordinary expiry must still bound the authenticated stream"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Issue #5521: a fractional NumericDate is an ordinary valid `exp`
+// ────────────────────────────────────────────────────────────────────
+
+/// RFC 7519 §2 defines a NumericDate as a JSON number, so `exp: 1060.75` is
+/// conforming and the JWT layer validates it. Reading it as an integer only
+/// dropped the bound entirely, which left an already-admitted streaming
+/// request with no credential deadline at all.
+#[test]
+fn a_fractional_claims_expiry_still_bounds_the_credential() {
+    let now = tokio::time::Instant::now();
+    for exp in [json!(1_060.75), json!(1_060.25), json!(1_060.0)] {
+        let claims = json!({"sub": "alice", "exp": exp});
+        assert_eq!(
+            credential_deadline_from_claims_at_for_test(&claims, 0, 1_000, now),
+            Some(now + Duration::from_secs(60)),
+            "a fractional expiry truncates toward the past, never to no bound: {claims}"
+        );
+    }
+    assert_eq!(
+        credential_deadline_from_claims_at_for_test(
+            &json!({"sub": "alice", "exp": 1_060}),
+            0,
+            1_000,
+            now
+        ),
+        Some(now + Duration::from_secs(60)),
+        "the integer control is unchanged"
+    );
+    assert_eq!(
+        credential_deadline_from_claims_at_for_test(
+            &json!({"sub": "alice", "exp": 1_000.75}),
+            60,
+            1_000,
+            now
+        ),
+        Some(now + Duration::from_secs(60)),
+        "the configured leeway is still added to the truncated expiry"
+    );
+}
+
+/// The truncation direction is the conservative one for each claim role: an
+/// upper bound (`exp`) can only move toward the past and a lower bound
+/// (`nbf`/`iat`) only toward the future, so a fractional value never widens
+/// the window the token states.
+#[test]
+fn numeric_dates_truncate_toward_the_narrower_window() {
+    for (value, upper, lower) in [
+        (json!(1_060.75), Some(1_060), Some(1_061)),
+        (json!(1_060.25), Some(1_060), Some(1_061)),
+        (json!(1_060.0), Some(1_060), Some(1_060)),
+        (json!(1_060), Some(1_060), Some(1_060)),
+        (json!(-0.5), Some(-1), Some(0)),
+        (json!(0), Some(0), Some(0)),
+    ] {
+        assert_eq!(
+            numeric_date_seconds_for_test(&value, true),
+            upper,
+            "upper bound of {value}"
+        );
+        assert_eq!(
+            numeric_date_seconds_for_test(&value, false),
+            lower,
+            "lower bound of {value}"
+        );
+    }
+}
+
+/// Unchanged: a value that is not a number, or whose magnitude no `i64` can
+/// hold, publishes no bound. That is deliberately NOT an expiry — issue #5420
+/// settled that contract and issue #5521 only stops an ordinary fractional
+/// value from landing in this class.
+#[test]
+fn unrepresentable_and_non_numeric_dates_publish_no_bound() {
+    for value in [
+        json!("1060"),
+        json!(null),
+        json!(true),
+        json!([1_060]),
+        json!({"exp": 1_060}),
+        json!(u64::MAX),
+        json!(1e30),
+        json!(-1e30),
+    ] {
+        assert_eq!(
+            numeric_date_seconds_for_test(&value, true),
+            None,
+            "upper bound of {value}"
+        );
+        assert_eq!(
+            numeric_date_seconds_for_test(&value, false),
+            None,
+            "lower bound of {value}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn jwt_auth_publishes_a_fractional_exp_as_a_deadline() {
+    let plugin = JwtAuth::new(&json!({})).expect("default jwt_auth config");
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    let exp = chrono::Utc::now().timestamp() as f64 + 3_600.25;
+    let token = create_hs256_token(&json!({"sub": "testuser", "exp": exp}), "test-jwt-secret");
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {token}"));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert!(
+        request_credential_deadline_at(&ctx).is_some(),
+        "a conforming fractional expiry must bound the authenticated stream \
+         exactly like an integer one"
+    );
+}
+
+#[tokio::test]
+async fn jwks_auth_publishes_a_fractional_exp_as_a_deadline() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let inline_jwks = build_rsa_jwks_from_pem(public_key_pem).to_string();
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "issuer": "https://issuer.example.com",
+                "jwks": inline_jwks
+            }]
+        }),
+        default_client(),
+    )
+    .expect("inline JWKS provider");
+    plugin.warmup_jwks().await;
+
+    let exp = chrono::Utc::now().timestamp() as f64 + 3_600.25;
+    let token = create_rs256_token_exact(
+        &json!({
+            "iss": "https://issuer.example.com",
+            "sub": "fractional-user",
+            "exp": exp
+        }),
+        private_key_pem,
+    );
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {token}"));
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.authenticated_identity.as_deref(),
+        Some("fractional-user")
+    );
+    assert!(
+        request_credential_deadline_at(&ctx).is_some(),
+        "the JWKS path shares the same claim-expiry contract"
     );
 }

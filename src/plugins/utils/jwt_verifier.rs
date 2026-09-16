@@ -51,6 +51,29 @@ pub async fn verify_jwt_with_jwks(
     decode::<Value>(token, &cached_key.decoding_key, &validation)
         .ok()
         .map(|td| td.claims)
+        .filter(issuer_claim_is_single_string)
+}
+
+/// Re-check the registered `iss` claim's shape at Ferrum's verified-claims
+/// boundary.
+///
+/// RFC 7519 §4.1.1 defines `iss` as a single `StringOrURI`, so an array is not
+/// a token that legitimately claims several issuers — it is a malformed claim.
+/// `jsonwebtoken` nonetheless models a multi-valued issuer internally and
+/// matches by set INTERSECTION, so `["https://issuer", "https://attacker"]`
+/// satisfies an exactly configured `https://issuer` (issue #5522). Configuring
+/// several *accepted* issuers is an operator decision about which issuers this
+/// gateway trusts; it never licenses one token to claim more than one.
+///
+/// An absent claim is not this predicate's concern — presence is enforced
+/// through `required_spec_claims` by `build_validation` whenever an issuer is
+/// configured. Every other JSON shape (array, object, number, boolean, null)
+/// fails closed.
+pub fn issuer_claim_is_single_string(claims: &Value) -> bool {
+    match claims.get("iss") {
+        None => true,
+        Some(value) => value.is_string(),
+    }
 }
 
 /// Bind verification to the single trusted key named by the JWT header `kid`.

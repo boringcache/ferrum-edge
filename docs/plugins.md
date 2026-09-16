@@ -2591,6 +2591,8 @@ Unknown top-level, provider, and custom-header-location fields are rejected so m
 
 Remote discovery documents are capped at 128 KiB and JWKS responses at 1 MiB/256 keys, with bounded key components. A valid non-empty JWKS atomically replaces the key map, refreshes the monotonic trust deadline, clears failure state, and can restore authentication after expiry. Empty 200 responses, malformed or oversized bodies, non-2xx status, and transport/DNS/TLS/timeout failures retain last-known-good material only for the finite grace window and use a bounded accelerated retry cadence; after the deadline, verification refuses the retained material without deleting diagnostic/recovery state. JWKs are accepted for signature verification only when `use` is absent or `sig` and `key_ops` is absent or includes `verify`; contradictory operation metadata is rejected. The JWK `alg` parameter is honoured per RFC 7517 §4.4: a key that declares an `alg` is admitted only when that value names a supported signature algorithm for its key type — `RS256`/`RS384`/`RS512` for RSA, and `ES256`/`ES384` matching the key's `crv` for EC — and verification is then bound to exactly that algorithm. Keys declaring an encryption algorithm (`RSA-OAEP`, `RSA-OAEP-256`, `RSA1_5`), RSASSA-PSS (`PS256`/`PS384`/`PS512`), a key-agreement algorithm, or an `alg` that contradicts the curve are skipped as unsupported rather than silently treated as RS256/curve-derived verification keys. A key with no `alg` keeps the previous defaults (RS256 for RSA, curve-derived for EC). RSA signing keys must carry a modulus of at least 2048 bits; weaker keys are skipped rather than trusted. Signing keys without a non-empty `kid` are unusable, and a JWKS with duplicate usable `kid` values is rejected rather than choosing one by response order.
 
+Registered claims are validated for shape, not only for value. A present `iss` must be exactly one string (RFC 7519 §4.1.1); an array, object, number, boolean, or null `iss` is rejected with the same generic 401 even when one array element matches the configured issuer. Configuring an accepted issuer is a decision about which issuers this gateway trusts; it never lets one token claim several. `exp` and `nbf` are read as RFC 7519 §2 NumericDates — JSON numbers that may carry a fractional part — so a conforming fractional expiry bounds the authenticated stream exactly like an integer one instead of being read as "no expiry at all". Fractional seconds truncate conservatively (an expiry toward the past, a not-before toward the future), so the enforced window is never wider than the token states.
+
 JWT header `kid` is required and binding. A missing `kid`, an empty `kid`, or a `kid` that is not in the selected provider's current trusted JWKS is rejected with the same generic 401 (`{"error":"Invalid or unrecognized JWT"}`) as any other invalid token. There is no all-keys fallback: a known `kid` selects only that key, so a token signed by a different published key is still rejected. Ferrum never logs token data, key material, claims, or attacker-controlled `kid` values.
 
 A token naming a non-empty `kid` the trusted key set does not contain also triggers **at most one out-of-band JWKS fetch per `kid_miss_refresh_cooldown_seconds` window**, so an identity-provider key rotation recovers in seconds instead of waiting out `jwks_refresh_interval_secs`. The triggering request still fails closed — it never blocks on the fetch — and a later request verifies once the refreshed key set is published. A missing or empty `kid` triggers nothing, and the cooldown bounds tokens carrying random identifiers to one fetch per window. The out-of-band fetch is strictly additional: it never shortens the periodic refresh cadence or the empty-store retry backoff. Because `oidc_relying_party` and mesh `MeshRequestAuthentication` injection consume the same shared store, they inherit the behaviour without a knob of their own; a shared store honours the most restrictive cooldown among its active consumers (disabled wins, otherwise the longest window).
@@ -2674,7 +2676,9 @@ Active cache entries retain only the prevalidated authorization outcome, canonic
 
 Authorization fallback never fans a token across providers by default. Explicit `Authorization: Bearer` locations and the implicit Authorization fallback are treated as the same routing source and both match the Bearer scheme case-insensitively. Multi-provider configurations should use distinct `from_headers` or `from_params` locations as deterministic routing hints. Without shared-trust opt-in, the first matching routing hint selects exactly one provider even if a client repeats the same token in another provider location. Set `allow_provider_fanout: true` only for providers inside one shared trust boundary. When `forward_original_token: false`, every configured occurrence of the accepted token is stripped from headers and query parameters before proxying while unrelated credentials are preserved.
 
-Only ordinary bearer tokens are supported. Active responses containing `cnf` or a non-Bearer `token_type` fail closed because this plugin does not validate DPoP or mTLS proof-of-possession. Missing or non-Boolean `active` members, oversized/malformed responses, provider transport failures, and non-success provider responses are treated as dependency failures and return `503`; only explicit `active: false` is negative-cached and returned as `401`. In multi-auth mode, a dependency failure takes precedence over later client-authentication rejections when no authentication method succeeds. OAuth authentication failures include a `WWW-Authenticate: Bearer` challenge; when an authentication chain has no credential, the first configured auth plugin challenge is advertised.
+Only ordinary bearer tokens are supported. Active responses containing `cnf` or a non-Bearer `token_type` fail closed because this plugin does not validate DPoP or mTLS proof-of-possession. Missing or non-Boolean `active` members, oversized/malformed responses, provider transport failures, and non-success provider responses are treated as dependency failures and return `503`; only explicit `active: false` is negative-cached and returned as `401`.
+
+Both ends of the returned validity window are enforced independently of `active`, as defense in depth against a contradictory or malformed provider response. `exp`, `active_until`, and `expires_in` close the window; `nbf` (RFC 7662 §2.2) opens it. An `active: true` response whose `nbf` is still in the future is rejected with a bearer `401` and is **not** cached in either direction, so the same token authenticates normally as soon as its window opens. A present but non-integer `nbf` is a broken dependency response and returns the same fixed `503` as malformed expiry data. An omitted `nbf` remains fully supported. Both bounds are absolute instants resolved once at the provider-response boundary and re-checked on every cache hit, so a cached authorization can never outlive the window it was admitted under. In multi-auth mode, a dependency failure takes precedence over later client-authentication rejections when no authentication method succeeds. OAuth authentication failures include a `WWW-Authenticate: Bearer` challenge; when an authentication chain has no credential, the first configured auth plugin challenge is advertised.
 
 ```yaml
 plugin_name: oauth2_introspection
@@ -2703,7 +2707,7 @@ Active in `on_request_received` (callback and logout paths), `authenticate` (ses
 | Parameter | Type | Description |
 |---|---|---|
 | `providers` | Array | Exactly one OIDC provider configuration |
-| `providers[].issuer` | String | Expected ID token issuer |
+| `providers[].issuer` | String | Expected ID token issuer, compared as an exact case-sensitive string. A present `iss` must be a single string (RFC 7519 §4.1.1); an array, object, number, boolean, or null `iss` is rejected |
 | `providers[].discovery_url` | String | OIDC discovery URL |
 | `providers[].authorization_endpoint` | String | Explicit authorization endpoint when discovery is not used |
 | `providers[].token_endpoint` | String | Explicit token endpoint when discovery is not used |
@@ -2790,6 +2794,18 @@ there is no all-keys fallback. A known `kid` with a bad signature under that
 key is also rejected. Token data, key material, claims, and attacker-controlled
 `kid` values are never logged.
 
+The ID token's registered claims are held to the same shapes as `jwt_auth` and
+`jwks_auth`. A present `iss` must be exactly one string (RFC 7519 §4.1.1), so an
+array `iss` never satisfies the provider's configured issuer. The ID token `exp`
+is an RFC 7519 §2 NumericDate — a JSON number that may carry a fractional part —
+and it is the session's authoritative claim lifetime: a conforming fractional
+expiry bounds the session exactly like an integer one, truncated toward the past,
+rather than falling back to `session.ttl_secs` / the access-token lifetime. The
+session is still additionally capped by `session.ttl_secs` and
+`session.idle_ttl_secs`, and `providers[].id_token_clock_skew_secs` is the only
+leeway added to the claim expiry. A sealed cookie's stored claim expiry is
+honoured only where it is no looser than the claims it carries.
+
 ### Credential storage at rest
 
 Ferrum stores consumer credentials in the configuration database (the
@@ -2843,12 +2859,14 @@ Authenticates requests using HS256 JWT Bearer tokens matched against consumer cr
 |---|---|---|---|
 | `token_lookup` | String | `header:Authorization` | Exact credential location (`header:<name>` or `query:<name>`). Whitespace is not trimmed; a header name must be a valid HTTP header name and a query name must be non-empty and contain no whitespace. A location no request could ever satisfy is refused at config admission rather than published as a route that answers every request `401`. A `query:<name>` location is decoded identically on HTTP/1.1, HTTP/2, and HTTP/3, so a percent-encoded parameter name or token authenticates on every frontend |
 | `consumer_claim_field` | String | `sub` | JWT claim identifying the consumer |
-| `expected_issuer` | String | *(none)* | Required `iss` value; mutually exclusive with `expected_issuers` |
-| `expected_issuers` | String[] | `[]` | Accepted `iss` values |
+| `expected_issuer` | String | *(none)* | Required `iss` value, compared as an exact case-sensitive string; mutually exclusive with `expected_issuers` |
+| `expected_issuers` | String[] | `[]` | Accepted `iss` values. A token still claims exactly one issuer; several accepted values do not admit an array-valued `iss` |
 | `audiences` | String[] | `[]` | Accepted `aud` values; audience validation is disabled when empty |
 | `require_exp` | Boolean | `true` | Require an `exp` claim; expiration is always validated when present |
 | `require_nbf` | Boolean | `false` | Require an `nbf` claim; when present, `nbf` is always validated |
 | `leeway_secs` | u64 | `0` | Clock leeway for time-based JWT claims; max `300` |
+
+Registered claims are validated for shape as well as value. A present `iss` must be exactly one string (RFC 7519 §4.1.1): an array, object, number, boolean, or null `iss` is rejected with the generic `401` even when one array element matches a configured issuer, and even when no issuer is configured. `exp` and `nbf` are RFC 7519 §2 NumericDates — JSON numbers that may carry a fractional part — so a conforming fractional expiry bounds the authenticated stream exactly like an integer one; fractional seconds truncate conservatively (an expiry toward the past, a not-before toward the future) so the enforced window is never wider than the token states.
 
 **Consumer credential** (`jwt`) — array. Secrets must be at least 32 characters:
 ```yaml

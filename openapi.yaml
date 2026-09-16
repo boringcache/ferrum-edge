@@ -20647,7 +20647,10 @@ components:
                 description: >-
                   Expected JWT iss claim — routes tokens to this provider.
                   When set, the token MUST carry iss and it must match exactly;
-                  the issuer check alone rejects only a mismatching claim.
+                  the issuer check alone rejects only a mismatching claim. Per
+                  RFC 7519 section 4.1.1 a present iss must be a single string:
+                  an array, object, number, boolean, or null iss is rejected
+                  even when one element matches this value.
                   Required and must be nonblank when require_dpop is true: the
                   DPoP replay realm is this exact issuer, so key-set or JWKS
                   source rotation cannot reopen a proof. Issuers are compared
@@ -20705,8 +20708,12 @@ components:
                 description: >-
                   Per-provider override for requiring an exp claim. Expiry is
                   always validated when present. A present nbf is always
-                  validated too (it is not required). JWT exp/nbf use zero
-                  clock leeway; DPoP skew is a separate proof contract.
+                  validated too (it is not required). exp and nbf are RFC 7519
+                  section 2 NumericDates (JSON numbers that may carry a
+                  fractional part); a fractional value bounds the authenticated
+                  stream exactly like an integer one, truncated so the enforced
+                  window is never wider than the token states. JWT exp/nbf use
+                  zero clock leeway; DPoP skew is a separate proof contract.
               required_scopes:
                 type: array
                 items:
@@ -21017,7 +21024,18 @@ components:
     Oauth2IntrospectionConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: oauth2_introspection — RFC 7662 bearer token introspection with bounded, explicit multi-provider routing."
+      description: >-
+        Plugin: oauth2_introspection — RFC 7662 bearer token introspection with
+        bounded, explicit multi-provider routing. Both ends of a returned
+        validity window are enforced independently of the active member, as
+        defense in depth against a contradictory provider response: exp,
+        active_until, and expires_in close it, and nbf (RFC 7662 section 2.2)
+        opens it. An active:true response whose nbf is still in the future is
+        rejected with a bearer 401 and is not cached in either direction; a
+        present non-integer nbf is a dependency-response error and returns 503,
+        like malformed expiry data. An omitted nbf remains supported. Both
+        bounds are absolute instants resolved once at the provider-response
+        boundary and re-checked on every cache hit.
       required: [providers]
       properties:
         providers:
@@ -21349,7 +21367,11 @@ components:
               issuer:
                 type: string
                 minLength: 1
-                description: Expected ID token issuer
+                description: >-
+                  Expected ID token issuer, compared as an exact case-sensitive
+                  string. Per RFC 7519 section 4.1.1 a present iss must be a
+                  single string; an array, object, number, boolean, or null iss
+                  is rejected.
               discovery_url:
                 type: [string, "null"]
                 minLength: 1
@@ -21493,6 +21515,15 @@ components:
                 default: 60
                 minimum: 0
                 maximum: 3600
+                description: >-
+                  Leeway added to the ID token exp when deciding whether the
+                  session's claims are still live. The ID token exp is an RFC
+                  7519 section 2 NumericDate (a JSON number that may carry a
+                  fractional part) and is the session's authoritative claim
+                  lifetime, truncated toward the past; it does not fall back to
+                  session.ttl_secs or the access-token lifetime. The session is
+                  still additionally capped by session.ttl_secs and
+                  session.idle_ttl_secs.
         session:
           type: object
           additionalProperties: false
@@ -21668,8 +21699,9 @@ components:
           minLength: 1
           pattern: "\\S"
           description: >-
-            Required iss claim; must not be blank. Mutually exclusive with
-            expected_issuers — supplying both is rejected.
+            Required iss claim, compared as an exact case-sensitive string; must
+            not be blank. Mutually exclusive with expected_issuers — supplying
+            both is rejected.
         expected_issuers:
           type: array
           items:
@@ -21678,7 +21710,10 @@ components:
             pattern: "\\S"
           description: >-
             Accepted iss claims; no entry may be blank. Mutually exclusive with
-            expected_issuer.
+            expected_issuer. A token still claims exactly one issuer: per RFC
+            7519 section 4.1.1 a present iss must be a single string, and an
+            array, object, number, boolean, or null iss is rejected even when
+            one element matches an accepted value.
         audiences:
           type: array
           items:
@@ -21691,7 +21726,12 @@ components:
         require_exp:
           type: boolean
           default: true
-          description: Require an exp claim; expiration is always validated when present
+          description: >-
+            Require an exp claim; expiration is always validated when present.
+            exp and nbf are RFC 7519 section 2 NumericDates (JSON numbers that
+            may carry a fractional part); a fractional value bounds the
+            authenticated stream exactly like an integer one, truncated so the
+            enforced window is never wider than the token states.
         require_nbf:
           type: boolean
           default: false
