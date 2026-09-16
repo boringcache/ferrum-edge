@@ -44,6 +44,23 @@ does not poison `cargo test --test unit_tests` (or the other unit targets). A
 test that needs a specific `FERRUM_*` value must set it explicitly inside the
 guard; do not rely on host environment.
 
+## TLS Inventory Fixture Isolation
+
+TLS inventory cache tests must own their `TlsInventoryCache` and admin metrics
+registry through `ProxyState` before cloning it into admin listeners. Use
+`TlsInventoryCache::with_collector` for a counting collector; never pin a fake
+in the production process cache. Config publication invalidates the cache on
+that proxy state. TLS events still invalidate the production process cache.
+An isolated registry is also required: otherwise concurrent scrapes can replace
+each other's certificate gauges even when their collection caches are separate.
+
+Issue #5544 reproduced under `cargo test --test integration_tests admin` because
+unrelated admin/config fixtures invalidated a global counting collector's cache.
+Keep this invocation supported with Cargo's ordinary parallel test threads.
+Use collector channels to hold a refresh in flight and join its returned task
+handle to observe completed publication; fetch entry alone is not completion.
+Do not substitute sleeps, scrape retries, or runner/process isolation for ownership.
+
 ## Test Placement
 
 - Prefer external tests under `tests/` over new inline `#[cfg(test)] mod tests` in production source files.

@@ -4,6 +4,21 @@ This document describes the functional testing strategy for the Ferrum Edge, par
 
 ## Test Files
 
+### admin_metrics_tls_inventory_snapshot_tests.rs
+
+The TLS inventory scrape regressions run in-process through real admin listeners:
+
+```bash
+cargo test --test integration_tests admin
+```
+
+Each counting fixture owns its inventory cache and metrics registry. The suite
+checks concurrent fixtures, config reload invalidation, serving-cycle replacement,
+single-flight collection, and fetch-free cached scrapes. Collector channels and
+joined refresh tasks provide synchronization without sleeps or retries; the broad
+Cargo invocation uses its normal parallel test threads. Production retains the
+process-wide cache, TTL, and TLS-event invalidation behavior.
+
 ### cp_dp_grpc_tests.rs
 
 Located in `tests/integration/cp_dp_grpc_tests.rs`, this file contains integration tests for gRPC communication between CP and DP.

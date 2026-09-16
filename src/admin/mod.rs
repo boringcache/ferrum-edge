@@ -981,6 +981,23 @@ fn tls_inventory_snapshot_ttl_seconds(state: &AdminState) -> u64 {
         .unwrap_or(crate::tls::inventory_cache::DEFAULT_SNAPSHOT_TTL_SECONDS)
 }
 
+fn tls_inventory_cache(state: &AdminState) -> &Arc<crate::tls::inventory_cache::TlsInventoryCache> {
+    match state.proxy_state.as_ref() {
+        Some(proxy) => &proxy.tls_inventory_cache,
+        None => crate::tls::inventory_cache::process_cache(),
+    }
+}
+
+fn admin_metrics_registry(
+    state: &AdminState,
+) -> Arc<crate::plugins::prometheus_metrics::MetricsRegistry> {
+    state
+        .proxy_state
+        .as_ref()
+        .map(|proxy| Arc::clone(&proxy.admin_metrics_registry))
+        .unwrap_or_else(crate::plugins::prometheus_metrics::global_registry)
+}
+
 /// Register the metrics inventory collector and warm the snapshot when an admin
 /// listener starts, so the first Prometheus scrape already has certificate
 /// metadata instead of waiting for its own background refresh to land.
@@ -989,7 +1006,7 @@ fn warm_tls_inventory_snapshot(state: &AdminState) {
     let ttl_seconds = tls_inventory_snapshot_ttl_seconds(state);
     if ttl_seconds > 0 {
         let ttl = Duration::from_secs(ttl_seconds);
-        crate::tls::inventory_cache::schedule_refresh_if_due(ttl);
+        let _ = tls_inventory_cache(state).schedule_refresh_if_due(ttl);
     }
 }
 
@@ -1052,8 +1069,7 @@ pub async fn serve_admin_on_listener(
     conn_limiter: Arc<conn_limit::AdminConnLimiter>,
 ) -> Result<(), anyhow::Error> {
     // Publish the limiter so `/metrics` can render its gauge/counters.
-    crate::plugins::prometheus_metrics::global_registry()
-        .set_admin_conn_metrics(conn_limiter.clone());
+    admin_metrics_registry(&state).set_admin_conn_metrics(conn_limiter.clone());
     // Publish the metrics-safe TLS inventory collector and warm its snapshot so
     // the first scrape reads cached certificate metadata instead of loading
     // TLS material inline (issue #2410).
@@ -1200,8 +1216,7 @@ pub async fn serve_admin_on_listener_with_dynamic_tls(
     conn_limiter: Arc<conn_limit::AdminConnLimiter>,
 ) -> Result<(), anyhow::Error> {
     // Publish the limiter so `/metrics` can render its gauge/counters.
-    crate::plugins::prometheus_metrics::global_registry()
-        .set_admin_conn_metrics(conn_limiter.clone());
+    admin_metrics_registry(&state).set_admin_conn_metrics(conn_limiter.clone());
     // Publish the metrics-safe TLS inventory collector and warm its snapshot so
     // the first scrape reads cached certificate metadata instead of loading
     // TLS material inline (issue #2410).
@@ -3375,7 +3390,7 @@ async fn handle_admin_request_inner(
         if !observability_detail_allowed(&state, auth_header.as_deref(), &client_ip) {
             return Ok(metrics_unauthorized_response());
         }
-        let registry = crate::plugins::prometheus_metrics::global_registry();
+        let registry = admin_metrics_registry(&state);
         // TLS certificate metadata comes from the cached, non-secret inventory
         // snapshot (issue #2410). The scrape performs zero filesystem,
         // Kubernetes, HSM, or cloud-secret I/O and never blocks on a provider:
@@ -3386,9 +3401,9 @@ async fn handle_admin_request_inner(
         let snapshot_ttl_seconds = tls_inventory_snapshot_ttl_seconds(&state);
         if snapshot_ttl_seconds > 0 {
             let ttl = Duration::from_secs(snapshot_ttl_seconds);
-            crate::tls::inventory_cache::schedule_refresh_if_due(ttl);
+            let _ = tls_inventory_cache(&state).schedule_refresh_if_due(ttl);
         }
-        match crate::tls::inventory_cache::snapshot() {
+        match tls_inventory_cache(&state).snapshot() {
             Some(snapshot) => {
                 let collected_at = snapshot.collected_at.timestamp();
                 registry.refresh_tls_certificate_inventory(&snapshot.inventory);

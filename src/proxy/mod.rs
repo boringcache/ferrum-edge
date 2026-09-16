@@ -6578,6 +6578,13 @@ impl Default for ConfigRevisionNotifier {
 #[derive(Clone)]
 pub struct ProxyState {
     pub config: Arc<ArcSwap<GatewayConfig>>,
+    /// Metrics inventory ownership, shared by config publication and admin listeners.
+    /// Production uses the process cache so TLS event invalidations reach it;
+    /// in-process fixtures can supply an independent cache before cloning state.
+    pub tls_inventory_cache: Arc<crate::tls::inventory_cache::TlsInventoryCache>,
+    /// Registry rendered by the admin metrics endpoint. Production shares the
+    /// global registry; fixtures can own one so TLS gauge publication is isolated too.
+    pub admin_metrics_registry: Arc<crate::plugins::prometheus_metrics::MetricsRegistry>,
     pub request_epoch: Arc<RequestEpochStore>,
     pub dns_cache: DnsCache,
     pub connection_pool: Arc<ConnectionPool>,
@@ -9926,6 +9933,8 @@ impl ProxyState {
 
         let state = Self {
             config: config_arc,
+            tls_inventory_cache: Arc::clone(crate::tls::inventory_cache::process_cache()),
+            admin_metrics_registry: crate::plugins::prometheus_metrics::global_registry(),
             request_epoch,
             dns_cache,
             connection_pool,
@@ -12582,7 +12591,7 @@ impl ProxyState {
         // metrics-safe snapshot only after the validated epoch is published so
         // the next scrape refreshes against the accepted config, while rejected
         // and unchanged candidates leave the current snapshot undisturbed.
-        crate::tls::inventory_cache::mark_stale();
+        self.tls_inventory_cache.mark_stale();
     }
 
     /// Record whether the serving mode actually started an H3 listener.
