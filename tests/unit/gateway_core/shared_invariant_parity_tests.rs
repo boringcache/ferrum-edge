@@ -1949,8 +1949,10 @@ fn plugin_structs_behind_raw_json_values_retain_object_admission() {
             "JsonObject<OutboundRegistryConfig>",
         ),
         (
+            // `MeshAuthz::new` only forwards; the slice is parsed in
+            // `new_with_http_client`, so the guard must read that body.
             "src/plugins/mesh/authz.rs",
-            "pub fn new(config: &Value)",
+            "pub fn new_with_http_client(",
             "\n    }",
             "json_object::JsonObject<MeshSlice>",
         ),
