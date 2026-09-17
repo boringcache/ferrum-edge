@@ -3156,7 +3156,9 @@ fn mint_peer_chain_via_intermediate(spiffe: &str) -> IssuedChain {
         .distinguished_name
         .push(DnType::CommonName, format!("{spiffe} root CA"));
     root_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let root_cert = root_params.self_signed(&root_key).expect("self-signed root");
+    let root_cert = root_params
+        .self_signed(&root_key)
+        .expect("self-signed root");
     let root_der = root_cert.der().to_vec();
     // `Issuer::new` consumes the params + key, so capture the DER first.
     let root_issuer = Issuer::new(root_params, root_key);

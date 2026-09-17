@@ -17699,11 +17699,13 @@ fn mesh_inbound_spiffe_verifier(
         // DISABLE has no TLS; client-side DR modes never reach here.
         _ => return None,
     };
-    Some(tls::build_spiffe_client_cert_verifier_for_inbound_admission(
-        slot.clone(),
-        peer_required,
-        admission,
-    ))
+    Some(
+        tls::build_spiffe_client_cert_verifier_for_inbound_admission(
+            slot.clone(),
+            peer_required,
+            admission,
+        ),
+    )
 }
 
 fn mesh_inbound_tls_reload_snapshot(
