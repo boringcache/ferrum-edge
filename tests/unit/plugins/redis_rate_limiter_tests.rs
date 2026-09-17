@@ -4674,13 +4674,24 @@ async fn background_recovery_never_probes_the_clock_for_a_clockless_client() {
 ///    charge still settles, because settlement is judged on the `TIME` that same
 ///    transaction carried. No rebuild, no hand-back, no refusal, indefinitely.
 /// 2. The server's clock then steps ten minutes ahead under the live client.
-///    The frozen base cannot learn it, so every request now mis-settles on its
-///    FIRST pass, hands its charge back and rebuilds from the server instant —
-///    and is still admitted. That cost is permanent while replies stay slow.
-/// 3. A repeat mis-settlement is what reaches the failure policy. The clock
-///    steps back while pass 1's reply is still held, so the ladder rebuilt from
-///    the ten-minute-ahead instant lands in the FUTURE, the bounded rebuild is
-///    spent, and the decision refuses.
+///    The frozen base cannot learn it, so every request mis-settles on its
+///    FIRST pass and hands its charge back — and the rebuild cannot recover the
+///    step either, because the SAME held response is what makes it unrecoverable:
+///    the rebuilt pass selects from the server instant the abandoned pass
+///    carried, which the 200ms hold already leaves more than three sub-buckets
+///    behind the instant the server applies the rebuild in. So the second pass
+///    mis-settles too and the request refuses through `redis_failure_policy`.
+///
+/// That is the whole statement, and it is an entailment rather than a
+/// coincidence of these parameters: the threshold that starves learning (a
+/// reply latency of one sub-bucket) and the staleness the rebuild inherits are
+/// the same quantity, so a response held far enough past one sub-bucket to
+/// freeze the base is also far enough to push the rebuilt pass past `b + 1`.
+/// A frozen offset plus a drift past the band is an unavailable store, not a
+/// permanent double charge.
+/// [`a_prompt_store_pays_exactly_one_rebuild_for_a_clock_step_and_learns_it`]
+/// is the other side: with prompt replies the same drift costs exactly one
+/// rebuild, is admitted, and is learned from that pass's own sample.
 #[tokio::test]
 async fn starved_offset_learning_settles_until_the_server_clock_drifts_under_it() {
     use ferrum_edge::plugins::utils::rate_limit::{
@@ -4744,29 +4755,35 @@ async fn starved_offset_learning_settles_until_the_server_clock_drifts_under_it(
     );
 
     // 2. The clock steps under the live client. Nothing can re-teach the offset
-    //    while replies stay slow, so the rebuild is not a one-off.
+    //    while replies stay slow, and nothing can place the rebuild either: the
+    //    rebuilt pass selects from the instant the abandoned pass carried, and
+    //    this fixture holds every response 200ms AFTER applying it, so by the
+    //    time the server applies the rebuild that instant is more than three
+    //    sub-buckets stale. Both passes mis-settle and the request refuses.
+    //    Repeated, because the point is that it is the steady state and not a
+    //    transient.
     server.set_time_mode(ServerTimeMode::Ahead(DRIFT));
     for round in 0..2 {
         let charges_before = server.incrs();
         let handbacks_before = server.decrs();
+        let refused = algorithm.check_redis(&client, "ip:127.0.0.1", &op).await;
         assert!(
-            algorithm
-                .check_redis(&client, "ip:127.0.0.1", &op)
-                .await
-                .expect("one rebuild is still a decision")
-                .allowed,
-            "round {round}: a single mis-settlement rebuilds and admits"
+            refused.is_err(),
+            "round {round}: a drift past the settlement band, on a store no reply \
+             of which is prompt enough to teach it, must refuse through \
+             redis_failure_policy rather than publish a decision from a ladder it \
+             could not place: {refused:?}"
         );
         await_compensations(&client).await;
         assert_eq!(
             server.incrs() - charges_before,
             2,
-            "round {round}: the drifted base mis-settles once and rebuilds once"
+            "round {round}: the bounded rebuild still stops at two transactions"
         );
         assert_eq!(
             server.decrs() - handbacks_before,
-            1,
-            "round {round}: the abandoned pass hands its own charge back"
+            2,
+            "round {round}: both abandoned passes hand their charges back"
         );
     }
     let still_frozen = client
@@ -4778,40 +4795,122 @@ async fn starved_offset_learning_settles_until_the_server_clock_drifts_under_it(
         "no reply was prompt enough to teach the ten-minute step, so the base \
          stays exactly where the probes left it: frozen={frozen} now={still_frozen}"
     );
-
-    // 3. A repeat mis-settlement refuses through the failure policy. The
-    //    fixture applies every queued command — the `TIME` included — in one
-    //    synchronous span before the AfterApply hold, so an observed `INCR`
-    //    means pass 1 has already read the ten-minute-ahead clock and the step
-    //    back cannot race it.
-    let charges_before = server.incrs();
-    let handbacks_before = server.decrs();
-    let charge = algorithm.check_redis(&client, "ip:127.0.0.1", &op);
-    let step_back = async {
-        loop {
-            if server.incrs() > charges_before {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        server.set_time_mode(ServerTimeMode::RealClock);
-    };
-    let (refused, ()) = tokio::join!(charge, step_back);
+    // And it is a PLACEMENT refusal, not an endpoint verdict: every transaction
+    // succeeded, so the store is still available and the consumer's
+    // `redis_failure_policy` is what governs these decisions.
     assert!(
-        refused.is_err(),
-        "a second mis-settlement must refuse through redis_failure_policy rather \
-         than publish a decision from a ladder it could not place: {refused:?}"
+        client.is_available(),
+        "a ladder that could not be placed is routed through redis_failure_policy; \
+         it must not mark an endpoint that answered every command unusable"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// The other side of that boundary: with PROMPT replies the same ten-minute
+/// step costs exactly ONE rebuild, is admitted, and is not paid twice.
+///
+/// Nothing is held here, so the sample the mis-settled pass carries is prompt
+/// enough to move the base (`clock_sample_is_prompt`'s rule). Three things
+/// follow, and they are the exact complement of the starved fixture above:
+/// the rebuild selects from an instant that is still current when the server
+/// applies it, so it settles and the request is admitted; the same sample
+/// teaches the step, so the NEXT request settles on its first pass; and the
+/// double charge is therefore a one-off rather than a steady state.
+///
+/// The pool is warmed BEFORE the step so the only thing that can teach the
+/// drift is a charge transaction's own reply — a slot opened afterwards would
+/// seed the new clock from its own probe and prove nothing about learning.
+#[tokio::test]
+async fn a_prompt_store_pays_exactly_one_rebuild_for_a_clock_step_and_learns_it() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    const DRIFT: Duration = Duration::from_secs(600);
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = Arc::new(keyspace_client(server.port));
+    assert_eq!(
+        client.warm_pool_for_test().await,
+        4,
+        "every pooled slot must be screened before the clock moves"
+    );
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 100,
+        duration: Duration::from_secs(1),
+    }]);
+    assert!(
+        algorithm
+            .check_redis(&client, "ip:127.0.0.1", &op)
+            .await
+            .expect("an undrifted charge settles on its first pass")
+            .allowed
+    );
+    let seeded = client
+        .server_clock()
+        .offset_nanos()
+        .expect("the connections' own probes seeded the offset");
+    assert_eq!(server.incrs(), 1);
+    assert_eq!(server.decrs(), 0);
+
+    // The step. The first request after it mis-settles on the base it still
+    // holds, hands that charge back, and rebuilds from the server instant —
+    // which is current here, because no leg of that round trip was held.
+    server.set_time_mode(ServerTimeMode::Ahead(DRIFT));
+    let charges_before = server.incrs();
+    assert!(
+        algorithm
+            .check_redis(&client, "ip:127.0.0.1", &op)
+            .await
+            .expect("one rebuild is still a decision")
+            .allowed,
+        "a prompt store's single mis-settlement rebuilds and admits"
     );
     await_compensations(&client).await;
     assert_eq!(
         server.incrs() - charges_before,
         2,
-        "the bounded rebuild still stops at two transactions"
+        "the drifted base mis-settles once and rebuilds once"
+    );
+    assert_eq!(
+        server.decrs(),
+        1,
+        "the abandoned pass hands its own charge back, and only it"
+    );
+
+    // The mis-settled pass's own reply was prompt, so it also taught the step.
+    let learned = client
+        .server_clock()
+        .offset_nanos()
+        .expect("the offset is still known");
+    assert!(
+        learned - seeded > 500_000_000_000,
+        "a prompt sample from the mis-settled pass must teach the ten-minute \
+         step: seeded={seeded} learned={learned}"
+    );
+
+    // Which makes the rebuild a one-off rather than a standing cost.
+    let charges_before = server.incrs();
+    let handbacks_before = server.decrs();
+    assert!(
+        algorithm
+            .check_redis(&client, "ip:127.0.0.1", &op)
+            .await
+            .expect("the relearned base settles on its first pass")
+            .allowed
+    );
+    await_compensations(&client).await;
+    assert_eq!(
+        server.incrs() - charges_before,
+        1,
+        "a base that learned the step charges exactly one transaction again"
     );
     assert_eq!(
         server.decrs() - handbacks_before,
-        2,
-        "both abandoned passes hand their charges back"
+        0,
+        "with nothing left to hand back"
     );
 
     let _ = server.shutdown.send(());

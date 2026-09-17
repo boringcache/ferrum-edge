@@ -2533,6 +2533,20 @@ async fn check_http_windows_redis(
         // Hand the stale charge back before rebuilding, so the abandoned pass
         // leaves no counter behind, then rebuild from the server instant that
         // just proved the rollover — no additional clock read.
+        //
+        // That instant is used RAW, and deliberately. It is already stale by
+        // this pass's response leg (plus the hand-back below and the rebuilt
+        // pass's own request leg) by the time the server applies the rebuild,
+        // but every correction for that is a guess: the round trip cannot be
+        // apportioned between its legs, and `clock_sample_is_prompt` refuses to
+        // let a late reply move the base for exactly that reason. Raw is also
+        // the safer side of the two-sided band — it can only place the rebuilt
+        // charge EARLIER than the server's own execution, which settlement's
+        // late end catches, never in the future, which is the unreachable
+        // placement. A store slow enough for that staleness to exceed the band
+        // spends its second pass and refuses below, which is the fail-closed
+        // answer for a store that cannot land a transaction in the sub-bucket
+        // it was keyed to.
         let compensation = Arc::clone(redis)
             .spawn_uncharge_rate_limit_windows(charges)
             .await;

@@ -746,11 +746,28 @@ impl RedisServerClock {
 /// What a frozen offset costs is real but deferred: the base stops tracking the
 /// server, so a later server-side clock change — or a wall-clock step on this
 /// host — is never learned. Once that drift passes the settlement band every
-/// request mis-settles on its first pass, hands its charge back and rebuilds
-/// from the server instant, permanently, because nothing can re-teach the
-/// offset while replies stay slow; and a request whose REBUILT pass also
-/// mis-settles refuses through `redis_failure_policy`. A store slow enough to
-/// stall execution past one sub-bucket reaches that second pass on its own.
+/// request mis-settles on its FIRST pass and hands its charge back, and nothing
+/// can re-teach the offset while replies stay slow, so that is a steady state
+/// rather than a transient.
+///
+/// The rebuild does not recover it either, and the reason is the same latency.
+/// The rebuilt pass selects from the server instant the ABANDONED pass carried,
+/// which is already stale by that pass's RESPONSE leg — plus the hand-back it
+/// waits for and its own request leg — by the time the server applies it. The
+/// latency that starves learning and the staleness the rebuild inherits are the
+/// same quantity, so a reply held far enough past one sub-bucket to freeze
+/// the base is also far enough to push the rebuilt pass past `b + 1`, and a
+/// request whose REBUILT pass also mis-settles refuses through
+/// `redis_failure_policy`. A frozen offset plus a drift past the band is
+/// therefore an unavailable store, not a permanent double charge; a store slow
+/// enough to stall EXECUTION past one sub-bucket reaches that same second pass
+/// with no drift at all.
+///
+/// PROMPT replies are what make a rebuild a one-off: the instant it selects
+/// from is still current when the server applies it, and the same sample that
+/// settles it also teaches the drift, so the next request settles on its first
+/// pass. A rebuild recovers a clock step only while replies are prompt — which
+/// is exactly when learning would have recovered it anyway.
 pub fn clock_sample_is_prompt(reply_latency: Duration, narrowest_window_seconds: u64) -> bool {
     reply_latency.as_nanos() < redis_sub_bucket_nanos(narrowest_window_seconds)
 }

@@ -769,9 +769,19 @@ on a native-gRPC request.
   and ANSWERS late settles every charge correctly, forever, on a frozen offset.
   The cost is deferred: the base stops tracking the server, so a later
   server-side clock change or a wall-clock step is never learned, and once the
-  drift passes the settlement band every request mis-settles, rebuilds, and —
-  when the rebuilt pass mis-settles too — refuses through
-  `redis_failure_policy`.
+  drift passes the settlement band every request mis-settles on its FIRST pass.
+  The REBUILD does not recover that step either, and do NOT write that it does:
+  the rebuilt pass selects from the server instant the ABANDONED pass carried,
+  which the same late response already leaves stale by more than the band, so it
+  mis-settles too and the request refuses through `redis_failure_policy`. The
+  threshold that starves learning and the staleness the rebuild inherits are one
+  quantity, so starved learning plus drift is an unavailable store, not a
+  permanent double charge. A PROMPT store pays exactly ONE rebuild for the same
+  drift, is admitted, and learns the step from that pass's own sample — a
+  rebuild recovers a clock step only while replies are prompt, which is exactly
+  when learning would have recovered it anyway. Both sides are pinned by
+  `starved_offset_learning_settles_until_the_server_clock_drifts_under_it` and
+  `a_prompt_store_pays_exactly_one_rebuild_for_a_clock_step_and_learns_it`.
 - `TIME` IS REQUIRED FOR REQUEST QUOTAS. THERE IS NO LOCAL-CLOCK MODE. It is
   probed ONCE per established connection with a plain standalone `TIME`
   (`probe_server_time`, called from `screen_and_arm`) — never trialled inside
