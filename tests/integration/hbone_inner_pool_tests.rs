@@ -2508,21 +2508,28 @@ async fn nested_h2_carriers_widen_when_every_incumbent_is_at_the_peers_stream_ca
         send_rpc(&mut first.sender).await.expect("first rpc"),
         StatusCode::OK
     );
-    assert_eq!(
-        first.peer_max_streams(),
-        1,
-        "the application advertised SETTINGS_MAX_CONCURRENT_STREAMS: 1"
+    // Whatever the nested peer advertised is what the pool must respect; the
+    // test drives itself from the observed value rather than assuming one.
+    let cap = first.peer_max_streams();
+    assert!(
+        (1..=256).contains(&cap),
+        "the nested peer must advertise a small finite \
+         SETTINGS_MAX_CONCURRENT_STREAMS for a carrier to be saturable; got {cap}"
     );
     let publish_lease = publish_fresh_h2(&fx, &parts, &first);
     drop(publish_lease);
     assert_eq!(fx.pool.inner_pool().pooled_connections(), 1);
 
-    // One dispatch holds the only carrier, which advertised a cap of one.
-    let held = fx
-        .pool
-        .inner_pool()
-        .checkout_h2(&parts)
-        .expect("the published carrier is reusable");
+    // Fill the only carrier to the peer's cap.
+    let mut held = Vec::with_capacity(cap);
+    for _ in 0..cap {
+        held.push(
+            fx.pool
+                .inner_pool()
+                .checkout_h2(&parts)
+                .expect("a carrier with room under its peer's cap is reusable"),
+        );
+    }
 
     assert!(
         fx.pool.inner_pool().checkout_h2(&parts).is_none(),
@@ -2537,6 +2544,7 @@ async fn nested_h2_carriers_widen_when_every_incumbent_is_at_the_peers_stream_ca
         send_rpc(&mut second.sender).await.expect("second rpc"),
         StatusCode::OK
     );
+    // The publication itself is this dispatch's first hold on the sibling.
     let second_lease = publish_fresh_h2(&fx, &parts, &second);
     assert_eq!(
         fx.pool.inner_pool().pooled_connections(),
@@ -2544,6 +2552,17 @@ async fn nested_h2_carriers_widen_when_every_incumbent_is_at_the_peers_stream_ca
         "the key widened to the configured `http2_connections_per_host`"
     );
     assert_eq!(fx.peer.connects(), 2);
+
+    // Fill the sibling too. Every checkout must land on it, since the first
+    // carrier is already at its cap.
+    for _ in 1..cap {
+        held.push(
+            fx.pool
+                .inner_pool()
+                .checkout_h2(&parts)
+                .expect("the freshly widened carrier has room"),
+        );
+    }
 
     // Both carriers are now at their cap and the key is at its width, so the
     // next checkout QUEUES on the least loaded rather than growing further —
