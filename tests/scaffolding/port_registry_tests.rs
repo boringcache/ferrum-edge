@@ -1,6 +1,8 @@
 //! Regression coverage for nextest's one-test-per-process port handoff.
 
-use super::port_registry::{PortLease, PortRegistry, TestSocket, bind_tcp_listener, bind_udp_socket};
+use super::port_registry::{
+    PortLease, PortRegistry, TestSocket, bind_tcp_listener, bind_udp_socket,
+};
 use std::collections::BTreeSet;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};

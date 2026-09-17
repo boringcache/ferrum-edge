@@ -46,7 +46,11 @@ async fn readiness_admin(
     identity: SpawnedGatewayIdentity,
     ready: Arc<AtomicBool>,
     accept_jwt: bool,
-) -> (u16, tokio::task::JoinHandle<()>, mpsc::UnboundedReceiver<()>) {
+) -> (
+    u16,
+    tokio::task::JoinHandle<()>,
+    mpsc::UnboundedReceiver<()>,
+) {
     let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .unwrap();
@@ -223,9 +227,10 @@ async fn udp_readiness_requires_an_identity_instead_of_falling_back_to_a_bind() 
     let mut child = readiness_child();
     let http = reserve_port().await.unwrap();
     let udp = super::ports::reserve_udp_port().await.unwrap();
-    let error = wait_for_spawned_gateway(&mut child, http.port, Some(StreamListener::Udp(udp.port)))
-        .await
-        .unwrap_err();
+    let error =
+        wait_for_spawned_gateway(&mut child, http.port, Some(StreamListener::Udp(udp.port)))
+            .await
+            .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     assert!(error.to_string().contains("spawn_with_identity"));
 }
