@@ -225,8 +225,7 @@ async fn functional_mcp_gateway_batch_rejects_trailing_slash_alias() {
         assert_eq!(headers.lines().next(), Some("POST /mcp HTTP/1.1"));
         assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), initialize);
 
-        // A request rejected by exact-path mediation must also be rejected at
-        // the alias, rather than being forwarded to the echo server raw.
+        // Exact-path admission still validates JSON-RPC before forwarding.
         let response = client
             .post(gateway.proxy_url(path))
             .header("content-type", "application/json")

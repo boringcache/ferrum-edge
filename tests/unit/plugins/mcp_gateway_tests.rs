@@ -11333,6 +11333,8 @@ async fn endpoint_scope_refuses_descendants_in_both_modes() {
             config["endpoint"]["path"] = json!(endpoint);
             let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
             for path in [
+                "/mcp",
+                "/mcp/",
                 "/mcp//",
                 "/mcp/tools",
                 "/mcp/tools/",
@@ -11344,6 +11346,9 @@ async fn endpoint_scope_refuses_descendants_in_both_modes() {
                 "/mCp/",
                 "/MCP/tools",
             ] {
+                if path == endpoint {
+                    continue;
+                }
                 for method in ["POST", "GET", "DELETE", "PUT", "HEAD", "OPTIONS"] {
                     let (mut ctx, mut headers) = mcp_ctx(json!({
                         "jsonrpc": "2.0", "id": 1, "method": "ping"
@@ -11356,6 +11361,7 @@ async fn endpoint_scope_refuses_descendants_in_both_modes() {
                     assert_eq!(status, 404, "{mode} {endpoint} {method} {path}");
                     assert_eq!(body["error"]["code"], -32600);
                     assert_eq!(body["error"]["message"], "Unknown MCP endpoint");
+                    assert_eq!(ctx.path, path);
                     assert!(ctx.route_override_backend_host.is_none());
                     assert!(ctx.route_override_path.is_none());
                     // A reserved descendant is denied, exactly like the 405.
