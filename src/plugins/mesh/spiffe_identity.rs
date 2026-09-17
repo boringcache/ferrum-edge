@@ -193,6 +193,38 @@ impl SpiffeIdentityConnectionCache {
             derive_peer_spiffe_extraction(der)
         })
     }
+
+    /// The admitted leaf's own credential deadline, from the extraction this
+    /// connection already performed — never a fresh X.509 parse (issue #5568).
+    ///
+    /// `None` means this cache holds no leaf-derived identity to bound: either
+    /// nothing has been extracted on this connection yet, or the peer's
+    /// certificate carried no usable SPIFFE SAN. A caller that needs a deadline
+    /// for a certificate it knows was admitted must then parse the retained DER
+    /// itself.
+    ///
+    /// On an H2 mesh listener many CONNECTs multiplex over one connection, so
+    /// the HBONE admission fence reads this rather than re-parsing the same
+    /// leaf once per tunnel. The returned value is exactly what
+    /// [`admission_deadline`] admitted the principal with: the monotonic
+    /// `Instant` captured at the first successful admission when one exists,
+    /// and otherwise the same conversion of the retained window — so the fence
+    /// and the request path can never disagree about when the credential ends.
+    pub(crate) fn admitted_leaf_deadline(&self) -> Option<CredentialDeadline> {
+        let PeerSpiffeExtraction::Id {
+            validity,
+            monotonic_expiry,
+            ..
+        } = self.outcome.get()?
+        else {
+            return None;
+        };
+        if let Some(&deadline) = monotonic_expiry.get() {
+            return Some(CredentialDeadline::Bounded(deadline));
+        }
+        let unix = validity.not_after_unix;
+        Some(auth_flow::try_credential_deadline_from_unix_seconds(unix, 0))
+    }
 }
 
 pub struct SpiffeIdentity;

@@ -74,6 +74,16 @@ impl From<rustls::Error> for SpiffeTlsError {
 /// Shared bundle slot type alias used by the rustls resolvers.
 pub type SharedBundleSlot = Arc<ArcSwap<Option<SvidBundle>>>;
 
+/// Build a [`SharedBundleSlot`] holding `bundle`.
+///
+/// One constructor so every producer of an inbound verifier slot builds the
+/// same shape: the mesh inbound SPIFFE slot is also what the HBONE admission
+/// fence re-checks live tunnels against (issue #5568), and the fence identifies
+/// a published bundle by the slot it came out of.
+pub fn shared_bundle_slot(bundle: Option<SvidBundle>) -> SharedBundleSlot {
+    Arc::new(ArcSwap::new(Arc::new(bundle)))
+}
+
 // ── Inbound (server-side) ─────────────────────────────────────────────────
 
 /// Build a [`ServerConfig`] that:
