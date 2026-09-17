@@ -139,8 +139,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   eventually refuse; those refusals are routed as an unavailable centralized
   store through `redis_failure_policy`, not as quota refusals.
 - **Redis request quotas: `TIME` is REQUIRED, and there is no local-clock
-  mode.** Every connection probes `TIME` once, standalone, before it may carry a
-  policy command, and **every** unsuccessful answer — a `NOPERM`, an
+  mode.** Every connection a request-quota policy opens (`rate_limiting`,
+  `graphql`, `grpc_method_router`) probes `TIME` once, standalone, before it may
+  carry a policy command, and **every** unsuccessful answer — a `NOPERM`, an
   `ERR unknown command` from a server that does not implement `TIME`, a reply
   that is not a clock (a server answering `+OK`), a probe timeout, a transport
   failure — discards that connection exactly like a failed `INFO CLUSTER` screen
@@ -157,15 +158,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   *diagnostic* — the warning names `+time` — but not the outcome, and a `TIME`
   revoked mid-flight needs no special case, because the aborted `EXEC` is an
   ordinary command failure whose reconnect re-probes and refuses to publish the
-  socket. Because the probe is part of connection screening rather than of one
-  caller, the requirement applies to **every** plugin that opens a Ferrum Redis
-  client, including `request_deduplication` and `soap_ws_security`'s shared
-  replay authority, which never read the clock themselves. Grant `+time` (or the
-  `@slow`/`@fast` category that already contains it) before upgrading.
-  Replay-authority clients publish only a fixed classification
-  (`server_clock_denied`, `server_clock_unreadable`,
-  `server_clock_unavailable`) beside the redacted endpoint for these failures,
-  never the backend's error text.
+  socket. Grant `+time` (or the `@slow`/`@fast` category that already contains
+  it) on the Redis these three plugins use before upgrading.
+  **The requirement stops at request quotas.** It follows what a consumer
+  computes, not what a connection is, so it is declared at construction and
+  enforced at both ends: only a request-quota client probes, and the ladder
+  fails closed rather than charge on a client that did not declare it.
+  `ai_rate_limiter`, `ws_rate_limiting` and `udp_rate_limiting` index their
+  windows locally; `request_deduplication`, `soap_ws_security`'s shared replay
+  authority and the `jwks_auth` / `hmac_auth` replay clients claim markers with
+  `SET NX EX`; `ai_semantic_cache` stores a blob. None of them reads the server
+  clock, none of them sends `TIME`, and a Redis whose ACL withholds `+time`
+  leaves every one of them fully enforcing — a deployment that uses only those
+  plugins needs no ACL change at all.
 - **`rate_limiting` fallback attribution follows the decision, not the client's
   reachability.** A per-decision fallback — a sub-bucket rollover that refused
   twice, or a reply the gateway could not pair with its windows — routes one
@@ -190,12 +195,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `{prefix:rate-key}:{window_index}`, over nineteen sub-buckets per window
   rather than a previous/current pair. The keyspace command set (`GET`, `INCR`,
   `DECR`, `EXPIRE`, `MULTI`, `EXEC`) and the key prefix are unchanged, but the
-  server-clock contract above adds one **new** command: **restrictive Redis ACLs
-  must grant `TIME`** (`+time`, or the category that already contains it). An
-  ACL that omits it makes the endpoint unavailable for every Ferrum Redis
-  client: each connection probes `TIME` once before it carries a policy command,
-  and a `NOPERM` (or an unimplemented `TIME`) discards that connection so
-  `redis_failure_policy` governs. An in-place upgrade also starts new counters: expect up
+  server-clock contract above adds one **new** command for these three plugins:
+  **restrictive Redis ACLs must grant `TIME`** (`+time`, or the category that
+  already contains it). An ACL that omits it makes the endpoint unavailable for
+  a request-quota policy: each of its connections probes `TIME` once before it
+  carries a policy command, and a `NOPERM` (or an unimplemented `TIME`) discards
+  that connection so `redis_failure_policy` governs. Every other Redis-backed
+  plugin is unaffected and needs no ACL change. An in-place upgrade also starts new counters: expect up
   to one window of reduced enforcement while the ladder fills, and during a
   rolling upgrade old and new replicas count against separate keys until every
   replica is on the new build. Abandoned counters expire on their own TTL.

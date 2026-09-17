@@ -761,9 +761,10 @@ on a native-gRPC request.
   gone. The standalone probe's sample is the one exception (it is the seed,
   there is no previous offset, and it is bounded by the screened per-command
   deadline).
-- `TIME` IS REQUIRED. THERE IS NO LOCAL-CLOCK MODE. It is probed ONCE per
-  established connection with a plain standalone `TIME` (`probe_server_time`,
-  called from `screen_and_arm`) — never trialled inside `MULTI`, because a
+- `TIME` IS REQUIRED FOR REQUEST QUOTAS. THERE IS NO LOCAL-CLOCK MODE. It is
+  probed ONCE per established connection with a plain standalone `TIME`
+  (`probe_server_time`, called from `screen_and_arm`) — never trialled inside
+  `MULTI`, because a
   denied command there aborts the whole `EXEC`. EVERY unsuccessful answer —
   `NOPERM`, `ERR unknown command`, a malformed successful reply (`+OK` to
   `TIME`), a timeout, a transport error, any other server error — leaves the
@@ -775,14 +776,32 @@ on a native-gRPC request.
   budget. `is_permission_denied_error` / `is_unknown_command_error` survive only
   to pick the DIAGNOSTIC (tell the operator to grant `+time`); they never pick
   an outcome. A mid-flight revocation needs no special case — the aborted `EXEC`
-  is an ordinary command failure and the reconnect re-probes. Because the probe
-  is connection screening, the requirement reaches EVERY consumer of
-  `RedisRateLimitClient`, including `request_deduplication` and the shared
-  replay authority; those clients' probe failures publish a fixed classification
+  is an ordinary command failure and the reconnect re-probes.
+  `docs/plugins.md` and the CHANGELOG must keep listing `TIME` as
+  mandatory for the quota roots.
+- THE REQUIREMENT IS SCOPED TO THE CONSUMERS THAT READ THE CLOCK, not to the
+  socket. It is a construction-time property (`ServerClockRequirement`,
+  alongside `RedisClientLogPolicy` and `RedisRetentionRequirement`) chosen by
+  the constructor: `RedisRateLimitClient::for_request_quota` declares
+  `Required`; `new`, `for_replay_authority` and `for_retention_authority`
+  declare `NotUsed`. Only a `Required` client probes, and
+  `charge_rate_limit_windows` fails closed (debug assertion + `Err(())`) on any
+  other, so a ladder can never be charged against an unseeded clock.
+  `RedisLimiter::new_with_config_id` picks the constructor from
+  `RateLimitAlgorithm::REQUIRES_SERVER_CLOCK` — a REQUIRED associated const, so
+  a new algorithm must state its contract rather than inherit one. True for
+  `HttpRateLimitAlgorithm` / `DynamicHttpRateLimitAlgorithm` (`rate_limiting`,
+  `graphql`, `grpc_method_router`); false for the `ai_rate_limiter`,
+  `ws_rate_limiting` and `udp_rate_limiting` algorithms, for
+  `request_deduplication`, `soap_ws_security`'s shared replay authority,
+  `jwks_auth` / `hmac_auth` replay clients, and `ai_semantic_cache`. Those
+  deployments do NOT need `+time` and must not be taken out of service by an
+  ACL that withholds it. Do NOT re-widen the probe to every consumer.
+  The classification-only probe diagnostics
   (`server_clock_denied` / `server_clock_unreadable` /
-  `server_clock_unavailable`) through `warn_replay_backend`, never the raw
-  backend text. `docs/plugins.md` and the CHANGELOG must keep listing `TIME` as
-  mandatory.
+  `server_clock_unavailable`, through `warn_replay_backend`) are retained
+  because the log policy and the clock requirement stay independent choices,
+  but no current constructor pairs them.
 - Every configured window derives its bucket from the SAME instant, and the
   rebuild reuses the server instant that proved the rollover rather than reading
   any clock again. No `f64` anywhere on the quota path. Token-accounting paths
@@ -847,8 +866,8 @@ on a native-gRPC request.
   Naming the window in the quota key keeps two windows of one policy on provably
   disjoint ladders. Changing this layout restarts counters on an in-place
   upgrade, so it needs a CHANGELOG note; the keyspace command set is unchanged,
-  but the server clock additionally requires `TIME` (see the clock contract
-  above). Default prefix is
+  but the server clock additionally requires `TIME` on the three QUOTA roots
+  only (see the clock contract above). Default prefix is
   `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` — the config-id component
   isolates independent policies of one plugin type inside a namespace while
   replicas of the same policy keep sharing a budget. An explicit

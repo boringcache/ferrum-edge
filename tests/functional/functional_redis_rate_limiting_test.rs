@@ -1772,7 +1772,8 @@ async fn test_rate_limiting_redis_database_selector_handshake() {
         )
         .unwrap()
         .unwrap();
-        let redis = Arc::new(RedisRateLimitClient::new(config, None, false, None).unwrap());
+        let redis =
+            Arc::new(RedisRateLimitClient::for_request_quota(config, None, false, None).unwrap());
         let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
             limit: 1,
             duration: Duration::from_secs(6),
@@ -1810,7 +1811,8 @@ async fn test_rate_limiting_redis_multi_window_rejections_leave_state_unchanged(
     )
     .unwrap()
     .unwrap();
-    let redis = Arc::new(RedisRateLimitClient::new(config, None, false, None).unwrap());
+    let redis =
+        Arc::new(RedisRateLimitClient::for_request_quota(config, None, false, None).unwrap());
     let algorithm = DynamicHttpRateLimitAlgorithm::new();
     // Hour/day windows rather than minute/hour: neither index can roll over
     // inside a sub-second test, so the counter snapshots below are stable.

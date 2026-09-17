@@ -52,6 +52,13 @@
 //! existing topology-only behavior, because eviction there degrades a counter
 //! or a cache rather than voiding a guarantee.
 //!
+//! Screening therefore carries three independent per-consumer requirements —
+//! [`RedisClientLogPolicy`], [`RedisRetentionRequirement`], and
+//! [`ServerClockRequirement`] — and each is chosen by the constructor the
+//! consumer calls. Request-quota admission
+//! (`RedisRateLimitClient::for_request_quota`) is the only one that additionally
+//! proves `TIME`; see the clock contract below.
+//!
 //! The proactive probe is bounded by the configured
 //! `redis_connect_timeout_seconds` (no separate knob): a server can accept and
 //! authenticate a connection and then never answer `INFO`, and an unbounded
@@ -213,8 +220,10 @@
 //! gateway either selects on the Redis server clock or it does not enforce
 //! centrally at all.
 //!
-//! **`TIME` is REQUIRED, and there is no local-clock fallback.** It is probed
-//! ONCE per established connection with a plain `TIME` before the socket
+//! **`TIME` is REQUIRED for request quotas, and there is no local-clock
+//! fallback.** It is probed ONCE per established connection of a client built
+//! with `RedisRateLimitClient::for_request_quota` — the consumers that charge a
+//! sub-bucket ladder — with a plain `TIME` before the socket
 //! carries a policy command. EVERY unsuccessful answer — a `NOPERM`, an
 //! `ERR unknown command` from a server that does not implement `TIME`, a
 //! malformed successful reply, a timeout, a transport failure — leaves the
@@ -229,14 +238,20 @@
 //! refusals still pick the DIAGNOSTIC (so an operator is told to grant `+time`
 //! rather than reading a generic failure); they do not pick an outcome.
 //!
-//! The probe is part of connection screening, so it runs for every consumer of
-//! this client, including the ones that never read the clock — the shared
-//! replay authority and `request_deduplication` claim markers with `SET NX EX`
-//! and order nothing on sub-buckets. Those deployments therefore need `+time`
-//! as well. Keeping one screening path is deliberate: the screen is a property
-//! of the connection rather than of the caller that happens to open it, and a
-//! per-consumer exemption would be a second admission rule to audit for one
-//! saved server command.
+//! **The requirement is scoped to the consumers that read the clock**
+//! ([`ServerClockRequirement`], chosen by the constructor the consumer calls).
+//! It is a property of the computation, not of the socket: request-quota
+//! admission charges a ladder every gateway must agree on, while the shared
+//! replay authority and `request_deduplication` claim markers with `SET NX EX`,
+//! `ai_semantic_cache` stores a blob, and the token/datagram accounting
+//! limiters reserve under a window index they compute locally. None of those
+//! order anything on sub-buckets, so their connections skip the probe entirely
+//! and keep their previous screening, and a replay-only deployment on a
+//! restrictive ACL that never granted `+time` stays in service. The scope is
+//! enforced at both ends: the probe runs only for a
+//! [`ServerClockRequirement::Required`] client, and
+//! [`RedisRateLimitClient::charge_rate_limit_windows`] refuses outright on any
+//! other, so a ladder can never be charged against an unseeded clock.
 //!
 //! **Bucket mis-settlement has a bounded rebuild, and it is not a retry
 //! budget.** Bucket selection precedes connection acquisition, so a charge is
@@ -619,7 +634,9 @@ pub fn parse_redis_server_time(value: redis::Value) -> Option<Duration> {
 /// ([`REDIS_WINDOW_TRAILING_SUB_BUCKETS`]) to cover exactly that.
 ///
 /// There is exactly ONE bucket base, and it is the server's. `TIME` is a hard
-/// requirement: a connection whose probe cannot answer a clock is discarded
+/// requirement of every client that charges a ladder
+/// ([`ServerClockRequirement::Required`]; a consumer that reads no clock never
+/// reaches this structure): a connection whose probe cannot answer a clock is discarded
 /// unpublished and the consumer's `redis_failure_policy` governs, so this
 /// structure never has to describe a second, weaker mode or a transition
 /// between two bases. Before any sample is known `at()` is the identity, which
@@ -646,7 +663,9 @@ pub struct RedisServerClock {
 
 impl RedisServerClock {
     /// A clock with no sample yet: what every client starts as, until a
-    /// screened connection probes `TIME`.
+    /// request-quota client's screened connection probes `TIME`. It stays
+    /// unseeded for the life of a client that reads no clock, which is why
+    /// [`RedisRateLimitClient::charge_rate_limit_windows`] refuses on one.
     pub fn new() -> Self {
         Self::default()
     }
@@ -2533,6 +2552,18 @@ pub struct RedisRateLimitClient {
     /// `request_deduplication` needs the second without the first
     /// (`GHSA-26gf-943w-w5x8`).
     retention: RedisRetentionRequirement,
+    /// Whether this client's consumer selects sub-buckets on the Redis server's
+    /// clock, and therefore whether a connection must prove `TIME` before it is
+    /// published.
+    ///
+    /// Chosen by the constructor the consumer calls, because it is a property
+    /// of what the consumer computes rather than of the endpoint: only
+    /// request-quota admission
+    /// ([`Self::charge_rate_limit_windows`]) orders one budget across gateways
+    /// on the server clock. A replay, idempotency, cache, or token-accounting
+    /// consumer reads no clock at all, so requiring `+time` of it would refuse
+    /// deployments that are perfectly safe.
+    server_clock_requirement: ServerClockRequirement,
     /// Lifecycle registration for shared-replay readiness/metrics. Present
     /// only after [`Self::register_as_shared_replay_authority`]; independent of
     /// connections, endpoints, and credentials. Drop of this client drops the
@@ -2581,6 +2612,27 @@ enum RedisRetentionRequirement {
     /// `maxmemory == 0` or `maxmemory_policy == noeviction` before it may carry
     /// a command, and a proven evicting endpoint is terminal.
     NoEviction,
+}
+
+/// Whether a client's consumer selects sub-buckets on the Redis server's clock.
+///
+/// `TIME` is a hard requirement for the consumers that do — a ladder selected
+/// on an uncorrected local clock is not a shared budget — but it is a
+/// requirement of the *computation*, not of the socket. Request-quota admission
+/// charges a sub-bucket ladder that every gateway must agree on; a replay or
+/// idempotency authority claims a marker with `SET NX EX`, a cache stores a
+/// blob, and the token-accounting limiters reserve under a window index they
+/// compute locally. None of those read the clock, so a restrictive ACL that
+/// withholds `+time` must not take them out of service.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServerClockRequirement {
+    /// Request-quota admission. Every established connection proves `TIME`
+    /// during screening ([`RedisRateLimitClient::probe_server_time`]) and every
+    /// charge transaction queues one.
+    Required,
+    /// The consumer never reads the server clock. No probe runs, and
+    /// [`RedisRateLimitClient::charge_rate_limit_windows`] refuses outright.
+    NotUsed,
 }
 
 /// Why an endpoint is permanently refused for this client generation.
@@ -3054,6 +3106,11 @@ impl RedisRateLimitClient {
     /// Returns `Err` when a CA bundle path is configured, verification is
     /// enabled, and the bundle cannot be loaded. That is fail-closed exclusive
     /// trust: the client is never built against redis-rs default roots.
+    ///
+    /// The consumer is assumed NOT to read the Redis server clock, so no `TIME`
+    /// probe runs and [`Self::charge_rate_limit_windows`] refuses. Caches,
+    /// `SET NX EX` markers, and the token/datagram accounting limiters all
+    /// belong here; request-quota admission must use [`Self::for_request_quota`].
     pub fn new(
         config: RedisConfig,
         dns_cache: Option<DnsCache>,
@@ -3067,6 +3124,44 @@ impl RedisRateLimitClient {
             tls_ca_bundle_path,
             RedisClientLogPolicy::Operational,
             RedisRetentionRequirement::BestEffort,
+            ServerClockRequirement::NotUsed,
+        )
+    }
+
+    /// Redis client for centralized request-quota admission — the consumers
+    /// that charge a sub-bucket ladder (`rate_limiting`, `graphql`,
+    /// `grpc_method_router`, through `check_http_windows_redis`).
+    ///
+    /// Identical to [`Self::new`] except that the server clock is a hard
+    /// prerequisite: every established connection proves `TIME` with a plain
+    /// standalone command during screening ([`Self::probe_server_time`]) before
+    /// the socket may carry a policy command, and every charge transaction
+    /// queues one `TIME` inside its own `MULTI`/`EXEC`. Sub-buckets are only as
+    /// shared as the clock that selects them, so a connection that cannot
+    /// answer a clock is discarded unpublished and `redis_failure_policy`
+    /// governs.
+    ///
+    /// The requirement is deliberately NOT a property of the socket. Screening
+    /// is shared with every other consumer of this client, and the replay,
+    /// idempotency, cache and token-accounting consumers read no clock at all —
+    /// making them prove `TIME` would take a replay-only deployment on a
+    /// restrictive ACL out of service for a command it never sends.
+    ///
+    /// Returns `Err` under the same exclusive-CA load failure as [`Self::new`].
+    pub fn for_request_quota(
+        config: RedisConfig,
+        dns_cache: Option<DnsCache>,
+        tls_no_verify: bool,
+        tls_ca_bundle_path: Option<&str>,
+    ) -> Result<Self, String> {
+        Self::construct(
+            config,
+            dns_cache,
+            tls_no_verify,
+            tls_ca_bundle_path,
+            RedisClientLogPolicy::Operational,
+            RedisRetentionRequirement::BestEffort,
+            ServerClockRequirement::Required,
         )
     }
 
@@ -3104,6 +3199,7 @@ impl RedisRateLimitClient {
             tls_ca_bundle_path,
             RedisClientLogPolicy::Operational,
             RedisRetentionRequirement::NoEviction,
+            ServerClockRequirement::NotUsed,
         )
     }
 
@@ -3136,6 +3232,7 @@ impl RedisRateLimitClient {
             tls_ca_bundle_path,
             RedisClientLogPolicy::ClassificationOnly,
             RedisRetentionRequirement::NoEviction,
+            ServerClockRequirement::NotUsed,
         )
     }
 
@@ -3146,6 +3243,7 @@ impl RedisRateLimitClient {
         tls_ca_bundle_path: Option<&str>,
         log_policy: RedisClientLogPolicy,
         retention: RedisRetentionRequirement,
+        server_clock_requirement: ServerClockRequirement,
     ) -> Result<Self, String> {
         let tls_ca_bundle_pem = load_redis_tls_ca_bundle(tls_no_verify, tls_ca_bundle_path)?;
 
@@ -3163,6 +3261,7 @@ impl RedisRateLimitClient {
             tls_ca_bundle_pem,
             log_policy,
             retention,
+            server_clock_requirement,
             shared_replay_health: OnceLock::new(),
             pending_compensations: AtomicUsize::new(0),
             server_clock: RedisServerClock::new(),
@@ -3229,6 +3328,26 @@ impl RedisRateLimitClient {
     /// may carry a command.
     fn requires_no_eviction(&self) -> bool {
         matches!(self.retention, RedisRetentionRequirement::NoEviction)
+    }
+
+    /// Whether this client's consumer selects sub-buckets on the Redis server's
+    /// clock, and therefore whether every connection must prove `TIME`.
+    fn requires_server_clock(&self) -> bool {
+        matches!(
+            self.server_clock_requirement,
+            ServerClockRequirement::Required
+        )
+    }
+
+    /// Whether this client declared the server-clock requirement at
+    /// construction (test support).
+    ///
+    /// The probe itself needs a live server, so this is how coverage proves a
+    /// consumer asked for the prerequisite — the exact distinction between a
+    /// deployment that must grant `+time` and one that must not be forced to.
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn requires_server_clock_for_test(&self) -> bool {
+        self.requires_server_clock()
     }
 
     /// Whether this client requires the no-eviction retention proof
@@ -3345,10 +3464,12 @@ impl RedisRateLimitClient {
     /// proven to be an unsupported topology is never available again, so a
     /// consumer's failure policy applies for the life of the client.
     ///
-    /// An endpoint that cannot answer `TIME` reaches this the ordinary way: the
-    /// probe leaves the connection unpublished and marks the client
-    /// unavailable, so there is no second gate to consult and no mode in which
-    /// this reads `true` while the bucket clock is not the server's.
+    /// For a request-quota client, an endpoint that cannot answer `TIME`
+    /// reaches this the ordinary way: the probe leaves the connection
+    /// unpublished and marks the client unavailable, so there is no second gate
+    /// to consult and no mode in which this reads `true` while the bucket clock
+    /// is not the server's. A client that reads no clock never probes, so its
+    /// availability is unaffected by the endpoint's `TIME` ACL.
     pub fn is_available(&self) -> bool {
         self.availability.is_available()
     }
@@ -4096,11 +4217,21 @@ impl RedisRateLimitClient {
     /// a `WATCH`/`MULTI` sequence, and before it is cloned — restores a bounded
     /// command deadline for every policy operation that follows. A connection
     /// that fails the screen is dropped, so it is never armed.
+    ///
+    /// The `TIME` probe runs only for clients that declared
+    /// [`ServerClockRequirement::Required`]. It is the one screen that belongs
+    /// to the consumer rather than to the endpoint: only request-quota
+    /// admission orders a shared ladder on the server's clock, so requiring the
+    /// command of a replay, idempotency, cache, or token-accounting client
+    /// would take a deployment out of service over a command it never sends.
     async fn screen_and_arm(&self, conn: &mut redis::aio::MultiplexedConnection) -> bool {
         if !self.screen_established_connection(conn).await {
             return false;
         }
         conn.set_response_timeout(SCREENED_COMMAND_RESPONSE_TIMEOUT);
+        if !self.requires_server_clock() {
+            return true;
+        }
         self.probe_server_time(conn).await
     }
 
@@ -4115,9 +4246,10 @@ impl RedisRateLimitClient {
     /// Read the server clock on a freshly screened connection, seed the offset
     /// from it, and report whether the connection may be used at all.
     ///
-    /// Run once per established connection — at first use and after every
-    /// reconnect — because the answer belongs to the server (its ACL, and its
-    /// clock), which an operator can change under a live gateway. It is
+    /// Run once per established connection of a
+    /// [`ServerClockRequirement::Required`] client — at first use and after
+    /// every reconnect — because the answer belongs to the server (its ACL, and
+    /// its clock), which an operator can change under a live gateway. It is
     /// deliberately a STANDALONE command rather than a trial `TIME` inside a
     /// real transaction: a denied command queued in `MULTI` aborts the whole
     /// `EXEC`, so a probe that guessed wrong would fail an admission instead of
@@ -4226,6 +4358,13 @@ impl RedisRateLimitClient {
     /// redacted endpoint and nothing else — no backend text ever reaches their
     /// logs, and a probe failure is no exception. Operational clients get the
     /// actionable sentence. Neither arm interpolates the server's reply.
+    ///
+    /// No constructor currently pairs
+    /// [`RedisClientLogPolicy::ClassificationOnly`] with
+    /// [`ServerClockRequirement::Required`], so the classification arm is
+    /// reachable only if one is added. It stays because the two are deliberately
+    /// independent choices: a future clock-reading consumer that must not
+    /// publish backend text would otherwise leak it from exactly this path.
     fn reject_unclocked_connection(
         &self,
         classification: &'static str,
@@ -4262,8 +4401,13 @@ impl RedisRateLimitClient {
     /// The two-sided settlement check remains the guarantee for every selection
     /// that still happens on a stale base — a wall-clock step, or an offset
     /// learned before a server-side clock change.
+    ///
+    /// Only a [`ServerClockRequirement::Required`] client's connections probe,
+    /// so seeding a client that reads no clock would dial for nothing; it is
+    /// skipped, and [`Self::charge_rate_limit_windows`] refuses on such a
+    /// client anyway.
     pub async fn ensure_clock_seeded(&self) {
-        if self.server_clock.offset_nanos().is_some() {
+        if !self.requires_server_clock() || self.server_clock.offset_nanos().is_some() {
             return;
         }
         let _ = self.get_connection().await;
@@ -5301,12 +5445,43 @@ impl RedisRateLimitClient {
     /// rather than at the caller: this helper is `pub`, so it carries its own
     /// bound instead of trusting every present and future caller's config
     /// validation to keep an atomic operation inside the fixed buffers.
+    ///
+    /// For the same reason it carries the server-clock prerequisite itself. A
+    /// client built with anything but [`Self::for_request_quota`] declared
+    /// [`ServerClockRequirement::NotUsed`], so its connections never proved
+    /// `TIME` and its offset was never seeded; charging a ladder on it would
+    /// select every sub-bucket from this gateway's raw local clock, which is
+    /// the local-clock mode this layout exists to refuse. That is a wiring
+    /// mistake rather than an operator's configuration, so it trips a debug
+    /// assertion and refuses with `Err(())` in release.
     // Redis command failures are intentionally collapsed to () at this boundary.
     #[allow(clippy::result_unit_err)]
     pub async fn charge_rate_limit_windows(
         &self,
         windows: &[RedisWindowCharge],
     ) -> Result<RedisChargeOutcome, ()> {
+        // A client built for a consumer that reads no clock never probed
+        // `TIME`, so its connections carry no proof that this endpoint can
+        // order one ladder across gateways — and its `RedisServerClock` offset
+        // is unseeded, which would place every sub-bucket on this gateway's raw
+        // local clock. That is exactly the local-clock mode this layout exists
+        // to refuse, so fail closed rather than charge. Reaching here is a
+        // wiring mistake in Ferrum itself, not an operator's configuration,
+        // hence the debug assertion above the release refusal.
+        debug_assert!(
+            self.requires_server_clock(),
+            "charge_rate_limit_windows requires a client built with \
+             RedisRateLimitClient::for_request_quota"
+        );
+        if !self.requires_server_clock() {
+            warn_sampled!(
+                redis_url = %self.config.redacted_url(),
+                operation = "GET+INCR+EXPIRE+TIME",
+                "Redis rate-limit charge attempted on a client that did not declare the \
+                 server-clock requirement"
+            );
+            return Err(());
+        }
         if windows.is_empty() {
             return Ok(RedisChargeOutcome::default());
         }

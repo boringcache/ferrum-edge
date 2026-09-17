@@ -2250,14 +2250,15 @@ fn replay_info_reply(chunk: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// The standalone `TIME` screening probe every established connection runs
-/// after its `INFO` screens, answered from the one shared fixture definition.
+/// The standalone `TIME` screening probe a REQUEST-QUOTA connection runs after
+/// its `INFO` screens, answered from the one shared fixture definition.
 ///
-/// The replay authority never reads the server clock — it claims markers with
-/// `SET NX EX` — but it shares `RedisRateLimitClient`'s connection screening,
-/// and a connection that cannot answer `TIME` with a clock is dropped
-/// unpublished. A catch-all `+OK` therefore refuses the endpoint before any
-/// claim reaches it. See [`super::redis_resp`].
+/// A replay authority reads no server clock — it claims markers with
+/// `SET NX EX` — so its connections skip the probe and these fixtures are never
+/// asked. The arm is retained because a fake peer that stands in for a real
+/// Redis should answer what a real Redis answers, and because a fixture shared
+/// with quota coverage would otherwise refuse the endpoint with its catch-all
+/// `+OK`. See [`super::redis_resp`].
 fn replay_time_reply(chunk: &[u8]) -> Option<Vec<u8>> {
     resp_contains(chunk, TIME_CMD).then(host_clock_time_reply)
 }
@@ -3043,9 +3044,9 @@ enum LoggingShape {
     CommandError,
     ClusterInfo,
     ClusterMoved,
-    /// The standalone `TIME` screen answers an ordinary `-ERR`. `TIME` is a
-    /// hard requirement, so the connection is rejected — and the rejection must
-    /// not carry the backend's text into a replay client's logs.
+    /// The standalone `TIME` screen answers an ordinary `-ERR`. A replay
+    /// authority must never send that command in the first place, so this peer
+    /// serves it and every claim on it still succeeds.
     TimeError,
 }
 
@@ -3185,16 +3186,10 @@ async fn replay_client_logs_only_classification_and_redacted_endpoint() {
             LoggingShape::ClusterMoved,
             "unsupported_topology",
         ),
-        // The shared `TIME` screen runs on every connection this client
-        // establishes, including the ones that never read a clock, and `TIME`
-        // is a hard requirement. An ordinary `-ERR` there rejects the socket,
-        // and that rejection must go through the same classification-only
-        // logger as every other replay-backend failure.
-        (
-            "server_clock",
-            LoggingShape::TimeError,
-            "server_clock_unavailable",
-        ),
+        // No `server_clock` row: a replay authority reads no clock, so its
+        // connections never probe `TIME` and there is no such rejection to
+        // classify. That the probe is genuinely absent is asserted by
+        // `a_replay_authority_never_probes_the_server_clock` below.
     ] {
         let (port, probes, shutdown) = spawn_logging_redis_server(shape).await;
         let config = sentinel_replay_config(port);
@@ -3246,20 +3241,7 @@ async fn replay_client_logs_only_classification_and_redacted_endpoint() {
                     "{label}: sentinel backend must fail closed"
                 );
             }
-            LoggingShape::TimeError => {
-                // The connection is rejected at the screen, so the client never
-                // becomes available and the claim fails closed.
-                assert_eq!(
-                    authority.admit(&marker).await,
-                    ReplayAdmission::AuthorityUnavailable,
-                    "{label}: a backend that cannot answer TIME must fail closed"
-                );
-                wait_until(
-                    || logs.contents().contains(expected_class),
-                    &format!("{label}: probe classification"),
-                )
-                .await;
-            }
+            LoggingShape::TimeError => unreachable!("no server_clock row above"),
         }
         drop(guard);
         let captured = logs.contents();
@@ -3278,6 +3260,47 @@ async fn replay_client_logs_only_classification_and_redacted_endpoint() {
         drop(client);
         let _ = shutdown.send(());
     }
+}
+
+/// A replay authority reads no server clock, so an endpoint whose ACL refuses
+/// `TIME` must still admit its claims.
+///
+/// Connection screening is shared with request-quota clients, so making the
+/// `TIME` probe a property of the socket took every replay-only deployment on a
+/// restrictive ACL out of service for a command it never sends. The peer here
+/// answers `-ERR` to `TIME` and `+OK` to the claim: a client that probed would
+/// discard the connection unpublished and fail closed, and a client that does
+/// not probe claims normally.
+#[tokio::test(flavor = "current_thread")]
+async fn a_replay_authority_never_probes_the_server_clock() {
+    let _serialized = shared_health_guard_async().await;
+
+    let (port, _probes, shutdown) = spawn_logging_redis_server(LoggingShape::TimeError).await;
+    let config = sentinel_replay_config(port);
+    let (logs, guard) = super::plugin_utils::capture_logs();
+    let client = Arc::new(replay_redis_client(config));
+    let authority = shared_live(Arc::clone(&client), RETENTION);
+
+    wait_until_available(&client).await;
+    let marker = domain("shared-no-clock").marker(&[b"c", b"first"]);
+    assert_eq!(
+        authority.admit(&marker).await,
+        ReplayAdmission::Admitted,
+        "an endpoint that denies TIME still backs single-use claims"
+    );
+
+    drop(guard);
+    let captured = logs.contents();
+    assert!(
+        !captured.contains("server_clock"),
+        "no server-clock classification may be published for a consumer that reads \
+         no clock: {captured}"
+    );
+    assert_sentinels_absent(&captured, "no_clock_probe");
+
+    drop(authority);
+    drop(client);
+    let _ = shutdown.send(());
 }
 
 /// Generic rate-limiter clients keep publishing backend error text. The replay

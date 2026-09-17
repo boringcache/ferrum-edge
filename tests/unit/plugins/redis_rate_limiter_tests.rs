@@ -2348,8 +2348,10 @@ enum ServerTimeMode {
     /// relative to Redis, so an uncorrected selection lands in the future,
     /// where no peer's trailing window reaches it.
     Behind(Duration),
-    /// A restrictive ACL: `TIME` is refused. The connection cannot be screened,
-    /// so the store is unavailable and `redis_failure_policy` governs.
+    /// A restrictive ACL: `TIME` is refused. A request-quota client's connection
+    /// cannot be screened, so the store is unavailable and
+    /// `redis_failure_policy` governs. A client that reads no clock never sends
+    /// the command and is unaffected.
     Denied,
     /// A RESP-compatible server that does not implement `TIME` at all. Like
     /// `Denied`, a permanent statement about the endpoint — and the same
@@ -2428,6 +2430,10 @@ struct KeyspaceState {
     /// keyspace lock, so it is the real serialization order across connections
     /// and not a dispatch order — which is what an ordering assertion needs.
     ops: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    /// Standalone `TIME` commands this server answered — the connection-screening
+    /// probe, counted apart from the `TIME` that rides inside a charge
+    /// transaction. Zero proves a client never asked for the server clock.
+    clock_probes: Arc<AtomicUsize>,
     /// The fixture's `TIME` behaviour, settable while the server is running so
     /// a test can revoke or restore the ACL under a LIVE client — which is the
     /// only way to exercise a clock-mode transition rather than a startup
@@ -2469,6 +2475,9 @@ impl KeyspaceState {
         if name == "TIME" {
             if in_transaction && self.breaks_transaction_time() {
                 return b"+OK\r\n".to_vec();
+            }
+            if !in_transaction {
+                self.clock_probes.fetch_add(1, Ordering::Relaxed);
             }
             return match self.time_mode() {
                 ServerTimeMode::Denied => TIME_DENIED_REPLY.to_vec(),
@@ -2642,6 +2651,11 @@ impl KeyspaceServer {
         self.state.decrs.load(Ordering::Relaxed)
     }
 
+    /// Standalone `TIME` commands answered: the connection-screening probe.
+    fn clock_probes(&self) -> usize {
+        self.state.clock_probes.load(Ordering::Relaxed)
+    }
+
     /// Every key the fake keyspace holds.
     fn keys(&self) -> Vec<String> {
         let mut keys: Vec<String> = self
@@ -2720,6 +2734,7 @@ async fn spawn_keyspace_redis_server(options: KeyspaceServerOptions) -> Keyspace
         charges: Arc::new(AtomicUsize::new(0)),
         compensations: Arc::new(AtomicUsize::new(0)),
         ops: Arc::new(std::sync::Mutex::new(Vec::new())),
+        clock_probes: Arc::new(AtomicUsize::new(0)),
         time_mode: Arc::new(std::sync::Mutex::new(options.time_mode)),
         options,
     };
@@ -2780,7 +2795,7 @@ async fn serve_keyspace_connection(mut stream: tokio::net::TcpStream, state: Key
     }
 }
 
-fn keyspace_client(port: u16) -> RedisRateLimitClient {
+fn keyspace_config(port: u16) -> RedisConfig {
     let url = format!("redis://127.0.0.1:{port}/0");
     let mut config = make_config(&url, false);
     config.connect_timeout_seconds = 5;
@@ -2790,7 +2805,11 @@ fn keyspace_client(port: u16) -> RedisRateLimitClient {
     // transaction behind it on one socket; the timing under test is the
     // client's, not the fake server's read loop.
     config.pool_size = 4;
-    redis_rate_limit_client_for_test(config)
+    config
+}
+
+fn keyspace_client(port: u16) -> RedisRateLimitClient {
+    redis_rate_limit_client_for_test(keyspace_config(port))
 }
 
 /// Two requests that select adjacent sub-buckets must not both be admitted
@@ -4180,6 +4199,115 @@ async fn a_server_that_does_not_implement_time_is_an_unusable_endpoint() {
     let _ = server.shutdown.send(());
 }
 
+// ── The `TIME` requirement is scoped to the consumers that read the clock ──
+//
+// Connection screening is shared by every consumer of `RedisRateLimitClient`,
+// so making the probe a property of the SOCKET made `+time` mandatory for
+// `request_deduplication`, `soap_ws_security`'s shared replay authority,
+// `ai_semantic_cache`, and the three token/frame/datagram budgets — none of
+// which ever selects a sub-bucket. The requirement is therefore declared at
+// construction, and enforced at both ends: the probe runs only for a
+// request-quota client, and the ladder refuses to charge on any other.
+
+/// A consumer that reads no server clock never sends `TIME`, so an endpoint
+/// whose ACL denies it stays fully usable for that consumer.
+///
+/// The same fixture refuses the request-quota client on the same connection
+/// screen, which is what keeps the two halves of this test honest: the endpoint
+/// is identical, only the declared requirement differs.
+#[tokio::test]
+async fn only_a_request_quota_client_probes_the_server_clock() {
+    use ferrum_edge::_test_support::redis_client_without_server_clock_for_test;
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        time_mode: ServerTimeMode::Denied,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+
+    // A replay / idempotency / cache / token-budget client: no probe, no
+    // refusal, and the endpoint's missing `+time` grant is none of its business.
+    let clockless = redis_client_without_server_clock_for_test(keyspace_config(server.port));
+    let counted = clockless.incr_with_expire("ferrum:clockless:key", 60).await;
+    assert_eq!(
+        counted,
+        Ok(1),
+        "a consumer that reads no clock must not be refused by a TIME ACL"
+    );
+    assert!(
+        clockless.is_available(),
+        "an endpoint that denies TIME is still a usable marker/counter store"
+    );
+    assert_eq!(
+        clockless.server_clock().offset_nanos(),
+        None,
+        "a clockless consumer learns no offset because it asks for none"
+    );
+    assert_eq!(
+        server.clock_probes(),
+        0,
+        "no standalone TIME may be sent on behalf of a consumer that reads no clock"
+    );
+
+    // The request-quota client, against the very same endpoint.
+    let quota = keyspace_client(server.port);
+    let bucket = RedisRateLimitClient::sub_bucket_at(Duration::from_secs(100), 1);
+    let charge = quota.window_charge("ip:127.0.0.1", bucket, 3);
+    assert!(
+        quota.charge_rate_limit_windows(&[charge]).await.is_err(),
+        "a shared ladder cannot be charged against an endpoint that denies TIME"
+    );
+    assert!(!quota.is_available());
+    assert!(
+        server.clock_probes() >= 1,
+        "the request-quota client must screen the server clock before it charges"
+    );
+    assert_eq!(
+        server.incrs(),
+        0,
+        "no policy command may run on a connection that could not be screened"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// Charging a ladder on a client that never declared the requirement is a
+/// wiring mistake, and it fails closed.
+///
+/// Such a client never probed `TIME`, so its `RedisServerClock` offset is
+/// unseeded and every sub-bucket would be selected from this gateway's raw
+/// local clock — precisely the local-clock mode the layout exists to refuse.
+/// The guard runs before any connection is acquired, so the unreachable
+/// endpoint below is never dialled.
+async fn charge_on_a_clockless_client_is_refused() -> bool {
+    use ferrum_edge::_test_support::redis_client_without_server_clock_for_test;
+
+    let config = make_config("redis://127.0.0.1:6379/0", false);
+    let client = redis_client_without_server_clock_for_test(config);
+    let bucket = RedisRateLimitClient::sub_bucket_at(Duration::from_secs(100), 1);
+    let charge = client.window_charge("ip:127.0.0.1", bucket, 3);
+    client.charge_rate_limit_windows(&[charge]).await.is_err()
+}
+
+/// Debug builds make the mistake loud.
+#[cfg(debug_assertions)]
+#[tokio::test]
+#[should_panic(expected = "for_request_quota")]
+async fn a_client_without_the_server_clock_requirement_cannot_charge_a_ladder() {
+    let _ = charge_on_a_clockless_client_is_refused().await;
+}
+
+/// Release builds refuse instead of panicking: a proxy hot path never aborts
+/// the process over a decision it can fail closed on.
+#[cfg(not(debug_assertions))]
+#[tokio::test]
+async fn a_client_without_the_server_clock_requirement_cannot_charge_a_ladder() {
+    assert!(
+        charge_on_a_clockless_client_is_refused().await,
+        "a ladder charged on an unseeded clock is not a shared budget"
+    );
+}
+
 // ── An ACL change is an outage, not a mode change (review round 6) ────────
 //
 // There is ONE bucket base: the Redis server's. A gateway that cannot read it
@@ -4578,6 +4706,128 @@ fn the_server_clock_rides_inside_the_charge_transaction_and_is_probed_first() {
         "selection is the ONLY bucket-clock read on the quota path: settlement now \
          always uses the instant the transaction itself returned"
     );
+
+    // The requirement is scoped at BOTH ends, and the two must stay paired: a
+    // probe that only screened, or a charge that only asserted, would let a
+    // clockless client select sub-buckets on its own wall clock.
+    assert!(
+        screen.contains("if !self.requires_server_clock() {"),
+        "only a request-quota client's connections may spend a round trip proving \
+         TIME: {screen}"
+    );
+    assert!(
+        charge.contains("if !self.requires_server_clock() {"),
+        "the ladder must fail closed on a client that never declared the \
+         server-clock requirement: {charge}"
+    );
+    assert!(
+        charge.contains("debug_assert!("),
+        "and it must say so loudly in debug, where reaching it is a wiring bug: \
+         {charge}"
+    );
+    assert!(
+        redis.contains("enum ServerClockRequirement"),
+        "the requirement is a construction-time property, not a runtime guess"
+    );
+
+    // The limiter picks the client kind from the ALGORITHM, so a new algorithm
+    // cannot silently inherit a quota client's ACL demand.
+    assert!(
+        limiter.contains("if A::REQUIRES_SERVER_CLOCK {")
+            && limiter.contains("RedisRateLimitClient::for_request_quota("),
+        "RedisLimiter must choose its client from the algorithm's declared contract"
+    );
+    assert!(
+        limiter.contains("const REQUIRES_SERVER_CLOCK: bool;"),
+        "the contract must stay a REQUIRED associated const: a default would let a \
+         new algorithm decide an operator's Redis ACL by omission"
+    );
+}
+
+/// The six Redis-backed rate-limit roots, and which of them makes `+time`
+/// mandatory.
+///
+/// Only the three request-quota roots charge the shared sub-bucket ladder. The
+/// token, frame, and datagram budgets index their windows locally, so an ACL
+/// that withholds `TIME` must leave them enforcing. A new root added without a
+/// row here fails the count assertion rather than quietly inheriting either
+/// answer.
+#[test]
+fn only_the_request_quota_roots_make_the_server_clock_mandatory() {
+    use ferrum_edge::_test_support::rate_limit_redis_requires_server_clock;
+
+    let redis_fields = |extra: serde_json::Value| {
+        let mut base = json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:6379/0",
+            "redis_health_check_interval_seconds": 3600,
+        });
+        let (Some(object), Some(extra)) = (base.as_object_mut(), extra.as_object()) else {
+            return base;
+        };
+        for (key, value) in extra {
+            object.insert(key.clone(), value.clone());
+        }
+        base
+    };
+
+    let expected = [
+        (
+            "rate_limiting",
+            redis_fields(json!({
+                "limit_by": "ip",
+                "limits": [{ "scope": "default", "requests_per_minute": 10 }]
+            })),
+            true,
+        ),
+        (
+            "graphql",
+            redis_fields(json!({
+                "type_rate_limits": { "query": { "max_requests": 5, "window_seconds": 60 } }
+            })),
+            true,
+        ),
+        (
+            "grpc_method_router",
+            redis_fields(json!({
+                "method_rate_limits": {
+                    "/pkg.Svc/M": { "max_requests": 5, "window_seconds": 60 }
+                }
+            })),
+            true,
+        ),
+        (
+            "ai_rate_limiter",
+            redis_fields(json!({ "token_limit": 100, "window_seconds": 60 })),
+            false,
+        ),
+        (
+            "ws_rate_limiting",
+            redis_fields(json!({ "frames_per_second": 10, "burst_size": 10 })),
+            false,
+        ),
+        (
+            "udp_rate_limiting",
+            redis_fields(json!({ "datagrams_per_second": 10 })),
+            false,
+        ),
+    ];
+
+    assert_eq!(
+        expected.len(),
+        6,
+        "every Redis-backed rate-limit root must state which clock contract it is on"
+    );
+    for (plugin_name, config, requires_clock) in expected {
+        let observed = rate_limit_redis_requires_server_clock(plugin_name, &config)
+            .unwrap_or_else(|error| panic!("{plugin_name}: {error}"))
+            .unwrap_or_else(|| panic!("{plugin_name}: sync_mode redis must build a client"));
+        assert_eq!(
+            observed, requires_clock,
+            "{plugin_name}: server-clock requirement (and therefore whether the \
+             deployment's Redis ACL must grant +time)"
+        );
+    }
 }
 
 /// Review finding 3: a capacity refusal taken during a per-decision fallback
@@ -5415,6 +5665,64 @@ fn only_retention_authorities_require_the_no_eviction_screen() {
     assert!(
         retention.requires_no_eviction_screen_for_test(),
         "an idempotency authority must prove the endpoint retains its records"
+    );
+}
+
+/// The `TIME` prerequisite belongs to the consumers that select sub-buckets on
+/// the Redis server's clock, not to the socket. Screening is shared, so making
+/// it a property of the connection took a replay-only deployment on a
+/// restrictive ACL out of service for a command it never sends.
+#[test]
+fn only_request_quota_clients_require_the_server_clock() {
+    let config = make_config("redis://127.0.0.1:6379/0", false);
+
+    let quota = RedisRateLimitClient::for_request_quota(config.clone(), None, false, None)
+        .expect("construction without a CA path must succeed");
+    assert!(
+        quota.requires_server_clock_for_test(),
+        "request-quota admission orders one ladder across gateways on the server clock"
+    );
+
+    let counters = RedisRateLimitClient::new(config.clone(), None, false, None)
+        .expect("construction without a CA path must succeed");
+    let replay = RedisRateLimitClient::for_replay_authority(config.clone(), None, false, None)
+        .expect("construction without a CA path must succeed");
+    let retention = RedisRateLimitClient::for_retention_authority(config, None, false, None)
+        .expect("construction without a CA path must succeed");
+
+    for (label, client) in [
+        ("counter/cache", &counters),
+        ("replay authority", &replay),
+        ("retention authority", &retention),
+    ] {
+        assert!(
+            !client.requires_server_clock_for_test(),
+            "{label}: a consumer that reads no clock must not force an operator to grant +time"
+        );
+    }
+}
+
+/// The two screening prerequisites are independent: the retention proof follows
+/// what a consumer RETAINS, the clock proof follows what it COMPUTES, and no
+/// current consumer needs both.
+#[test]
+fn the_retention_and_server_clock_prerequisites_are_chosen_independently() {
+    let config = make_config("redis://127.0.0.1:6379/0", false);
+
+    let quota = RedisRateLimitClient::for_request_quota(config.clone(), None, false, None)
+        .expect("construction without a CA path must succeed");
+    assert!(quota.requires_server_clock_for_test());
+    assert!(
+        !quota.requires_no_eviction_screen_for_test(),
+        "an evicted counter degrades a budget; it does not void a guarantee"
+    );
+
+    let retention = RedisRateLimitClient::for_retention_authority(config, None, false, None)
+        .expect("construction without a CA path must succeed");
+    assert!(retention.requires_no_eviction_screen_for_test());
+    assert!(
+        !retention.requires_server_clock_for_test(),
+        "an idempotency authority claims markers with SET NX EX and reads no clock"
     );
 }
 

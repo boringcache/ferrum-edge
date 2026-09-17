@@ -1,13 +1,17 @@
 //! RESP wire fixtures every fake Redis peer in the test suites shares.
 //!
-//! `RedisRateLimitClient` screens each connection it establishes and then asks
-//! that connection for the server clock with a standalone `TIME`
-//! (`RedisRateLimitClient::probe_server_time`). Exactly three replies leave the
-//! connection usable: a well-formed clock, a `NOPERM` verdict, and an
-//! unknown-command verdict. Everything else — including the `+OK` a catch-all
-//! stub answers — is an endpoint the client cannot pair with a clock, so the
-//! connection is dropped unpublished and every command that would have run on
-//! it fails.
+//! A `RedisRateLimitClient` built for request-quota admission
+//! (`RedisRateLimitClient::for_request_quota`) screens each connection it
+//! establishes and then asks that connection for the server clock with a
+//! standalone `TIME` (`RedisRateLimitClient::probe_server_time`). Only a
+//! well-formed clock leaves such a connection usable; everything else —
+//! including the `+OK` a catch-all stub answers — is an endpoint the client
+//! cannot pair with a clock, so the connection is dropped unpublished and every
+//! command that would have run on it fails.
+//!
+//! Clients for consumers that read no clock (caches, `SET NX EX` markers, the
+//! token/frame/datagram budgets) never send the command at all, so their
+//! fixtures are never asked.
 //!
 //! A real Redis answers `TIME`, so a fixture standing in for one has to answer
 //! it too. It answers it from here, so the wire shape and the two verdict

@@ -5559,6 +5559,50 @@ pub mod _test_support {
         }
     }
 
+    // ── Redis server-clock requirement (`+time`) ─────────────────────────────
+    /// Whether one rate-limit plugin's centralized client demands the Redis
+    /// server clock, and therefore whether its deployment's ACL must grant
+    /// `+time`.
+    ///
+    /// `None` for a local-only config. Only the three request-quota roots
+    /// charge the shared sub-bucket ladder; the token, frame, and datagram
+    /// budgets index their windows locally and must not be taken out of service
+    /// by an endpoint that withholds `TIME`.
+    pub fn rate_limit_redis_requires_server_clock(
+        plugin_name: &str,
+        config: &serde_json::Value,
+    ) -> Result<Option<bool>, String> {
+        use crate::plugins::PluginHttpClient;
+        use crate::plugins::ai_rate_limiter::AiRateLimiter;
+        use crate::plugins::graphql::GraphqlPlugin;
+        use crate::plugins::grpc_method_router::GrpcMethodRouter;
+        use crate::plugins::rate_limiting::RateLimiting;
+        use crate::plugins::udp_rate_limiting::UdpRateLimiting;
+        use crate::plugins::ws_rate_limiting::WsRateLimiting;
+
+        let http = PluginHttpClient::default();
+        match plugin_name {
+            "rate_limiting" => {
+                Ok(RateLimiting::new(config, http)?.redis_requires_server_clock_for_test())
+            }
+            "graphql" => {
+                Ok(GraphqlPlugin::new(config, http)?.redis_requires_server_clock_for_test())
+            }
+            "grpc_method_router" => {
+                Ok(GrpcMethodRouter::new(config, http)?.redis_requires_server_clock_for_test())
+            }
+            "ai_rate_limiter" => {
+                Ok(AiRateLimiter::new(config, http)?.redis_requires_server_clock_for_test())
+            }
+            "ws_rate_limiting" => {
+                Ok(WsRateLimiting::new(config, http)?.redis_requires_server_clock_for_test())
+            }
+            "udp_rate_limiting" => Ok(UdpRateLimiting::new_with_http_client(config, http)?
+                .redis_requires_server_clock_for_test()),
+            other => Err(format!("unsupported rate-limit plugin: {other}")),
+        }
+    }
+
     /// Mark a constructed `rate_limiting` policy's centralized store
     /// unavailable so its next enforcement decision fails closed. `false` when
     /// the policy is local-only and has no client to mark.
@@ -5940,7 +5984,17 @@ pub mod _test_support {
         }
     }
 
+    /// A request-quota client: the kind that screens `TIME` on every connection
+    /// and charges the shared sub-bucket ladder.
     pub fn redis_rate_limit_client_for_test(config: RedisConfig) -> RedisRateLimitClient {
+        RedisRateLimitClient::for_request_quota(config, None, false, None)
+            .expect("construction without a CA path must succeed")
+    }
+
+    /// A client for a consumer that reads no server clock (caches, `SET NX EX`
+    /// markers, token/frame/datagram budgets): no `TIME` probe, and the quota
+    /// ladder refuses on it.
+    pub fn redis_client_without_server_clock_for_test(config: RedisConfig) -> RedisRateLimitClient {
         RedisRateLimitClient::new(config, None, false, None)
             .expect("construction without a CA path must succeed")
     }

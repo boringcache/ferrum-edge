@@ -416,6 +416,24 @@ pub trait RateLimitAlgorithm: Send + Sync + 'static {
     type State: Send + Sync + 'static;
     type Op: Send + Sync;
 
+    /// Whether this algorithm's Redis path selects its buckets on the **Redis
+    /// server's** clock, and therefore needs the `TIME` command.
+    ///
+    /// Only request-quota admission does (`check_http_windows_redis`): its
+    /// sub-bucket ladder is shared across gateways, so the instant that selects
+    /// a bucket has to be the one that orders every gateway's charge. The
+    /// token- and datagram-accounting algorithms reserve under a
+    /// `{tag}:{window_index}` index they compute locally and never read the
+    /// server clock.
+    ///
+    /// It is a required associated const rather than a defaulted one on
+    /// purpose: a new algorithm must state which contract it is on, because the
+    /// answer decides whether an operator's Redis ACL has to grant `+time`.
+    /// [`RedisLimiter::new_with_config_id`] turns it into the client
+    /// constructor, and `RedisRateLimitClient::charge_rate_limit_windows`
+    /// fails closed if the two ever disagree.
+    const REQUIRES_SERVER_CLOCK: bool;
+
     fn new_state(&self) -> Self::State;
 
     fn check_local(&self, state: &mut Self::State, op: &Self::Op, now: Instant)
@@ -655,12 +673,26 @@ impl<A: RateLimitAlgorithm> RedisLimiter<A> {
         let health_check_interval = Duration::from_secs(cfg.health_check_interval_seconds.max(1));
         let key_prefix = cfg.key_prefix.clone();
 
-        let redis_client = Arc::new(RedisRateLimitClient::new(
-            cfg,
-            http_client.dns_cache().cloned(),
-            http_client.tls_no_verify(),
-            http_client.tls_ca_bundle_path(),
-        )?);
+        // Which client this policy gets is decided by the algorithm, not by the
+        // plugin name: only the request-quota ladder selects sub-buckets on the
+        // Redis server's clock, so only its connections prove `TIME`. A token,
+        // frame, or datagram budget reads no clock, and making it demand
+        // `+time` would take an otherwise-safe deployment out of service.
+        let redis_client = Arc::new(if A::REQUIRES_SERVER_CLOCK {
+            RedisRateLimitClient::for_request_quota(
+                cfg,
+                http_client.dns_cache().cloned(),
+                http_client.tls_no_verify(),
+                http_client.tls_ca_bundle_path(),
+            )?
+        } else {
+            RedisRateLimitClient::new(
+                cfg,
+                http_client.dns_cache().cloned(),
+                http_client.tls_no_verify(),
+                http_client.tls_ca_bundle_path(),
+            )?
+        });
         Ok(Some(Self {
             redis_client,
             algorithm,
@@ -2334,14 +2366,24 @@ fn check_http_windows(
 /// abandoned pass. That is bounded by one gateway's concurrency, not by fleet
 /// size or by clock discipline.
 ///
-/// `TIME` is a hard requirement, not a preference. A connection whose `TIME`
+/// `TIME` is a hard requirement of THIS path, not a preference. The client is
+/// built with `RedisRateLimitClient::for_request_quota`
+/// (`RateLimitAlgorithm::REQUIRES_SERVER_CLOCK`), so a connection whose `TIME`
 /// probe answers a `NOPERM`, an unknown command, a non-clock, a timeout, or a
 /// transport failure is discarded unpublished and the client is marked
-/// unavailable, so a deployment whose ACL omits `+time` gets exactly the
+/// unavailable, and a deployment whose ACL omits `+time` gets exactly the
 /// `redis_failure_policy` it configured — per-process budgets under
 /// `local_fallback`, refusals under `fail_closed`. There is deliberately no
 /// local-clock mode: a ladder selected on an uncorrected local clock is not a
 /// shared budget, and serving one quietly would be enforcement in name only.
+///
+/// The requirement stops here. `ai_rate_limiter`, `ws_rate_limiting` and
+/// `udp_rate_limiting` index their windows locally, and the replay,
+/// idempotency and cache consumers of `RedisRateLimitClient` read no clock at
+/// all, so their clients never probe and a restrictive ACL that withholds
+/// `+time` leaves them in service. `charge_rate_limit_windows` fails closed on
+/// a client that did not declare the requirement, so the two ends cannot drift
+/// apart.
 ///
 /// ## Stale and future bucket selection
 ///
@@ -2601,6 +2643,10 @@ impl RateLimitAlgorithm for HttpRateLimitAlgorithm {
     type State = Vec<HttpWindowState>;
     type Op = RequestUnit;
 
+    /// Request quotas charge the shared sub-bucket ladder, so the bucket clock
+    /// must be the Redis server's.
+    const REQUIRES_SERVER_CLOCK: bool = true;
+
     fn new_state(&self) -> Self::State {
         new_http_window_states(&self.specs)
     }
@@ -2664,6 +2710,10 @@ impl DynamicHttpRateLimitAlgorithm {
 impl RateLimitAlgorithm for DynamicHttpRateLimitAlgorithm {
     type State = DynamicHttpRateLimitState;
     type Op = DynamicRateLimitOp;
+
+    /// Same ladder as [`HttpRateLimitAlgorithm`], with the windows resolved
+    /// per request (`graphql`, `grpc_method_router`).
+    const REQUIRES_SERVER_CLOCK: bool = true;
 
     fn new_state(&self) -> Self::State {
         DynamicHttpRateLimitState {
@@ -3110,6 +3160,10 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
     type State = TokenUsageWindow;
     type Op = AiRateLimitOp;
 
+    /// Token accounting reserves and reconciles under one locally computed
+    /// `{tag}:{window_index}`; it never selects a shared sub-bucket.
+    const REQUIRES_SERVER_CLOCK: bool = false;
+
     fn new_state(&self) -> Self::State {
         TokenUsageWindow::new(
             self.token_limit,
@@ -3511,6 +3565,9 @@ impl RateLimitAlgorithm for WsFrameRateAlgorithm {
     type State = TokenBucket;
     type Op = WsRateLimitOp;
 
+    /// Frame budgets use the same locally indexed window as token accounting.
+    const REQUIRES_SERVER_CLOCK: bool = false;
+
     fn new_state(&self) -> Self::State {
         TokenBucket::from_rate(self.burst_size, self.frames_per_second)
     }
@@ -3642,6 +3699,9 @@ impl UdpRateLimitAlgorithm {
 impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
     type State = UdpWindowState;
     type Op = UdpRateLimitOp;
+
+    /// A plain fixed window with no previous-window term and no sub-buckets.
+    const REQUIRES_SERVER_CLOCK: bool = false;
 
     fn new_state(&self) -> Self::State {
         UdpWindowState::new(0, 0)
@@ -3823,6 +3883,8 @@ mod tests {
     impl RateLimitAlgorithm for TestAlgorithm {
         type State = TestState;
         type Op = TestOp;
+
+        const REQUIRES_SERVER_CLOCK: bool = false;
 
         fn new_state(&self) -> Self::State {
             TestState::default()
