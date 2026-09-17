@@ -3533,10 +3533,7 @@ async fn a_rejected_trust_candidate_never_strands_the_handshake_on_stale_records
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rebind_to_an_uncompilable_slot_keeps_the_accepted_anchors_in_force() {
     let mut fx = admit_client_tunnel_with_inbound_trust(vec![allow_client()], true).await;
-    let slot_a = fx
-        .inbound_trust_slot
-        .clone()
-        .expect("the inbound-trust fixture installs a slot");
+    let slot_a = fx.inbound_trust_slot.clone().expect("fixture inbound slot");
     let verifier = inbound_verifier(&fx.state, &slot_a);
     let peer_leaf = fx.certs.client_leaf_der();
     assert!(
@@ -3601,13 +3598,10 @@ async fn a_rebind_to_an_uncompilable_slot_keeps_the_accepted_anchors_in_force() 
         accepted_revision + 1,
         "the publication recompiles the anchors the refused rebind left in force"
     );
-    assert_eq!(
-        fx.state.hbone_admission_fence.trust_anchor_builds(),
-        compilations + 1
-    );
+    assert_eq!(fx.state.hbone_admission_fence.trust_anchor_builds(), compilations + 1);
     assert!(
         !handshake_admits_leaf(&verifier, &peer_leaf),
-        "and the same records reach the handshake"
+        "and the same records reach the handshake through the anchors in force"
     );
     assert_tunnel_closed(&mut fx.tunnel.response_body).await;
     assert_tunnel_closed(&mut second.response_body).await;
