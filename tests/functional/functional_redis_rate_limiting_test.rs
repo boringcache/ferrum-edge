@@ -1484,8 +1484,7 @@ async fn test_rate_limiting_redis_boundary_clustered_burst_keeps_counting() {
         let first_bucket = live_sub_bucket(4);
         for attempt in 1..=5 {
             let what = format!("burst request {attempt}");
-            let Some(status) =
-                bounded_status(&client, &url, Duration::from_secs(2), &what).await
+            let Some(status) = bounded_status(&client, &url, Duration::from_secs(2), &what).await
             else {
                 return Err(format!("{what} did not answer within 2s"));
             };
@@ -1649,8 +1648,13 @@ async fn test_rate_limiting_redis_full_window_does_not_lock_out_the_next() {
         await_epoch_window_offset(2_000_000_000, 0..200_000_000).await;
         let spent_at = tokio::time::Instant::now();
         let spend_bucket = live_sub_bucket(2);
-        let Some(status) =
-            bounded_status(&client, &url, Duration::from_secs(2), "first-window request").await
+        let Some(status) = bounded_status(
+            &client,
+            &url,
+            Duration::from_secs(2),
+            "first-window request",
+        )
+        .await
         else {
             return Err("the first-window request did not answer within 2s".to_string());
         };
