@@ -1764,9 +1764,12 @@ impl HboneAdmissionFence {
             AdmittedLeafExpiry::At(_) | AdmittedLeafExpiry::Unbounded => {}
         }
 
-        // A tunnel the inbound admission trust never anchored (a chain-only
-        // inbound posture with no gateway SVID material) has no trust state to
-        // regress from, so this gate can only produce false positives for it.
+        // A tunnel whose CONNECT verified nothing — a chain-only inbound
+        // posture with no gateway SVID material, or a slot with nothing yet in
+        // force — has no trust state to regress from, so this gate can only
+        // produce false positives for it. Every other tunnel WAS positively
+        // verified at its CONNECT, which is what makes the comparison below a
+        // regression check rather than a guess.
         if !credential.anchored_at_admission {
             return None;
         }
