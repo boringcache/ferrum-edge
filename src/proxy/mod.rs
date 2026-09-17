@@ -8913,7 +8913,7 @@ impl ProxyState {
     /// anchors cannot be compiled with, takes no force at all.
     pub fn publish_mesh_inbound_crls(&self, crls: crate::tls::CrlList) -> bool {
         self.hbone_admission_fence
-            .publish_inbound_admission_crls(&self.mesh_inbound_crls, crls)
+            .publish_inbound_admission_crls(crls)
     }
 
     /// Republish only the captured-listener-port → application-port alias table,

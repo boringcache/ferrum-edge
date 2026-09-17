@@ -1172,11 +1172,11 @@ impl HboneAdmissionFence {
     /// in-force revision advances BEFORE the sweep is requested, so a CONNECT
     /// that read the superseded set necessarily captured a stale sweep counter
     /// too and [`Self::admit`] turns that into a fresh pass.
-    pub fn publish_inbound_admission_crls(
-        self: &Arc<Self>,
-        slot: &SharedEnforcedCrlSet,
-        crls: CrlList,
-    ) -> bool {
+    pub fn publish_inbound_admission_crls(self: &Arc<Self>, crls: CrlList) -> bool {
+        // The fence owns the verifier's slot; there is deliberately no slot
+        // parameter, so a caller cannot publish records into one slot while the
+        // anchors in force were compiled against another.
+        let slot = &self.mesh_inbound_crls;
         // Compared against what the VERIFIER enforces, which is also the
         // baseline `enforced_crl_records` hands every compile: a republish of
         // the live records changes nothing on either surface.
