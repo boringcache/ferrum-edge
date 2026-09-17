@@ -1223,7 +1223,10 @@ struct IncrementalResultDe {
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     added_or_modified_proxies: Vec<Proxy>,
     removed_proxy_ids: Vec<RemovalKeyWire>,
-    #[serde(default, deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    #[serde(
+        default,
+        deserialize_with = "crate::util::json_object::deserialize_object_vec"
+    )]
     removed_proxy_keys: Vec<NamespacedResourceId>,
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     added_or_modified_consumers: Vec<Consumer>,
@@ -1231,12 +1234,18 @@ struct IncrementalResultDe {
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     added_or_modified_plugin_configs: Vec<PluginConfig>,
     removed_plugin_config_ids: Vec<RemovalKeyWire>,
-    #[serde(default, deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    #[serde(
+        default,
+        deserialize_with = "crate::util::json_object::deserialize_object_vec"
+    )]
     removed_plugin_config_keys: Vec<NamespacedResourceId>,
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     added_or_modified_upstreams: Vec<Upstream>,
     removed_upstream_ids: Vec<RemovalKeyWire>,
-    #[serde(default, deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    #[serde(
+        default,
+        deserialize_with = "crate::util::json_object::deserialize_object_vec"
+    )]
     removed_upstream_keys: Vec<NamespacedResourceId>,
     #[serde(default)]
     sequence_cursor: u64,

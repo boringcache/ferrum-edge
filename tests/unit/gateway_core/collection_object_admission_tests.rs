@@ -356,7 +356,15 @@ fn delta_resource_and_qualified_removal_lists_require_objects() {
     );
 
     let positional = json!([
-        {}, "replacement", null, "ferrum", [], "/replacement", "http", "127.0.0.1", 12345
+        {},
+        "replacement",
+        null,
+        "ferrum",
+        [],
+        "/replacement",
+        "http",
+        "127.0.0.1",
+        12345
     ]);
     let proxy: config::Proxy = serde_json::from_value(positional.clone()).unwrap();
     assert_eq!(proxy.id, "replacement");

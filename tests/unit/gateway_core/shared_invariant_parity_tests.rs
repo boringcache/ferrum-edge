@@ -2094,9 +2094,7 @@ fn api_spec_restore_section_requires_an_object_and_preserves_absence() {
 
     for rejected in [json!([]), json!(["1", []]), json!([{}])] {
         let body = json!({"api_specs": rejected});
-        assert!(
-            restore_envelope_admission_for_test(&serde_json::to_vec(&body).unwrap()).is_err()
-        );
+        assert!(restore_envelope_admission_for_test(&serde_json::to_vec(&body).unwrap()).is_err());
     }
     for accepted in [
         json!({}),
