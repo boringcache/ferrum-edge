@@ -25,6 +25,50 @@ pub const HBONE_PROTOCOL: &str = "hbone";
 pub const UDP_PROTOCOL: &str = "udp";
 pub const HBONE_DATAGRAM_METADATA_KEY: &str = "hbone_datagram";
 
+/// Response header the DESTINATION stamps on an HBONE CONNECT `200` to tell the
+/// source that this tunnel is covered by the receiver-side admission fence, and
+/// that reusing the application connection inside it is therefore admissible
+/// (issue #5042 step 2).
+///
+/// It is a CAPABILITY advertisement and nothing else. It authorizes no request,
+/// names no policy, and carries no identity: the source may read it only to
+/// decide whether to keep an inner HTTP/1.1 sender or a nested HTTP/2 sender
+/// alive across requests. Every CONNECT-time gate — the authenticated-peer
+/// requirement, the PeerAuthentication transport mode, the relay-destination
+/// ownership guard, and the authorize chain — still runs in full for every NEW
+/// CONNECT, and a forged header on a peer that does not actually fence its live
+/// tunnels can buy an attacker nothing it could not already get by holding one
+/// long-lived tunnel open.
+///
+/// ABSENT means "per-request behaviour, exactly as before": a destination that
+/// predates this contract, or one whose tunnel is for any reason not registered
+/// with its fence, advertises nothing and the source opens one CONNECT and one
+/// inner connection per request as it always did.
+pub const TUNNEL_REUSE_HEADER: &str = "x-ferrum-mesh-tunnel-reuse";
+
+/// The ONLY [`TUNNEL_REUSE_HEADER`] value that enables source-side reuse.
+///
+/// A single fixed token rather than a version number or a feature list: the
+/// source's decision is binary, and an unrecognized value must fail to the
+/// per-request default rather than being parsed for a subset of behaviours.
+pub const TUNNEL_REUSE_FENCED: &str = "fenced";
+
+/// Whether a CONNECT `200` response advertises the receiver-side admission
+/// fence (issue #5042 step 2).
+///
+/// Case-insensitive on the value because HTTP field values from a foreign
+/// implementation are not guaranteed to match byte for byte; anything other
+/// than exactly [`TUNNEL_REUSE_FENCED`] — a missing header, an unrecognized
+/// token, a non-visible-ASCII value, or a repeated header whose first value
+/// does not match — reads as "not advertised", which is the per-request
+/// default.
+pub fn connect_response_advertises_tunnel_reuse(headers: &HeaderMap) -> bool {
+    headers
+        .get(TUNNEL_REUSE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case(TUNNEL_REUSE_FENCED))
+}
+
 /// Source workload evidence attached to an Ambient UDP capture manager. The
 /// manager is created per pod netns, so this value is fixed for every session
 /// it originates rather than inferred from individual datagrams.

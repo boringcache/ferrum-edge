@@ -2942,6 +2942,20 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_mesh_hbone_inner_pool_events_total",
+    "type": "counter",
+    "help": "Inner application connections reused inside fenced HBONE tunnels, by inner wire protocol and outcome (hit, miss, eviction, discard, fenced).",
+    "labels": [
+      "protocol",
+      "event",
+      "namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_mesh_hbone_relay_failures_total",
     "type": "counter",
     "help": "HBONE CONNECT tunnel relay failures after the 200 response has been sent.",

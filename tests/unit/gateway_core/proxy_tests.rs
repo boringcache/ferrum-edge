@@ -2462,18 +2462,23 @@ fn hbone_arms_operator_read_window_after_tunnel_checkout() {
         .split("fn boxed_proxy_to_backend_hbone_after_ready<'a>(")
         .next()
         .expect("bounded HBONE acquire body");
+    // Issue #5042 step 2: the acquire coroutine now yields an inner LEASE — a
+    // pool hit, or a CONNECT plus inner HTTP/1.1 handshake on a miss — and
+    // `boxed_open_hbone_inner_h1` is the boxed seam that produces it.
     let checkout = acquire
-        .find("boxed_hbone_pool_get_tunnel_via(")
-        .expect("HBONE CONNECT checkout boundary");
+        .find("boxed_open_hbone_inner_h1(")
+        .expect("HBONE inner-lease checkout boundary");
     let post_tunnel_handoff = acquire
         .find("boxed_proxy_to_backend_hbone_after_ready(")
         .expect("post-tunnel handoff");
     assert!(
         checkout < post_tunnel_handoff,
-        "HBONE acquire must await CONNECT checkout before post-tunnel handoff"
+        "HBONE acquire must await the inner-lease checkout before post-tunnel handoff"
     );
     assert!(
-        !acquire.contains("let read_deadline") && !acquire.contains("sender.send_request("),
+        !acquire.contains("let read_deadline")
+            && !acquire.contains("sender.send_request(")
+            && !acquire.contains("sender.try_send_request("),
         "operator response-read window must not arm during HBONE acquire"
     );
 
@@ -2488,7 +2493,7 @@ fn hbone_arms_operator_read_window_after_tunnel_checkout() {
         .find("let read_deadline")
         .expect("operator read window");
     let send_request = post_ready
-        .find("sender.send_request(")
+        .find("checkout.sender.try_send_request(")
         .expect("HBONE backend send");
     assert!(
         read_window < send_request,

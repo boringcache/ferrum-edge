@@ -738,6 +738,24 @@ fn representative_exposition() -> String {
     registry.record_request_mirror_dispatched();
     registry.record_mesh_tcp_egress_connection("hbone", true);
     registry.record_mesh_tcp_egress_connection("mtls", false);
+    // Inner-application-connection reuse inside fenced HBONE tunnels (issue
+    // #5042 step 2). Both labels are compiled-in, so exercising one protocol
+    // and one event pins the family's HELP/TYPE/label keys.
+    registry.record_hbone_inner_pool_event(
+        ferrum_edge::plugins::prometheus_metrics::HboneInnerPoolProtocol::Http1,
+        ferrum_edge::plugins::prometheus_metrics::HboneInnerPoolEvent::Hit,
+    );
+    registry.record_hbone_inner_pool_event(
+        ferrum_edge::plugins::prometheus_metrics::HboneInnerPoolProtocol::H2,
+        ferrum_edge::plugins::prometheus_metrics::HboneInnerPoolEvent::Miss,
+    );
+    // A check-in a retirement refused carries its OWN `event` value, so an
+    // operator can tell "the destination stopped advertising the fence" apart
+    // from "a trust drain cut live leases".
+    registry.record_hbone_inner_pool_event(
+        ferrum_edge::plugins::prometheus_metrics::HboneInnerPoolProtocol::Http1,
+        ferrum_edge::plugins::prometheus_metrics::HboneInnerPoolEvent::Fenced,
+    );
     let mut stream_err = make_stream_summary("stream-proxy", "tcp");
     stream_err.error_class = Some(ferrum_edge::retry::ErrorClass::DnsLookupError);
     registry.record_stream(&stream_err);
@@ -1110,6 +1128,7 @@ fn representative_metrics_exposition_matches_contract() {
     for required in [
         "ferrum_database_delta_consecutive_identical_rejections",
         "ferrum_mesh_tcp_egress_connections_total",
+        "ferrum_mesh_hbone_inner_pool_events_total",
         "ferrum_mesh_remote_discovery_poll_failures_total",
         "ferrum_mesh_remote_discovery_poll_successes_total",
         "ferrum_mesh_remote_discovery_last_success_timestamp_seconds",
