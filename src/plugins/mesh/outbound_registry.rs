@@ -510,6 +510,43 @@ impl Plugin for OutboundRegistry {
         HTTP_FAMILY_PROTOCOLS
     }
 
+    /// Reusable exactly while this instance is scoped to explicit listener
+    /// ports, because only an UNSCOPED one can decide an HBONE CONNECT.
+    ///
+    /// The whole hook sits behind one gate. `should_enforce_for_request` is the
+    /// FIRST statement of `Self::on_request_received`, it reads nothing but
+    /// `self.outbound_listen_ports` and `ctx.frontend_listen_port`, and a
+    /// request arriving on a port this instance does not name returns
+    /// `Continue` before any registry lookup, any Prometheus record, and any
+    /// rejection. Such a request decided nothing, so eliding it costs nothing —
+    /// which is what a reused inner connection does to the CONNECTs it saves.
+    ///
+    /// A PORT-SCOPED instance therefore decides only on the listener ports it
+    /// names, and an HBONE CONNECT is only ever terminated by an INBOUND
+    /// listener. Mesh auto-injection names exactly the OUTBOUND-direction
+    /// capture ports — `mesh_outbound_registry_listen_ports` filters
+    /// `MeshRuntimeConfig::listener_plan()` to
+    /// `MeshTrafficDirection::Outbound`, and `inject_mesh_global_plugins`
+    /// REMOVES the plugin outright when that set is empty rather than
+    /// installing an unscoped one — so under `outboundTrafficPolicy:
+    /// REGISTRY_ONLY` this plugin does sit in every inbound chain (it is a
+    /// `PluginScope::Global` row, and globals enter every proxy chain) but
+    /// never decides one. Refusing reuse for it would take inner-connection
+    /// reuse away from every inbound tunnel on a REGISTRY_ONLY mesh, and
+    /// revoke the live ones, for a gate that answered `Continue` on all of
+    /// them.
+    ///
+    /// An UNSCOPED instance (`outbound_listen_ports: []` — the operator-managed
+    /// generic Host allowlist this module documents, and what
+    /// `Self::deny_all` builds) enforces wherever it runs, including on a
+    /// listener that terminates HBONE. Its registry verdict is then a
+    /// per-operation decision no sweep re-issues: the fence re-issues the
+    /// authorize chain and the peer's mTLS credential, never this allowlist. So
+    /// it takes the fail-closed answer, and one CONNECT per operation.
+    fn allows_hbone_inner_reuse(&self) -> bool {
+        !self.outbound_listen_ports.is_empty()
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         if !self.should_enforce_for_request(ctx) {
             return PluginResult::Continue;

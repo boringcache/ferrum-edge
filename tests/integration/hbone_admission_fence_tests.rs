@@ -86,9 +86,12 @@ use ferrum_edge::identity::{
 };
 use ferrum_edge::modes::mesh::config::{
     MeshConfig, MeshExtAuthzProvider, MeshInboundRelayDestination, MeshInboundRelayHost,
-    MeshPolicy, MeshRelayEnrollmentEvidence, MtlsMode, PolicyAction, PolicyScope,
+    MeshPolicy, MeshRelayEnrollmentEvidence, MtlsMode, OutboundTrafficPolicy, PolicyAction,
+    PolicyScope,
 };
-use ferrum_edge::modes::mesh::{MeshTrafficDirection, prepare_gateway_config_for_mesh};
+use ferrum_edge::modes::mesh::{
+    MeshRuntimeConfig, MeshTrafficDirection, prepare_gateway_config_for_mesh,
+};
 use ferrum_edge::plugins::{ProxyProtocol, RequestContext};
 use ferrum_edge::proxy::hbone_admission_fence::{
     AdmittedHboneTunnel, AdmittedLeafExpiry, HboneAdmissionSnapshot, HbonePeerCredential,
@@ -219,7 +222,27 @@ fn prepared_config_from_mesh(
     mesh: MeshConfig,
     plugin_configs: Vec<PluginConfig>,
 ) -> GatewayConfig {
-    let runtime = default_mesh_runtime();
+    prepared_config_from_mesh_with_runtime(
+        proxy_backend_port,
+        proxy_id,
+        mesh,
+        plugin_configs,
+        default_mesh_runtime(),
+    )
+}
+
+/// [`prepared_config_from_mesh`] over an explicit [`MeshRuntimeConfig`], for
+/// the cases whose injected plugin set depends on the LISTENER PLAN rather than
+/// on the slice — `mesh_outbound_registry` is scoped to the outbound-direction
+/// capture ports, and `default_mesh_runtime` binds that listener on `:0`, which
+/// yields no ports at all.
+fn prepared_config_from_mesh_with_runtime(
+    proxy_backend_port: Option<u16>,
+    proxy_id: Option<&str>,
+    mesh: MeshConfig,
+    plugin_configs: Vec<PluginConfig>,
+    runtime: MeshRuntimeConfig,
+) -> GatewayConfig {
     let proxies = proxy_backend_port
         .map(|port| {
             let mut proxy = create_mesh_proxy(port);
@@ -3421,21 +3444,200 @@ async fn a_chain_that_becomes_reusable_leaves_live_tunnels_untouched() {
     fx.teardown().await;
 }
 
+/// The outbound capture listener port the REGISTRY_ONLY fixture below gives its
+/// mesh runtime.
+///
+/// Nothing in this suite BINDS it: the only listener these tests open is the
+/// inbound gateway, on a registry-allocated ephemeral port. The number exists
+/// so `MeshRuntimeConfig::listener_plan()` yields one nonzero
+/// OUTBOUND-direction entry, which is what `inject_mesh_global_plugins` stamps
+/// onto the injected gate as `outbound_listen_ports`. With
+/// `default_mesh_runtime`'s `127.0.0.1:0` that set is empty and injection
+/// removes the plugin outright, so a REGISTRY_ONLY fixture built on it would
+/// prove nothing at all.
+const REGISTRY_ONLY_OUTBOUND_CAPTURE_PORT: u16 = 15001;
+
+fn registry_only_runtime() -> MeshRuntimeConfig {
+    MeshRuntimeConfig {
+        outbound_listen_addr: SocketAddr::from((
+            IpAddr::from([127, 0, 0, 1]),
+            REGISTRY_ONLY_OUTBOUND_CAPTURE_PORT,
+        )),
+        ..default_mesh_runtime()
+    }
+}
+
+/// `outboundTrafficPolicy: REGISTRY_ONLY` over an EMPTY slice, so the derived
+/// known-destinations registry admits NOTHING.
+///
+/// That is deliberate and is what makes the test below a real pin: if the
+/// injected gate ever decided on the inbound HBONE listener, this CONNECT would
+/// be REJECTED outright rather than merely losing its capability.
+fn registry_only_mesh() -> MeshConfig {
+    MeshConfig {
+        mesh_policies: vec![allow_client()],
+        outbound_traffic_policy: Some(OutboundTrafficPolicy::RegistryOnly),
+        ..MeshConfig::default()
+    }
+}
+
+/// Prove the fixture installs what it claims before anything is asserted
+/// through it.
+fn assert_registry_only_gate_is_injected(config: &GatewayConfig) {
+    let row = config
+        .plugin_configs
+        .iter()
+        .find(|plugin| plugin.plugin_name == "mesh_outbound_registry")
+        .expect("REGISTRY_ONLY must inject the outbound registry gate");
+    assert!(row.enabled, "the injected gate must be enabled");
+    assert_eq!(
+        row.scope,
+        PluginScope::Global,
+        "the gate is a GLOBAL row, which is exactly why it enters the inbound chain"
+    );
+    assert_eq!(
+        row.config["outbound_listen_ports"],
+        json!([REGISTRY_ONLY_OUTBOUND_CAPTURE_PORT]),
+        "the injected gate must be scoped to the OUTBOUND capture port; an unscoped instance \
+         would decide on the inbound HBONE listener too, and would then be right to refuse reuse"
+    );
+    assert_eq!(
+        row.config["registry"],
+        json!([]),
+        "an empty registry is what makes an inbound enforcement regression loud: it admits no \
+         destination at all"
+    );
+}
+
+/// `REGISTRY_ONLY` must neither withhold inbound reuse nor revoke the tunnels
+/// that already have it.
+///
+/// `mesh_outbound_registry` is injected `PluginScope::Global`, and a global
+/// plugin enters EVERY proxy chain — including the one that admits an inbound
+/// HBONE CONNECT. What keeps it out of that decision is its port gate, the
+/// first statement of its hook: the CONNECT arrives on the inbound listener,
+/// which is not an outbound capture port, so the hook returns `Continue` before
+/// any registry lookup. A blanket `false` classification would therefore have
+/// turned inner reuse off mesh-wide for a common Istio posture — and, because
+/// eligibility is re-judged on every sweep, revoked every already-reusable
+/// inbound tunnel the moment an operator applied the policy.
+///
+/// Both halves are asserted against the production dispatcher: a live tunnel
+/// survives the publication still carrying bytes, and a fresh CONNECT under the
+/// new generation is admitted AND advertised.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registry_only_publication_neither_revokes_nor_withholds_inbound_reuse() {
+    let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
+    let (backend_addr, backend_handle) = start_interactive_echo_backend().await;
+
+    // ALLOW_ANY start, on the SAME runtime the publication uses, so the only
+    // delta between the two generations is the outbound traffic policy.
+    let state = build_state(prepared_config_from_mesh_with_runtime(
+        Some(backend_addr.port()),
+        None,
+        MeshConfig {
+            mesh_policies: vec![allow_client()],
+            ..MeshConfig::default()
+        },
+        Vec::new(),
+        registry_only_runtime(),
+    ));
+    let (gateway_addr, shutdown_tx) =
+        start_inbound_gateway(state.clone(), hbone_server_config(&certs)).await;
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let (response, request_body) = send_connect(&mut sender, None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        tunnel_reuse_advertisement(&response).as_deref(),
+        Some(ferrum_edge::modes::mesh::hbone::TUNNEL_REUSE_FENCED),
+        "the ALLOW_ANY chain is the ordinary reusable one, or this test proves nothing"
+    );
+    let mut tunnel = Tunnel {
+        request_body,
+        response_body: response.into_body(),
+    };
+    echo_round_trip(&mut tunnel, b"before-registry-only").await;
+
+    let registry_only = prepared_config_from_mesh_with_runtime(
+        Some(backend_addr.port()),
+        None,
+        registry_only_mesh(),
+        Vec::new(),
+        registry_only_runtime(),
+    );
+    assert_registry_only_gate_is_injected(&registry_only);
+    assert_eq!(state.update_config(registry_only), ConfigApplyOutcome::Applied);
+    wait_for_settled_sweeps(&state).await;
+
+    assert_eq!(
+        state.hbone_admission_fence.live_tunnels(),
+        1,
+        "arming REGISTRY_ONLY must not revoke an inbound tunnel: the gate it installs answers \
+         `Continue` on the listener that terminated this CONNECT"
+    );
+    assert_eq!(
+        revocation_counts(&state),
+        [0, 0, 0, 0, 0, 0, 0, 0, 0],
+        "no reuse_withdrawn, and no refusal either"
+    );
+    // Still carrying bytes, not merely still registered.
+    echo_round_trip(&mut tunnel, b"after-registry-only").await;
+
+    // And the capability survives into the new generation. The empty registry
+    // would refuse every destination if this gate decided inbound at all, so a
+    // 200 here is itself the proof that it did not.
+    let (response, _request_body) = send_connect(&mut sender, None).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "an outbound egress policy must not refuse an inbound CONNECT"
+    );
+    assert_eq!(
+        tunnel_reuse_advertisement(&response).as_deref(),
+        Some(ferrum_edge::modes::mesh::hbone::TUNNEL_REUSE_FENCED),
+        "and it must not cost the new tunnel its capability either"
+    );
+
+    let _ = shutdown_tx.send(true);
+    backend_handle.abort();
+    conn_task.abort();
+}
+
 /// A CONNECT released simultaneously with the withdrawing publication ends in
-/// one of exactly two states, and never in the third.
+/// one of exactly three states, and never in the fourth.
 ///
 /// What this test CAN force: both sides start at the same instant, from a
 /// barrier, on a multi-threaded runtime. What it CANNOT force is which one wins
-/// — nor should it, because the contract is that neither order leaves a
-/// reusable tunnel under a chain that no longer permits reuse. So the assertion
-/// is on the invariant, not on the interleaving: if the CONNECT was admitted
-/// under the OLD generation it carries the advertisement and MUST be revoked
-/// `reuse_withdrawn` (publish-then-recheck is what guarantees the publication's
-/// own sweep cannot miss an insert that had not happened yet); if it was
-/// admitted under the NEW one it never advertised and must be left alone. A run
-/// that always took the same branch would still be a correct run of this test,
-/// and the two sibling tests above pin each branch deterministically — this one
-/// exists for the window between them.
+/// — nor should it, because the contract is that no order leaves a reusable
+/// tunnel under a chain that no longer permits reuse. So the assertion is on
+/// the terminal state, not on the interleaving. Three of them are correct:
+///
+/// 1. the CONNECT was admitted under the OLD generation and its response read
+///    `fence_in_force()` while the tunnel was still held, so it carries the
+///    advertisement and the tunnel is revoked `reuse_withdrawn` — this is the
+///    ordering publish-then-recheck exists for, since the publication's own
+///    sweep may have read the registry before the insert;
+/// 2. it was admitted under the NEW generation, never recorded the
+///    advertisement, and is left alone;
+/// 3. it recorded OLD-generation eligibility and the sweep the publication
+///    requested revoked the tunnel BEFORE the response read `fence_in_force()`
+///    — so the header is ABSENT even though the tunnel had it. The result is
+///    unadvertised, revoked `reuse_withdrawn`, and closed, which is correct
+///    twice over.
+///
+/// (3) is why the header alone cannot stand in for the admitting generation:
+/// absent means "not advertised", never "admitted under the new chain". The
+/// safety statement is therefore taken from the SURVIVING snapshots plus the
+/// revocation and closure evidence — nothing still live may hold the capability
+/// the new chain withdrew, and anything that lost it lost it to
+/// `reuse_withdrawn` rather than to a refusal.
+///
+/// The fourth state — a live tunnel whose snapshot recorded the advertisement —
+/// is the failure. A run that always took the same branch would still be a
+/// correct run of this test, and the sibling tests above pin the deterministic
+/// branches; this one exists for the window between them.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_connect_racing_the_withdrawing_publication_is_never_left_reusable() {
     let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
@@ -3486,24 +3688,71 @@ async fn a_connect_racing_the_withdrawing_publication_is_never_left_reusable() {
         "neither ordering refuses this principal; only the capability is at stake"
     );
 
+    wait_for_settled_sweeps(&state).await;
+
+    // The safety statement, taken from the terminal state rather than from the
+    // interleaving: nothing STILL LIVE may hold the capability the published
+    // chain withdrew. This is the one assertion that holds in all three correct
+    // orderings, including the one where the sweep beat the response to
+    // `fence_in_force()` and the header is absent on a tunnel that had it.
+    let surviving: Vec<bool> = state
+        .hbone_admission_fence
+        .inspect_live_tunnels(|snapshot| snapshot.advertised_inner_reuse);
+    assert!(
+        !surviving.contains(&true),
+        "a live tunnel still carrying inner-reuse eligibility under a chain that no longer \
+         permits it is exactly the state this gate exists to prevent (surviving snapshots: \
+         {surviving:?})"
+    );
+
+    // Whatever was revoked was revoked for losing the CAPABILITY. Neither
+    // ordering refuses this principal, so any other reason would be a real
+    // regression hiding behind the race.
+    let counts = revocation_counts(&state);
+    let reasons = HboneRevocationReason::ALL;
+    for (reason, count) in reasons.into_iter().zip(counts) {
+        if reason != HboneRevocationReason::ReuseWithdrawn {
+            assert_eq!(
+                count,
+                0,
+                "nothing may be revoked for `{}` in either ordering",
+                reason.as_str()
+            );
+        }
+    }
+
+    let reuse_withdrawn = counts[HboneRevocationReason::ReuseWithdrawn.index()];
     if advertised {
-        // Admitted under the superseded generation. The publication's own sweep
-        // may have read the registry before this tunnel reached it, so what has
-        // to close the window is `admit()`'s own sweep-epoch recheck.
+        // The response SAW the fence holding the tunnel, so the tunnel had the
+        // capability and must have lost it. `admit()`'s own sweep-epoch recheck
+        // is what closes the window when the publication's sweep read the
+        // registry before the insert.
+        assert_eq!(
+            reuse_withdrawn,
+            1,
+            "a tunnel whose 200 advertised reuse across a withdrawing publication must be \
+             revoked by the sweep that publication requested"
+        );
         assert_tunnel_closed(&mut response_body).await;
         wait_for_no_live_tunnels(&state).await;
-        assert_eq!(
-            revocation_counts(&state),
-            [0, 0, 0, 0, 0, 0, 0, 1, 0],
-            "a tunnel admitted reusable across a withdrawing publication must be revoked by the \
-             sweep that publication requested"
-        );
+    } else if reuse_withdrawn == 1 {
+        // State (3): eligibility was recorded, then revoked before the response
+        // read `fence_in_force()`. Unadvertised AND cut — safe twice over.
+        assert_tunnel_closed(&mut response_body).await;
+        wait_for_no_live_tunnels(&state).await;
     } else {
-        // Admitted under the new generation: it never had the capability, so
-        // there is nothing to withdraw and nothing to cut.
-        wait_for_settled_sweeps(&state).await;
-        assert_eq!(state.hbone_admission_fence.live_tunnels(), 1);
-        assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // State (2): admitted under the new generation, so there was never
+        // anything to withdraw and nothing to cut.
+        assert_eq!(
+            reuse_withdrawn,
+            0,
+            "a tunnel that never recorded the advertisement cannot lose it"
+        );
+        assert_eq!(
+            state.hbone_admission_fence.live_tunnels(),
+            1,
+            "and it must not be cut for anything else either"
+        );
     }
 
     let _ = shutdown_tx.send(true);
