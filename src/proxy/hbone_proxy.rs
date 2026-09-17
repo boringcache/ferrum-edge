@@ -586,6 +586,42 @@ pub(super) struct HboneAdmissionView {
     pub(super) sweep_epoch: u64,
 }
 
+/// Whether a plugin chain permits the source to keep the application connection
+/// inside an HBONE tunnel and carry later operations over it (issue #5583).
+///
+/// ONE fold, with TWO callers, deliberately:
+///
+/// 1. the CONNECT path folds the protocol-scoped slice the dispatcher resolved
+///    for THIS CONNECT (`PluginCacheRequestView::plugins()` for the request's
+///    own protocol / gRPC-Web view), which is what actually decided it. That
+///    happens once, before `admit()`, and the result is recorded on the
+///    admission snapshot as `advertised_inner_reuse`; the response reads that
+///    field back rather than re-folding, so the header the source receives and
+///    the obligation the fence takes on are the same value.
+/// 2. every fence sweep folds the same view key, re-resolved from whatever
+///    generation is then current (route overrides never move a request's
+///    `namespace|id`, so the key is stable), for every tunnel whose snapshot
+///    recorded the advertisement. A chain that has stopped permitting reuse
+///    revokes those tunnels
+///    ([`crate::proxy::hbone_admission_fence::HboneRevocationReason::ReuseWithdrawn`]),
+///    which is what restores per-operation admission: the source's next
+///    operation performs a fresh CONNECT under the new chain.
+///
+/// The second caller is why the first is not sufficient on its own. The sweep's
+/// authorize re-evaluation consults only `authorize_plugins()` that opt into
+/// `reevaluates_live_admission()`, so a plugin ADDED after admission — a
+/// `rate_limiting` row, a `CUSTOM`-delegating `mesh_authz` generation — would
+/// otherwise never see the operations the tunnel keeps carrying.
+///
+/// Fail-closed and allocation-free: one boolean fold over a short slice, with
+/// an empty chain — nothing decided anything — reusable. No plugin hook runs, so
+/// a sweep calling it charges nothing and asks no external service.
+pub(super) fn admitting_chain_allows_inner_reuse(plugins: &[Arc<dyn Plugin>]) -> bool {
+    plugins
+        .iter()
+        .all(|plugin| plugin.allows_hbone_inner_reuse())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_hbone_request(
     state: &ProxyState,
@@ -1097,6 +1133,13 @@ pub(super) async fn handle_hbone_request(
     let backend_resolved_ip = backend.resolved_ip.clone();
     let bytes_sent_observed = Arc::clone(&ctx.bytes_sent_observed);
     let relay_plugins: Vec<Arc<dyn Plugin>> = plugins.to_vec();
+    // Fold the ADMITTING chain's reuse classification BEFORE the tunnel is
+    // registered (issue #5583), because the snapshot carries it and a sweep may
+    // judge this tunnel the instant `admit()` returns. This is the ONLY
+    // evaluation of the fold on this path: the CONNECT response reads the
+    // recorded value back rather than re-folding, so the header the source
+    // receives and the obligation the fence takes on cannot disagree.
+    let chain_allows_inner_reuse = admitting_chain_allows_inner_reuse(plugins);
     // Register the admitted tunnel with the receiver-side admission fence
     // (issue #5042 step 1). The snapshot is what the gates above judged; a
     // later policy generation that would refuse this CONNECT revokes the
@@ -1133,15 +1176,41 @@ pub(super) async fn handle_hbone_request(
         // CONNECT actually verified under, which is what the sweep's skip key
         // is allowed to be seeded from.
         peer_credential,
+        // Reuse dimension (issue #5583). Recording it is what obliges every
+        // later sweep to re-fold the CURRENT chain for this tunnel and revoke
+        // it `reuse_withdrawn` when the chain stops permitting reuse — the
+        // source elides the CONNECTs a newly attached per-operation plugin
+        // would otherwise have decided, so the eligibility itself has to be
+        // re-decided for the tunnel's whole life, not only at admission.
+        advertised_inner_reuse: chain_allows_inner_reuse,
     });
     // Advertise the receiver-side admission fence on the CONNECT `200` (issue
-    // #5042 step 2), and ONLY while the fence really holds this tunnel: source
-    // -side reuse of the application connection inside it is admissible only
-    // because a later policy or credential generation can still reach the
-    // tunnel and cut it. Read BEFORE the relay task takes ownership of the
-    // handle, and never assumed from `admit()` having returned — see
+    // #5042 step 2) only when BOTH halves hold.
+    //
+    // The fence must really hold this tunnel: source-side reuse of the
+    // application connection inside it is admissible only because a later
+    // policy or credential generation can still reach the tunnel and cut it.
+    // Read BEFORE the relay task takes ownership of the handle, and never
+    // assumed from `admit()` having returned — see
     // `AdmittedHboneTunnel::fence_in_force`.
-    let advertise_tunnel_reuse = tunnel.fence_in_force();
+    //
+    // And every plugin that ADMITTED this CONNECT must classify its own
+    // verdict as connection-reusable (issue #5583). The fence re-issues the
+    // local authorize verdict and the peer credential, and nothing else: a
+    // rate limit that charged one CONNECT, an external CUSTOM authorization
+    // verdict no sweep re-consults, or a bearer credential whose lifetime the
+    // fence does not track would each be spent once and then honoured for an
+    // unbounded number of later operations. One `false` anywhere in the chain
+    // costs one CONNECT per operation, exactly as before reuse existed.
+    //
+    // Read back out of the SNAPSHOT, never re-folded: what the source is told
+    // and what the fence undertook to keep re-deciding must be the same value.
+    // `fence_in_force()` is the half that could not be recorded — it cannot be
+    // evaluated before registration — and it needs no recording, because a
+    // tunnel the fence does not hold is absent from the registry and therefore
+    // out of every sweep's reach anyway.
+    let advertise_tunnel_reuse =
+        tunnel.fence_in_force() && tunnel.snapshot().advertised_inner_reuse;
     let relay_proxy = proxy.clone();
     let relay_method = method.to_string();
     let relay_backend_target = backend_target.clone();
@@ -1898,6 +1967,13 @@ pub(super) async fn handle_hbone_udp_request(
         // the same peer SVID, so it carries the same snapshot fields — already
         // re-verified by the trust gate above.
         peer_credential,
+        // A datagram tunnel never advertises reuse (see the response builder
+        // below), so it never takes on the obligation either: a tunnel that
+        // performs one CONNECT per operation has nothing a later chain could
+        // miss. Unconditional here for the same reason it is unconditional
+        // there — the capability does not exist on this surface, whatever its
+        // admitting chain would have classified.
+        advertised_inner_reuse: false,
     });
     let relay_proxy = proxy.clone();
     let relay_plugins: Vec<Arc<dyn Plugin>> = plugins.to_vec();
@@ -2011,6 +2087,19 @@ pub(super) async fn handle_hbone_udp_request(
     });
 
     record_request(state, StatusCode::OK.as_u16());
+    // A datagram tunnel NEVER advertises inner reuse, whatever its admitting
+    // chain would classify (issue #5583). There is no inner application
+    // connection to keep: this tunnel unframes into a local `UdpSocket` and
+    // carries no request/response exchange the source could pool, so the
+    // capability the mesh tunnel-reuse header names does not exist on this
+    // surface at all. Stamping nothing is therefore the same refusal
+    // `admitting_chain_allows_inner_reuse` gives the byte-stream relay, reached
+    // unconditionally rather than by classification — which is also why the gate
+    // must never be relaxed into "advertise when the chain allows it" here. Do
+    // not grow an advertisement on this response:
+    // `a_datagram_connect_never_advertises_reuse` and the source pin in
+    // `the_datagram_connect_path_never_stamps_the_reuse_header` both fail if
+    // one appears.
     Response::builder()
         .status(StatusCode::OK)
         .body(ProxyBody::empty())

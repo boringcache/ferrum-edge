@@ -1211,7 +1211,10 @@ impl McpGateway {
     }
 
     fn matches_endpoint(&self, ctx: &RequestContext) -> bool {
-        super::utils::endpoint_path::matches_endpoint_path(&ctx.path, &self.endpoint_path)
+        // Authorization plugins evaluate `ctx.path` before MCP dispatch. Keep
+        // admission exact so routing can never reinterpret an authorized path
+        // as a different MCP endpoint.
+        ctx.path == self.endpoint_path
     }
 
     fn within_endpoint_scope(&self, ctx: &RequestContext) -> bool {
@@ -5692,13 +5695,6 @@ impl Plugin for McpGateway {
                 )]),
             };
         }
-        // Normalize only after exact-or-single-slash admission. All methods,
-        // session handling, and response ownership follow the same path. The
-        // upstream target remains the configured server URL, never this alias.
-        if ctx.path != self.endpoint_path {
-            ctx.path.clone_from(&self.endpoint_path);
-        }
-
         if ctx.method.eq_ignore_ascii_case("GET") {
             if self.mode == McpGatewayMode::TransparentProxy {
                 if let Some(server) = self.primary_server() {

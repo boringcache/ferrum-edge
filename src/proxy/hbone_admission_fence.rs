@@ -182,7 +182,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use super::hbone_proxy::{
-    inbound_hbone_relay_effective_destination_decision,
+    admitting_chain_allows_inner_reuse, inbound_hbone_relay_effective_destination_decision,
     inbound_ingress_relay_effective_destination_allowed,
 };
 use super::{
@@ -190,6 +190,7 @@ use super::{
     mesh_egress_udp_destination_allowed, mesh_inbound_peer_auth_transport_mismatch_for_policy,
 };
 use crate::config::types::{Proxy, UpstreamTarget};
+use crate::plugin_cache::PluginCacheRequestView;
 use crate::plugins::mesh::authz::MESH_AUTHZ_REEVALUATION_METADATA_KEY;
 use crate::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
@@ -208,9 +209,11 @@ pub const HBONE_ADMISSION_REVOKED_MESSAGE: &str =
 ///
 /// The variants are declared, indexed, and rendered in GATE ORDER — the order
 /// [`HboneAdmissionFence::reevaluate`] applies them, which is the order the
-/// CONNECT path applies them — with the fail-closed arm last. The `reason`
-/// label is an operator's only attribution, so a tunnel failing two gates must
-/// carry the one its peer's next CONNECT would actually be refused with.
+/// CONNECT path applies them — with [`Self::ReuseWithdrawn`], the only reason
+/// that is not a refusal, after every gate that is, and the fail-closed arm
+/// last. The `reason` label is an operator's only attribution, so a tunnel
+/// failing two gates must carry the one its peer's next CONNECT would actually
+/// be refused with.
 ///
 /// The three credential arms sit in the order the inbound handshake verifier
 /// itself would report them, derived from webpki's own path-building sequence
@@ -267,6 +270,26 @@ pub enum HboneRevocationReason {
     PeerAuthTransport,
     /// The relay destination is no longer one this terminator owns.
     RelayDestination,
+    /// This tunnel was admitted with INNER REUSE advertised, and the chain that
+    /// would admit its peer's next CONNECT no longer permits reuse (issue
+    /// #5583) — a `CUSTOM` `mesh_authz` policy now selects this workload, a
+    /// `rate_limiting` row was added, an unclassified plugin was attached.
+    ///
+    /// The only reason on this list whose tunnel would still be ADMITTED. The
+    /// capability, not the admission, was withdrawn: the source was told it
+    /// could keep one application connection inside this tunnel and elide the
+    /// CONNECTs for every later operation, and the plugin that now wants a
+    /// per-operation decision would never see them. Revoking is what restores
+    /// it — the source's next operation performs a fresh CONNECT, under the new
+    /// chain, and is charged, mirrored, or externally authorized exactly as
+    /// that chain requires. Every other gate here outranks it, because every
+    /// other gate describes a refusal and this one does not; a tunnel that
+    /// fails one of them must carry that reason instead.
+    ///
+    /// Only tunnels that ADVERTISED reuse are judged. A tunnel admitted without
+    /// the advertisement already performs one CONNECT per operation, so there
+    /// is nothing for a later chain to miss.
+    ReuseWithdrawn,
     /// Re-evaluation itself could not produce a verdict: an authorize plugin
     /// unwound, the retained peer leaf is not parseable (or not retained) at
     /// all, or the CRL authoritative for the chain has reached `nextUpdate` by
@@ -300,6 +323,7 @@ impl HboneRevocationReason {
             Self::AuthorizationDenied => "authorization_denied",
             Self::PeerAuthTransport => "peer_auth_transport",
             Self::RelayDestination => "relay_destination",
+            Self::ReuseWithdrawn => "reuse_withdrawn",
             Self::ReevaluationFailed => "reevaluation_failed",
         }
     }
@@ -309,7 +333,7 @@ impl HboneRevocationReason {
     /// length, and the contract tests assert the rendered order against THIS
     /// rather than against a handwritten copy of it — a copy would silently
     /// stop describing the enum the moment a reason was inserted.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::ProxyWithdrawn,
         Self::PeerExpired,
         Self::PeerTrust,
@@ -317,6 +341,7 @@ impl HboneRevocationReason {
         Self::AuthorizationDenied,
         Self::PeerAuthTransport,
         Self::RelayDestination,
+        Self::ReuseWithdrawn,
         Self::ReevaluationFailed,
     ];
 
@@ -330,7 +355,8 @@ impl HboneRevocationReason {
             Self::AuthorizationDenied => 4,
             Self::PeerAuthTransport => 5,
             Self::RelayDestination => 6,
-            Self::ReevaluationFailed => 7,
+            Self::ReuseWithdrawn => 7,
+            Self::ReevaluationFailed => 8,
         }
     }
 
@@ -711,6 +737,26 @@ pub struct HboneAdmissionSnapshot {
     /// credential gate inapplicable — see
     /// [`HbonePeerCredential::from_admitted_connect`].
     pub peer_credential: Option<HbonePeerCredential>,
+    /// Whether the admitting plugin chain classified this CONNECT's tunnel as
+    /// safe to carry LATER application operations without running again — the
+    /// chain half of the `x-ferrum-mesh-tunnel-reuse` advertisement (issue
+    /// #5583).
+    ///
+    /// Recorded here, BEFORE [`HboneAdmissionFence::admit`] registers the
+    /// tunnel, because it is what the CONNECT response then reads to decide
+    /// whether to stamp the header: the two cannot disagree, because there is
+    /// only one value. The response ANDs it with
+    /// [`AdmittedHboneTunnel::fence_in_force`], which cannot be evaluated
+    /// before registration and needs no recording — a tunnel the fence does not
+    /// hold is not in the registry, so no sweep reaches it either way.
+    ///
+    /// `true` obliges the fence to keep re-deciding it: a tunnel admitted with
+    /// the advertisement is carrying operations the source will not re-CONNECT
+    /// for, so every sweep re-folds the CURRENT chain and revokes on
+    /// [`HboneRevocationReason::ReuseWithdrawn`] when it no longer permits
+    /// reuse. `false` obliges nothing — that tunnel already performs one full
+    /// destination admission per operation.
+    pub advertised_inner_reuse: bool,
 }
 
 struct AdmittedHboneTunnelInner {
@@ -2022,6 +2068,13 @@ impl HboneAdmissionFence {
     /// than relabelling every existing diagnostic. The proxy
     /// lifecycle check below is not one of those gates: a withdrawn proxy is
     /// never routed to at all, so it necessarily precedes every one of them.
+    ///
+    /// One check follows all four and is not a CONNECT gate either: INNER REUSE
+    /// eligibility (issue #5583). A tunnel admitted with the capability
+    /// advertised is carrying operations its source is not re-CONNECTing for,
+    /// so a chain that stops permitting reuse has to reach it — but that
+    /// tunnel's CONNECT would still be ADMITTED, so every gate above outranks
+    /// it and it is judged last.
     async fn reevaluate(
         &self,
         tunnel: &AdmittedHboneTunnelInner,
@@ -2047,7 +2100,14 @@ impl HboneAdmissionFence {
             return Some(reason);
         }
 
-        if self.authorize_chain_denies(snapshot, epoch).await {
+        // Resolved ONCE, from the generation now current, and shared by the two
+        // gates below that need it. `authorize_chain_denies` resolved it
+        // unconditionally before the reuse gate existed — including for the
+        // chains it then finds nothing to re-run in — so hoisting it costs
+        // nothing and keeps the reuse fold from resolving a second copy.
+        let view = admitting_request_view(snapshot, epoch);
+
+        if self.authorize_chain_denies(snapshot, &view).await {
             return Some(HboneRevocationReason::AuthorizationDenied);
         }
 
@@ -2106,32 +2166,50 @@ impl HboneAdmissionFence {
             return Some(HboneRevocationReason::RelayDestination);
         }
 
+        // LAST of the gates, because it is the only one whose tunnel would
+        // still be ADMITTED: a tunnel that also fails one of the gates above
+        // must carry that gate's reason, which is the one its peer's next
+        // CONNECT would actually be refused with.
+        //
+        // The CONNECT admission decision is re-issued for a reusable tunnel's
+        // whole life by the sweep and the credential gate; what is NOT
+        // re-issued is anything a plugin decides per OPERATION, and reuse means
+        // the source stops making the CONNECTs that would carry those
+        // decisions. So the eligibility itself is re-judged here, for every
+        // tunnel that was admitted with the capability advertised. Revoking is
+        // the restoration: the source's next operation performs a fresh CONNECT
+        // under the new chain, which is exactly the per-operation admission the
+        // new chain asked for.
+        //
+        // A pure boolean fold over the CURRENT chain, and nothing else. It must
+        // never run `authorize`, `on_request_received`, or any other hook — a
+        // sweep provokes no request, so charging a token, taking a permit, or
+        // issuing an external check here would do to every live tunnel exactly
+        // what `Plugin::reevaluates_live_admission` exists to prevent.
+        //
+        // It is also the SAME function the CONNECT path folded, over the same
+        // slice, so "still reusable" here means exactly what "reusable" meant
+        // there and the two cannot drift apart.
+        if snapshot.advertised_inner_reuse {
+            let current_chain = view.plugins();
+            if !admitting_chain_allows_inner_reuse(&current_chain) {
+                return Some(HboneRevocationReason::ReuseWithdrawn);
+            }
+        }
+
         None
     }
 
-    /// Re-run the re-evaluation-safe part of the admitting authorize chain.
-    /// `true` denies, which the caller turns into
-    /// [`HboneRevocationReason::AuthorizationDenied`].
+    /// Re-run the re-evaluation-safe part of the admitting authorize chain
+    /// against `view`, the admitting view re-resolved from the generation this
+    /// sweep is judging (see [`admitting_request_view`]). `true` denies, which
+    /// the caller turns into [`HboneRevocationReason::AuthorizationDenied`].
     async fn authorize_chain_denies(
         &self,
         snapshot: &HboneAdmissionSnapshot,
-        epoch: &RequestEpoch,
+        view: &PluginCacheRequestView,
     ) -> bool {
         let proxy = &snapshot.proxy;
-        // The authorize chain is protocol-scoped and the admitting view is
-        // peer-selectable: an HBONE CONNECT carrying `content-type:
-        // application/grpc` classifies as gRPC, and a gRPC-Web request resolves
-        // an entirely separate view. Re-resolve exactly the view
-        // `plugin_cache_view` resolved at admission, never a hardcoded HTTP one.
-        let view = if snapshot.grpc_web_request {
-            epoch
-                .plugin_cache
-                .grpc_web_request_view(&proxy.namespace, &proxy.id)
-        } else {
-            epoch
-                .plugin_cache
-                .request_view(&proxy.namespace, &proxy.id, snapshot.request_protocol)
-        };
         // Only plugins whose `authorize` is free of side effects and external
         // I/O are re-run (`Plugin::reevaluates_live_admission`). A sweep that
         // consumed a rate-limit token or issued one ext_authz/OPA call per live
@@ -2172,6 +2250,38 @@ impl HboneAdmissionFence {
             }
         }
         false
+    }
+}
+
+/// Re-resolve, from the generation a sweep is judging, the SAME plugin view the
+/// request path resolved when it admitted this tunnel.
+///
+/// The admitting view is protocol-scoped and the selector is peer-influenced:
+/// an HBONE CONNECT carrying `content-type: application/grpc` classifies as
+/// gRPC, and a gRPC-Web request resolves an entirely separate view. The
+/// snapshot records which one `plugin_cache_view` picked, so the sweep must
+/// replay that selector rather than assume plain HTTP. Only the GENERATION
+/// differs between this and the admitting resolution: the view key is
+/// `namespace|id`, which a route override never moves.
+///
+/// Both sweep gates that need plugins read this one resolution.
+/// [`PluginCacheRequestView::plugins`] is the same slice
+/// `handle_proxy_request_inner` binds as `plugins` and hands to
+/// `handle_hbone_request`, which is what makes the reuse fold here comparable
+/// with the fold the CONNECT path performed.
+fn admitting_request_view(
+    snapshot: &HboneAdmissionSnapshot,
+    epoch: &RequestEpoch,
+) -> PluginCacheRequestView {
+    let proxy = &snapshot.proxy;
+    if snapshot.grpc_web_request {
+        epoch
+            .plugin_cache
+            .grpc_web_request_view(&proxy.namespace, &proxy.id)
+    } else {
+        epoch
+            .plugin_cache
+            .request_view(&proxy.namespace, &proxy.id, snapshot.request_protocol)
     }
 }
 
