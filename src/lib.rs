@@ -88,11 +88,10 @@ pub use router_cache::{RouteMatch, RouterCache};
 pub mod _test_support {
     /// Structural admission of a `POST /restore` envelope (issue #5538).
     ///
-    /// `true` when the body is a JSON object whose keys are all recognized
-    /// restore/backup members; `false` for a JSON array, a positional
-    /// sequence, a scalar, or an unknown/misspelled key.
-    pub fn restore_envelope_admits_for_test(body: &[u8]) -> bool {
-        crate::admin::restore_envelope_admits_for_test(body)
+    /// Preserve the parser error so tests can distinguish object admission
+    /// from a later required-field or value-shape rejection.
+    pub fn restore_envelope_admission_for_test(body: &[u8]) -> Result<(), serde_json::Error> {
+        crate::admin::restore_envelope_admission_for_test(body)
     }
 
     /// Serde-accepted member names of the `POST /restore` envelope

@@ -22,6 +22,7 @@ mod circuit_breaker_tests;
 mod client_identity_tests;
 mod client_ip_tests;
 mod cni_ownership_tests;
+mod collection_object_admission_tests;
 mod config_delta_namespace_prune_tests;
 mod config_delta_tests;
 mod configsync_lifecycle_tests;

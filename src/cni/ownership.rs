@@ -85,6 +85,7 @@ pub struct DurableCniOwnershipRecord {
     pub container_id: String,
     pub ifname: String,
     pub pod_uid: String,
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
     pub cleanup: DurableCniCleanupSnapshot,
 }
 
@@ -92,6 +93,7 @@ pub struct DurableCniOwnershipRecord {
 #[serde(deny_unknown_fields)]
 struct DurableCniOwnershipDocument {
     version: u32,
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     attachments: Vec<DurableCniOwnershipRecord>,
 }
 

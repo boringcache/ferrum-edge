@@ -265,6 +265,7 @@ pub struct MeshSlice {
     /// routing view already contained those Services) while the relay
     /// inventory must rebuild.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub service_waypoint_bound_services: Vec<MeshWaypointServiceRef>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
@@ -295,6 +296,7 @@ pub struct MeshSlice {
     /// or deletion must rebuild the listener candidates instead of retaining a
     /// stale route or stale materialized local-workload selector decision.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub virtual_service_l4_proxies: Vec<serde_json::Value>,
     /// Weighted multi-destination upstreams referenced by
     /// [`Self::virtual_service_l4_proxies`]. Ordinary `GatewayConfig.upstreams`
@@ -304,6 +306,7 @@ pub struct MeshSlice {
     /// this field so weight/target updates and deletions cannot retain a stale
     /// load-balancer set.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub virtual_service_l4_upstreams: Vec<serde_json::Value>,
     pub version: String,
     /// Authoritative, CP-replica-shared config revision this slice was built
@@ -327,12 +330,14 @@ pub struct MeshSlice {
     #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub revision: Option<crate::modes::mesh::revision::MeshConfigRevision>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub workloads: Vec<Workload>,
     /// Workloads eligible to bind trusted Ambient UDP `source.pod_uid`
     /// evidence. Kept separate from `workloads` because ServiceWaypoint narrows
     /// that field to destination backends, while a source pod normally is not a
     /// backend of the service whose waypoint terminates its HBONE datagram.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub ambient_udp_source_workloads: Vec<Workload>,
     /// NodeWaypoints trusted to assert HBONE source workload identity for this
     /// slice, each carrying the exact identities it fronts. Unlike `workloads`,
@@ -345,6 +350,7 @@ pub struct MeshSlice {
     /// NodeWaypoint may assert exactly the workloads enrolled on its node and
     /// nothing else. An entry with no fronted identities authorizes nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub node_waypoint_assertors: Vec<NodeWaypointAssertor>,
     /// Destination workloads this NodeWaypoint's transparent inbound capture
     /// listener may terminate direct plaintext for (issue #3287).
@@ -363,6 +369,7 @@ pub struct MeshSlice {
     /// the capture path resolves NOTHING and fails closed — never a PERMISSIVE
     /// default.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub node_waypoint_capture_destinations: Vec<Workload>,
     /// PeerAuthentication candidates applicable to
     /// [`Self::node_waypoint_capture_destinations`] (issue #3287).
@@ -377,8 +384,10 @@ pub struct MeshSlice {
     /// nothing else. Istio precedence and port overrides are then resolved by
     /// the canonical [`resolve_effective_mtls_mode`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub node_waypoint_capture_peer_authentications: Vec<PeerAuthentication>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub services: Vec<MeshService>,
     /// Inbound-only view: the LOCAL workload's own service(s), captured
     /// **un-narrowed** by Sidecar egress scope. `services` is the egress/
@@ -390,6 +399,7 @@ pub struct MeshSlice {
     /// materializer falls back to it). Kept out of `services` so the outbound
     /// registry / egress scope is never widened by it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub local_inbound_services: Vec<MeshService>,
     /// The local workload(s) backing this sidecar, captured **un-narrowed** by
     /// Sidecar egress/identity narrowing. `workloads` is narrowed under
@@ -408,6 +418,7 @@ pub struct MeshSlice {
     /// ambiguity to one (wrong) service. `None` means no narrowing applied, so
     /// the materializer falls back to the full `workloads`/`services`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object_vec")]
     pub local_inbound_workloads: Option<Vec<Workload>>,
     /// Resolved custom inbound listeners from the local workload's applicable
     /// Istio `Sidecar.ingress[]`. Computed at slice build (the applicable
@@ -425,6 +436,7 @@ pub struct MeshSlice {
     /// plane's containment allowlist at materialization and dial time. Empty when
     /// no Sidecar applies, the Sidecar declares no ingress, or no entry resolved.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub local_ingress_listeners: Vec<ResolvedIngressListener>,
     /// Fail-closed marker: the local workload's applicable `Sidecar` declared a
     /// NON-EMPTY `spec.ingress[]`, independent of whether any entry RESOLVED
@@ -453,6 +465,7 @@ pub struct MeshSlice {
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub declared_ingress_http_ports: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub mesh_policies: Vec<MeshPolicy>,
     /// Admitted mesh-wide external authorization providers (issue #3235).
     ///
@@ -462,23 +475,31 @@ pub struct MeshSlice {
     /// so narrowing never has to consider tenant namespaces — a workload can
     /// only ever reach a provider the mesh operator declared.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub ext_authz_providers: Vec<crate::modes::mesh::config::MeshExtAuthzProvider>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub peer_authentications: Vec<PeerAuthentication>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub service_entries: Vec<ServiceEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub request_authentications: Vec<MeshRequestAuthentication>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub telemetry_resources: Vec<MeshTelemetryResource>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub destination_rules: Vec<MeshDestinationRule>,
     /// VirtualService-derived host-level CORS policies (issue #1973),
     /// narrowed like `destination_rules`. The DP synthesizes per-route `cors`
     /// plugin instances onto materialized outbound routes from these.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub virtual_service_cors_policies: Vec<MeshVirtualServiceCorsPolicy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub proxy_configs: Vec<MeshProxyConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
@@ -532,6 +553,7 @@ pub struct MeshSlice {
     /// `type_url` and applies the DR locally instead of relying on the
     /// fragmentary CDS/EDS recoverable fields.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub extension_configs: Vec<MeshExtensionConfig>,
     /// xDS RTDS (`envoy.service.runtime.v3.Runtime`) overlay merged across
     /// all subscribed layers. Fault-injection values are captured in the
@@ -617,6 +639,7 @@ pub struct MeshEgressScopeSnapshot {
     /// of the three resources affected by Sidecar narrowing, alongside
     /// services and service_entries).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub destination_rules: Vec<MeshEgressScopeResource>,
     /// Count of DestinationRules in scope before narrowing was applied,
     /// matched against the workload namespace using the same predicate as the
@@ -626,8 +649,10 @@ pub struct MeshEgressScopeSnapshot {
     #[serde(default)]
     pub sidecar_denied_destination_rules: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub services: Vec<MeshEgressScopeResource>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub service_entries: Vec<MeshEgressScopeResource>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub known_destinations: Vec<String>,

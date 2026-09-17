@@ -18174,18 +18174,18 @@ fn restore_request_publishes_the_complete_closed_envelope() {
         single.insert((*member).to_string(), value.clone());
         let single = serde_json::Value::Object(single);
         assert!(
-            ferrum_edge::_test_support::restore_envelope_admits_for_test(
+            ferrum_edge::_test_support::restore_envelope_admission_for_test(
                 single.to_string().as_bytes()
-            ),
+            )
+            .is_ok(),
             "runtime restore must accept the published member {member}"
         );
         assert_component_validity(&spec, "RestoreRequest", &single, true);
         whole.insert((*member).to_string(), value.clone());
     }
     let whole = serde_json::Value::Object(whole);
-    assert!(
-        ferrum_edge::_test_support::restore_envelope_admits_for_test(whole.to_string().as_bytes())
-    );
+    ferrum_edge::_test_support::restore_envelope_admission_for_test(whole.to_string().as_bytes())
+        .unwrap();
     assert_component_validity(&spec, "RestoreRequest", &whole, true);
 
     // Closed on both axes, in the schema and in the runtime alike.
@@ -18205,15 +18205,16 @@ fn restore_request_publishes_the_complete_closed_envelope() {
         json!(5),
     ] {
         assert!(
-            !ferrum_edge::_test_support::restore_envelope_admits_for_test(
+            ferrum_edge::_test_support::restore_envelope_admission_for_test(
                 rejected.to_string().as_bytes()
-            ),
+            )
+            .is_err(),
             "runtime restore must reject {rejected}"
         );
         assert_component_validity(&spec, "RestoreRequest", &rejected, false);
     }
     // An explicit empty object keeps its documented destructive meaning.
-    assert!(ferrum_edge::_test_support::restore_envelope_admits_for_test(b"{}"));
+    ferrum_edge::_test_support::restore_envelope_admission_for_test(b"{}").unwrap();
     assert_component_validity(&spec, "RestoreRequest", &json!({}), true);
 
     // Trust bundles are published with their three-state semantics.

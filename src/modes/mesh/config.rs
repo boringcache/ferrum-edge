@@ -94,6 +94,7 @@ pub struct Workload {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub addresses: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub ports: Vec<WorkloadPort>,
     pub trust_domain: TrustDomain,
     pub namespace: String,
@@ -267,8 +268,10 @@ pub struct MeshService {
     pub name: String,
     pub namespace: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub ports: Vec<ServicePort>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub workloads: Vec<WorkloadRef>,
     /// Per-port overrides for service-level protocol classification.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -369,6 +372,7 @@ pub struct MeshPolicy {
     pub namespace: String,
     pub scope: PolicyScope,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub rules: Vec<MeshRule>,
 }
 
@@ -453,10 +457,13 @@ pub enum PolicyTargetAttachment {
 #[serde(deny_unknown_fields)]
 pub struct MeshRule {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub from: Vec<PrincipalMatch>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub to: Vec<RequestMatch>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub when: Vec<ConditionMatch>,
     /// Glob patterns over JWT-derived request principals (`iss/sub`).
     ///
@@ -637,6 +644,7 @@ pub struct MeshExtAuthzProvider {
     /// Istio `includeAdditionalHeadersInCheck` — fixed operator-authored
     /// headers added to the check request.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub include_additional_headers_in_check: Vec<MeshExtAuthzHeader>,
     /// Istio `includeRequestBodyInCheck`. `None` means the check carries no
     /// request body at all.
@@ -2206,6 +2214,7 @@ pub struct MeshRequestAuthentication {
     pub namespace: String,
     pub scope: PolicyScope,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub jwt_rules: Vec<MeshJwtRule>,
 }
 
@@ -2221,6 +2230,7 @@ pub struct MeshJwtRule {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwks: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub from_headers: Vec<JwtHeader>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub from_params: Vec<String>,
@@ -2234,6 +2244,7 @@ pub struct MeshJwtRule {
     /// inbound request before validation and re-asserts it only from a
     /// validated token, so a client cannot forge one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub output_claim_to_headers: Vec<MeshJwtClaimHeader>,
 }
 
@@ -2552,6 +2563,7 @@ where
 pub struct MeshMetricsConfig {
     /// Tag overrides: rename, remove, or set custom values for metric tags.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub tag_overrides: Vec<MetricTagOverride>,
     /// Specific metric names to disable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2921,12 +2933,14 @@ pub struct ServiceEntry {
     pub namespace: String,
     pub hosts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub endpoints: Vec<MeshEndpoint>,
     #[serde(default)]
     pub resolution: Resolution,
     #[serde(default)]
     pub location: ServiceEntryLocation,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub ports: Vec<ServicePort>,
     /// Optional Istio-style visibility list. Empty means namespace-local for
     /// Ferrum's materialization path; `*` exports mesh-wide, `.` exports to
@@ -3004,6 +3018,7 @@ pub struct TrustBundleSet {
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
     pub local: TrustBundle,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub federated: Vec<TrustBundle>,
 }
 
@@ -3018,6 +3033,7 @@ pub struct TrustBundle {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub x509_authorities: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub jwt_authorities: Vec<JwtAuthority>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_hint_seconds: Option<u64>,
@@ -3107,6 +3123,7 @@ pub struct MeshSidecar {
     #[serde(default, skip_serializing_if = "is_false")]
     pub egress_inherits_defaults: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub egress: Vec<MeshSidecarEgress>,
     /// `true` when Kubernetes `spec.ingress` was PRESENT — including an explicit
     /// empty `ingress: []` — as opposed to omitted. Istio distinguishes the two:
@@ -3131,6 +3148,7 @@ pub struct MeshSidecar {
     /// default inbound behavior unchanged unless `ingress_declared` is set (an
     /// explicit empty `ingress: []`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub ingress: Vec<MeshSidecarIngress>,
     /// Istio `spec.outboundTrafficPolicy.mode` — the workload-scoped override of
     /// the mesh-wide [`MeshConfig::outbound_traffic_policy`] (issue #3262).
@@ -3842,10 +3860,12 @@ pub struct MultiClusterConfig {
     pub federation_endpoint: Option<String>,
     /// Remote clusters whose services/workloads/bundles may be exchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub remote_clusters: Vec<RemoteCluster>,
     /// SNI-routed east-west gateway backends. Mesh mode materializes these as
     /// passthrough TCP proxies only when topology is `east_west_gateway`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub east_west_gateways: Vec<EastWestGateway>,
 }
 
@@ -3921,6 +3941,7 @@ pub struct MeshDestinationRule {
     /// Named subsets with per-subset label selectors and optional policy
     /// overrides. Proxies reference these via `upstream_subset`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub subsets: Vec<MeshSubset>,
     /// Export visibility from Istio `spec.exportTo` (issue #2465).
     ///
@@ -4287,10 +4308,12 @@ pub struct MeshLocalityLbSetting {
     /// 0-100 as a percentage). Targets in localities not named by any
     /// matching `to` map are excluded from selection.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub distribute: Vec<MeshLocalityDistribute>,
     /// Per-source-region failover targets. Consulted when no healthy
     /// target exists in the source's exact/zone/region tiers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub failover: Vec<MeshLocalityFailover>,
     /// Ordered Istio `failoverPriority` label keys (`key`) or key/value
     /// overrides containing exactly one equals sign (`key=value`). Mutually
@@ -4576,10 +4599,13 @@ pub struct MeshConfig {
     )]
     pub istio_root_namespace: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub workloads: Vec<Workload>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub services: Vec<MeshService>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub mesh_policies: Vec<MeshPolicy>,
     /// Admitted root-namespace `meshConfig.extensionProviders[]` external
     /// authorization providers (issue #3235). An `AuthorizationPolicy` with
@@ -4587,16 +4613,22 @@ pub struct MeshConfig {
     /// (root namespace only), so a workload can never reach a provider
     /// declared in another tenant's namespace.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub ext_authz_providers: Vec<MeshExtAuthzProvider>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub peer_authentications: Vec<PeerAuthentication>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub service_entries: Vec<ServiceEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub request_authentications: Vec<MeshRequestAuthentication>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub telemetry_resources: Vec<MeshTelemetryResource>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub destination_rules: Vec<MeshDestinationRule>,
     /// VirtualService-derived host-level CORS policies (issue #1973). The
     /// sidecar DP synthesizes per-route `cors` plugin instances onto its
@@ -4604,8 +4636,10 @@ pub struct MeshConfig {
     /// translator from `http[].corsPolicy` and directly expressible on the
     /// file source; rides its own xDS ECDS carrier.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub virtual_service_cors_policies: Vec<MeshVirtualServiceCorsPolicy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub proxy_configs: Vec<MeshProxyConfig>,
     /// Istio `Sidecar` egress-scoping resources. Used by the slice builder
     /// to narrow which services / service-entries / destination-rules a
@@ -4613,6 +4647,7 @@ pub struct MeshConfig {
     /// (default `false`) — when disabled the field is parsed and persisted
     /// but slice narrowing is skipped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub sidecars: Vec<MeshSidecar>,
     /// GAMMA Waypoint bindings: a list mapping waypoint names to the set
     /// of services routed through that waypoint. Populated by the K8s
@@ -4624,6 +4659,7 @@ pub struct MeshConfig {
     /// `workloads` to entries bound to the named waypoint. Empty default
     /// keeps non-mesh and non-waypoint deployments at zero overhead.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub waypoint_bindings: Vec<MeshWaypointBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
@@ -4640,6 +4676,7 @@ pub struct MeshConfig {
     /// Operator-defined ECDS resources served by the ADS translator as
     /// `envoy.config.core.v3.TypedExtensionConfig` payloads.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub extension_configs: Vec<crate::modes::mesh::slice::MeshExtensionConfig>,
     /// Runtime-only CP-derived NodeWaypoint assertor inventory. The CP fills
     /// this before request-specific workload narrowing so destination slices can
@@ -6087,6 +6124,7 @@ pub struct MeshWaypointBinding {
     /// empty binding as "no services pass through this waypoint" and
     /// fails closed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub services: Vec<MeshWaypointServiceRef>,
 }
 

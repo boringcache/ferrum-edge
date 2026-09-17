@@ -286,6 +286,7 @@ pub(crate) struct BackupCounts {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ApiSpecsBackupSection {
     pub(crate) section_version: String,
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub(crate) items: Vec<ApiSpecBackupItem>,
 }
 
@@ -476,12 +477,16 @@ impl ApiSpecBackupItem {
 #[serde(deny_unknown_fields)]
 pub(crate) struct BatchCreateRequest {
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub proxies: Vec<Proxy>,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub consumers: Vec<Consumer>,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub plugin_configs: Vec<PluginConfig>,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub upstreams: Vec<Upstream>,
     #[serde(default, rename = "version")]
     _version: String,
@@ -505,6 +510,7 @@ pub(crate) struct BatchCreateRequest {
     )]
     _api_specs: Option<ApiSpecsBackupSection>,
     #[serde(default, rename = "gateway_trust_bundles")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object_vec")]
     _gateway_trust_bundles: Option<Vec<GatewayTrustBundleRecord>>,
 }
 
@@ -593,12 +599,16 @@ pub(crate) struct RestorePayload {
     #[serde(default)]
     pub version: String,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub proxies: Vec<Proxy>,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub consumers: Vec<Consumer>,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub plugin_configs: Vec<PluginConfig>,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub upstreams: Vec<Upstream>,
     /// Present when the backup includes the versioned `api_specs` section.
     /// `None` means a legacy backup that omitted the section entirely.
@@ -610,6 +620,7 @@ pub(crate) struct RestorePayload {
     /// exactly as it is; `Some(vec![])` is an explicit "this namespace had no
     /// trust resource" and revokes.
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object_vec")]
     pub gateway_trust_bundles: Option<Vec<GatewayTrustBundleRecord>>,
     /// Accepted-and-ignored `GET /backup` metadata. Declared so
     /// `deny_unknown_fields` still admits an unmodified backup artifact.

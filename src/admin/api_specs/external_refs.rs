@@ -409,6 +409,7 @@ pub struct ExternalRefSnapshotDocument {
 pub struct ExternalRefSnapshot {
     pub policy_digest: String,
     pub root_document_base: String,
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub documents: Vec<ExternalRefSnapshotDocument>,
     /// Aggregate digest over policy + ordered document digests.
     pub snapshot_digest: String,

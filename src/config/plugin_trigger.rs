@@ -85,9 +85,11 @@ pub struct PluginTrigger {
 pub struct PluginTriggerNode {
     /// Logical AND. An empty list is rejected (it would be a silent tautology).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object_vec")]
     pub all: Option<Vec<PluginTriggerNode>>,
     /// Logical OR. An empty list is rejected (it would silently never match).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object_vec")]
     pub any: Option<Vec<PluginTriggerNode>>,
     /// Logical NOT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
