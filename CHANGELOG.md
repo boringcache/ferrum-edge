@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **MCP trailing-slash alias withdrawn** (#5582). The single-trailing-slash
+  alias introduced for #5536 is no longer accepted. Authorization plugins
+  evaluate the raw request path before MCP dispatch, so admitting and rewriting
+  an alias afterward let a request authorized as one spelling be served as
+  another. Both MCP modes now require the exact configured `endpoint.path`;
+  `/mcp/` returns 404 `Unknown MCP endpoint` when the endpoint is `/mcp` and is
+  never forwarded. Operators who relied on `/mcp/` must configure clients with
+  the exact spelling, or configure `endpoint.path` as `/mcp/` if that is the
+  spelling they want.
 - **Breaking default:** `rate_limiting` now defaults `redis_failure_policy` to
   `local_fallback`, enforcing the configured quota independently in each pod
   during a Redis outage. Set `fail_closed` explicitly to require centralized
