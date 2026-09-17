@@ -612,7 +612,7 @@ fn rejects_unknown_rule_type_with_variant_fields_reports_type() {
     });
     let err = ProxyAlerts::new(&cfg, http_client()).unwrap_err();
     assert!(
-        err.contains("unknown type 'error_ratee'"),
+        err.contains("unknown type \"error_ratee\""),
         "unknown discriminator must be the primary error: {err}"
     );
     assert!(
@@ -714,7 +714,7 @@ fn rejects_malformed_optional_proxy_alerts_scalars() {
                     "channels": ["ops"]
                 }]
             }),
-            "'enabled' must be a boolean",
+            "`enabled` must be a boolean",
         ),
         (
             json!({
@@ -733,7 +733,7 @@ fn rejects_malformed_optional_proxy_alerts_scalars() {
                     "channels": ["ops"]
                 }]
             }),
-            "'enabled' must be a boolean",
+            "`enabled` must be a boolean",
         ),
         (
             json!({
@@ -771,7 +771,7 @@ fn rejects_malformed_optional_proxy_alerts_scalars() {
                     "channels": ["ops"]
                 }]
             }),
-            "'max_concurrent_dispatches' must be an unsigned integer",
+            "`max_concurrent_dispatches` must be an unsigned integer",
         ),
         (
             json!({
@@ -790,7 +790,7 @@ fn rejects_malformed_optional_proxy_alerts_scalars() {
                     "channels": ["ops"]
                 }]
             }),
-            "'max_concurrent_dispatches' must be an unsigned integer",
+            "`max_concurrent_dispatches` must be an unsigned integer",
         ),
         (
             json!({
@@ -901,12 +901,12 @@ fn rejects_invalid_top_level_defaults_even_when_rules_override_them() {
         (
             "default_cooldown_seconds",
             json!(0),
-            "'default_cooldown_seconds' must be in [1, 86400]",
+            "`default_cooldown_seconds` must be in [1, 86400]",
         ),
         (
             "default_cooldown_seconds",
             json!(86_401),
-            "'default_cooldown_seconds' must be in [1, 86400]",
+            "`default_cooldown_seconds` must be in [1, 86400]",
         ),
         (
             "default_min_request_count",
@@ -916,22 +916,22 @@ fn rejects_invalid_top_level_defaults_even_when_rules_override_them() {
         (
             "default_window_seconds",
             json!(4),
-            "'default_window_seconds' must be in [5, 3600]",
+            "`default_window_seconds` must be in [5, 3600]",
         ),
         (
             "default_window_seconds",
             json!(3_601),
-            "'default_window_seconds' must be in [5, 3600]",
+            "`default_window_seconds` must be in [5, 3600]",
         ),
         (
             "default_resolved_window_seconds",
             json!(4),
-            "'default_resolved_window_seconds' must be in [5, 86400]",
+            "`default_resolved_window_seconds` must be in [5, 86400]",
         ),
         (
             "default_resolved_window_seconds",
             json!(86_401),
-            "'default_resolved_window_seconds' must be in [5, 86400]",
+            "`default_resolved_window_seconds` must be in [5, 86400]",
         ),
     ] {
         let mut config = minimal_config();
@@ -968,7 +968,7 @@ fn shared_validator_rejects_malformed_optional_proxy_alerts_values() {
     )
     .expect_err("shared validation must reject malformed enabled");
     assert!(
-        err.contains("'enabled' must be a boolean"),
+        err.contains("`enabled` must be a boolean"),
         "shared validator path missing: {err}"
     );
 }

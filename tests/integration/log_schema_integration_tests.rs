@@ -232,7 +232,7 @@ fn stray_schema_ref_participates_only_when_the_plugin_is_enabled() {
     assert!(
         errors
             .iter()
-            .any(|error| error.contains("unknown schema 'missing'")),
+            .any(|error| error.contains("unknown schema \"missing\"")),
         "unexpected errors: {errors:?}"
     );
 }
@@ -355,7 +355,7 @@ fn shared_runtime_rejecting_contract_rejects_dangling_graphs_only() {
     assert!(
         errors
             .iter()
-            .any(|error| error.contains("unknown schema 'missing'")),
+            .any(|error| error.contains("unknown schema \"missing\"")),
         "database, MongoDB, and CP snapshots must reject dangling graph refs: {errors:?}"
     );
 
@@ -463,7 +463,7 @@ fn schema_ref_unknown_rejected_after_commit() {
     registry::commit_reload().expect("empty reload bracket commits");
 
     let err = create_err("stdout_logging", json!({ "schema_ref": "missing" }));
-    assert!(err.contains("unknown schema 'missing'"), "got: {err}");
+    assert!(err.contains("unknown schema \"missing\""), "got: {err}");
 }
 
 #[test]
@@ -512,7 +512,7 @@ fn transaction_debugger_schema_rejects_unknown_field_with_diagnostic() {
     );
     assert!(
         err.contains(
-            "transaction_debugger: schema omit references unknown field 'request_user_agent'"
+            "transaction_debugger: schema omit references unknown field \"request_user_agent\""
         ),
         "got: {err}"
     );
@@ -527,7 +527,7 @@ fn transaction_debugger_rejects_dangling_schema_ref() {
         json!({ "schema_ref": "definitely-not-defined" }),
     );
     assert!(
-        err.contains("references unknown schema 'definitely-not-defined'"),
+        err.contains("references unknown schema \"definitely-not-defined\""),
         "got: {err}"
     );
 }
@@ -881,7 +881,7 @@ fn non_summary_families_resolve_schema_ref_and_survive_reload() {
     ] {
         let err = create_err(plugin, config);
         assert!(
-            err.contains("references unknown schema 'portable'"),
+            err.contains("references unknown schema \"portable\""),
             "{plugin}: {err}"
         );
     }
@@ -910,7 +910,7 @@ fn non_summary_families_reject_a_named_schema_they_cannot_represent() {
         json!({ "schema_ref": "summary_only" }),
     );
     assert!(
-        err.contains("schema omit references unknown field 'request_user_agent'"),
+        err.contains("schema omit references unknown field \"request_user_agent\""),
         "got: {err}"
     );
 }
@@ -1023,7 +1023,7 @@ fn charge_event_family_resolves_schema_ref_and_rejects_a_colliding_definition() 
         sink_config(json!({ "schema_ref": "sink_portable" })),
     );
     assert!(
-        err.contains("references unknown schema 'sink_portable'"),
+        err.contains("references unknown schema \"sink_portable\""),
         "got: {err}"
     );
 }

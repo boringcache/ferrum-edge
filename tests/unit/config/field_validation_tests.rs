@@ -1690,7 +1690,7 @@ fn test_validate_all_fields_catches_proxy_errors() {
     let errs = config.validate_all_fields(30).unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.contains("Proxy 'test'") && e.contains("backend_connect_timeout_ms"))
+            .any(|e| e.contains("Proxy \"test\"") && e.contains("backend_connect_timeout_ms"))
     );
 }
 
@@ -1706,7 +1706,7 @@ fn test_validate_all_fields_catches_consumer_errors() {
     let errs = config.validate_all_fields(30).unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.contains("Consumer 'test'") && e.contains("username"))
+            .any(|e| e.contains("Consumer \"test\"") && e.contains("username"))
     );
 }
 
@@ -1726,7 +1726,7 @@ fn test_validate_all_fields_catches_upstream_errors() {
     let errs = config.validate_all_fields(30).unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.contains("Upstream 'test'") && e.contains("targets[0].port"))
+            .any(|e| e.contains("Upstream \"test\"") && e.contains("targets[0].port"))
     );
 }
 

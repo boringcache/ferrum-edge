@@ -899,7 +899,10 @@ mod tests {
             ..Default::default()
         };
 
-        assert_single_rejecting_error(config, "non-existent upstream_id 'missing-upstream'");
+        assert_single_rejecting_error(
+            config,
+            "Proxy \"dangling-upstream\" references non-existent upstream_id \"missing-upstream\"",
+        );
     }
 
     #[test]
@@ -913,7 +916,10 @@ mod tests {
             ..Default::default()
         };
 
-        assert_single_rejecting_error(config, "non-existent plugin_config 'missing-plugin'");
+        assert_single_rejecting_error(
+            config,
+            "Proxy \"dangling-plugin\" references non-existent plugin_config \"missing-plugin\"",
+        );
     }
 
     #[test]

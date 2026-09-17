@@ -614,9 +614,9 @@ fn gateway_config_validates_proxy_subset_reference() {
 
     let errors = config.validate_upstream_references().unwrap_err();
     assert!(
-        errors
-            .iter()
-            .any(|e| { e.contains("upstream_subset 'missing'") && e.contains("upstream_id 'u1'") }),
+        errors.iter().any(|e| {
+            e.contains("upstream_subset \"missing\"") && e.contains("upstream_id \"u1\"")
+        }),
         "Expected missing subset reference error, got: {:?}",
         errors
     );

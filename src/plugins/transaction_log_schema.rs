@@ -335,7 +335,10 @@ mod tests {
         .unwrap_err();
         // Compile errors are prefixed with the schema label.
         assert!(e.contains("[bad]"), "got: {e}");
-        assert!(e.contains("unknown field 'not_a_field'"), "got: {e}");
+        assert!(
+            e.contains("schema omit references unknown field \"not_a_field\""),
+            "got: {e}"
+        );
     }
 
     #[test]

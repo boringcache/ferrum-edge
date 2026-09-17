@@ -8893,7 +8893,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("rules[].when[0].key 'destination.labels[app]'")
+                .contains("rules[].when[0].key \"destination.labels[app]\" is unsupported")
         );
         assert!(err.to_string().contains("unsupported"));
     }

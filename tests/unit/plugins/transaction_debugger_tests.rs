@@ -504,7 +504,7 @@ fn test_transaction_debugger_accepts_inline_schema_and_rejects_dangling_ref() {
         .err()
         .unwrap();
     assert!(
-        err.contains("references unknown schema 'definitely-not-defined'"),
+        err.contains("references unknown schema \"definitely-not-defined\""),
         "got: {err}"
     );
     let err = TransactionDebugger::new(&json!({"schema": {}, "schema_ref": "x"}))
@@ -2216,7 +2216,7 @@ fn test_debugger_schema_rejects_unrepresentable_shapes_with_field_diagnostics() 
     for (config, needle) in [
         (
             json!({"schema": {"omit": ["request_user_agent"]}}),
-            "schema omit references unknown field 'request_user_agent'",
+            "schema omit references unknown field \"request_user_agent\"",
         ),
         (
             json!({"schema": {"rename": {"outcome": "authorization"}}}),
@@ -2228,7 +2228,7 @@ fn test_debugger_schema_rejects_unrepresentable_shapes_with_field_diagnostics() 
         ),
         (
             json!({"schema": {"derived_fields": [{"name": "k", "kind": "not_a_kind"}]}}),
-            "unknown derived kind 'not_a_kind'",
+            "unknown derived kind \"not_a_kind\"",
         ),
         (
             json!({"schema": {"summary_type": "sideways"}}),

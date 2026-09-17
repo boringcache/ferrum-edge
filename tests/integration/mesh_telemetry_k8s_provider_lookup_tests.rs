@@ -831,7 +831,7 @@ fn k8s_telemetry_rejects_workload_metrics_constructor_blackout_vectors() {
                     }]
                 }]
             }),
-            "unsupported metric tag 'request_host'",
+            "unsupported metric tag \"request_host\"",
         ),
         (
             "oversized metric tag value",
@@ -848,7 +848,7 @@ fn k8s_telemetry_rejects_workload_metrics_constructor_blackout_vectors() {
                     }]
                 }]
             }),
-            "metric tag 'source_workload' value exceeds 256 bytes",
+            "metric tag \"source_workload\" value exceeds 256 bytes",
         ),
         (
             "credential-bearing custom header",
@@ -859,7 +859,7 @@ fn k8s_telemetry_rejects_workload_metrics_constructor_blackout_vectors() {
                     }
                 }]
             }),
-            "cannot copy sensitive header 'Authorization'",
+            "cannot copy sensitive header \"Authorization\"",
         ),
         (
             "environment tag missing name",
@@ -892,7 +892,7 @@ fn k8s_telemetry_rejects_workload_metrics_constructor_blackout_vectors() {
                     }
                 }]
             }),
-            "has invalid header name 'bad header'",
+            "has invalid header name \"bad header\"",
         ),
         (
             "combined custom tag count",
@@ -919,7 +919,7 @@ fn k8s_telemetry_rejects_workload_metrics_constructor_blackout_vectors() {
                     }
                 }]
             }),
-            "custom tag 'tenant' value exceeds 1024 bytes",
+            "custom tag \"tenant\" value exceeds 1024 bytes",
         ),
         (
             "reserved custom tag collision",
@@ -930,7 +930,7 @@ fn k8s_telemetry_rejects_workload_metrics_constructor_blackout_vectors() {
                     }
                 }]
             }),
-            "custom tag name 'trace_id' is reserved or sensitive",
+            "custom tag name \"trace_id\" is reserved or sensitive",
         ),
         (
             "unknown disabled metric",
@@ -942,7 +942,7 @@ fn k8s_telemetry_rejects_workload_metrics_constructor_blackout_vectors() {
                     }]
                 }]
             }),
-            "unsupported disabled metric 'NOT_AN_ISTIO_METRIC'",
+            "unsupported disabled metric \"NOT_AN_ISTIO_METRIC\"",
         ),
         (
             "unknown tag override operation",

@@ -2271,11 +2271,11 @@ async fn transaction_log_schema_crud_validates_the_prospective_database_graph() 
     let (status, body) =
         admin_put(&base_url, "/plugins/config/schema-owner", &token, &renamed).await;
     assert_eq!(status, 400, "dangling rename was admitted: {body:?}");
-    assert!(body.to_string().contains("unknown schema 'audit'"));
+    assert!(body.to_string().contains(r#"unknown schema \"audit\""#));
 
     let (status, body) = admin_delete(&base_url, "/plugins/config/schema-owner", &token).await;
     assert_eq!(status, 400, "dangling delete was admitted: {body:?}");
-    assert!(body.to_string().contains("unknown schema 'audit'"));
+    assert!(body.to_string().contains(r#"unknown schema \"audit\""#));
 }
 
 #[tokio::test]
@@ -2434,7 +2434,7 @@ async fn transaction_log_schema_batch_and_restore_are_definition_order_independe
     let (status, body) =
         admin_post(&base_url, "/restore?confirm=true", &token, &invalid_restore).await;
     assert_eq!(status, 400, "dangling restore was admitted: {body:?}");
-    assert!(body.to_string().contains("unknown schema 'missing'"));
+    assert!(body.to_string().contains(r#"unknown schema \"missing\""#));
 
     let (status, _, _) = admin_get(&base_url, "/plugins/config/restore-schema", &token).await;
     assert_eq!(
@@ -3026,7 +3026,7 @@ async fn test_admin_create_rejects_unknown_proxy_alerts_keys() {
                     "channels": ["ops"]
                 }]
             }),
-            "'enabled' must be a boolean",
+            "`enabled` must be a boolean",
         ),
         (
             "proxy-alerts-max-concurrent-zero",
@@ -3066,7 +3066,7 @@ async fn test_admin_create_rejects_unknown_proxy_alerts_keys() {
                     "channels": ["ops"]
                 }]
             }),
-            "'min_request_count' must be an unsigned integer",
+            "`min_request_count` must be an unsigned integer",
         ),
         (
             "proxy-alerts-quiet-hours-null",
@@ -3107,7 +3107,7 @@ async fn test_admin_create_rejects_unknown_proxy_alerts_keys() {
                     "recovery": {"resolved_window_seconds": 300}
                 }]
             }),
-            "'default_resolved_window_seconds' must be in [5, 86400]",
+            "`default_resolved_window_seconds` must be in [5, 86400]",
         ),
     ] {
         let plugin = json!({
@@ -4031,11 +4031,11 @@ async fn restore_rejects_duplicate_proxy_and_upstream_names_before_delete() {
     );
     let errors = body["validation_errors"].to_string();
     assert!(
-        errors.contains("Duplicate proxy name 'shared_proxy'"),
+        errors.contains(r#"Duplicate proxy name \"shared_proxy\""#),
         "expected the duplicate proxy-name diagnostic: {body:?}"
     );
     assert!(
-        errors.contains("Duplicate upstream name 'shared_upstream'"),
+        errors.contains(r#"Duplicate upstream name \"shared_upstream\""#),
         "expected the duplicate upstream-name diagnostic: {body:?}"
     );
 

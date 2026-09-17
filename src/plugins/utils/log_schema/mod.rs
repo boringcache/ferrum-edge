@@ -1204,7 +1204,10 @@ mod tests {
     #[test]
     fn unknown_field_in_omit_rejected() {
         let e = err(json!({ "omit": ["typo"] }));
-        assert!(e.contains("unknown field 'typo'"), "got: {e}");
+        assert!(
+            e.contains("schema omit references unknown field \"typo\""),
+            "got: {e}"
+        );
     }
 
     #[test]
@@ -1239,7 +1242,10 @@ mod tests {
             "summary_type": "http",
             "omit": ["protocol"]
         }));
-        assert!(e.contains("unknown field 'protocol'"), "got: {e}");
+        assert!(
+            e.contains("schema omit references unknown field \"protocol\""),
+            "got: {e}"
+        );
     }
 
     #[test]
@@ -1257,7 +1263,10 @@ mod tests {
                 "summary_type": "http",
                 "omit": [field],
             }));
-            assert!(e.contains(&format!("unknown field '{field}'")), "got: {e}");
+            assert!(
+                e.contains(&format!("schema omit references unknown field {field:?}")),
+                "got: {e}"
+            );
         }
     }
 
@@ -1335,7 +1344,7 @@ mod tests {
             "omit": ["frames_client_to_backend"],
         }));
         assert!(
-            e.contains("unknown field 'frames_client_to_backend'"),
+            e.contains("schema omit references unknown field \"frames_client_to_backend\""),
             "got: {e}"
         );
     }
@@ -1493,7 +1502,10 @@ mod tests {
             "summary_type": "stream",
             "rename": { "request_path": "path" }
         }));
-        assert!(e.contains("unknown field 'request_path'"), "got: {e}");
+        assert!(
+            e.contains("schema rename references unknown field \"request_path\""),
+            "got: {e}"
+        );
     }
 
     #[test]
