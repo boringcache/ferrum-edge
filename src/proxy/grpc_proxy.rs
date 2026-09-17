@@ -3753,13 +3753,19 @@ fn hbone_dispatch_authority<'a>(
 ///
 /// Since issue #5042 step 2 the inner connection is REUSED across RPCs when the
 /// destination advertises the receiver-side admission fence on its CONNECT
-/// `200`: one shared multiplexed sender per
+/// `200`: a small BOUNDED set of shared multiplexed senders per
 /// [`crate::proxy::hbone_inner_pool`] key, cloned per RPC. Nothing about the
 /// wire changes — the reuse decision is the destination's to grant, the key is
 /// the complete transport and admission identity (so an SVID rotation or a
 /// different asserted principal partitions the pool rather than sharing across
 /// it), and a peer that does not advertise the fence keeps the previous 1:1
 /// model of one CONNECT and one nested handshake per RPC.
+///
+/// The returned sender carries its carrier's load hold for the lifetime of this
+/// dispatch, which is how the pool knows a carrier has reached the nested
+/// peer's `SETTINGS_MAX_CONCURRENT_STREAMS` and must be widened rather than
+/// queued on. The width ceiling is `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST`
+/// clamped by `hbone_inner_pool::MAX_SHARED_H2_PER_KEY`; see `docs/mesh.md`.
 ///
 /// HTTP/2 PING keepalive is still deliberately NOT enabled on the inner
 /// connection. It is a stream on the outer pooled HBONE connection, which
@@ -3828,10 +3834,19 @@ async fn open_hbone_grpc_sender(
         .as_ref()
         .and_then(|credential| credential.leaf_deadline);
     if let Some(parts) = inner_key.as_ref()
-        && let Some(sender) = hbone.pool.inner_pool().checkout_h2(parts)
+        && let Some(checkout) = hbone.pool.inner_pool().checkout_h2(parts)
     {
-        return Ok(GrpcPooledSender::new(sender));
+        return Ok(GrpcPooledSender::pooled_inner(checkout.sender, checkout.lease));
     }
+
+    // Snapshot the retirement generation and the source TLS material BEFORE
+    // the dial (issue #5042 step 2 review). A drain or an SVID/CRL rotation
+    // that lands while the CONNECT and the nested handshake are in flight must
+    // not be laundered by publishing afterwards: the outer pool already
+    // refuses to pool a transport under those conditions, and the nested
+    // sender rides that very transport.
+    let inner_drain_generation = hbone.pool.inner_pool().drain_generation();
+    let inner_dial_fence = hbone.pool.source_dial_fence();
 
     let tunnel = hbone
         .pool
@@ -3918,18 +3933,26 @@ async fn open_hbone_grpc_sender(
     // credential deadline, the global ceiling, or losing the race to a
     // concurrent cold miss all leave it unpooled — which is exactly the
     // per-request behaviour this replaces.
-    if let Some(parts) = inner_key.as_ref() {
+    let inner_lease = inner_key.as_ref().map(|parts| {
+        let source_material_unchanged = inner_dial_fence
+            .as_ref()
+            .is_some_and(|fence| hbone.pool.source_dial_fence_intact(fence));
         hbone.pool.inner_pool().publish_h2(
             parts,
             &sender,
             peer_advertises_fence,
+            source_material_unchanged,
             inner_credential_deadline,
-        );
-    }
+            inner_drain_generation,
+        )
+    });
     // The socket underneath this sender is the OUTER HBONE session, shared by
     // every tunnel multiplexed on it and owned by the HBONE pool, so no
     // per-request send-queue bound is published here (issue #4411).
-    Ok(GrpcPooledSender::new(sender))
+    Ok(match inner_lease {
+        Some(lease) => GrpcPooledSender::pooled_inner(sender, lease),
+        None => GrpcPooledSender::new(sender),
+    })
 }
 
 /// One pooled native-gRPC HTTP/2 transport.
@@ -3944,11 +3967,37 @@ async fn open_hbone_grpc_sender(
 #[derive(Clone, Debug)]
 pub struct GrpcPooledSender {
     inner: http2::SendRequest<GrpcBody>,
+    /// The nested-HBONE carrier's load accounting for THIS dispatch, when the
+    /// sender came from `hbone_inner_pool` (issue #5042 step 2 review).
+    ///
+    /// Behind an `Arc` so cloning the dispatch sender shares ONE hold instead
+    /// of double-counting, and dropped when the dispatch releases the carrier —
+    /// which is what lets the inner pool see a carrier at its nested peer's
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS` and open a sibling rather than queue
+    /// every RPC to one destination behind one connection. `None` for the
+    /// direct-dial gRPC pool, which is bounded by its own pool.
+    #[allow(dead_code)] // Held for its `Drop`; the accounting IS the read.
+    inner_lease: Option<Arc<crate::proxy::hbone_inner_pool::HboneInnerH2StreamLease>>,
 }
 
 impl GrpcPooledSender {
     fn new(inner: http2::SendRequest<GrpcBody>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            inner_lease: None,
+        }
+    }
+
+    /// A sender taken from the source-side HBONE inner pool, carrying that
+    /// carrier's load accounting for the lifetime of this dispatch.
+    fn pooled_inner(
+        inner: http2::SendRequest<GrpcBody>,
+        lease: crate::proxy::hbone_inner_pool::HboneInnerH2StreamLease,
+    ) -> Self {
+        Self {
+            inner,
+            inner_lease: Some(Arc::new(lease)),
+        }
     }
 
     fn backend_socket(&self) -> Option<Arc<crate::proxy::backend_send_queue::BackendSocketHandle>> {

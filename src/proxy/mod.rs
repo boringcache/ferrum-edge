@@ -7951,6 +7951,39 @@ impl ProxyState {
         );
     }
 
+    /// Reconcile the source-side HBONE inner application-connection pool
+    /// against a request epoch that HAS JUST BECOME CURRENT (issue #5042 step 2
+    /// review).
+    ///
+    /// The inner pool is keyed by the COMPLETE admission identity, so a proxy
+    /// that is withdrawn, re-bound (a new lifecycle generation), or has its
+    /// effective `pool_enable_http_keep_alive` turned off produces a NEW key:
+    /// the resident entries become unreachable — the security property holds —
+    /// but nothing retires them, and each keeps holding an outer HTTP/2 stream,
+    /// a destination `accept(2)`, and a destination fence-registry entry until
+    /// the amortised idle sweep notices. This is the synchronous half, the same
+    /// discipline [`Self::reconcile_unix_backend_pool`] applies.
+    ///
+    /// `published` is the exact request epoch that just became current, and its
+    /// own plugin cache resolves the lifecycle generations, so the identities
+    /// compared here are rendered from the same source the dispatch stamps into
+    /// a key.
+    fn reconcile_hbone_inner_pool(&self, published: &RequestEpoch) {
+        // Source-side HBONE reuse is mesh-only and starts empty, so the
+        // overwhelmingly common publication has nothing to retire. One relaxed
+        // atomic load keeps every other deployment from rendering a live-route
+        // set per publication.
+        if self.hbone_pool.inner_pool().pooled_connections() == 0 {
+            return;
+        }
+        self.hbone_pool
+            .inner_pool()
+            .retain_live_routes(&collect_live_hbone_inner_routes(
+                published,
+                self.hbone_pool.default_enable_http_keep_alive(),
+            ));
+    }
+
     /// Reclaim per-endpoint H2/gRPC `rr_counters` and backend TLS config cache
     /// entries whose endpoints (or TLS identities) are no longer in the
     /// published config. Pod/EDS churn otherwise retains a counter and a
@@ -12925,6 +12958,7 @@ impl ProxyState {
             // is now current, so it owns the generation advance like any other
             // publication (issue #3764).
             self.reconcile_unix_backend_pool(&published);
+            self.reconcile_hbone_inner_pool(&published);
             self.reconcile_backend_pool_side_maps(&published);
 
             // DNS warmup for all hostnames in the new config
@@ -13208,6 +13242,7 @@ impl ProxyState {
         // idle map, and its check-in is fenced against the generation it was
         // leased under (issue #3764).
         self.reconcile_unix_backend_pool(&published);
+        self.reconcile_hbone_inner_pool(&published);
         self.reconcile_backend_pool_side_maps(&published);
 
         // Wake external config watchers (Gateway API listener lifecycle) on the
@@ -13839,6 +13874,7 @@ impl ProxyState {
         // (issue #3764). Before the no-delta early return below, for the same
         // reason as on the full path.
         self.reconcile_unix_backend_pool(&published);
+        self.reconcile_hbone_inner_pool(&published);
         self.reconcile_backend_pool_side_maps(&published);
 
         // Wake socket reconciliation here as well as in the full-snapshot path;
@@ -49490,6 +49526,13 @@ async fn open_hbone_inner_h1(
     sni_override: Option<&str>,
     asserted_source_identity: Option<&crate::identity::SpiffeId>,
 ) -> Result<hbone_inner_pool::HboneInnerH1Checkout, HboneInnerOpenError> {
+    // Snapshot the retirement generation and the source TLS material BEFORE
+    // the dial (issue #5042 step 2 review). Both are compared after it: a
+    // retirement that ran while the CONNECT was in flight already cleared
+    // everything this key could name, and a mid-dial SVID/CRL rotation is the
+    // hazard `get_tunnel_via`'s own insert refusal names.
+    let drain_generation = state.hbone_pool.inner_pool().drain_generation();
+    let dial_fence = state.hbone_pool.source_dial_fence();
     // The outer dial stays boxed inside this coroutine too: without it this
     // frame would hold the TLS + CONNECT handshake AND the inner HTTP/1.1
     // handshake at once. See `boxed_hbone_pool_get_tunnel_via`.
@@ -49513,6 +49556,14 @@ async fn open_hbone_inner_h1(
     // thing it decides is whether this connection may be held open across
     // requests.
     let peer_advertises_fence = tunnel.peer_advertises_inner_reuse();
+    // The source material must still be the material this dial started under,
+    // exactly as `get_tunnel_via` requires of the OUTER transport it just
+    // pooled (issue #5042 step 2 review). A rotation that landed mid-dial
+    // means pooling under this key would resurrect a connection after its
+    // one-shot drain already ran.
+    let source_material_unchanged = dial_fence
+        .as_ref()
+        .is_some_and(|fence| state.hbone_pool.source_dial_fence_intact(fence));
     let io = TokioIo::new(tunnel);
     let (sender, connection) = hyper::client::conn::http1::Builder::new()
         .handshake(io)
@@ -49527,9 +49578,10 @@ async fn open_hbone_inner_h1(
         Some(plan) => state.hbone_pool.inner_pool().fresh_h1(
             &plan.key_parts(hbone_inner_pool::HboneInnerProtocol::Http1),
             sender,
-            peer_advertises_fence,
+            peer_advertises_fence && source_material_unchanged,
             plan.keep_alive,
             plan.credential_deadline,
+            drain_generation,
         ),
         None => hbone_inner_pool::HboneInnerConnectionPool::unpooled_h1(sender),
     })
@@ -50302,17 +50354,21 @@ async fn proxy_to_backend_hbone_after_ready(
         ctx,
         state.env_config.authenticated_stream_max_lifetime_seconds,
     );
+    // ALSO absolute, and hoisted above the loop for exactly that reason: the
+    // at-most-one idle-race replay must not hand the retried dispatch a second
+    // full `backend_read_timeout_ms` window, which would let one request wait
+    // twice the configured budget for its response headers.
+    let read_deadline = if proxy.backend_read_timeout_ms > 0 {
+        tokio::time::Instant::now()
+            .checked_add(Duration::from_millis(proxy.backend_read_timeout_ms))
+    } else {
+        None
+    };
     let response = loop {
         // `send_fut` borrows `checkout.sender` mutably, so it lives in an inner
         // scope: the idle-race arm below REPLACES `checkout`, which cannot
         // compile while that borrow is still live.
         let send_result = {
-            let read_deadline = if proxy.backend_read_timeout_ms > 0 {
-                tokio::time::Instant::now()
-                    .checked_add(Duration::from_millis(proxy.backend_read_timeout_ms))
-            } else {
-                None
-            };
             let send_bound =
                 compose_dispatch_phase_auth_bound(read_deadline, send_auth_deadline.as_ref());
             let send_fut = checkout.sender.try_send_request(backend_req);
@@ -50860,6 +50916,74 @@ pub fn collect_live_unix_target_identities(
     live
 }
 
+/// The input to
+/// [`hbone_inner_pool::HboneInnerConnectionPool::retain_live_routes`] (issue
+/// #5042 step 2 review): the route-generation identity of every proxy the
+/// published epoch declares AS REUSABLE.
+///
+/// Anything pooled whose route identity is absent from this set is unreachable
+/// under the new configuration and must not stay resident: a deleted proxy, a
+/// proxy re-bound to another namespace, a republished proxy carrying a new
+/// lifecycle generation, and a proxy whose effective
+/// `pool_enable_http_keep_alive` is now off (which the key's leading
+/// `write_pool_config_key` field already partitions, so its old entries can
+/// never be reached again).
+///
+/// It is deliberately a SUPERSET of the proxies that could own an inner
+/// connection: every declared proxy with keep-alive on is included, whether or
+/// not its DECLARED upstream carries a `mesh.hbone` target, because a route
+/// override can send a proxy over HBONE to an upstream the published proxy does
+/// not name. Including a proxy that owns nothing costs one set entry;
+/// excluding one that does would retire a live route on every publication.
+/// `default_enable_http_keep_alive` is the process-lifetime pool default,
+/// overridden per proxy with the SAME precedence `PoolConfig::for_proxy` uses
+/// at dispatch.
+///
+/// Identities are rendered by
+/// [`hbone_inner_pool::write_hbone_inner_route_identity`], the same writer the
+/// key itself uses, so the two cannot drift.
+///
+/// Runs once per config publication that becomes current, including
+/// out-of-band mesh/MMDB republications with no resource delta; never on the
+/// request path.
+pub(crate) fn collect_live_hbone_inner_routes(
+    published: &RequestEpoch,
+    default_enable_http_keep_alive: bool,
+) -> std::collections::HashSet<String> {
+    let mut live = std::collections::HashSet::new();
+    let mut rendered = String::with_capacity(96);
+    for proxy in &published.config.proxies {
+        if !proxy
+            .pool_enable_http_keep_alive
+            .unwrap_or(default_enable_http_keep_alive)
+        {
+            continue;
+        }
+        // The dispatch reads the lifecycle generation off the CURRENT epoch's
+        // plugin cache; this reads it off the epoch that just became current,
+        // which is the generation every later dispatch will stamp.
+        //
+        // A proxy the published generation cannot name has nothing to compare,
+        // and the retention pass exempts such entries rather than retiring them
+        // on every publication.
+        let Some(lifecycle) = published
+            .plugin_cache
+            .proxy_lifecycle_generation(&proxy.namespace, &proxy.id)
+        else {
+            continue;
+        };
+        rendered.clear();
+        hbone_inner_pool::write_hbone_inner_route_identity(
+            &mut rendered,
+            &proxy.namespace,
+            &proxy.id,
+            Some(lifecycle),
+        );
+        live.insert(rendered.clone());
+    }
+    live
+}
+
 /// HTTP-family dispatch to a co-located Unix-domain STREAM socket
 /// (Istio `Sidecar` `ingress[].defaultEndpoint: unix:///path`).
 ///
@@ -51185,15 +51309,19 @@ async fn proxy_to_backend_unix(
         ctx,
         state.env_config.authenticated_stream_max_lifetime_seconds,
     );
+    // ALSO absolute, and hoisted above the loop for exactly that reason: a
+    // replayed dispatch must not get a second full `backend_read_timeout_ms`
+    // window and make one request wait twice the configured budget. Kept in
+    // step with the HBONE dispatch, which composes the identical bound.
+    let read_deadline = if proxy.backend_read_timeout_ms > 0 {
+        tokio::time::Instant::now()
+            .checked_add(Duration::from_millis(proxy.backend_read_timeout_ms))
+    } else {
+        None
+    };
     let response = loop {
         let send_result = {
             let send_fut = checkout.sender.try_send_request(backend_req);
-            let read_deadline = if proxy.backend_read_timeout_ms > 0 {
-                tokio::time::Instant::now()
-                    .checked_add(Duration::from_millis(proxy.backend_read_timeout_ms))
-            } else {
-                None
-            };
             let send_bound =
                 compose_dispatch_phase_auth_bound(read_deadline, send_auth_deadline.as_ref());
             if let Some(send_deadline) = send_bound.at {

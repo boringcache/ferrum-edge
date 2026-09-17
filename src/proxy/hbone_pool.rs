@@ -885,6 +885,17 @@ pub struct HboneConnectionPool {
     request_epoch: OnceLock<Arc<crate::request_epoch::RequestEpochStore>>,
 }
 
+/// The SOURCE TLS material a dial started under, for the mid-dial rotation
+/// refusal (issue #5042 step 2 review).
+///
+/// Pointer identity on both slots plus the current leaf fingerprint — the same
+/// three facts `get_tunnel_via` compares before it pools an outer transport.
+pub struct HboneSourceDialFence {
+    svid_slot: Arc<Option<SvidBundle>>,
+    crls: crate::tls::CrlList,
+    fingerprint: Arc<str>,
+}
+
 struct HboneSvidIdentityCache {
     source: Arc<Option<SvidBundle>>,
     identity: crate::identity::SpiffeId,
@@ -1012,6 +1023,43 @@ impl HboneConnectionPool {
     /// The source-side inner application-connection pool (issue #5042 step 2).
     pub fn inner_pool(&self) -> &Arc<crate::proxy::hbone_inner_pool::HboneInnerConnectionPool> {
         &self.inner_pool
+    }
+
+    /// The process-lifetime pool default for `pool_enable_http_keep_alive`,
+    /// which the publication retention pass resolves per proxy with the same
+    /// precedence `PoolConfig::for_proxy` uses.
+    pub fn default_enable_http_keep_alive(&self) -> bool {
+        self.pool_config.enable_http_keep_alive
+    }
+
+    /// Snapshot of the SOURCE TLS material a dial is about to run under
+    /// (issue #5042 step 2 review).
+    ///
+    /// Taken BEFORE the dial and compared with [`Self::source_dial_fence_intact`]
+    /// after it, so a nested inner connection is pooled only under material
+    /// that is still current — the exact refusal [`Self::get_tunnel_via`]
+    /// applies to the OUTER transport, restated for the connection riding
+    /// inside it. `None` means this gateway has no usable SVID, which is
+    /// already fatal for the dial.
+    pub fn source_dial_fence(&self) -> Option<HboneSourceDialFence> {
+        let (_, fingerprint) = self.current_svid_identity_cached().ok()?;
+        Some(HboneSourceDialFence {
+            svid_slot: self.gateway_svid.load_full(),
+            crls: self.crls.load_full(),
+            fingerprint,
+        })
+    }
+
+    /// Whether the source TLS material is byte-for-byte the snapshot `fence`
+    /// recorded: the same SVID slot pointer (which catches a same-leaf
+    /// trust-bundle rotation the fingerprint cannot see), the same CRL slot
+    /// pointer, and the same current leaf fingerprint.
+    pub fn source_dial_fence_intact(&self, fence: &HboneSourceDialFence) -> bool {
+        Arc::ptr_eq(&fence.svid_slot, &self.gateway_svid.load_full())
+            && Arc::ptr_eq(&fence.crls, &self.crls.load_full())
+            && self
+                .current_svid_identity_cached()
+                .is_ok_and(|(_, current)| current.as_ref() == fence.fingerprint.as_ref())
     }
 
     /// The gateway SVID facts every inner lease is keyed and bounded by

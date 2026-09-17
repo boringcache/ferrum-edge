@@ -30,7 +30,8 @@ use chrono::Utc;
 use ferrum_edge::_test_support::hbone_inner_h1_request_body_for_test;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, DispatchKind, Proxy, ResponseBodyMode, default_namespace,
+    AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy, ResponseBodyMode,
+    default_namespace,
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain, spiffe_id_to_san};
@@ -38,9 +39,11 @@ use ferrum_edge::identity::{SharedSvidBundle, SvidBundle, TrustBundle, TrustBund
 use ferrum_edge::modes::mesh::hbone::{TUNNEL_REUSE_FENCED, TUNNEL_REUSE_HEADER};
 use ferrum_edge::proxy::grpc_proxy::GrpcBody;
 use ferrum_edge::proxy::hbone_inner_pool::{
-    HboneInnerConnectionPool, HboneInnerH1Checkout, HboneInnerH1RequestBody, HboneInnerKeyParts,
-    HboneInnerProtocol, HboneSourceCredential, MAX_IDLE_H1_PER_KEY,
+    HboneInnerConnectionPool, HboneInnerH1Checkout, HboneInnerH1RequestBody,
+    HboneInnerH2StreamLease, HboneInnerKeyParts, HboneInnerProtocol, HboneSourceCredential,
+    MAX_IDLE_H1_PER_KEY,
 };
+use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::proxy::hbone_pool::HboneConnectionPool;
 use ferrum_edge::tls::spiffe::build_spiffe_inbound_config;
 use http::{Response, StatusCode};
@@ -172,20 +175,51 @@ enum AppBehaviour {
     /// Declares 16 bytes, writes 5, and closes. The response is TRUNCATED, so
     /// the exchange never completes cleanly and the lease must not come back.
     Truncate,
+    /// One `200` carrying `Connection: close`, then the socket is closed. The
+    /// carrier is unusable afterwards and must never re-enter the idle set.
+    ConnectionClose,
+    /// `204 No Content` per request, keep-alive. hyper reports the response
+    /// body as already ended, which is the dispatch's `is_end_stream` arm:
+    /// the lease is checked in immediately rather than travelling with a body.
+    NoContent,
+    /// Declares four body bytes, writes two, waits for
+    /// [`App::release_split_body`], then writes the rest. What the CLIENT sees
+    /// before the release is what distinguishes an eagerly buffered response
+    /// (nothing, not even the headers) from a streamed one (headers and the
+    /// first two bytes).
+    SplitBody,
     /// An h2c server: one `200` per request, and after `goaway_after` requests
     /// it gracefully shuts the connection down (GOAWAY).
     H2c { goaway_after: usize },
+    /// An h2c server advertising `SETTINGS_MAX_CONCURRENT_STREAMS`, so the
+    /// source pool learns a real per-carrier stream cap.
+    H2cCapped { max_concurrent_streams: u32 },
 }
 
 struct App {
     addr: SocketAddr,
     accepts: Arc<AtomicUsize>,
+    requests: Arc<AtomicUsize>,
+    release: Arc<tokio::sync::Notify>,
     handle: JoinHandle<()>,
 }
 
 impl App {
     fn accepts(&self) -> usize {
         self.accepts.load(Ordering::SeqCst)
+    }
+
+    /// Requests the application actually SERVED. The reuse contract is that
+    /// this never exceeds the number of client requests: the at-most-once
+    /// pre-wire replay may only resend a request nothing wrote to the wire.
+    fn requests(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
+
+    /// Let an [`AppBehaviour::SplitBody`] response finish. `notify_one` stores
+    /// a permit, so the test may release before or after the app parks.
+    fn release_split_body(&self) {
+        self.release.notify_one();
     }
 }
 
@@ -236,27 +270,44 @@ async fn start_app(behaviour: AppBehaviour) -> App {
         .expect("bind application");
     let addr = listener.local_addr().expect("application addr");
     let accepts = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
     let accepts_for_task = Arc::clone(&accepts);
+    let requests_for_task = Arc::clone(&requests);
+    let release_for_task = Arc::clone(&release);
     let handle = tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
             accepts_for_task.fetch_add(1, Ordering::SeqCst);
-            tokio::spawn(serve_app_connection(stream, behaviour));
+            tokio::spawn(serve_app_connection(
+                stream,
+                behaviour,
+                Arc::clone(&requests_for_task),
+                Arc::clone(&release_for_task),
+            ));
         }
     });
     App {
         addr,
         accepts,
+        requests,
+        release,
         handle,
     }
 }
 
-async fn serve_app_connection(mut stream: TcpStream, behaviour: AppBehaviour) {
+async fn serve_app_connection(
+    mut stream: TcpStream,
+    behaviour: AppBehaviour,
+    requests: Arc<AtomicUsize>,
+    release: Arc<tokio::sync::Notify>,
+) {
     match behaviour {
         AppBehaviour::Ok => {
             while read_h1_request(&mut stream).await {
+                requests.fetch_add(1, Ordering::SeqCst);
                 if stream
                     .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
                     .await
@@ -268,11 +319,80 @@ async fn serve_app_connection(mut stream: TcpStream, behaviour: AppBehaviour) {
         }
         AppBehaviour::Truncate => {
             if read_h1_request(&mut stream).await {
+                requests.fetch_add(1, Ordering::SeqCst);
                 // Declares sixteen body bytes and writes five, then hangs up.
                 let _ = stream
                     .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 16\r\n\r\nshort")
                     .await;
                 let _ = stream.shutdown().await;
+            }
+        }
+        AppBehaviour::ConnectionClose => {
+            if read_h1_request(&mut stream).await {
+                requests.fetch_add(1, Ordering::SeqCst);
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                    )
+                    .await;
+                let _ = stream.shutdown().await;
+            }
+        }
+        AppBehaviour::NoContent => {
+            while read_h1_request(&mut stream).await {
+                requests.fetch_add(1, Ordering::SeqCst);
+                if stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+        AppBehaviour::SplitBody => {
+            while read_h1_request(&mut stream).await {
+                requests.fetch_add(1, Ordering::SeqCst);
+                if stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nab")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                // The tail is withheld until the test says so, which is what
+                // makes "did the client see the headers yet?" a decisive
+                // question rather than a timing guess.
+                release.notified().await;
+                if stream.write_all(b"cd").await.is_err() {
+                    return;
+                }
+            }
+        }
+        AppBehaviour::H2cCapped {
+            max_concurrent_streams,
+        } => {
+            let Ok(mut server) = h2::server::Builder::new()
+                .max_concurrent_streams(max_concurrent_streams)
+                .handshake(stream)
+                .await
+            else {
+                return;
+            };
+            while let Some(next) = server.accept().await {
+                let Ok((_request, mut respond)) = next else {
+                    return;
+                };
+                requests.fetch_add(1, Ordering::SeqCst);
+                let response = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/grpc")
+                    .body(())
+                    .expect("h2c response");
+                let Ok(mut send) = respond.send_response(response, false) else {
+                    return;
+                };
+                let _ = send.send_data(Bytes::from_static(b"ok"), true);
             }
         }
         AppBehaviour::H2c { goaway_after } => {
@@ -284,6 +404,7 @@ async fn serve_app_connection(mut stream: TcpStream, behaviour: AppBehaviour) {
                 let Ok((_request, mut respond)) = next else {
                     return;
                 };
+                requests.fetch_add(1, Ordering::SeqCst);
                 let response = Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "application/grpc")
@@ -549,9 +670,26 @@ fn source_pool(gateway: SvidBundle) -> Arc<HboneConnectionPool> {
 struct KeyIdentity {
     credential: HboneSourceCredential,
     pool_config: PoolConfig,
+    namespace: String,
+    proxy_id: String,
+    upstream_id: Option<String>,
+    /// The admitting proxy's lifecycle generation. `None` is the shape a
+    /// synthesized relay proxy produces — absent from every published
+    /// generation by design.
+    proxy_lifecycle_generation: Option<u64>,
     peer_id: SpiffeId,
+    /// The PINNED peer identity, when one is pinned. `None` is the
+    /// trust-domain-scoped cross-cluster shape.
+    expected_peer: Option<SpiffeId>,
+    /// The remote trust domain a cross-cluster session is verified against.
+    expected_trust_domain: Option<TrustDomain>,
+    /// The ClientHello SNI override a cross-cluster east-west dial carries.
+    sni_override: Option<String>,
     app_host: String,
     app_port: u16,
+    /// The host the OUTER session is dialled to. Differs from `app_host` on
+    /// NodeWaypoint secured egress and cross-cluster east-west.
+    dial_host: String,
     hbone_port: u16,
     asserted_principal: Option<SpiffeId>,
 }
@@ -560,17 +698,17 @@ impl KeyIdentity {
     fn parts(&self, protocol: HboneInnerProtocol) -> HboneInnerKeyParts<'_> {
         HboneInnerKeyParts {
             protocol,
-            namespace: NAMESPACE,
-            proxy_id: PROXY_ID,
-            upstream_id: Some(UPSTREAM_ID),
-            proxy_lifecycle_generation: None,
+            namespace: self.namespace.as_str(),
+            proxy_id: self.proxy_id.as_str(),
+            upstream_id: self.upstream_id.as_deref(),
+            proxy_lifecycle_generation: self.proxy_lifecycle_generation,
             app_host: self.app_host.as_str(),
             app_port: self.app_port,
-            dial_host: self.app_host.as_str(),
+            dial_host: self.dial_host.as_str(),
             hbone_port: self.hbone_port,
-            expected_peer: Some(&self.peer_id),
-            expected_trust_domain: None,
-            sni_override: None,
+            expected_peer: self.expected_peer.as_ref(),
+            expected_trust_domain: self.expected_trust_domain.as_ref(),
+            sni_override: self.sni_override.as_deref(),
             source_principal: self
                 .asserted_principal
                 .as_ref()
@@ -579,6 +717,34 @@ impl KeyIdentity {
             credential: &self.credential,
             pool_config: &self.pool_config,
         }
+    }
+}
+
+/// The base identity every focused test starts from: in-cluster, pinned peer,
+/// gateway acting as itself, `dial_host == app_host`.
+fn base_identity(
+    credential: HboneSourceCredential,
+    peer_id: SpiffeId,
+    app_host: &str,
+    app_port: u16,
+    hbone_port: u16,
+) -> KeyIdentity {
+    KeyIdentity {
+        credential,
+        pool_config: PoolConfig::default(),
+        namespace: NAMESPACE.to_string(),
+        proxy_id: PROXY_ID.to_string(),
+        upstream_id: Some(UPSTREAM_ID.to_string()),
+        proxy_lifecycle_generation: None,
+        expected_peer: Some(peer_id.clone()),
+        peer_id,
+        expected_trust_domain: None,
+        sni_override: None,
+        app_host: app_host.to_string(),
+        app_port,
+        dial_host: app_host.to_string(),
+        hbone_port,
+        asserted_principal: None,
     }
 }
 
@@ -599,15 +765,7 @@ async fn fixture(behaviour: AppBehaviour, advertise: bool) -> Fixture {
     let credential = pool
         .source_credential_identity()
         .expect("the gateway SVID resolves a source credential identity");
-    let identity = KeyIdentity {
-        credential,
-        pool_config: PoolConfig::default(),
-        peer_id: ids.peer_id,
-        app_host: "127.0.0.1".to_string(),
-        app_port: 8080,
-        hbone_port: peer.addr.port(),
-        asserted_principal: None,
-    };
+    let identity = base_identity(credential, ids.peer_id, "127.0.0.1", 8080, peer.addr.port());
     Fixture {
         pool,
         peer,
@@ -622,16 +780,20 @@ impl Fixture {
     /// advertisement off the `200` before the tunnel is consumed.
     async fn try_open_fresh_h1(&self) -> Result<HboneInnerH1Checkout, String> {
         let proxy = source_proxy();
+        // The dispatch snapshots the retirement generation BEFORE the dial;
+        // mirror that here so the fixture's cold-miss path is fenced exactly
+        // as `open_hbone_inner_h1` is.
+        let generation = self.pool.inner_pool().drain_generation();
         let tunnel = tokio::time::timeout(
             DEADLINE,
             self.pool.get_tunnel_via(
                 &proxy,
-                "127.0.0.1",
+                &self.identity.dial_host,
                 &self.identity.app_host,
                 self.identity.app_port,
                 self.identity.app_port,
                 self.identity.hbone_port,
-                Some(&self.identity.peer_id),
+                self.identity.expected_peer.as_ref(),
                 None,
                 None,
                 self.identity.asserted_principal.as_ref(),
@@ -654,6 +816,7 @@ impl Fixture {
             advertised,
             true,
             self.identity.credential.leaf_deadline,
+            generation,
         ))
     }
 
@@ -895,6 +1058,7 @@ async fn an_elapsed_source_credential_is_never_handed_out() {
         true,
         true,
         Some(elapsed),
+        fx.pool.inner_pool().drain_generation(),
     );
     fx.pool.inner_pool().checkin_h1(expired);
     assert_eq!(fx.pool.inner_pool().pooled_connections(), 1);
@@ -971,6 +1135,7 @@ async fn keep_alive_off_never_consults_or_fills_the_idle_set() {
         true,
         false,
         fx.identity.credential.leaf_deadline,
+        fx.pool.inner_pool().drain_generation(),
     );
     assert!(
         !lease.poolable(),
@@ -1131,6 +1296,25 @@ async fn open_fresh_h2(fx: &Fixture) -> (H2SendRequest<GrpcBody>, bool) {
     (sender, advertised)
 }
 
+/// Publish a freshly established nested carrier exactly as
+/// `open_hbone_grpc_sender` does: source material unchanged, and the
+/// retirement generation read before the dial.
+fn publish_fresh_h2(
+    fx: &Fixture,
+    parts: &HboneInnerKeyParts<'_>,
+    sender: &H2SendRequest<GrpcBody>,
+    advertised: bool,
+) -> HboneInnerH2StreamLease {
+    fx.pool.inner_pool().publish_h2(
+        parts,
+        sender,
+        advertised,
+        true,
+        fx.identity.credential.leaf_deadline,
+        fx.pool.inner_pool().drain_generation(),
+    )
+}
+
 fn empty_grpc_body() -> GrpcBody {
     GrpcBody::Buffered(http_body_util::Full::new(Bytes::new()))
 }
@@ -1166,16 +1350,12 @@ async fn a_nested_h2_sender_is_shared_across_rpcs_on_one_connect() {
     );
     let (mut sender, advertised) = open_fresh_h2(&fx).await;
     assert!(advertised, "the fixture peer advertises the fence");
-    fx.pool.inner_pool().publish_h2(
-        &parts,
-        &sender,
-        advertised,
-        fx.identity.credential.leaf_deadline,
-    );
+    let first_lease = publish_fresh_h2(&fx, &parts, &sender, advertised);
     assert_eq!(
         send_rpc(&mut sender).await.expect("first rpc"),
         StatusCode::OK
     );
+    drop(first_lease);
 
     // Every later RPC clones the published carrier: no CONNECT, no nested
     // preface/SETTINGS exchange, no second app accept.
@@ -1186,7 +1366,7 @@ async fn a_nested_h2_sender_is_shared_across_rpcs_on_one_connect() {
             .checkout_h2(&parts)
             .expect("the shared nested HTTP/2 sender is reused");
         assert_eq!(
-            send_rpc(&mut shared).await.expect("shared rpc"),
+            send_rpc(&mut shared.sender).await.expect("shared rpc"),
             StatusCode::OK
         );
     }
@@ -1204,16 +1384,12 @@ async fn a_nested_h2_sender_that_received_goaway_is_retired_and_never_reissued()
     let parts = fx.identity.parts(HboneInnerProtocol::H2);
 
     let (mut sender, advertised) = open_fresh_h2(&fx).await;
-    fx.pool.inner_pool().publish_h2(
-        &parts,
-        &sender,
-        advertised,
-        fx.identity.credential.leaf_deadline,
-    );
+    let first_lease = publish_fresh_h2(&fx, &parts, &sender, advertised);
     assert_eq!(
         send_rpc(&mut sender).await.expect("first rpc"),
         StatusCode::OK
     );
+    drop(first_lease);
     drop(sender);
 
     // The application answered one RPC and then went away. Once the connection
@@ -1222,7 +1398,7 @@ async fn a_nested_h2_sender_that_received_goaway_is_retired_and_never_reissued()
     tokio::time::timeout(DEADLINE, async {
         loop {
             match fx.pool.inner_pool().checkout_h2(&parts) {
-                Some(reused) if !reused.is_closed() => {
+                Some(reused) if !reused.sender.is_closed() => {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 _ => return,
@@ -1259,13 +1435,9 @@ async fn a_nested_h2_sender_is_never_published_for_a_peer_without_the_capability
         !advertised,
         "this peer does not advertise the admission fence"
     );
-    fx.pool.inner_pool().publish_h2(
-        &parts,
-        &sender,
-        advertised,
-        fx.identity.credential.leaf_deadline,
-    );
+    let lease = publish_fresh_h2(&fx, &parts, &sender, advertised);
     assert_eq!(send_rpc(&mut sender).await.expect("rpc"), StatusCode::OK);
+    drop(lease);
 
     assert_eq!(
         fx.pool.inner_pool().pooled_connections(),
@@ -1283,8 +1455,19 @@ async fn a_nested_h2_sender_is_never_published_for_a_peer_without_the_capability
 /// Render the key for `parts` so a test can compare two identities directly.
 fn key_of(parts: &HboneInnerKeyParts<'_>) -> String {
     let mut buf = String::new();
-    ferrum_edge::proxy::hbone_inner_pool::write_hbone_inner_pool_key(&mut buf, parts);
+    let _ = ferrum_edge::proxy::hbone_inner_pool::write_hbone_inner_pool_key(&mut buf, parts);
     buf
+}
+
+/// The route-generation run the publication retention pass compares, resolved
+/// through the span the key writer recorded rather than by splitting the key.
+fn route_of(parts: &HboneInnerKeyParts<'_>) -> String {
+    let mut buf = String::new();
+    let spans = ferrum_edge::proxy::hbone_inner_pool::write_hbone_inner_pool_key(&mut buf, parts);
+    spans
+        .route(&buf)
+        .expect("the writer's own span addresses its own key")
+        .to_string()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1295,29 +1478,19 @@ async fn every_admission_component_partitions_the_key() {
     let credential = pool
         .source_credential_identity()
         .expect("source credential identity");
-    let base = KeyIdentity {
-        credential,
-        pool_config: PoolConfig::default(),
-        peer_id: ids.peer_id.clone(),
-        app_host: "10.0.0.7".to_string(),
-        app_port: 8080,
-        hbone_port: 15008,
-        asserted_principal: None,
-    };
+    let base = base_identity(credential, ids.peer_id.clone(), "10.0.0.7", 8080, 15008);
     let baseline = key_of(&base.parts(HboneInnerProtocol::Http1));
 
     // The inner wire protocol.
     assert_ne!(baseline, key_of(&base.parts(HboneInnerProtocol::H2)));
 
-    let mut variant = KeyIdentity {
-        credential: base.credential.clone(),
-        pool_config: PoolConfig::default(),
-        peer_id: ids.peer_id.clone(),
-        app_host: base.app_host.clone(),
-        app_port: base.app_port,
-        hbone_port: base.hbone_port,
-        asserted_principal: None,
-    };
+    let mut variant = base_identity(
+        base.credential.clone(),
+        ids.peer_id.clone(),
+        &base.app_host,
+        base.app_port,
+        base.hbone_port,
+    );
 
     variant.app_host = "10.0.0.8".to_string();
     assert_ne!(
@@ -1331,6 +1504,17 @@ async fn every_admission_component_partitions_the_key() {
     assert_ne!(baseline, key_of(&variant.parts(HboneInnerProtocol::Http1)));
     variant.app_port = base.app_port;
 
+    // The DIAL host, independently of the application endpoint: NodeWaypoint
+    // secured egress and cross-cluster east-west both dial a host that is not
+    // the CONNECT `:authority`, and the two must never share a connection.
+    variant.dial_host = "10.0.0.9".to_string();
+    assert_ne!(
+        baseline,
+        key_of(&variant.parts(HboneInnerProtocol::Http1)),
+        "the outer dial peer partitions independently of the app endpoint"
+    );
+    variant.dial_host = base.dial_host.clone();
+
     variant.hbone_port = 15009;
     assert_ne!(
         baseline,
@@ -1338,6 +1522,92 @@ async fn every_admission_component_partitions_the_key() {
         "a different peer HBONE listener is a different dial"
     );
     variant.hbone_port = base.hbone_port;
+
+    // The cross-cluster verification scope. These are the fields the outer
+    // pool documents as security-critical: a session verified against TD-B for
+    // service-X must never be reused for a different trust domain or SNI.
+    variant.expected_trust_domain = Some(TrustDomain::new("remote.example").expect("remote td"));
+    let scoped_to_remote = key_of(&variant.parts(HboneInnerProtocol::Http1));
+    assert_ne!(
+        baseline, scoped_to_remote,
+        "a remote-trust-domain-scoped session never shares an in-cluster one"
+    );
+    variant.expected_trust_domain = Some(TrustDomain::new("other.example").expect("other td"));
+    assert_ne!(
+        scoped_to_remote,
+        key_of(&variant.parts(HboneInnerProtocol::Http1)),
+        "two remote trust domains never share an inner connection"
+    );
+    variant.expected_trust_domain = None;
+
+    variant.sni_override = Some("reviews.default.svc.cluster.local".to_string());
+    let sni_a = key_of(&variant.parts(HboneInnerProtocol::Http1));
+    assert_ne!(
+        baseline, sni_a,
+        "an east-west SNI override partitions the pool"
+    );
+    variant.sni_override = Some("ratings.default.svc.cluster.local".to_string());
+    assert_ne!(
+        sni_a,
+        key_of(&variant.parts(HboneInnerProtocol::Http1)),
+        "two destination-FQDN SNI overrides never share an inner connection"
+    );
+    variant.sni_override = None;
+
+    // A PINNED peer identity versus none at all. The absent form is the
+    // trust-domain-scoped cross-cluster shape, which authorizes strictly less
+    // than a pin and must not inherit a pinned session.
+    variant.expected_peer = None;
+    assert_ne!(
+        baseline,
+        key_of(&variant.parts(HboneInnerProtocol::Http1)),
+        "an unpinned dial must not reuse a session verified against a pinned peer"
+    );
+    variant.expected_peer = Some(SpiffeId::new(CALLER_A).expect("caller a"));
+    assert_ne!(
+        baseline,
+        key_of(&variant.parts(HboneInnerProtocol::Http1)),
+        "a different pinned peer is a different destination"
+    );
+    variant.expected_peer = base.expected_peer.clone();
+
+    // The route generation: namespace, proxy id, upstream id, and the
+    // admitting proxy's lifecycle generation.
+    variant.namespace = "other-namespace".to_string();
+    assert_ne!(
+        baseline,
+        key_of(&variant.parts(HboneInnerProtocol::Http1)),
+        "a proxy in another namespace inherits nothing"
+    );
+    variant.namespace = base.namespace.clone();
+
+    variant.proxy_id = "another-proxy".to_string();
+    assert_ne!(baseline, key_of(&variant.parts(HboneInnerProtocol::Http1)));
+    variant.proxy_id = base.proxy_id.clone();
+
+    variant.upstream_id = Some("another-upstream".to_string());
+    assert_ne!(baseline, key_of(&variant.parts(HboneInnerProtocol::Http1)));
+    variant.upstream_id = None;
+    assert_ne!(
+        baseline,
+        key_of(&variant.parts(HboneInnerProtocol::Http1)),
+        "an absent upstream id is its own identity, not a wildcard"
+    );
+    variant.upstream_id = base.upstream_id.clone();
+
+    variant.proxy_lifecycle_generation = Some(7);
+    let generation_seven = key_of(&variant.parts(HboneInnerProtocol::Http1));
+    assert_ne!(
+        baseline, generation_seven,
+        "a proxy resolvable in a published generation is not the synthesized shape"
+    );
+    variant.proxy_lifecycle_generation = Some(8);
+    assert_ne!(
+        generation_seven,
+        key_of(&variant.parts(HboneInnerProtocol::Http1)),
+        "a republished or re-bound proxy is a new incarnation that inherits nothing"
+    );
+    variant.proxy_lifecycle_generation = None;
 
     variant.asserted_principal = Some(SpiffeId::new(CALLER_A).expect("caller a"));
     let asserted_a = key_of(&variant.parts(HboneInnerProtocol::Http1));
@@ -1407,14 +1677,16 @@ async fn per_request_policy_is_not_part_of_the_key() {
     proxy.backend_write_timeout_ms = 3;
     let retimed = PoolConfig::default().for_proxy(&proxy);
 
-    let identity_for = |pool_config: PoolConfig| KeyIdentity {
-        credential: credential.clone(),
-        pool_config,
-        peer_id: ids.peer_id.clone(),
-        app_host: "10.0.0.7".to_string(),
-        app_port: 8080,
-        hbone_port: 15008,
-        asserted_principal: None,
+    let identity_for = |pool_config: PoolConfig| {
+        let mut identity = base_identity(
+            credential.clone(),
+            ids.peer_id.clone(),
+            "10.0.0.7",
+            8080,
+            15008,
+        );
+        identity.pool_config = pool_config;
+        identity
     };
 
     assert_eq!(
@@ -1422,5 +1694,896 @@ async fn per_request_policy_is_not_part_of_the_key() {
         key_of(&identity_for(retimed).parts(HboneInnerProtocol::Http1)),
         "connect/read/write timeouts are applied per dispatch and must not \
          partition a pooled connection"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The PRODUCTION dispatch: a real frontend through `proxy_to_backend_hbone`
+// ---------------------------------------------------------------------------
+//
+// Everything above drives the pool directly. These drive the GATEWAY: a real
+// `ProxyState` whose upstream target is `mesh.hbone`-tagged, a real HTTP/1.1
+// frontend served by `handle_proxy_request`, and the same real peer + real
+// application as the focused tests. That is what exercises the parts of the
+// change that live in the dispatch rather than in the pool — the at-most-once
+// pre-wire replay, the `poolable()`-gated eager buffer, the
+// `is_end_stream` / `PooledBackendLeaseSlot` split, `Connection: close`,
+// HEAD/204/304, and a client that walks away mid-body.
+
+/// The gateway SVID on disk, which is how `ProxyState::new` loads it.
+struct SvidFiles {
+    _dir: tempfile::TempDir,
+    cert_path: String,
+    key_path: String,
+    trust_bundle_path: String,
+}
+
+fn issue_svid_pem(spiffe_id: &SpiffeId, root_pem: &str, root_key_pem: &str) -> (String, String) {
+    let issuer_key = KeyPair::from_pem(root_key_pem).expect("issuer key");
+    let issuer = Issuer::from_ca_cert_pem(root_pem, issuer_key).expect("issuer");
+    let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("leaf key");
+
+    let mut params = CertificateParams::default();
+    params.distinguished_name = DistinguishedName::new();
+    params
+        .subject_alt_names
+        .push(spiffe_id_to_san(spiffe_id).expect("spiffe san"));
+    params.is_ca = IsCa::ExplicitNoCa;
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    params.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ServerAuth,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now;
+    params.not_after = now + time::Duration::hours(1);
+    let leaf = params.signed_by(&leaf_key, &issuer).expect("leaf cert");
+    (leaf.pem(), leaf_key.serialize_pem())
+}
+
+/// Gateway + peer identities, with the gateway's half also written to disk.
+struct GatewayIdentities {
+    peer_slot: SharedSvidBundle,
+    peer_id: SpiffeId,
+    files: SvidFiles,
+}
+
+fn gateway_identities() -> GatewayIdentities {
+    let td = TrustDomain::new(TRUST_DOMAIN).expect("trust domain");
+    let (root_der, root_pem, root_key_pem) = synthetic_root(&td);
+    let gateway_id = SpiffeId::from_parts(&td, GATEWAY_SPIFFE).expect("gateway id");
+    let peer_id = SpiffeId::from_parts(&td, PEER_SPIFFE).expect("peer id");
+    let (gateway_leaf_pem, gateway_key_pem) = issue_svid_pem(&gateway_id, &root_pem, &root_key_pem);
+    let (peer_leaf, peer_key) = issue_svid(&peer_id, &root_pem, &root_key_pem);
+
+    let dir = tempfile::tempdir().expect("svid dir");
+    let cert_path = dir.path().join("gateway-svid.pem");
+    let key_path = dir.path().join("gateway-svid.key");
+    let trust_bundle_path = dir.path().join("trust-bundle.pem");
+    std::fs::write(&cert_path, gateway_leaf_pem).expect("write gateway leaf");
+    std::fs::write(&key_path, gateway_key_pem).expect("write gateway key");
+    std::fs::write(&trust_bundle_path, &root_pem).expect("write trust bundle");
+
+    GatewayIdentities {
+        peer_slot: svid_slot(bundle_for(peer_id.clone(), peer_leaf, peer_key, root_der)),
+        peer_id,
+        files: SvidFiles {
+            cert_path: cert_path.to_string_lossy().into_owned(),
+            key_path: key_path.to_string_lossy().into_owned(),
+            trust_bundle_path: trust_bundle_path.to_string_lossy().into_owned(),
+            _dir: dir,
+        },
+    }
+}
+
+/// A real gateway in front of the real peer and the real application.
+struct GatewayFixture {
+    state: ProxyState,
+    frontend: SocketAddr,
+    peer: Peer,
+    app: App,
+    /// The gateway SVID on disk, held for the fixture's whole life so the
+    /// temporary directory outlives anything that may re-read it.
+    _svid_files: SvidFiles,
+    _config_handles: Vec<tokio::task::JoinHandle<()>>,
+    frontend_task: JoinHandle<()>,
+}
+
+impl Drop for GatewayFixture {
+    fn drop(&mut self) {
+        self.frontend_task.abort();
+        for handle in &self._config_handles {
+            handle.abort();
+        }
+    }
+}
+
+impl GatewayFixture {
+    fn inner_pool(&self) -> &Arc<HboneInnerConnectionPool> {
+        self.state.hbone_pool.inner_pool()
+    }
+
+    /// Open one frontend HTTP/1.1 connection to the gateway.
+    async fn connect(&self) -> FrontendClient {
+        let stream = TcpStream::connect(self.frontend)
+            .await
+            .expect("connect to the gateway frontend");
+        let _ = stream.set_nodelay(true);
+        let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .expect("frontend h1 handshake");
+        let driver = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        FrontendClient { sender, driver }
+    }
+
+    /// One complete client request through the gateway, body fully read.
+    async fn get(&self, path: &str) -> (StatusCode, Bytes) {
+        let mut client = self.connect().await;
+        let response = client.send(http::Method::GET, path).await;
+        let status = response.status();
+        let body = tokio::time::timeout(DEADLINE, response.into_body().collect())
+            .await
+            .expect("frontend body in time")
+            .expect("frontend body")
+            .to_bytes();
+        (status, body)
+    }
+}
+
+struct FrontendClient {
+    sender: hyper::client::conn::http1::SendRequest<http_body_util::Full<Bytes>>,
+    driver: JoinHandle<()>,
+}
+
+impl Drop for FrontendClient {
+    fn drop(&mut self) {
+        self.driver.abort();
+    }
+}
+
+impl FrontendClient {
+    async fn send(
+        &mut self,
+        method: http::Method,
+        path: &str,
+    ) -> hyper::Response<hyper::body::Incoming> {
+        let request = http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", "orders.local")
+            .body(http_body_util::Full::new(Bytes::new()))
+            .expect("frontend request");
+        tokio::time::timeout(DEADLINE, self.sender.send_request(request))
+            .await
+            .expect("frontend response in time")
+            .expect("frontend response")
+    }
+}
+
+/// Build a gateway whose single route dispatches over Ambient HBONE to `peer`,
+/// with the destination application behind the peer's relay.
+async fn gateway_fixture(behaviour: AppBehaviour, advertise: bool) -> GatewayFixture {
+    gateway_fixture_with_cutoff(behaviour, advertise, 65_536).await
+}
+
+async fn gateway_fixture_with_cutoff(
+    behaviour: AppBehaviour,
+    advertise: bool,
+    response_buffer_cutoff_bytes: usize,
+) -> GatewayFixture {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let ids = gateway_identities();
+    let app = start_app(behaviour).await;
+    let peer = start_peer(ids.peer_slot, app.addr, advertise).await;
+
+    let mut config: GatewayConfig = serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "consumers": [],
+        "plugin_configs": [],
+        "proxies": [{
+            "id": PROXY_ID,
+            "hosts": ["orders.local"],
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": app.addr.port(),
+            "upstream_id": UPSTREAM_ID,
+            "preserve_host_header": false,
+            "backend_read_timeout_ms": 5000,
+            "backend_connect_timeout_ms": 5000
+        }],
+        "upstreams": [{
+            "id": UPSTREAM_ID,
+            "targets": [{
+                "host": "127.0.0.1",
+                "port": app.addr.port(),
+                "tags": {
+                    "mesh.hbone": "true",
+                    "mesh.hbone_port": peer.addr.port().to_string(),
+                    "mesh.spiffe_id": ids.peer_id.as_str()
+                }
+            }]
+        }]
+    }))
+    .expect("gateway config deserializes");
+    config.normalize_fields();
+
+    let env_config = ferrum_edge::config::EnvConfig {
+        gateway_svid_cert_path: Some(ids.files.cert_path.clone()),
+        gateway_svid_key_path: Some(ids.files.key_path.clone()),
+        gateway_svid_trust_bundle_path: Some(ids.files.trust_bundle_path.clone()),
+        response_buffer_cutoff_bytes,
+        ..Default::default()
+    };
+    let (state, config_handles) = ProxyState::new(
+        config,
+        DnsCache::new(DnsConfig::default()),
+        env_config,
+        None,
+        None,
+    )
+    .expect("proxy state");
+    assert!(
+        state.admits_gateway_mesh_identity(),
+        "the file-loaded gateway SVID must admit Ambient HBONE dispatch"
+    );
+
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind gateway frontend");
+    let frontend = listener.local_addr().expect("frontend addr");
+    let frontend_state = state.clone();
+    let frontend_task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, remote)) = listener.accept().await else {
+                return;
+            };
+            let state = frontend_state.clone();
+            tokio::spawn(async move {
+                let _ = stream.set_nodelay(true);
+                let io = TokioIo::new(stream);
+                let svc = hyper::service::service_fn(
+                    move |req: hyper::Request<hyper::body::Incoming>| {
+                        let state = state.clone();
+                        async move {
+                            ferrum_edge::proxy::handle_proxy_request(
+                                req, state, remote, false, None, None,
+                            )
+                            .await
+                        }
+                    },
+                );
+                let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(io, svc)
+                    .await;
+            });
+        }
+    });
+
+    GatewayFixture {
+        state,
+        frontend,
+        peer,
+        app,
+        _svid_files: ids.files,
+        _config_handles: config_handles,
+        frontend_task,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_production_dispatch_reuses_one_inner_connection_across_requests() {
+    let fx = gateway_fixture(AppBehaviour::Ok, true).await;
+
+    for _ in 0..3 {
+        let (status, body) = fx.get("/").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_ref(), b"ok");
+        wait_for_pooled(fx.inner_pool(), 1).await;
+    }
+
+    assert_eq!(
+        fx.peer.connects(),
+        1,
+        "three gateway requests over a fenced tunnel must cost ONE CONNECT"
+    );
+    assert_eq!(fx.app.accepts(), 1);
+    assert_eq!(fx.app.requests(), 3);
+    let stats = fx.inner_pool().stats();
+    assert_eq!(stats.h1_misses, 1);
+    assert_eq!(stats.h1_hits, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_that_silently_reaps_a_pooled_tunnel_costs_one_extra_connect_and_no_duplicate() {
+    // The reuse race the at-most-once PRE-WIRE `try_send_request` handback
+    // exists for: the destination's side of a POOLED tunnel is gone, and the
+    // source has not necessarily learned it yet. Whether this particular run
+    // takes the handback arm (the close has not propagated) or the eviction arm
+    // (it has) is a genuine timing race, and the contract is that BOTH produce
+    // the same observable outcome — which is what this pins: the client is
+    // served, exactly one extra CONNECT is opened, and the application sees one
+    // request per client request and never a duplicate.
+    let fx = gateway_fixture(AppBehaviour::Ok, true).await;
+
+    let (status, _) = fx.get("/").await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_pooled(fx.inner_pool(), 1).await;
+    assert_eq!(fx.peer.connects(), 1);
+    assert_eq!(fx.app.requests(), 1);
+
+    // The peer reaps the tunnel underneath the pooled connection.
+    fx.peer.revoke_all().await;
+
+    let (status, body) = fx.get("/").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a reaped pooled tunnel must not be visible to the client"
+    );
+    assert_eq!(body.as_ref(), b"ok");
+    assert_eq!(
+        fx.peer.connects(),
+        2,
+        "recovering from the reap must cost EXACTLY one extra CONNECT — the \
+         replay is at most once"
+    );
+    assert_eq!(fx.app.accepts(), 2);
+    assert_eq!(
+        fx.app.requests(),
+        2,
+        "a pre-wire handback replays a request nothing wrote to the wire, so \
+         the application must never see it twice"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_close_response_discards_the_lease_instead_of_pooling_it() {
+    let fx = gateway_fixture(AppBehaviour::ConnectionClose, true).await;
+
+    let (status, body) = fx.get("/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_ref(), b"ok");
+
+    let (status, _) = fx.get("/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        fx.peer.connects(),
+        2,
+        "a `Connection: close` response leaves nothing reusable, so the next \
+         request must pay a fresh CONNECT"
+    );
+    assert_eq!(fx.app.accepts(), 2);
+    assert_eq!(
+        fx.inner_pool().pooled_connections(),
+        0,
+        "a carrier the peer closed must never re-enter the idle set"
+    );
+    // The refusal may land from the deferred readiness waiter, so poll for the
+    // accounting rather than sampling it once.
+    tokio::time::timeout(DEADLINE, async {
+        while fx.inner_pool().stats().discards == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a closed carrier is accounted as a discard, not silently dropped");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bodyless_response_checks_the_lease_in_immediately_and_is_reused() {
+    // A 204 has no body for hyper to read, so `is_end_stream` is already true
+    // at the dispatch and the lease is checked in right there rather than
+    // travelling with a `PooledBackendLeaseSlot`.
+    let fx = gateway_fixture(AppBehaviour::NoContent, true).await;
+
+    for _ in 0..3 {
+        let (status, body) = fx.get("/").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(body.is_empty());
+        wait_for_pooled(fx.inner_pool(), 1).await;
+    }
+
+    assert_eq!(
+        fx.peer.connects(),
+        1,
+        "a bodyless response is a complete exchange, so its carrier is reusable"
+    );
+    assert_eq!(fx.app.accepts(), 1);
+    assert_eq!(fx.app.requests(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_walks_away_mid_body_retires_the_inner_connection() {
+    // A response larger than the eager-buffer cutoff keeps the STREAMING shape,
+    // so the lease rides the `ProxyBody`. The client takes the headers and the
+    // first two bytes and then drops the connection, which is one of the
+    // abnormal terminals: the lease must be dropped, never checked in.
+    let fx = gateway_fixture_with_cutoff(AppBehaviour::SplitBody, true, 2).await;
+
+    {
+        // The application is still withholding the tail, so the response is
+        // provably incomplete when the frontend connection — and with it the
+        // streaming `ProxyBody` that owns the lease — goes away.
+        let mut client = fx.connect().await;
+        let response = client.send(http::Method::GET, "/").await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    assert_eq!(fx.peer.connects(), 1);
+
+    // Only now may the application finish; a background releaser keeps handing
+    // out permits so the follow-up request never has to time its release
+    // against a response it is also awaiting.
+    let releaser_handle = Arc::clone(&fx.app.release);
+    let releaser = tokio::spawn(async move {
+        loop {
+            releaser_handle.notify_one();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+
+    tokio::time::timeout(DEADLINE, async {
+        while fx.inner_pool().pooled_connections() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("an abandoned streaming body must never pool its lease");
+
+    let (status, body) = fx.get("/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_ref(), b"abcd");
+    assert_eq!(
+        fx.peer.connects(),
+        2,
+        "the abandoned exchange retired its tunnel, so the next request redials"
+    );
+    assert_eq!(fx.app.accepts(), 2);
+    releaser.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fenced_peer_eagerly_buffers_a_small_declared_response() {
+    // `poolable()` is what admits the eager buffer. With it on, the dispatch
+    // reads the whole declared body before the client sees anything — which is
+    // exactly what keeps the exclusive H1 carrier alive across a frontend that
+    // would otherwise drop the body without the terminal poll.
+    let fx = gateway_fixture(AppBehaviour::SplitBody, true).await;
+    let mut client = fx.connect().await;
+    let request = http::Request::builder()
+        .method(http::Method::GET)
+        .uri("/")
+        .header("host", "orders.local")
+        .body(http_body_util::Full::new(Bytes::new()))
+        .expect("frontend request");
+    let mut pending = Box::pin(client.sender.send_request(request));
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &mut pending)
+            .await
+            .is_err(),
+        "an eagerly buffered response cannot reach the client before the \
+         application has written its whole declared body"
+    );
+
+    fx.app.release_split_body();
+    let response = tokio::time::timeout(DEADLINE, pending)
+        .await
+        .expect("buffered response in time")
+        .expect("buffered response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("buffered body")
+        .to_bytes();
+    assert_eq!(body.as_ref(), b"abcd");
+    wait_for_pooled(fx.inner_pool(), 1).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_without_the_capability_keeps_streaming_the_same_response() {
+    // The SAME response shape on a peer that does NOT advertise the fence.
+    // `poolable()` is false, so the eager buffer is not applied and the client
+    // sees the response headers while the application is still writing —
+    // byte-for-byte the pre-#5042 behaviour.
+    let fx = gateway_fixture(AppBehaviour::SplitBody, false).await;
+    let mut client = fx.connect().await;
+    let request = http::Request::builder()
+        .method(http::Method::GET)
+        .uri("/")
+        .header("host", "orders.local")
+        .body(http_body_util::Full::new(Bytes::new()))
+        .expect("frontend request");
+    let pending = Box::pin(client.sender.send_request(request));
+
+    let response = tokio::time::timeout(DEADLINE, pending)
+        .await
+        .expect("streamed response headers arrive before the body completes")
+        .expect("streamed response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    fx.app.release_split_body();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("streamed body")
+        .to_bytes();
+    assert_eq!(body.as_ref(), b"abcd");
+    assert_eq!(
+        fx.inner_pool().pooled_connections(),
+        0,
+        "an unfenced peer's connection is never retained"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The retirement fence: a lease that was CHECKED OUT across a drain
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_whole_pool_drain_discards_a_lease_that_was_checked_out_across_it() {
+    // The shape a CRL reload produces: `reload_backend_tls_material` calls
+    // `force_drain_all` and does NOT retire the tunnel gates, so the in-flight
+    // inner connection stays perfectly healthy and its key's fingerprint is
+    // unchanged. Clearing the maps cannot reach a checked-out lease — it is not
+    // in them — so without the generation fence the check-in would re-insert it
+    // under the very same key and the drain would be a fail-open.
+    let fx = fixture(AppBehaviour::Ok, true).await;
+
+    let lease = fx.open_fresh_h1().await;
+    assert_eq!(
+        fx.pool.inner_pool().pooled_connections(),
+        0,
+        "an exclusive lease is deliberately NOT in the pool's maps"
+    );
+    assert_eq!(fx.peer.connects(), 1);
+
+    let before = fx.pool.inner_pool().drain_generation();
+    fx.pool.force_drain_all();
+    assert_ne!(
+        fx.pool.inner_pool().drain_generation(),
+        before,
+        "a whole-pool retirement must advance the generation FIRST"
+    );
+
+    HboneInnerConnectionPool::checkin_h1_when_idle(fx.pool.inner_pool(), lease);
+    assert_eq!(
+        fx.pool.inner_pool().pooled_connections(),
+        0,
+        "a lease that straddled a drain must never be resurrected under its key"
+    );
+    assert!(
+        fx.pool.inner_pool().fenced_checkins() >= 1,
+        "and the refusal must be attributable to the fence, not to liveness"
+    );
+
+    // Nothing reusable is left, so the next request faces a fresh CONNECT the
+    // destination judges under the CURRENT policy.
+    fx.request().await.expect("request after the drain");
+    assert_eq!(fx.peer.connects(), 2);
+    assert_eq!(fx.app.accepts(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_svid_rotation_drain_also_fences_a_lease_that_was_checked_out_across_it() {
+    let fx = fixture(AppBehaviour::Ok, true).await;
+
+    let lease = fx.open_fresh_h1().await;
+    fx.pool
+        .inner_pool()
+        .retire_svid_fingerprints(&[Arc::clone(&fx.identity.credential.fingerprint)]);
+
+    HboneInnerConnectionPool::checkin_h1_when_idle(fx.pool.inner_pool(), lease);
+    assert_eq!(
+        fx.pool.inner_pool().pooled_connections(),
+        0,
+        "a rotation drain must reach an outstanding lease too"
+    );
+    assert!(fx.pool.inner_pool().fenced_checkins() >= 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drain_between_the_outer_dial_and_publication_never_pools_the_nested_sender() {
+    // `open_hbone_grpc_sender` snapshots the retirement generation BEFORE
+    // `get_tunnel_via`, so a drain that lands while the CONNECT and the nested
+    // handshake are in flight refuses the publication instead of resurrecting a
+    // carrier the drain already cleared.
+    let fx = fixture(AppBehaviour::H2c { goaway_after: 0 }, true).await;
+    let parts = fx.identity.parts(HboneInnerProtocol::H2);
+
+    let generation = fx.pool.inner_pool().drain_generation();
+    let (mut sender, advertised) = open_fresh_h2(&fx).await;
+    assert!(advertised);
+
+    fx.pool.force_drain_all();
+
+    let lease = fx.pool.inner_pool().publish_h2(
+        &parts,
+        &sender,
+        advertised,
+        true,
+        fx.identity.credential.leaf_deadline,
+        generation,
+    );
+    assert_eq!(
+        fx.pool.inner_pool().pooled_connections(),
+        0,
+        "a nested sender dialled before a drain must not be published after it"
+    );
+    assert!(fx.pool.inner_pool().fenced_checkins() >= 1);
+    assert!(fx.pool.inner_pool().checkout_h2(&parts).is_none());
+
+    // The RPC the caller already owns is still served on it, which is the whole
+    // point of the publication being a hint rather than a gate.
+    assert_eq!(send_rpc(&mut sender).await.expect("rpc"), StatusCode::OK);
+    drop(lease);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn source_material_that_moved_during_the_dial_refuses_the_nested_publication() {
+    // The mirror of the outer pool's own insert refusal: an SVID slot, CRL
+    // slot, or leaf fingerprint that moved mid-dial means `get_tunnel_via`
+    // declined to pool the transport, and the nested sender rides that very
+    // transport.
+    let fx = fixture(AppBehaviour::H2c { goaway_after: 0 }, true).await;
+    let parts = fx.identity.parts(HboneInnerProtocol::H2);
+    let (mut sender, advertised) = open_fresh_h2(&fx).await;
+
+    let lease = fx.pool.inner_pool().publish_h2(
+        &parts,
+        &sender,
+        advertised,
+        false,
+        fx.identity.credential.leaf_deadline,
+        fx.pool.inner_pool().drain_generation(),
+    );
+    assert_eq!(
+        fx.pool.inner_pool().pooled_connections(),
+        0,
+        "a sender whose source material rotated mid-dial is never pooled"
+    );
+    assert!(fx.pool.inner_pool().stats().discards >= 1);
+    assert_eq!(send_rpc(&mut sender).await.expect("rpc"), StatusCode::OK);
+    drop(lease);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_source_dial_fence_notices_a_gateway_svid_rotation() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let first = identities();
+    let second = identities();
+    let slot = svid_slot(first.gateway);
+    let pool = HboneConnectionPool::new(
+        PoolConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        Arc::clone(&slot),
+        8,
+    );
+
+    let fence = pool
+        .source_dial_fence()
+        .expect("a loaded gateway SVID snapshots a dial fence");
+    assert!(
+        pool.source_dial_fence_intact(&fence),
+        "unchanged material must not refuse a publication"
+    );
+
+    slot.store(Arc::new(Some(second.gateway)));
+    assert!(
+        !pool.source_dial_fence_intact(&fence),
+        "a rotation between the snapshot and the publication must be visible"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Nested HTTP/2 width
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nested_h2_carriers_widen_when_every_incumbent_is_at_the_peers_stream_cap() {
+    let fx = fixture(
+        AppBehaviour::H2cCapped {
+            max_concurrent_streams: 1,
+        },
+        true,
+    )
+    .await;
+    let mut identity = base_identity(
+        fx.identity.credential.clone(),
+        fx.identity.peer_id.clone(),
+        &fx.identity.app_host,
+        fx.identity.app_port,
+        fx.identity.hbone_port,
+    );
+    // The operator's own per-destination HTTP/2 width. It is deliberately NOT
+    // part of the pool key, so pinning it here does not change the identity.
+    identity.pool_config = PoolConfig {
+        http2_connections_per_host: 2,
+        ..PoolConfig::default()
+    };
+    let parts = identity.parts(HboneInnerProtocol::H2);
+
+    let (mut first, advertised) = open_fresh_h2(&fx).await;
+    // One RPC first, so the nested peer's SETTINGS have certainly arrived
+    // before the carrier is published and its cap is sampled — production gets
+    // that from `h2c_preface::await_peer_settings`.
+    assert_eq!(
+        send_rpc(&mut first).await.expect("first rpc"),
+        StatusCode::OK
+    );
+    let publish_lease = publish_fresh_h2(&fx, &parts, &first, advertised);
+    drop(publish_lease);
+    assert_eq!(fx.pool.inner_pool().pooled_connections(), 1);
+
+    // One dispatch holds the only carrier, which advertised a cap of one.
+    let held = fx
+        .pool
+        .inner_pool()
+        .checkout_h2(&parts)
+        .expect("the published carrier is reusable");
+
+    assert!(
+        fx.pool.inner_pool().checkout_h2(&parts).is_none(),
+        "a carrier at its nested peer's SETTINGS_MAX_CONCURRENT_STREAMS must \
+         report a MISS so the caller opens a sibling, not queue every RPC \
+         behind one connection"
+    );
+
+    // The caller does exactly that, and the key now holds two carriers.
+    let (mut second, advertised) = open_fresh_h2(&fx).await;
+    assert_eq!(
+        send_rpc(&mut second).await.expect("second rpc"),
+        StatusCode::OK
+    );
+    let second_lease = publish_fresh_h2(&fx, &parts, &second, advertised);
+    assert_eq!(
+        fx.pool.inner_pool().pooled_connections(),
+        2,
+        "the key widened to the configured `http2_connections_per_host`"
+    );
+    assert_eq!(fx.peer.connects(), 2);
+
+    // Both carriers are now at their cap and the key is at its width, so the
+    // next checkout QUEUES on the least loaded rather than growing further —
+    // the outer pool's saturated branch, restated.
+    let queued = fx
+        .pool
+        .inner_pool()
+        .checkout_h2(&parts)
+        .expect("a key at its width queues on the least-loaded carrier");
+    drop(queued);
+    drop(second_lease);
+    drop(held);
+    assert_eq!(
+        fx.pool.inner_pool().pooled_connections(),
+        2,
+        "queueing must not retire either carrier"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_nested_publication_that_loses_the_width_race_is_accounted_as_a_discard() {
+    let fx = fixture(AppBehaviour::H2c { goaway_after: 0 }, true).await;
+    let mut identity = base_identity(
+        fx.identity.credential.clone(),
+        fx.identity.peer_id.clone(),
+        &fx.identity.app_host,
+        fx.identity.app_port,
+        fx.identity.hbone_port,
+    );
+    identity.pool_config = PoolConfig {
+        http2_connections_per_host: 1,
+        ..PoolConfig::default()
+    };
+    let parts = identity.parts(HboneInnerProtocol::H2);
+
+    let (first, advertised) = open_fresh_h2(&fx).await;
+    drop(publish_fresh_h2(&fx, &parts, &first, advertised));
+    let discards_after_first = fx.pool.inner_pool().stats().discards;
+    assert_eq!(fx.pool.inner_pool().pooled_connections(), 1);
+
+    let (second, advertised) = open_fresh_h2(&fx).await;
+    drop(publish_fresh_h2(&fx, &parts, &second, advertised));
+    assert_eq!(
+        fx.pool.inner_pool().pooled_connections(),
+        1,
+        "a live incumbent set already at its width wins the race"
+    );
+    assert_eq!(
+        fx.pool.inner_pool().stats().discards,
+        discards_after_first + 1,
+        "and the losing sender is accounted as a healthy-but-unpooled discard"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Publication-time retirement
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_publication_retires_inner_connections_the_new_config_no_longer_declares() {
+    let mut fx = fixture(AppBehaviour::Ok, true).await;
+    // A proxy the published generation CAN name: this is the shape the
+    // retention pass is allowed to speak about.
+    fx.identity.proxy_lifecycle_generation = Some(5);
+
+    fx.request().await.expect("first request");
+    wait_for_pooled(fx.pool.inner_pool(), 1).await;
+    let live_route = route_of(&fx.identity.parts(HboneInnerProtocol::Http1));
+
+    // A publication that still declares this exact route changes nothing.
+    let mut live = std::collections::HashSet::new();
+    live.insert(live_route.clone());
+    fx.pool.inner_pool().retain_live_routes(&live);
+    assert_eq!(
+        fx.pool.inner_pool().pooled_connections(),
+        1,
+        "a route the published configuration still declares must be kept"
+    );
+
+    // A publication that re-binds the proxy (a new lifecycle generation) makes
+    // the resident entry unreachable, and must retire it rather than leave it
+    // holding an outer stream until the amortised idle sweep.
+    let mut rebound = fx.identity.parts(HboneInnerProtocol::Http1);
+    rebound.proxy_lifecycle_generation = Some(6);
+    let mut live = std::collections::HashSet::new();
+    live.insert(route_of(&rebound));
+    fx.pool.inner_pool().retain_live_routes(&live);
+    assert_eq!(
+        fx.pool.inner_pool().pooled_connections(),
+        0,
+        "a re-bound proxy is a new incarnation and inherits nothing"
+    );
+    assert!(fx.pool.inner_pool().stats().evictions >= 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_publication_leaves_a_lease_with_no_lifecycle_generation_alone() {
+    // A synthesized relay proxy is absent from every published generation by
+    // design, so its route carries no lifecycle generation and the published
+    // configuration cannot speak about it. Retiring it on every publication
+    // would be wrong; it stays bounded by the idle timeout.
+    let fx = fixture(AppBehaviour::Ok, true).await;
+    assert!(fx.identity.proxy_lifecycle_generation.is_none());
+
+    fx.request().await.expect("first request");
+    wait_for_pooled(fx.pool.inner_pool(), 1).await;
+
+    fx.pool
+        .inner_pool()
+        .retain_live_routes(&std::collections::HashSet::new());
+    assert_eq!(
+        fx.pool.inner_pool().pooled_connections(),
+        1,
+        "an entry the published configuration cannot name must not be retired \
+         by its absence"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_publication_that_retires_nothing_does_not_fence_outstanding_leases() {
+    let mut fx = fixture(AppBehaviour::Ok, true).await;
+    fx.identity.proxy_lifecycle_generation = Some(5);
+
+    fx.request().await.expect("first request");
+    wait_for_pooled(fx.pool.inner_pool(), 1).await;
+
+    let mut live = std::collections::HashSet::new();
+    live.insert(route_of(&fx.identity.parts(HboneInnerProtocol::Http1)));
+    let before = fx.pool.inner_pool().drain_generation();
+    fx.pool.inner_pool().retain_live_routes(&live);
+    assert_eq!(
+        fx.pool.inner_pool().drain_generation(),
+        before,
+        "a publication that withdraws nothing must not fence every outstanding \
+         lease and force a reconnect storm"
     );
 }
