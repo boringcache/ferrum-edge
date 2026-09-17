@@ -607,7 +607,7 @@ async fn wait_for_revocation(tunnel: &AdmittedHboneTunnel) {
 /// The three credential arms are ordered by webpki's own error precedence —
 /// `notAfter` before any anchor, `UnknownIssuer` before revocation — so this
 /// array is also the pin on that derivation (issue #5574).
-fn revocation_counts(state: &ProxyState) -> [u64; 8] {
+fn revocation_counts(state: &ProxyState) -> [u64; HboneRevocationReason::ALL.len()] {
     let fence = &state.hbone_admission_fence;
     [
         fence.revocations(HboneRevocationReason::ProxyWithdrawn),
@@ -3118,12 +3118,13 @@ fn the_revocation_reason_order_is_pinned() {
         );
     }
 
-    // And the same array is what `revocation_counts` reads, so a new reason
-    // cannot be added without the fixture growing with it.
+    // And the same array sizes the counter fixture: `revocation_counts` returns
+    // `[u64; HboneRevocationReason::ALL.len()]`, so a new reason breaks the
+    // build rather than slipping in unasserted.
     assert_eq!(
+        labels.len(),
         HboneRevocationReason::ALL.len(),
-        revocation_counts(&credential_state(9646)).len(),
-        "the counter fixture must cover every declared reason"
+        "every declared reason must render exactly one label"
     );
 }
 
