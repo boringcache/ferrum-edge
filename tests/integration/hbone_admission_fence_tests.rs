@@ -2775,7 +2775,7 @@ async fn an_admitted_connect_advertises_the_fence_capability_on_its_200() {
     );
     // The advertisement is a capability flag, never an authorization: the
     // admission counters are untouched by it.
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0]);
 
     let _ = shutdown_tx.send(true);
     backend_handle.abort();
