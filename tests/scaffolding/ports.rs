@@ -8,8 +8,16 @@
 //!
 //! Keep fixture sockets bound and pass them to the consumer. For a gateway
 //! subprocess, release only the socket with `drop_and_take_port`: the registry
-//! lease survives until the test process exits. Keep the gateway's bounded bind
-//! retries for unrelated OS users, which do not participate in this registry.
+//! lease survives until the test process exits. Reservations exclude the host's
+//! ephemeral source range so outbound connects cannot steal a released port.
+//! TCP reservations bind exclusively with `SO_REUSEADDR` disabled, skipping
+//! TIME_WAIT ports that the gateway could not bind. Each process scans from a
+//! PID/time-derived pseudo-random offset in the eligible range and wraps once,
+//! spreading consecutive test processes across ports instead of recycling the
+//! lowest numbers. Registry coordination and lease retention still apply.
+//! Native `TestSocket::bind_test(...:0)` fixtures must keep their socket bound.
+//! Keep the gateway's bounded bind retries for unrelated OS users, which do not
+//! participate in this registry.
 //!
 //! Dropping an unused reservation releases its lease. Transferring a native
 //! socket extends its lease to process exit because the socket cannot carry a
@@ -29,10 +37,13 @@
 //! will itself bind), use [`PortReservation::drop_and_take_port`] explicitly
 //! so the reasoning is captured in the test source.
 
-use super::port_registry::{PortLease, TestSocket, process_registry};
+use super::port_registry::{
+    PortLease, TestSocket, bind_tcp_listener, bind_tcp_socket, process_registry,
+};
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use tokio::net::{TcpListener, UdpSocket};
 
@@ -89,13 +100,58 @@ impl PortReservation {
     }
 }
 
-/// Bind `127.0.0.1:0` under the registry lock and return the live listener and
-/// lease. Rejected leased ports stay bound while another candidate is selected.
+/// The source-port range in the gateway's network namespace. Linux CI may
+/// override its default; a missing proc file uses the Linux default. Other
+/// supported hosts use the IANA dynamic range. Malformed/read errors fail closed.
+pub fn ephemeral_source_port_range() -> io::Result<RangeInclusive<u16>> {
+    #[cfg(target_os = "linux")]
+    {
+        let raw = match std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range") {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(32_768..=60_999);
+            }
+            Err(error) => return Err(error),
+        };
+        let bounds = raw
+            .split_whitespace()
+            .map(str::parse::<u16>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if bounds.len() != 2 || bounds[0] == 0 || bounds[0] > bounds[1] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid ip_local_port_range",
+            ));
+        }
+        Ok(bounds[0]..=bounds[1])
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(49_152..=65_535)
+    }
+}
+
+/// Match the registry's mesh allocation floor, avoiding well-known/service
+/// ports. Never fall back to port zero when this candidate set is exhausted.
+fn handoff_ports() -> io::Result<impl Iterator<Item = u16>> {
+    let ephemeral = ephemeral_source_port_range()?;
+    let candidates = (10_240..=u16::MAX).filter(move |port| !ephemeral.contains(port));
+    Ok(process_registry()?.candidates(candidates))
+}
+
+fn reserve_tcp_listener() -> io::Result<(PortLease, std::net::TcpListener)> {
+    process_registry()?.lease_with(handoff_ports()?, |port| {
+        let listener = bind_tcp_listener(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
+        Ok((port, listener))
+    })
+}
+
+/// Return a live listener and lease outside the host's ephemeral source range.
+/// Reservations can be handed to a backend or released for a subprocess without
+/// letting the kernel's automatic source-port allocator steal the handoff.
 pub async fn reserve_port() -> io::Result<PortReservation> {
-    let (lease, listener) = process_registry()?.lease_with(std::iter::repeat_n(0, 256), |_| {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        Ok((listener.local_addr()?.port(), listener))
-    })?;
+    let (lease, listener) = reserve_tcp_listener()?;
     listener.set_nonblocking(true)?;
     Ok(PortReservation {
         port: lease.port,
@@ -107,8 +163,12 @@ pub async fn reserve_port() -> io::Result<PortReservation> {
 /// Reserve a listener in a bounded range outside the host's ephemeral source
 /// ports when a fixture must release and rebind the socket during startup.
 pub fn reserve_port_in_range(ports: std::ops::Range<u16>) -> io::Result<PortReservation> {
-    let (lease, listener) = process_registry()?.lease_with(ports, |port| {
-        let listener = std::net::TcpListener::bind(("127.0.0.1", port))?;
+    let ephemeral = ephemeral_source_port_range()?;
+    let registry = process_registry()?;
+    let candidates =
+        registry.candidates(ports.filter(|port| *port >= 10_240 && !ephemeral.contains(port)));
+    let (lease, listener) = registry.lease_with(candidates, |port| {
+        let listener = bind_tcp_listener(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
         Ok((port, listener))
     })?;
     listener.set_nonblocking(true)?;
@@ -165,12 +225,11 @@ impl UdpPortReservation {
     }
 }
 
-/// Bind `127.0.0.1:0` on UDP and return the live socket. Retry semantics
-/// mirror [`reserve_port`].
+/// Reserve a live UDP socket outside the source range, like [`reserve_port`].
 pub async fn reserve_udp_port() -> io::Result<UdpPortReservation> {
-    let (lease, socket) = process_registry()?.lease_with(std::iter::repeat_n(0, 256), |_| {
-        let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
-        Ok((socket.local_addr()?.port(), socket))
+    let (lease, socket) = process_registry()?.lease_with(handoff_ports()?, |port| {
+        let socket = std::net::UdpSocket::bind(("127.0.0.1", port))?;
+        Ok((port, socket))
     })?;
     socket.set_nonblocking(true)?;
     Ok(UdpPortReservation {
@@ -195,18 +254,16 @@ pub async fn unbound_udp_port() -> io::Result<u16> {
 /// backend respectively, so the proxy's single `backend_port` value works
 /// for both.
 ///
-/// Strategy: bind TCP on `0`, note its port, then bind UDP on that same
+/// Strategy: bind TCP outside the source range, then bind UDP on that same
 /// port. Retry on UDP conflict. TCP and UDP share the port namespace at
 /// the kernel level without issue (different protocol numbers), so a UDP
 /// bind at the same port generally succeeds on the first try.
 pub async fn reserve_colocated_tcp_udp() -> io::Result<(PortReservation, UdpPortReservation)> {
-    let (lease, (tcp, udp)) =
-        process_registry()?.lease_with(std::iter::repeat_n(0, 256), |_| {
-            let tcp = std::net::TcpListener::bind("127.0.0.1:0")?;
-            let port = tcp.local_addr()?.port();
-            let udp = std::net::UdpSocket::bind(("127.0.0.1", port))?;
-            Ok((port, (tcp, udp)))
-        })?;
+    let (lease, (tcp, udp)) = process_registry()?.lease_with(handoff_ports()?, |port| {
+        let tcp = bind_tcp_listener(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
+        let udp = std::net::UdpSocket::bind(("127.0.0.1", port))?;
+        Ok((port, (tcp, udp)))
+    })?;
     tcp.set_nonblocking(true)?;
     udp.set_nonblocking(true)?;
     let lease = Arc::new(lease);
@@ -224,9 +281,9 @@ pub async fn reserve_colocated_tcp_udp() -> io::Result<(PortReservation, UdpPort
     ))
 }
 
-/// Reserve and immediately release a port. Connects to the returned port
-/// produce a genuine `ECONNREFUSED` at the kernel level (nothing is
-/// listening), unlike
+/// Reserve and immediately release a non-ephemeral port for a subprocess.
+/// Connects to the returned port produce a genuine `ECONNREFUSED` at the kernel
+/// level (nothing is listening), unlike
 /// [`super::backends::tcp::TcpStep::RefuseNextConnect`] which accepts and
 /// drops — that emits FIN/RST, not a connect-time refusal.
 ///
@@ -235,13 +292,15 @@ pub async fn reserve_colocated_tcp_udp() -> io::Result<(PortReservation, UdpPort
 /// [`reserve_refused_tcp_port`] instead, which keeps the port bound
 /// without listening.
 pub async fn unbound_port() -> io::Result<u16> {
-    Ok(reserve_port().await?.drop_and_take_port())
+    unbound_tcp_port()
 }
 
 /// Synchronous gateway handoff for spawners that do not own a Tokio runtime.
 pub fn unbound_tcp_port() -> io::Result<u16> {
-    let listener = std::net::TcpListener::bind_test("127.0.0.1:0")?;
-    Ok(listener.local_addr()?.port())
+    let (lease, listener) = reserve_tcp_listener()?;
+    let port = lease.retain_for_process();
+    drop(listener);
+    Ok(port)
 }
 
 /// Whether a held [`RefusedTcpPort`] makes a connect fail IMMEDIATELY on this
@@ -270,7 +329,8 @@ pub struct RefusedTcpPort {
 }
 
 impl RefusedTcpPort {
-    /// Release the bound socket for a gateway handoff, retaining the process lease.
+    /// Release a [`reserve_future_tcp_port`] reservation for a gateway handoff.
+    /// Retain genuine refused-backend reservations instead of releasing them.
     pub fn drop_and_take_port(self) -> u16 {
         self.lease.retain_for_process()
     }
@@ -289,16 +349,8 @@ impl RefusedTcpPort {
     }
 }
 
-fn bind_unlistened_tcp_port() -> io::Result<(u16, socket2::Socket)> {
-    let socket = socket2::Socket::new(
-        socket2::Domain::IPV4,
-        socket2::Type::STREAM,
-        Some(socket2::Protocol::TCP),
-    )?;
-    // Keep SO_REUSEADDR off so a parallel listener cannot steal the port
-    // while this reservation is held.
-    socket.set_reuse_address(false)?;
-    socket.bind(&SocketAddr::from((Ipv4Addr::LOCALHOST, 0)).into())?;
+fn bind_unlistened_tcp_port(port: u16) -> io::Result<(u16, socket2::Socket)> {
+    let socket = bind_tcp_socket(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
     let port = socket
         .local_addr()?
         .as_socket()
@@ -311,8 +363,20 @@ fn bind_unlistened_tcp_port() -> io::Result<(u16, socket2::Socket)> {
 /// with the same budget as [`reserve_port`]; this is reservation retry, not
 /// a whole-scenario retry-until-green loop.
 pub fn reserve_refused_tcp_port() -> io::Result<RefusedTcpPort> {
-    let (lease, socket) = process_registry()?
-        .lease_with(std::iter::repeat_n(0, 256), |_| bind_unlistened_tcp_port())?;
+    let (lease, socket) =
+        process_registry()?.lease_with(std::iter::repeat_n(0, 256), bind_unlistened_tcp_port)?;
+    Ok(RefusedTcpPort {
+        port: lease.port,
+        _socket: socket,
+        lease,
+    })
+}
+
+/// A future subprocess listener that must refuse connections before handoff.
+/// Genuine refused-backend fixtures should keep using [`reserve_refused_tcp_port`].
+pub fn reserve_future_tcp_port() -> io::Result<RefusedTcpPort> {
+    let (lease, socket) =
+        process_registry()?.lease_with(handoff_ports()?, bind_unlistened_tcp_port)?;
     Ok(RefusedTcpPort {
         port: lease.port,
         _socket: socket,

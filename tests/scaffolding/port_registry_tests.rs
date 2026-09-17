@@ -1,8 +1,9 @@
 //! Regression coverage for nextest's one-test-per-process port handoff.
 
-use super::port_registry::{PortLease, PortRegistry, TestSocket};
+use super::port_registry::{PortLease, PortRegistry, TestSocket, bind_tcp_listener};
 use std::collections::BTreeSet;
 use std::io;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -40,6 +41,139 @@ fn lease_is_released_on_drop() {
     assert_ne!(port, other.port);
     drop(held);
     assert_eq!(lease(&second).unwrap().port, port);
+}
+
+#[test]
+fn allocator_offsets_wrap_the_filtered_range_from_distinct_starts() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = PortRegistry::with_candidate_offset(directory.path().join("first"), 1).unwrap();
+    let second = PortRegistry::with_candidate_offset(directory.path().join("second"), 2).unwrap();
+    let candidates = [10_240, 32_768, 60_999, 61_000, 61_001]
+        .into_iter()
+        .filter(|port| !(32_768..=60_999).contains(port));
+    assert_eq!(
+        first.candidates(candidates.clone()).collect::<Vec<_>>(),
+        [61_000, 61_001, 10_240]
+    );
+    assert_eq!(
+        second.candidates(candidates.clone()).collect::<Vec<_>>(),
+        [61_001, 10_240, 61_000]
+    );
+    // Separate tables ensure registry contention cannot make this pass when
+    // both instances accidentally start at the lowest candidate.
+    let (first_port, ()) = first
+        .lease_with(first.candidates(candidates.clone()), |port| Ok((port, ())))
+        .unwrap();
+    let (second_port, ()) = second
+        .lease_with(second.candidates(candidates), |port| Ok((port, ())))
+        .unwrap();
+    assert_ne!(first_port.port, second_port.port);
+    assert_eq!(first.candidates(std::iter::empty()).next(), None);
+}
+
+#[test]
+fn allocator_skips_a_held_exclusive_socket_without_a_registry_entry() {
+    let held = super::ports::reserve_refused_tcp_port().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let registry = PortRegistry::new(directory.path()).unwrap();
+    let mut attempted = Vec::new();
+    let (lease, listener) = registry
+        .lease_with([held.port, 0], |port| {
+            attempted.push(port);
+            let listener = bind_tcp_listener(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
+            Ok((listener.local_addr()?.port(), listener))
+        })
+        .unwrap();
+    assert_eq!(attempted, [held.port, 0]);
+    assert_ne!(lease.port, held.port);
+    assert_eq!(lease.port, listener.local_addr().unwrap().port());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn allocator_skips_time_wait_that_a_reuse_address_bind_would_accept() {
+    use std::io::Read;
+    use std::net::{Shutdown, TcpListener, TcpStream};
+
+    let listener = super::ports::reserve_port()
+        .await
+        .unwrap()
+        .into_listener()
+        .into_std()
+        .unwrap();
+    listener.set_nonblocking(false).unwrap();
+    // Model the old reservation / a reuse-enabled server. The accepted socket
+    // inherits this option; an ordinary std listener can later reuse its port.
+    socket2::SockRef::from(&listener)
+        .set_reuse_address(true)
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut client = TcpStream::connect(addr).unwrap();
+    let (mut server, _) = listener.accept().unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    server
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    // The server actively closes and the client observes FIN before replying,
+    // so TIME_WAIT belongs to the listener's port. No timing sleeps are needed.
+    server.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(client.read(&mut [0]).unwrap(), 0);
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(server.read(&mut [0]).unwrap(), 0);
+    drop(server);
+    drop(client);
+    drop(listener);
+
+    let reusable = TcpListener::bind(addr).expect("old SO_REUSEADDR probe accepts TIME_WAIT");
+    drop(reusable);
+    assert_eq!(
+        bind_tcp_listener(addr).unwrap_err().kind(),
+        io::ErrorKind::AddrInUse
+    );
+    // Use an independent table so the kernel, rather than the retained process
+    // lease, rejects the first candidate. Port zero is only a test fallback.
+    let directory = tempfile::tempdir().unwrap();
+    let registry = PortRegistry::new(directory.path()).unwrap();
+    let mut attempted = Vec::new();
+    let (lease, _listener) = registry
+        .lease_with([addr.port(), 0], |port| {
+            attempted.push(port);
+            let listener = bind_tcp_listener(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
+            Ok((listener.local_addr()?.port(), listener))
+        })
+        .unwrap();
+    assert_eq!(attempted, [addr.port(), 0]);
+    assert_ne!(lease.port, addr.port());
+}
+
+#[tokio::test]
+async fn tcp_reservations_and_native_listeners_disable_address_reuse() {
+    use super::ports;
+
+    let (first, second) = ports::reserve_port_pair().await.unwrap();
+    let (tcp, _udp) = ports::reserve_colocated_tcp_udp().await.unwrap();
+    for reservation in [
+        ports::reserve_port().await.unwrap(),
+        ports::reserve_port_in_range(10_240..u16::MAX).unwrap(),
+        first,
+        second,
+        tcp,
+    ] {
+        let listener = reservation.into_listener().into_std().unwrap();
+        assert!(!socket2::SockRef::from(&listener).reuse_address().unwrap());
+    }
+    let native = std::net::TcpListener::bind_test((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    assert!(!socket2::SockRef::from(&native).reuse_address().unwrap());
+    let native = tokio::net::TcpListener::bind_test((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap()
+        .into_std()
+        .unwrap();
+    assert!(!socket2::SockRef::from(&native).reuse_address().unwrap());
+    let socket = tokio::net::TcpSocket::bind_test((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    assert!(!socket.reuseaddr().unwrap());
 }
 
 struct RegistryChild(Child);
@@ -155,6 +289,91 @@ async fn socket_handoff_and_wildcard_listener_share_the_registry() {
         next, port,
         "dropping a native listener must preserve the handoff lease"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn every_subprocess_handoff_avoids_the_linux_source_port_range() {
+    use super::ports;
+    use crate::common::gateway_harness;
+    use std::collections::HashSet;
+
+    // Read the kernel independently of the allocator so returning bind(:0)
+    // ports, or hard-coding the default on a tuned runner, breaks this test.
+    let raw = match std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range") {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => "32768 60999".to_string(),
+        Err(error) => panic!("read ephemeral range: {error}"),
+    };
+    let bounds: Vec<u16> = raw.split_whitespace().map(|s| s.parse().unwrap()).collect();
+    assert_eq!(bounds.len(), 2);
+    let ephemeral = bounds[0]..=bounds[1];
+    let (tcp, udp) = ports::reserve_colocated_tcp_udp().await.unwrap();
+    let colocated = tcp.drop_and_take_port();
+    assert_eq!(udp.drop_and_take_port(), colocated);
+    let (first, second) = ports::reserve_port_pair().await.unwrap();
+    let mut excluded = HashSet::new();
+    let held = gateway_harness::hold_ephemeral_port_excluding(&mut excluded)
+        .await
+        .unwrap();
+    let cases = [
+        ("sync TCP", ports::unbound_tcp_port().unwrap()),
+        ("async TCP", ports::unbound_port().await.unwrap()),
+        ("async UDP", ports::unbound_udp_port().await.unwrap()),
+        (
+            "bounded TCP reservation",
+            ports::reserve_port_in_range(10_240..u16::MAX)
+                .unwrap()
+                .drop_and_take_port(),
+        ),
+        (
+            "mesh namespace handoff",
+            super::port_registry::unbound_port_outside(ephemeral.clone()).unwrap(),
+        ),
+        (
+            "TCP reservation",
+            ports::reserve_port().await.unwrap().drop_and_take_port(),
+        ),
+        (
+            "UDP reservation",
+            ports::reserve_udp_port()
+                .await
+                .unwrap()
+                .drop_and_take_port(),
+        ),
+        ("colocated TCP/UDP", colocated),
+        ("pair first", first.drop_and_take_port()),
+        ("pair second", second.drop_and_take_port()),
+        (
+            "future listener",
+            ports::reserve_future_tcp_port()
+                .unwrap()
+                .drop_and_take_port(),
+        ),
+        (
+            "generic spawner",
+            gateway_harness::ephemeral_port().await.unwrap(),
+        ),
+        ("held generic spawner", held.port),
+        (
+            "excluding generic spawner",
+            gateway_harness::ephemeral_port_excluding(&mut excluded)
+                .await
+                .unwrap(),
+        ),
+    ];
+    let mut distinct = BTreeSet::new();
+    for (name, port) in cases {
+        assert!(port >= 10_240, "{name}: avoid well-known/service ports");
+        assert!(
+            !ephemeral.contains(&port),
+            "{name}: {port} is in {ephemeral:?}"
+        );
+        assert!(distinct.insert(port), "{name}: handoff lease was lost");
+    }
+    if bounds[0] < bounds[1] {
+        assert!(ports::reserve_port_in_range(bounds[0]..bounds[1]).is_err());
+    }
 }
 
 #[test]
