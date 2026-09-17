@@ -49805,11 +49805,10 @@ async fn proxy_to_backend_hbone(
             // admitted it: the request's own accepted-credential minimum (SVID
             // and JWT alike) folded with this gateway's SVID leaf `notAfter`.
             // Reuse must never prolong a credential's lifetime.
-            credential_deadline:
-                hbone_inner_pool::HboneInnerConnectionPool::earliest_deadline(
-                    ctx.and_then(|ctx| ctx.credential_deadline_at),
-                    credential.leaf_deadline,
-                ),
+            credential_deadline: hbone_inner_pool::HboneInnerConnectionPool::earliest_deadline(
+                ctx.and_then(|ctx| ctx.credential_deadline_at),
+                credential.leaf_deadline,
+            ),
             keep_alive: inner_pool_config.enable_http_keep_alive,
             pool_config: inner_pool_config.clone(),
             credential,

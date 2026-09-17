@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use chrono::Utc;
 use ferrum_edge::_test_support::hbone_inner_h1_request_body_for_test;
@@ -35,18 +36,17 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain, spiffe_id_to_san};
 use ferrum_edge::identity::{SharedSvidBundle, SvidBundle, TrustBundle, TrustBundleSet};
 use ferrum_edge::modes::mesh::hbone::{TUNNEL_REUSE_FENCED, TUNNEL_REUSE_HEADER};
+use ferrum_edge::proxy::grpc_proxy::GrpcBody;
 use ferrum_edge::proxy::hbone_inner_pool::{
     HboneInnerConnectionPool, HboneInnerH1Checkout, HboneInnerH1RequestBody, HboneInnerKeyParts,
     HboneInnerProtocol, HboneSourceCredential, MAX_IDLE_H1_PER_KEY,
 };
-use ferrum_edge::proxy::grpc_proxy::GrpcBody;
 use ferrum_edge::proxy::hbone_pool::HboneConnectionPool;
 use ferrum_edge::tls::spiffe::build_spiffe_inbound_config;
 use http::{Response, StatusCode};
 use http_body_util::BodyExt;
 use hyper::client::conn::http2::SendRequest as H2SendRequest;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use arc_swap::ArcSwap;
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
@@ -78,7 +78,10 @@ const DEADLINE: Duration = Duration::from_secs(10);
 fn synthetic_root(td: &TrustDomain) -> (Vec<u8>, String, String) {
     let mut params = CertificateParams::default();
     let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, format!("{}-inner-pool-root", td.as_str()));
+    dn.push(
+        DnType::CommonName,
+        format!("{}-inner-pool-root", td.as_str()),
+    );
     params.distinguished_name = dn;
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
@@ -395,10 +398,9 @@ async fn start_peer(peer_slot: SharedSvidBundle, app_addr: SocketAddr, advertise
                     if advertise.load(Ordering::SeqCst) {
                         builder = builder.header(TUNNEL_REUSE_HEADER, TUNNEL_REUSE_FENCED);
                     }
-                    let Ok(accepted) = respond.send_response(
-                        builder.body(()).expect("connect response"),
-                        false,
-                    ) else {
+                    let Ok(accepted) =
+                        respond.send_response(builder.body(()).expect("connect response"), false)
+                    else {
                         return;
                     };
                     let recv = request.into_body();
@@ -963,16 +965,13 @@ async fn keep_alive_off_never_consults_or_fills_the_idle_set() {
     );
     assert!(checkout.is_none(), "keep-alive off never reuses");
 
-    let lease = fx
-        .pool
-        .inner_pool()
-        .fresh_h1(
-            &fx.identity.parts(HboneInnerProtocol::Http1),
-            fx.open_fresh_h1().await.sender,
-            true,
-            false,
-            fx.identity.credential.leaf_deadline,
-        );
+    let lease = fx.pool.inner_pool().fresh_h1(
+        &fx.identity.parts(HboneInnerProtocol::Http1),
+        fx.open_fresh_h1().await.sender,
+        true,
+        false,
+        fx.identity.credential.leaf_deadline,
+    );
     assert!(
         !lease.poolable(),
         "a lease taken under keep-alive off may never re-enter the idle set"
@@ -1256,7 +1255,10 @@ async fn a_nested_h2_sender_is_never_published_for_a_peer_without_the_capability
     let parts = fx.identity.parts(HboneInnerProtocol::H2);
 
     let (mut sender, advertised) = open_fresh_h2(&fx).await;
-    assert!(!advertised, "this peer does not advertise the admission fence");
+    assert!(
+        !advertised,
+        "this peer does not advertise the admission fence"
+    );
     fx.pool.inner_pool().publish_h2(
         &parts,
         &sender,
