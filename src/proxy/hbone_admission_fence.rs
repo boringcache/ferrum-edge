@@ -1811,9 +1811,7 @@ impl HboneAdmissionFence {
                     .store(published.revision(), Ordering::Release);
                 None
             }
-            AdmittedPeerTrustVerdict::Withdrawn => {
-                Some(HboneRevocationReason::PeerTrust)
-            }
+            AdmittedPeerTrustVerdict::Withdrawn => Some(HboneRevocationReason::PeerTrust),
             // Nothing was retained to verify. Fail closed exactly like an
             // authorize plugin that unwound: a tunnel whose trust cannot be
             // judged is cut, not left serving.
