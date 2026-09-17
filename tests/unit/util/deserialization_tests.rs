@@ -244,7 +244,11 @@ fn cidr_document_errors_keep_field_paths_and_reasons_without_values() {
                 .unwrap_err()
                 .to_string(),
         ] {
-            assert!(message.contains("ip_blocks[0]"), "{message}");
+            // The CIDR parser validates the whole `ip_blocks` list after serde has
+            // handed it over, so the boundary path names the field, not the
+            // element: `ip_blocks: prefix length 40 out of range in CIDR ...`.
+            assert!(message.contains("ip_blocks"), "{message}");
+            assert!(!message.contains("ip_blocks[0]"), "{message}");
             assert!(message.contains(reason), "{message}");
             assert!(message.contains(REDACTED_SCALAR), "{message}");
             assert!(message.contains("line "), "{message}");
