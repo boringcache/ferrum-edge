@@ -4107,7 +4107,7 @@ async fn restore_rejects_incompatible_stream_mtls_auth_before_delete() {
     assert!(
         body["validation_errors"]
             .to_string()
-            .contains("cannot use mtls_auth PluginConfig"),
+            .contains("cannot use `mtls_auth` PluginConfig"),
         "expected the mTLS transport-compatibility diagnostic: {body:?}"
     );
 
@@ -4115,7 +4115,7 @@ async fn restore_rejects_incompatible_stream_mtls_auth_before_delete() {
     assert_eq!(status, 400, "batch must refuse the same shape: {body:?}");
     assert!(
         body.to_string()
-            .contains("cannot use mtls_auth PluginConfig"),
+            .contains("cannot use `mtls_auth` PluginConfig"),
         "batch and restore must share the mTLS compatibility contract: {body:?}"
     );
 
