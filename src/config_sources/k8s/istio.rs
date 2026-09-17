@@ -19275,7 +19275,7 @@ extensionProviders:
         .expect_err("a system trust source with a path suffix must fail translation");
 
         assert!(
-            error.to_string().contains("must be exactly 'system://'"),
+            error.to_string().contains("must be exactly `system://`"),
             "{error}"
         );
     }
