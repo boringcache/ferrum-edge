@@ -276,6 +276,7 @@ impl ScriptedTcpBackendBuilder {
 #[derive(Default)]
 struct BackendState {
     accepted: AtomicU32,
+    resets: AtomicU32,
     received_bytes: Mutex<Vec<u8>>,
     /// Errors returned by `run_script`. Without this the step errors
     /// would be silently dropped and a script that e.g. short-reads its
@@ -326,6 +327,13 @@ impl ScriptedTcpBackend {
     /// and connections beyond the first in `Once` mode.
     pub fn accepted_connections(&self) -> u32 {
         self.state.accepted.load(Ordering::SeqCst)
+    }
+
+    /// Connections that reached `Reset` and successfully set `SO_LINGER=0`.
+    /// Published immediately before the synchronous close, so a peer observing
+    /// that close can distinguish an executed reset from `Once`'s fallback EOF.
+    pub fn reset_connections(&self) -> u32 {
+        self.state.resets.load(Ordering::SeqCst)
     }
 
     /// Snapshot of everything any connection's `ReadExact` / `ReadUntil`
@@ -494,6 +502,7 @@ async fn run_script(
                 let std_stream = stream.into_std()?;
                 let sock = socket2::Socket::from(std_stream);
                 sock.set_linger(Some(Duration::from_secs(0)))?;
+                state.resets.fetch_add(1, Ordering::SeqCst);
                 drop(sock);
                 return Ok(());
             }
