@@ -324,7 +324,11 @@ fn the_connect_path_records_the_admitting_chain_fold_before_it_advertises() {
         "the advertisement must read the RECORDED value back, not re-fold: the header and the \
          fence's obligation have to be one value"
     );
-    assert_eq!(src.matches(fold_call).count(), 1, "the CONNECT path folds exactly once");
+    assert_eq!(
+        src.matches(fold_call).count(),
+        1,
+        "the CONNECT path folds exactly once"
+    );
     assert!(
         !src.contains("admission_view.plugins()"),
         "the admitting chain is the dispatcher's `plugins` slice; the admission view carries \

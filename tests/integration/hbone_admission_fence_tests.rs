@@ -3476,7 +3476,9 @@ async fn a_connect_racing_the_withdrawing_publication_is_never_left_reusable() {
 
     let (status, advertised, _request_body, mut response_body) =
         connecting.await.expect("the CONNECT task must not panic");
-    let outcome = publishing.await.expect("the publication task must not panic");
+    let outcome = publishing
+        .await
+        .expect("the publication task must not panic");
     assert_eq!(outcome, ConfigApplyOutcome::Applied);
     assert_eq!(
         status,
