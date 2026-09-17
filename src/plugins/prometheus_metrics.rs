@@ -4658,7 +4658,7 @@ impl MetricsRegistry {
 
         if !self.hbone_tunnel_revocation_counter.is_empty() {
             output.push_str(
-                "# HELP ferrum_mesh_hbone_tunnel_revocations_total Live HBONE tunnels revoked by the admission fence because the current policy generation, peer credential, or enforced revocation list would no longer admit their CONNECT.\n",
+                "# HELP ferrum_mesh_hbone_tunnel_revocations_total Live HBONE tunnels revoked by the admission fence because the current policy generation, peer credential, or enforced revocation list would no longer admit their CONNECT, or would no longer let it carry later application operations.\n",
             );
             output.push_str("# TYPE ferrum_mesh_hbone_tunnel_revocations_total counter\n");
             for entry in self.hbone_tunnel_revocation_counter.iter() {
@@ -6319,6 +6319,19 @@ impl Plugin for PrometheusMetrics {
             self.tunables.mesh_series_budget_per_family,
             &self.tunables.namespace,
         );
+    }
+
+    /// Reusable (issue #5583): pure observability. Its request-phase hooks
+    /// stamp one observed-marker key on the context; everything else it does is
+    /// recording completed transactions. It takes no admission decision, holds
+    /// no per-request budget, makes no external
+    /// admission call, and never rejects — so nothing an elided CONNECT would
+    /// have decided is lost. What reuse costs here is FIDELITY, not
+    /// enforcement: one tunnel summary stands for every operation the tunnel
+    /// carried, the same trade the relay already makes for the inner requests
+    /// it byte-copies without ever parsing them.
+    fn allows_hbone_inner_reuse(&self) -> bool {
+        true
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {

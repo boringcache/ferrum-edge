@@ -866,6 +866,19 @@ impl Plugin for OtelTracing {
         }
     }
 
+    /// Reusable (issue #5583): pure observability. Its request-phase hooks only
+    /// capture and propagate span attributes and trace context; spans are
+    /// exported after the fact. It takes no admission decision, holds no
+    /// per-request budget, makes no external
+    /// admission call, and never rejects — so nothing an elided CONNECT would
+    /// have decided is lost. What reuse costs here is FIDELITY, not
+    /// enforcement: one tunnel summary stands for every operation the tunnel
+    /// carried, the same trade the relay already makes for the inner requests
+    /// it byte-copies without ever parsing them.
+    fn allows_hbone_inner_reuse(&self) -> bool {
+        true
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         // Capture bounded client-facing authority for SERVER span attributes.
         if let Some(port) = ctx.frontend_listen_port {
