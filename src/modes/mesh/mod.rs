@@ -34952,8 +34952,12 @@ mod tests {
             "PERMISSIVE must not mandate client auth"
         );
         assert!(
-            mesh_inbound_spiffe_verifier(Some(&slot), config::MtlsMode::Disable, no_enforced_crls())
-                .is_none(),
+            mesh_inbound_spiffe_verifier(
+                Some(&slot),
+                config::MtlsMode::Disable,
+                no_enforced_crls()
+            )
+            .is_none(),
             "DISABLE has no TLS, so no verifier"
         );
     }

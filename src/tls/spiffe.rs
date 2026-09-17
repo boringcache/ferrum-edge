@@ -712,11 +712,14 @@ fn peer_verifier_cache(
             // compiles the enforced CRLs independently and fails those tunnels
             // closed, so tolerating the bad set here never leaves a revoked
             // peer's tunnel running.
-            let retained = cached.as_ref().as_ref().map(|cache| SpiffePeerVerifierCache {
-                source: Arc::clone(&cache.source),
-                crl_generation: crls.generation(),
-                verifiers: cache.verifiers.clone(),
-            });
+            let retained = cached
+                .as_ref()
+                .as_ref()
+                .map(|cache| SpiffePeerVerifierCache {
+                    source: Arc::clone(&cache.source),
+                    crl_generation: crls.generation(),
+                    verifiers: cache.verifiers.clone(),
+                });
             let retained = Arc::new(retained);
             cache_slot.store(Arc::clone(&retained));
             Ok(retained)
