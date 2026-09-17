@@ -457,15 +457,21 @@ pub fn apply_clock_offset(local_now: Duration, offset_nanos: i64) -> Duration {
 /// cannot pair, a microsecond field outside `[0, 1_000_000)` — is `None`. The
 /// caller never guesses at a partial reading: an unusable server clock is
 /// handled as an unusable reply, not as a zero.
-pub fn parse_redis_server_time(value: &redis::Value) -> Option<Duration> {
+///
+/// Takes the reply BY VALUE because redis-rs decodes a `Value` by value;
+/// borrowing would cost a clone of each bulk string on the admission path.
+pub fn parse_redis_server_time(value: redis::Value) -> Option<Duration> {
     let redis::Value::Array(items) = value else {
         return None;
     };
-    let [seconds, micros] = items.as_slice() else {
+    let mut items = items.into_iter();
+    let seconds_value = items.next()?;
+    let micros_value = items.next()?;
+    if items.next().is_some() {
         return None;
-    };
-    let seconds: u64 = redis::from_redis_value(seconds).ok()?;
-    let micros: u64 = redis::from_redis_value(micros).ok()?;
+    }
+    let seconds: u64 = redis::from_redis_value(seconds_value).ok()?;
+    let micros: u64 = redis::from_redis_value(micros_value).ok()?;
     if micros >= 1_000_000 {
         return None;
     }
@@ -3927,7 +3933,7 @@ impl RedisRateLimitClient {
             redis::cmd("TIME").query_async(conn).await;
         let sampled_at = redis_epoch_now();
         let server_time = match probed {
-            Ok(value) => parse_redis_server_time(&value),
+            Ok(value) => parse_redis_server_time(value),
             Err(_) => None,
         };
         match server_time {
@@ -5025,9 +5031,10 @@ impl RedisRateLimitClient {
 
         // `GET` answers a bulk string or nil, `INCR` an integer, and `TIME` a
         // two-element array, so the reply is decoded one element at a time
-        // rather than through a single scalar type. `Vec<redis::Value>` consumes
-        // redis-rs's own decode allocation; the admission path adds none of its
-        // own on top of it.
+        // rather than through a single scalar type. `Vec<redis::Value>` IS
+        // redis-rs's own decode allocation, and it is consumed element by
+        // element below — redis-rs decodes a `Value` by value, so borrowing
+        // would add one clone per counter on the admission hot path.
         let ladder_values = windows.len() * REDIS_WINDOW_SUB_BUCKET_KEYS;
         let expected_values = ladder_values + usize::from(server_clock_mode);
         let result: Result<Vec<redis::Value>, redis::RedisError> =
@@ -5038,12 +5045,16 @@ impl RedisRateLimitClient {
         match result {
             Ok(reply) if reply.len() == expected_values => {
                 self.note_command_success()?;
-                let (ladders, tail) = reply.split_at(ladder_values);
                 let mut counts = RedisWindowCounts::default();
                 let mut ladder = [None; REDIS_WINDOW_SUB_BUCKET_KEYS];
-                for chunk in ladders.chunks_exact(REDIS_WINDOW_SUB_BUCKET_KEYS) {
-                    for (slot, value) in ladder.iter_mut().zip(chunk) {
-                        let Ok(count) = redis::from_redis_value::<Option<i64>>(value) else {
+                let mut values = reply.into_iter();
+                for _ in 0..windows.len() {
+                    for slot in ladder.iter_mut() {
+                        let decoded = match values.next() {
+                            Some(value) => redis::from_redis_value::<Option<i64>>(value).ok(),
+                            None => None,
+                        };
+                        let Some(count) = decoded else {
                             // A counter this code cannot read is NOT a zero: it
                             // would under-count and over-admit. Same posture as
                             // the short-reply arm below — an unusable endpoint,
@@ -5062,7 +5073,8 @@ impl RedisRateLimitClient {
                     counts.push(redis_trailing_window_count(&ladder));
                 }
                 let settled_at = if server_clock_mode {
-                    let Some(server_time) = tail.first().and_then(parse_redis_server_time) else {
+                    let sampled = values.next().and_then(parse_redis_server_time);
+                    let Some(server_time) = sampled else {
                         // `TIME` was queued and the server answered something
                         // this code cannot pair with a clock. Falling back to
                         // the local clock here would silently reinstate the

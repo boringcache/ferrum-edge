@@ -2621,7 +2621,7 @@ fn a_server_time_reply_is_parsed_strictly_or_not_at_all() {
         redis::Value::BulkString(b"151000".to_vec()),
     ]);
     assert_eq!(
-        parse_redis_server_time(&ok),
+        parse_redis_server_time(ok),
         Some(Duration::from_millis(100_151))
     );
 
@@ -2646,10 +2646,12 @@ fn a_server_time_reply_is_parsed_strictly_or_not_at_all() {
             redis::Value::BulkString(b"0".to_vec()),
         ]),
     ] {
+        // The parse consumes the reply, so render the shape before handing it over.
+        let rendered = format!("{rejected:?}");
         assert_eq!(
-            parse_redis_server_time(&rejected),
+            parse_redis_server_time(rejected),
             None,
-            "an unusable server clock must never be guessed at: {rejected:?}"
+            "an unusable server clock must never be guessed at: {rendered}"
         );
     }
 }
