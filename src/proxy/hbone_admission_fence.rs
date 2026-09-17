@@ -83,15 +83,14 @@
 //! a mesh where nothing is being republished at all.
 //!
 //! The operator's ENFORCED REVOCATION LIST is part of that same in-force cell
-//! (issue #5574), not a second input consulted beside it. The mesh inbound
-//! SPIFFE verifier reads `ProxyState::mesh_inbound_crls` live on every
-//! handshake, so a CRL that revokes a workload's leaf refuses that peer's next
-//! handshake — but an established inbound session is never re-handshaked, and
-//! many CONNECTs multiplex over one, so without the fence the revoked peer kept
-//! every tunnel it already had AND could open more. The anchors in force are
-//! therefore compiled WITH the enforced records, which makes one compiled
-//! artifact answer the whole credential question the next handshake would: does
-//! this chain still anchor, and is nothing on it revoked.
+//! (issue #5574), not a second input consulted beside it. A CRL that revokes a
+//! workload's leaf must refuse that peer's next handshake — but an established
+//! inbound session is never re-handshaked, and many CONNECTs multiplex over
+//! one, so without the fence the revoked peer kept every tunnel it already had
+//! AND could open more. The anchors in force are therefore compiled WITH the
+//! enforced records, which makes one compiled artifact answer the whole
+//! credential question the next handshake would: does this chain still anchor,
+//! and is nothing on it revoked.
 //! `ProxyState::publish_mesh_inbound_crls` goes through the same single
 //! publisher the trust bundle does ([`HboneAdmissionFence::publish_inbound_admission_crls`]):
 //! it recompiles the cached anchors with the new records, advances the ONE
@@ -99,6 +98,58 @@
 //! the sweep. There is no second generation and no second skip key — a
 //! publication of either kind moves one revision, and a tunnel whose
 //! last-verified revision matches it does no path building at all.
+//!
+//! THE HANDSHAKE READS THE SAME ARTIFACT. `ProxyState::mesh_inbound_admission`
+//! ([`crate::tls::InboundAdmissionArtifact`]) carries the enforced records AND
+//! the compiled anchors in force, and the inbound SPIFFE client-certificate
+//! verifier verifies against those anchors whenever any are in force. Its own
+//! compile — `SpiffePeerVerifierCache`, from the raw SVID slot plus the raw
+//! records, with last-known-good retention — is ONLY the startup fallback for a
+//! listener whose fence has never published, never a second opinion once
+//! something is in force. Two independently retained histories let the two
+//! surfaces disagree indefinitely: a trust candidate the fence refuses to put in
+//! force is still STORED in the slot (the same slot backs the listener's server
+//! identity), so the verifier kept failing to build from it and kept returning
+//! its own previous set — which meant a CRL published afterwards, one the fence
+//! had already compiled into its anchors, never reached a single handshake. The
+//! handshake admitted a revoked leaf while the fence revoked its tunnels and
+//! refused its CONNECTs, and a later CRL REMOVAL produced the mirror image.
+//! `tls::SvidServerCertResolver` still reads the raw slot, because the server
+//! identity must follow a leaf/key rotation immediately and that material is no
+//! part of what a peer chain anchors in.
+//!
+//! WHICH RELOAD PATH ACTUALLY REPUBLISHES THE RECORDS (issue #5574 re-review).
+//! Exactly one production caller reaches `ProxyState::publish_mesh_inbound_crls`:
+//! the BACKEND TLS live-reload task, through
+//! `ProxyState::reload_backend_tls_material`. `FERRUM_TLS_CRL_FILE_PATH` is one
+//! process-wide source rather than a frontend or backend one, and the backend
+//! watcher is the one that arms in a mesh deployment — the frontend task
+//! additionally requires `FERRUM_FRONTEND_TLS_CERT_PATH`/`_KEY_PATH`, which a
+//! mesh serving its SVID as its inbound server identity does not set. So the
+//! prerequisites for a rotation to reach live tunnels without a restart are:
+//! `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED` (default `true`), a refreshable CRL
+//! source, and the poll cadence — `FERRUM_BACKEND_TLS_WATCH_INTERVAL_SECONDS`
+//! (default 30s) for file-backed sources, the source's own `?poll=` or
+//! `FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` otherwise. One consequence is worth
+//! stating plainly: that task validates the WHOLE backend TLS surface before it
+//! publishes anything, so a backend TLS validation failure with nothing to do
+//! with the CRL withholds the mesh inbound publication as well, and disabling
+//! backend live reload pins the mesh inbound enforced set at its startup
+//! snapshot.
+//!
+//! ALL THREE PUBLISHERS SHARE ONE FENCE-OWNED LOCK
+//! ([`HboneAdmissionFence::publication_lock`]), taken by the trust install, the
+//! trust publication, and the CRL publication alike, and every equality
+//! comparison that decides what goes in force is re-taken under it — against
+//! both the published records and the records the anchors in force were
+//! compiled with. The lock has to exist from `HboneAdmissionFence::new` rather
+//! than per installed trust, because the install itself is one of the racers:
+//! production starts the backend CRL watcher before mesh installs its inbound
+//! slot, so a CRL publisher could read "no trust installed", be overtaken by an
+//! install that compiled against the records in force at that instant, and then
+//! store newer records with nothing recompiled — leaving the verifier on one
+//! list and the fence's anchors on another, permanently, because a
+//! byte-identical republish returns early and can never repair it.
 //!
 //! The all-or-nothing rule covers the records too. A candidate CRL that is
 //! unparseable, not yet valid, carries no `nextUpdate`, or has already reached
@@ -143,10 +194,10 @@ use crate::plugins::mesh::authz::MESH_AUTHZ_REEVALUATION_METADATA_KEY;
 use crate::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 use crate::tls::CrlList;
-use crate::tls::crl_policy::{
-    SharedEnforcedCrlSet, crl_records_equal, publish_enforced_crl_set, usable_crl_records,
+use crate::tls::crl_policy::{crl_records_equal, publish_enforced_crl_set, usable_crl_records};
+use crate::tls::spiffe::{
+    AdmittedPeerTrustAnchors, AdmittedPeerTrustVerdict, SharedInboundAdmissionArtifact,
 };
-use crate::tls::spiffe::{AdmittedPeerTrustAnchors, AdmittedPeerTrustVerdict};
 
 /// Client-visible / log-visible message for a tunnel the fence revoked. A
 /// compiled-in literal: no policy name, principal, or destination.
@@ -253,7 +304,12 @@ impl HboneRevocationReason {
         }
     }
 
-    const ALL: [Self; 8] = [
+    /// Every reason, in GATE ORDER. The metric's closed label set: the
+    /// per-reason counters are indexed by [`Self::index`] into an array of this
+    /// length, and the contract tests assert the rendered order against THIS
+    /// rather than against a handwritten copy of it — a copy would silently
+    /// stop describing the enum the moment a reason was inserted.
+    pub const ALL: [Self; 8] = [
         Self::ProxyWithdrawn,
         Self::PeerExpired,
         Self::PeerTrust,
@@ -264,7 +320,8 @@ impl HboneRevocationReason {
         Self::ReevaluationFailed,
     ];
 
-    const fn index(self) -> usize {
+    /// This reason's position in [`Self::ALL`], which is also its counter slot.
+    pub const fn index(self) -> usize {
         match self {
             Self::ProxyWithdrawn => 0,
             Self::PeerExpired => 1,
@@ -872,10 +929,26 @@ pub struct HboneAdmissionFence {
     trust_revision_seq: AtomicU64,
     request_epoch: Arc<RequestEpochStore>,
     mesh_inbound_tls_policy: SharedMeshInboundTlsPolicy,
-    /// The CRL set the mesh inbound SPIFFE peer verifier enforces, read live so
-    /// a sweep re-checks retained chains against exactly the records the next
-    /// handshake would police (issue #5574). The same slot the verifier holds.
-    mesh_inbound_crls: SharedEnforcedCrlSet,
+    /// The ONE accepted inbound admission artifact (issue #5574): the enforced
+    /// CRL records the mesh inbound SPIFFE peer verifier polices, and the cell
+    /// naming the compiled anchors currently IN FORCE. The very object the
+    /// verifier holds, so a sweep, a CONNECT, and a handshake all decide from
+    /// one compiled set rather than from three independently retained ones.
+    mesh_inbound_admission: SharedInboundAdmissionArtifact,
+    /// Serializes install → compare → store → in-force advance across ALL THREE
+    /// publishers (trust install, trust publication, CRL publication).
+    ///
+    /// Fence-owned and created in [`Self::new`], deliberately not per installed
+    /// trust: the install itself has to be inside it. A CRL publisher that read
+    /// "no trust installed" outside a lock could otherwise be overtaken by
+    /// startup's install — which compiles against the records in force at that
+    /// instant — and then store newer records with nothing recompiled, leaving
+    /// the verifier on one list and the fence's anchors on another with no
+    /// later publication able to repair it (a byte-identical republish returns
+    /// early). Production really does start the backend CRL watcher before mesh
+    /// installs its inbound slot, so that is a startup interleaving rather than
+    /// a misuse of a test helper.
+    publish_lock: std::sync::Mutex<()>,
 }
 
 /// No expiry watcher is parked on any deadline.
@@ -891,7 +964,7 @@ impl HboneAdmissionFence {
     pub fn new(
         request_epoch: Arc<RequestEpochStore>,
         mesh_inbound_tls_policy: SharedMeshInboundTlsPolicy,
-        mesh_inbound_crls: SharedEnforcedCrlSet,
+        mesh_inbound_admission: SharedInboundAdmissionArtifact,
     ) -> Self {
         Self {
             tunnels: DashMap::new(),
@@ -913,7 +986,8 @@ impl HboneAdmissionFence {
             trust_revision_seq: AtomicU64::new(0),
             request_epoch,
             mesh_inbound_tls_policy,
-            mesh_inbound_crls,
+            mesh_inbound_admission,
+            publish_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -933,20 +1007,71 @@ impl HboneAdmissionFence {
     /// already carries is compiled here, so a CONNECT arriving before the first
     /// publication is judged against the material actually installed.
     pub fn install_inbound_admission_trust(&self, slot: &crate::tls::SharedBundleSlot) {
+        let _publication = self.publication_lock();
+        self.install_inbound_admission_trust_locked(slot);
+    }
+
+    /// [`Self::install_inbound_admission_trust`] with the publication lock
+    /// already held, returning the binding in force afterwards.
+    ///
+    /// Separate because the trust publisher must install and publish as ONE
+    /// critical section: the lock is not reentrant, and a publisher that
+    /// released it between the two would reopen the interleaving the lock
+    /// exists to close.
+    fn install_inbound_admission_trust_locked(
+        &self,
+        slot: &crate::tls::SharedBundleSlot,
+    ) -> Arc<MeshInboundAdmissionTrust> {
         if let Some(installed) = self.inbound_trust.load_full()
             && Arc::ptr_eq(&installed.slot, slot)
         {
-            return;
+            return installed;
         }
         let current = slot.load_full();
         let crls = self.enforced_crl_records();
         let material = current.as_ref().as_ref().map(|svid| &svid.trust_bundles);
+        let compiled = self.compile_in_force(material, &crls).ok();
+        // The handshake verifier adopts the binding's anchors too — including
+        // CLEARING them when a rebind to a different slot compiles nothing, so
+        // the verifier falls back to its own compile of the NEW slot rather
+        // than going on verifying against a previous slot's anchors.
+        self.mesh_inbound_admission
+            .put_in_force(compiled.as_ref().map(|c| Arc::clone(&c.anchors)));
         let in_force = InForceInboundTrust {
             revision: self.next_trust_revision(),
-            compiled: self.compile_in_force(material, &crls).ok(),
+            compiled,
         };
-        let installed = MeshInboundAdmissionTrust::wrap(slot.clone(), in_force);
-        self.inbound_trust.store(Some(Arc::new(installed)));
+        let installed = Arc::new(MeshInboundAdmissionTrust::wrap(slot.clone(), in_force));
+        self.inbound_trust.store(Some(Arc::clone(&installed)));
+        installed
+    }
+
+    /// The one publication lock, recovering a poisoned guard's contents (it
+    /// guards no data, only ordering).
+    fn publication_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.publish_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Put `compiled` in force: publish its anchors to the shared artifact the
+    /// handshake verifier reads, then advance the in-force revision.
+    ///
+    /// The verifier FIRST, deliberately. The two stores cannot be one atomic
+    /// step, so one of them is briefly ahead; making it the handshake means the
+    /// overlap can only refuse a peer the fence would still admit for a few
+    /// nanoseconds, never admit one the fence has already decided to revoke.
+    /// The revision is drawn after, from the fence-wide sequence, so a reader
+    /// that observes a revision observes anchors at least as new as it names.
+    ///
+    /// Callers hold [`Self::publication_lock`].
+    fn store_in_force(&self, trust: &MeshInboundAdmissionTrust, compiled: CompiledInboundTrust) {
+        self.mesh_inbound_admission
+            .put_in_force(Some(Arc::clone(&compiled.anchors)));
+        trust.in_force.store(Arc::new(InForceInboundTrust {
+            revision: self.next_trust_revision(),
+            compiled: Some(compiled),
+        }));
     }
 
     /// The CRL records the mesh inbound SPIFFE verifier enforces right now, as
@@ -957,7 +1082,7 @@ impl HboneAdmissionFence {
     /// standing list, not part of an accepted config, and the whole point of
     /// issue #5574 is that both surfaces police the same records.
     fn enforced_crl_records(&self) -> CrlList {
-        Arc::clone(self.mesh_inbound_crls.load().crls())
+        Arc::clone(self.mesh_inbound_admission.crls().load().crls())
     }
 
     /// The next value of the fence's single strictly-increasing trust-revision
@@ -1011,7 +1136,7 @@ impl HboneAdmissionFence {
                 Ok(CompiledInboundTrust {
                     material: material.clone(),
                     crls: Arc::clone(crls),
-                    anchors,
+                    anchors: Arc::new(anchors),
                 })
             }
             Err(class) => Err(class.as_str()),
@@ -1082,12 +1207,13 @@ impl HboneAdmissionFence {
         slot: &crate::tls::SharedBundleSlot,
         bundle: Arc<Option<crate::identity::SvidBundle>>,
     ) {
-        self.install_inbound_admission_trust(slot);
-        if let Some(trust) = self.inbound_trust.load_full() {
-            let _publication = trust
-                .publish_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
+            // ONE critical section covering install, compare, store and the
+            // in-force advance. Installing inside it is what keeps a concurrent
+            // CRL publisher from deciding "no trust installed" against a
+            // binding this call is in the middle of creating.
+            let _publication = self.publication_lock();
+            let trust = self.install_inbound_admission_trust_locked(slot);
             let in_force = trust.in_force.load_full();
             let candidate = (*bundle).as_ref().map(|bundle| &bundle.trust_bundles);
             let crls = self.enforced_crl_records();
@@ -1101,7 +1227,9 @@ impl HboneAdmissionFence {
             // publication that arrives while the records in force are stale —
             // a CRL rotation that landed before any trust was in force, so it
             // had no anchors to recompile — must pick them up rather than
-            // compile the new material against the old list.
+            // compile the new material against the old list. Both halves are
+            // read under the lock, so neither can move between the comparison
+            // and the compile.
             let crls_changed = in_force
                 .crls()
                 .is_some_and(|current| !crl_records_equal(current, &crls));
@@ -1122,16 +1250,8 @@ impl HboneAdmissionFence {
                 None
             };
             trust.slot.store(bundle);
-            if compiled.is_some() {
-                // AFTER the store, so a reader that observes this revision is
-                // guaranteed to observe anchors at least as new as it names.
-                // Drawn from the fence-wide sequence so the value can never
-                // repeat.
-                let advanced = InForceInboundTrust {
-                    revision: self.next_trust_revision(),
-                    compiled,
-                };
-                trust.in_force.store(Arc::new(advanced));
+            if let Some(compiled) = compiled {
+                self.store_in_force(&trust, compiled);
             }
         }
         self.request_sweep();
@@ -1176,15 +1296,51 @@ impl HboneAdmissionFence {
         // The fence owns the verifier's slot; there is deliberately no slot
         // parameter, so a caller cannot publish records into one slot while the
         // anchors in force were compiled against another.
-        let slot = &self.mesh_inbound_crls;
+        //
         // Compared against what the VERIFIER enforces, which is also the
         // baseline `enforced_crl_records` hands every compile: a republish of
-        // the live records changes nothing on either surface.
-        if crl_records_equal(slot.load().crls(), &crls) {
+        // the live records changes nothing on either surface. Checked outside
+        // the lock because an unchanged reload is the common case and must cost
+        // nothing; every decision this check gates is re-taken under the lock.
+        if crl_records_equal(self.enforced_crl_slot().load().crls(), &crls) {
             return false;
         }
         if let Err(class) = usable_crl_records(&crls) {
             self.warn_crls_not_in_force(class);
+            return false;
+        }
+        let published = self.publish_usable_inbound_admission_crls(crls);
+        if published {
+            self.request_sweep();
+        }
+        published
+    }
+
+    /// The locked half of [`Self::publish_inbound_admission_crls`], for a
+    /// candidate already known to be usable.
+    ///
+    /// Everything that decides what goes in force is re-taken here, under the
+    /// one fence-wide publication lock, because every input can move between
+    /// the outer checks and this point:
+    ///
+    /// - The enforced records: two publishers can pass the outer equality check
+    ///   with the SAME candidate. The loser must recompile nothing and advance
+    ///   nothing — an identical publication that moved the revision would make
+    ///   every live tunnel rebuild its certificate path for a decision that did
+    ///   not change.
+    /// - Whether any inbound admission trust is installed: production starts
+    ///   the backend CRL watcher before mesh installs its inbound slot, so a
+    ///   publisher really can read "nothing installed" and be overtaken by the
+    ///   install. Re-reading it under the lock is what makes the installer's
+    ///   compile and this publication one order rather than two.
+    /// - The records the anchors in force were compiled WITH: if the installer
+    ///   (or the trust publisher) already compiled against exactly these
+    ///   records, there is nothing to recompile and no revision to move, and
+    ///   storing them is all that is left.
+    fn publish_usable_inbound_admission_crls(&self, crls: CrlList) -> bool {
+        let _publication = self.publication_lock();
+        let slot = self.enforced_crl_slot();
+        if crl_records_equal(slot.load().crls(), &crls) {
             return false;
         }
         let Some(trust) = self.inbound_trust.load_full() else {
@@ -1192,50 +1348,53 @@ impl HboneAdmissionFence {
             // for these records to police and the credential gate's trust half
             // is inapplicable for every live tunnel. Publishing them for the
             // verifier is the whole job; the sweep still runs because the
-            // policy gates are re-applied on every publication.
-            let changed = publish_enforced_crl_set(slot, crls);
-            if changed {
-                self.request_sweep();
-            }
-            return changed;
+            // policy gates are re-applied on every publication. Under the lock
+            // this really does mean nothing is installed: an installer that
+            // arrives next compiles against the records stored here.
+            return publish_enforced_crl_set(slot, crls);
         };
-        let published = {
-            let _publication = trust
-                .publish_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let in_force = trust.in_force.load_full();
-            // Recompiled from the material already IN FORCE, not from the
-            // slot's current bytes: a trust candidate the fence refused is in
-            // the slot but is not what anything is judged against, and a CRL
-            // rotation must not be the thing that quietly adopts it.
-            let compiled = match in_force.material() {
-                None => None,
-                Some(material) => match self.compile_in_force(Some(material), &crls) {
-                    Ok(compiled) => Some(compiled),
-                    Err(trust_domain_class) => {
-                        self.warn_trust_not_in_force(trust_domain_class);
-                        return false;
-                    }
-                },
-            };
-            let changed = publish_enforced_crl_set(slot, crls);
-            if let Some(compiled) = compiled {
-                // AFTER the store, exactly as the trust publication orders it,
-                // so a reader that observes this revision observes records at
-                // least as new as it names.
-                let advanced = InForceInboundTrust {
-                    revision: self.next_trust_revision(),
-                    compiled: Some(compiled),
-                };
-                trust.in_force.store(Arc::new(advanced));
+        let in_force = trust.in_force.load_full();
+        // Recompiled from the material already IN FORCE, not from the slot's
+        // current bytes: a trust candidate the fence refused is in the slot but
+        // is not what anything is judged against, and a CRL rotation must not
+        // be the thing that quietly adopts it.
+        let compiled = match in_force.material() {
+            None => None,
+            Some(_) if in_force.crls().is_some_and(|c| crl_records_equal(c, &crls)) => {
+                // The anchors in force were ALREADY compiled with exactly these
+                // records — an installer or a trust publisher that ran between
+                // the outer check and this lock picked them up first. Storing
+                // the records for the verifier is all that remains; recompiling
+                // would rebuild identical anchors and advancing the revision
+                // would charge every live tunnel a certificate path build for
+                // nothing.
+                None
             }
-            changed
+            Some(material) => match self.compile_in_force(Some(material), &crls) {
+                Ok(compiled) => Some(compiled),
+                Err(trust_domain_class) => {
+                    self.warn_trust_not_in_force(trust_domain_class);
+                    return false;
+                }
+            },
         };
-        if published {
-            self.request_sweep();
+        let changed = publish_enforced_crl_set(slot, crls);
+        if let Some(compiled) = compiled
+            && changed
+        {
+            // Only on a real change. `publish_enforced_crl_set` reporting
+            // `false` here would mean the records were already enforced, and
+            // advancing the revision for records nothing is newly policing is
+            // exactly the wasted full-registry re-verification the skip key
+            // exists to prevent.
+            self.store_in_force(&trust, compiled);
         }
-        published
+        changed
+    }
+
+    /// The enforced CRL slot inside the shared inbound admission artifact.
+    fn enforced_crl_slot(&self) -> &crate::tls::crl_policy::SharedEnforcedCrlSet {
+        self.mesh_inbound_admission.crls()
     }
 
     /// One sampled operator line for an enforced-CRL candidate that took no
@@ -1909,11 +2068,6 @@ pub struct MeshInboundAdmissionTrust {
     /// material — published together as one immutable cell so nothing can read
     /// a revision beside anchors it does not name.
     in_force: ArcSwap<InForceInboundTrust>,
-    /// Serializes compare → store → in-force advance for this slot, so the
-    /// in-force cell can never name material a losing publisher did not write.
-    /// Production's two writers already serialize on `gateway_svid_update_lock`;
-    /// this makes the invariant the fence's own rather than a caller's.
-    publish_lock: std::sync::Mutex<()>,
 }
 
 /// One generation of inbound admission trust.
@@ -1960,8 +2114,10 @@ struct CompiledInboundTrust {
     /// the records the verifier's slot holds, never a copy of the DER.
     crls: CrlList,
     /// Compiled ONCE, here, at publication — never per sweep and never per
-    /// CONNECT.
-    anchors: AdmittedPeerTrustAnchors,
+    /// CONNECT. Shared by `Arc` with the inbound admission artifact the
+    /// handshake verifier reads, so "in force" is literally the same object on
+    /// both surfaces rather than two compiles of the same inputs.
+    anchors: Arc<AdmittedPeerTrustAnchors>,
 }
 
 impl MeshInboundAdmissionTrust {
@@ -1969,7 +2125,6 @@ impl MeshInboundAdmissionTrust {
         Self {
             slot,
             in_force: ArcSwap::from_pointee(in_force),
-            publish_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -1993,7 +2148,10 @@ impl InboundTrustSnapshot {
     /// The anchors in force, or `None` when nothing is (see
     /// [`InForceInboundTrust::compiled`]).
     fn anchors(&self) -> Option<&AdmittedPeerTrustAnchors> {
-        self.0.compiled.as_ref().map(|compiled| &compiled.anchors)
+        self.0
+            .compiled
+            .as_ref()
+            .map(|compiled| compiled.anchors.as_ref())
     }
 }
 

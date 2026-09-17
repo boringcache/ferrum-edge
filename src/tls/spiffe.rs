@@ -32,7 +32,7 @@
 //!   DIFFERENT federated trust domain. With both `None` the verifier keeps the
 //!   any-federated behavior (HBONE operator targets).
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use rustls::client::WantsClientCert;
 use rustls::pki_types::{
     CertificateDer, CertificateRevocationListDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName,
@@ -75,6 +75,72 @@ impl From<rustls::Error> for SpiffeTlsError {
 /// Shared bundle slot type alias used by the rustls resolvers.
 pub type SharedBundleSlot = Arc<ArcSwap<Option<SvidBundle>>>;
 
+/// The ONE accepted mesh inbound admission artifact: the enforced revocation
+/// records, plus the peer-chain verifiers compiled from those records and the
+/// trust material currently IN FORCE (issue #5574 re-review).
+///
+/// The inbound SPIFFE handshake verifier and the HBONE admission fence read
+/// this one cell, which is what makes "would this peer's next handshake be
+/// refused" a question with a single answer. Before it existed each surface
+/// compiled its own verifiers from overlapping inputs and the two could
+/// disagree indefinitely: a trust candidate the fence refused to put in force
+/// still lands in the SVID slot, so the handshake verifier kept failing to
+/// build from it and kept returning its own last-known-good set — which meant
+/// it never adopted a CRL published afterwards, even though the fence had
+/// already compiled that CRL into its anchors. The handshake admitted a
+/// revoked leaf while the fence revoked its tunnels, and removing the
+/// revocation produced the mirror-image disagreement.
+///
+/// [`Self::in_force`] is `None` only while nothing has been put in force: a
+/// listener whose fence has not published yet (startup), and every caller that
+/// pins a fixed record list through [`inbound_admission_artifact`] without
+/// binding a fence. The handshake verifier falls back to its own compile in
+/// exactly that case — never as a second opinion once something is in force.
+pub struct InboundAdmissionArtifact {
+    crls: SharedEnforcedCrlSet,
+    in_force: ArcSwapOption<AdmittedPeerTrustAnchors>,
+}
+
+/// A shared [`InboundAdmissionArtifact`], read lock-free on every handshake,
+/// every CONNECT, and every fence sweep.
+pub type SharedInboundAdmissionArtifact = Arc<InboundAdmissionArtifact>;
+
+/// A fresh [`InboundAdmissionArtifact`] enforcing `crls`, with nothing in force.
+///
+/// Generation 1 of the enforced set, exactly as [`enforced_crl_set`] produces
+/// it, so `0` stays reserved for "never published".
+pub fn inbound_admission_artifact(crls: CrlList) -> SharedInboundAdmissionArtifact {
+    Arc::new(InboundAdmissionArtifact {
+        crls: enforced_crl_set(crls),
+        in_force: ArcSwapOption::empty(),
+    })
+}
+
+impl InboundAdmissionArtifact {
+    /// The enforced CRL slot. The fence's single publisher writes it; the
+    /// handshake verifier's fallback compile reads it.
+    pub fn crls(&self) -> &SharedEnforcedCrlSet {
+        &self.crls
+    }
+
+    /// The anchors in force, or `None` while nothing is.
+    pub(crate) fn in_force(&self) -> Option<Arc<AdmittedPeerTrustAnchors>> {
+        self.in_force.load_full()
+    }
+
+    /// Publish the anchors one accepted publication put in force, or clear the
+    /// cell when a rebind to a different trust slot leaves nothing in force.
+    ///
+    /// `HboneAdmissionFence` is the only caller, and only under its single
+    /// publication lock: this cell and the fence's in-force revision name the
+    /// same generation. The fence stores HERE FIRST, so the brief overlap in
+    /// which the two surfaces are one generation apart can only make the
+    /// handshake stricter than the fence, never looser.
+    pub(crate) fn put_in_force(&self, anchors: Option<Arc<AdmittedPeerTrustAnchors>>) {
+        self.in_force.store(anchors);
+    }
+}
+
 /// Build a [`SharedBundleSlot`] holding `bundle`.
 ///
 /// One constructor so every producer of an inbound verifier slot builds the
@@ -111,8 +177,11 @@ pub fn build_spiffe_inbound_config(
         .with_safe_default_protocol_versions()
         .map_err(|e| SpiffeTlsError::Rustls(e.to_string()))?;
 
-    let verifier =
-        SpiffeClientCertVerifier::new(bundle_slot.clone(), peer_required, enforced_crl_set(crls));
+    let verifier = SpiffeClientCertVerifier::new(
+        bundle_slot.clone(),
+        peer_required,
+        inbound_admission_artifact(crls),
+    );
     let server_resolver = SpiffeServerCertResolver::new(bundle_slot);
 
     let builder: rustls::ConfigBuilder<ServerConfig, WantsServerCert> =
@@ -146,39 +215,44 @@ pub fn build_spiffe_inbound_config(
 /// operator-CA path. An empty `crls` leaves revocation checking off, preserving the
 /// pre-CRL behavior exactly.
 ///
-/// This form PINS the list for the verifier's lifetime. The mesh inbound
-/// listener uses [`build_spiffe_client_cert_verifier_with_enforced_crls`]
-/// instead so an operator's CRL rotation reaches the next handshake (issue
+/// This form PINS the list for the verifier's lifetime and binds no admission
+/// artifact, so the verifier always compiles its own anchors. The mesh inbound
+/// listener uses [`build_spiffe_client_cert_verifier_for_inbound_admission`]
+/// instead, so an operator's CRL rotation reaches the next handshake and so the
+/// handshake and the HBONE admission fence decide from ONE compiled set (issue
 /// #5574); this one remains for callers whose CRL set genuinely cannot change.
 pub fn build_spiffe_client_cert_verifier(
     bundle_slot: SharedBundleSlot,
     peer_required: bool,
     crls: CrlList,
 ) -> Arc<dyn rustls::server::danger::ClientCertVerifier> {
-    build_spiffe_client_cert_verifier_with_enforced_crls(
+    build_spiffe_client_cert_verifier_for_inbound_admission(
         bundle_slot,
         peer_required,
-        enforced_crl_set(crls),
+        inbound_admission_artifact(crls),
     )
 }
 
-/// [`build_spiffe_client_cert_verifier`] against a LIVE enforced CRL set.
+/// [`build_spiffe_client_cert_verifier`] against the shared inbound admission
+/// artifact (issue #5574).
 ///
-/// The verifier reads `crls` on every handshake and rebuilds its cached
-/// per-trust-domain chain verifiers whenever the generation moves, so a
-/// republished revocation list takes effect without rebinding the listener or
-/// rebuilding its `ServerConfig`. This is the set the HBONE admission fence
-/// re-applies to ALREADY-ADMITTED peers, so a peer revoked mid-session is both
-/// cut from its live tunnel and refused on its next CONNECT (issue #5574).
-pub fn build_spiffe_client_cert_verifier_with_enforced_crls(
+/// Two things follow from the artifact rather than from a pinned list. The
+/// enforced records are read on every handshake, so a republished revocation
+/// list takes effect without rebinding the listener or rebuilding its
+/// `ServerConfig`. And once the HBONE admission fence has put a compiled
+/// trust-and-CRL set IN FORCE, THAT set is what this verifier verifies
+/// against — the same artifact the fence re-applies to already-admitted peers,
+/// so a peer revoked mid-session is cut from its live tunnel, refused on its
+/// next CONNECT, and refused on its next handshake, all from one decision.
+pub fn build_spiffe_client_cert_verifier_for_inbound_admission(
     bundle_slot: SharedBundleSlot,
     peer_required: bool,
-    crls: SharedEnforcedCrlSet,
+    admission: SharedInboundAdmissionArtifact,
 ) -> Arc<dyn rustls::server::danger::ClientCertVerifier> {
     Arc::new(SpiffeClientCertVerifier::new(
         bundle_slot,
         peer_required,
-        crls,
+        admission,
     ))
 }
 
@@ -326,22 +400,29 @@ impl rustls::client::ResolvesClientCert for SpiffeClientCertResolver {
 struct SpiffeClientCertVerifier {
     slot: SharedBundleSlot,
     peer_required: bool,
-    /// CRLs applied to inbound mesh peers, read LIVE from the shared enforced
-    /// slot on every handshake (issue #5574) exactly as `slot` is. Empty means
-    /// revocation checking is skipped, matching the operator-CA path; a
-    /// rotation republished into the slot rebuilds the cached per-domain
-    /// verifiers on the next handshake without a listener restart.
-    crls: SharedEnforcedCrlSet,
+    /// The ONE accepted inbound admission artifact (issue #5574): the enforced
+    /// CRL slot, read LIVE on every handshake exactly as `slot` is, and the
+    /// anchors the HBONE admission fence has compiled and put IN FORCE. When
+    /// anchors are in force they ARE what this verifier verifies against;
+    /// `peer_verifier_cache` below is only the startup fallback for a listener
+    /// whose fence has never published.
+    admission: SharedInboundAdmissionArtifact,
     schemes: Vec<rustls::SignatureScheme>,
+    /// The verifier's OWN compile of the SVID slot, with last-known-good
+    /// retention. Used only while [`Self::admission`] has nothing in force.
     peer_verifier_cache: ArcSwap<Option<SpiffePeerVerifierCache>>,
 }
 
 impl SpiffeClientCertVerifier {
-    fn new(slot: SharedBundleSlot, peer_required: bool, crls: SharedEnforcedCrlSet) -> Self {
+    fn new(
+        slot: SharedBundleSlot,
+        peer_required: bool,
+        admission: SharedInboundAdmissionArtifact,
+    ) -> Self {
         Self {
             slot,
             peer_required,
-            crls,
+            admission,
             schemes: crate::fips::base_crypto_provider()
                 .signature_verification_algorithms
                 .supported_schemes(),
@@ -371,11 +452,27 @@ impl rustls::server::danger::ClientCertVerifier for SpiffeClientCertVerifier {
         snapshot.as_ref().as_ref().ok_or_else(|| {
             rustls::Error::General("SPIFFE inbound verifier: no SVID bundle yet".into())
         })?;
+        // ONE accepted artifact, never two opinions (issue #5574 re-review).
+        // When the admission fence has put a compiled trust-and-CRL set in
+        // force, that set decides this handshake: it is by construction the set
+        // the fence judges live tunnels and arriving CONNECTs against, so the
+        // three surfaces cannot drift. The fallback below exists only for a
+        // listener whose fence has never published — and must never run as a
+        // second opinion once something IS in force, because the fallback keeps
+        // its own last-known-good set when a candidate trust source fails to
+        // build, and would then go on enforcing the records that set was built
+        // with while the fence had already recompiled its anchors with newer
+        // ones.
+        if let Some(anchors) = self.admission.in_force() {
+            return verify_peer_against_in_force_anchors(&anchors, end_entity, intermediates)
+                .map(|_| rustls::server::danger::ClientCertVerified::assertion())
+                .map_err(|e| rustls::Error::General(format!("SPIFFE inbound verify: {e}")));
+        }
         // One load per handshake, exactly like the SVID slot above: the
         // enforced CRL set is republished by the operator's reload path, and a
         // handshake must police the generation that is live now rather than the
         // one this verifier was constructed with (issue #5574).
-        let enforced_crls = self.crls.load();
+        let enforced_crls = self.admission.crls().load();
         verify_peer_against_cached_snapshot(
             &self.peer_verifier_cache,
             snapshot.clone(),
@@ -951,6 +1048,19 @@ impl AdmittedPeerTrustAnchors {
         })
     }
 
+    /// The compiled chain verifier for `trust_domain`, or `None` when the set
+    /// in force declares no such domain.
+    ///
+    /// Membership and chain verification are the same lookup here, and that is
+    /// exact rather than a shortcut: [`Self::compile`] is atomic, so a declared
+    /// domain that produced no usable verifier failed the whole publication
+    /// and nothing is in force for it at all. A domain missing from this map is
+    /// therefore a trust-domain membership failure, which is what the
+    /// handshake verifier's own two-step check reports too.
+    pub(crate) fn verifier_for(&self, trust_domain: &TrustDomain) -> Option<&PeerChainVerifier> {
+        self.by_trust_domain.get(trust_domain)
+    }
+
     /// Re-check one retained peer chain against the published anchors for
     /// `trust_domain`. Takes the leaf and its intermediates separately, exactly
     /// as the handshake verifier does, so the retained DER is borrowed rather
@@ -1006,6 +1116,38 @@ fn admitted_peer_chain_failure_verdict(error: &rustls::Error) -> AdmittedPeerTru
         }
         _ => AdmittedPeerTrustVerdict::Withdrawn,
     }
+}
+
+/// Verify one inbound peer chain against the anchors currently IN FORCE.
+///
+/// The handshake half of the single accepted artifact (issue #5574 re-review).
+/// It asks exactly the question [`AdmittedPeerTrustAnchors::recheck`] asks for
+/// an already-admitted peer, against the same compiled verifiers, so the
+/// handshake, the CONNECT gate, and the sweep cannot reach three different
+/// answers about one chain.
+///
+/// Inbound mesh verification is any-federated — fine-grained source checks are
+/// `AuthorizationPolicy`'s job — so there is no trust-domain scope to apply and
+/// no peer pin to match, exactly as the cached-snapshot path passes `None` for
+/// both.
+fn verify_peer_against_in_force_anchors(
+    anchors: &AdmittedPeerTrustAnchors,
+    end_entity: &CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>],
+) -> Result<SpiffeId, String> {
+    let peer_id = extract_and_check_peer_spiffe_id(end_entity, None)?;
+    let Some(verifier) = anchors.verifier_for(peer_id.trust_domain()) else {
+        return Err(format!(
+            "no trust bundle for peer's trust domain '{}'",
+            peer_id.trust_domain()
+        ));
+    };
+    verify_peer_chain(verifier.as_ref(), end_entity, intermediates)?;
+    debug!(
+        peer_id = %peer_id,
+        "SPIFFE peer verified against the inbound admission anchors in force"
+    );
+    Ok(peer_id)
 }
 
 fn extract_and_check_peer_spiffe_id(
@@ -1613,8 +1755,11 @@ mod tests {
             leaf_a.clone(),
         )));
         let slot = Arc::new(ArcSwap::new(initial.clone()));
-        let verifier =
-            SpiffeClientCertVerifier::new(slot.clone(), true, enforced_crl_set(empty_crls()));
+        let verifier = SpiffeClientCertVerifier::new(
+            slot.clone(),
+            true,
+            inbound_admission_artifact(empty_crls()),
+        );
 
         rustls::server::danger::ClientCertVerifier::verify_client_cert(
             &verifier,

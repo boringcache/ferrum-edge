@@ -391,6 +391,29 @@ pub(super) fn hbone_server_config(certs: &HboneMtlsCerts) -> Arc<rustls::ServerC
     Arc::new(cfg)
 }
 
+/// [`hbone_server_config`] with a caller-supplied client-certificate verifier.
+///
+/// The plain form above builds a bare WebPKI verifier, which is enough to prove
+/// a CONNECT gate but says nothing about the verifier production actually
+/// installs. A revocation test needs the real one — the SPIFFE peer verifier
+/// bound to the shared inbound admission artifact — so that a rotation can be
+/// observed at the TLS handshake and not only through the fence (issue #5574).
+pub(super) fn hbone_server_config_with_client_verifier(
+    certs: &HboneMtlsCerts,
+    verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+) -> Arc<rustls::ServerConfig> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut cfg = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(
+            vec![certs.server_cert_der.clone()],
+            certs.server_key_der.clone_key(),
+        )
+        .expect("server config");
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    Arc::new(cfg)
+}
+
 /// Client-side `ClientConfig` presenting the SPIFFE client cert. ALPN `h2`.
 pub(super) fn hbone_client_config(certs: &HboneMtlsCerts) -> Arc<rustls::ClientConfig> {
     let _ = rustls::crypto::ring::default_provider().install_default();

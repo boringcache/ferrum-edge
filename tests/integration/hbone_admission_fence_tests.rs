@@ -103,8 +103,9 @@ use ferrum_edge::tls::{self, SharedBundleSlot};
 use super::mesh_hbone_tests::{
     HBONE_CLIENT_LEAF_SERIAL, HboneMtlsCerts, connect_hbone_h2_mtls,
     create_egress_udp_gateway_state, create_mesh_proxy, egress_udp_mesh_config, frame_datagram,
-    generate_hbone_mtls_certs, hbone_client_config, hbone_server_config, read_framed_datagram,
-    start_external_udp_echo, udp_connect_request,
+    generate_hbone_mtls_certs, hbone_client_config, hbone_server_config,
+    hbone_server_config_with_client_verifier, read_framed_datagram, start_external_udp_echo,
+    udp_connect_request,
 };
 use super::mesh_test_support::{
     DEFAULT_NAMESPACE, default_mesh_runtime, gateway_config_with_mesh, mesh_config_with,
@@ -1418,6 +1419,14 @@ const PEER_LEAF_SERIAL: u64 = 0x5574;
 /// A serial no minted leaf carries. A CRL listing only this must revoke nothing.
 const UNRELATED_LEAF_SERIAL: u64 = 0x5575;
 
+/// The issuing intermediate's serial, so a root-signed CRL can revoke the
+/// ISSUER rather than the leaf and prove the policy really is full-chain.
+const INTERMEDIATE_SERIAL: u64 = 0x5576;
+
+/// The leaf under that intermediate. Deliberately never named by any CRL in
+/// the full-chain test: revoking the issuer has to be enough.
+const INTERMEDIATE_LEAF_SERIAL: u64 = 0x5577;
+
 /// A self-signed CA plus one SPIFFE leaf it issued, both DER.
 ///
 /// Minted here rather than borrowed from `mesh_hbone_tests` so these tests own
@@ -1492,6 +1501,21 @@ fn signed_crl_in_window(
     this_update: time::OffsetDateTime,
     next_update: time::OffsetDateTime,
 ) -> CertificateRevocationListDer<'static> {
+    signed_crl_by_issuer(&chain.issuer, serials, this_update, next_update)
+}
+
+/// [`signed_crl_in_window`] against an arbitrary issuer.
+///
+/// Separate because a full-chain revocation test has to sign with the ROOT — a
+/// CRL revoking an issuing intermediate is authoritative only when the
+/// authority that ISSUED that intermediate signed it, and webpki ignores one
+/// signed by anything else.
+fn signed_crl_by_issuer(
+    issuer: &rcgen::Issuer<'static, rcgen::KeyPair>,
+    serials: &[u64],
+    this_update: time::OffsetDateTime,
+    next_update: time::OffsetDateTime,
+) -> CertificateRevocationListDer<'static> {
     let revoked_certs = serials
         .iter()
         .map(|serial| rcgen::RevokedCertParams {
@@ -1509,13 +1533,7 @@ fn signed_crl_in_window(
         revoked_certs,
         key_identifier_method: rcgen::KeyIdMethod::Sha256,
     };
-    CertificateRevocationListDer::from(
-        params
-            .signed_by(&chain.issuer)
-            .expect("sign CRL")
-            .der()
-            .to_vec(),
-    )
+    CertificateRevocationListDer::from(params.signed_by(issuer).expect("sign CRL").der().to_vec())
 }
 
 /// Publish `records` as the enforced mesh inbound CRL set, through the one
@@ -1536,10 +1554,10 @@ fn inbound_verifier(
     state: &ProxyState,
     slot: &SharedBundleSlot,
 ) -> Arc<dyn rustls::server::danger::ClientCertVerifier> {
-    tls::build_spiffe_client_cert_verifier_with_enforced_crls(
+    tls::build_spiffe_client_cert_verifier_for_inbound_admission(
         slot.clone(),
         true,
-        Arc::clone(&state.mesh_inbound_crls),
+        Arc::clone(&state.mesh_inbound_admission),
     )
 }
 
@@ -2515,20 +2533,64 @@ fn every_trust_publisher_stores_before_it_requests_a_sweep() {
     // (issue #5574), so their publisher owes the same two guarantees: the
     // records reach the verifier's slot before the sweep that judges live
     // tunnels against them, and a candidate that takes no force says so.
+    //
+    // That publisher is split in two — the outer function does the lock-free
+    // pre-checks and the sweep, the locked half decides what goes in force — so
+    // the ordering is pinned ACROSS the split: the locked half stores and the
+    // caller sweeps only once it has returned, which is also what keeps the
+    // sweep from being requested while the publication lock is held.
     let publish_crls = body(
         fence,
         "pub fn publish_inbound_admission_crls(",
-        "\n    /// One sampled operator line for an enforced-CRL candidate",
+        "\n    /// The locked half of",
     );
     assert_store_then_sweep(
         publish_crls,
-        "publish_enforced_crl_set(slot, crls)",
+        "self.publish_usable_inbound_admission_crls(crls)",
         "self.request_sweep()",
         "publish_inbound_admission_crls",
     );
     assert!(
         publish_crls.contains("self.warn_crls_not_in_force("),
         "an unusable CRL candidate must not take no force silently"
+    );
+    let publish_crls_locked = body(
+        fence,
+        "fn publish_usable_inbound_admission_crls(",
+        "\n    /// The enforced CRL slot inside the shared inbound admission artifact.",
+    );
+    assert!(
+        publish_crls_locked.contains("publish_enforced_crl_set(slot, crls)"),
+        "the locked half is what stores the records into the verifier's slot"
+    );
+    assert!(
+        !publish_crls_locked.contains("self.request_sweep()"),
+        "and it must never sweep while it holds the publication lock"
+    );
+
+    // All three publishers take the ONE fence-owned lock, and the install is
+    // inside it: production arms the backend CRL watcher before mesh installs
+    // the inbound slot, so an installer that overtakes a publisher's
+    // no-trust-installed check is a startup interleaving rather than a misuse.
+    for publisher in [
+        "pub fn install_inbound_admission_trust(&self, slot: &crate::tls::SharedBundleSlot) {",
+        "pub fn publish_inbound_admission_trust(",
+        "fn publish_usable_inbound_admission_crls(",
+    ] {
+        // Delimited by the next doc comment rather than a byte budget: the
+        // source is full of multi-byte punctuation and a fixed-width slice can
+        // land mid-character.
+        let taken = body(fence, publisher, "\n    /// ");
+        assert!(
+            taken.contains("self.publication_lock()"),
+            "{publisher} must serialize on the fence's own publication lock"
+        );
+    }
+    assert_eq!(
+        fence.matches("publish_lock: std::sync::Mutex<()>").count(),
+        1,
+        "exactly ONE lock, owned by the fence itself — a per-installed-trust lock cannot \
+         cover the install that creates it"
     );
 
     // And `ProxyState` must route through it rather than storing the slot.
@@ -2626,10 +2688,12 @@ fn the_inbound_spiffe_verifier_and_the_fence_share_one_trust_slot() {
     // That same binding is what the inbound TLS state hands every verifier build.
     const VERIFIER_SLOT: &str = "spiffe_bundle_slot: mesh_inbound_spiffe_slot";
     const VERIFIER_CALL: &str = "mesh_inbound_spiffe_verifier(spiffe_bundle_slot";
-    // The LIVE-CRL builder, not the snapshot one: the mesh inbound listener has
-    // to read the enforced set on every handshake (issue #5574), and the
-    // snapshot form pins a list for the verifier's lifetime.
-    const VERIFIER_BUILD: &str = "tls::build_spiffe_client_cert_verifier_with_enforced_crls(";
+    // The shared-artifact builder, not the snapshot one: the mesh inbound
+    // listener has to read the enforced set on every handshake AND verify
+    // against the anchors the fence put in force (issue #5574), while the
+    // snapshot form pins a list for the verifier's lifetime and compiles its
+    // own anchors.
+    const VERIFIER_BUILD: &str = "tls::build_spiffe_client_cert_verifier_for_inbound_admission(";
     const PINNED_CRL_BUILD: &str = "tls::build_spiffe_client_cert_verifier(";
     // The CA-backend slot origin, and the carry-through that keeps it the SAME
     // `Arc` rather than a second slot the fence never saw.
@@ -2671,8 +2735,9 @@ fn the_inbound_spiffe_verifier_and_the_fence_share_one_trust_slot() {
     assert_eq!(
         mesh.matches(PINNED_CRL_BUILD).count(),
         0,
-        "the mesh inbound verifier must read the LIVE enforced CRL slot; the snapshot form \
-         pins a revocation list for the verifier's lifetime, which a rotation can never reach"
+        "the mesh inbound verifier must read the SHARED admission artifact; the snapshot form \
+         pins a revocation list for the verifier's lifetime and compiles its own anchors, so \
+         neither a rotation nor the fence's accepted set can ever reach it"
     );
 
     // The CA-backend slot reaches that binding as the SAME `Arc`: the builder
@@ -2904,11 +2969,20 @@ async fn an_unusable_crl_never_takes_force() {
     ));
     let compilations_before = fence.trust_anchor_builds();
 
-    // Not a CRL at all, and a CRL whose own `nextUpdate` has already passed.
-    // Both are refused at admission by exactly the rule
+    // Every class `crl_policy::classify_crl_window` refuses, each reached
+    // through the fence's own `usable_crl_records`: not a CRL at all, a
+    // `thisUpdate` in the future, a record declaring no `nextUpdate`, and one
+    // whose `nextUpdate` has already passed. The same rule
     // `crl_policy::validate_crl_windows` applies everywhere else.
     let now = time::OffsetDateTime::now_utc();
     let garbage = CertificateRevocationListDer::from(vec![0x30, 0x03, 0x02, 0x01, 0x00]);
+    let not_yet_valid = signed_crl_in_window(
+        &peer,
+        &[PEER_LEAF_SERIAL],
+        now + time::Duration::days(1),
+        now + time::Duration::days(30),
+    );
+    let no_next_update = crl_without_next_update(&signed_crl(&peer, &[PEER_LEAF_SERIAL]));
     let expired = signed_crl_in_window(
         &peer,
         &[PEER_LEAF_SERIAL],
@@ -2916,10 +2990,16 @@ async fn an_unusable_crl_never_takes_force() {
         now - time::Duration::days(1),
     );
     let usable = signed_crl(&peer, &[UNRELATED_LEAF_SERIAL]);
-    // The third candidate is a partially invalid multi-record source: the
-    // usable subset must not be published either, or an issuer the operator
-    // listed would silently stop being policed.
-    let candidates = vec![vec![garbage], vec![expired.clone()], vec![usable, expired]];
+    // The last candidate is a partially invalid multi-record source: the usable
+    // subset must not be published either, or an issuer the operator listed
+    // would silently stop being policed.
+    let candidates = vec![
+        vec![garbage],
+        vec![not_yet_valid],
+        vec![no_next_update],
+        vec![expired.clone()],
+        vec![usable, expired],
+    ];
 
     for candidate in candidates {
         assert!(
@@ -2927,7 +3007,7 @@ async fn an_unusable_crl_never_takes_force() {
             "an unusable candidate publishes nothing"
         );
         assert_eq!(
-            state.mesh_inbound_crls.load().crls().len(),
+            state.mesh_inbound_admission.crls().load().crls().len(),
             0,
             "the verifier keeps enforcing the records already published"
         );
@@ -3001,19 +3081,15 @@ async fn a_published_crl_refuses_the_peers_next_handshake() {
 /// matched. So expiry wins over anchoring, and anchoring wins over revocation.
 #[test]
 fn the_revocation_reason_order_is_pinned() {
-    let labels: Vec<&'static str> = [
-        HboneRevocationReason::ProxyWithdrawn,
-        HboneRevocationReason::PeerExpired,
-        HboneRevocationReason::PeerTrust,
-        HboneRevocationReason::PeerRevoked,
-        HboneRevocationReason::AuthorizationDenied,
-        HboneRevocationReason::PeerAuthTransport,
-        HboneRevocationReason::RelayDestination,
-        HboneRevocationReason::ReevaluationFailed,
-    ]
-    .iter()
-    .map(|reason| reason.as_str())
-    .collect();
+    // Read out of `ALL` rather than a handwritten copy of it. A copy silently
+    // stops describing the enum the moment a reason is inserted — it would keep
+    // asserting the order of the variants someone remembered — whereas `ALL` is
+    // the array the per-reason counters are indexed into, so pinning THAT pins
+    // what the metric actually emits.
+    let labels: Vec<&'static str> = HboneRevocationReason::ALL
+        .iter()
+        .map(|reason| reason.as_str())
+        .collect();
 
     assert_eq!(
         labels,
@@ -3030,4 +3106,827 @@ fn the_revocation_reason_order_is_pinned() {
         "the closed `reason` set and its gate order are pinned by docs/mesh.md, \
          docs/prometheus_metrics.md, and docs/prometheus_metric_contract.json"
     );
+
+    // `index()` is the counter slot, so it must agree with `ALL`'s order or a
+    // revocation would be metered under a neighbouring reason's label.
+    for (position, reason) in HboneRevocationReason::ALL.iter().enumerate() {
+        assert_eq!(
+            reason.index(),
+            position,
+            "{} must index its own slot in ALL",
+            reason.as_str()
+        );
+    }
+
+    // And the same array is what `revocation_counts` reads, so a new reason
+    // cannot be added without the fixture growing with it.
+    assert_eq!(
+        HboneRevocationReason::ALL.len(),
+        revocation_counts(&credential_state(9646)).len(),
+        "the counter fixture must cover every declared reason"
+    );
+}
+
+// ── Fixtures for the re-review's coverage gaps (issue #5574) ──────────────
+
+/// A three-level chain: a root CA, an issuing intermediate, and a SPIFFE leaf.
+///
+/// The shared CRL policy is FULL-CHAIN, so revoking the intermediate has to
+/// stop every leaf it signed even though no record names a leaf serial. The
+/// two-level [`PeerChain`] above cannot express that case at all.
+struct IssuedChain {
+    root_der: Vec<u8>,
+    intermediate_der: Vec<u8>,
+    leaf_der: Vec<u8>,
+    /// The ROOT's issuer, retained so a CRL revoking the intermediate is signed
+    /// by the authority that issued it.
+    root_issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
+}
+
+fn mint_peer_chain_via_intermediate(spiffe: &str) -> IssuedChain {
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+        KeyPair, KeyUsagePurpose, SanType, SerialNumber, string::Ia5String,
+    };
+
+    let root_key = KeyPair::generate().expect("root key");
+    let mut root_params = CertificateParams::new(Vec::<String>::new()).expect("root params");
+    root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    root_params
+        .distinguished_name
+        .push(DnType::CommonName, format!("{spiffe} root CA"));
+    root_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let root_cert = root_params.self_signed(&root_key).expect("self-signed root");
+    let root_der = root_cert.der().to_vec();
+    // `Issuer::new` consumes the params + key, so capture the DER first.
+    let root_issuer = Issuer::new(root_params, root_key);
+
+    let intermediate_key = KeyPair::generate().expect("intermediate key");
+    let mut intermediate_params =
+        CertificateParams::new(Vec::<String>::new()).expect("intermediate params");
+    intermediate_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    intermediate_params.serial_number = Some(SerialNumber::from(INTERMEDIATE_SERIAL));
+    intermediate_params
+        .distinguished_name
+        .push(DnType::CommonName, format!("{spiffe} issuing CA"));
+    intermediate_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let intermediate_cert = intermediate_params
+        .signed_by(&intermediate_key, &root_issuer)
+        .expect("intermediate");
+    let intermediate_der = intermediate_cert.der().to_vec();
+    let intermediate_issuer = Issuer::new(intermediate_params, intermediate_key);
+
+    let leaf_key = KeyPair::generate().expect("leaf key");
+    let mut leaf_params = CertificateParams::new(Vec::<String>::new()).expect("leaf params");
+    leaf_params.serial_number = Some(SerialNumber::from(INTERMEDIATE_LEAF_SERIAL));
+    leaf_params.subject_alt_names.push(SanType::URI(
+        Ia5String::try_from(spiffe.to_string()).expect("spiffe uri san"),
+    ));
+    leaf_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let leaf = leaf_params
+        .signed_by(&leaf_key, &intermediate_issuer)
+        .expect("leaf");
+
+    IssuedChain {
+        root_der,
+        intermediate_der,
+        leaf_der: leaf.der().to_vec(),
+        root_issuer,
+    }
+}
+
+/// [`handshake_admits`] for a chain that presents an intermediate, so the
+/// verifier is asked the same full-chain question the fence's re-check is.
+fn handshake_admits_chain(
+    verifier: &Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    chain: &IssuedChain,
+) -> bool {
+    use rustls::server::danger::ClientCertVerifier;
+
+    let leaf = rustls::pki_types::CertificateDer::from(chain.leaf_der.clone());
+    let intermediates = [rustls::pki_types::CertificateDer::from(
+        chain.intermediate_der.clone(),
+    )];
+    let now = rustls::pki_types::UnixTime::now();
+    ClientCertVerifier::verify_client_cert(verifier.as_ref(), &leaf, &intermediates, now).is_ok()
+}
+
+/// [`peer_credential`] retaining the intermediate, exactly as the accept path
+/// retains `ctx.tls_client_cert_chain_der`.
+fn intermediate_peer_credential(
+    chain: &IssuedChain,
+    admitted_trust_revision: u64,
+) -> HbonePeerCredential {
+    HbonePeerCredential {
+        spiffe_id: SpiffeId::new(CLIENT_SPIFFE).expect("client spiffe id"),
+        leaf_der: Arc::new(chain.leaf_der.clone()),
+        intermediates_der: Some(vec![chain.intermediate_der.clone()]),
+        leaf_expiry: live_expiry(),
+        anchored_at_admission: true,
+        admitted_trust_revision,
+    }
+}
+
+/// Whether a peer can still establish a usable mTLS session with the gateway.
+///
+/// Not just "did `connect` return": under TLS 1.3 the CLIENT finishes its
+/// handshake before the server has looked at the client certificate, so a
+/// refusal arrives as an alert on the first exchange. The question an operator
+/// actually asks is whether the peer got a working session, so this drives a
+/// real HTTP/2 handshake and one CONNECT and reports whether a response came
+/// back at all. The response STATUS is deliberately not inspected — a `403`
+/// from a later gate still means the mTLS session was established.
+async fn mtls_session_is_established(
+    gateway_addr: SocketAddr,
+    client_config: Arc<rustls::ClientConfig>,
+) -> bool {
+    let Ok(tcp) = tokio::net::TcpStream::connect(gateway_addr).await else {
+        return false;
+    };
+    let _ = tcp.set_nodelay(true);
+    let connector = tokio_rustls::TlsConnector::from(client_config);
+    let server_name = rustls::pki_types::ServerName::IpAddress(
+        IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)).into(),
+    );
+    let Ok(Ok(tls)) = tokio::time::timeout(DEADLINE, connector.connect(server_name, tcp)).await
+    else {
+        return false;
+    };
+    let Ok(Ok((mut sender, conn))) =
+        tokio::time::timeout(DEADLINE, h2::client::handshake(tls)).await
+    else {
+        return false;
+    };
+    let conn_task = tokio::spawn(conn);
+    let request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(CONNECT_AUTHORITY)
+        .body(())
+        .expect("connect request");
+    let established = match sender.send_request(request, false) {
+        Ok((response_fut, _request_body)) => tokio::time::timeout(DEADLINE, response_fut)
+            .await
+            .is_ok_and(|response| response.is_ok()),
+        Err(_) => false,
+    };
+    conn_task.abort();
+    established
+}
+
+// ── DER surgery: the one CRL shape rcgen cannot emit ──────────────────────
+
+fn der_len(len: usize) -> Vec<u8> {
+    if len < 0x80 {
+        vec![len as u8]
+    } else if len <= 0xff {
+        vec![0x81, len as u8]
+    } else if len <= 0xffff {
+        vec![0x82, (len >> 8) as u8, (len & 0xff) as u8]
+    } else {
+        panic!("test CRL is unexpectedly large");
+    }
+}
+
+/// Split one DER TLV off the front of `input`, returning `(tag, content, rest)`.
+fn read_tlv(input: &[u8]) -> (u8, &[u8], &[u8]) {
+    assert!(input.len() >= 2, "truncated DER");
+    let tag = input[0];
+    let first = input[1] as usize;
+    let (len, header) = if first < 0x80 {
+        (first, 2)
+    } else {
+        let count = first & 0x7f;
+        assert!(count > 0 && count <= 4, "unsupported DER length form");
+        let mut len = 0usize;
+        for byte in &input[2..2 + count] {
+            len = (len << 8) | *byte as usize;
+        }
+        (len, 2 + count)
+    };
+    assert!(input.len() >= header + len, "truncated DER value");
+    (tag, &input[header..header + len], &input[header + len..])
+}
+
+fn der_wrap(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    out.extend(der_len(content.len()));
+    out.extend_from_slice(content);
+    out
+}
+
+/// Rebuild `crl` with its `nextUpdate` field DROPPED.
+///
+/// The one shape rcgen cannot emit, and the shape RFC 5280 §5.1.2.5 forbids a
+/// conforming issuer from emitting — which is why the fence has to refuse it
+/// rather than let a verifier build fail later with an opaque DER error. Only
+/// the second `Time` of `tbsCertList` is removed; every other field and the
+/// signature are carried through byte for byte. The signature no longer matches
+/// the rewritten body, which is exactly right here: the fence classifies the
+/// temporal window before any signer is known.
+fn crl_without_next_update(
+    crl: &CertificateRevocationListDer<'static>,
+) -> CertificateRevocationListDer<'static> {
+    let (outer_tag, outer, outer_rest) = read_tlv(crl.as_ref());
+    assert_eq!(outer_tag, 0x30, "a CRL is a SEQUENCE");
+    assert!(outer_rest.is_empty(), "trailing bytes after the CRL");
+    let (tbs_tag, tbs, after_tbs) = read_tlv(outer);
+    assert_eq!(tbs_tag, 0x30, "tbsCertList is a SEQUENCE");
+
+    let mut rebuilt: Vec<u8> = Vec::new();
+    let mut rest = tbs;
+    let mut times_seen = 0;
+    while !rest.is_empty() {
+        let (tag, _content, next) = read_tlv(rest);
+        let element = &rest[..rest.len() - next.len()];
+        if tag == 0x17 || tag == 0x18 {
+            times_seen += 1;
+            if times_seen != 2 {
+                rebuilt.extend_from_slice(element);
+            }
+        } else {
+            rebuilt.extend_from_slice(element);
+        }
+        rest = next;
+    }
+    assert_eq!(
+        times_seen, 2,
+        "an rcgen CRL carries exactly thisUpdate and nextUpdate at the top level"
+    );
+
+    let mut outer_content = der_wrap(0x30, &rebuilt);
+    outer_content.extend_from_slice(after_tbs);
+    CertificateRevocationListDer::from(der_wrap(0x30, &outer_content))
+}
+
+// ── One accepted artifact, and one publication order (issue #5574 re-review) ──
+
+/// The divergence the independent review found, in the direction that lets a
+/// REVOKED peer keep handshaking.
+///
+/// A trust candidate the fence refuses to put in force is still STORED in the
+/// SVID slot — the same slot backs the inbound listener's server identity — so
+/// a handshake verifier that compiles its own anchors keeps failing to build
+/// from that candidate and keeps returning its own previous set. It therefore
+/// never adopts a CRL published afterwards, even though the fence has already
+/// compiled that CRL into the anchors it judges live tunnels and arriving
+/// CONNECTs with. The fence cut the tunnel and refused the CONNECT while the
+/// very next handshake re-admitted the revoked leaf.
+///
+/// ONE verifier for the whole test, warmed before anything is rejected: a cold
+/// verifier fails outright on a rejected candidate, so only a warmed one can
+/// show the stale retained set.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_trust_candidate_never_strands_the_handshake_on_stale_records() {
+    let gateway = mint_peer_chain(GATEWAY_SPIFFE);
+    let peer = mint_peer_chain(CLIENT_SPIFFE);
+    let state = credential_state(9660);
+
+    let slot = install_inbound_trust(
+        &state,
+        &gateway,
+        local_trust(PEER_TRUST_DOMAIN, vec![peer.ca_der.clone()]),
+    );
+    let verifier = inbound_verifier(&state, &slot);
+    assert!(
+        handshake_admits(&verifier, &peer),
+        "the peer must be admissible before anything is rejected or revoked"
+    );
+
+    // A federated trust domain declaring only JWT authorities: entirely valid
+    // configuration, and a candidate the inbound verifier compiles ATOMICALLY
+    // and therefore refuses as a whole.
+    let mut jwt_only = std::collections::HashMap::new();
+    jwt_only.insert(
+        TrustDomain::new(SLICE_TRUST_DOMAIN).expect("slice trust domain"),
+        trust_bundle(SLICE_TRUST_DOMAIN, Vec::new()),
+    );
+    let in_force = inbound_trust_revision(&state);
+    publish_inbound_trust(
+        &state,
+        &slot,
+        &gateway,
+        RuntimeTrustBundleSet {
+            local: trust_bundle(PEER_TRUST_DOMAIN, vec![peer.ca_der.clone()]),
+            federated: jwt_only,
+        },
+    );
+    assert_eq!(
+        inbound_trust_revision(&state),
+        in_force,
+        "a candidate the verifier would reject must take no force"
+    );
+    assert!(
+        handshake_admits(&verifier, &peer),
+        "and the peer is still admitted, exactly as the last-known-good posture promises"
+    );
+
+    // NOW the operator revokes that peer's leaf.
+    let revoking = signed_crl(&peer, &[PEER_LEAF_SERIAL]);
+    assert!(publish_crls(&state, vec![revoking]));
+    assert!(
+        !handshake_admits(&verifier, &peer),
+        "a CRL published while a trust candidate stands rejected must still reach the \
+         handshake; otherwise the fence revokes the tunnel and refuses the CONNECT while the \
+         peer's very next handshake re-admits the revoked leaf"
+    );
+
+    // ...and the mirror image: withdrawing the revocation must re-admit it, or
+    // a rescinded revocation never takes effect on the surface the peer retries
+    // against.
+    assert!(publish_crls(&state, Vec::new()));
+    assert!(
+        handshake_admits(&verifier, &peer),
+        "removing the records must reach the handshake too"
+    );
+    assert_eq!(
+        state.mesh_inbound_admission.crls().load().crls().len(),
+        0,
+        "an empty publication is a real publication, not a no-op"
+    );
+}
+
+/// Removing the enforced records restores admission on BOTH surfaces at once:
+/// the peer's next CONNECT is admitted again and no live tunnel is revoked for
+/// revocation. An empty list is the operator's "revocation rescinded", not an
+/// absence of publication.
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_the_enforced_records_readmits_the_peer() {
+    let gateway = mint_peer_chain(GATEWAY_SPIFFE);
+    let peer = mint_peer_chain(CLIENT_SPIFFE);
+    let state = credential_state(9661);
+
+    let slot = install_inbound_trust(
+        &state,
+        &gateway,
+        local_trust(PEER_TRUST_DOMAIN, vec![peer.ca_der.clone()]),
+    );
+    let verifier = inbound_verifier(&state, &slot);
+    let fence = &state.hbone_admission_fence;
+
+    let revoking = signed_crl(&peer, &[PEER_LEAF_SERIAL]);
+    assert!(publish_crls(&state, vec![revoking]));
+    assert!(!handshake_admits(&verifier, &peer));
+
+    let revision_while_revoked = inbound_trust_revision(&state);
+    assert!(
+        publish_crls(&state, Vec::new()),
+        "withdrawing every record is a publication in its own right"
+    );
+    assert_eq!(
+        inbound_trust_revision(&state),
+        revision_while_revoked + 1,
+        "the withdrawal advances the ONE in-force revision, so every live tunnel re-verifies"
+    );
+    assert!(
+        handshake_admits(&verifier, &peer),
+        "with no records enforced, revocation checking is off again"
+    );
+
+    // A tunnel admitted under the revoked generation is not revoked by the
+    // withdrawal: the sweep re-verifies and finds the peer admissible.
+    let tunnel = fence.admit(credential_snapshot(
+        fence.sweep_epoch(),
+        peer_credential(&peer, live_expiry(), true, revision_while_revoked),
+    ));
+    fence.request_sweep();
+    wait_for_settled_sweeps(&state).await;
+    assert_eq!(tunnel.revoked_reason(), None);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0]);
+}
+
+/// The shared CRL policy is FULL-CHAIN, so revoking the ISSUING INTERMEDIATE
+/// must stop every leaf it signed even though no record names a leaf serial. A
+/// two-level fixture cannot show that at all, and an operator revoking a
+/// compromised issuing CA is the case that matters most.
+#[tokio::test(flavor = "multi_thread")]
+async fn revoking_the_issuing_intermediate_revokes_the_tunnel_and_the_handshake() {
+    let gateway = mint_peer_chain(GATEWAY_SPIFFE);
+    let chain = mint_peer_chain_via_intermediate(CLIENT_SPIFFE);
+    let state = credential_state(9662);
+
+    let slot = install_inbound_trust(
+        &state,
+        &gateway,
+        local_trust(PEER_TRUST_DOMAIN, vec![chain.root_der.clone()]),
+    );
+    let verifier = inbound_verifier(&state, &slot);
+    assert!(
+        handshake_admits_chain(&verifier, &chain),
+        "the three-level chain must be admissible before anything revokes it"
+    );
+
+    let fence = &state.hbone_admission_fence;
+    let tunnel = fence.admit(credential_snapshot(
+        fence.sweep_epoch(),
+        intermediate_peer_credential(&chain, inbound_trust_revision(&state)),
+    ));
+
+    // Signed by the ROOT, which is the authority that issued the intermediate;
+    // a CRL from anything else is not authoritative and webpki ignores it.
+    let revoking = signed_crl_by_issuer(
+        &chain.root_issuer,
+        &[INTERMEDIATE_SERIAL],
+        time::OffsetDateTime::now_utc() - time::Duration::hours(1),
+        time::OffsetDateTime::now_utc() + time::Duration::days(30),
+    );
+    assert!(publish_crls(&state, vec![revoking]));
+
+    wait_for_revocation(&tunnel).await;
+    assert_eq!(
+        tunnel.revoked_reason(),
+        Some(HboneRevocationReason::PeerRevoked),
+        "a revoked issuing CA revokes the leaves it signed, and it is a revocation rather \
+         than a trust withdrawal: the chain still anchors in the root"
+    );
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 1, 0, 0, 0, 0]);
+    assert!(
+        !handshake_admits_chain(&verifier, &chain),
+        "and the same record refuses the peer's next handshake"
+    );
+}
+
+/// A CRL that ages out AFTER it took force is a fence failure, not a statement
+/// about the peer: the revocation question can no longer be answered, so the
+/// tunnel is cut as `reevaluation_failed` rather than left serving or filed
+/// under `peer_expired`. Bounded by the skip key, deliberately — it is observed
+/// on the next publication that moves the revision, not at the instant the
+/// record expires — so this test publishes a trust change to move it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crl_that_ages_out_after_taking_force_fails_closed_on_the_next_revision() {
+    let gateway = mint_peer_chain(GATEWAY_SPIFFE);
+    let peer = mint_peer_chain(CLIENT_SPIFFE);
+    let joining = mint_peer_chain(OTHER_SPIFFE);
+    let state = credential_state(9664);
+
+    let slot = install_inbound_trust(
+        &state,
+        &gateway,
+        local_trust(PEER_TRUST_DOMAIN, vec![peer.ca_der.clone()]),
+    );
+    let fence = &state.hbone_admission_fence;
+
+    // In window now, expired shortly. Naming an unrelated serial on purpose:
+    // the tunnel is cut because the list can no longer be evaluated, not
+    // because it revokes this peer.
+    let now = time::OffsetDateTime::now_utc();
+    let short_lived = signed_crl_in_window(
+        &peer,
+        &[UNRELATED_LEAF_SERIAL],
+        now - time::Duration::hours(1),
+        now + time::Duration::seconds(2),
+    );
+    assert!(
+        publish_crls(&state, vec![short_lived]),
+        "the record is usable at publication, so it takes force"
+    );
+    let tunnel = fence.admit(credential_snapshot(
+        fence.sweep_epoch(),
+        peer_credential(&peer, live_expiry(), true, inbound_trust_revision(&state)),
+    ));
+    wait_for_settled_sweeps(&state).await;
+    assert_eq!(tunnel.revoked_reason(), None);
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // A trust change that still anchors the peer. It recompiles with the SAME,
+    // now-expired records and moves the revision, which is what makes the
+    // tunnel re-verify.
+    publish_inbound_trust(
+        &state,
+        &slot,
+        &gateway,
+        local_trust(
+            PEER_TRUST_DOMAIN,
+            vec![peer.ca_der.clone(), joining.ca_der.clone()],
+        ),
+    );
+
+    wait_for_revocation(&tunnel).await;
+    assert_eq!(
+        tunnel.revoked_reason(),
+        Some(HboneRevocationReason::ReevaluationFailed),
+        "an in-force CRL past its nextUpdate makes the chain un-judgeable; the fence fails \
+         closed and must NOT file it as peer_expired, which describes the peer's own SVID"
+    );
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 1]);
+}
+
+/// The datagram relay shares the credential gate with the byte-stream relay, so
+/// a published CRL must cut a live `CONNECT-UDP` tunnel and refuse the peer's
+/// next datagram CONNECT on the same never-re-handshaked mTLS session.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crl_revoking_the_peer_cuts_a_live_datagram_tunnel_and_refuses_its_retry() {
+    let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
+    let gateway = mint_peer_chain(GATEWAY_SPIFFE);
+    let (external_addr, external_handle) = start_external_udp_echo().await;
+    let state = create_egress_udp_gateway_state(egress_udp_mesh_config(
+        "127.0.0.1",
+        external_addr.port(),
+        external_addr.port(),
+    ));
+    let _slot = install_inbound_trust(
+        &state,
+        &gateway,
+        local_trust(PEER_TRUST_DOMAIN, vec![certs.ca_der()]),
+    );
+    let (gateway_addr, shutdown_tx) =
+        start_inbound_gateway(state.clone(), hbone_server_config(&certs)).await;
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let authority = format!("127.0.0.1:{}", external_addr.port());
+    let (response_fut, mut request_body) = sender
+        .send_request(udp_connect_request(&authority), false)
+        .expect("send udp CONNECT");
+    let resp = tokio::time::timeout(DEADLINE, response_fut)
+        .await
+        .expect("udp CONNECT response within deadline")
+        .expect("udp CONNECT response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut response_body = resp.into_body();
+    request_body
+        .send_data(frame_datagram(b"ping"), false)
+        .expect("send framed datagram");
+    let echoed = tokio::time::timeout(DEADLINE, read_framed_datagram(&mut response_body))
+        .await
+        .expect("external udp reply");
+    assert_eq!(echoed, b"pong:ping".to_vec());
+    assert_eq!(state.hbone_admission_fence.live_tunnels(), 1);
+
+    let revoking = certs.signed_crl(&[HBONE_CLIENT_LEAF_SERIAL]);
+    assert!(publish_crls(&state, vec![revoking]));
+
+    assert_tunnel_closed(&mut response_body).await;
+    wait_for_no_live_tunnels(&state).await;
+    assert_eq!(
+        revocation_counts(&state),
+        [0, 0, 0, 1, 0, 0, 0, 0],
+        "the datagram relay honors the revocation exactly as the byte-stream relay does"
+    );
+
+    // The retry on the same pooled connection is refused at admission.
+    let (retry_fut, _retry_body) = sender
+        .send_request(udp_connect_request(&authority), false)
+        .expect("send retry udp CONNECT");
+    let retry = tokio::time::timeout(DEADLINE, retry_fut)
+        .await
+        .expect("retry response within deadline")
+        .expect("retry response");
+    assert_eq!(
+        retry.status(),
+        StatusCode::FORBIDDEN,
+        "a datagram CONNECT whose chain the enforced records revoke must be refused"
+    );
+    assert_eq!(state.hbone_admission_fence.connect_trust_refusals(), 1);
+    assert_eq!(state.hbone_admission_fence.live_tunnels(), 0);
+
+    let _ = shutdown_tx.send(true);
+    external_handle.abort();
+    conn_task.abort();
+}
+
+/// A rotation must reach a REAL TLS handshake on a live listener, not only a
+/// direct `verify_client_cert` call. The listener here is built with the
+/// production SPIFFE peer verifier bound to the shared admission artifact, and
+/// is never rebound: the assertion is that the peer's next mTLS session simply
+/// stops working once its leaf is revoked, and keeps working for a record that
+/// names a different serial.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_spiffe_mtls_session_stops_being_established_after_a_crl_rotation() {
+    let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
+    let gateway = mint_peer_chain(GATEWAY_SPIFFE);
+    let state = credential_state(9665);
+    let slot = install_inbound_trust(
+        &state,
+        &gateway,
+        local_trust(PEER_TRUST_DOMAIN, vec![certs.ca_der()]),
+    );
+    let server_config =
+        hbone_server_config_with_client_verifier(&certs, inbound_verifier(&state, &slot));
+    let (gateway_addr, shutdown_tx) = start_inbound_gateway(state.clone(), server_config).await;
+
+    assert!(
+        mtls_session_is_established(gateway_addr, hbone_client_config(&certs)).await,
+        "the peer must complete mTLS and exchange one request before anything revokes it"
+    );
+
+    let unrelated = certs.signed_crl(&[UNRELATED_LEAF_SERIAL]);
+    assert!(publish_crls(&state, vec![unrelated]));
+    assert!(
+        mtls_session_is_established(gateway_addr, hbone_client_config(&certs)).await,
+        "a record naming a different serial must leave this peer connecting"
+    );
+
+    let revoking = certs.signed_crl(&[HBONE_CLIENT_LEAF_SERIAL]);
+    assert!(publish_crls(&state, vec![revoking]));
+    assert!(
+        !mtls_session_is_established(gateway_addr, hbone_client_config(&certs)).await,
+        "the rotation must end the peer's next session on the LIVE listener, with no rebind \
+         and no ServerConfig rebuild"
+    );
+
+    let _ = shutdown_tx.send(true);
+}
+
+/// Production arms the backend CRL watcher before mesh installs its inbound
+/// slot, so a CRL publisher really can read "no trust installed" and be
+/// overtaken by the install. Before the fence-owned lock, the publisher then
+/// stored its records with nothing recompiled: the verifier enforced one list
+/// and the fence's anchors policed another, permanently, because a
+/// byte-identical republish returns early and can never repair it.
+///
+/// Barrier-released so the two racers start together, and repeated so the
+/// interleaving is actually hit. Whichever order lands, ONE set must be in
+/// force on both surfaces — which is observable as the peer the records revoke
+/// being cut by the fence, not only refused by the handshake.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_install_that_races_a_crl_publication_leaves_one_set_in_force() {
+    for iteration in 0..12u16 {
+        let gateway = mint_peer_chain(GATEWAY_SPIFFE);
+        let peer = mint_peer_chain(CLIENT_SPIFFE);
+        let state = credential_state(9670 + iteration);
+        let revoking = signed_crl(&peer, &[PEER_LEAF_SERIAL]);
+        let slot = tls::shared_bundle_slot(Some(inbound_bundle(
+            &gateway,
+            local_trust(PEER_TRUST_DOMAIN, vec![peer.ca_der.clone()]),
+        )));
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let installer = {
+            let handle = tokio::runtime::Handle::current();
+            let barrier = Arc::clone(&barrier);
+            let state = state.clone();
+            let slot = slot.clone();
+            std::thread::spawn(move || {
+                let _runtime = handle.enter();
+                barrier.wait();
+                state.install_mesh_inbound_admission_trust(&slot);
+            })
+        };
+        let publisher = {
+            let handle = tokio::runtime::Handle::current();
+            let barrier = Arc::clone(&barrier);
+            let state = state.clone();
+            std::thread::spawn(move || {
+                let _runtime = handle.enter();
+                barrier.wait();
+                state.publish_mesh_inbound_crls(Arc::new(vec![revoking]));
+            })
+        };
+        installer.join().expect("installer thread");
+        publisher.join().expect("publisher thread");
+
+        assert_eq!(
+            state.mesh_inbound_admission.crls().load().crls().len(),
+            1,
+            "the records are enforced whichever thread won"
+        );
+        let verifier = inbound_verifier(&state, &slot);
+        assert!(
+            !handshake_admits(&verifier, &peer),
+            "the handshake polices the published records"
+        );
+
+        // ...and so does the fence. `admitted_trust_revision` 0 never matches a
+        // real revision, so the sweep always re-verifies rather than skipping.
+        let fence = &state.hbone_admission_fence;
+        let tunnel = fence.admit(credential_snapshot(
+            fence.sweep_epoch(),
+            peer_credential(&peer, live_expiry(), true, 0),
+        ));
+        fence.request_sweep();
+        wait_for_revocation(&tunnel).await;
+        assert_eq!(
+            tunnel.revoked_reason(),
+            Some(HboneRevocationReason::PeerRevoked),
+            "the anchors in force must have been compiled WITH the published records; an \
+             install that overtook the publisher's 'no trust installed' check must not leave \
+             the fence judging by an empty list"
+        );
+    }
+}
+
+/// Two publishers can pass the outer equality check with the SAME candidate.
+/// The loser must recompile nothing and advance nothing: an identical
+/// publication that moved the in-force revision would charge every live tunnel
+/// a certificate path build for a decision that did not change, which is
+/// exactly what the skip key exists to prevent.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_identical_concurrent_crl_publications_compile_and_advance_once() {
+    for iteration in 0..12u16 {
+        let gateway = mint_peer_chain(GATEWAY_SPIFFE);
+        let peer = mint_peer_chain(CLIENT_SPIFFE);
+        let state = credential_state(9690 + iteration);
+        let _slot = install_inbound_trust(
+            &state,
+            &gateway,
+            local_trust(PEER_TRUST_DOMAIN, vec![peer.ca_der.clone()]),
+        );
+        let revoking = signed_crl(&peer, &[PEER_LEAF_SERIAL]);
+        let revision_before = inbound_trust_revision(&state);
+        let compilations_before = state.hbone_admission_fence.trust_anchor_builds();
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let racers: Vec<std::thread::JoinHandle<bool>> = (0..2)
+            .map(|_| {
+                let handle = tokio::runtime::Handle::current();
+                let barrier = Arc::clone(&barrier);
+                let state = state.clone();
+                let records = vec![revoking.clone()];
+                std::thread::spawn(move || {
+                    let _runtime = handle.enter();
+                    barrier.wait();
+                    state.publish_mesh_inbound_crls(Arc::new(records))
+                })
+            })
+            .collect();
+        let published: Vec<bool> = racers
+            .into_iter()
+            .map(|racer| racer.join().expect("publisher thread"))
+            .collect();
+
+        assert_eq!(
+            published.iter().filter(|changed| **changed).count(),
+            1,
+            "exactly one of two identical publications changes the enforced set"
+        );
+        assert_eq!(
+            inbound_trust_revision(&state),
+            revision_before + 1,
+            "and it moves the ONE in-force revision exactly once"
+        );
+        assert_eq!(
+            state.hbone_admission_fence.trust_anchor_builds(),
+            compilations_before + 1,
+            "the loser must not recompile the anchors either"
+        );
+    }
+}
+
+/// The CONNECT refusal's operator attribution is a closed four-value set, and
+/// the same literal has to reach BOTH surfaces an operator reads: the
+/// `mesh_authz.deny_policy` request metadata and the rejected-request reason.
+///
+/// `HboneConnectRefusal` is crate-private and the metadata never leaves the
+/// gateway, so the wiring is pinned in source — the technique the sibling
+/// chain-of-custody test above already uses. The runtime half (a `403` with the
+/// byte-identical unauthenticated body, and one `connect_trust_refusals`) is
+/// asserted by the TCP and datagram revocation tests.
+#[test]
+fn the_connect_refusal_attribution_is_one_closed_set_on_both_surfaces() {
+    // Collapse runs of whitespace so an assertion survives rustfmt reflow.
+    fn flat(source: &str) -> String {
+        source.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    let proxy = flat(include_str!("../../src/proxy/hbone_proxy.rs"));
+    let fence = flat(include_str!("../../src/proxy/hbone_admission_fence.rs"));
+
+    // Each relay derives its attribution from the refusal itself, never from a
+    // literal at the call site that can drift from the gate that produced it.
+    let byte_stream = "let deny_reason = refusal.connect_reason();";
+    let datagram = "let deny_reason = refusal.udp_connect_reason();";
+    assert_eq!(proxy.matches(byte_stream).count(), 1);
+    assert_eq!(proxy.matches(datagram).count(), 1);
+
+    // Both stamp the SAME metadata key from that reason...
+    let stamp = ".insert(\"mesh_authz.deny_policy\".to_string(), deny_policy);";
+    assert_eq!(
+        proxy.matches(stamp).count(),
+        2,
+        "the byte-stream and datagram relays must stamp one metadata key"
+    );
+    // ...and log the rejected request with the very same value.
+    assert_eq!(
+        proxy.matches("start_time, deny_reason,").count(),
+        2,
+        "the logged reason and the metadata must never be two different strings"
+    );
+
+    // The set itself is closed: four literals, each declared exactly once, on
+    // the renderer rather than scattered across the relays.
+    for reason in [
+        "hbone_peer_trust_withdrawn",
+        "hbone_peer_revoked",
+        "hbone_udp_peer_trust_withdrawn",
+        "hbone_udp_peer_revoked",
+    ] {
+        let literal = format!("\"{reason}\"");
+        assert_eq!(
+            fence.matches(&literal).count(),
+            1,
+            "{reason} must be declared exactly once, on HboneConnectRefusal"
+        );
+        assert_eq!(
+            proxy.matches(&literal).count(),
+            0,
+            "{reason} must not be re-spelled at a relay call site"
+        );
+    }
+    assert_eq!(fence.matches("fn connect_reason(self)").count(), 1);
+    assert_eq!(fence.matches("fn udp_connect_reason(self)").count(), 1);
 }

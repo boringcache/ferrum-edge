@@ -15458,7 +15458,7 @@ async fn arm_mesh_runtime_startup(
         env_config,
         &tls_policy,
         &crls,
-        &proxy_state.mesh_inbound_crls,
+        &proxy_state.mesh_inbound_admission,
         inbound_mtls_mode,
         runtime.topology,
         mesh_frontend_identity.as_deref(),
@@ -15470,7 +15470,7 @@ async fn arm_mesh_runtime_startup(
             env_config,
             &tls_policy,
             &crls,
-            &proxy_state.mesh_inbound_crls,
+            &proxy_state.mesh_inbound_admission,
             &inbound_mtls_modes_by_port,
             runtime.topology,
             mesh_frontend_identity.as_deref(),
@@ -17680,15 +17680,17 @@ fn stage_gateway_runtime_spiffe_bundle_with_federation(
 /// STRICT requires + validates a peer cert. Returns `None` when no slot is
 /// available or the mode is DISABLE.
 ///
-/// `crls` is the LIVE enforced mesh inbound CRL slot, not a snapshot: the
-/// verifier reads it on every handshake so an operator's rotation reaches the
-/// next peer without rebinding the listener (issue #5574), and it is the same
-/// slot the HBONE admission fence sweeps already-admitted peers against. An
-/// empty enforced set disables revocation checking (the pre-CRL behavior).
+/// `admission` is the LIVE shared inbound admission artifact, not a snapshot:
+/// the verifier reads the enforced CRL records on every handshake so an
+/// operator's rotation reaches the next peer without rebinding the listener,
+/// and once the HBONE admission fence has compiled a trust-and-CRL set into
+/// force the verifier verifies against THAT set — the same one the fence
+/// sweeps already-admitted peers with (issue #5574). An empty enforced set
+/// disables revocation checking (the pre-CRL behavior).
 fn mesh_inbound_spiffe_verifier(
     slot: Option<&tls::SharedBundleSlot>,
     mtls_mode: config::MtlsMode,
-    crls: crate::tls::crl_policy::SharedEnforcedCrlSet,
+    admission: crate::tls::SharedInboundAdmissionArtifact,
 ) -> Option<Arc<dyn rustls::server::danger::ClientCertVerifier>> {
     let slot = slot?;
     let peer_required = match mtls_mode {
@@ -17697,10 +17699,10 @@ fn mesh_inbound_spiffe_verifier(
         // DISABLE has no TLS; client-side DR modes never reach here.
         _ => return None,
     };
-    Some(tls::build_spiffe_client_cert_verifier_with_enforced_crls(
+    Some(tls::build_spiffe_client_cert_verifier_for_inbound_admission(
         slot.clone(),
         peer_required,
-        crls,
+        admission,
     ))
 }
 
@@ -17961,7 +17963,7 @@ fn load_mesh_frontend_tls(
     env_config: &EnvConfig,
     tls_policy: &TlsPolicy,
     crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
-    mesh_inbound_crls: &crate::tls::crl_policy::SharedEnforcedCrlSet,
+    mesh_inbound_admission: &crate::tls::SharedInboundAdmissionArtifact,
     mtls_mode: config::MtlsMode,
     topology: MeshTopology,
     server_identity: Option<&tls::MeshServerIdentity>,
@@ -17991,8 +17993,8 @@ fn load_mesh_frontend_tls(
     // gateway CRLs are threaded in so inbound mesh peers get the same
     // end-entity revocation enforcement the operator-CA path already applies
     // (empty CRLs => no revocation checking, unchanged behavior).
-    let spiffe_verifier =
-        mesh_inbound_spiffe_verifier(spiffe_bundle_slot, mtls_mode, Arc::clone(mesh_inbound_crls));
+    let admission = Arc::clone(mesh_inbound_admission);
+    let spiffe_verifier = mesh_inbound_spiffe_verifier(spiffe_bundle_slot, mtls_mode, admission);
 
     let client_ca_bundle_path = client_ca_bundle
         .map(|bundle| bundle.path.as_str())
@@ -18112,7 +18114,7 @@ fn load_mesh_frontend_tls_by_port(
     env_config: &EnvConfig,
     tls_policy: &TlsPolicy,
     crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
-    mesh_inbound_crls: &crate::tls::crl_policy::SharedEnforcedCrlSet,
+    mesh_inbound_admission: &crate::tls::SharedInboundAdmissionArtifact,
     modes: &std::collections::BTreeMap<u16, config::MtlsMode>,
     topology: MeshTopology,
     server_identity: Option<&tls::MeshServerIdentity>,
@@ -18136,7 +18138,7 @@ fn load_mesh_frontend_tls_by_port(
                 env_config,
                 tls_policy,
                 crls,
-                mesh_inbound_crls,
+                mesh_inbound_admission,
                 mode,
                 topology,
                 server_identity,
@@ -18551,7 +18553,7 @@ fn plan_mesh_inbound_tls_reload_with_federation(
         &proxy_state.env_config,
         tls_policy,
         &proxy_state.crls,
-        &proxy_state.mesh_inbound_crls,
+        &proxy_state.mesh_inbound_admission,
         mtls_mode,
         runtime.topology,
         server_identity,
@@ -18564,7 +18566,7 @@ fn plan_mesh_inbound_tls_reload_with_federation(
                     &proxy_state.env_config,
                     tls_policy,
                     &proxy_state.crls,
-                    &proxy_state.mesh_inbound_crls,
+                    &proxy_state.mesh_inbound_admission,
                     &next_snapshot.port_modes,
                     runtime.topology,
                     server_identity,
@@ -21310,12 +21312,13 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(cert.der())
     }
 
-    /// An enforced mesh inbound CRL slot carrying no records, i.e. revocation
-    /// checking off — the pre-CRL posture every TLS-shape test here asserts
-    /// against (issue #5574). The rotation behavior itself is pinned where the
-    /// verifier reads the slot, in the SPIFFE and admission-fence suites.
-    fn no_enforced_crls() -> crate::tls::crl_policy::SharedEnforcedCrlSet {
-        crate::tls::crl_policy::enforced_crl_set(Arc::new(Vec::new()))
+    /// An inbound admission artifact carrying no records and nothing in force,
+    /// i.e. revocation checking off and the verifier on its own compile — the
+    /// pre-CRL posture every TLS-shape test here asserts against (issue #5574).
+    /// The rotation behavior itself is pinned where the verifier reads the
+    /// artifact, in the SPIFFE and admission-fence suites.
+    fn no_enforced_crls() -> crate::tls::SharedInboundAdmissionArtifact {
+        crate::tls::inbound_admission_artifact(Arc::new(Vec::new()))
     }
 
     /// The SVID slot `load_mesh_frontend_server_identity` resolves the

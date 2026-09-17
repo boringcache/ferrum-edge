@@ -35,11 +35,17 @@
 //! published under (issue #5574). The mesh inbound SPIFFE peer verifier reads
 //! that shared slot on every handshake rather than a snapshot captured when its
 //! `ServerConfig` was built, so an operator's rotation reaches the next peer
-//! without rebinding the listener, and the generation is the other half of its
-//! verifier-cache identity beside the SVID source. The same records are
-//! compiled into the HBONE admission fence's in-force anchors, which is what
-//! re-judges peers whose established inbound session is never re-handshaked;
-//! publication for both surfaces goes through
+//! without rebinding the listener, and the generation is the other half of that
+//! verifier's own cache identity beside the SVID source.
+//!
+//! For the mesh inbound surface the slot does not stand alone: it lives inside
+//! [`crate::tls::InboundAdmissionArtifact`], beside the compiled peer anchors
+//! the HBONE admission fence has put IN FORCE — the same records, compiled into
+//! the same verifiers. That is what lets the handshake, the CONNECT credential
+//! gate, and the fence's sweep answer one question from one artifact instead of
+//! from three independently retained histories; the verifier's own compile
+//! above is its startup fallback, for a listener whose fence has not published
+//! yet. Publication for every one of those surfaces goes through
 //! `ProxyState::publish_mesh_inbound_crls`.
 
 use std::sync::Arc;
@@ -111,8 +117,9 @@ pub fn enforced_crl_set(crls: CrlList) -> SharedEnforcedCrlSet {
 /// caller that owns the surface is the one place allowed to publish, and it
 /// must recompile and re-check whatever the change implies. For the mesh
 /// inbound set that caller is `HboneAdmissionFence::publish_inbound_admission_crls`,
-/// reached through `ProxyState::publish_mesh_inbound_crls`; nothing else may
-/// store into that slot.
+/// reached through `ProxyState::publish_mesh_inbound_crls` and holding the
+/// fence's single publication lock while it does; nothing else may store into
+/// that slot.
 pub fn publish_enforced_crl_set(slot: &SharedEnforcedCrlSet, crls: CrlList) -> bool {
     let current = slot.load();
     if crl_records_equal(current.crls(), &crls) {
