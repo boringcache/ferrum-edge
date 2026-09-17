@@ -98,7 +98,6 @@
 
 use crate::common::gateway_harness::{DbType, GatewayChildGuard, TestGateway, TestGatewayBuilder};
 use crate::scaffolding::clients::Http1Client;
-use crate::scaffolding::port_registry::TestSocket;
 use crate::scaffolding::ports::{PortReservation, reserve_port_pair};
 use chrono::Utc;
 use ferrum_edge::admin::jwt_auth::{JwtConfig, JwtManager};
@@ -1122,9 +1121,10 @@ pub enum StreamListener {
 ///
 /// HTTP readiness alone is insufficient: file mode starts HTTP before reconciling
 /// TCP/UDP stream listeners. TCP readiness uses a raw connect. UDP (including DTLS)
-/// readiness uses a loopback bind on the test's existing registry lease: `AddrInUse`
-/// means the listener is bound, while a successful probe socket is dropped immediately
-/// without awaiting so it cannot remain held between polls. Sending a probe datagram
+/// requires `GatewayChildGuard::spawn_with_identity` and the child's authenticated
+/// admin readiness barrier, which completes only after every listener has bound.
+/// Never bind the UDP port to probe readiness: even a synchronous bind/drop can
+/// overlap the child's bind on another CPU (issue #5590). Sending a probe datagram
 /// would create a session and change the counts or ordering asserted by UDP tests.
 ///
 /// The HTTP and stream stages share one deadline. Child exit is checked before and
@@ -1193,15 +1193,16 @@ async fn wait_for_spawned_listener(
                 }
                 _ => Ok(false),
             },
-            StreamListener::Udp(_) => match std::net::UdpSocket::bind_test(("127.0.0.1", port)) {
-                Ok(socket) => {
-                    drop(socket);
-                    Ok(false)
-                }
-                Err(error) if error.kind() == io::ErrorKind::AddrInUse => Ok(true),
-                Err(error) => Err(io::Error::new(
-                    error.kind(),
-                    format!("gateway {stage} readiness probe on port {port} failed: {error}"),
+            StreamListener::Udp(_) => match tokio::time::timeout_at(
+                deadline,
+                child.wait_for_owned_ready(deadline.saturating_duration_since(now)),
+            )
+            .await
+            {
+                Ok(result) => result.map(|()| true),
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("gateway {stage} listener on port {port} not ready within 30s"),
                 )),
             },
         };
