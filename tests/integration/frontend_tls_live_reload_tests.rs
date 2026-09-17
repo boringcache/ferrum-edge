@@ -12,7 +12,6 @@
 //! 3. Existing in-flight TLS sessions are NOT torn down by a swap (rustls
 //!    consults the `ServerConfig` only during the handshake).
 
-use crate::scaffolding::port_registry::TestSocket;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
