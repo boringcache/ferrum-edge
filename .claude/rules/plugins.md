@@ -653,15 +653,205 @@ on a native-gRPC request.
 - `rate_limiting`, `graphql`, `grpc_method_router`, `ai_rate_limiter`,
   `ws_rate_limiting`, and `udp_rate_limiting` support `sync_mode: "redis"`.
 - Shared Redis client lives in `src/plugins/utils/redis_rate_limiter.rs`.
-- Algorithm is two-window weighted with pipelined `INCR`/`GET`/`EXPIRE`; no Lua.
+- Request quotas (`rate_limiting`, `graphql`, `grpc_method_router`) count a
+  SUB-BUCKETED TRAILING WINDOW: each configured window is split into
+  `REDIS_WINDOW_SUB_BUCKETS` (16, a `const`, never configurable — it is part of
+  the shared key layout) equal sub-buckets, and the count is the FULL sum of the
+  charged sub-bucket, the `K + 1` = 17 before it
+  (`REDIS_WINDOW_TRAILING_SUB_BUCKETS`), and the ONE AFTER it — 19 keys per
+  window, every bucket at face value (`redis_trailing_window_count`). No decay
+  term, no Lua. The trailing 18 of those counters span
+  `window + (1 + f) * (window / K)` from the reader's SELECTION instant and up
+  to `window + 3 * (window / K)` from the instant Redis EXECUTES it (settlement
+  admits a reader that selected `s - 1`), which is why the error is bounded BOTH
+  ways: every charge executed inside the reader's trailing window is covered
+  (fail closed against a boundary-clustered burst) and at most THREE sub-buckets
+  of older history are over-counted. Do NOT replace this with
+  `previous + current`: that counts up to two whole windows and refuses a
+  well-behaved client for a whole window after every window it fills — roughly
+  half its quota at EVERY limit, permanently.
+- The over-count has a real, per-limit cost and every document must state it as
+  a BOUND, never an unconditional "8/9" and never the narrower selection-time
+  figure. A client at exactly its configured rate `L` keeps AT LEAST
+  `L / (L + ceil(3L / K))`: `1/2` at `L = 1`, `2/3` at `L = 2`, `8/10` at
+  `L = 8`, ~84% at `L = 100`. The third sub-bucket is the reader's own placement
+  lag: a charge is keyed at its SELECTION bucket while the reader counts from
+  its EXECUTION bucket, so the widest coverage needs the reader to straddle a
+  boundary the charges it counts did not. A homogeneous stream — every request
+  carrying the same placement lag — sees `L / (L + ceil(2L / K))` (`8/9` at
+  `L = 8`) instead; that is the better case, not the contract. The quantisation
+  is inherent to counting the oldest bucket in full and is NOT a regression (the
+  retired weighted estimate halved `L = 1` too). Do NOT "fix" it by decaying the
+  oldest sub-bucket on a timestamp — that reopens the boundary-burst
+  over-admission this layout exists to close, because a burst clustered at the
+  END of the oldest sub-bucket would be discounted while still live. The
+  deterministic models in `tests/unit/plugins/redis_rate_limiter_tests.rs` take
+  SEPARATE selection and execution instants (`execution = selection + latency`)
+  and pin both figures for `L = 1, 2, 8` on sub-bucket edges; a model that uses
+  one instant for both cannot establish the production bound.
+- BOTH extra sub-bucket reads are correctness requirements, not padding, and
+  neither substitutes for the other.
+  - FORWARD (`b + 1`): bucket selection precedes connection acquisition, so a
+    request that selected `b` can execute after a peer that selected `b + 1`;
+    without reading `b + 1` both are admitted although both lie inside one
+    trailing window. Whichever transaction lands second must see the other.
+  - EXTRA OLD (`b - K - 1`): a retained charge's KEY can be one sub-bucket older
+    than the bucket the server executed it in, because settlement deliberately
+    admits `exec == b + 1` and the learned offset is one reply latency stale. A
+    reader at server bucket `s` must therefore reach back to `s - K - 1` or a
+    live peer charge drops off the old end. Learned offsets do NOT close this:
+    `server_time − local_time_at_reply` carries each gateway's own reply
+    latency, so two gateways select on clocks differing by the difference of
+    theirs (the 992ms/`1/s` double admission at `K = 8`).
+  Together with two-sided settlement the invariant is
+  `key ∈ {exec_bucket − 1, exec_bucket}`, so a reader covering `[s − K − 1,
+  s + 1]` cannot miss a charge executed inside its trailing window.
+- SETTLEMENT IS TWO-SIDED: `sub_bucket_charge_is_settled` requires
+  `b <= server_bucket <= b + 1`. Late (`> b + 1`) means a peer may have charged
+  a bucket this ladder neither read nor charged; EARLY (`< b`) means the charge
+  was placed in the FUTURE where no peer's trailing window reaches it (a gateway
+  clock ahead of Redis, a wall-clock step, a stale offset). Do NOT relax either
+  end. `check_http_windows_redis` compensates and rebuilds from that server
+  instant for exactly one more transaction (`MAX_REDIS_CHARGE_PASSES = 2`); a
+  second mis-settlement fails closed with a sampled warning. The rebuild AWAITS
+  its own hand-back (`RedisCompensationHandle::confirmed`, bounded by the
+  screened per-command deadline) before charging again: the rebuilt ladder reads
+  the sub-bucket the abandoned pass charged, so a rebuild that only DISPATCHED
+  the compensation counts its own abandoned charge and refuses at a quota the
+  client is inside. An unconfirmed hand-back refuses through
+  `redis_failure_policy` instead of rebuilding; the stranded charge expires with
+  the key TTL. Keep the compensation itself independently owned (detached task
+  holding the client `Arc`) so cancellation still cannot strand it. That is a
+  settlement rebuild on a SUCCESSFUL transaction — the "no retry budget" rule
+  still holds for failed commands. Do NOT "fix" reordering by refusing every
+  straddler: that throttles legitimate traffic at ordinary Redis latency. The
+  late trigger is phase-dependent (one to two sub-buckets: 62.5–125ms for a
+  one-second policy, 3.75–7.5s for a one-minute one) and it is EXECUTION delay,
+  never response delay: a transaction applied inside its own sub-bucket settles
+  on the `TIME` it carried however late the response lands. A store whose
+  EXECUTION is slower than one sub-bucket degrades a sub-minute policy into
+  `redis_failure_policy` territory — an unavailable store, not a quota refusal.
+  A store that merely REPLIES slowly does not roll over at all; it stops
+  teaching the offset instead (see the stale-reply rule below). That is
+  deliberate and documented.
+- CLOCK CONTRACT: sub-buckets are selected on the REDIS SERVER's clock, not on
+  each gateway's. Every charge transaction ends with a `TIME` inside the same
+  `MULTI`/`EXEC` (no extra round trip), and `RedisServerClock` keeps a per-client
+  `AtomicI64` offset (`server_time − local_time_at_reply`) refreshed by every
+  successful `EXEC`; the NEXT request selects from `local_now + offset`.
+  `check_http_windows_redis` calls `RedisRateLimitClient::ensure_clock_seeded`
+  before its FIRST selection, so the connection (and therefore its probe) exists
+  first and even the first request selects on the server clock. Never write that
+  the correction puts gateways "on the same clock" or that the ladder "never
+  under-counts": the offset lags by one reply latency, and the guarantee comes
+  from the ladder shape plus two-sided settlement, not from an exact clock.
+  Do NOT reintroduce a local post-`EXEC` sample: reply latency after `EXEC` is
+  harmless (a later peer reads this request's own increment) while execution
+  latency before it is the hazard, and conflating them rebuilt ladders for
+  nothing. The honest statement of the residual is: (a) no charge executed
+  inside a reader's trailing window is ever missing from its ladder; (b)
+  residual over-admission is ONE gateway's concurrent in-flight requests during
+  the two-pass rebuild window. NTP is host hygiene now, not the
+  correctness anchor. The retired `{tag}:{window_index}` layout tolerated a full
+  `window_seconds` of skew; the upgrade note lives in `docs/plugins.md`.
+- A STALE REPLY MUST NOT MOVE THE BASE. `charge_rate_limit_windows` samples the
+  local clock on BOTH sides of `query_async` and folds the `TIME` into the
+  offset only while `clock_sample_is_prompt(reply_latency, narrowest window this
+  transaction charged)` — one sub-bucket of the tightest ladder. Past that the
+  previous offset stands; the charge is still judged by settlement against the
+  server instant the reply carried, which owes nothing to the offset. The
+  narrowest window is computed FROM THAT TRANSACTION's windows — never from
+  client-lifetime min/max bookkeeping, which was a lost-update hazard and is
+  gone. The standalone probe's sample is the one exception (it is the seed,
+  there is no previous offset, and it is bounded by the screened per-command
+  deadline). Do NOT write that permanently starved learning necessarily degrades
+  through the failure policy — it does not. A connection that EXECUTES promptly
+  and ANSWERS late settles every charge correctly, forever, on a frozen offset.
+  The cost is deferred: the base stops tracking the server, so a later
+  server-side clock change or a wall-clock step is never learned, and once the
+  drift passes the settlement band every request mis-settles on its FIRST pass.
+  The REBUILD does not recover that step either, and do NOT write that it does:
+  the rebuilt pass selects from the server instant the ABANDONED pass carried,
+  which the same late response already leaves stale by more than the band, so it
+  mis-settles too and the request refuses through `redis_failure_policy`. The
+  threshold that starves learning and the staleness the rebuild inherits are one
+  quantity, so starved learning plus drift is an unavailable store, not a
+  permanent double charge. A PROMPT store pays exactly ONE rebuild for the same
+  drift, is admitted, and learns the step from that pass's own sample — a
+  rebuild recovers a clock step only while replies are prompt, which is exactly
+  when learning would have recovered it anyway. Both sides are pinned by
+  `starved_offset_learning_settles_until_the_server_clock_drifts_under_it` and
+  `a_prompt_store_pays_exactly_one_rebuild_for_a_clock_step_and_learns_it`.
+- `TIME` IS REQUIRED FOR REQUEST QUOTAS. THERE IS NO LOCAL-CLOCK MODE. It is
+  probed ONCE per established connection with a plain standalone `TIME`
+  (`probe_server_time`, called from `screen_and_arm`) — never trialled inside
+  `MULTI`, because a
+  denied command there aborts the whole `EXEC`. EVERY unsuccessful answer —
+  `NOPERM`, `ERR unknown command`, a malformed successful reply (`+OK` to
+  `TIME`), a timeout, a transport error, any other server error — leaves the
+  connection UNUSABLE: `mark_unavailable` / `note_command_failure`, the socket
+  is never published, and `redis_failure_policy` decides
+  (`local_fallback` = per-process budgets, `fail_closed` = refuse). Do NOT
+  reintroduce a mode, a base transition, a quarantine, or a weaker documented
+  skew contract: a ladder selected on an uncorrected local clock is not a shared
+  budget. `is_permission_denied_error` / `is_unknown_command_error` survive only
+  to pick the DIAGNOSTIC (tell the operator to grant `+time`); they never pick
+  an outcome. A mid-flight revocation needs no special case — the aborted `EXEC`
+  is an ordinary command failure and the reconnect re-probes.
+  `docs/plugins.md` and the CHANGELOG must keep listing `TIME` as
+  mandatory for the quota roots.
+  THE BACKGROUND RECOVERY CHECKER PROVES THE SAME THING. It publishes this
+  client's availability, so it screens everything the connect path screens:
+  `PING`, topology, retention when required, and — for a `Required` client — a
+  bounded, well-formed `TIME` through the SAME
+  `screen_connection_server_clock` the connect-path probe uses. A `PING`-only
+  recovery republished availability (and logged "centralized Redis access
+  restored") on an endpoint that still denied the clock. None of the clock
+  refusals is terminal there (an ACL can be granted under a live gateway), and
+  the recovery sample is DISCARDED rather than seeded: it is bounded only by the
+  connect timeout, far past one sub-bucket. A `NotUsed` client still sends zero
+  clock probes, in recovery as at connect.
+- THE REQUIREMENT IS SCOPED TO THE CONSUMERS THAT READ THE CLOCK, not to the
+  socket. It is a construction-time property (`ServerClockRequirement`,
+  alongside `RedisClientLogPolicy` and `RedisRetentionRequirement`) chosen by
+  the constructor: `RedisRateLimitClient::for_request_quota` declares
+  `Required`; `new`, `for_replay_authority` and `for_retention_authority`
+  declare `NotUsed`. Only a `Required` client probes, and
+  `charge_rate_limit_windows` fails closed (debug assertion + `Err(())`) on any
+  other, so a ladder can never be charged against an unseeded clock.
+  `RedisLimiter::new_with_config_id` picks the constructor from
+  `RateLimitAlgorithm::REQUIRES_SERVER_CLOCK` — a REQUIRED associated const, so
+  a new algorithm must state its contract rather than inherit one. True for
+  `HttpRateLimitAlgorithm` / `DynamicHttpRateLimitAlgorithm` (`rate_limiting`,
+  `graphql`, `grpc_method_router`); false for the `ai_rate_limiter`,
+  `ws_rate_limiting` and `udp_rate_limiting` algorithms, for
+  `request_deduplication`, `soap_ws_security`'s shared replay authority,
+  `jwks_auth` / `hmac_auth` replay clients, and `ai_semantic_cache`. Those
+  deployments do NOT need `+time` and must not be taken out of service by an
+  ACL that withholds it. Do NOT re-widen the probe to every consumer.
+  The classification-only probe diagnostics
+  (`server_clock_denied` / `server_clock_unreadable` /
+  `server_clock_unavailable`, through `warn_replay_backend`) are retained
+  because the log policy and the clock requirement stay independent choices,
+  but no current constructor pairs them.
+- Every configured window derives its bucket from the SAME instant, and the
+  rebuild reuses the server instant that proved the rollover rather than reading
+  any clock again. No `f64` anywhere on the quota path. Token-accounting paths
+  (`ai_rate_limiter` `INCRBY` budgets, `ws_rate_limiting` frame budgets) keep
+  the two-window weighted estimate and the `{tag}:{window_index}` layout,
+  because they reserve under one window index and reconcile against that same
+  index; their residual boundary-burst exposure is documented in
+  `docs/plugins.md`, not silently shared with the quota path. `udp_rate_limiting`
+  is a plain fixed window with no previous-window term.
 - HTTP/GraphQL/gRPC quota admission is CHARGE-THEN-COMPENSATE over that
   algorithm, on the shared pooled multiplexed connections: ONE atomic
-  `MULTI`/`EXEC` charges every configured window (`GET` previous, `INCR`
-  current, `EXPIRE` current) so the decision is tied to the caller's own
-  increment, and any refusal issues ONE compensating atomic `MULTI`/`EXEC`
-  (`DECR` + `EXPIRE`) over every window it charged. A refusal therefore leaves
-  no lasting charge on any window (issue #5517) and a tighter window's refusal
-  never consumes a looser window's budget. Never reintroduce `WATCH`, a
+  `MULTI`/`EXEC` charges every configured window (`GET` each of the 17 older
+  sub-buckets and the one forward sub-bucket, `INCR` the charged sub-bucket,
+  `EXPIRE` it) so the decision is
+  tied to the caller's own increment, and any refusal issues ONE compensating
+  atomic `MULTI`/`EXEC` (`DECR` + `EXPIRE`) over the one sub-bucket it charged
+  per window. A refusal therefore leaves no lasting charge on any window (issue
+  #5517) and a tighter window's refusal never consumes a looser window's budget. Never reintroduce `WATCH`, a
   dedicated per-request connection, a retry budget, or `EVAL`/`EVALSHA`/`SCRIPT`
   — every command must be plain RESP. Between an `INCR` and its compensating
   `DECR` the transient charge is visible to concurrent requests, which is a
@@ -676,11 +866,40 @@ on a native-gRPC request.
   exit between the charge and its compensation. Both transaction helpers carry
   their own `MAX_REDIS_ADMISSION_WINDOWS` (3) bound and fail closed above it;
   the per-request window and counter buffers are fixed-capacity and inline, not
-  `Vec`s. The local token bucket / 64-bucket sliding aggregate are deliberately
-  NOT replicated in Redis.
-- Key format is `{escaped-prefix:escaped-rate-key}:{window_index}` — the braces
-  are a Redis Cluster hash tag so every key of one atomic operation shares a
-  slot; `%`, braces, and `:` are percent-escaped inside it. Default prefix is
+  `Vec`s, so one transaction touches at most
+  `MAX_REDIS_ADMISSION_WINDOWS * (REDIS_WINDOW_SUB_BUCKETS + 3)` keys (3 × 19 =
+  57) — eighteen `GET`s, one `INCR`, and one ignored `EXPIRE` per window, plus
+  ONE `TIME` per transaction, unconditionally (validate the reply length for
+  exactly that shape; an unreadable counter or an unreadable server clock is an
+  unusable endpoint, never a zero). Each
+  window packs its whole key ladder into ONE `String` allocation
+  (`RedisRateLimitClient::window_charge`) — fewer allocations than the two
+  `make_slot_key` calls it replaced, and the accessors slice on ranges the
+  builder itself recorded. The local token bucket / 64-bucket sliding aggregate
+  are deliberately NOT replicated in Redis, and their contracts are NOT the
+  Redis one: short (<= 5s) local windows are a token bucket with CONTINUOUS
+  refill, a burst-plus-refill contract that can admit `limit + refill` inside a
+  trailing window, while the > 5s sliding aggregate is a trailing-window cap
+  over-counting by at most `ceil(window / 63)`. Never document a single
+  "fail-closed relative to an exact trailing window" guarantee across local and
+  Redis modes.
+- `weighted_window_count` in `src/plugins/utils/rate_limit.rs` is the ONLY place
+  the two-window weighted estimate is written down. `FixedWindow`, all three
+  `ai_rate_limiter` `INCRBY` arms, and the `ws_rate_limiting` frame budget route
+  through it; do not re-inline the formula, or a test on one path stops proving
+  anything about the others
+  (`token_accounting_paths_share_the_one_weighted_formula`).
+- Request-quota key format is
+  `{escaped-prefix:escaped-rate-key}:{window_seconds}:{sub_index}`; every other
+  Redis rate-limit family stays on
+  `{escaped-prefix:escaped-rate-key}:{window_index}` (plus `datagrams`/`bytes`
+  for UDP). The braces are a Redis Cluster hash tag so every key of one atomic
+  operation shares a slot; `%`, braces, and `:` are percent-escaped inside it.
+  Naming the window in the quota key keeps two windows of one policy on provably
+  disjoint ladders. Changing this layout restarts counters on an in-place
+  upgrade, so it needs a CHANGELOG note; the keyspace command set is unchanged,
+  but the server clock additionally requires `TIME` on the three QUOTA roots
+  only (see the clock contract above). Default prefix is
   `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` — the config-id component
   isolates independent policies of one plugin type inside a namespace while
   replicas of the same policy keep sharing a budget. An explicit
@@ -711,7 +930,14 @@ on a native-gRPC request.
   `ferrum_rate_limit_local_fallback_decisions_total`; `fail_closed` `503`s count
   in `ferrum_rate_limit_enforcement_unavailable_total`. Fallback is now the
   DEFAULT posture for this plugin, so the silent case is the common case: do not
-  regress those signals back to the once-per-outage latched warning. The client
+  regress those signals back to the once-per-outage latched warning. The
+  capacity `429` carries no outcome to mark, so its attribution travels with the
+  decision (`RateLimitDecision::local_fallback`, produced by
+  `check_with_redis_key_and_local_capacity_attributed`). Do NOT reconstruct it
+  from `RateLimitBackend::local_fallback_active()`: that asks whether the store
+  is unreachable NOW, and a per-decision fallback (a second sub-bucket rollover,
+  an unpairable reply) leaves the client available, so the attribution would be
+  dropped exactly where degraded enforcement is least visible. The client
   reconnects in the background either way. `request_deduplication` expresses the
   same choice as `on_redis_unavailable` and does NOT accept
   `redis_failure_policy`; `ai_semantic_cache` has neither.

@@ -21,6 +21,7 @@
 //!   contract, and
 //! - `/live` staying healthy throughout.
 
+use crate::common::redis_resp::{TIME_CMD, host_clock_time_reply};
 use crate::scaffolding::port_registry::TestSocket;
 
 use std::sync::{
@@ -189,9 +190,9 @@ fn resp_contains(chunk: &[u8], command: &[u8]) -> bool {
 
 /// Gated RESP peer: when closed, accepted sockets are dropped so the probe
 /// fails fast; when open, handshake/PING succeed, `INFO CLUSTER` reports a
-/// usable non-Cluster topology, and `INFO MEMORY` proves a no-eviction
-/// posture. Recovery is proven by those screens, not by PING alone and not
-/// by a protected `SET`.
+/// usable non-Cluster topology, `INFO MEMORY` proves a no-eviction posture,
+/// and the standalone `TIME` screening probe gets this host's clock. Recovery
+/// is proven by those screens, not by PING alone and not by a protected `SET`.
 async fn spawn_gated_replay_redis(
     initially_open: bool,
 ) -> (u16, Arc<AtomicBool>, tokio::sync::oneshot::Sender<()>) {
@@ -230,6 +231,13 @@ async fn spawn_gated_replay_redis(
                                     CLUSTER_DISABLED_INFO
                                 };
                                 format!("${}\r\n{text}\r\n", text.len()).into_bytes()
+                            } else if resp_contains(chunk, TIME_CMD) {
+                                // The standalone screening probe every
+                                // established connection runs after its `INFO`
+                                // screens. A `+OK` is not a clock, so the
+                                // connection would be dropped unpublished and
+                                // recovery would never restore readiness.
+                                host_clock_time_reply()
                             } else {
                                 b"+OK\r\n".repeat(resp_command_count(chunk))
                             };

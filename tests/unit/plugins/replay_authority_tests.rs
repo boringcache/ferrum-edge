@@ -34,6 +34,8 @@ use ferrum_edge::plugins::utils::replay_authority::{
     shared_health_snapshot, validate_scope_backend,
 };
 
+use super::redis_resp::{TIME_CMD, host_clock_time_reply};
+
 const PROFILE: &str = "ferrum-replay-authority-tests-v1";
 const RETENTION: Duration = Duration::from_secs(600);
 
@@ -2248,6 +2250,19 @@ fn replay_info_reply(chunk: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// The standalone `TIME` screening probe a REQUEST-QUOTA connection runs after
+/// its `INFO` screens, answered from the one shared fixture definition.
+///
+/// A replay authority reads no server clock — it claims markers with
+/// `SET NX EX` — so its connections skip the probe and these fixtures are never
+/// asked. The arm is retained because a fake peer that stands in for a real
+/// Redis should answer what a real Redis answers, and because a fixture shared
+/// with quota coverage would otherwise refuse the endpoint with its catch-all
+/// `+OK`. See [`super::redis_resp`].
+fn replay_time_reply(chunk: &[u8]) -> Option<Vec<u8>> {
+    resp_contains(chunk, TIME_CMD).then(host_clock_time_reply)
+}
+
 fn resp_contains(chunk: &[u8], command: &[u8]) -> bool {
     chunk.windows(command.len()).any(|window| window == command)
 }
@@ -2328,6 +2343,8 @@ async fn spawn_claim_redis_server(
                                 }
                             } else if let Some(reply) = replay_info_reply(chunk) {
                                 reply
+                            } else if let Some(reply) = replay_time_reply(chunk) {
+                                reply
                             } else {
                                 // The redis crate pipelines connection setup, so
                                 // reply once per command array in the chunk.
@@ -2394,6 +2411,8 @@ async fn spawn_ping_silent_then_healthy_redis(
                                 continue;
                             }
                             let reply: Vec<u8> = if let Some(reply) = replay_info_reply(chunk) {
+                                reply
+                            } else if let Some(reply) = replay_time_reply(chunk) {
                                 reply
                             } else {
                                 b"+OK\r\n".repeat(resp_command_count(chunk))
@@ -2957,6 +2976,8 @@ async fn spawn_ttl_observing_redis_server() -> (
                                 b"+OK\r\n".to_vec()
                             } else if let Some(reply) = replay_info_reply(chunk) {
                                 reply
+                            } else if let Some(reply) = replay_time_reply(chunk) {
+                                reply
                             } else {
                                 b"+OK\r\n".repeat(resp_command_count(chunk))
                             };
@@ -3015,6 +3036,7 @@ const SENTINEL_PREFIX: &str = "SENTINEL-KEY-PREFIX-r149";
 const SENTINEL_AUTH_ERR: &str = "SENTINEL-AUTH-ERR-r149";
 const SENTINEL_CMD_ERR: &str = "SENTINEL-CMD-ERR-r149";
 const SENTINEL_MOVED_HOST: &str = "SENTINEL-MOVED-HOST-r149";
+const SENTINEL_TIME_ERR: &str = "SENTINEL-TIME-ERR-r5584";
 
 #[derive(Clone, Copy)]
 enum LoggingShape {
@@ -3022,6 +3044,10 @@ enum LoggingShape {
     CommandError,
     ClusterInfo,
     ClusterMoved,
+    /// The standalone `TIME` screen answers an ordinary `-ERR`. A replay
+    /// authority must never send that command in the first place, so this peer
+    /// serves it and every claim on it still succeeds.
+    TimeError,
 }
 
 async fn spawn_logging_redis_server(
@@ -3073,9 +3099,17 @@ async fn spawn_logging_redis_server(
                                 LoggingShape::CommandError if resp_contains(chunk, SET_CMD) => {
                                     format!("-ERR {SENTINEL_CMD_ERR}\r\n").into_bytes()
                                 }
+                                LoggingShape::TimeError if resp_contains(chunk, TIME_CMD) => {
+                                    format!("-ERR {SENTINEL_TIME_ERR}\r\n").into_bytes()
+                                }
                                 _ if resp_contains(chunk, INFO_CMD) => {
                                     replay_info_reply(chunk).expect("INFO chunk")
                                 }
+                                // Only after the shape-specific arms above: an
+                                // `AuthReject` peer rejects `TIME` like every
+                                // other command, and `ClusterInfo` is terminal
+                                // at `INFO` before the probe ever runs.
+                                _ if resp_contains(chunk, TIME_CMD) => host_clock_time_reply(),
                                 _ => b"+OK\r\n".repeat(resp_command_count(chunk)),
                             };
                             if stream.write_all(&reply).await.is_err() {
@@ -3118,6 +3152,7 @@ fn assert_sentinels_absent(logs: &str, context: &str) {
         SENTINEL_AUTH_ERR,
         SENTINEL_CMD_ERR,
         SENTINEL_MOVED_HOST,
+        SENTINEL_TIME_ERR,
     ] {
         assert!(
             !logs.contains(sentinel),
@@ -3151,6 +3186,10 @@ async fn replay_client_logs_only_classification_and_redacted_endpoint() {
             LoggingShape::ClusterMoved,
             "unsupported_topology",
         ),
+        // No `server_clock` row: a replay authority reads no clock, so its
+        // connections never probe `TIME` and there is no such rejection to
+        // classify. That the probe is genuinely absent is asserted by
+        // `a_replay_authority_never_probes_the_server_clock` below.
     ] {
         let (port, probes, shutdown) = spawn_logging_redis_server(shape).await;
         let config = sentinel_replay_config(port);
@@ -3202,6 +3241,7 @@ async fn replay_client_logs_only_classification_and_redacted_endpoint() {
                     "{label}: sentinel backend must fail closed"
                 );
             }
+            LoggingShape::TimeError => unreachable!("no server_clock row above"),
         }
         drop(guard);
         let captured = logs.contents();
@@ -3220,6 +3260,47 @@ async fn replay_client_logs_only_classification_and_redacted_endpoint() {
         drop(client);
         let _ = shutdown.send(());
     }
+}
+
+/// A replay authority reads no server clock, so an endpoint whose ACL refuses
+/// `TIME` must still admit its claims.
+///
+/// Connection screening is shared with request-quota clients, so making the
+/// `TIME` probe a property of the socket took every replay-only deployment on a
+/// restrictive ACL out of service for a command it never sends. The peer here
+/// answers `-ERR` to `TIME` and `+OK` to the claim: a client that probed would
+/// discard the connection unpublished and fail closed, and a client that does
+/// not probe claims normally.
+#[tokio::test(flavor = "current_thread")]
+async fn a_replay_authority_never_probes_the_server_clock() {
+    let _serialized = shared_health_guard_async().await;
+
+    let (port, _probes, shutdown) = spawn_logging_redis_server(LoggingShape::TimeError).await;
+    let config = sentinel_replay_config(port);
+    let (logs, guard) = super::plugin_utils::capture_logs();
+    let client = Arc::new(replay_redis_client(config));
+    let authority = shared_live(Arc::clone(&client), RETENTION);
+
+    wait_until_available(&client).await;
+    let marker = domain("shared-no-clock").marker(&[b"c", b"first"]);
+    assert_eq!(
+        authority.admit(&marker).await,
+        ReplayAdmission::Admitted,
+        "an endpoint that denies TIME still backs single-use claims"
+    );
+
+    drop(guard);
+    let captured = logs.contents();
+    assert!(
+        !captured.contains("server_clock"),
+        "no server-clock classification may be published for a consumer that reads \
+         no clock: {captured}"
+    );
+    assert_sentinels_absent(&captured, "no_clock_probe");
+
+    drop(authority);
+    drop(client);
+    let _ = shutdown.send(());
 }
 
 /// Generic rate-limiter clients keep publishing backend error text. The replay
@@ -3297,6 +3378,8 @@ async fn spawn_memory_policy_redis(
                                 }
                             } else if resp_contains(chunk, INFO_CMD) {
                                 resp_bulk(CLUSTER_DISABLED_INFO)
+                            } else if let Some(reply) = replay_time_reply(chunk) {
+                                reply
                             } else {
                                 b"+OK\r\n".repeat(resp_command_count(chunk))
                             };

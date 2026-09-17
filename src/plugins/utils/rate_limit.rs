@@ -14,9 +14,20 @@ use tracing::{info, warn};
 
 use super::http_client::PluginHttpClient;
 use super::redis_rate_limiter::{
-    MAX_REDIS_ADMISSION_WINDOWS, RedisConfig, RedisRateLimitClient, RedisWindowCharge,
-    RedisWindowCharges,
+    MAX_REDIS_ADMISSION_WINDOWS, RedisConfig, RedisRateLimitClient, RedisWindowCharges,
+    sub_bucket_charge_is_settled,
 };
+
+/// Transactions ONE Redis quota decision may spend before it fails closed.
+///
+/// Two: the ordinary charge, plus at most one rebuild when the server clock
+/// that `EXEC` returned proves the ladder rolled past the sub-bucket after the
+/// one it charged. This is NOT a retry budget for failed commands — a Redis
+/// error still costs exactly one round trip and is never retried — and it is
+/// not reachable by client behaviour: only the server applying a transaction a
+/// whole sub-bucket after its bucket was selected triggers a rebuild, and the
+/// abandoned pass hands its own charge back (and waits for it) first.
+const MAX_REDIS_CHARGE_PASSES: u32 = 2;
 
 /// Root config keys every Redis-backed rate-limit plugin accepts.
 ///
@@ -349,10 +360,79 @@ impl RateLimitOutcome {
     }
 }
 
+/// One admission decision, plus WHY it was served the way it was.
+///
+/// A capacity refusal carries no [`RateLimitOutcome`] to mark, so its
+/// provenance has to travel beside it. Reconstructing it afterwards from
+/// [`RateLimitBackend::local_fallback_active`] asks a different question — "is
+/// the centralized store unreachable *now*" — and the two answers diverge
+/// exactly where the attribution matters: a staleness rollover, a short or
+/// unpairable reply, or any other per-decision `Err(())` routes THIS request
+/// onto the per-process budget while successful transactions keep the client's
+/// availability signal true. The `429` an unseen identity then receives at
+/// `MAX_STATE_ENTRIES` would lose both its `ratelimit_local_fallback` metadata
+/// and its fallback-decision counter, leaving a degraded-enforcement refusal
+/// indistinguishable from ordinary client behaviour.
+#[derive(Debug, Clone, Default)]
+pub struct RateLimitDecision {
+    /// `None` is a capacity refusal: a previously unseen local/fallback key
+    /// arrived at the configured cap and no budget was created for it.
+    pub outcome: Option<RateLimitOutcome>,
+    /// Whether this decision was served on the per-process fallback budget,
+    /// including when it produced no outcome at all.
+    pub local_fallback: bool,
+}
+
+impl RateLimitDecision {
+    /// A decision the centralized store (or a local-only backend) produced.
+    fn centralized(outcome: RateLimitOutcome) -> Self {
+        Self {
+            outcome: Some(outcome),
+            local_fallback: false,
+        }
+    }
+
+    /// A decision served on the per-process fallback budget, with or without an
+    /// outcome to carry the marker itself.
+    fn fallback(outcome: Option<RateLimitOutcome>) -> Self {
+        Self {
+            outcome,
+            local_fallback: true,
+        }
+    }
+
+    /// A local-only backend's decision: there is no centralized store to lose,
+    /// so nothing is attributed to an outage.
+    fn local_only(outcome: Option<RateLimitOutcome>) -> Self {
+        Self {
+            outcome,
+            local_fallback: false,
+        }
+    }
+}
+
 #[async_trait]
 pub trait RateLimitAlgorithm: Send + Sync + 'static {
     type State: Send + Sync + 'static;
     type Op: Send + Sync;
+
+    /// Whether this algorithm's Redis path selects its buckets on the **Redis
+    /// server's** clock, and therefore needs the `TIME` command.
+    ///
+    /// Only request-quota admission does (`check_http_windows_redis`): its
+    /// sub-bucket ladder is shared across gateways, so the instant that selects
+    /// a bucket has to be the one that orders every gateway's charge. The
+    /// token- and datagram-accounting algorithms reserve under a
+    /// `{tag}:{window_index}` index they compute locally and never read the
+    /// server clock.
+    ///
+    /// It is a required associated const rather than a defaulted one on
+    /// purpose: a new algorithm must state which contract it is on, because the
+    /// answer decides whether an operator's Redis ACL has to grant `+time`.
+    /// [`RedisLimiter::new_with_config_id`] turns it into the client
+    /// constructor, and `RedisRateLimitClient::charge_rate_limit_windows`
+    /// fails closed if the two ever disagree.
+    const REQUIRES_SERVER_CLOCK: bool;
 
     fn new_state(&self) -> Self::State;
 
@@ -593,12 +673,26 @@ impl<A: RateLimitAlgorithm> RedisLimiter<A> {
         let health_check_interval = Duration::from_secs(cfg.health_check_interval_seconds.max(1));
         let key_prefix = cfg.key_prefix.clone();
 
-        let redis_client = Arc::new(RedisRateLimitClient::new(
-            cfg,
-            http_client.dns_cache().cloned(),
-            http_client.tls_no_verify(),
-            http_client.tls_ca_bundle_path(),
-        )?);
+        // Which client this policy gets is decided by the algorithm, not by the
+        // plugin name: only the request-quota ladder selects sub-buckets on the
+        // Redis server's clock, so only its connections prove `TIME`. A token,
+        // frame, or datagram budget reads no clock, and making it demand
+        // `+time` would take an otherwise-safe deployment out of service.
+        let redis_client = Arc::new(if A::REQUIRES_SERVER_CLOCK {
+            RedisRateLimitClient::for_request_quota(
+                cfg,
+                http_client.dns_cache().cloned(),
+                http_client.tls_no_verify(),
+                http_client.tls_ca_bundle_path(),
+            )?
+        } else {
+            RedisRateLimitClient::new(
+                cfg,
+                http_client.dns_cache().cloned(),
+                http_client.tls_no_verify(),
+                http_client.tls_ca_bundle_path(),
+            )?
+        });
         Ok(Some(Self {
             redis_client,
             algorithm,
@@ -760,36 +854,49 @@ where
     }
 
     /// Prefer Redis when healthy; otherwise atomically cap distinct local
-    /// fallback keys. None means a new local key was denied at capacity.
-    pub async fn check_with_local_capacity(
+    /// fallback keys, reporting whether THIS decision was served on the
+    /// per-process budget.
+    ///
+    /// The provenance is produced here rather than reconstructed by the caller
+    /// because this is the only place that knows it: once the centralized arm
+    /// has returned `Err(())` and control has fallen through, the client's own
+    /// availability signal may already read healthy again (or never have gone
+    /// unhealthy at all, as with a staleness rollover). See
+    /// [`RateLimitDecision`].
+    pub async fn check_with_local_capacity_attributed(
         &self,
         local_key: K,
         redis_key: &str,
         op: &A::Op,
         max_entries: usize,
-    ) -> Option<RateLimitOutcome> {
+    ) -> RateLimitDecision {
         // See `check`: `is_available()` is the only admission gate, and a
         // concurrent topology rejection wins over an in-flight success.
         if self.primary.is_available() {
             match self.primary.check(redis_key, op).await {
                 Ok(result) if !self.primary.is_topology_unsupported() => {
                     self.fallback_warned.store(false, Ordering::Relaxed);
-                    return Some(result);
+                    return RateLimitDecision::centralized(result);
                 }
                 Ok(_) | Err(()) => {}
             }
         }
 
         if !self.degraded_allows_local() {
-            return Some(RateLimitOutcome::deny_enforcement_unavailable());
+            let refusal = RateLimitOutcome::deny_enforcement_unavailable();
+            return RateLimitDecision::centralized(refusal);
         }
 
-        self.fallback
-            .check_at_with_capacity(local_key, op, Instant::now(), max_entries)
-            .map(|mut outcome| {
-                outcome.local_fallback = true;
-                outcome
-            })
+        // Past this point THIS decision is on the per-process budget, whether
+        // or not it produces an outcome that can carry the marker.
+        RateLimitDecision::fallback(
+            self.fallback
+                .check_at_with_capacity(local_key, op, Instant::now(), max_entries)
+                .map(|mut outcome| {
+                    outcome.local_fallback = true;
+                    outcome
+                }),
+        )
     }
 
     /// See [`RateLimitBackend::local_fallback_active`].
@@ -1469,11 +1576,16 @@ where
     /// fallback budget: a Redis-backed policy whose centralized store cannot be
     /// consulted and whose `redis_failure_policy` admits locally.
     ///
-    /// A capacity denial carries no outcome of its own, so the caller reads
-    /// this to decide whether that refusal belongs to the outage rather than to
-    /// the client: a Redis-backed policy suddenly hitting the local key cap is
-    /// an outage symptom. A local-only backend has no centralized store to
-    /// lose and reads `false`.
+    /// This is an OBSERVABILITY question about the backend right now, not the
+    /// provenance of a decision. Do not attribute a refusal with it: a
+    /// per-decision `Err(())` — a staleness rollover, a short or unpairable
+    /// reply — routes that request onto the fallback budget while successful
+    /// transactions keep this signal true, so the attribution would be dropped
+    /// exactly where degraded enforcement is least visible. A decision's own
+    /// provenance travels with it in [`RateLimitDecision::local_fallback`].
+    ///
+    /// A local-only backend has no centralized store to lose and reads `false`.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn local_fallback_active(&self) -> bool {
         match self {
             Self::Local(_) => false,
@@ -1503,7 +1615,42 @@ where
     }
 
     /// Check through Redis when available, or reserve a bounded local/fallback
-    /// entry slot atomically. None denies only a previously unseen local key.
+    /// entry slot atomically, reporting whether the decision was served on the
+    /// per-process fallback budget.
+    ///
+    /// `rate_limiting` is the plugin that attributes every decision it serves
+    /// on that budget — admissions, quota refusals, and the capacity `429` an
+    /// unseen key gets at `MAX_STATE_ENTRIES` — so it reads the provenance
+    /// here. The other five Redis-backed rate-limit roots default to
+    /// `fail_closed` and publish no fallback attribution, and use
+    /// [`Self::check_with_redis_key_and_local_capacity`].
+    pub async fn check_with_redis_key_and_local_capacity_attributed<F>(
+        &self,
+        local_key: K,
+        redis_key: F,
+        op: &A::Op,
+        max_entries: usize,
+    ) -> RateLimitDecision
+    where
+        F: FnOnce() -> String,
+    {
+        match self {
+            Self::Local(local) => {
+                let outcome =
+                    local.check_at_with_capacity(local_key, op, Instant::now(), max_entries);
+                RateLimitDecision::local_only(outcome)
+            }
+            Self::Failover(failover) => {
+                let redis_key = redis_key();
+                failover
+                    .check_with_local_capacity_attributed(local_key, &redis_key, op, max_entries)
+                    .await
+            }
+        }
+    }
+
+    /// [`Self::check_with_redis_key_and_local_capacity_attributed`] without the
+    /// provenance. None denies only a previously unseen local key.
     pub async fn check_with_redis_key_and_local_capacity<F>(
         &self,
         local_key: K,
@@ -1514,17 +1661,13 @@ where
     where
         F: FnOnce() -> String,
     {
-        match self {
-            Self::Local(local) => {
-                local.check_at_with_capacity(local_key, op, Instant::now(), max_entries)
-            }
-            Self::Failover(failover) => {
-                let redis_key = redis_key();
-                failover
-                    .check_with_local_capacity(local_key, &redis_key, op, max_entries)
-                    .await
-            }
-        }
+        let attributed = self.check_with_redis_key_and_local_capacity_attributed(
+            local_key,
+            redis_key,
+            op,
+            max_entries,
+        );
+        attributed.await.outcome
     }
 
     pub fn tracked_keys_count(&self) -> usize {
@@ -1676,10 +1819,28 @@ pub struct FixedWindow {
 /// The documented two-window weighted approximation
 /// (`previous * (1 - elapsed_fraction) + current`).
 ///
-/// One definition shared by [`FixedWindow::weighted_count`] and the Redis
-/// admission path, which reads its counters out of a fixed-capacity buffer and
-/// never materializes a `FixedWindow` per request.
-fn weighted_window_count(previous: u64, current: u64, elapsed_fraction: f64) -> f64 {
+/// This is the TOKEN-ACCOUNTING estimate, and it is the ONLY place the formula
+/// is written down. Every production caller reasons in it through this
+/// function — [`FixedWindow`], the three `ai_rate_limiter` `INCRBY` arms
+/// (`Check`, `Reserve`, `AdjustUsage`), and the `ws_rate_limiting` frame
+/// budget — so a change to the formula cannot leave one path on the old shape
+/// and a test green on another. Those paths reserve an estimate under one
+/// window index and reconcile it against that same index after the response,
+/// so the count has to be a continuous function of one `(previous, current)`
+/// pair.
+///
+/// Counters are `i64` because that is what the Redis replies are: a
+/// reconciliation racing a rollback can leave a counter negative, and these
+/// paths deliberately let a negative `previous` reduce the estimate rather than
+/// flooring it per counter the way the request-quota fold does.
+///
+/// Request quotas (`rate_limiting`, `graphql`, `grpc_method_router`) do NOT use
+/// it. They count a sub-bucketed trailing window in full
+/// (`check_http_windows_redis`), because linear decay assumes the previous
+/// bucket's traffic was spread evenly through it and therefore discounts a
+/// burst clustered at its end while that burst is still inside the exact
+/// trailing window.
+pub(crate) fn weighted_window_count(previous: i64, current: i64, elapsed_fraction: f64) -> f64 {
     previous as f64 * (1.0 - elapsed_fraction.clamp(0.0, 1.0)) + current as f64
 }
 
@@ -1693,7 +1854,13 @@ impl FixedWindow {
     }
 
     pub fn weighted_count(&self, previous: u64, current: u64, elapsed_fraction: f64) -> f64 {
-        weighted_window_count(previous, current, elapsed_fraction)
+        // Saturating rather than wrapping: a count above `i64::MAX` is already
+        // astronomically over any configured limit, so both spellings refuse.
+        weighted_window_count(
+            u64_to_i64_saturating(previous),
+            u64_to_i64_saturating(current),
+            elapsed_fraction,
+        )
     }
 
     pub fn outcome(&self, previous: u64, current: u64, elapsed_fraction: f64) -> RateLimitOutcome {
@@ -2061,10 +2228,11 @@ fn check_http_windows(
 /// Lua, no `EVAL*`, no `WATCH`, no per-request connection, and no retry budget
 /// a hot key can exhaust:
 ///
-/// 1. ONE atomic `MULTI`/`EXEC` charges EVERY configured window
-///    (`GET previous`, `INCR current`, `EXPIRE current`) and returns each
-///    window's counters. The decision is read off the caller's own increment,
-///    never off a stale read two gateways could both act on.
+/// 1. ONE atomic `MULTI`/`EXEC` charges EVERY configured window (`GET` on each
+///    older sub-bucket and on the one after the charged bucket, `INCR` +
+///    `EXPIRE` on the sub-bucket this request lands in) and returns each
+///    window's trailing-window count. The decision is read off the caller's own
+///    increment, never off a stale read two gateways could both act on.
 /// 2. If every window fits, the request is admitted and the tightest window's
 ///    remaining budget is reported.
 /// 3. If ANY window refuses, ONE compensating atomic `MULTI`/`EXEC` hands back
@@ -2104,15 +2272,176 @@ fn check_http_windows(
 ///
 /// # Algorithm
 ///
-/// Every window uses the documented previous/current two-window weighted
-/// approximation (`previous * (1 - elapsed_fraction) + current`) over
-/// `{prefix:key}:{window_index}` counters. Local mode's token bucket and its
-/// 64-bucket sliding aggregate are deliberately NOT replicated in Redis:
-/// reproducing them centrally costs either a server-side script or a
-/// read-modify-write per request. Burst and smoothing behaviour therefore
-/// differs from `sync_mode: "local"` within that approximation, while the
-/// contract that matters is identical — one unit per admitted request, refusal
-/// at the configured cap, and no charge left behind by a refusal.
+/// A **sub-bucketed trailing window**. Every configured window is split into
+/// `REDIS_WINDOW_SUB_BUCKETS` (`K`, currently 16) equal sub-buckets keyed
+/// `{prefix:key}:{window_seconds}:{sub_index}`, and a window's count is the
+/// FULL sum of the sub-bucket this request lands in, the `K + 1` before it, and
+/// the one after it — every bucket at face value, no decay term. Nineteen keys
+/// per window, one `MULTI`/`EXEC`, one round trip.
+///
+/// The trailing `K + 2` of those counters span `window + (1 + f) * (window / K)`
+/// of wall clock measured from the reader's SELECTION instant, where `f` is how
+/// far into its own sub-bucket the request arrived — and up to
+/// `window + 3 * (window / K)` measured from the instant the server EXECUTES
+/// it, because settlement admits a reader that selected `s - 1`. That bounds
+/// the error in both directions against an exact trailing-window cap:
+///
+/// - **Counts every charge executed inside its trailing window.** Settlement
+///   below is two-sided, so every charge that survives is keyed in
+///   `{exec_bucket - 1, exec_bucket}`; a reader executing at server bucket `s`
+///   reads `[s - K - 1, s + 1]` and therefore cannot miss one — whatever the
+///   two gateways' reply latencies are. The retired
+///   `previous * (1 - elapsed_fraction) + current` estimate instead assumed the
+///   previous bucket's traffic was spread evenly through it, so a burst at that
+///   bucket's END was discounted in proportion to how far the current window
+///   had run — admitting a second burst while the first was still live.
+/// - **Over-counts by at most three sub-buckets** of older history (`3 / K` of
+///   a window, i.e. three sixteenths at `K = 16`). A bare `previous + current`
+///   sum would instead count up to two whole windows, which settles at roughly
+///   half the configured rate for every limit, indefinitely.
+///
+/// What it does NOT promise: that a well-behaved client always gets its nominal
+/// rate (see below), and that concurrent gateways can never over-admit at all
+/// (a single gateway's in-flight requests during a rebuild still can — see
+/// **Residual exposure**).
+///
+/// ## What the over-count costs, honestly
+///
+/// Counting the oldest sub-buckets in full means the ladder covers MORE than
+/// the exact trailing window, so a client sending at EXACTLY its configured
+/// rate is throttled. The extra history counted is at most three sub-buckets —
+/// up to `ceil(3 * limit / K)` requests — so the steady-state admitted fraction
+/// at exactly the configured rate is at least
+/// `limit / (limit + ceil(3 * limit / K))`: `1/2` at `limit = 1`, `2/3` at
+/// `limit = 2`, `8/10` at `limit = 8`, about 84% at `limit = 100`.
+///
+/// The third sub-bucket is the reader's own PLACEMENT LAG. A charge's key is
+/// its selection bucket, and settlement deliberately admits a transaction the
+/// server applies one bucket later, so a reader executing at `s` may be reading
+/// a ladder built around `s - 1` while the charges it counts were keyed at the
+/// bucket they executed in. A stream whose requests all carry the same
+/// placement lag is better off — `limit / (limit + ceil(2 * limit / K))`, so
+/// `8/9` at `limit = 8` — because the widest coverage needs the reader to
+/// straddle a boundary that the charges it counts did not. Every document
+/// states the BOUND, not the better case.
+///
+/// The penalty falls hardest on small quotas, and it is inherent to any
+/// bucketed counter that counts its oldest bucket at face value. It is not a
+/// regression — the retired weighted estimate refused a `1/s` client polling
+/// every `1.05s` every other request too — and it is deliberately not fixed by
+/// decaying the oldest sub-bucket on a timestamp, which would reopen the
+/// boundary-burst over-admission above. Operators who need a small quota to
+/// admit its full nominal rate should configure the quota over a longer window
+/// (`10` per `10s` rather than `1` per `1s`).
+///
+/// ## The bucket clock is Redis's, not this gateway's
+///
+/// Sub-buckets are only as shared as the clock that selects them. Bucket
+/// selection therefore runs on `redis.server_clock()`: this process's wall
+/// clock shifted by an offset learned from the `TIME` that rides inside every
+/// charge transaction (`server_time − local_time_at_reply`, refreshed on every
+/// successful `EXEC`, no extra round trip). Bucket selection and settlement are
+/// judged on the Redis server clock; the local clock is used only through that
+/// continuously corrected offset. Before the first selection of a client's life
+/// the connection — and therefore its `TIME` probe — is established first
+/// (`RedisRateLimitClient::ensure_clock_seeded`), so even the first request
+/// selects on the server clock.
+///
+/// That correction is NOT exact, and the ladder does not pretend it is.
+/// `server_time − local_time_at_reply` is sampled one reply latency after the
+/// server read its clock, so each gateway's corrected clock lags the server's
+/// by roughly its own reply latency, and two gateways sharing a quota select on
+/// clocks that differ by the DIFFERENCE of their latencies. What the correction
+/// buys is that the difference is bounded by round-trip times rather than by
+/// NTP discipline; what makes the ladder correct in spite of it is the extra
+/// old counter plus two-sided settlement, which together mean a charge's key is
+/// always within one sub-bucket of the bucket the server executed it in.
+///
+/// ## Residual exposure
+///
+/// One gateway's concurrent in-flight requests during a rebuild. A request that
+/// rolls over hands its charge back, waits for the confirmation, and charges
+/// again; another request of the SAME gateway can select in between and, in the
+/// worst case, be decided against a ladder that does not yet include the
+/// abandoned pass. That is bounded by one gateway's concurrency, not by fleet
+/// size or by clock discipline.
+///
+/// `TIME` is a hard requirement of THIS path, not a preference. The client is
+/// built with `RedisRateLimitClient::for_request_quota`
+/// (`RateLimitAlgorithm::REQUIRES_SERVER_CLOCK`), so a connection whose `TIME`
+/// probe answers a `NOPERM`, an unknown command, a non-clock, a timeout, or a
+/// transport failure is discarded unpublished and the client is marked
+/// unavailable, and a deployment whose ACL omits `+time` gets exactly the
+/// `redis_failure_policy` it configured — per-process budgets under
+/// `local_fallback`, refusals under `fail_closed`. There is deliberately no
+/// local-clock mode: a ladder selected on an uncorrected local clock is not a
+/// shared budget, and serving one quietly would be enforcement in name only.
+///
+/// The requirement stops here. `ai_rate_limiter`, `ws_rate_limiting` and
+/// `udp_rate_limiting` index their windows locally, and the replay,
+/// idempotency and cache consumers of `RedisRateLimitClient` read no clock at
+/// all, so their clients never probe and a restrictive ACL that withholds
+/// `+time` leaves them in service. `charge_rate_limit_windows` fails closed on
+/// a client that did not declare the requirement, so the two ends cannot drift
+/// apart.
+///
+/// ## Stale and future bucket selection
+///
+/// Bucket selection precedes connection acquisition, so every charge is
+/// slightly stale when the server executes it. One sub-bucket of that is
+/// covered by the forward `GET`: a request that selected bucket `b` sees a peer
+/// that selected `b + 1` and vice versa, so the pair's decision does not depend
+/// on which transaction reached the server first. Past one sub-bucket it is not
+/// covered, so the server clock returned by that same `EXEC` settles it, in
+/// BOTH directions:
+///
+/// - **`server_bucket > b + 1`**: the ladder may have missed a peer's charge.
+/// - **`server_bucket < b`**: this charge was placed in the FUTURE and is
+///   invisible to every peer reading its own trailing window. It happens when
+///   this process's clock runs ahead of Redis and the correction has not caught
+///   up — a wall-clock step, or an offset learned before a server-side clock
+///   change.
+///
+/// Either way the charge is handed back and rebuilt from that server instant
+/// for exactly ONE more transaction. A second rollover fails closed. That is a
+/// settlement rebuild on a SUCCESSFUL transaction, not a retry of a failed
+/// command: a Redis error is still one round trip and is never retried.
+///
+/// The rebuild waits for its own hand-back to be CONFIRMED before it charges
+/// again. The rebuilt ladder reads the sub-bucket the abandoned pass charged,
+/// so a rebuild that raced ahead of its own `DECR` would count that charge
+/// against the very request that abandoned it and refuse at a quota the client
+/// is inside. A hand-back that fails or does not answer inside the screened
+/// per-command deadline refuses through `redis_failure_policy` instead of
+/// rebuilding; the stranded charge then expires with the window's TTL.
+///
+/// The late trigger is the server applying the transaction a whole sub-bucket
+/// after the bucket was selected. How long a stall that takes is phase-dependent
+/// — somewhere between one and two sub-buckets, depending on where inside its
+/// own sub-bucket the request arrived, so 62.5–125ms for a one-second window
+/// and 3.75–7.5s for a one-minute one. A store whose round trip regularly
+/// reaches that will rebuild on most requests and eventually refuse, and those
+/// refusals are routed as an unavailable centralized store
+/// (`redis_failure_policy`), not as quota refusals. That is the intended
+/// reading: a store that cannot answer inside one sixteenth of the window
+/// cannot enforce that window.
+///
+/// ## Local mode is a different contract
+///
+/// Local mode's token bucket and 64-bucket sliding aggregate are deliberately
+/// NOT replicated in Redis: reproducing them centrally costs either a
+/// server-side script or a read-modify-write per request. Their contracts
+/// differ and neither is the Redis one:
+///
+/// - Windows longer than five seconds use the bounded sliding aggregate, whose
+///   oldest bucket is also counted in full, so it too is fail closed relative
+///   to an exact trailing window and over-counts by at most `ceil(window / 63)`.
+/// - Windows of five seconds or less use a **token bucket with continuous
+///   refill**, which is a burst-plus-refill contract, NOT a trailing-window cap:
+///   a `10`-per-second bucket admits ten requests immediately and another every
+///   100ms after that, so more than ten can land inside one trailing second. It
+///   smooths sustained traffic to the configured rate rather than bounding any
+///   one-second interval.
 async fn check_http_windows_redis(
     specs: &[RateLimitWindowSpec],
     redis: &Arc<RedisRateLimitClient>,
@@ -2134,53 +2463,138 @@ async fn check_http_windows_redis(
         return Err(());
     }
 
-    // Fixed-capacity, allocated inline: at most `MAX_REDIS_ADMISSION_WINDOWS`
-    // windows by construction, on a proxy hot path.
-    let mut elapsed_fractions = [0.0_f64; MAX_REDIS_ADMISSION_WINDOWS];
-    let mut charges = RedisWindowCharges::default();
-    for (index, spec) in specs.iter().enumerate() {
-        let window_seconds = spec.duration.as_secs().max(1);
-        // One timestamp sample per window, so a boundary straddle cannot pair
-        // an index from one instant with a fraction from another.
-        let progress = RedisRateLimitClient::window_progress(window_seconds);
-        let current_index = progress.index.to_string();
-        let previous_index = progress.index.saturating_sub(1).to_string();
-        let charge = RedisWindowCharge {
-            previous_key: redis.make_slot_key(key, &[&previous_index]),
-            current_key: redis.make_slot_key(key, &[&current_index]),
-            ttl_seconds: two_window_ttl_seconds(window_seconds),
-        };
-        if !charges.push(charge) {
-            // Unreachable behind the bound above; still fail closed rather than
-            // charge a subset of the configured windows.
+    // Establish (and therefore probe) a connection before the FIRST selection
+    // of this client's life, so the very first request already selects on the
+    // server clock instead of charging a ladder nobody else shares. No-op once
+    // a `TIME` verdict is known, which is every request after the first.
+    redis.ensure_clock_seeded().await;
+
+    // ONE instant builds every window's ladder, so a policy mixing a per-second
+    // and a per-minute window can never pair one window's bucket with another
+    // window's instant — and it is the REDIS server's instant (this process's
+    // clock plus the learned offset), so two gateways cannot disagree about
+    // which sub-bucket "now" is.
+    let mut sampled_at = redis.server_clock().now();
+    let mut pass = 1_u32;
+    let (charges, charged) = loop {
+        // Fixed-capacity, allocated inline: at most `MAX_REDIS_ADMISSION_WINDOWS`
+        // windows by construction, on a proxy hot path. Each window packs its
+        // whole `REDIS_WINDOW_SUB_BUCKETS + 3` key ladder into one allocation.
+        let mut charges = RedisWindowCharges::default();
+        for spec in specs {
+            let window_seconds = spec.duration.as_secs().max(1);
+            let bucket = RedisRateLimitClient::sub_bucket_at(sampled_at, window_seconds);
+            // Two windows' retention is comfortably longer than the `window +
+            // two sub-buckets` of history the ladder reads back, so the oldest
+            // bucket a decision needs is never expired out from under it.
+            let charge = redis.window_charge(key, bucket, two_window_ttl_seconds(window_seconds));
+            if !charges.push(charge) {
+                // Unreachable behind the bound above; still fail closed rather
+                // than charge a subset of the configured windows.
+                return Err(());
+            }
+        }
+
+        let charged = redis.charge_rate_limit_windows(charges.as_slice()).await?;
+        if charged.len() != specs.len() {
+            // `charge_rate_limit_windows` already refused a short reply; this
+            // keeps the indexing below total rather than trusting that a second
+            // time.
             return Err(());
         }
-        elapsed_fractions[index] = progress.elapsed_fraction;
-    }
 
-    let charged = redis.charge_rate_limit_windows(charges.as_slice()).await?;
+        // Settled on the SERVER's clock at `EXEC`, carried back by this same
+        // transaction. The ladder already covers a peer one sub-bucket ahead;
+        // this catches the two cases it cannot — a transaction the server
+        // applied past `b + 1` (still inside the 500ms screened response timeout
+        // for a one-second window), where a peer may have charged a bucket this
+        // ladder neither read nor charged, and one applied BEFORE `b`, where
+        // this charge sits in a bucket no peer's trailing window reaches.
+        let Some(settled_at) = charged.settled_at() else {
+            // Unreachable: `specs` is non-empty above, so the transaction
+            // carried its `TIME`, and a connection that could not answer one
+            // was never published. There is no local clock to stand in — that
+            // is the whole point — so fail closed rather than judge a ladder
+            // against no clock at all.
+            return Err(());
+        };
+        // Two-sided: a charge the server applied BEFORE the bucket it was keyed
+        // to is invisible to every peer reading its own trailing window, and a
+        // charge applied more than one bucket after it may have missed a peer.
+        // Both rebuild from the server instant that proved the mismatch.
+        if charges
+            .as_slice()
+            .iter()
+            .all(|charge| sub_bucket_charge_is_settled(charge.bucket(), settled_at))
+        {
+            break (charges, charged);
+        }
+
+        // Hand the stale charge back before rebuilding, so the abandoned pass
+        // leaves no counter behind, then rebuild from the server instant that
+        // just proved the rollover — no additional clock read.
+        //
+        // That instant is used RAW, and deliberately. It is already stale by
+        // this pass's response leg (plus the hand-back below and the rebuilt
+        // pass's own request leg) by the time the server applies the rebuild,
+        // but every correction for that is a guess: the round trip cannot be
+        // apportioned between its legs, and `clock_sample_is_prompt` refuses to
+        // let a late reply move the base for exactly that reason. Raw is also
+        // the safer side of the two-sided band — it can only place the rebuilt
+        // charge EARLIER than the server's own execution, which settlement's
+        // late end catches, never in the future, which is the unreachable
+        // placement. A store slow enough for that staleness to exceed the band
+        // spends its second pass and refuses below, which is the fail-closed
+        // answer for a store that cannot land a transaction in the sub-bucket
+        // it was keyed to.
+        let compensation = Arc::clone(redis)
+            .spawn_uncharge_rate_limit_windows(charges)
+            .await;
+        if pass >= MAX_REDIS_CHARGE_PASSES {
+            // Two consecutive mis-settlements mean the process cannot get a
+            // transaction to land in the bucket it was keyed to. Refusing is the
+            // fail-closed answer; admitting would publish a decision derived
+            // from a ladder that provably missed part of its own window. The
+            // hand-back stays detached here: there is no rebuilt ladder to keep
+            // honest, and the refusal must not pay its round trip.
+            warn_sampled!(
+                passes = pass,
+                "Redis rate-limit charge kept settling outside its sub-bucket; refusing"
+            );
+            return Err(());
+        }
+        // The rebuilt ladder READS the sub-bucket the abandoned pass charged,
+        // so dispatching the hand-back is not enough: without waiting for the
+        // `DECR` to land, the rebuild counts this request's own abandoned
+        // charge and refuses at a quota the client is inside.
+        if !compensation.confirmed().await {
+            warn_sampled!(
+                passes = pass,
+                "Redis rate-limit charge settled outside its sub-bucket and its hand-back could \
+                 not be confirmed; refusing rather than rebuilding against a charge this \
+                 request abandoned (it expires with the window's TTL)"
+            );
+            return Err(());
+        }
+        sampled_at = settled_at;
+        pass += 1;
+    };
     let counts = charged.as_slice();
-    if counts.len() != specs.len() {
-        // `charge_rate_limit_windows` already refused a short reply; this keeps
-        // the indexing below total rather than trusting that a second time.
-        return Err(());
-    }
 
     let mut tightest: Option<(u64, u64, u64)> = None;
     let mut refused: Option<&RateLimitWindowSpec> = None;
     for (index, spec) in specs.iter().enumerate() {
-        let (previous, current) = counts[index];
-        // A counter can only be negative when a compensation raced this key's
-        // expiry; read that as zero usage rather than as negative budget.
-        let previous = previous.max(0) as u64;
-        let current = current.max(0) as u64;
-        let weighted = weighted_window_count(previous, current, elapsed_fractions[index]);
-        if weighted > spec.limit as f64 {
+        // Already the full trailing-window sum, with each sub-bucket floored at
+        // zero (a counter can only be negative when a compensation raced its
+        // expiry). Integer throughout: `remaining` decorates `x-ratelimit-*`, so
+        // it must never be a rounded float.
+        let usage = counts[index];
+        if usage > spec.limit {
             refused = Some(spec);
             break;
         }
 
-        let remaining = (spec.limit as f64 - weighted).max(0.0) as u64;
+        let remaining = spec.limit.saturating_sub(usage);
         match tightest {
             Some((current_remaining, _, _)) if remaining >= current_remaining => {}
             _ => {
@@ -2197,7 +2611,10 @@ async fn check_http_windows_redis(
         // inline. A failed compensation is still reported through the client's
         // ordinary failure path, so `redis_failure_policy` governs the NEXT
         // decision; this one is a correct refusal either way and is returned.
-        Arc::clone(redis)
+        // The completion handle is dropped on purpose: dropping it cannot
+        // cancel the task, and unlike the rebuild there is no ladder left to
+        // keep honest, so the refusal must not wait for the `DECR`.
+        let _ = Arc::clone(redis)
             .spawn_uncharge_rate_limit_windows(charges)
             .await;
         return Ok(RateLimitOutcome::deny()
@@ -2239,6 +2656,10 @@ impl HttpRateLimitAlgorithm {
 impl RateLimitAlgorithm for HttpRateLimitAlgorithm {
     type State = Vec<HttpWindowState>;
     type Op = RequestUnit;
+
+    /// Request quotas charge the shared sub-bucket ladder, so the bucket clock
+    /// must be the Redis server's.
+    const REQUIRES_SERVER_CLOCK: bool = true;
 
     fn new_state(&self) -> Self::State {
         new_http_window_states(&self.specs)
@@ -2303,6 +2724,10 @@ impl DynamicHttpRateLimitAlgorithm {
 impl RateLimitAlgorithm for DynamicHttpRateLimitAlgorithm {
     type State = DynamicHttpRateLimitState;
     type Op = DynamicRateLimitOp;
+
+    /// Same ladder as [`HttpRateLimitAlgorithm`], with the windows resolved
+    /// per request (`graphql`, `grpc_method_router`).
+    const REQUIRES_SERVER_CLOCK: bool = true;
 
     fn new_state(&self) -> Self::State {
         DynamicHttpRateLimitState {
@@ -2749,6 +3174,10 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
     type State = TokenUsageWindow;
     type Op = AiRateLimitOp;
 
+    /// Token accounting reserves and reconciles under one locally computed
+    /// `{tag}:{window_index}`; it never selects a shared sub-bucket.
+    const REQUIRES_SERVER_CLOCK: bool = false;
+
     fn new_state(&self) -> Self::State {
         TokenUsageWindow::new(
             self.token_limit,
@@ -2838,7 +3267,7 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                 let curr_key = redis.make_slot_key(key, &[&curr_idx.to_string()]);
                 let prev_key = redis.make_slot_key(key, &[&prev_idx.to_string()]);
                 let (prev_count, curr_count) = redis.get_two_counters(&prev_key, &curr_key).await?;
-                let weighted = prev_count as f64 * (1.0 - elapsed_fraction) + curr_count as f64;
+                let weighted = weighted_window_count(prev_count, curr_count, elapsed_fraction);
                 let usage = weighted as u64;
                 let remaining = self.token_limit.saturating_sub(usage);
                 let outcome = if usage >= self.token_limit {
@@ -2863,7 +3292,7 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                 let increment = u64_to_i64_saturating(tokens);
                 let new_curr_count = redis.incrby_with_expire(&curr_key, increment, ttl).await?;
                 let (prev_count, _) = redis.get_two_counters(&prev_key, &curr_key).await?;
-                let weighted = prev_count as f64 * (1.0 - elapsed_fraction) + new_curr_count as f64;
+                let weighted = weighted_window_count(prev_count, new_curr_count, elapsed_fraction);
                 let usage = weighted.max(0.0) as u64;
                 let remaining = self.token_limit.saturating_sub(usage);
                 if weighted > self.token_limit as f64 {
@@ -2980,7 +3409,7 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                 }
                 // Compute post-reconcile telemetry without another fallible
                 // Redis call after the mutation.
-                let weighted = prev_count as f64 * (1.0 - elapsed_fraction) + curr_count as f64;
+                let weighted = weighted_window_count(prev_count, curr_count, elapsed_fraction);
                 let usage = weighted.max(0.0) as u64;
                 let remaining = self.token_limit.saturating_sub(usage);
                 Ok(RateLimitOutcome::allow()
@@ -3150,6 +3579,9 @@ impl RateLimitAlgorithm for WsFrameRateAlgorithm {
     type State = TokenBucket;
     type Op = WsRateLimitOp;
 
+    /// Frame budgets use the same locally indexed window as token accounting.
+    const REQUIRES_SERVER_CLOCK: bool = false;
+
     fn new_state(&self) -> Self::State {
         TokenBucket::from_rate(self.burst_size, self.frames_per_second)
     }
@@ -3205,7 +3637,7 @@ impl RateLimitAlgorithm for WsFrameRateAlgorithm {
         let (prev_count, curr_count) = redis
             .sliding_window_increment_by(&prev_key, &curr_key, charge, ttl)
             .await?;
-        let weighted = prev_count as f64 * (1.0 - elapsed_fraction) + curr_count as f64;
+        let weighted = weighted_window_count(prev_count, curr_count, elapsed_fraction);
         let allowed = weighted <= limit as f64;
         let remaining = ((limit as f64) - weighted).max(0.0) as u64;
 
@@ -3281,6 +3713,9 @@ impl UdpRateLimitAlgorithm {
 impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
     type State = UdpWindowState;
     type Op = UdpRateLimitOp;
+
+    /// A plain fixed window with no previous-window term and no sub-buckets.
+    const REQUIRES_SERVER_CLOCK: bool = false;
 
     fn new_state(&self) -> Self::State {
         UdpWindowState::new(0, 0)
@@ -3462,6 +3897,8 @@ mod tests {
     impl RateLimitAlgorithm for TestAlgorithm {
         type State = TestState;
         type Op = TestOp;
+
+        const REQUIRES_SERVER_CLOCK: bool = false;
 
         fn new_state(&self) -> Self::State {
             TestState::default()
