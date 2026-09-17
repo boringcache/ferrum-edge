@@ -264,7 +264,8 @@ pub fn process_registry() -> io::Result<&'static Arc<PortRegistry>> {
 /// Call in the actual network namespace where the gateway will bind.
 pub fn unbound_port_outside(excluded: std::ops::RangeInclusive<u16>) -> io::Result<u16> {
     let registry = process_registry()?;
-    let candidates = registry.candidates((10_240..=u16::MAX).filter(|port| !excluded.contains(port)));
+    let candidates =
+        registry.candidates((10_240..=u16::MAX).filter(|port| !excluded.contains(port)));
     let (lease, sockets) = registry.lease_with(candidates, |port| {
         let tcp = bind_tcp_listener(SocketAddr::from(([0, 0, 0, 0], port)))?;
         let udp = UdpSocket::bind(("0.0.0.0", port))?;

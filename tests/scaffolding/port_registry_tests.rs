@@ -110,8 +110,12 @@ async fn allocator_skips_time_wait_that_a_reuse_address_bind_would_accept() {
     let addr = listener.local_addr().unwrap();
     let mut client = TcpStream::connect(addr).unwrap();
     let (mut server, _) = listener.accept().unwrap();
-    client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    server
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     // The server actively closes and the client observes FIN before replying,
     // so TIME_WAIT belongs to the listener's port. No timing sleeps are needed.
     server.shutdown(Shutdown::Write).unwrap();
