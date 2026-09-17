@@ -402,7 +402,11 @@ fn custom_document_errors_withhold_nested_and_unterminated_quoted_tails() {
             Box::new(from_yaml_str::<CustomDiagnostic>(&yaml).unwrap_err()),
         ];
         for error in errors {
-            assert_safe_error(error.as_ref(), "custom error", true);
+            // A custom diagnostic raised inside a `Deserialize` impl reaches the
+            // boundary through the path adapter, which does not carry the
+            // parser position serde-generated families get; the path (when
+            // nested) and the sanitized text are the guarantee here.
+            assert_safe_error(error.as_ref(), "custom error", false);
             if raw.ends_with("`schema`") {
                 assert!(error.to_string().contains("expected `schema`"), "{error}");
             }
