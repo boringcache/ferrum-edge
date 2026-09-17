@@ -59,20 +59,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Redis request quotas: what the trailing-window over-count costs.** Counting
   the oldest sub-buckets at face value means the ladder covers slightly more
   than the exact trailing window, so a client sending at *exactly* its configured
-  rate is throttled. The extra history counted is at most two sub-buckets — up
-  to `ceil(limit / 8)` requests — so the steady-state admitted fraction at
-  exactly the configured rate is about `limit / (limit + ceil(limit / 8))`:
-  roughly 50% at a limit of 1, 67% at 2, 89% (8/9) at 8, and 89% at 100. There
-  is **no unconditional 8/9**; the quantisation falls hardest on small quotas.
-  This is not a regression — the two-window weighted estimate this replaced
-  refused a `1/s` client polling every `1.05s` every other request as well — and
-  it is deliberately not addressed by decaying the oldest sub-bucket, which
-  would reopen the boundary-burst over-admission. The sub-bucket count was set
-  to sixteen rather than eight so that reading one extra old counter would leave
-  these figures exactly where the narrower ladder had them. A client spaced
-  `window + window/8` apart is admitted in full at every limit. Operators who
-  need a small quota to admit its full nominal rate should configure it over a
-  longer window (`10` per `10s` rather than `1` per `1s`).
+  rate is throttled. Measured from the instant Redis *executes* a decision the
+  ladder reaches up to three sub-buckets further back than the window itself,
+  because settlement deliberately admits a reader whose ladder was built one
+  sub-bucket before the bucket it executes in while the charges it counts may
+  have been keyed at the bucket they executed in. The extra history counted is
+  therefore at most three sub-buckets — up to `ceil(3 * limit / 16)` requests —
+  so the steady-state admitted fraction at exactly the configured rate is **at
+  least** `limit / (limit + ceil(3 * limit / 16))`: 50% at a limit of 1, ~67% at
+  2, 80% (8/10) at 8, and ~84% at 100. A stream whose requests all carry the
+  same placement lag does better (`limit / (limit + ceil(2 * limit / 16))`, so
+  8/9 at a limit of 8), because the widest coverage needs the reader to straddle
+  a sub-bucket boundary the charges it counts did not; the documented figures
+  are the bound. There is **no unconditional 8/9**; the quantisation falls
+  hardest on small quotas. This is not a regression — the two-window weighted
+  estimate this replaced refused a `1/s` client polling every `1.05s` every
+  other request as well — and it is deliberately not addressed by decaying the
+  oldest sub-bucket, which would reopen the boundary-burst over-admission. The
+  sub-bucket count was set to sixteen rather than eight so that reading one
+  extra old counter would leave these figures close to where the narrower ladder
+  had them. A client spaced `window + 3 * window/16` apart is admitted in full
+  at every limit. Operators who need a small quota to admit its full nominal
+  rate should configure it over a longer window (`10` per `10s` rather than `1`
+  per `1s`).
 - **Redis request quotas: reordering and placement fence on the Redis server's
   own clock.**
   Bucket selection happens before the pooled connection is acquired, so a charge
@@ -113,16 +122,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because settlement is two-sided and the ladder reads one sub-bucket further
   back than its own window, which together pin every retained charge's key
   within one sub-bucket of the sub-bucket Redis executed it in. Stated exactly:
-  in server-clock mode **no charge executed inside a reader's trailing window is
-  ever missing from that reader's ladder**; the residual over-admission is one
-  gateway's own concurrent in-flight requests during the two-pass rebuild
-  window. Run NTP on
+  **no charge executed inside a reader's trailing window is ever missing from
+  that reader's ladder**; the residual over-admission is one gateway's own
+  concurrent in-flight requests during the two-pass rebuild window. Run NTP on
   every gateway host as ordinary hygiene; the request-quota ladder no longer
-  rests on it. **If the endpoint's ACL refuses `TIME`** the client falls back to
-  local-clock mode with a sampled warning, and the weaker contract applies:
-  gateways sharing one Redis quota must then keep their clocks within one
-  sub-bucket of each other (`window_seconds / 16`; 62.5ms for a one-second
-  window), and that contract does admit double admission when it is violated.
+  rests on it. A stale reply cannot move the base: the offset a transaction
+  teaches is adopted only when that transaction's own reply arrived inside one
+  sub-bucket of the tightest window it charged, and otherwise the previous
+  offset stands while settlement still judges the charge against the server
+  instant the reply carried.
   **Operational note:** the late rebuild triggers when the server applies a
   transaction a whole sub-bucket after its bucket was selected — phase-dependent,
   so one to two sub-buckets (roughly 62.5–125ms for a one-second window, half
@@ -130,31 +138,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   badly overloaded Redis will rebuild on most sub-minute-window requests and
   eventually refuse; those refusals are routed as an unavailable centralized
   store through `redis_failure_policy`, not as quota refusals.
-- **Redis request quotas: an unreadable `TIME` probe no longer weakens the
-  contract silently.** Only two probe answers select local-clock mode — a
-  `NOPERM`, and an `ERR unknown command` from a server that does not implement
-  `TIME`. A reply that is not a clock (a server answering `+OK` to `TIME`), a
-  probe timeout, or a transport failure is now treated as a connection that
-  could not be screened, exactly like a failed `INFO CLUSTER` screen: the socket
-  is discarded and `redis_failure_policy` governs the decision. Previously all of
-  those collapsed into local-clock mode and the connection was published as
-  screened, so an explicit `fail_closed` policy could keep admitting against an
-  endpoint that could not answer its own clock.
-- **Redis request quotas: changing clock mode is now a coherent, quarantined
-  transition.** The two modes have exactly one bucket base each — raw local, or
-  local plus the learned offset — and a gateway no longer mixes them. When
-  `TIME` is revoked at runtime the learned offset is **cleared**, so an existing
-  gateway and a gateway created after the revocation select identical
-  sub-buckets; previously the existing one kept applying its offset while the
-  new one used raw local time, which with a large offset put them on disjoint
-  ladders that could each admit the full shared quota even with perfectly
-  synchronized host clocks. When the base moves by more than one sub-bucket,
-  centralized enforcement is additionally held through `redis_failure_policy`
-  for one window (the widest that gateway has charged) so charges keyed on the
-  previous base age out first, with a sampled warning; the same applies when
-  `TIME` is granted again. A mid-flight `NOPERM` also marks the endpoint
-  unavailable and clears its connections, so it is a mode change recorded on the
-  way through an outage rather than a downgrade that keeps serving in place.
+- **Redis request quotas: `TIME` is REQUIRED, and there is no local-clock
+  mode.** Every connection probes `TIME` once, standalone, before it may carry a
+  policy command, and **every** unsuccessful answer — a `NOPERM`, an
+  `ERR unknown command` from a server that does not implement `TIME`, a reply
+  that is not a clock (a server answering `+OK`), a probe timeout, a transport
+  failure — discards that connection exactly like a failed `INFO CLUSTER` screen
+  and marks the client unavailable, so `redis_failure_policy` governs every
+  decision on that endpoint (`local_fallback` enforces the configured quota once
+  per gateway process; `fail_closed` refuses with `503`). Earlier drafts of this
+  release let a `NOPERM` or an unimplemented `TIME` select a "local-clock mode"
+  that kept serving centralized admissions against buckets picked from each
+  gateway's own wall clock, under a weaker documented skew contract and with a
+  quarantined transition between the two bases. That mode, its `window/16` skew
+  contract and its transition machinery are gone: a ladder selected on an
+  uncorrected local clock is not a shared budget, and serving one quietly is
+  enforcement in name only. A `NOPERM` and an unknown command still pick the
+  *diagnostic* — the warning names `+time` — but not the outcome, and a `TIME`
+  revoked mid-flight needs no special case, because the aborted `EXEC` is an
+  ordinary command failure whose reconnect re-probes and refuses to publish the
+  socket. Because the probe is part of connection screening rather than of one
+  caller, the requirement applies to **every** plugin that opens a Ferrum Redis
+  client, including `request_deduplication` and `soap_ws_security`'s shared
+  replay authority, which never read the clock themselves. Grant `+time` (or the
+  `@slow`/`@fast` category that already contains it) before upgrading.
+  Replay-authority clients publish only a fixed classification
+  (`server_clock_denied`, `server_clock_unreadable`,
+  `server_clock_unavailable`) beside the redacted endpoint for these failures,
+  never the backend's error text.
 - **`rate_limiting` fallback attribution follows the decision, not the client's
   reachability.** A per-decision fallback — a sub-bucket rollover that refused
   twice, or a reply the gateway could not pair with its windows — routes one
@@ -180,11 +191,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than a previous/current pair. The keyspace command set (`GET`, `INCR`,
   `DECR`, `EXPIRE`, `MULTI`, `EXEC`) and the key prefix are unchanged, but the
   server-clock contract above adds one **new** command: **restrictive Redis ACLs
-  must grant `TIME`** (`+time`, or the category that already contains it) for
-  request-quota policies. An ACL that omits it does not fail admission — each
-  connection probes `TIME` once before it carries a policy command, and a
-  `NOPERM` (or an unimplemented `TIME`) selects local-clock mode with a sampled
-  warning and the weaker clock contract. An in-place upgrade also starts new counters: expect up
+  must grant `TIME`** (`+time`, or the category that already contains it). An
+  ACL that omits it makes the endpoint unavailable for every Ferrum Redis
+  client: each connection probes `TIME` once before it carries a policy command,
+  and a `NOPERM` (or an unimplemented `TIME`) discards that connection so
+  `redis_failure_policy` governs. An in-place upgrade also starts new counters: expect up
   to one window of reduced enforcement while the ladder fills, and during a
   rolling upgrade old and new replicas count against separate keys until every
   replica is on the new build. Abandoned counters expire on their own TTL.

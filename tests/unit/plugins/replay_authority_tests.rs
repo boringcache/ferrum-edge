@@ -3035,6 +3035,7 @@ const SENTINEL_PREFIX: &str = "SENTINEL-KEY-PREFIX-r149";
 const SENTINEL_AUTH_ERR: &str = "SENTINEL-AUTH-ERR-r149";
 const SENTINEL_CMD_ERR: &str = "SENTINEL-CMD-ERR-r149";
 const SENTINEL_MOVED_HOST: &str = "SENTINEL-MOVED-HOST-r149";
+const SENTINEL_TIME_ERR: &str = "SENTINEL-TIME-ERR-r5584";
 
 #[derive(Clone, Copy)]
 enum LoggingShape {
@@ -3042,6 +3043,10 @@ enum LoggingShape {
     CommandError,
     ClusterInfo,
     ClusterMoved,
+    /// The standalone `TIME` screen answers an ordinary `-ERR`. `TIME` is a
+    /// hard requirement, so the connection is rejected — and the rejection must
+    /// not carry the backend's text into a replay client's logs.
+    TimeError,
 }
 
 async fn spawn_logging_redis_server(
@@ -3093,6 +3098,9 @@ async fn spawn_logging_redis_server(
                                 LoggingShape::CommandError if resp_contains(chunk, SET_CMD) => {
                                     format!("-ERR {SENTINEL_CMD_ERR}\r\n").into_bytes()
                                 }
+                                LoggingShape::TimeError if resp_contains(chunk, TIME_CMD) => {
+                                    format!("-ERR {SENTINEL_TIME_ERR}\r\n").into_bytes()
+                                }
                                 _ if resp_contains(chunk, INFO_CMD) => {
                                     replay_info_reply(chunk).expect("INFO chunk")
                                 }
@@ -3143,6 +3151,7 @@ fn assert_sentinels_absent(logs: &str, context: &str) {
         SENTINEL_AUTH_ERR,
         SENTINEL_CMD_ERR,
         SENTINEL_MOVED_HOST,
+        SENTINEL_TIME_ERR,
     ] {
         assert!(
             !logs.contains(sentinel),
@@ -3175,6 +3184,16 @@ async fn replay_client_logs_only_classification_and_redacted_endpoint() {
             "topology_command",
             LoggingShape::ClusterMoved,
             "unsupported_topology",
+        ),
+        // The shared `TIME` screen runs on every connection this client
+        // establishes, including the ones that never read a clock, and `TIME`
+        // is a hard requirement. An ordinary `-ERR` there rejects the socket,
+        // and that rejection must go through the same classification-only
+        // logger as every other replay-backend failure.
+        (
+            "server_clock",
+            LoggingShape::TimeError,
+            "server_clock_unavailable",
         ),
     ] {
         let (port, probes, shutdown) = spawn_logging_redis_server(shape).await;
@@ -3226,6 +3245,20 @@ async fn replay_client_logs_only_classification_and_redacted_endpoint() {
                     ReplayAdmission::AuthorityUnavailable,
                     "{label}: sentinel backend must fail closed"
                 );
+            }
+            LoggingShape::TimeError => {
+                // The connection is rejected at the screen, so the client never
+                // becomes available and the claim fails closed.
+                assert_eq!(
+                    authority.admit(&marker).await,
+                    ReplayAdmission::AuthorityUnavailable,
+                    "{label}: a backend that cannot answer TIME must fail closed"
+                );
+                wait_until(
+                    || logs.contents().contains(expected_class),
+                    &format!("{label}: probe classification"),
+                )
+                .await;
             }
         }
         drop(guard);

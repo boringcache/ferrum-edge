@@ -661,26 +661,34 @@ on a native-gRPC request.
   (`REDIS_WINDOW_TRAILING_SUB_BUCKETS`), and the ONE AFTER it — 19 keys per
   window, every bucket at face value (`redis_trailing_window_count`). No decay
   term, no Lua. The trailing 18 of those counters span
-  `window + (1 + f) * (window / K)`, which is why the error is bounded BOTH
+  `window + (1 + f) * (window / K)` from the reader's SELECTION instant and up
+  to `window + 3 * (window / K)` from the instant Redis EXECUTES it (settlement
+  admits a reader that selected `s - 1`), which is why the error is bounded BOTH
   ways: every charge executed inside the reader's trailing window is covered
-  (fail closed against a boundary-clustered burst) and at most TWO sub-buckets
+  (fail closed against a boundary-clustered burst) and at most THREE sub-buckets
   of older history are over-counted. Do NOT replace this with
   `previous + current`: that counts up to two whole windows and refuses a
   well-behaved client for a whole window after every window it fills — roughly
   half its quota at EVERY limit, permanently.
-- The over-count has a real, per-limit cost and every document must state it,
-  never an unconditional "8/9". A client at exactly its configured rate `L`
-  keeps about `L / (L + ceil(2L / K))`: `1/2` at `L = 1`, `2/3` at `L = 2`,
-  `8/9` at `L = 8`, ~89% at `L = 100`. Those are the same figures the retired
-  `K = 8` / `K + 2`-key ladder had — `K` was doubled to 16 precisely so that
-  adding the extra OLD counter would not widen the penalty. The quantisation is
-  inherent to counting the oldest bucket in full and is NOT a regression (the
+- The over-count has a real, per-limit cost and every document must state it as
+  a BOUND, never an unconditional "8/9" and never the narrower selection-time
+  figure. A client at exactly its configured rate `L` keeps AT LEAST
+  `L / (L + ceil(3L / K))`: `1/2` at `L = 1`, `2/3` at `L = 2`, `8/10` at
+  `L = 8`, ~84% at `L = 100`. The third sub-bucket is the reader's own placement
+  lag: a charge is keyed at its SELECTION bucket while the reader counts from
+  its EXECUTION bucket, so the widest coverage needs the reader to straddle a
+  boundary the charges it counts did not. A homogeneous stream — every request
+  carrying the same placement lag — sees `L / (L + ceil(2L / K))` (`8/9` at
+  `L = 8`) instead; that is the better case, not the contract. The quantisation
+  is inherent to counting the oldest bucket in full and is NOT a regression (the
   retired weighted estimate halved `L = 1` too). Do NOT "fix" it by decaying the
   oldest sub-bucket on a timestamp — that reopens the boundary-burst
   over-admission this layout exists to close, because a burst clustered at the
   END of the oldest sub-bucket would be discounted while still live. The
-  deterministic models in `tests/unit/plugins/redis_rate_limiter_tests.rs` pin
-  the exact figures for `L = 1, 2, 8` on sub-bucket edges.
+  deterministic models in `tests/unit/plugins/redis_rate_limiter_tests.rs` take
+  SEPARATE selection and execution instants (`execution = selection + latency`)
+  and pin both figures for `L = 1, 2, 8` on sub-bucket edges; a model that uses
+  one instant for both cannot establish the production bound.
 - BOTH extra sub-bucket reads are correctness requirements, not padding, and
   neither substitutes for the other.
   - FORWARD (`b + 1`): bucket selection precedes connection acquisition, so a
@@ -736,47 +744,45 @@ on a native-gRPC request.
   Do NOT reintroduce a local post-`EXEC` sample: reply latency after `EXEC` is
   harmless (a later peer reads this request's own increment) while execution
   latency before it is the hazard, and conflating them rebuilt ladders for
-  nothing. The honest statement of the residual is: (a) in server-clock mode no
-  charge executed inside a reader's trailing window is ever missing from its
-  ladder; (b) residual over-admission is ONE gateway's concurrent in-flight
-  requests during the two-pass rebuild window; (c) local-clock mode keeps the
-  weaker "gateways within one sub-bucket of each other" contract and does admit
-  counterexamples when it is violated. NTP is host hygiene now, not the
+  nothing. The honest statement of the residual is: (a) no charge executed
+  inside a reader's trailing window is ever missing from its ladder; (b)
+  residual over-admission is ONE gateway's concurrent in-flight requests during
+  the two-pass rebuild window. NTP is host hygiene now, not the
   correctness anchor. The retired `{tag}:{window_index}` layout tolerated a full
   `window_seconds` of skew; the upgrade note lives in `docs/plugins.md`.
-- `TIME` is a NEW required command for restrictive Redis ACLs, and it is probed
-  ONCE per established connection with a plain standalone `TIME`
-  (`probe_server_time`, called from `screen_and_arm`) — never trialled inside
-  `MULTI`, because a denied command there aborts the whole `EXEC`. EXACTLY TWO
-  replies may select LOCAL-CLOCK MODE: `NOPERM` (`is_permission_denied_error`)
-  and `ERR unknown command` (`is_unknown_command_error`). Those are not outages
-  and must not mark the client unavailable. Everything else — a malformed
-  successful reply (`+OK` to `TIME`), a timeout, a transport error, any other
-  server error — is a connection that could NOT be screened: report it through
-  `note_command_failure` / `mark_unavailable`, leave the connection unpublished,
-  and let `redis_failure_policy` decide. Do not collapse them back into a silent
-  mode downgrade. In local-clock mode no `TIME` is queued and the weaker
-  documented contract applies (gateway clocks within `window_seconds / K` of
-  each other). A mid-flight ACL revocation is detected on the aborted
-  transaction (`is_permission_denied_error`); it records the new verdict AND
-  marks the endpoint unavailable through `note_command_failure`, so it is a mode
-  change recorded on the way through an outage, never a downgrade that keeps
-  serving on the same connection. `docs/plugins.md` and the CHANGELOG must keep
-  listing `TIME` as required for the server-clock mode.
-- CLOCK-MODE TRANSITIONS ARE COHERENT AND QUARANTINED. ONE clock base per mode:
-  local-clock mode selects on the RAW local clock, so a downgrade CLEARS the
-  learned offset (`RedisServerClock::clear_offset`). Never let an existing
-  client keep applying a large offset while a newly created client selects raw
-  local buckets — perfectly synchronized gateways would then hold disjoint
-  ladders and each admit the full shared quota. When the base moves by more than
-  one sub-bucket of the narrowest window this client has charged, enforcement is
-  held through `redis_failure_policy` for the WIDEST window it has charged
-  (`begin_clock_quarantine`; `is_available()` reads false, and
-  `charge_rate_limit_windows` re-checks after establishing the connection,
-  because establishing it is what runs the probe). The same quarantine applies
-  on re-permission. The windows are learned on the charge path
-  (`RedisServerClock::observe_window`), so a client that never charged has
-  nothing to age out and is not quarantined.
+- A STALE REPLY MUST NOT MOVE THE BASE. `charge_rate_limit_windows` samples the
+  local clock on BOTH sides of `query_async` and folds the `TIME` into the
+  offset only while `clock_sample_is_prompt(reply_latency, narrowest window this
+  transaction charged)` — one sub-bucket of the tightest ladder. Past that the
+  previous offset stands; the charge is still judged by settlement against the
+  server instant the reply carried, which owes nothing to the offset. The
+  narrowest window is computed FROM THAT TRANSACTION's windows — never from
+  client-lifetime min/max bookkeeping, which was a lost-update hazard and is
+  gone. The standalone probe's sample is the one exception (it is the seed,
+  there is no previous offset, and it is bounded by the screened per-command
+  deadline).
+- `TIME` IS REQUIRED. THERE IS NO LOCAL-CLOCK MODE. It is probed ONCE per
+  established connection with a plain standalone `TIME` (`probe_server_time`,
+  called from `screen_and_arm`) — never trialled inside `MULTI`, because a
+  denied command there aborts the whole `EXEC`. EVERY unsuccessful answer —
+  `NOPERM`, `ERR unknown command`, a malformed successful reply (`+OK` to
+  `TIME`), a timeout, a transport error, any other server error — leaves the
+  connection UNUSABLE: `mark_unavailable` / `note_command_failure`, the socket
+  is never published, and `redis_failure_policy` decides
+  (`local_fallback` = per-process budgets, `fail_closed` = refuse). Do NOT
+  reintroduce a mode, a base transition, a quarantine, or a weaker documented
+  skew contract: a ladder selected on an uncorrected local clock is not a shared
+  budget. `is_permission_denied_error` / `is_unknown_command_error` survive only
+  to pick the DIAGNOSTIC (tell the operator to grant `+time`); they never pick
+  an outcome. A mid-flight revocation needs no special case — the aborted `EXEC`
+  is an ordinary command failure and the reconnect re-probes. Because the probe
+  is connection screening, the requirement reaches EVERY consumer of
+  `RedisRateLimitClient`, including `request_deduplication` and the shared
+  replay authority; those clients' probe failures publish a fixed classification
+  (`server_clock_denied` / `server_clock_unreadable` /
+  `server_clock_unavailable`) through `warn_replay_backend`, never the raw
+  backend text. `docs/plugins.md` and the CHANGELOG must keep listing `TIME` as
+  mandatory.
 - Every configured window derives its bucket from the SAME instant, and the
   rebuild reuses the server instant that proved the rollover rather than reading
   any clock again. No `f64` anywhere on the quota path. Token-accounting paths
@@ -812,7 +818,7 @@ on a native-gRPC request.
   `Vec`s, so one transaction touches at most
   `MAX_REDIS_ADMISSION_WINDOWS * (REDIS_WINDOW_SUB_BUCKETS + 3)` keys (3 × 19 =
   57) — eighteen `GET`s, one `INCR`, and one ignored `EXPIRE` per window, plus
-  ONE `TIME` per transaction in server-clock mode (validate the reply length for
+  ONE `TIME` per transaction, unconditionally (validate the reply length for
   exactly that shape; an unreadable counter or an unreadable server clock is an
   unusable endpoint, never a zero). Each
   window packs its whole key ladder into ONE `String` allocation
@@ -841,7 +847,7 @@ on a native-gRPC request.
   Naming the window in the quota key keeps two windows of one policy on provably
   disjoint ladders. Changing this layout restarts counters on an in-place
   upgrade, so it needs a CHANGELOG note; the keyspace command set is unchanged,
-  but the server-clock mode additionally requires `TIME` (see the clock contract
+  but the server clock additionally requires `TIME` (see the clock contract
   above). Default prefix is
   `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` — the config-id component
   isolates independent policies of one plugin type inside a namespace while

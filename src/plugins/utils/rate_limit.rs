@@ -2248,9 +2248,11 @@ fn check_http_windows(
 /// per window, one `MULTI`/`EXEC`, one round trip.
 ///
 /// The trailing `K + 2` of those counters span `window + (1 + f) * (window / K)`
-/// of wall clock, where `f` is how far into its own sub-bucket the request
-/// arrived. That bounds the error in both directions against an exact
-/// trailing-window cap:
+/// of wall clock measured from the reader's SELECTION instant, where `f` is how
+/// far into its own sub-bucket the request arrived — and up to
+/// `window + 3 * (window / K)` measured from the instant the server EXECUTES
+/// it, because settlement admits a reader that selected `s - 1`. That bounds
+/// the error in both directions against an exact trailing-window cap:
 ///
 /// - **Counts every charge executed inside its trailing window.** Settlement
 ///   below is two-sided, so every charge that survives is keyed in
@@ -2261,10 +2263,10 @@ fn check_http_windows(
 ///   previous bucket's traffic was spread evenly through it, so a burst at that
 ///   bucket's END was discounted in proportion to how far the current window
 ///   had run — admitting a second burst while the first was still live.
-/// - **Over-counts by at most two sub-buckets** of older history (`2 / K` of a
-///   window, i.e. one eighth at `K = 16`). A bare `previous + current` sum
-///   would instead count up to two whole windows, which settles at roughly half
-///   the configured rate for every limit, indefinitely.
+/// - **Over-counts by at most three sub-buckets** of older history (`3 / K` of
+///   a window, i.e. three sixteenths at `K = 16`). A bare `previous + current`
+///   sum would instead count up to two whole windows, which settles at roughly
+///   half the configured rate for every limit, indefinitely.
 ///
 /// What it does NOT promise: that a well-behaved client always gets its nominal
 /// rate (see below), and that concurrent gateways can never over-admit at all
@@ -2275,20 +2277,30 @@ fn check_http_windows(
 ///
 /// Counting the oldest sub-buckets in full means the ladder covers MORE than
 /// the exact trailing window, so a client sending at EXACTLY its configured
-/// rate is throttled. The extra history counted is at most two sub-buckets — up
-/// to `ceil(2 * limit / K)` requests — so the steady-state admitted fraction at
-/// exactly the configured rate is about `limit / (limit + ceil(2 * limit / K))`:
-/// `1/2` at `limit = 1`, `2/3` at `limit = 2`, `8/9` at `limit = 8`, about 89%
-/// at `limit = 100`. That is the same cost the narrower `K = 8` ladder had; `K`
-/// was doubled precisely so the extra old counter would not widen it. The
-/// penalty falls hardest on small quotas, and it is inherent to any bucketed
-/// counter that counts its oldest bucket at face value. It is not a regression
-/// — the retired weighted estimate refused a `1/s` client polling every `1.05s`
-/// every other request too — and it is deliberately not fixed by decaying the
-/// oldest sub-bucket on a timestamp, which would reopen the boundary-burst
-/// over-admission above. Operators who need a small quota to admit its full
-/// nominal rate should configure the quota over a longer window (`10` per `10s`
-/// rather than `1` per `1s`).
+/// rate is throttled. The extra history counted is at most three sub-buckets —
+/// up to `ceil(3 * limit / K)` requests — so the steady-state admitted fraction
+/// at exactly the configured rate is at least
+/// `limit / (limit + ceil(3 * limit / K))`: `1/2` at `limit = 1`, `2/3` at
+/// `limit = 2`, `8/10` at `limit = 8`, about 84% at `limit = 100`.
+///
+/// The third sub-bucket is the reader's own PLACEMENT LAG. A charge's key is
+/// its selection bucket, and settlement deliberately admits a transaction the
+/// server applies one bucket later, so a reader executing at `s` may be reading
+/// a ladder built around `s - 1` while the charges it counts were keyed at the
+/// bucket they executed in. A stream whose requests all carry the same
+/// placement lag is better off — `limit / (limit + ceil(2 * limit / K))`, so
+/// `8/9` at `limit = 8` — because the widest coverage needs the reader to
+/// straddle a boundary that the charges it counts did not. Every document
+/// states the BOUND, not the better case.
+///
+/// The penalty falls hardest on small quotas, and it is inherent to any
+/// bucketed counter that counts its oldest bucket at face value. It is not a
+/// regression — the retired weighted estimate refused a `1/s` client polling
+/// every `1.05s` every other request too — and it is deliberately not fixed by
+/// decaying the oldest sub-bucket on a timestamp, which would reopen the
+/// boundary-burst over-admission above. Operators who need a small quota to
+/// admit its full nominal rate should configure the quota over a longer window
+/// (`10` per `10s` rather than `1` per `1s`).
 ///
 /// ## The bucket clock is Redis's, not this gateway's
 ///
@@ -2322,14 +2334,14 @@ fn check_http_windows(
 /// abandoned pass. That is bounded by one gateway's concurrency, not by fleet
 /// size or by clock discipline.
 ///
-/// When the endpoint's ACL denies `TIME`, the client runs in local-clock mode
-/// and the weaker contract applies — gateways sharing the quota must keep their
-/// clocks within one sub-bucket of each other. That contract is a real
-/// constraint, not a formality: two gateways `window / K` apart can select
-/// ladders far enough apart to admit twice inside one trailing window. In that
-/// mode every client selects on the RAW local clock, with no offset applied at
-/// all, so a client that was in server-clock mode earlier does not keep its own
-/// base (see `RedisRateLimitClient::degrade_to_local_clock`).
+/// `TIME` is a hard requirement, not a preference. A connection whose `TIME`
+/// probe answers a `NOPERM`, an unknown command, a non-clock, a timeout, or a
+/// transport failure is discarded unpublished and the client is marked
+/// unavailable, so a deployment whose ACL omits `+time` gets exactly the
+/// `redis_failure_policy` it configured — per-process budgets under
+/// `local_fallback`, refusals under `fail_closed`. There is deliberately no
+/// local-clock mode: a ladder selected on an uncorrected local clock is not a
+/// shared budget, and serving one quietly would be enforcement in name only.
 ///
 /// ## Stale and future bucket selection
 ///
@@ -2455,12 +2467,14 @@ async fn check_http_windows_redis(
         // applied past `b + 1` (still inside the 500ms screened response timeout
         // for a one-second window), where a peer may have charged a bucket this
         // ladder neither read nor charged, and one applied BEFORE `b`, where
-        // this charge sits in a bucket no peer's trailing window reaches. In
-        // local-clock mode there is no server sample and the raw local clock
-        // stands in.
-        let settled_at = match charged.settled_at() {
-            Some(server_now) => server_now,
-            None => redis.server_clock().now(),
+        // this charge sits in a bucket no peer's trailing window reaches.
+        let Some(settled_at) = charged.settled_at() else {
+            // Unreachable: `specs` is non-empty above, so the transaction
+            // carried its `TIME`, and a connection that could not answer one
+            // was never published. There is no local clock to stand in — that
+            // is the whole point — so fail closed rather than judge a ladder
+            // against no clock at all.
+            return Err(());
         };
         // Two-sided: a charge the server applied BEFORE the bucket it was keyed
         // to is invisible to every peer reading its own trailing window, and a
