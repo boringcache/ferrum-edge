@@ -67,6 +67,7 @@ pub use frontend_reload::{
 pub use spiffe::{
     SharedBundleSlot, SpiffeClientCertResolver, SpiffeServerCertResolver, SpiffeTlsError,
     build_spiffe_client_cert_verifier, build_spiffe_inbound_config, build_spiffe_outbound_config,
+    shared_bundle_slot,
 };
 
 use rustls::ServerConfig;

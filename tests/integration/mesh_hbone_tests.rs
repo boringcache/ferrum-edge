@@ -245,6 +245,15 @@ pub(super) struct HboneMtlsCerts {
     client_key_der: rustls::pki_types::PrivateKeyDer<'static>,
 }
 
+impl HboneMtlsCerts {
+    /// The issuing CA, DER-encoded: the anchor a chain minted here builds a
+    /// path to. Sibling suites need it to publish an inbound SPIFFE trust
+    /// bundle that actually admits this fixture's client leaf.
+    pub(super) fn ca_der(&self) -> Vec<u8> {
+        self.ca_der.to_vec()
+    }
+}
+
 pub(super) fn generate_hbone_mtls_certs(client_spiffe: &str) -> HboneMtlsCerts {
     use rcgen::{
         BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
@@ -291,6 +300,12 @@ pub(super) fn generate_hbone_mtls_certs(client_spiffe: &str) -> HboneMtlsCerts {
         KeyUsagePurpose::KeyEncipherment,
     ];
     client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    // A real SVID carries a finite `notAfter`, and rcgen's default (year 4096)
+    // converts to a monotonic deadline only on platforms whose `Instant` is
+    // seconds-based. An explicit, comfortably-in-range expiry keeps the
+    // admitted credential's deadline the SAME shape on every host, which the
+    // HBONE admission fence's credential capture asserts on (issue #5568).
+    client_params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365);
     let client_cert = client_params
         .signed_by(&client_key, &issuer)
         .expect("client leaf");

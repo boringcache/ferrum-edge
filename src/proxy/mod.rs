@@ -8267,15 +8267,48 @@ impl ProxyState {
     /// Idempotent: when the published admission is already live and already
     /// carries this exact snapshot, nothing is stored and the trust generation
     /// does not advance, so ordinary reloads and repeated commits are free.
+    ///
+    /// This is the ONE place the request-facing gateway trust generation
+    /// advances, and every trust publisher —
+    /// `commit_gateway_trust_generation_locked` for an accepted
+    /// `Replace`/`Clear`, `install_gateway_runtime_svid_bundle` for a SPIRE /
+    /// file / CA-backend source rotation, and the epoch publication above —
+    /// ends here, so one call site covers them all.
+    ///
+    /// It requests an HBONE admission-fence sweep, but NOT because it decides
+    /// the credential verdict: since issue #5568's review, the fence judges a
+    /// live tunnel's chain against the inbound mTLS verifier's own trust slot
+    /// (`ProxyState::publish_mesh_inbound_trust_bundle`), because that is the
+    /// material the peer's next handshake would apply and this epoch's bundles
+    /// are not. The sweep stays here as the defence-in-depth half of a
+    /// two-publication step: the gateway trust epoch and the inbound slot are
+    /// written by different code, in that order, so a publication of the first
+    /// without the second must cost one cheap pass rather than a missed one.
+    /// It is cheap precisely because the trust re-verification is keyed on the
+    /// slot's own revision — a sweep from here that the slot did not follow
+    /// does no certificate path building at all.
+    ///
+    /// The sweep is requested AFTER the store, which is the same
+    /// publish-then-recheck ordering `publish_mesh_inbound_tls_policy` relies
+    /// on: a CONNECT that read the superseded state necessarily captured a
+    /// stale sweep counter too, and `HboneAdmissionFence::admit` turns that
+    /// into a fresh sweep. [`Self::fence_gateway_trust_generation`] deliberately
+    /// does NOT sweep — fencing carries the same material forward, so there is
+    /// nothing a re-check could decide differently, and sweeping
+    /// mid-publication would only judge tunnels against the outgoing
+    /// generation.
     fn publish_live_gateway_trust(&self) {
         let svid = self.gateway_svid_bundle.load_full();
-        let _committed = self.request_epoch.update_gateway_trust(|current| {
+        let committed = self.request_epoch.update_gateway_trust(|current| {
             let published = current.gateway_trust();
             if published.is_live() && Arc::ptr_eq(published.svid(), &svid) {
                 return None;
             }
             Some(published.committed(Arc::clone(&svid)))
         });
+        if committed.is_some() {
+            self.hbone_admission_fence.request_sweep();
+        }
     }
 
     /// Whether request paths may authenticate gateway-to-mesh peers right now.
@@ -8803,6 +8836,45 @@ impl ProxyState {
     pub fn publish_mesh_inbound_tls_policy(&self, policy: MeshInboundTlsPolicy) {
         self.mesh_inbound_tls_policy.store(Arc::new(policy));
         self.hbone_admission_fence.request_sweep();
+    }
+
+    /// Bind the mesh inbound SPIFFE verifier's trust slot to the HBONE
+    /// admission fence (issue #5568).
+    ///
+    /// Mesh startup calls this for the ONE slot
+    /// `mesh_inbound_spiffe_verifier` reads, at the moment it is created and
+    /// before anything can be published into it. The fence's credential gate
+    /// judges both live tunnels and arriving CONNECTs against exactly those
+    /// anchors, because the fence answers "would this still be admitted" and
+    /// admission is what that verifier decides. Idempotent for the same slot.
+    pub fn install_mesh_inbound_admission_trust(&self, slot: &crate::tls::SharedBundleSlot) {
+        self.hbone_admission_fence
+            .install_inbound_admission_trust(slot);
+    }
+
+    /// Publish the mesh inbound SPIFFE verifier's trust bundle.
+    ///
+    /// This is the ONE way that slot changes: the store is followed by an HBONE
+    /// admission-fence sweep, so a live tunnel whose peer chain no longer
+    /// anchors in the material the next handshake would apply is revoked
+    /// (`peer_trust`) instead of outliving the trust that admitted it, and the
+    /// peer's next CONNECT on that same pooled session is refused rather than
+    /// re-admitted. A direct `slot.store()` skips the sweep AND leaves the
+    /// fence's in-force trust — its skip key for certificate path building, and
+    /// the anchors the CONNECT gate reads — behind the bytes the verifier is
+    /// serving, which would make the gate stop re-checking.
+    ///
+    /// A candidate that does not compile as ONE atomic set is stored (the same
+    /// slot backs the inbound listener's server identity) but does not take
+    /// force: the inbound verifier keeps its last-known-good set in exactly that
+    /// case, so the fence must too.
+    pub fn publish_mesh_inbound_trust_bundle(
+        &self,
+        slot: &crate::tls::SharedBundleSlot,
+        bundle: Arc<Option<SvidBundle>>,
+    ) {
+        self.hbone_admission_fence
+            .publish_inbound_admission_trust(slot, bundle);
     }
 
     /// Republish only the captured-listener-port → application-port alias table,
