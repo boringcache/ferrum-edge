@@ -4658,7 +4658,7 @@ impl MetricsRegistry {
 
         if !self.hbone_tunnel_revocation_counter.is_empty() {
             output.push_str(
-                "# HELP ferrum_mesh_hbone_tunnel_revocations_total Live HBONE tunnels revoked by the admission fence because the current policy generation or peer credential would no longer admit their CONNECT.\n",
+                "# HELP ferrum_mesh_hbone_tunnel_revocations_total Live HBONE tunnels revoked by the admission fence because the current policy generation, peer credential, or enforced revocation list would no longer admit their CONNECT.\n",
             );
             output.push_str("# TYPE ferrum_mesh_hbone_tunnel_revocations_total counter\n");
             for entry in self.hbone_tunnel_revocation_counter.iter() {

@@ -243,7 +243,16 @@ pub(super) struct HboneMtlsCerts {
     server_key_der: rustls::pki_types::PrivateKeyDer<'static>,
     client_cert_der: rustls::pki_types::CertificateDer<'static>,
     client_key_der: rustls::pki_types::PrivateKeyDer<'static>,
+    /// The issuing CA, retained so a sibling suite can sign a CRL with the very
+    /// key that issued the client leaf (issue #5574). A CRL signed by anything
+    /// else is not authoritative for this chain and webpki ignores it, which
+    /// would make a revocation test pass for the wrong reason.
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
 }
+
+/// The client leaf's pinned serial, so a CRL can name it. rcgen would otherwise
+/// pick a random one, and a revocation test cannot name what it cannot predict.
+pub(super) const HBONE_CLIENT_LEAF_SERIAL: u64 = 0x5b10;
 
 impl HboneMtlsCerts {
     /// The issuing CA, DER-encoded: the anchor a chain minted here builds a
@@ -251,6 +260,53 @@ impl HboneMtlsCerts {
     /// bundle that actually admits this fixture's client leaf.
     pub(super) fn ca_der(&self) -> Vec<u8> {
         self.ca_der.to_vec()
+    }
+
+    /// The client leaf this fixture's handshake presents, DER-encoded.
+    ///
+    /// Sibling suites need it to drive the production `verify_client_cert` for
+    /// the SAME peer a live tunnel was admitted for, so one assertion can cover
+    /// the handshake and the fence without a second identity.
+    pub(super) fn client_leaf_der(&self) -> Vec<u8> {
+        self.client_cert_der.to_vec()
+    }
+
+    /// An in-window CRL from this fixture's own CA revoking `serials`, for the
+    /// mesh inbound enforced CRL set (issue #5574).
+    ///
+    /// The window brackets now, so `enforce_revocation_expiration()` — which
+    /// the shared CRL policy always sets — accepts the record. Pass
+    /// [`HBONE_CLIENT_LEAF_SERIAL`] to revoke the client SVID this fixture's
+    /// handshake presents.
+    pub(super) fn signed_crl(
+        &self,
+        serials: &[u64],
+    ) -> rustls::pki_types::CertificateRevocationListDer<'static> {
+        let this_update = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let revoked_certs = serials
+            .iter()
+            .map(|serial| rcgen::RevokedCertParams {
+                serial_number: rcgen::SerialNumber::from(*serial),
+                revocation_time: this_update,
+                reason_code: Some(rcgen::RevocationReason::KeyCompromise),
+                invalidity_date: None,
+            })
+            .collect();
+        let params = rcgen::CertificateRevocationListParams {
+            this_update,
+            next_update: time::OffsetDateTime::now_utc() + time::Duration::days(30),
+            crl_number: rcgen::SerialNumber::from(1u64),
+            issuing_distribution_point: None,
+            revoked_certs,
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        };
+        rustls::pki_types::CertificateRevocationListDer::from(
+            params
+                .signed_by(&self.issuer)
+                .expect("sign CRL")
+                .der()
+                .to_vec(),
+        )
     }
 }
 
@@ -292,6 +348,7 @@ pub(super) fn generate_hbone_mtls_certs(client_spiffe: &str) -> HboneMtlsCerts {
     // Client leaf: carries the SPIFFE URI SAN as its identity.
     let client_key = KeyPair::generate().expect("client key");
     let mut client_params = CertificateParams::new(Vec::<String>::new()).expect("client");
+    client_params.serial_number = Some(rcgen::SerialNumber::from(HBONE_CLIENT_LEAF_SERIAL));
     client_params.subject_alt_names.push(SanType::URI(
         Ia5String::try_from(client_spiffe.to_string()).expect("spiffe uri san"),
     ));
@@ -318,6 +375,7 @@ pub(super) fn generate_hbone_mtls_certs(client_spiffe: &str) -> HboneMtlsCerts {
         client_cert_der: client_cert.der().clone(),
         client_key_der: rustls::pki_types::PrivateKeyDer::try_from(client_key.serialize_der())
             .expect("client key der"),
+        issuer,
     }
 }
 
@@ -331,6 +389,29 @@ pub(super) fn hbone_server_config(certs: &HboneMtlsCerts) -> Arc<rustls::ServerC
     let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
         .build()
         .expect("client verifier");
+    let mut cfg = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(
+            vec![certs.server_cert_der.clone()],
+            certs.server_key_der.clone_key(),
+        )
+        .expect("server config");
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    Arc::new(cfg)
+}
+
+/// [`hbone_server_config`] with a caller-supplied client-certificate verifier.
+///
+/// The plain form above builds a bare WebPKI verifier, which is enough to prove
+/// a CONNECT gate but says nothing about the verifier production actually
+/// installs. A revocation test needs the real one — the SPIFFE peer verifier
+/// bound to the shared inbound admission artifact — so that a rotation can be
+/// observed at the TLS handshake and not only through the fence (issue #5574).
+pub(super) fn hbone_server_config_with_client_verifier(
+    certs: &HboneMtlsCerts,
+    verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+) -> Arc<rustls::ServerConfig> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let mut cfg = rustls::ServerConfig::builder()
         .with_client_cert_verifier(verifier)
         .with_single_cert(
