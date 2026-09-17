@@ -6032,7 +6032,7 @@ jobs:
         # omit debuginfo (same as the test-artifact archives) to lower per-
         # process RSS and allow modest parallel compilation again.
         env:
-          CARGO_BUILD_JOBS: 2
+          CARGO_BUILD_JOBS: 1
         run: |
           cargo clippy \
             --config profile.test.debug=0 \
