@@ -260,6 +260,11 @@ Functional tests are ignored by default. Conformance reporter emits `target/conf
 ## Dependency Version Sync
 
 - `tests/performance/multi_protocol/` is not a workspace member and has its own lockfile.
+  The workspace `Tests` aggregate therefore never builds it; its own tests
+  (`tests/metrics_tests.rs`, `tests/test_benchmark_validity.py`) run in the
+  `Benchmark Harness Tests` workflow, which triggers on any change under
+  `tests/performance/multi_protocol/**`. Add new harness tests where that lane
+  reaches them.
 - Keep protocol deps aligned with root `Cargo.toml`. DTLS, H2, H3, QUIC, tonic, prost, rustls, and related crates can silently fail when versions drift.
 - When bumping a shared dependency, update the multi-protocol manifest and run `cd tests/performance/multi_protocol && cargo update -p <crate>`.
 - Preserve `# SYNC:` comments.
