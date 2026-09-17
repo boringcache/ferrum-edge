@@ -950,11 +950,13 @@ impl HboneInnerConnectionPool {
     /// streams on the OUTER sessions that same knob already widens, so letting
     /// the inner width exceed the fixed clamp would multiply the destination's
     /// held stream count without an operator ever asking for it.
+    ///
+    /// `clamp` cannot panic here: its bounds are the literal `1` and a
+    /// compile-time constant that is greater than it.
     fn shared_h2_width(pool_config: &PoolConfig) -> usize {
         pool_config
             .http2_connections_per_host
-            .max(1)
-            .min(MAX_SHARED_H2_PER_KEY)
+            .clamp(1, MAX_SHARED_H2_PER_KEY)
     }
 
     fn record(&self, protocol: HboneInnerProtocol, event: HboneInnerPoolEvent) {
