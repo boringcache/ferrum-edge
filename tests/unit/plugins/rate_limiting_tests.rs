@@ -1,9 +1,10 @@
 //! Tests for rate_limiting plugin
 
+use ferrum_edge::config::BackendScheme;
 use ferrum_edge::identity::SpiffeId;
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
-    rate_limiting::RateLimiting,
+    ALL_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, StreamConnectionContext,
+    priority, rate_limiting::RateLimiting,
 };
 use ferrum_edge::proxy::client_ip::{TrustedProxies, resolve_client_ip};
 use serde_json::{Value, json};
@@ -1856,6 +1857,73 @@ async fn local_fallback_policy_admits_while_redis_is_unavailable() {
         refusal.is_none(),
         "local_fallback must admit on per-process state, got {refusal:?}"
     );
+}
+
+fn stream_context() -> StreamConnectionContext {
+    StreamConnectionContext::new(
+        "203.0.113.7".to_string(),
+        "203.0.113.7".to_string(),
+        "rate-limit-stream-test".to_string(),
+        None,
+        9000,
+        BackendScheme::Tcp,
+        Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
+    )
+}
+
+#[tokio::test]
+async fn stream_local_fallback_marks_degraded_decision() {
+    use ferrum_edge::_test_support::rate_limiting_mark_redis_unavailable_for_test;
+    use ferrum_edge::plugins::prometheus_metrics::global_registry;
+
+    let plugin = make_rate_limiter(redis_rate_limit_config(json!({})));
+    assert!(rate_limiting_mark_redis_unavailable_for_test(&plugin));
+    let before = global_registry().render_uncached();
+
+    let mut ctx = stream_context();
+    assert_continue(plugin.on_stream_connect(&mut ctx).await);
+    assert_eq!(
+        ctx.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("ratelimit_local_fallback"))
+            .map(String::as_str),
+        Some("true")
+    );
+    let after = global_registry().render_uncached();
+    assert_ne!(
+        metric_value(&before, "ferrum_rate_limit_local_fallback_decisions_total"),
+        metric_value(&after, "ferrum_rate_limit_local_fallback_decisions_total")
+    );
+}
+
+#[tokio::test]
+async fn stream_fail_closed_records_enforcement_unavailable() {
+    use ferrum_edge::_test_support::rate_limiting_mark_redis_unavailable_for_test;
+    use ferrum_edge::plugins::prometheus_metrics::global_registry;
+
+    let plugin = make_rate_limiter(redis_rate_limit_config(json!({
+        "redis_failure_policy": "fail_closed"
+    })));
+    assert!(rate_limiting_mark_redis_unavailable_for_test(&plugin));
+    let before = global_registry().render_uncached();
+
+    let mut ctx = stream_context();
+    expect_reject(plugin.on_stream_connect(&mut ctx).await, 503);
+
+    let after = global_registry().render_uncached();
+    assert_ne!(
+        metric_value(&before, "ferrum_rate_limit_enforcement_unavailable_total"),
+        metric_value(&after, "ferrum_rate_limit_enforcement_unavailable_total")
+    );
+}
+
+fn metric_value(rendered: &str, name: &str) -> Option<u64> {
+    rendered.lines().find_map(|line| {
+        let (series, value) = line.split_once(' ')?;
+        series
+            .starts_with(name)
+            .then(|| value.parse::<u64>().ok())?
+    })
 }
 
 #[tokio::test]
