@@ -180,6 +180,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fail_closed` through the same disjunction as the HTTP path, and a missed
   deadline is now warned about independently of `log_to_stdout`, since messages
   carry no `waf.*` metadata.
+- **HBONE inner-connection reuse is now advertised only when every admitting
+  plugin is reuse-safe** (issue #5583). A mesh destination stamps
+  `x-ferrum-mesh-tunnel-reuse: fenced` on a CONNECT `200` only when the HBONE
+  admission fence really holds the tunnel **and** every plugin in the chain that
+  admitted that CONNECT declares `Plugin::allows_hbone_inner_reuse()`. Reuse
+  elides CONNECTs whose request attributes would have been identical, so the
+  only thing they could have decided differently is time-varying state — and the
+  fence re-issues exactly two kinds: the local authorize verdict, on every
+  published generation, and the peer's mTLS credential. Anything that charges an
+  operation, or authenticates the CONNECT with a bearer credential the fence
+  does not track, previously had its single CONNECT-time decision honoured for
+  every later operation the reused tunnel carried. The classification is
+  fail-closed by a literal `false` default that no other marker can change, so
+  every unclassified built-in and **every custom plugin** now refuses. Reusable
+  built-ins: `mesh_authz` (only while no external authorization provider is
+  bound to the generation — a sweep never re-consults one), `access_control`,
+  `spiffe_identity`, `workload_metrics`, `stdout_logging`,
+  `prometheus_metrics`, `otel_tracing`, `proxy_alerts`. Explicitly
+  non-reusable: `rate_limiting` (a token per operation, in every `limit_by`
+  mode), `adaptive_concurrency` (a permit), `request_mirror` (a shadow
+  dispatch). Datagram-over-HBONE tunnels never advertise at all. Of the
+  *mesh-injected* plugins: `jwks_auth` withholds the capability wherever a
+  `RequestAuthentication` is in play (correct and permanent — the fence bounds
+  the mTLS leaf, not a bearer token's own lifetime); `__mesh_bpf_metrics` is
+  classified reusable (it implements no request hook at all); and
+  `mesh_outbound_registry` (`outboundTrafficPolicy: REGISTRY_ONLY`) is
+  classified per INSTANCE, `!outbound_listen_ports.is_empty()`. It is injected
+  as a `PluginScope::Global` row and globals enter every proxy chain, so it is
+  in every inbound admitting chain; the outbound-port list gates the request
+  hook's ENFORCEMENT, not the plugin's membership. What keeps it out of the
+  CONNECT's decision is that its port gate is the first statement of the hook,
+  so a request on a port the instance does not name returns `Continue` before
+  any registry lookup, metric, or rejection — and auto-injection names exactly
+  the outbound-direction capture ports, while only an inbound listener
+  terminates an HBONE CONNECT. A blanket `false` would have withheld inbound
+  reuse mesh-wide on a REGISTRY_ONLY mesh and revoked every already-reusable
+  inbound tunnel when the policy was applied; a blanket `true` would have
+  granted reuse to an operator-managed UNSCOPED instance, which really does
+  enforce on the inbound listener, so that shape keeps the fail-closed default.
+- **A live HBONE tunnel loses inner reuse when its chain stops permitting it**
+  (issue #5583). The admission snapshot records whether reuse was advertised —
+  the same value the header was stamped from — and every admission-fence sweep
+  re-folds `Plugin::allows_hbone_inner_reuse` over the chain resolved for the
+  current generation. A tunnel that was advertised reusable and whose chain no
+  longer permits reuse is revoked with the new reason `reuse_withdrawn` on
+  `ferrum_mesh_hbone_tunnel_revocations_total`. Publishing a `CUSTOM`
+  `mesh_authz` policy or attaching `rate_limiting` previously left every
+  already-reusable tunnel carrying operations the new plugin never saw, because
+  a sweep re-issues only opted-in `authorize` verdicts and never a per-operation
+  charge or an external check. The fold is pure — no plugin hook runs during a
+  sweep — and tunnels admitted without the advertisement are untouched. The
+  operator-visible effect of any refusal is one CONNECT per operation, exactly
+  as before reuse existed. That restored per-operation admission **can** reject
+  or charge operations a reused tunnel previously carried without one; that is
+  the point of the change, and it is the only behaviour difference an operator
+  should expect.
 
 ## [0.9.5] - 2026-09-13
 

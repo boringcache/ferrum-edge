@@ -733,7 +733,12 @@ impl RateLimiting {
         PluginResult::Continue
     }
 
-    async fn check_rate_stream(&self, key: String, limit_op: &DynamicRateLimitOp) -> PluginResult {
+    async fn check_rate_stream(
+        &self,
+        key: String,
+        limit_op: &DynamicRateLimitOp,
+        ctx: &mut super::StreamConnectionContext,
+    ) -> PluginResult {
         self.maybe_evict_stale_entries();
         let Some(outcome) = self
             .limiter
@@ -745,12 +750,28 @@ impl RateLimiting {
             )
             .await
         else {
+            if self.limiter.local_fallback_active() {
+                ctx.metadata
+                    .get_or_insert_with(HashMap::new)
+                    .insert("ratelimit_local_fallback".to_string(), "true".to_string());
+                super::prometheus_metrics::global_registry()
+                    .record_rate_limit_local_fallback_decision();
+            }
             return self.reject_capacity();
         };
+        if outcome.local_fallback {
+            ctx.metadata
+                .get_or_insert_with(HashMap::new)
+                .insert("ratelimit_local_fallback".to_string(), "true".to_string());
+            super::prometheus_metrics::global_registry()
+                .record_rate_limit_local_fallback_decision();
+        }
         if !outcome.allowed {
             if outcome.enforcement_unavailable {
                 // See `check_rate`: the backend owns bounded outage
                 // observability, and a 503 is not a rate-limit exceedance.
+                super::prometheus_metrics::global_registry()
+                    .record_rate_limit_enforcement_unavailable();
                 return self.reject(&outcome);
             }
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
@@ -795,7 +816,7 @@ impl Plugin for RateLimiting {
     ) -> super::PluginResult {
         let key = self.stream_key(ctx);
         let limit_op = self.stream_limit_op(ctx);
-        self.check_rate_stream(key, limit_op).await
+        self.check_rate_stream(key, limit_op, ctx).await
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
@@ -820,6 +841,18 @@ impl Plugin for RateLimiting {
 
     fn is_authorize_plugin(&self) -> bool {
         matches!(self.limit_by, LimitBy::Consumer | LimitBy::SpiffeIdentity)
+    }
+
+    /// Never reusable, in any `limit_by` mode (issue #5583). A limit is a
+    /// per-operation CHARGE: reuse would consume one token on the CONNECT and
+    /// then let an unbounded number of later operations ride free, which is the
+    /// budget bypass this classification exists to prevent. The trait default
+    /// already refuses; this override says so in the plugin that charges,
+    /// because the mode is exactly what makes the answer non-obvious — IP
+    /// limiting charges in `on_request_received` rather than in the authorize
+    /// phase, so no authorize-phase marker on this plugin describes it.
+    fn allows_hbone_inner_reuse(&self) -> bool {
+        false
     }
 
     /// Participate in the shared rejection/synthetic finalizer so an admitted,

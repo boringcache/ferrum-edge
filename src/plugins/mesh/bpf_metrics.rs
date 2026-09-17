@@ -405,6 +405,17 @@ impl Plugin for MeshBpfMetrics {
         Some(self.exporter())
     }
 
+    /// Reusable (issue #5583): this plugin implements no request, response,
+    /// stream, or WebSocket hook at all — it is a passive scrape-exporter
+    /// carrier whose counters are updated by the event-consumer task — so an
+    /// elided CONNECT would have decided nothing here. It is a GLOBAL plugin,
+    /// present in every chain of a deployment that enables it, so leaving it at
+    /// the fail-closed default would switch inner reuse off mesh-wide for a
+    /// plugin that never looks at a request.
+    fn allows_hbone_inner_reuse(&self) -> bool {
+        true
+    }
+
     // No hot-path hooks. The plugin is a passive metrics surface; all
     // counter updates happen on the event-consumer task that shares the
     // same `Arc<BpfMetricsState>`. The Plugin trait's default no-op

@@ -396,6 +396,23 @@ impl Plugin for AccessControl {
         true
     }
 
+    /// Reusable (issue #5583), and for the SAME reason
+    /// `reevaluates_live_admission` above is `true`: the verdict is a pure
+    /// function of the request's identity inputs and this instance's immutable
+    /// allow/deny sets, so the only thing that can flip it for a live tunnel is
+    /// a new generation carrying different sets. Every published generation
+    /// requests a fence sweep
+    /// (`ProxyState::publish_request_epoch_with_gateway_trust`), and the sweep
+    /// re-runs exactly this `authorize` against the admitting request context
+    /// under the new generation's view — so the decision reuse elides is
+    /// re-issued, on the one event that could change it, for the tunnel's whole
+    /// life. Both halves are load-bearing: dropping
+    /// `reevaluates_live_admission` would strand this verdict at the admitting
+    /// generation and must drop this with it.
+    fn allows_hbone_inner_reuse(&self) -> bool {
+        true
+    }
+
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
         self.authorize_identity(
             &ctx.client_ip,

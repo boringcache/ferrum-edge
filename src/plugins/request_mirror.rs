@@ -2436,6 +2436,18 @@ impl Plugin for RequestMirror {
         self.body_admission_enabled()
     }
 
+    /// Never reusable, in either configuration (issue #5583). A mirror is a
+    /// per-operation SIDE EFFECT — a shadow request dispatched to another
+    /// destination — and the body-admission form additionally takes a
+    /// concurrency permit and a byte-budget lease per request. Reuse would
+    /// mirror one CONNECT and then silently stop mirroring every later
+    /// operation it carried. The trait default already refuses; this override
+    /// is the classification for BOTH forms, neither of which is described by
+    /// an authorize-phase marker that follows `body_admission_enabled()`.
+    fn allows_hbone_inner_reuse(&self) -> bool {
+        false
+    }
+
     /// Decide sampling and bounded mirror admission BEFORE body collection.
     ///
     /// The built-in priority places this after the built-in rejecting
