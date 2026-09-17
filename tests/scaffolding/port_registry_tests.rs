@@ -1,12 +1,14 @@
 //! Regression coverage for nextest's one-test-per-process port handoff.
 
-use super::port_registry::{PortLease, PortRegistry, TestSocket, bind_tcp_listener};
+use super::port_registry::{
+    PortLease, PortRegistry, TestSocket, bind_tcp_listener, bind_udp_socket,
+};
 use std::collections::BTreeSet;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 // Synthetic candidates isolate the registry invariant from OS port availability.
@@ -174,6 +176,105 @@ async fn tcp_reservations_and_native_listeners_disable_address_reuse() {
     assert!(!socket2::SockRef::from(&native).reuse_address().unwrap());
     let socket = tokio::net::TcpSocket::bind_test((Ipv4Addr::LOCALHOST, 0)).unwrap();
     assert!(!socket.reuseaddr().unwrap());
+}
+
+#[tokio::test]
+async fn udp_reservations_and_native_sockets_disable_address_reuse() {
+    use super::ports;
+
+    let (_tcp, udp) = ports::reserve_colocated_tcp_udp().await.unwrap();
+    for reservation in [ports::reserve_udp_port().await.unwrap(), udp] {
+        let socket = reservation.into_socket().into_std().unwrap();
+        assert!(!socket2::SockRef::from(&socket).reuse_address().unwrap());
+        let peer = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
+        peer.set_reuse_address(true).unwrap();
+        assert_eq!(
+            peer.bind(&socket.local_addr().unwrap().into())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AddrInUse,
+            "a reuse-enabled peer must not share an exclusive UDP reservation"
+        );
+    }
+    let native = std::net::UdpSocket::bind_test((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    assert!(!socket2::SockRef::from(&native).reuse_address().unwrap());
+    let native = tokio::net::UdpSocket::bind_test((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap()
+        .into_std()
+        .unwrap();
+    assert!(!socket2::SockRef::from(&native).reuse_address().unwrap());
+}
+
+#[tokio::test]
+async fn udp_handoff_excludes_racing_owners_after_socket_release() {
+    // The process lease keeps unrelated tests away from this real port while
+    // isolated owners race for the same candidate in their own registry.
+    let port = super::ports::unbound_udp_port().await.unwrap();
+    assert_eq!(
+        super::port_registry::process_registry()
+            .unwrap()
+            .lease_with([port], |port| Ok((port, ())))
+            .err()
+            .expect("the public UDP handoff must retain its process lease")
+            .kind(),
+        io::ErrorKind::AddrInUse
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let owners = [
+        PortRegistry::new(directory.path()).unwrap(),
+        PortRegistry::new(directory.path()).unwrap(),
+    ];
+    let barrier = Arc::new(Barrier::new(2));
+    let racers = owners.each_ref().map(|owner| {
+        let owner = Arc::clone(owner);
+        let barrier = Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            barrier.wait();
+            owner
+                .lease_with([port], |port| {
+                    let socket = bind_udp_socket((Ipv4Addr::LOCALHOST, port).into())?;
+                    Ok((port, socket))
+                })
+                .map(|(lease, socket)| {
+                    // Model the handoff: close the socket before returning, but
+                    // keep the lease while the child has yet to bind.
+                    lease.retain_for_process();
+                    drop(socket);
+                })
+        })
+    });
+    let results = racers.map(|racer| racer.join().unwrap());
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    for error in results.iter().filter_map(|result| result.as_ref().err()) {
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    }
+    let contender = PortRegistry::new(directory.path()).unwrap();
+    let try_handoff = || {
+        contender.lease_with([port], |port| {
+            let socket = bind_udp_socket((Ipv4Addr::LOCALHOST, port).into())?;
+            Ok((port, socket))
+        })
+    };
+    // Both racing calls have returned and dropped their socket and PortLease.
+    // This assertion deterministically catches releasing the lease too early,
+    // even if the losing racer previously saw the winner's still-bound socket.
+    assert_eq!(
+        try_handoff().err().unwrap().kind(),
+        io::ErrorKind::AddrInUse
+    );
+    let child_socket = bind_udp_socket(([0, 0, 0, 0], port).into()).unwrap();
+    assert!(try_handoff().is_err());
+    drop(child_socket);
+    assert!(try_handoff().is_err(), "lease outlives the child socket");
+    drop(owners);
+    let (lease, _socket) = try_handoff().expect("reclaim only after the lease owners exit");
+    assert_eq!(lease.port, port);
 }
 
 struct RegistryChild(Child);
