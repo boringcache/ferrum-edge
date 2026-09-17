@@ -72,8 +72,7 @@ fn every_startup_failure_site_renders_the_sanitized_cause_chain() {
         );
     }
     assert!(
-        item_body(&entry, "fn emit_bootstrap_error(", "\n}\n")
-            .contains("render_startup_error("),
+        item_body(&entry, "fn emit_bootstrap_error(", "\n}\n").contains("render_startup_error("),
         "bootstrap failures bypass tracing and must use the same redaction boundary"
     );
 }

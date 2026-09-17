@@ -29,7 +29,10 @@ fn startup_chain_redacts_database_urls_below_safe_contexts() {
     assert!(message.starts_with("failed to start database mode: database initialization failed"));
     assert!(message.contains("driver rejected postgres://"));
     for credential in ["fixture-user", "fixture-password", "fixture-token"] {
-        assert!(!message.contains(credential), "credential escaped: {message}");
+        assert!(
+            !message.contains(credential),
+            "credential escaped: {message}"
+        );
     }
 }
 

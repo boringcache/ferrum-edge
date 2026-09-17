@@ -1056,8 +1056,8 @@ pub fn execute_validate(args: &ValidateArgs) -> Result<(), String> {
     // `run` fail-closes on before dialing. Validate must exercise the same
     // gate so a production plaintext ADS URL cannot report success.
     if env_config.mode == OperatingMode::Mesh {
-        let runtime = crate::modes::mesh::MeshRuntimeConfig::from_env_config(&env_config)
-            .map_err(|e| {
+        let runtime =
+            crate::modes::mesh::MeshRuntimeConfig::from_env_config(&env_config).map_err(|e| {
                 format!(
                     "Mesh runtime validation failed: {}",
                     render_startup_error(anyhow::anyhow!(e), &[])
@@ -1079,7 +1079,10 @@ pub fn execute_validate(args: &ValidateArgs) -> Result<(), String> {
                             runtime.mesh_slice_request(),
                         )
                         .map_err(|e| {
-                            format!("Mesh spec validation failed: {}", render_startup_error(e, &[]))
+                            format!(
+                                "Mesh spec validation failed: {}",
+                                render_startup_error(e, &[])
+                            )
                         })?;
                     let surviving =
                         crate::modes::mesh::validate::MeshValidateInventory::from_slice(&slice);
@@ -1138,12 +1141,14 @@ pub fn execute_validate(args: &ValidateArgs) -> Result<(), String> {
             println!("Injector runtime and serving TLS: OK");
         }
         OperatingMode::NodeAgent => {
-            crate::modes::node_agent::NodeAgentConfig::from_env_config(&env_config).map_err(|e| {
-                format!(
-                    "Node-agent runtime validation failed: {}",
-                    render_startup_error(anyhow::anyhow!(e), &[])
-                )
-            })?;
+            crate::modes::node_agent::NodeAgentConfig::from_env_config(&env_config).map_err(
+                |e| {
+                    format!(
+                        "Node-agent runtime validation failed: {}",
+                        render_startup_error(anyhow::anyhow!(e), &[])
+                    )
+                },
+            )?;
             println!("Node-agent runtime: OK");
         }
         OperatingMode::Migrate if env_config.migrate_action == "config" => {
