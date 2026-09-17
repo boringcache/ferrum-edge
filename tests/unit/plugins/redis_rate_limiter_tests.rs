@@ -2909,8 +2909,7 @@ async fn a_charge_transaction_teaches_the_client_the_server_clock() {
     let (local_index, local_count) = charged[0];
     let (server_index, server_count) = charged[1];
     assert_eq!(
-        local_count,
-        0,
+        local_count, 0,
         "the local-clock pass handed its charge back"
     );
     assert_eq!(server_count, 1, "the rebuilt charge is the one that stands");
