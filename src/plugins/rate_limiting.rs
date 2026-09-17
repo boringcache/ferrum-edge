@@ -740,17 +740,22 @@ impl RateLimiting {
         ctx: &mut super::StreamConnectionContext,
     ) -> PluginResult {
         self.maybe_evict_stale_entries();
-        let Some(outcome) = self
+        // Attribution travels with the decision, exactly as `check_rate` does
+        // above: a capacity refusal taken on the local fallback budget is
+        // marked from the decision that took it, never reconstructed from the
+        // client's availability signal (a second sub-bucket rollover refuses
+        // through the failure policy while that signal still reads available).
+        let decision = self
             .limiter
-            .check_with_redis_key_and_local_capacity(
+            .check_with_redis_key_and_local_capacity_attributed(
                 key.clone(),
                 || key.clone(),
                 limit_op,
                 MAX_STATE_ENTRIES,
             )
-            .await
-        else {
-            if self.limiter.local_fallback_active() {
+            .await;
+        let Some(outcome) = decision.outcome else {
+            if decision.local_fallback {
                 ctx.metadata
                     .get_or_insert_with(HashMap::new)
                     .insert("ratelimit_local_fallback".to_string(), "true".to_string());
