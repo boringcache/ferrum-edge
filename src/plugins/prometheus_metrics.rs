@@ -6213,9 +6213,7 @@ fn optional_mesh_series_budget_per_family(config: &Value) -> Result<usize, Strin
         ));
     }
     usize::try_from(value).map_err(|_| {
-        format!(
-            "prometheus_metrics: `mesh_series_budget_per_family` (\"{value}\") exceeds usize"
-        )
+        format!("prometheus_metrics: `mesh_series_budget_per_family` (\"{value}\") exceeds usize")
     })
 }
 

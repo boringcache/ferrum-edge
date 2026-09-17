@@ -167,12 +167,9 @@ fn compile_literal_pattern_set(key: &str, patterns: &[String]) -> Result<Option<
     let escaped_patterns = patterns.iter().map(|pattern| regex::escape(pattern));
     let mut builder = RegexSetBuilder::new(escaped_patterns);
     builder.case_insensitive(true);
-    builder
-        .build()
-        .map(Some)
-        .map_err(|_| {
-            format!("bot_detection: failed to compile `{key}` patterns (complexity limit exceeded)")
-        })
+    builder.build().map(Some).map_err(|_| {
+        format!("bot_detection: failed to compile `{key}` patterns (complexity limit exceeded)")
+    })
 }
 
 /// Compile allow-list patterns with word-boundary anchors (`\b…\b`).
@@ -200,12 +197,9 @@ fn compile_word_boundary_pattern_set(
         .map(|pattern| format!(r"\b{}\b", regex::escape(pattern)));
     let mut builder = RegexSetBuilder::new(anchored_patterns);
     builder.case_insensitive(true);
-    builder
-        .build()
-        .map(Some)
-        .map_err(|_| {
-            format!("bot_detection: failed to compile `{key}` patterns (complexity limit exceeded)")
-        })
+    builder.build().map(Some).map_err(|_| {
+        format!("bot_detection: failed to compile `{key}` patterns (complexity limit exceeded)")
+    })
 }
 
 fn parse_response_code(config: &Map<String, Value>) -> Result<u16, String> {

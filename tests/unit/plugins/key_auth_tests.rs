@@ -31,7 +31,10 @@ fn constructor_type_diagnostics_quote_complete_json_values() {
         );
         assert!(diagnostic.contains("<redacted scalar>"), "{diagnostic}");
         assert!(!diagnostic.contains("9876543210"), "{diagnostic}");
-        assert!(!diagnostic.contains("UNREGISTERED_TYPE_TOKEN"), "{diagnostic}");
+        assert!(
+            !diagnostic.contains("UNREGISTERED_TYPE_TOKEN"),
+            "{diagnostic}"
+        );
     }
 }
 

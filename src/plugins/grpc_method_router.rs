@@ -461,14 +461,12 @@ fn parse_optional_method_set(config: &Value, key: &str) -> Result<Option<HashSet
         return Ok(None);
     }
 
-    let entries = value
-        .as_array()
-        .ok_or_else(|| {
-            format!(
-                "grpc_method_router: `{key}` must be an array, got: {value:?}",
-                value = value.to_string()
-            )
-        })?;
+    let entries = value.as_array().ok_or_else(|| {
+        format!(
+            "grpc_method_router: `{key}` must be an array, got: {value:?}",
+            value = value.to_string()
+        )
+    })?;
     let mut methods = HashSet::with_capacity(entries.len());
     for (idx, entry) in entries.iter().enumerate() {
         let method = entry.as_str().ok_or_else(|| {

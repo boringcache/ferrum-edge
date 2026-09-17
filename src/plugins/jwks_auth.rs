@@ -2112,14 +2112,12 @@ fn optional_u64(
     let Some(value) = config.get(field) else {
         return Ok(default_value);
     };
-    value
-        .as_u64()
-        .ok_or_else(|| {
-            format!(
-                "jwks_auth: `{field}` must be an unsigned integer, got: {value:?}",
-                value = value.to_string()
-            )
-        })
+    value.as_u64().ok_or_else(|| {
+        format!(
+            "jwks_auth: `{field}` must be an unsigned integer, got: {value:?}",
+            value = value.to_string()
+        )
+    })
 }
 
 fn validate_max_stale_seconds(field: &str, value: u64) -> Result<(), String> {
@@ -2140,14 +2138,12 @@ fn optional_bool(config: &Map<String, Value>, field: &str) -> Result<Option<bool
     config
         .get(field)
         .map(|value| {
-            value
-                .as_bool()
-                .ok_or_else(|| {
-                    format!(
-                        "jwks_auth: `{field}` must be a boolean, got: {value:?}",
-                        value = value.to_string()
-                    )
-                })
+            value.as_bool().ok_or_else(|| {
+                format!(
+                    "jwks_auth: `{field}` must be a boolean, got: {value:?}",
+                    value = value.to_string()
+                )
+            })
         })
         .transpose()
 }

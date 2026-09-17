@@ -3706,7 +3706,10 @@ async fn functional_cli_mesh_versions_are_redacted_without_registration() {
 #[ignore]
 #[tokio::test]
 async fn functional_cli_mesh_semantic_values_are_redacted_without_registration() {
-    for secret in ["UNREGISTERED_TOKEN_5589", "prefix'\"UNREGISTERED_TOKEN_5589\\tail"] {
+    for secret in [
+        "UNREGISTERED_TOKEN_5589",
+        "prefix'\"UNREGISTERED_TOKEN_5589\\tail",
+    ] {
         let documents = [
             (
                 serde_json::json!({"mesh": {"services": [{
@@ -3766,7 +3769,9 @@ async fn functional_cli_gateway_versions_are_redacted_without_registration() {
     let secret = "UNREGISTERED_GATEWAY_VERSION_5589";
     for extension in ["yaml", "json"] {
         let directory = TempDir::new().unwrap();
-        let path = directory.path().join(format!("invalid-version.{extension}"));
+        let path = directory
+            .path()
+            .join(format!("invalid-version.{extension}"));
         let document = serde_json::json!({"version": secret});
         let content = if extension == "yaml" {
             serde_yaml::to_string(&document).unwrap()
@@ -3823,7 +3828,11 @@ async fn functional_cli_backup_versions_are_redacted_without_registration() {
         let diagnostic = cli_contract_diagnostic(&output);
         assert_eq!(output.status.code(), Some(1), "{diagnostic}");
         assert!(!diagnostic.contains(secret), "{diagnostic}");
-        for required in ["Config backup", "version migration", "No config migration path"] {
+        for required in [
+            "Config backup",
+            "version migration",
+            "No config migration path",
+        ] {
             assert!(diagnostic.contains(required), "{diagnostic}");
         }
     }

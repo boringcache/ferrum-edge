@@ -1748,8 +1748,9 @@ fn optional_status_code_set(
                 "ai_federation: '{field}' must contain integer status codes"
             ));
         };
-        let status = u16::try_from(value)
-            .map_err(|_| format!("ai_federation: `{field}` status code \"{value}\" is too large"))?;
+        let status = u16::try_from(value).map_err(|_| {
+            format!("ai_federation: `{field}` status code \"{value}\" is too large")
+        })?;
         if !(100..=599).contains(&status) {
             return Err(format!(
                 "ai_federation: '{field}' contains invalid HTTP status code {status}"

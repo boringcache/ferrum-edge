@@ -5873,13 +5873,9 @@ fn parse_regex_set(value: Option<&Value>, field: &'static str) -> Result<Option<
         }
         patterns.push(pattern.to_string());
     }
-    RegexSet::new(patterns)
-        .map(Some)
-        .map_err(|_| {
-            format!(
-                "openapi_validator: `{field}` contains invalid regex or exceeds complexity limits"
-            )
-        })
+    RegexSet::new(patterns).map(Some).map_err(|_| {
+        format!("openapi_validator: `{field}` contains invalid regex or exceeds complexity limits")
+    })
 }
 
 fn parse_header_present(value: Option<&Value>) -> Result<HashMap<String, Option<String>>, String> {

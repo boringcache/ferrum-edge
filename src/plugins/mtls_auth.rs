@@ -986,14 +986,12 @@ fn string_field(
     let Some(value) = obj.get(key) else {
         return Ok(None);
     };
-    let raw = value
-        .as_str()
-        .ok_or_else(|| {
-            format!(
-                "mtls_auth: `{context}.{key}` must be a string, got: {value:?}",
-                value = value.to_string()
-            )
-        })?;
+    let raw = value.as_str().ok_or_else(|| {
+        format!(
+            "mtls_auth: `{context}.{key}` must be a string, got: {value:?}",
+            value = value.to_string()
+        )
+    })?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(format!("mtls_auth: '{context}.{key}' must not be empty"));

@@ -1858,14 +1858,12 @@ fn parse_u64_field(value: Option<&Value>, field: &str, default_value: u64) -> Re
     let Some(value) = value else {
         return Ok(default_value);
     };
-    value
-        .as_u64()
-        .ok_or_else(|| {
-            format!(
-                "hmac_auth: `{field}` must be an unsigned integer, got: {value:?}",
-                value = value.to_string()
-            )
-        })
+    value.as_u64().ok_or_else(|| {
+        format!(
+            "hmac_auth: `{field}` must be an unsigned integer, got: {value:?}",
+            value = value.to_string()
+        )
+    })
 }
 
 /// Default Redis key prefix for shared `ferrum-hmac-v2` replay markers:

@@ -91,14 +91,12 @@ pub fn parse_claim_headers(
     let Some(value) = config.get(field) else {
         return Ok(Vec::new());
     };
-    let object = value
-        .as_object()
-        .ok_or_else(|| {
-            format!(
-                "{plugin}: `{field}` must be an object, got: {value:?}",
-                value = value.to_string()
-            )
-        })?;
+    let object = value.as_object().ok_or_else(|| {
+        format!(
+            "{plugin}: `{field}` must be an object, got: {value:?}",
+            value = value.to_string()
+        )
+    })?;
     let mut mappings = Vec::with_capacity(object.len());
     for (claim_path, header_value) in object {
         let parsed_claim_path = parse_claim_path_value(
@@ -144,14 +142,12 @@ pub fn parse_claim_header_list(
     let Some(value) = config.get(field) else {
         return Ok(Vec::new());
     };
-    let entries = value
-        .as_array()
-        .ok_or_else(|| {
-            format!(
-                "{plugin}: `{field}` must be an array, got: {value:?}",
-                value = value.to_string()
-            )
-        })?;
+    let entries = value.as_array().ok_or_else(|| {
+        format!(
+            "{plugin}: `{field}` must be an array, got: {value:?}",
+            value = value.to_string()
+        )
+    })?;
     if entries.len() > MAX_OUTPUT_CLAIM_HEADERS {
         return Err(format!(
             "{plugin}: '{field}' supports at most {MAX_OUTPUT_CLAIM_HEADERS} entries"
@@ -392,14 +388,12 @@ pub fn parse_separator(
     let Some(value) = config.get(field) else {
         return Ok(default_value.to_string());
     };
-    let raw = value
-        .as_str()
-        .ok_or_else(|| {
-            format!(
-                "{plugin}: `{field}` must be a string, got: {value:?}",
-                value = value.to_string()
-            )
-        })?;
+    let raw = value.as_str().ok_or_else(|| {
+        format!(
+            "{plugin}: `{field}` must be a string, got: {value:?}",
+            value = value.to_string()
+        )
+    })?;
     if raw.is_empty() {
         return Err(format!("{plugin}: '{field}' must not be empty"));
     }

@@ -7303,9 +7303,7 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
                 ));
             }
             Some(jsonschema::validator_for(schema).map_err(|_| {
-                format!(
-                    "ai_tool_governor: tool {name:?} `json_schema` is not a valid JSON Schema"
-                )
+                format!("ai_tool_governor: tool {name:?} `json_schema` is not a valid JSON Schema")
             })?)
         }
     };

@@ -213,12 +213,10 @@ impl CompiledConditions {
                     // still apply to normal paths like `/api/v1` and
                     // `/v1/api-keys`. Global exemptions use separate anchored
                     // semantics because they short-circuit the entire WAF.
-                    Regex::new(regex)
-                        .map(PathMatcher::Regex)
-                        .map_err(|_| {
-                            "waf: invalid conditions.paths regex or complexity limit exceeded"
-                                .to_string()
-                        })
+                    Regex::new(regex).map(PathMatcher::Regex).map_err(|_| {
+                        "waf: invalid conditions.paths regex or complexity limit exceeded"
+                            .to_string()
+                    })
                 } else if let Some(prefix) = pattern.strip_suffix('*') {
                     Ok(PathMatcher::Prefix(prefix.to_string()))
                 } else {
