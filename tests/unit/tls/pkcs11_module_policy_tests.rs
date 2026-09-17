@@ -19,7 +19,7 @@ fn pkcs11_admission_requires_build_feature() {
     assert!(
         errors
             .iter()
-            .any(|error| error.contains("'pkcs11' Cargo feature"))
+            .any(|error| error.contains("`pkcs11` Cargo feature"))
     );
 }
 
