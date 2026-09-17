@@ -1259,8 +1259,8 @@ impl CpDpTrustBundle {
             TrustBundleLoadError::new(TrustBundleRejectReason::DocumentInvalid, detail)
         };
 
-        let document: TrustBundleDocument =
-            crate::util::deserialization::from_json_str(raw).map_err(|e| {
+        let document: TrustBundleDocument = crate::util::deserialization::from_json_str(raw)
+            .map_err(|e| {
                 invalid(format!(
                     "CP/DP trust bundle '{origin}' is not valid JSON: {e}"
                 ))

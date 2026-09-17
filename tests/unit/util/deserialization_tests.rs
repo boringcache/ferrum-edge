@@ -72,12 +72,15 @@ fn serde_message_families_keep_structure_without_offending_scalars() {
     for (raw, expected) in cases {
         let raw =
             format!("mesh.destination_rules[0].traffic_policy.tls: {raw} at line 9 column 14");
-        let expected = format!(
-            "mesh.destination_rules[0].traffic_policy.tls: {expected} at line 9 column 14"
-        );
+        let expected =
+            format!("mesh.destination_rules[0].traffic_policy.tls: {expected} at line 9 column 14");
         let sanitized = sanitize_message(&raw);
         assert_eq!(sanitized, expected);
-        assert_eq!(sanitize_message(&sanitized), sanitized, "must be idempotent");
+        assert_eq!(
+            sanitize_message(&sanitized),
+            sanitized,
+            "must be idempotent"
+        );
     }
 }
 
@@ -151,8 +154,16 @@ fn real_json_yaml_and_value_boundaries_withhold_scalars_and_raw_causes() {
         let document = serde_json::json!({"object": object});
         let json = serde_json::to_string_pretty(&document).unwrap();
         let yaml = serde_yaml::to_string(&document).unwrap();
-        assert_safe_error(&from_json_str::<Document>(&json).unwrap_err(), "object", true);
-        assert_safe_error(&from_yaml_str::<Document>(&yaml).unwrap_err(), "object", true);
+        assert_safe_error(
+            &from_json_str::<Document>(&json).unwrap_err(),
+            "object",
+            true,
+        );
+        assert_safe_error(
+            &from_yaml_str::<Document>(&yaml).unwrap_err(),
+            "object",
+            true,
+        );
         assert_safe_error(
             &from_json_object_slice::<Document>(json.as_bytes()).unwrap_err(),
             "object",
@@ -190,7 +201,10 @@ fn diagnostic_wrappers_preserve_success_and_reject_trailing_documents() {
 
 #[test]
 fn object_helpers_sanitize_even_without_the_document_boundary() {
-    for input in [r#""unregistered-secret""#, r#"{"count":"unregistered-secret"}"#] {
+    for input in [
+        r#""unregistered-secret""#,
+        r#"{"count":"unregistered-secret"}"#,
+    ] {
         let mut parser = serde_json::Deserializer::from_str(input);
         let error = deserialize_object::<_, BTreeMap<String, u32>>(&mut parser).unwrap_err();
         assert_safe_error(&error, "invalid type", true);

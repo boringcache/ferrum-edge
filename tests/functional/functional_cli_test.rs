@@ -3666,7 +3666,10 @@ async fn functional_cli_mesh_document_scalars_are_redacted_without_registration(
         "unregistered.synthetic.token.5589",
     ];
     for secret in secrets {
-        for (field, expected) in [("tls", "expected a"), ("connect_timeout_ms", "expected u64")] {
+        for (field, expected) in [
+            ("tls", "expected a"),
+            ("connect_timeout_ms", "expected u64"),
+        ] {
             let mut policy = serde_json::Map::new();
             policy.insert(field.to_string(), serde_json::json!(secret));
             let document = serde_json::json!({
@@ -3754,8 +3757,14 @@ async fn functional_cli_mesh_diagnostics_do_not_materialize_dormant_database_tls
             .env("FERRUM_ADMIN_HTTP_PORT", "0")
             .env("FERRUM_DB_TYPE", "postgres")
             .env("FERRUM_DB_URL", "postgres://fixture@localhost/primary")
-            .env("FERRUM_DB_READ_REPLICA_URL", "postgres://fixture@localhost/replica")
-            .env("FERRUM_DB_FAILOVER_URLS", "postgres://fixture@localhost/failover")
+            .env(
+                "FERRUM_DB_READ_REPLICA_URL",
+                "postgres://fixture@localhost/replica",
+            )
+            .env(
+                "FERRUM_DB_FAILOVER_URLS",
+                "postgres://fixture@localhost/failover",
+            )
             .env("FERRUM_DB_TLS_MODE", "require")
             .env(
                 "FERRUM_DB_TLS_CLIENT_CERT_SOURCE",
@@ -3773,10 +3782,19 @@ async fn functional_cli_mesh_diagnostics_do_not_materialize_dormant_database_tls
         let output = cli_contract_output(command).await;
         let diagnostic = cli_contract_diagnostic(&output);
         assert_eq!(output.status.code(), Some(1), "{subcommand}: {diagnostic}");
-        assert!(diagnostic.contains("missing field `selector`"), "{diagnostic}");
-        assert!(!diagnostic.contains("SYNTHETIC-DORMANT-KEY"), "{diagnostic}");
+        assert!(
+            diagnostic.contains("missing field `selector`"),
+            "{diagnostic}"
+        );
+        assert!(
+            !diagnostic.contains("SYNTHETIC-DORMANT-KEY"),
+            "{diagnostic}"
+        );
         let after: Vec<_> = std::fs::read_dir(&pem_directory).unwrap().collect();
-        assert!(after.is_empty(), "dormant database TLS created files: {after:?}");
+        assert!(
+            after.is_empty(),
+            "dormant database TLS created files: {after:?}"
+        );
     }
 }
 

@@ -1320,8 +1320,8 @@ impl DatabaseStore {
 
         for row in rows {
             let existing_hosts_raw = required_utf8_text_column(row, "hosts")?;
-            let existing_hosts: Vec<String> =
-                config_decode::from_json_str(&existing_hosts_raw).map_err(|error| {
+            let existing_hosts: Vec<String> = config_decode::from_json_str(&existing_hosts_raw)
+                .map_err(|error| {
                     anyhow::anyhow!("failed to parse hosts JSON during uniqueness check: {error}")
                 })?;
 
@@ -12377,9 +12377,11 @@ fn row_to_proxy_inner(
             None => None,
         },
         retry: match optional_utf8_text_column(row, "retry")? {
-            Some(s) => Some(config_decode::from_json_str::<RetryConfig>(&s).map_err(|e| {
-                anyhow::anyhow!("Proxy {}: failed to parse retry JSON: {}", pid, e)
-            })?),
+            Some(s) => Some(
+                config_decode::from_json_str::<RetryConfig>(&s).map_err(|e| {
+                    anyhow::anyhow!("Proxy {}: failed to parse retry JSON: {}", pid, e)
+                })?,
+            ),
             None => None,
         },
         response_body_mode: row
@@ -12472,9 +12474,11 @@ fn row_to_proxy_inner(
             .ok()
             .map(|v| v.max(0) as u64),
         allowed_methods: match optional_utf8_text_column(row, "allowed_methods")? {
-            Some(s) => Some(config_decode::from_json_str::<Vec<String>>(&s).map_err(|e| {
-                anyhow::anyhow!("Proxy {}: failed to parse allowed_methods JSON: {}", pid, e)
-            })?),
+            Some(s) => Some(
+                config_decode::from_json_str::<Vec<String>>(&s).map_err(|e| {
+                    anyhow::anyhow!("Proxy {}: failed to parse allowed_methods JSON: {}", pid, e)
+                })?,
+            ),
             None => None,
         },
         allowed_ws_origins: match optional_utf8_text_column(row, "allowed_ws_origins")? {
@@ -12857,8 +12861,9 @@ fn row_to_gateway_trust_bundle_inner(
     }
     // Never surface serde's message: it can quote the offending document.
     let bundle: crate::modes::mesh::config::TrustBundleSet =
-        config_decode::from_json_str(&bundle_json)
-            .map_err(|_| anyhow::anyhow!("gateway trust bundle stored material is not decodable"))?;
+        config_decode::from_json_str(&bundle_json).map_err(|_| {
+            anyhow::anyhow!("gateway trust bundle stored material is not decodable")
+        })?;
     let revision = strict_stored_revision(row)?;
     let updated_by = optional_utf8_text_column(row, "updated_by").map_err(|error| {
         anyhow::anyhow!("gateway trust bundle updated_by column is unreadable: {error}")
