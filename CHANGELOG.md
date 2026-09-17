@@ -91,17 +91,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operation, or authenticates the CONNECT with a bearer credential the fence
   does not track, previously had its single CONNECT-time decision honoured for
   every later operation the reused tunnel carried. The classification is
-  fail-closed (`!is_authorize_plugin()` over a marker that itself defaults to
-  `true`), so every unclassified built-in and **every custom plugin** now
-  refuses. Reusable built-ins: `mesh_authz` (only while no external
-  authorization provider is bound to the generation — a sweep never re-consults
-  one), `access_control`, `spiffe_identity`, `workload_metrics`,
-  `stdout_logging`, `prometheus_metrics`, `otel_tracing`, `proxy_alerts`.
-  Explicitly non-reusable: `rate_limiting` (a token per operation, in every
-  `limit_by` mode), `adaptive_concurrency` (a permit), `request_mirror` (a
-  shadow dispatch). Datagram-over-HBONE tunnels never advertise at all. The only
-  operator-visible effect of a refusal is one CONNECT per operation, exactly as
-  before reuse existed; nothing is rejected that was not rejected before.
+  fail-closed by a literal `false` default that no other marker can change, so
+  every unclassified built-in and **every custom plugin** now refuses. Reusable
+  built-ins: `mesh_authz` (only while no external authorization provider is
+  bound to the generation — a sweep never re-consults one), `access_control`,
+  `spiffe_identity`, `workload_metrics`, `stdout_logging`,
+  `prometheus_metrics`, `otel_tracing`, `proxy_alerts`. Explicitly
+  non-reusable: `rate_limiting` (a token per operation, in every `limit_by`
+  mode), `adaptive_concurrency` (a permit), `request_mirror` (a shadow
+  dispatch). Datagram-over-HBONE tunnels never advertise at all. Three
+  *mesh-injected* plugins are unclassified and so withhold the capability
+  wherever they are injected: `jwks_auth` (a `RequestAuthentication` is in play,
+  and the fence bounds the mTLS leaf rather than a bearer token's own lifetime),
+  `mesh_outbound_registry` (`outboundTrafficPolicy: REGISTRY_ONLY`), and
+  `__mesh_bpf_metrics`. The last two have not been reviewed for reuse safety;
+  until they are, such deployments pay one CONNECT per operation.
+- **A live HBONE tunnel loses inner reuse when its chain stops permitting it**
+  (issue #5583). The admission snapshot records whether reuse was advertised —
+  the same value the header was stamped from — and every admission-fence sweep
+  re-folds `Plugin::allows_hbone_inner_reuse` over the chain resolved for the
+  current generation. A tunnel that was advertised reusable and whose chain no
+  longer permits reuse is revoked with the new reason `reuse_withdrawn` on
+  `ferrum_mesh_hbone_tunnel_revocations_total`. Publishing a `CUSTOM`
+  `mesh_authz` policy or attaching `rate_limiting` previously left every
+  already-reusable tunnel carrying operations the new plugin never saw, because
+  a sweep re-issues only opted-in `authorize` verdicts and never a per-operation
+  charge or an external check. The fold is pure — no plugin hook runs during a
+  sweep — and tunnels admitted without the advertisement are untouched. The
+  operator-visible effect of any refusal is one CONNECT per operation, exactly
+  as before reuse existed. That restored per-operation admission **can** reject
+  or charge operations a reused tunnel previously carried without one; that is
+  the point of the change, and it is the only behaviour difference an operator
+  should expect.
 
 ## [0.9.5] - 2026-09-13
 

@@ -822,11 +822,11 @@ impl Plugin for RateLimiting {
     /// Never reusable, in any `limit_by` mode (issue #5583). A limit is a
     /// per-operation CHARGE: reuse would consume one token on the CONNECT and
     /// then let an unbounded number of later operations ride free, which is the
-    /// budget bypass this classification exists to prevent. The mode matters
-    /// for the default, not for the answer — `is_authorize_plugin()` is `false`
-    /// for IP limiting (it charges in `on_request_received`, not in the
-    /// authorize phase), so the trait default would have said `true` exactly
-    /// there.
+    /// budget bypass this classification exists to prevent. The trait default
+    /// already refuses; this override says so in the plugin that charges,
+    /// because the mode is exactly what makes the answer non-obvious — IP
+    /// limiting charges in `on_request_received` rather than in the authorize
+    /// phase, so no authorize-phase marker on this plugin describes it.
     fn allows_hbone_inner_reuse(&self) -> bool {
         false
     }

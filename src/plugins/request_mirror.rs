@@ -2441,9 +2441,9 @@ impl Plugin for RequestMirror {
     /// destination — and the body-admission form additionally takes a
     /// concurrency permit and a byte-budget lease per request. Reuse would
     /// mirror one CONNECT and then silently stop mirroring every later
-    /// operation it carried. `is_authorize_plugin()` is `false` whenever body
-    /// admission is off, so the trait default would have said `true` there;
-    /// this override is the classification for both forms.
+    /// operation it carried. The trait default already refuses; this override
+    /// is the classification for BOTH forms, neither of which is described by
+    /// an authorize-phase marker that follows `body_admission_enabled()`.
     fn allows_hbone_inner_reuse(&self) -> bool {
         false
     }

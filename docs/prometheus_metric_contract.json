@@ -2973,7 +2973,7 @@
   {
     "name": "ferrum_mesh_hbone_tunnel_revocations_total",
     "type": "counter",
-    "help": "Live HBONE tunnels revoked by the admission fence because the current policy generation, peer credential, or enforced revocation list would no longer admit their CONNECT.",
+    "help": "Live HBONE tunnels revoked by the admission fence because the current policy generation, peer credential, or enforced revocation list would no longer admit their CONNECT, or would no longer let it carry later application operations.",
     "labels": [
       "proxy_id",
       "reason",

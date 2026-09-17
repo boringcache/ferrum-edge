@@ -1032,9 +1032,8 @@ impl Plugin for ProxyAlerts {
     /// rejects. Reuse changes only how many tunnel summaries its alert windows
     /// sample — the same fidelity trade every observability surface makes when
     /// one tunnel carries many operations — not what any operation is allowed
-    /// to do. The trait default already says `true` here; this override makes
-    /// that a classification rather than a consequence of
-    /// `is_authorize_plugin()`.
+    /// to do. The trait default refuses, so this override is a deliberate
+    /// opt-in and not an inherited answer.
     fn allows_hbone_inner_reuse(&self) -> bool {
         true
     }

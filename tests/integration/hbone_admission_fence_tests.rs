@@ -285,9 +285,9 @@ fn custom_policy_for_other_principal() -> MeshPolicy {
 ///
 /// `correlation_id` takes no authorization decision of any kind and never
 /// rejects, so it is the sharpest possible statement of the fail-closed rule:
-/// `Plugin::allows_hbone_inner_reuse` defaults to `!is_authorize_plugin()`, and
-/// `is_authorize_plugin` itself defaults to `true`, so ANY plugin nobody has
-/// classified — built-in or custom — refuses reuse.
+/// `Plugin::allows_hbone_inner_reuse` defaults to a literal `false`, so ANY
+/// plugin nobody has classified — built-in or custom — refuses reuse, whatever
+/// else it declares about itself.
 fn unclassified_plugin() -> PluginConfig {
     PluginConfig {
         labels: Default::default(),
@@ -439,6 +439,13 @@ fn synthetic_snapshot(
         // watcher) inapplicable. `credential_snapshot` is the fixture for that
         // dimension.
         peer_credential: None,
+        // Likewise for the reuse gate (issue #5583): a synthetic tunnel that
+        // never advertised the capability is never judged for it, so these
+        // fixtures see exactly the gate they are about. The reuse dimension is
+        // exercised end to end through the production dispatcher instead —
+        // there is no synthetic fixture for it, because the thing under test is
+        // the chain the dispatcher itself resolves.
+        advertised_inner_reuse: false,
     }
 }
 
@@ -476,6 +483,7 @@ fn dual_gate_snapshot(proxy: Arc<Proxy>, admission_sweep_epoch: u64) -> HboneAdm
         grpc_web_request: false,
         admission_sweep_epoch,
         peer_credential: None,
+        advertised_inner_reuse: false,
     }
 }
 
@@ -705,11 +713,13 @@ async fn wait_for_revocation(tunnel: &AdmittedHboneTunnel) {
 /// reads the same way the sweep decides:
 /// `[proxy_withdrawn, peer_expired, peer_trust, peer_revoked,
 ///   authorization_denied, peer_auth_transport, relay_destination,
-///   reevaluation_failed]`.
+///   reuse_withdrawn, reevaluation_failed]`.
 ///
 /// The three credential arms are ordered by webpki's own error precedence —
 /// `notAfter` before any anchor, `UnknownIssuer` before revocation — so this
-/// array is also the pin on that derivation (issue #5574).
+/// array is also the pin on that derivation (issue #5574). `reuse_withdrawn`
+/// (issue #5583) sits after every gate that is a refusal, because it is the
+/// only reason whose tunnel would still have been ADMITTED.
 fn revocation_counts(state: &ProxyState) -> [u64; HboneRevocationReason::ALL.len()] {
     let fence = &state.hbone_admission_fence;
     [
@@ -720,6 +730,7 @@ fn revocation_counts(state: &ProxyState) -> [u64; HboneRevocationReason::ALL.len
         fence.revocations(HboneRevocationReason::AuthorizationDenied),
         fence.revocations(HboneRevocationReason::PeerAuthTransport),
         fence.revocations(HboneRevocationReason::RelayDestination),
+        fence.revocations(HboneRevocationReason::ReuseWithdrawn),
         fence.revocations(HboneRevocationReason::ReevaluationFailed),
     ]
 }
@@ -790,7 +801,7 @@ async fn admit_client_tunnel_with_inbound_trust(
         .expect("admitted CONNECT under the initial policy generation");
     echo_round_trip(&mut tunnel, b"before-publish").await;
     assert_eq!(state.hbone_admission_fence.live_tunnels(), 1);
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
     AdmittedFixture {
         state,
@@ -827,7 +838,7 @@ async fn tightened_authorization_policy_revokes_live_tunnel_and_denies_the_next_
     wait_for_no_live_tunnels(&fx.state).await;
     assert_eq!(
         revocation_counts(&fx.state),
-        [0, 0, 0, 0, 1, 0, 0, 0],
+        [0, 0, 0, 0, 1, 0, 0, 0, 0],
         "exactly one authorization_denied revocation"
     );
     assert!(
@@ -845,7 +856,7 @@ async fn tightened_authorization_policy_revokes_live_tunnel_and_denies_the_next_
     );
     assert_eq!(
         revocation_counts(&fx.state),
-        [0, 0, 0, 0, 1, 0, 0, 0],
+        [0, 0, 0, 0, 1, 0, 0, 0, 0],
         "a refused CONNECT is never a revocation"
     );
 
@@ -871,7 +882,7 @@ async fn unrelated_policy_publication_reevaluates_but_keeps_the_tunnel() {
         fx.state.hbone_admission_fence.reevaluations() > reevaluations_before,
         "the publication must re-judge the live tunnel, not skip it"
     );
-    assert_eq!(revocation_counts(&fx.state), [0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&fx.state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
     assert_eq!(fx.state.hbone_admission_fence.live_tunnels(), 1);
     echo_round_trip(&mut fx.tunnel, b"after-unrelated-publish").await;
 
@@ -892,7 +903,7 @@ async fn withdrawing_the_admitting_proxy_revokes_live_tunnel() {
     wait_for_no_live_tunnels(&fx.state).await;
     assert_eq!(
         revocation_counts(&fx.state),
-        [1, 0, 0, 0, 0, 0, 0, 0],
+        [1, 0, 0, 0, 0, 0, 0, 0, 0],
         "exactly one proxy_withdrawn revocation"
     );
 
@@ -911,7 +922,7 @@ async fn peer_authentication_swap_revokes_only_a_non_compliant_tunnel() {
             ..MeshInboundTlsPolicy::default()
         });
     wait_for_sweep_after(&fx.state, completed_before).await;
-    assert_eq!(revocation_counts(&fx.state), [0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&fx.state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
     echo_round_trip(&mut fx.tunnel, b"still-admitted-under-strict").await;
 
     // DISABLE refuses TLS transport for the app port: the same tunnel is now
@@ -925,7 +936,7 @@ async fn peer_authentication_swap_revokes_only_a_non_compliant_tunnel() {
     wait_for_no_live_tunnels(&fx.state).await;
     assert_eq!(
         revocation_counts(&fx.state),
-        [0, 0, 0, 0, 0, 1, 0, 0],
+        [0, 0, 0, 0, 0, 1, 0, 0, 0],
         "exactly one peer_auth_transport revocation"
     );
 
@@ -976,7 +987,7 @@ async fn peer_authentication_swap_revokes_a_live_datagram_tunnel() {
     wait_for_no_live_tunnels(&state).await;
     assert_eq!(
         revocation_counts(&state),
-        [0, 0, 0, 0, 0, 1, 0, 0],
+        [0, 0, 0, 0, 0, 1, 0, 0, 0],
         "the datagram relay honors the same revocation as the byte-stream relay"
     );
 
@@ -1023,7 +1034,7 @@ async fn an_admission_that_raced_a_publication_is_reswept_when_it_registers() {
     // Read at the cancellation edge, deliberately: the accounting is published
     // before the token is cancelled, so anything woken by the cancellation
     // already sees the revocation counted.
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 1, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 1, 0, 0]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1075,7 +1086,7 @@ async fn a_withdrawn_relay_destination_revokes_a_live_inbound_relay_tunnel() {
         Some(HboneRevocationReason::RelayDestination),
         "the synthesized inbound relay's ownership guard is what revoked it"
     );
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 1, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 1, 0, 0]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1162,7 +1173,7 @@ async fn a_grpc_classified_connect_is_refused_before_it_can_become_a_fenced_tunn
         0,
         "a refused CONNECT must not register a sweepable tunnel"
     );
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
     // The same peer's plain CONNECT IS admitted, on the plain-HTTP view, and
     // the fence judges it against exactly that view.
@@ -1185,7 +1196,7 @@ async fn a_grpc_classified_connect_is_refused_before_it_can_become_a_fenced_tunn
         state.hbone_admission_fence.reevaluations() > reevaluations_before,
         "the sweep must have resolved a non-empty authorize chain for the admitting view"
     );
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 1, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 1, 0, 0, 0, 0]);
 
     let _ = shutdown_tx.send(true);
     backend_handle.abort();
@@ -1228,7 +1239,7 @@ async fn a_side_effecting_operator_authorize_plugin_is_never_re_run_by_a_sweep()
 
     assert_eq!(
         revocation_counts(&state),
-        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0, 0],
         "a sweep must not revoke a compliant tunnel over a plugin it may not re-run"
     );
     assert_eq!(state.hbone_admission_fence.live_tunnels(), 1);
@@ -1292,7 +1303,7 @@ async fn close_publications_coalesce_and_revoke_every_live_tunnel_exactly_once()
 
     assert_eq!(
         revocation_counts(&state),
-        [0, 0, 0, 0, 3, 0, 0, 0],
+        [0, 0, 0, 0, 3, 0, 0, 0, 0],
         "each live tunnel is revoked exactly once"
     );
     let fence = &state.hbone_admission_fence;
@@ -1388,7 +1399,7 @@ async fn an_authorization_denial_outranks_a_transport_mismatch_in_one_sweep() {
 
     let tunnel = fence.admit(dual_gate_snapshot(proxy, fence.sweep_epoch()));
     assert_eq!(tunnel.revoked_reason(), None);
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
     // STRICT arms the transport gate for this plaintext tunnel AND is what
     // schedules the single sweep that now sees both gates failing.
@@ -1406,7 +1417,7 @@ async fn an_authorization_denial_outranks_a_transport_mismatch_in_one_sweep() {
     );
     assert_eq!(
         revocation_counts(&state),
-        [0, 0, 0, 0, 1, 0, 0, 0],
+        [0, 0, 0, 0, 1, 0, 0, 0, 0],
         "exactly one authorization_denied revocation, and no peer_auth_transport one"
     );
     assert!(
@@ -1454,7 +1465,7 @@ async fn a_tunnel_the_relay_retired_first_is_never_counted_or_classified_as_revo
     );
     assert_eq!(
         revocation_counts(&state),
-        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0, 0],
         "a retired tunnel must never be counted as a revocation"
     );
     assert!(
@@ -1492,7 +1503,7 @@ async fn a_revoked_tunnels_reason_survives_the_relays_retire() {
         Some(HboneRevocationReason::RelayDestination),
         "the reason must outlive the relay's retire(), or the datagram relay misreports it"
     );
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 1, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 1, 0, 0]);
 }
 
 // ── Credential dimension (issue #5568) ────────────────────────────────────
@@ -1875,7 +1886,7 @@ async fn a_trust_rotation_that_keeps_the_peer_anchored_revokes_nothing() {
     wait_for_settled_sweeps(&state).await;
 
     assert_eq!(tunnel.revoked_reason(), None);
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
     assert_eq!(fence.live_tunnels(), 1);
     assert_eq!(
         fence.trust_rechecks(),
@@ -1918,7 +1929,7 @@ async fn withdrawing_the_peers_trust_domain_revokes_its_live_tunnel() {
         Some(HboneRevocationReason::PeerTrust),
         "a retired trust domain is a credential withdrawal, not a policy denial"
     );
-    assert_eq!(revocation_counts(&state), [0, 0, 1, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 1, 0, 0, 0, 0, 0, 0]);
 }
 
 /// Withdrawing a FEDERATED trust domain is the same withdrawal as withdrawing
@@ -1965,7 +1976,7 @@ async fn withdrawing_a_federated_trust_domain_revokes_its_live_tunnel() {
         tunnel.revoked_reason(),
         Some(HboneRevocationReason::PeerTrust)
     );
-    assert_eq!(revocation_counts(&state), [0, 0, 1, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 1, 0, 0, 0, 0, 0, 0]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2002,7 +2013,7 @@ async fn rotating_away_the_issuing_authority_revokes_its_live_tunnel() {
         tunnel.revoked_reason(),
         Some(HboneRevocationReason::PeerTrust)
     );
-    assert_eq!(revocation_counts(&state), [0, 0, 1, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 1, 0, 0, 0, 0, 0, 0]);
 }
 
 /// The regression the independent review of #5573 found, in its own words: a
@@ -2077,7 +2088,7 @@ async fn a_root_rotation_the_inbound_verifier_accepted_keeps_live_tunnels() {
         "a peer the inbound verifier still admits must not be revoked because the request \
          epoch's separately-built bundles never carried its root"
     );
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
     assert_eq!(fence.live_tunnels(), 1);
 }
 
@@ -2124,7 +2135,7 @@ async fn an_unchanged_republish_revokes_nothing_and_builds_no_certificate_path()
     wait_for_settled_sweeps(&state).await;
 
     assert_eq!(tunnel.revoked_reason(), None);
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
     assert_eq!(
         inbound_trust_revision(&state),
         admitted_revision,
@@ -2193,7 +2204,7 @@ async fn an_expired_peer_svid_is_revoked_with_no_publication_at_all() {
         Some(HboneRevocationReason::PeerExpired),
         "an aged-out leaf is `peer_expired`, never folded into the trust verdict"
     );
-    assert_eq!(revocation_counts(&state), [0, 1, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 1, 0, 0, 0, 0, 0, 0, 0]);
     assert_eq!(
         fence.sweep_epoch(),
         sweep_epoch_before,
@@ -2223,7 +2234,7 @@ async fn an_unparseable_retained_leaf_fails_closed_as_a_reevaluation_failure() {
         Some(HboneRevocationReason::ReevaluationFailed),
         "an unparseable leaf must not be attributed to the peer's SVID lifetime"
     );
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 1]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 1]);
 }
 
 /// A leaf whose `notAfter` outruns the representable monotonic range carries no
@@ -2243,7 +2254,7 @@ async fn an_unbounded_leaf_is_not_revoked_by_the_expiry_half() {
     wait_for_settled_sweeps(&state).await;
 
     assert_eq!(tunnel.revoked_reason(), None);
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
 }
 
 /// Parity with the inbound verifier, which is what "would still be admitted"
@@ -2319,7 +2330,7 @@ async fn a_trust_publication_that_does_not_compile_never_takes_force() {
         "the verifier is still admitting this peer under its last-known-good set, so the \
          fence must not cut its tunnel"
     );
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
     assert_eq!(fence.trust_rechecks(), 0);
 
     // A withdrawal that DOES compile is still a withdrawal: the fence has not
@@ -2337,7 +2348,7 @@ async fn a_trust_publication_that_does_not_compile_never_takes_force() {
         Some(HboneRevocationReason::PeerTrust),
         "a trust set that IS in force and no longer anchors the peer still revokes"
     );
-    assert_eq!(revocation_counts(&state), [0, 0, 1, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 1, 0, 0, 0, 0, 0, 0]);
     assert!(inbound_trust_revision(&state) > in_force);
 }
 
@@ -2375,7 +2386,7 @@ async fn a_peer_the_admitting_trust_never_anchored_is_not_revoked_for_trust() {
     wait_for_settled_sweeps(&state).await;
 
     assert_eq!(tunnel.revoked_reason(), None);
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
     assert_eq!(fence.live_tunnels(), 1);
     assert_eq!(fence.trust_rechecks(), 0);
 }
@@ -2483,7 +2494,7 @@ async fn withdrawing_the_svids_own_trust_domain_revokes_a_real_tunnel() {
     .await
     .expect("withdrawing the peer's trust domain must revoke its live tunnel");
 
-    assert_eq!(revocation_counts(&fx.state), [0, 0, 1, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&fx.state), [0, 0, 1, 0, 0, 0, 0, 0, 0]);
     fx.teardown().await;
 }
 
@@ -2522,7 +2533,7 @@ async fn a_pooled_connect_after_a_trust_withdrawal_is_refused_not_reseeded() {
     wait_for_no_live_tunnels(&fx.state).await;
     assert_eq!(
         revocation_counts(&fx.state),
-        [0, 0, 1, 0, 0, 0, 0, 0],
+        [0, 0, 1, 0, 0, 0, 0, 0, 0],
         "exactly one peer_trust revocation"
     );
 
@@ -2539,7 +2550,7 @@ async fn a_pooled_connect_after_a_trust_withdrawal_is_refused_not_reseeded() {
     assert_eq!(fx.state.hbone_admission_fence.connect_trust_refusals(), 1);
     assert_eq!(
         revocation_counts(&fx.state),
-        [0, 0, 1, 0, 0, 0, 0, 0],
+        [0, 0, 1, 0, 0, 0, 0, 0, 0],
         "a refused CONNECT is never a revocation"
     );
     assert_eq!(
@@ -2574,7 +2585,7 @@ async fn a_chain_only_posture_still_admits_a_pooled_second_connect() {
     assert_eq!(fence.live_tunnels(), 2);
     assert_eq!(fence.connect_trust_refusals(), 0);
     assert_eq!(fence.trust_anchor_builds(), 0);
-    assert_eq!(revocation_counts(&fx.state), [0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&fx.state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
     fx.teardown().await;
 }
@@ -2898,7 +2909,7 @@ async fn an_admitted_connect_advertises_the_fence_capability_on_its_200() {
     );
     // The advertisement is a capability flag, never an authorization: the
     // admission counters are untouched by it.
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
     let _ = shutdown_tx.send(true);
     backend_handle.abort();
@@ -2938,7 +2949,7 @@ async fn a_connect_with_per_request_rate_limiting_does_not_advertise_reuse() {
         1,
         "the classification withholds the capability, it does not refuse the tunnel"
     );
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
     let _ = shutdown_tx.send(true);
     backend_handle.abort();
@@ -2988,7 +2999,7 @@ async fn a_connect_whose_mesh_authz_binds_an_external_authorizer_does_not_advert
          a fresh external verdict, per operation"
     );
     assert_eq!(state.hbone_admission_fence.live_tunnels(), 1);
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
     let _ = shutdown_tx.send(true);
     backend_handle.abort();
@@ -2999,10 +3010,10 @@ async fn a_connect_whose_mesh_authz_binds_an_external_authorizer_does_not_advert
 /// when it takes no authorization decision at all.
 ///
 /// `correlation_id` only stamps a header and never rejects, but nobody has
-/// declared it reuse-safe, so `!is_authorize_plugin()` over a marker that
-/// itself defaults to `true` refuses it — and one refusal anywhere in the chain
-/// is the whole chain's answer. That is the intended direction: a new built-in,
-/// or any custom plugin, must be looked at before it can ride a reused tunnel.
+/// declared it reuse-safe, so the literal `false` default refuses it — and one
+/// refusal anywhere in the chain is the whole chain's answer. That is the
+/// intended direction: a new built-in, or any custom plugin, must be looked at
+/// before it can ride a reused tunnel.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_connect_whose_chain_carries_an_unclassified_plugin_does_not_advertise_reuse() {
     let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
@@ -3061,10 +3072,13 @@ async fn an_access_control_chain_refuses_the_connect_it_would_have_let_reuse() {
         connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
 
     let (response, _request_body) = send_connect(&mut sender, None).await;
-    assert_ne!(
+    assert_eq!(
         response.status(),
-        StatusCode::OK,
-        "access_control has no mapped Consumer for an HBONE CONNECT and refuses it"
+        StatusCode::UNAUTHORIZED,
+        "the no-consumer arm of `AccessControl::authorize_identity` is what refuses this CONNECT, \
+         and it rejects `401`: `allow_authenticated_identity` needs an `authenticated_identity`, \
+         and `spiffe_identity` publishes a certificate PRINCIPAL (`peer_spiffe_id`) instead, so \
+         neither the Consumer nor the external-identity arm is reached"
     );
     assert_eq!(
         tunnel_reuse_advertisement(&response),
@@ -3141,6 +3155,357 @@ async fn a_datagram_connect_never_advertises_reuse() {
 
     let _ = shutdown_tx.send(true);
     external_handle.abort();
+    conn_task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Issue #5583, second half: the advertisement is an OBLIGATION, not a one-time
+// statement.
+//
+// A tunnel admitted with the capability advertised keeps carrying application
+// operations its source will not re-CONNECT for. So a chain that stops
+// permitting reuse — a CUSTOM `mesh_authz` policy is published, `rate_limiting`
+// is attached, an unclassified plugin appears — would never see them: the sweep
+// re-issues opted-in `authorize` verdicts and the peer credential, and NOTHING
+// else. Every sweep therefore re-folds the classification over the CURRENT
+// chain and revokes `reuse_withdrawn`, which is what restores per-operation
+// admission: the source's next operation performs a fresh CONNECT under the new
+// chain and is charged, mirrored, or externally authorized exactly as it asks.
+//
+// These run through the production dispatcher over real mTLS, like the
+// advertisement tests above. The static side — who classifies what, and that the
+// default is a literal `false` no other marker can move — is in
+// `tests/unit/gateway_core/hbone_inner_reuse_classification_tests.rs`.
+// ---------------------------------------------------------------------------
+
+/// One admitted byte-stream tunnel over a REAL inbound mTLS CONNECT, with the
+/// response head's reuse advertisement recorded.
+///
+/// [`admit_client_tunnel`] cannot serve these tests: it discards the response
+/// head, and the advertisement on it is the whole premise here — a tunnel that
+/// never advertised took on no obligation, which is itself one of the cases
+/// below.
+struct ReuseFixture {
+    state: ProxyState,
+    tunnel: Tunnel,
+    sender: h2::client::SendRequest<Bytes>,
+    conn_task: tokio::task::JoinHandle<Result<(), h2::Error>>,
+    backend_handle: tokio::task::JoinHandle<()>,
+    backend_port: u16,
+    shutdown_tx: watch::Sender<bool>,
+    /// Whether the admitted CONNECT's `200` carried the capability.
+    advertised: bool,
+}
+
+impl ReuseFixture {
+    async fn teardown(self) {
+        let _ = self.shutdown_tx.send(true);
+        self.backend_handle.abort();
+        self.conn_task.abort();
+    }
+}
+
+async fn admit_tunnel_with_plugins(plugin_configs: Vec<PluginConfig>) -> ReuseFixture {
+    let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
+    let (backend_addr, backend_handle) = start_interactive_echo_backend().await;
+    let state = build_state(prepared_config_with(
+        Some(backend_addr.port()),
+        None,
+        vec![allow_client()],
+        plugin_configs,
+    ));
+    let (gateway_addr, shutdown_tx) =
+        start_inbound_gateway(state.clone(), hbone_server_config(&certs)).await;
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let (response, request_body) = send_connect(&mut sender, None).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the reuse classification governs the CAPABILITY, never the admission"
+    );
+    let fenced = Some(ferrum_edge::modes::mesh::hbone::TUNNEL_REUSE_FENCED);
+    let advertised = tunnel_reuse_advertisement(&response).as_deref() == fenced;
+    let mut tunnel = Tunnel {
+        request_body,
+        response_body: response.into_body(),
+    };
+    echo_round_trip(&mut tunnel, b"before-publish").await;
+    assert_eq!(state.hbone_admission_fence.live_tunnels(), 1);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+    ReuseFixture {
+        state,
+        tunnel,
+        sender,
+        conn_task,
+        backend_handle,
+        backend_port: backend_addr.port(),
+        shutdown_tx,
+        advertised,
+    }
+}
+
+/// The generation that binds an external authorization executor: the same mesh
+/// shape `a_connect_whose_mesh_authz_binds_an_external_authorizer_does_not_advertise_reuse`
+/// admits a CONNECT under, so the CONNECT itself is unaffected and only the
+/// capability moves.
+fn custom_delegating_mesh() -> MeshConfig {
+    MeshConfig {
+        mesh_policies: vec![allow_client(), custom_policy_for_other_principal()],
+        ext_authz_providers: vec![ext_authz_provider()],
+        ..MeshConfig::default()
+    }
+}
+
+/// Publishing a `CUSTOM` `mesh_authz` policy revokes a tunnel that was already
+/// advertised reusable.
+///
+/// A sweep deliberately never re-consults an external authorizer
+/// (`MESH_AUTHZ_REEVALUATION_METADATA_KEY`), so without this gate the source
+/// would keep eliding CONNECTs the destination now wants an external verdict
+/// for — one `allow` bought at admission and honoured indefinitely. The tunnel's
+/// own CONNECT is still admitted by the local ALLOW tier, which is exactly why
+/// the reason has to be its own: nothing was refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_published_custom_authorization_policy_withdraws_reuse_from_a_live_tunnel() {
+    let mut fx = admit_tunnel_with_plugins(Vec::new()).await;
+    assert!(
+        fx.advertised,
+        "the ordinary mesh inbound chain must be reusable, or this test proves nothing"
+    );
+
+    let outcome = fx.state.update_config(prepared_config_from_mesh(
+        Some(fx.backend_port),
+        None,
+        custom_delegating_mesh(),
+        Vec::new(),
+    ));
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+
+    assert_tunnel_closed(&mut fx.tunnel.response_body).await;
+    wait_for_no_live_tunnels(&fx.state).await;
+    assert_eq!(
+        revocation_counts(&fx.state),
+        [0, 0, 0, 0, 0, 0, 0, 1, 0],
+        "exactly one reuse_withdrawn revocation, and no authorization_denied one: the local \
+         ALLOW tier still admits this principal, so nothing about the tunnel was REFUSED"
+    );
+
+    // The peer re-CONNECTs on the same pooled mTLS connection, which is what the
+    // revocation exists to provoke. It is admitted — and it is that fresh
+    // CONNECT, not a reused tunnel, that a CUSTOM policy can now decide.
+    let (response, _request_body) = send_connect(&mut fx.sender, None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        tunnel_reuse_advertisement(&response),
+        None,
+        "and the replacement tunnel must not be granted the capability that was just withdrawn"
+    );
+
+    fx.teardown().await;
+}
+
+/// Attaching a plugin that CHARGES an operation revokes a tunnel that was
+/// already advertised reusable.
+///
+/// `rate_limiting` consumes a token per operation. Left alone, the tunnel
+/// admitted before the publication would carry an unbounded number of
+/// operations against the single token its CONNECT paid — the budget bypass the
+/// classification exists to prevent, arrived at by a routine config apply
+/// instead of by a CONNECT.
+#[tokio::test(flavor = "multi_thread")]
+async fn attaching_a_per_operation_charge_withdraws_reuse_from_a_live_tunnel() {
+    let mut fx = admit_tunnel_with_plugins(Vec::new()).await;
+    assert!(fx.advertised);
+
+    // Generous limit: this test is about the CLASSIFICATION, and a budget small
+    // enough to refuse the follow-up CONNECT would confuse the two.
+    let outcome = fx.state.update_config(prepared_config_with(
+        Some(fx.backend_port),
+        None,
+        vec![allow_client()],
+        vec![spiffe_rate_limit_plugin(64)],
+    ));
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+
+    assert_tunnel_closed(&mut fx.tunnel.response_body).await;
+    wait_for_no_live_tunnels(&fx.state).await;
+    assert_eq!(
+        revocation_counts(&fx.state),
+        [0, 0, 0, 0, 0, 0, 0, 1, 0],
+        "exactly one reuse_withdrawn revocation; the sweep must not have RE-RUN the limiter, \
+         which would have charged a real client's budget per live tunnel"
+    );
+
+    let (response, _request_body) = send_connect(&mut fx.sender, None).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the replacement CONNECT is inside the budget and is charged one token, which is the \
+         per-operation admission the withdrawal restored"
+    );
+    assert_eq!(tunnel_reuse_advertisement(&response), None);
+
+    fx.teardown().await;
+}
+
+/// The SAME publication leaves a tunnel that never advertised alone.
+///
+/// Such a tunnel already performs one full destination admission per operation,
+/// so there is nothing for the newly attached policy to miss and cutting it
+/// would be a gratuitous connection reset on every config apply.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tunnel_that_never_advertised_survives_the_same_withdrawal_publication() {
+    let mut fx = admit_tunnel_with_plugins(vec![unclassified_plugin()]).await;
+    assert!(
+        !fx.advertised,
+        "an unclassified plugin in the chain must have withheld the capability at admission"
+    );
+
+    let outcome = fx.state.update_config(prepared_config_from_mesh(
+        Some(fx.backend_port),
+        None,
+        custom_delegating_mesh(),
+        vec![unclassified_plugin()],
+    ));
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+    wait_for_settled_sweeps(&fx.state).await;
+
+    assert_eq!(
+        fx.state.hbone_admission_fence.live_tunnels(),
+        1,
+        "a tunnel that was never granted the capability cannot lose it"
+    );
+    assert_eq!(revocation_counts(&fx.state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    // Still carrying bytes, not merely still registered.
+    echo_round_trip(&mut fx.tunnel, b"after-publish").await;
+
+    fx.teardown().await;
+}
+
+/// A chain that BECOMES reusable does not disturb live tunnels either.
+///
+/// The gate is one-directional by construction: it judges only tunnels whose
+/// snapshot recorded the advertisement. A tunnel admitted without it keeps
+/// doing what it was admitted to do — one CONNECT per operation — and only the
+/// NEXT CONNECT is granted the capability.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chain_that_becomes_reusable_leaves_live_tunnels_untouched() {
+    let mut fx = admit_tunnel_with_plugins(vec![unclassified_plugin()]).await;
+    assert!(!fx.advertised);
+
+    // The unclassified plugin is withdrawn: the chain is now the ordinary
+    // reusable mesh inbound one.
+    let outcome = fx.state.update_config(prepared_config_with(
+        Some(fx.backend_port),
+        None,
+        vec![allow_client()],
+        Vec::new(),
+    ));
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+    wait_for_settled_sweeps(&fx.state).await;
+
+    assert_eq!(fx.state.hbone_admission_fence.live_tunnels(), 1);
+    assert_eq!(revocation_counts(&fx.state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    echo_round_trip(&mut fx.tunnel, b"after-publish").await;
+
+    let (response, _request_body) = send_connect(&mut fx.sender, None).await;
+    assert_eq!(
+        tunnel_reuse_advertisement(&response).as_deref(),
+        Some(ferrum_edge::modes::mesh::hbone::TUNNEL_REUSE_FENCED),
+        "the capability follows the chain, so the next CONNECT does get it"
+    );
+
+    fx.teardown().await;
+}
+
+/// A CONNECT released simultaneously with the withdrawing publication ends in
+/// one of exactly two states, and never in the third.
+///
+/// What this test CAN force: both sides start at the same instant, from a
+/// barrier, on a multi-threaded runtime. What it CANNOT force is which one wins
+/// — nor should it, because the contract is that neither order leaves a
+/// reusable tunnel under a chain that no longer permits reuse. So the assertion
+/// is on the invariant, not on the interleaving: if the CONNECT was admitted
+/// under the OLD generation it carries the advertisement and MUST be revoked
+/// `reuse_withdrawn` (publish-then-recheck is what guarantees the publication's
+/// own sweep cannot miss an insert that had not happened yet); if it was
+/// admitted under the NEW one it never advertised and must be left alone. A run
+/// that always took the same branch would still be a correct run of this test,
+/// and the two sibling tests above pin each branch deterministically — this one
+/// exists for the window between them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connect_racing_the_withdrawing_publication_is_never_left_reusable() {
+    let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
+    let (backend_addr, backend_handle) = start_interactive_echo_backend().await;
+    let state = build_state(prepared_config(
+        Some(backend_addr.port()),
+        vec![allow_client()],
+    ));
+    let (gateway_addr, shutdown_tx) =
+        start_inbound_gateway(state.clone(), hbone_server_config(&certs)).await;
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let connect_barrier = Arc::clone(&barrier);
+    let connecting = tokio::spawn(async move {
+        connect_barrier.wait().await;
+        let (response, request_body) = send_connect(&mut sender, None).await;
+        let status = response.status();
+        let advertised = tunnel_reuse_advertisement(&response).is_some();
+        (status, advertised, request_body, response.into_body())
+    });
+
+    // Built BEFORE the barrier: mesh preparation is not cheap, and doing it
+    // after the release would hand the CONNECT a head start this test has no
+    // business granting it.
+    let withdrawing = prepared_config_from_mesh(
+        Some(backend_addr.port()),
+        None,
+        custom_delegating_mesh(),
+        Vec::new(),
+    );
+    let publishing_state = state.clone();
+    let publishing = tokio::spawn(async move {
+        barrier.wait().await;
+        publishing_state.update_config(withdrawing)
+    });
+
+    let (status, advertised, _request_body, mut response_body) =
+        connecting.await.expect("the CONNECT task must not panic");
+    let outcome = publishing.await.expect("the publication task must not panic");
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "neither ordering refuses this principal; only the capability is at stake"
+    );
+
+    if advertised {
+        // Admitted under the superseded generation. The publication's own sweep
+        // may have read the registry before this tunnel reached it, so what has
+        // to close the window is `admit()`'s own sweep-epoch recheck.
+        assert_tunnel_closed(&mut response_body).await;
+        wait_for_no_live_tunnels(&state).await;
+        assert_eq!(
+            revocation_counts(&state),
+            [0, 0, 0, 0, 0, 0, 0, 1, 0],
+            "a tunnel admitted reusable across a withdrawing publication must be revoked by the \
+             sweep that publication requested"
+        );
+    } else {
+        // Admitted under the new generation: it never had the capability, so
+        // there is nothing to withdraw and nothing to cut.
+        wait_for_settled_sweeps(&state).await;
+        assert_eq!(state.hbone_admission_fence.live_tunnels(), 1);
+        assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    let _ = shutdown_tx.send(true);
+    backend_handle.abort();
     conn_task.abort();
 }
 
@@ -3349,7 +3714,7 @@ async fn a_crl_revoking_the_admitted_leaf_revokes_the_tunnel_and_refuses_the_nex
     wait_for_no_live_tunnels(&fx.state).await;
     assert_eq!(
         revocation_counts(&fx.state),
-        [0, 0, 0, 1, 0, 0, 0, 0],
+        [0, 0, 0, 1, 0, 0, 0, 0, 0],
         "a chain that still anchors but whose leaf the enforced CRL lists is `peer_revoked`"
     );
 
@@ -3365,7 +3730,7 @@ async fn a_crl_revoking_the_admitted_leaf_revokes_the_tunnel_and_refuses_the_nex
     assert_eq!(fx.state.hbone_admission_fence.connect_trust_refusals(), 1);
     assert_eq!(
         revocation_counts(&fx.state),
-        [0, 0, 0, 1, 0, 0, 0, 0],
+        [0, 0, 0, 1, 0, 0, 0, 0, 0],
         "a refused CONNECT is never a revocation"
     );
     assert_eq!(
@@ -3406,7 +3771,7 @@ async fn a_crl_revoking_a_different_serial_revokes_nothing() {
         None,
         "a CRL that does not list this leaf's serial must not revoke it"
     );
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
     assert_eq!(fence.live_tunnels(), 1);
     assert_eq!(
         fence.trust_rechecks(),
@@ -3566,7 +3931,7 @@ async fn an_unusable_crl_never_takes_force() {
         "a candidate that never took force must not revoke the tunnels it was never \
          judged against"
     );
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
     assert_eq!(
         fence.trust_rechecks(),
         0,
@@ -3623,6 +3988,11 @@ async fn a_published_crl_refuses_the_peers_next_handshake() {
 /// trust-anchor loop defaults to `UnknownIssuer`, and revocation is consulted
 /// only inside the signed-chain check — i.e. only once a candidate anchor has
 /// matched. So expiry wins over anchoring, and anchoring wins over revocation.
+///
+/// `reuse_withdrawn` (issue #5583) is the one reason that is NOT a refusal —
+/// that tunnel's CONNECT would still be admitted, only without the reuse
+/// capability — so it sits after every gate that is one, and before the
+/// fail-closed arm.
 #[test]
 fn the_revocation_reason_order_is_pinned() {
     // Read out of `ALL` rather than a handwritten copy of it. A copy silently
@@ -3645,6 +4015,7 @@ fn the_revocation_reason_order_is_pinned() {
             "authorization_denied",
             "peer_auth_transport",
             "relay_destination",
+            "reuse_withdrawn",
             "reevaluation_failed",
         ],
         "the closed `reason` set and its gate order are pinned by docs/mesh.md, \
@@ -4095,7 +4466,7 @@ async fn a_rebind_to_an_uncompilable_slot_keeps_the_accepted_anchors_in_force() 
     wait_for_no_live_tunnels(&fx.state).await;
     assert_eq!(
         revocation_counts(&fx.state),
-        [0, 0, 0, 2, 0, 0, 0, 0],
+        [0, 0, 0, 2, 0, 0, 0, 0, 0],
         "both tunnels are cut as `peer_revoked`, judged by slot A's anchors"
     );
     let refused = open_tunnel(&mut fx.sender).await.err();
@@ -4184,7 +4555,7 @@ async fn removing_the_enforced_records_readmits_the_peer() {
     fence.request_sweep();
     wait_for_settled_sweeps(&state).await;
     assert_eq!(tunnel.revoked_reason(), None);
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
 }
 
 /// The shared CRL policy is FULL-CHAIN, so revoking the ISSUING INTERMEDIATE
@@ -4231,7 +4602,7 @@ async fn revoking_the_issuing_intermediate_revokes_the_tunnel_and_the_handshake(
         "a revoked issuing CA revokes the leaves it signed, and it is a revocation rather \
          than a trust withdrawal: the chain still anchors in the root"
     );
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 1, 0, 0, 0, 0]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 1, 0, 0, 0, 0, 0]);
     assert!(
         !handshake_admits_chain(&verifier, &chain),
         "and the same record refuses the peer's next handshake"
@@ -4342,7 +4713,7 @@ async fn a_crl_that_ages_out_after_taking_force_fails_closed_on_the_next_revisio
         "an in-force CRL past its nextUpdate makes the chain un-judgeable; the fence fails \
          closed and must NOT file it as peer_expired, which describes the peer's own SVID"
     );
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 1]);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 1]);
 }
 
 /// The datagram relay shares the credential gate with the byte-stream relay, so
@@ -4394,7 +4765,7 @@ async fn a_crl_revoking_the_peer_cuts_a_live_datagram_tunnel_and_refuses_its_ret
     wait_for_no_live_tunnels(&state).await;
     assert_eq!(
         revocation_counts(&state),
-        [0, 0, 0, 1, 0, 0, 0, 0],
+        [0, 0, 0, 1, 0, 0, 0, 0, 0],
         "the datagram relay honors the revocation exactly as the byte-stream relay does"
     );
 
@@ -4528,7 +4899,7 @@ async fn either_publication_order_leaves_one_set_in_force_on_both_surfaces() {
              install that runs after a publication must not leave the fence judging by an \
              empty list"
         );
-        assert_eq!(revocation_counts(&state), [0, 0, 0, 1, 0, 0, 0, 0]);
+        assert_eq!(revocation_counts(&state), [0, 0, 0, 1, 0, 0, 0, 0, 0]);
     }
 }
 

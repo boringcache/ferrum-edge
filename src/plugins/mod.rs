@@ -11337,14 +11337,25 @@ pub trait Plugin: Send + Sync {
     /// expiry would never reach a reused tunnel. The default already refuses
     /// every one of them; do not opt any of them in.
     ///
-    /// The default is `!is_authorize_plugin()`, and
-    /// [`Self::is_authorize_plugin`] itself defaults to `true` — so a plugin
-    /// nobody has classified, including every custom plugin, refuses reuse. A
-    /// plugin whose `is_authorize_plugin()` is `false` inherits `true` from
-    /// that default, which is NOT a classification: every such built-in
-    /// overrides this method explicitly so nothing is reusable by accident.
+    /// The default is a literal `false`. A plugin nobody has classified —
+    /// including every custom plugin — refuses reuse, and nothing else about it
+    /// can change that answer.
+    ///
+    /// It is deliberately NOT derived from [`Self::is_authorize_plugin`].
+    /// That marker describes participation in the AUTHORIZE PHASE, which is a
+    /// narrower question than "takes no per-operation decision anywhere": a
+    /// plugin that charges a quota, takes a permit, or consults an external
+    /// service from `on_request_received` and reports `is_authorize_plugin() ==
+    /// false` takes exactly the per-operation decision reuse would strand, so a
+    /// default of `!is_authorize_plugin()` opted that supported custom-plugin
+    /// shape in without anyone looking at it. A literal `false` also means the
+    /// two markers are independent: changing a plugin's authorize marker can
+    /// never, on its own, make it reusable.
+    ///
+    /// Every reusable built-in therefore overrides this method explicitly, and
+    /// so must every one that becomes reusable later.
     fn allows_hbone_inner_reuse(&self) -> bool {
-        !self.is_authorize_plugin()
+        false
     }
 
     /// Returns hostnames that this plugin will send traffic to.

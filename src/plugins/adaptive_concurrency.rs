@@ -91,9 +91,9 @@ impl Plugin for AdaptiveConcurrency {
     /// life (issue #5583). Reuse would take one permit and then let an
     /// unbounded number of later operations run outside the in-flight count
     /// this plugin exists to bound, so the limiter would under-count exactly
-    /// the load it is shedding against. `is_authorize_plugin()` is `false`
-    /// here, so the trait default would have said `true`; this override is the
-    /// classification.
+    /// the load it is shedding against. The trait default already refuses;
+    /// this override records that the permit was looked at and is the reason,
+    /// since this plugin takes it outside the authorize phase entirely.
     fn allows_hbone_inner_reuse(&self) -> bool {
         false
     }
