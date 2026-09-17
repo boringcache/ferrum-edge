@@ -37,13 +37,13 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain, spiffe_id_to_san};
 use ferrum_edge::identity::{SharedSvidBundle, SvidBundle, TrustBundle, TrustBundleSet};
 use ferrum_edge::modes::mesh::hbone::{TUNNEL_REUSE_FENCED, TUNNEL_REUSE_HEADER};
+use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::proxy::grpc_proxy::GrpcBody;
 use ferrum_edge::proxy::hbone_inner_pool::{
     HboneInnerConnectionPool, HboneInnerH1Checkout, HboneInnerH1RequestBody,
     HboneInnerH2StreamLease, HboneInnerKeyParts, HboneInnerProtocol, HboneSourceCredential,
     MAX_IDLE_H1_PER_KEY,
 };
-use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::proxy::hbone_pool::HboneConnectionPool;
 use ferrum_edge::tls::spiffe::build_spiffe_inbound_config;
 use http::{Response, StatusCode};

@@ -3836,7 +3836,10 @@ async fn open_hbone_grpc_sender(
     if let Some(parts) = inner_key.as_ref()
         && let Some(checkout) = hbone.pool.inner_pool().checkout_h2(parts)
     {
-        return Ok(GrpcPooledSender::pooled_inner(checkout.sender, checkout.lease));
+        return Ok(GrpcPooledSender::pooled_inner(
+            checkout.sender,
+            checkout.lease,
+        ));
     }
 
     // Snapshot the retirement generation and the source TLS material BEFORE

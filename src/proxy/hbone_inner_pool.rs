@@ -1153,9 +1153,8 @@ impl HboneInnerConnectionPool {
         // side.
         let generation = self.drain_generation();
         let taken = with_hbone_inner_pool_key(parts, |key, spans| {
-            self.take_idle_h1(key).map(|(sender, pooled_deadline)| {
-                (key.to_string(), spans, sender, pooled_deadline)
-            })
+            self.take_idle_h1(key)
+                .map(|(sender, pooled_deadline)| (key.to_string(), spans, sender, pooled_deadline))
         });
         let (key, spans, sender, pooled_deadline) = taken?;
         self.record_hit(HboneInnerProtocol::Http1);
