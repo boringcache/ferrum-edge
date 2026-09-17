@@ -769,6 +769,17 @@ pub struct MetricsRegistry {
     pub mesh_grpc_response_messages_counter: DashMap<MeshRequestKey, TimestampedCounter>,
     /// Rate limit exceeded counter
     pub rate_limit_exceeded: AtomicU64,
+    /// `rate_limiting` decisions served from the per-process fallback budget
+    /// while centralized (Redis) enforcement was unavailable.
+    ///
+    /// The default `redis_failure_policy` for that plugin is `local_fallback`,
+    /// so degraded enforcement is the silent common case rather than an opt-in:
+    /// this is the alertable signal that the configured quota is currently
+    /// being enforced once per gateway process instead of once per fleet.
+    pub rate_limit_fallback_decisions: AtomicU64,
+    /// `rate_limiting` requests refused because centralized enforcement was
+    /// unavailable and `redis_failure_policy` is `fail_closed`.
+    pub rate_limit_unavailable_denials: AtomicU64,
     pub ai_rate_limit_local_accounting_tokens: AtomicU64,
     pub ai_rate_limit_unaccounted_tokens: AtomicU64,
     /// Live OAuth2 introspection cache entries, partitioned into the fixed
@@ -1022,6 +1033,8 @@ impl MetricsRegistry {
             mesh_grpc_request_messages_counter: DashMap::new(),
             mesh_grpc_response_messages_counter: DashMap::new(),
             rate_limit_exceeded: AtomicU64::new(0),
+            rate_limit_fallback_decisions: AtomicU64::new(0),
+            rate_limit_unavailable_denials: AtomicU64::new(0),
             ai_rate_limit_local_accounting_tokens: AtomicU64::new(0),
             ai_rate_limit_unaccounted_tokens: AtomicU64::new(0),
             oauth2_introspection_cache_entries: std::array::from_fn(|_| AtomicI64::new(0)),
@@ -1411,6 +1424,26 @@ impl MetricsRegistry {
     /// rate-limiter plugin.
     pub fn record_rate_limit_exceeded(&self) {
         self.rate_limit_exceeded.fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    /// Record one rate-limit decision taken on the per-process fallback budget
+    /// because the centralized store could not be consulted.
+    ///
+    /// Counts admissions, quota refusals, and capacity refusals alike: the
+    /// alertable fact is that enforcement was degraded for this decision, not
+    /// which way it went.
+    pub fn record_rate_limit_local_fallback_decision(&self) {
+        self.rate_limit_fallback_decisions
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    /// Record one request refused because centralized rate-limit enforcement
+    /// was unavailable under `redis_failure_policy: fail_closed`.
+    pub fn record_rate_limit_enforcement_unavailable(&self) {
+        self.rate_limit_unavailable_denials
+            .fetch_add(1, Ordering::Relaxed);
         self.maybe_invalidate_cache();
     }
 
@@ -3729,6 +3762,16 @@ impl MetricsRegistry {
 
         // Rate limit exceeded
         for (name, help, value) in [
+            (
+                "ferrum_rate_limit_local_fallback_decisions_total",
+                "Rate-limit decisions taken on the per-process fallback budget.",
+                self.rate_limit_fallback_decisions.load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_rate_limit_enforcement_unavailable_total",
+                "Requests refused because centralized rate-limit enforcement was unavailable.",
+                self.rate_limit_unavailable_denials.load(Ordering::Relaxed),
+            ),
             (
                 "ferrum_ai_rate_limit_local_accounting_tokens_total",
                 "AI tokens charged locally after centralized reconciliation failed.",

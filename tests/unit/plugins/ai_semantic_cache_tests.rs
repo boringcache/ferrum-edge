@@ -442,19 +442,13 @@ fn semantic_cache_schema_bounds_redis_database_selectors() {
     let spec: Value = serde_yaml::from_str(include_str!("../../../openapi.yaml")).unwrap();
     let schema = &spec["components"]["schemas"]["AiSemanticCacheConfig"]["properties"]["redis_url"];
     let validator = jsonschema::draft202012::options().build(schema).unwrap();
-    for selector in [
-        "",
-        "/",
-        "/0",
-        "/12",
-        "/2147483647",
-        "/000001",
-        "/+1/",
-        "/-0",
-    ] {
+    for selector in ["", "/", "/0", "/12", "/2147483647"] {
         assert!(validator.is_valid(&json!(format!("redis://localhost{selector}"))));
     }
     for selector in [
+        "/000001",
+        "/+1/",
+        "/-0",
         "/banana",
         "/1/2",
         "/-1",

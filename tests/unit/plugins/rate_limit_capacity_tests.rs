@@ -37,10 +37,12 @@ fn failover_backend() -> RateLimitBackend<String, DynamicHttpRateLimitAlgorithm>
     // Point at a closed port so Redis is unavailable and admission lands in
     // the local fallback map (the Redis-fallback consumer path).
     //
-    // `redis_failure_policy: "local_fallback"` is required, not incidental:
-    // the secure default (`fail_closed`, GHSA-87rq-v4hx-8rcq) refuses during an
-    // outage before the fallback map is ever consulted, so without the explicit
-    // opt-in this fixture would prove nothing about local capacity admission.
+    // `redis_failure_policy: "local_fallback"` is stated rather than inherited.
+    // It is `rate_limiting`'s own default (issue #5519) — the other five
+    // rate-limit plugins still default to `fail_closed`, which refuses during
+    // an outage before the fallback map is ever consulted — so pinning it here
+    // keeps this fixture exercising local capacity admission no matter which
+    // way the default moves.
     RateLimitBackend::from_plugin_config(
         "rate_limiting",
         &json!({
@@ -208,6 +210,20 @@ async fn redis_fallback_path_denies_new_local_keys_at_capacity() {
     assert_eq!(backend.tracked_keys_count(), 2);
     assert!(backend.contains_local_key(&"fb-a".to_string()));
     assert!(backend.contains_local_key(&"fb-b".to_string()));
+
+    // The capacity denial above carries no outcome, so `rate_limiting` reads
+    // the backend directly to decide whether that 429 belongs to the outage.
+    // A Redis-backed policy hitting the local key cap during an outage is an
+    // outage symptom, not client behaviour, and must be attributed with
+    // `ratelimit_local_fallback` like every other fallback decision.
+    assert!(
+        backend.local_fallback_active(),
+        "a Redis-backed policy whose store is unreachable is serving the fallback budget"
+    );
+    assert!(
+        !local_backend().local_fallback_active(),
+        "a local-only policy has no centralized store to lose"
+    );
 }
 
 #[test]
