@@ -10,9 +10,9 @@
 //! subprocess, release only the socket with `drop_and_take_port`: the registry
 //! lease survives until the test process exits. Reservations exclude the host's
 //! ephemeral source range so outbound connects cannot steal a released port.
-//! TCP reservations bind exclusively with `SO_REUSEADDR` disabled, skipping
-//! TIME_WAIT ports that the gateway could not bind. Each process scans from a
-//! PID/time-derived pseudo-random offset in the eligible range and wraps once,
+//! TCP and UDP reservations bind exclusively with `SO_REUSEADDR` disabled,
+//! also skipping TCP TIME_WAIT ports that the gateway could not bind. Each process
+//! scans from a PID/time-derived pseudo-random offset in the eligible range and wraps once,
 //! spreading consecutive test processes across ports instead of recycling the
 //! lowest numbers. Registry coordination and lease retention still apply.
 //! Native `TestSocket::bind_test(...:0)` fixtures must keep their socket bound.
@@ -23,6 +23,9 @@
 //! socket extends its lease to process exit because the socket cannot carry a
 //! Rust lease guard. This also makes teardown and subsequent subprocess handoffs
 //! safe in libtest, where multiple tests can share a process.
+//! Readiness must never rebind a handed-off UDP port: the spawning process owns
+//! the lease, so the registry cannot distinguish that probe from the intended
+//! consumer. Use the child's authenticated admin readiness barrier instead.
 //!
 //! ## Usage
 //!
@@ -38,7 +41,7 @@
 //! so the reasoning is captured in the test source.
 
 use super::port_registry::{
-    PortLease, TestSocket, bind_tcp_listener, bind_tcp_socket, process_registry,
+    PortLease, TestSocket, bind_tcp_listener, bind_tcp_socket, bind_udp_socket, process_registry,
 };
 
 use std::io;
@@ -193,8 +196,9 @@ pub async fn reserve_port_pair() -> io::Result<(PortReservation, PortReservation
 /// [`PortReservation`] for the datagram-oriented backends in Phase 4.
 ///
 /// TCP's bind-drop-rebind race also exists for UDP — holding the socket
-/// until the backend is ready avoids it. Drop the socket to release the
-/// port.
+/// until the backend is ready avoids it. A subprocess handoff releases only
+/// the socket; the lease stays held until the test process exits, after the
+/// gateway guard has killed and waited for its child.
 pub struct UdpPortReservation {
     /// The reserved local port.
     pub port: u16,
@@ -228,7 +232,7 @@ impl UdpPortReservation {
 /// Reserve a live UDP socket outside the source range, like [`reserve_port`].
 pub async fn reserve_udp_port() -> io::Result<UdpPortReservation> {
     let (lease, socket) = process_registry()?.lease_with(handoff_ports()?, |port| {
-        let socket = std::net::UdpSocket::bind(("127.0.0.1", port))?;
+        let socket = bind_udp_socket(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
         Ok((port, socket))
     })?;
     socket.set_nonblocking(true)?;
@@ -261,7 +265,7 @@ pub async fn unbound_udp_port() -> io::Result<u16> {
 pub async fn reserve_colocated_tcp_udp() -> io::Result<(PortReservation, UdpPortReservation)> {
     let (lease, (tcp, udp)) = process_registry()?.lease_with(handoff_ports()?, |port| {
         let tcp = bind_tcp_listener(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
-        let udp = std::net::UdpSocket::bind(("127.0.0.1", port))?;
+        let udp = bind_udp_socket(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
         Ok((port, (tcp, udp)))
     })?;
     tcp.set_nonblocking(true)?;

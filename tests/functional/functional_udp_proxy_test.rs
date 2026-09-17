@@ -20,7 +20,10 @@ use crate::scaffolding::ports::{reserve_udp_port, unbound_tcp_port, unbound_udp_
 
 use crate::scaffolding::port_registry::TestSocket;
 
-use crate::common::{GatewayChildGuard, configure_coverage_gateway_command, explicit_test_binary};
+use crate::common::{
+    GatewayChildGuard, SpawnedGatewayIdentity, configure_coverage_gateway_command,
+    explicit_test_binary,
+};
 use std::io::Write;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -153,7 +156,11 @@ fn start_gateway_with_extra_env(
     }
     // Owned at the instant of spawn: every path out of a fixture from here on,
     // panic included, kills and reaps this child (issue #4991).
-    Ok(GatewayChildGuard::spawn(&mut cmd)?)
+    Ok(GatewayChildGuard::spawn_with_identity(
+        &mut cmd,
+        admin_port,
+        SpawnedGatewayIdentity::mint("udp"),
+    )?)
 }
 
 fn start_gateway_with_dtls(
@@ -191,7 +198,11 @@ fn start_gateway_with_dtls_and_env(
     }
 
     configure_coverage_gateway_command(&mut cmd);
-    Ok(GatewayChildGuard::spawn(&mut cmd)?)
+    Ok(GatewayChildGuard::spawn_with_identity(
+        &mut cmd,
+        admin_port,
+        SpawnedGatewayIdentity::mint("dtls"),
+    )?)
 }
 
 fn write_config(path: &std::path::Path, content: &str) {
