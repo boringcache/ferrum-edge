@@ -3665,7 +3665,9 @@ async fn functional_cli_mesh_versions_are_redacted_without_registration() {
     let document = serde_json::json!({"version": secret, "mesh": {}});
     for extension in ["yaml", "json"] {
         let directory = TempDir::new().unwrap();
-        let mesh_path = directory.path().join(format!("mesh-invalid-version.{extension}"));
+        let mesh_path = directory
+            .path()
+            .join(format!("mesh-invalid-version.{extension}"));
         let content = if extension == "yaml" {
             serde_yaml::to_string(&document).unwrap()
         } else {

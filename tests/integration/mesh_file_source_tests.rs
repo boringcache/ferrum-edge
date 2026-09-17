@@ -117,8 +117,8 @@ fn hostile_map_keys_cannot_bypass_mesh_document_scalar_redaction() {
                     serde_yaml::to_string(&document).unwrap()
                 };
                 let path = write_temp(extension, &content);
-                let error = load_mesh_slice_from_file(&path, request_for_namespace("ferrum"))
-                    .unwrap_err();
+                let error =
+                    load_mesh_slice_from_file(&path, request_for_namespace("ferrum")).unwrap_err();
                 let diagnostic = format!("{error:#}");
                 assert!(!diagnostic.contains("UNREGISTERED_TOKEN"), "{diagnostic}");
                 assert!(!format!("{error:?}").contains("UNREGISTERED_TOKEN"));

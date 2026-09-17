@@ -74,7 +74,11 @@ fn serde_message_families_keep_structure_without_offending_scalars() {
     for (raw, expected) in cases {
         let sanitized = sanitize_message(raw);
         assert_eq!(sanitized, expected);
-        assert_eq!(sanitize_message(&sanitized), sanitized, "must be idempotent");
+        assert_eq!(
+            sanitize_message(&sanitized),
+            sanitized,
+            "must be idempotent"
+        );
     }
 }
 
@@ -331,7 +335,13 @@ fn hostile_app_probe_map_keys_never_classify_the_inner_json_error() {
             let document = serde_json::json!({(key): {"timeoutSeconds": secret}});
             let error = parse_app_probes(&document.to_string()).unwrap_err();
             assert!(!error.contains("unregistered-secret"), "{error}");
-            for structure in [key, "timeoutSeconds", "invalid type", "expected u64", "line "] {
+            for structure in [
+                key,
+                "timeoutSeconds",
+                "invalid type",
+                "expected u64",
+                "line ",
+            ] {
                 assert!(error.contains(structure), "{error}");
             }
         }
