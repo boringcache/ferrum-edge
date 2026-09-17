@@ -1194,8 +1194,8 @@ async fn test_rate_limiting_redis_centralized() {
 /// Wait until the current instant sits comfortably inside a one-second Redis
 /// sub-bucket, and return that sub-bucket's index.
 ///
-/// An eight-second policy window splits into eight one-second sub-buckets, so
-/// the index is just the epoch second. Landing 300-500ms in leaves a busy
+/// A sixteen-second policy window splits into sixteen one-second sub-buckets,
+/// so the index is just the epoch second. Landing 300-500ms in leaves a busy
 /// hosted runner room to seed a counter and issue one HTTP request without the
 /// two straddling a sub-bucket boundary.
 async fn aligned_one_second_sub_bucket() -> u64 {
@@ -1206,14 +1206,14 @@ async fn aligned_one_second_sub_bucket() -> u64 {
         if (300_000_000..=500_000_000).contains(&now.subsec_nanos()) {
             // Derived by the production helper, not by an epoch division that
             // merely happens to agree with it today.
-            return ferrum_edge::_test_support::redis_sub_bucket_at(now, 8).index;
+            return ferrum_edge::_test_support::redis_sub_bucket_at(now, 16).index;
         }
         sleep(Duration::from_millis(5)).await;
     }
 }
 
 fn current_one_second_sub_bucket() -> u64 {
-    live_sub_bucket(8)
+    live_sub_bucket(16)
 }
 
 /// Wire key of one request-quota sub-bucket: `{tag}:{window_seconds}:{index}`.
@@ -1343,9 +1343,9 @@ async fn test_rate_limiting_redis_trailing_sub_bucket_counts_in_full() {
             "enabled": true,
             "config": {
                 "expose_headers": true,
-                // Eight seconds splits into eight one-second sub-buckets, so
-                // the seeded index below is just an epoch second.
-                "limits": [{"scope": "default", "window_seconds": 8, "max_requests": 10}],
+                // Sixteen seconds splits into sixteen one-second sub-buckets,
+                // so the seeded index below is just an epoch second.
+                "limits": [{"scope": "default", "window_seconds": 16, "max_requests": 10}],
                 "sync_mode": "redis",
                 "redis_url": REDIS_URL,
                 "redis_key_prefix": unique_prefix,
@@ -1365,11 +1365,11 @@ async fn test_rate_limiting_redis_trailing_sub_bucket_counts_in_full() {
     let url = format!("{}/redis-rl-ladder/test", harness.proxy_base_url);
     let mut verified_without_boundary_cross = false;
     for _ in 0..4 {
-        // Seven sub-buckets back is inside the ladder (`current` plus the eight
-        // before it), so a full counter there must bind at face value.
+        // Fifteen sub-buckets back is inside the ladder (`current` plus the
+        // seventeen before it), so a full counter there must bind at face value.
         delete_redis_keys_by_prefix(&unique_prefix).await;
         let index = aligned_one_second_sub_bucket().await;
-        set_redis_counter(&sub_bucket_key(&unique_prefix, 8, index - 7), 10, 60).await;
+        set_redis_counter(&sub_bucket_key(&unique_prefix, 16, index - 15), 10, 60).await;
         let refused = client.get(&url).send().await.expect("in-ladder probe");
         if current_one_second_sub_bucket() != index {
             continue;
@@ -1383,19 +1383,19 @@ async fn test_rate_limiting_redis_trailing_sub_bucket_counts_in_full() {
         // the charged sub-bucket: only the seeded 10 may remain.
         wait_for_redis_counter_sum(&unique_prefix, 10).await;
         assert_eq!(
-            redis_counter_value(&sub_bucket_key(&unique_prefix, 8, index))
+            redis_counter_value(&sub_bucket_key(&unique_prefix, 16, index))
                 .await
                 .unwrap_or(0),
             0,
             "the refused probe must charge its own sub-bucket and hand it straight back"
         );
 
-        // Nine sub-buckets back has aged past the ladder. The same counter must
-        // stop binding, or the limiter is a lockout rather than a trailing
+        // Eighteen sub-buckets back has aged past the ladder. The same counter
+        // must stop binding, or the limiter is a lockout rather than a trailing
         // window.
         delete_redis_keys_by_prefix(&unique_prefix).await;
         let index = aligned_one_second_sub_bucket().await;
-        set_redis_counter(&sub_bucket_key(&unique_prefix, 8, index - 9), 10, 60).await;
+        set_redis_counter(&sub_bucket_key(&unique_prefix, 16, index - 18), 10, 60).await;
         let admitted = client.get(&url).send().await.expect("aged-out probe");
         if current_one_second_sub_bucket() != index {
             continue;
@@ -1406,7 +1406,7 @@ async fn test_rate_limiting_redis_trailing_sub_bucket_counts_in_full() {
             "a counter older than the trailing window must stop binding"
         );
         assert_eq!(
-            redis_counter_value(&sub_bucket_key(&unique_prefix, 8, index)).await,
+            redis_counter_value(&sub_bucket_key(&unique_prefix, 16, index)).await,
             Some(1),
             "the admitted request must charge the expected sub-bucket"
         );
@@ -1478,7 +1478,8 @@ async fn test_rate_limiting_redis_boundary_clustered_burst_keeps_counting() {
     let placement: Result<(), String> = async {
         // Cluster the whole quota into the last second of a four-second epoch
         // window, which is where the retired estimate discounted it hardest.
-        // A four-second window has 500ms sub-buckets, eight to an epoch window.
+        // A four-second window has 250ms sub-buckets, sixteen to an epoch
+        // window.
         await_epoch_window_offset(4_000_000_000, 2_800_000_000..3_200_000_000).await;
         let burst = tokio::time::Instant::now();
         let first_bucket = live_sub_bucket(4);
@@ -1498,13 +1499,13 @@ async fn test_rate_limiting_redis_boundary_clustered_burst_keeps_counting() {
         // boundary across which the retired weighted estimate decayed a live
         // burst. A burst that straddled the boundary would have been refused by
         // the retired estimate for its own reasons, and the assertion would
-        // prove nothing. `/ 8` is the epoch window a sub-bucket belongs to.
-        if first_bucket / 8 != last_bucket / 8 {
+        // prove nothing. `/ 16` is the epoch window a sub-bucket belongs to.
+        if first_bucket / 16 != last_bucket / 16 {
             return Err(format!(
                 "the burst spanned epoch windows {}..={} (sub-buckets \
                  {first_bucket}..={last_bucket}) in {spent:?}; it must sit wholly in one",
-                first_bucket / 8,
-                last_bucket / 8
+                first_bucket / 16,
+                last_bucket / 16
             ));
         }
 
@@ -1512,23 +1513,23 @@ async fn test_rate_limiting_redis_boundary_clustered_burst_keeps_counting() {
         // exact trailing four seconds. The weighted estimate admitted here.
         tokio::time::sleep_until(burst + Duration::from_millis(2_200)).await;
         // Placement FIRST, outcome second. A probe in sub-bucket `p` counts the
-        // ladder `p - 8 ..= p + 1`, so the burst still binds exactly while
-        // `p <= first_bucket + 8`, and the probe has to sit in the epoch window
+        // ladder `p - 17 ..= p + 1`, so the burst still binds exactly while
+        // `p <= first_bucket + 17`, and the probe has to sit in the epoch window
         // immediately after the burst's — the boundary the retired estimate
         // decayed across.
         let probe_bucket = live_sub_bucket(4);
-        if probe_bucket > first_bucket + 8 {
+        if probe_bucket > first_bucket + 17 {
             return Err(format!(
                 "the mid-window probe was scheduled into sub-bucket {probe_bucket}, past \
                  the trailing window of a burst in {first_bucket}"
             ));
         }
-        if probe_bucket / 8 != last_bucket / 8 + 1 {
+        if probe_bucket / 16 != last_bucket / 16 + 1 {
             return Err(format!(
                 "the mid-window probe was scheduled into epoch window {}, not the one \
                  immediately after the burst's ({})",
-                probe_bucket / 8,
-                last_bucket / 8
+                probe_bucket / 16,
+                last_bucket / 16
             ));
         }
         let Some(status) =
@@ -1538,7 +1539,7 @@ async fn test_rate_limiting_redis_boundary_clustered_burst_keeps_counting() {
         };
         // The request itself must also have been SERVED inside that ladder.
         let served_bucket = live_sub_bucket(4);
-        if served_bucket > first_bucket + 8 {
+        if served_bucket > first_bucket + 17 {
             return Err(format!(
                 "the mid-window probe was served in sub-bucket {served_bucket}, past the \
                  trailing window of a burst in {first_bucket}"
@@ -1557,7 +1558,7 @@ async fn test_rate_limiting_redis_boundary_clustered_burst_keeps_counting() {
         // The whole burst must be OUT of this probe's ladder, so the bound is
         // taken against the LATEST request of the burst.
         let aged_bucket = live_sub_bucket(4);
-        if aged_bucket <= last_bucket + 8 {
+        if aged_bucket <= last_bucket + 17 {
             return Err(format!(
                 "the aged-out probe was scheduled into sub-bucket {aged_bucket}, still \
                  inside the ladder of a burst ending in {last_bucket}"
@@ -1643,8 +1644,8 @@ async fn test_rate_limiting_redis_full_window_does_not_lock_out_the_next() {
         // Start just after an epoch-window boundary so the spend lands in one
         // two-second epoch window and the next round lands in the FOLLOWING one
         // — the exact shape `previous + current` refuses outright. A two-second
-        // window has 250ms sub-buckets, eight to an epoch window, so `/ 8` is
-        // the epoch window a sub-bucket belongs to.
+        // window has 125ms sub-buckets, sixteen to an epoch window, so `/ 16`
+        // is the epoch window a sub-bucket belongs to.
         await_epoch_window_offset(2_000_000_000, 0..200_000_000).await;
         let spent_at = tokio::time::Instant::now();
         let spend_bucket = live_sub_bucket(2);
@@ -1664,37 +1665,37 @@ async fn test_rate_limiting_redis_full_window_does_not_lock_out_the_next() {
         // placement can only make this test stricter, never vacuous.
         let served_bucket = live_sub_bucket(2);
         let spent = spent_at.elapsed();
-        if spend_bucket / 8 != served_bucket / 8 {
+        if spend_bucket / 16 != served_bucket / 16 {
             return Err(format!(
                 "the spend spanned epoch windows {}..={} (sub-buckets \
                  {spend_bucket}..={served_bucket}) in {spent:?}; it must sit wholly in one",
-                spend_bucket / 8,
-                served_bucket / 8
+                spend_bucket / 16,
+                served_bucket / 16
             ));
         }
 
-        // Three and a half seconds is past the whole ladder for a two-second
-        // window (the charged sub-bucket plus the eight before it), and still
-        // inside the NEXT epoch window — which is exactly where `previous +
-        // current` refuses and a trailing window must not.
+        // Three and a half seconds (28 sub-buckets) is past the whole ladder
+        // for a two-second window (the charged sub-bucket plus the seventeen
+        // before it), and still inside the NEXT epoch window — which is exactly
+        // where `previous + current` refuses and a trailing window must not.
         tokio::time::sleep_until(spent_at + Duration::from_millis(3_500)).await;
         // Placement FIRST. The spend must be OUT of this probe's ladder
-        // (`p - 8 > served_bucket`) and the probe must sit in the epoch window
+        // (`p - 17 > served_bucket`) and the probe must sit in the epoch window
         // that immediately follows the spend's, or the scenario is not the one
         // `previous + current` fails.
         let probe_bucket = live_sub_bucket(2);
-        if probe_bucket <= served_bucket + 8 {
+        if probe_bucket <= served_bucket + 17 {
             return Err(format!(
                 "the next-window probe was scheduled into sub-bucket {probe_bucket}, still \
                  inside the ladder of a spend no later than {served_bucket}"
             ));
         }
-        if probe_bucket / 8 != served_bucket / 8 + 1 {
+        if probe_bucket / 16 != served_bucket / 16 + 1 {
             return Err(format!(
                 "the next-window probe was scheduled into epoch window {}, not the one \
                  immediately after the spend's ({})",
-                probe_bucket / 8,
-                served_bucket / 8
+                probe_bucket / 16,
+                served_bucket / 16
             ));
         }
         let Some(status) =
@@ -1706,12 +1707,12 @@ async fn test_rate_limiting_redis_full_window_does_not_lock_out_the_next() {
         // came back before the window moved on. Re-read the placement and only
         // then assert.
         let served_probe = live_sub_bucket(2);
-        if served_probe / 8 != served_bucket / 8 + 1 {
+        if served_probe / 16 != served_bucket / 16 + 1 {
             return Err(format!(
                 "the next-window probe was served in epoch window {}, not the one \
                  immediately after the spend's ({})",
-                served_probe / 8,
-                served_bucket / 8
+                served_probe / 16,
+                served_bucket / 16
             ));
         }
         assert_eq!(
@@ -1727,7 +1728,7 @@ async fn test_rate_limiting_redis_full_window_does_not_lock_out_the_next() {
         else {
             return Err("the over-quota request did not answer within 2s".to_string());
         };
-        if live_sub_bucket(2) > served_probe + 8 {
+        if live_sub_bucket(2) > served_probe + 17 {
             return Err(format!(
                 "the over-quota request landed past the ladder of the admission in \
                  sub-bucket {served_probe}"
