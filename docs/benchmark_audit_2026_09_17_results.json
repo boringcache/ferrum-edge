@@ -4218,5 +4218,6054 @@
         }
       ]
     }
-  ]
+  ],
+  "cpu_models_by_protocol": {
+    "http3": "AMD EPYC 9V45 96-Core Processor",
+    "http2": "AMD EPYC 9V74 80-Core Processor",
+    "tcp-tls": "AMD EPYC 9V74 80-Core Processor",
+    "http1-tls": "AMD EPYC 9V45 96-Core Processor",
+    "wss": "AMD EPYC 7763 64-Core Processor",
+    "udp": "AMD EPYC 7763 64-Core Processor",
+    "grpcs": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+    "udp-dtls": "AMD EPYC 9V74 80-Core Processor"
+  },
+  "current_main_run": {
+    "run_id": 35195212169,
+    "commit": "d8a37c6911aba89112fd2571e9364118964e7955",
+    "duration_seconds": 15,
+    "base_concurrency": 200,
+    "iterations": 3,
+    "sample_count": 359,
+    "invalid_sample_count": 38,
+    "cpu_models_by_protocol": {
+      "http3": "AMD EPYC 7763 64-Core Processor",
+      "udp-dtls": "AMD EPYC 7763 64-Core Processor",
+      "grpcs": "AMD EPYC 9V74 80-Core Processor",
+      "wss": "AMD EPYC 7763 64-Core Processor",
+      "http1-tls": "AMD EPYC 7763 64-Core Processor",
+      "http2": "Intel(R) Xeon(R) 6973P-C",
+      "udp": "AMD EPYC 9V74 80-Core Processor",
+      "tcp-tls": "AMD EPYC 7763 64-Core Processor"
+    },
+    "rows": [
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 10240,
+        "gateway": "direct",
+        "mean_rps": 35086.13333333333,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 35086.13333333333,
+            "total_requests": 526292,
+            "total_errors": 0,
+            "total_bytes": 5389230080,
+            "p50_us": 5355,
+            "p99_us": 13343,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 10240,
+        "gateway": "envoy",
+        "mean_rps": 15906.444444444445,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 15215.333333333334,
+            "total_requests": 228230,
+            "total_errors": 0,
+            "total_bytes": 2337075200,
+            "p50_us": 12327,
+            "p99_us": 29263,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 16104.333333333334,
+            "total_requests": 241565,
+            "total_errors": 0,
+            "total_bytes": 2473625600,
+            "p50_us": 11519,
+            "p99_us": 27871,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 16399.666666666668,
+            "total_requests": 245995,
+            "total_errors": 0,
+            "total_bytes": 2518988800,
+            "p50_us": 11535,
+            "p99_us": 26223,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 10240,
+        "gateway": "ferrum",
+        "mean_rps": 13224.91111111111,
+        "clean": false,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 12990.333333333334,
+            "total_requests": 194855,
+            "total_errors": 0,
+            "total_bytes": 1995315200,
+            "p50_us": 14671,
+            "p99_us": 34623,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 13918.4,
+            "total_requests": 208776,
+            "total_errors": 0,
+            "total_bytes": 2137866240,
+            "p50_us": 14247,
+            "p99_us": 27615,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 12766.0,
+            "total_requests": 191490,
+            "total_errors": 141,
+            "total_bytes": 1960857600,
+            "p50_us": 9255,
+            "p99_us": 28943,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "141 errors"
+            ]
+          }
+        ]
+      },
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 10240,
+        "gateway": "kong",
+        "mean_rps": 10353.311111111112,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 10298.666666666666,
+            "total_requests": 154480,
+            "total_errors": 0,
+            "total_bytes": 1581875200,
+            "p50_us": 18879,
+            "p99_us": 33503,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 10796.066666666668,
+            "total_requests": 161941,
+            "total_errors": 0,
+            "total_bytes": 1658275840,
+            "p50_us": 17967,
+            "p99_us": 33119,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 9965.2,
+            "total_requests": 149478,
+            "total_errors": 0,
+            "total_bytes": 1530654720,
+            "p50_us": 19487,
+            "p99_us": 34047,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 10240,
+        "gateway": "tyk",
+        "mean_rps": 6974.288888888889,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 6787.666666666667,
+            "total_requests": 101815,
+            "total_errors": 0,
+            "total_bytes": 1042585600,
+            "p50_us": 28687,
+            "p99_us": 46143,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 7220.266666666666,
+            "total_requests": 108304,
+            "total_errors": 0,
+            "total_bytes": 1109032960,
+            "p50_us": 27455,
+            "p99_us": 37599,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 6914.933333333333,
+            "total_requests": 103724,
+            "total_errors": 0,
+            "total_bytes": 1062133760,
+            "p50_us": 28735,
+            "p99_us": 38111,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 71680,
+        "gateway": "direct",
+        "mean_rps": 10664.533333333333,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 10664.533333333333,
+            "total_requests": 159968,
+            "total_errors": 0,
+            "total_bytes": 11466506240,
+            "p50_us": 17711,
+            "p99_us": 40511,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 71680,
+        "gateway": "envoy",
+        "mean_rps": 4481.377777777778,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 4417.0,
+            "total_requests": 66255,
+            "total_errors": 0,
+            "total_bytes": 4749158400,
+            "p50_us": 37695,
+            "p99_us": 240383,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 4465.266666666666,
+            "total_requests": 66979,
+            "total_errors": 0,
+            "total_bytes": 4801054720,
+            "p50_us": 39711,
+            "p99_us": 123583,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 4561.866666666667,
+            "total_requests": 68428,
+            "total_errors": 0,
+            "total_bytes": 4904919040,
+            "p50_us": 37151,
+            "p99_us": 138879,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 71680,
+        "gateway": "ferrum",
+        "mean_rps": 4681.4,
+        "clean": false,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 4737.933333333333,
+            "total_requests": 71069,
+            "total_errors": 143,
+            "total_bytes": 5094225920,
+            "p50_us": 13039,
+            "p99_us": 93183,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "143 errors"
+            ]
+          },
+          {
+            "iteration": 2,
+            "rps": 4752.8,
+            "total_requests": 71292,
+            "total_errors": 168,
+            "total_bytes": 5110210560,
+            "p50_us": 6515,
+            "p99_us": 55807,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "168 errors"
+            ]
+          },
+          {
+            "iteration": 3,
+            "rps": 4553.466666666666,
+            "total_requests": 68302,
+            "total_errors": 0,
+            "total_bytes": 4895887360,
+            "p50_us": 11143,
+            "p99_us": 653311,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 71680,
+        "gateway": "kong",
+        "mean_rps": 3532.088888888889,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 3528.133333333333,
+            "total_requests": 52922,
+            "total_errors": 0,
+            "total_bytes": 3793448960,
+            "p50_us": 56607,
+            "p99_us": 79359,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 3608.133333333333,
+            "total_requests": 54122,
+            "total_errors": 0,
+            "total_bytes": 3879464960,
+            "p50_us": 54943,
+            "p99_us": 78207,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 3460.0,
+            "total_requests": 51900,
+            "total_errors": 0,
+            "total_bytes": 3720192000,
+            "p50_us": 57663,
+            "p99_us": 80575,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 71680,
+        "gateway": "tyk",
+        "mean_rps": 2805.1777777777775,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 2802.133333333333,
+            "total_requests": 42032,
+            "total_errors": 0,
+            "total_bytes": 3012853760,
+            "p50_us": 71359,
+            "p99_us": 80575,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 2853.6666666666665,
+            "total_requests": 42805,
+            "total_errors": 0,
+            "total_bytes": 3068262400,
+            "p50_us": 70079,
+            "p99_us": 82623,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 2759.733333333333,
+            "total_requests": 41396,
+            "total_errors": 0,
+            "total_bytes": 2967265280,
+            "p50_us": 72319,
+            "p99_us": 82303,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 512000,
+        "gateway": "direct",
+        "mean_rps": 1910.6,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 1910.6,
+            "total_requests": 28659,
+            "total_errors": 0,
+            "total_bytes": 14673408000,
+            "p50_us": 101055,
+            "p99_us": 219391,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 512000,
+        "gateway": "envoy",
+        "mean_rps": 770.2,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 770.4666666666667,
+            "total_requests": 11557,
+            "total_errors": 0,
+            "total_bytes": 5917184000,
+            "p50_us": 232703,
+            "p99_us": 589311,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 768.0,
+            "total_requests": 11520,
+            "total_errors": 0,
+            "total_bytes": 5898240000,
+            "p50_us": 237823,
+            "p99_us": 569855,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 772.1333333333333,
+            "total_requests": 11582,
+            "total_errors": 0,
+            "total_bytes": 5929984000,
+            "p50_us": 240639,
+            "p99_us": 647167,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 512000,
+        "gateway": "ferrum",
+        "mean_rps": 885.9333333333334,
+        "clean": false,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 874.4666666666667,
+            "total_requests": 13117,
+            "total_errors": 194,
+            "total_bytes": 6715904000,
+            "p50_us": 22847,
+            "p99_us": 663551,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "194 errors"
+            ]
+          },
+          {
+            "iteration": 2,
+            "rps": 857.6,
+            "total_requests": 12864,
+            "total_errors": 0,
+            "total_bytes": 6586368000,
+            "p50_us": 137087,
+            "p99_us": 1416191,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 925.7333333333333,
+            "total_requests": 13886,
+            "total_errors": 0,
+            "total_bytes": 7109632000,
+            "p50_us": 15279,
+            "p99_us": 3665919,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 512000,
+        "gateway": "kong",
+        "mean_rps": 667.9333333333333,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 667.0,
+            "total_requests": 10005,
+            "total_errors": 0,
+            "total_bytes": 5122560000,
+            "p50_us": 300287,
+            "p99_us": 380415,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 674.6666666666666,
+            "total_requests": 10120,
+            "total_errors": 0,
+            "total_bytes": 5181440000,
+            "p50_us": 295167,
+            "p99_us": 395775,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 662.1333333333333,
+            "total_requests": 9932,
+            "total_errors": 0,
+            "total_bytes": 5085184000,
+            "p50_us": 301823,
+            "p99_us": 387327,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 512000,
+        "gateway": "tyk",
+        "mean_rps": 569.8222222222222,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 560.0666666666667,
+            "total_requests": 8401,
+            "total_errors": 0,
+            "total_bytes": 4301312000,
+            "p50_us": 363519,
+            "p99_us": 499455,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 583.4666666666667,
+            "total_requests": 8752,
+            "total_errors": 0,
+            "total_bytes": 4481024000,
+            "p50_us": 351231,
+            "p99_us": 571391,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 565.9333333333333,
+            "total_requests": 8489,
+            "total_errors": 0,
+            "total_bytes": 4346368000,
+            "p50_us": 361215,
+            "p99_us": 551935,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 1048576,
+        "gateway": "direct",
+        "mean_rps": 906.8,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 906.8,
+            "total_requests": 13602,
+            "total_errors": 0,
+            "total_bytes": 14262730752,
+            "p50_us": 107391,
+            "p99_us": 237823,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 1048576,
+        "gateway": "envoy",
+        "mean_rps": 394.9111111111111,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 395.06666666666666,
+            "total_requests": 5926,
+            "total_errors": 0,
+            "total_bytes": 6213861376,
+            "p50_us": 126719,
+            "p99_us": 2453503,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 394.93333333333334,
+            "total_requests": 5924,
+            "total_errors": 0,
+            "total_bytes": 6211764224,
+            "p50_us": 190591,
+            "p99_us": 753663,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 394.73333333333335,
+            "total_requests": 5921,
+            "total_errors": 0,
+            "total_bytes": 6208618496,
+            "p50_us": 196735,
+            "p99_us": 816639,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 1048576,
+        "gateway": "ferrum",
+        "mean_rps": 470.97777777777776,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 473.4,
+            "total_requests": 7101,
+            "total_errors": 0,
+            "total_bytes": 7445938176,
+            "p50_us": 226303,
+            "p99_us": 663551,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 457.3333333333333,
+            "total_requests": 6860,
+            "total_errors": 0,
+            "total_bytes": 7193231360,
+            "p50_us": 188671,
+            "p99_us": 715775,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 482.2,
+            "total_requests": 7233,
+            "total_errors": 0,
+            "total_bytes": 7584350208,
+            "p50_us": 24799,
+            "p99_us": 3223551,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 1048576,
+        "gateway": "kong",
+        "mean_rps": 338.4222222222222,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 335.6666666666667,
+            "total_requests": 5035,
+            "total_errors": 0,
+            "total_bytes": 5279580160,
+            "p50_us": 298751,
+            "p99_us": 442111,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 351.46666666666664,
+            "total_requests": 5272,
+            "total_errors": 0,
+            "total_bytes": 5528092672,
+            "p50_us": 240511,
+            "p99_us": 850943,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 328.1333333333333,
+            "total_requests": 4922,
+            "total_errors": 0,
+            "total_bytes": 5161091072,
+            "p50_us": 303103,
+            "p99_us": 447231,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 1048576,
+        "gateway": "tyk",
+        "mean_rps": 295.8222222222222,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 296.8666666666667,
+            "total_requests": 4453,
+            "total_errors": 0,
+            "total_bytes": 4669308928,
+            "p50_us": 337407,
+            "p99_us": 518911,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 307.26666666666665,
+            "total_requests": 4609,
+            "total_errors": 0,
+            "total_bytes": 4832886784,
+            "p50_us": 325119,
+            "p99_us": 523263,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 283.3333333333333,
+            "total_requests": 4250,
+            "total_errors": 0,
+            "total_bytes": 4456448000,
+            "p50_us": 351999,
+            "p99_us": 635903,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 5242880,
+        "gateway": "direct",
+        "mean_rps": 179.86666666666667,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 179.86666666666667,
+            "total_requests": 2698,
+            "total_errors": 0,
+            "total_bytes": 14145290240,
+            "p50_us": 277503,
+            "p99_us": 506367,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 5242880,
+        "gateway": "envoy",
+        "mean_rps": 82.42222222222222,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 80.33333333333333,
+            "total_requests": 1205,
+            "total_errors": 0,
+            "total_bytes": 6317670400,
+            "p50_us": 442367,
+            "p99_us": 1981439,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 86.4,
+            "total_requests": 1296,
+            "total_errors": 0,
+            "total_bytes": 6794772480,
+            "p50_us": 503295,
+            "p99_us": 1268735,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 80.53333333333333,
+            "total_requests": 1208,
+            "total_errors": 0,
+            "total_bytes": 6333399040,
+            "p50_us": 450047,
+            "p99_us": 1685503,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 5242880,
+        "gateway": "ferrum",
+        "mean_rps": 99.4888888888889,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 99.53333333333333,
+            "total_requests": 1493,
+            "total_errors": 0,
+            "total_bytes": 7827619840,
+            "p50_us": 670719,
+            "p99_us": 1171455,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 97.53333333333333,
+            "total_requests": 1463,
+            "total_errors": 0,
+            "total_bytes": 7670333440,
+            "p50_us": 495103,
+            "p99_us": 918015,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 101.4,
+            "total_requests": 1521,
+            "total_errors": 0,
+            "total_bytes": 7974420480,
+            "p50_us": 125311,
+            "p99_us": 6668287,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 5242880,
+        "gateway": "kong",
+        "mean_rps": 72.82222222222222,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 69.73333333333333,
+            "total_requests": 1046,
+            "total_errors": 0,
+            "total_bytes": 5484052480,
+            "p50_us": 840191,
+            "p99_us": 2232319,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 74.66666666666667,
+            "total_requests": 1120,
+            "total_errors": 0,
+            "total_bytes": 5872025600,
+            "p50_us": 506623,
+            "p99_us": 4186111,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 74.06666666666666,
+            "total_requests": 1111,
+            "total_errors": 0,
+            "total_bytes": 5824839680,
+            "p50_us": 698367,
+            "p99_us": 1071103,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "grpcs",
+        "payload_bytes": 5242880,
+        "gateway": "tyk",
+        "mean_rps": 58.044444444444444,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 58.333333333333336,
+            "total_requests": 875,
+            "total_errors": 0,
+            "total_bytes": 4587520000,
+            "p50_us": 889855,
+            "p99_us": 1184767,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 59.266666666666666,
+            "total_requests": 889,
+            "total_errors": 0,
+            "total_bytes": 4660920320,
+            "p50_us": 865279,
+            "p99_us": 1220607,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 56.53333333333333,
+            "total_requests": 848,
+            "total_errors": 0,
+            "total_bytes": 4445962240,
+            "p50_us": 912383,
+            "p99_us": 1081343,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 10240,
+        "gateway": "direct",
+        "mean_rps": 48966.066666666666,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 48966.066666666666,
+            "total_requests": 734491,
+            "total_errors": 0,
+            "total_bytes": 7521187840,
+            "p50_us": 3861,
+            "p99_us": 9271,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 10240,
+        "gateway": "envoy",
+        "mean_rps": 11835.977777777778,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 11458.333333333334,
+            "total_requests": 171875,
+            "total_errors": 0,
+            "total_bytes": 1760000000,
+            "p50_us": 16151,
+            "p99_us": 38143,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 11913.0,
+            "total_requests": 178695,
+            "total_errors": 0,
+            "total_bytes": 1829836800,
+            "p50_us": 16351,
+            "p99_us": 28799,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 12136.6,
+            "total_requests": 182049,
+            "total_errors": 0,
+            "total_bytes": 1864181760,
+            "p50_us": 15639,
+            "p99_us": 29007,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 10240,
+        "gateway": "ferrum",
+        "mean_rps": 10674.333333333334,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 9998.133333333333,
+            "total_requests": 149972,
+            "total_errors": 0,
+            "total_bytes": 1535713280,
+            "p50_us": 18943,
+            "p99_us": 44223,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 10972.4,
+            "total_requests": 164586,
+            "total_errors": 0,
+            "total_bytes": 1685360640,
+            "p50_us": 17695,
+            "p99_us": 35071,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 11052.466666666667,
+            "total_requests": 165787,
+            "total_errors": 0,
+            "total_bytes": 1697658880,
+            "p50_us": 17583,
+            "p99_us": 35231,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 10240,
+        "gateway": "kong",
+        "mean_rps": 2146.8888888888887,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 2109.733333333333,
+            "total_requests": 31646,
+            "total_errors": 0,
+            "total_bytes": 324055040,
+            "p50_us": 70079,
+            "p99_us": 254207,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 2177.2,
+            "total_requests": 32658,
+            "total_errors": 0,
+            "total_bytes": 334417920,
+            "p50_us": 82751,
+            "p99_us": 225535,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 2153.733333333333,
+            "total_requests": 32306,
+            "total_errors": 0,
+            "total_bytes": 330813440,
+            "p50_us": 66367,
+            "p99_us": 275455,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 10240,
+        "gateway": "krakend",
+        "mean_rps": 5850.022222222223,
+        "clean": false,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 5714.6,
+            "total_requests": 85719,
+            "total_errors": 1,
+            "total_bytes": 877762560,
+            "p50_us": 29999,
+            "p99_us": 115455,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "1 errors"
+            ]
+          },
+          {
+            "iteration": 2,
+            "rps": 5566.866666666667,
+            "total_requests": 83503,
+            "total_errors": 0,
+            "total_bytes": 855070720,
+            "p50_us": 30911,
+            "p99_us": 118975,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 6268.6,
+            "total_requests": 94029,
+            "total_errors": 1,
+            "total_bytes": 962856960,
+            "p50_us": 27903,
+            "p99_us": 99903,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "1 errors"
+            ]
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 10240,
+        "gateway": "tyk",
+        "mean_rps": 7445.288888888889,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 7031.2,
+            "total_requests": 105468,
+            "total_errors": 0,
+            "total_bytes": 1079992320,
+            "p50_us": 22735,
+            "p99_us": 111871,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 7653.866666666667,
+            "total_requests": 114808,
+            "total_errors": 0,
+            "total_bytes": 1175633920,
+            "p50_us": 21951,
+            "p99_us": 90943,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 7650.8,
+            "total_requests": 114762,
+            "total_errors": 0,
+            "total_bytes": 1175162880,
+            "p50_us": 21967,
+            "p99_us": 89471,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 71680,
+        "gateway": "direct",
+        "mean_rps": 12689.133333333333,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 12689.133333333333,
+            "total_requests": 190337,
+            "total_errors": 0,
+            "total_bytes": 13643356160,
+            "p50_us": 15079,
+            "p99_us": 33247,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 71680,
+        "gateway": "envoy",
+        "mean_rps": 3931.4,
+        "clean": false,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 3903.5333333333333,
+            "total_requests": 58553,
+            "total_errors": 0,
+            "total_bytes": 4197079040,
+            "p50_us": 49951,
+            "p99_us": 92095,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 3954.133333333333,
+            "total_requests": 59312,
+            "total_errors": 3,
+            "total_bytes": 4251484160,
+            "p50_us": 49663,
+            "p99_us": 94143,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "3 errors"
+            ]
+          },
+          {
+            "iteration": 3,
+            "rps": 3936.5333333333333,
+            "total_requests": 59048,
+            "total_errors": 2,
+            "total_bytes": 4232560640,
+            "p50_us": 49407,
+            "p99_us": 91647,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "2 errors"
+            ]
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 71680,
+        "gateway": "ferrum",
+        "mean_rps": 3246.5555555555557,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 3241.0666666666666,
+            "total_requests": 48616,
+            "total_errors": 0,
+            "total_bytes": 3484794880,
+            "p50_us": 59775,
+            "p99_us": 127935,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 3212.5333333333333,
+            "total_requests": 48188,
+            "total_errors": 0,
+            "total_bytes": 3454115840,
+            "p50_us": 59199,
+            "p99_us": 135167,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 3286.0666666666666,
+            "total_requests": 49291,
+            "total_errors": 0,
+            "total_bytes": 3533178880,
+            "p50_us": 59103,
+            "p99_us": 125247,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 71680,
+        "gateway": "kong",
+        "mean_rps": 1318.177777777778,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 1286.9333333333334,
+            "total_requests": 19304,
+            "total_errors": 0,
+            "total_bytes": 1383710720,
+            "p50_us": 102335,
+            "p99_us": 544255,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 1331.1333333333334,
+            "total_requests": 19967,
+            "total_errors": 0,
+            "total_bytes": 1431234560,
+            "p50_us": 92927,
+            "p99_us": 576511,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 1336.4666666666667,
+            "total_requests": 20047,
+            "total_errors": 0,
+            "total_bytes": 1436968960,
+            "p50_us": 90879,
+            "p99_us": 585727,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 71680,
+        "gateway": "krakend",
+        "mean_rps": 3355.711111111111,
+        "clean": false,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 3310.0,
+            "total_requests": 49650,
+            "total_errors": 3,
+            "total_bytes": 3558912000,
+            "p50_us": 55647,
+            "p99_us": 169599,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "3 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[http1] task reconnected 1 times over 246 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 261 requests",
+                "count": 1
+              }
+            ]
+          },
+          {
+            "iteration": 2,
+            "rps": 3359.5333333333333,
+            "total_requests": 50393,
+            "total_errors": 6,
+            "total_bytes": 3612170240,
+            "p50_us": 54431,
+            "p99_us": 174847,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "6 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[http1] task reconnected 1 times over 247 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 269 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 246 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 253 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 260 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 241 requests",
+                "count": 1
+              }
+            ]
+          },
+          {
+            "iteration": 3,
+            "rps": 3397.6,
+            "total_requests": 50964,
+            "total_errors": 8,
+            "total_bytes": 3653099520,
+            "p50_us": 53439,
+            "p99_us": 171135,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "8 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[http1] task reconnected 1 times over 256 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 251 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 259 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 269 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 267 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 252 requests",
+                "count": 1
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 71680,
+        "gateway": "tyk",
+        "mean_rps": 2982.4,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 2965.0,
+            "total_requests": 44475,
+            "total_errors": 0,
+            "total_bytes": 3187968000,
+            "p50_us": 52095,
+            "p99_us": 235263,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 3000.0,
+            "total_requests": 45000,
+            "total_errors": 0,
+            "total_bytes": 3225600000,
+            "p50_us": 48159,
+            "p99_us": 247039,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 2982.2,
+            "total_requests": 44733,
+            "total_errors": 0,
+            "total_bytes": 3206461440,
+            "p50_us": 46399,
+            "p99_us": 261247,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 512000,
+        "gateway": "direct",
+        "mean_rps": 2200.3333333333335,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 2200.3333333333335,
+            "total_requests": 33005,
+            "total_errors": 0,
+            "total_bytes": 16898560000,
+            "p50_us": 86783,
+            "p99_us": 193663,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 512000,
+        "gateway": "envoy",
+        "mean_rps": 761.1555555555556,
+        "clean": false,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 758.4,
+            "total_requests": 11376,
+            "total_errors": 0,
+            "total_bytes": 5824512000,
+            "p50_us": 258559,
+            "p99_us": 447231,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 764.1333333333333,
+            "total_requests": 11462,
+            "total_errors": 1,
+            "total_bytes": 5868544000,
+            "p50_us": 257535,
+            "p99_us": 405759,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "1 errors"
+            ]
+          },
+          {
+            "iteration": 3,
+            "rps": 760.9333333333333,
+            "total_requests": 11414,
+            "total_errors": 0,
+            "total_bytes": 5843968000,
+            "p50_us": 259199,
+            "p99_us": 407807,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 512000,
+        "gateway": "ferrum",
+        "mean_rps": 574.0,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 567.8,
+            "total_requests": 8517,
+            "total_errors": 0,
+            "total_bytes": 4360704000,
+            "p50_us": 349695,
+            "p99_us": 627711,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 580.2666666666667,
+            "total_requests": 8704,
+            "total_errors": 0,
+            "total_bytes": 4456448000,
+            "p50_us": 345343,
+            "p99_us": 603135,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 573.9333333333333,
+            "total_requests": 8609,
+            "total_errors": 0,
+            "total_bytes": 4407808000,
+            "p50_us": 346111,
+            "p99_us": 596479,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 512000,
+        "gateway": "kong",
+        "mean_rps": 421.26666666666665,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 417.73333333333335,
+            "total_requests": 6266,
+            "total_errors": 0,
+            "total_bytes": 3208192000,
+            "p50_us": 360703,
+            "p99_us": 1276927,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 423.73333333333335,
+            "total_requests": 6356,
+            "total_errors": 0,
+            "total_bytes": 3254272000,
+            "p50_us": 369919,
+            "p99_us": 1386495,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 422.3333333333333,
+            "total_requests": 6335,
+            "total_errors": 0,
+            "total_bytes": 3243520000,
+            "p50_us": 400127,
+            "p99_us": 1267711,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 512000,
+        "gateway": "krakend",
+        "mean_rps": 901.9333333333333,
+        "clean": false,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 900.4,
+            "total_requests": 13506,
+            "total_errors": 2,
+            "total_bytes": 6915072000,
+            "p50_us": 211071,
+            "p99_us": 488447,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "2 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[http1] task reconnected 1 times over 66 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 69 requests",
+                "count": 1
+              }
+            ]
+          },
+          {
+            "iteration": 2,
+            "rps": 906.6666666666666,
+            "total_requests": 13600,
+            "total_errors": 5,
+            "total_bytes": 6963200000,
+            "p50_us": 209151,
+            "p99_us": 484351,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "5 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[http1] task reconnected 1 times over 69 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 67 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 2 times over 67 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 60 requests",
+                "count": 1
+              }
+            ]
+          },
+          {
+            "iteration": 3,
+            "rps": 898.7333333333333,
+            "total_requests": 13481,
+            "total_errors": 3,
+            "total_bytes": 6902272000,
+            "p50_us": 211071,
+            "p99_us": 483327,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "3 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[http1] task reconnected 1 times over 66 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 59 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 69 requests",
+                "count": 1
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 512000,
+        "gateway": "tyk",
+        "mean_rps": 748.4444444444445,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 752.0666666666667,
+            "total_requests": 11281,
+            "total_errors": 0,
+            "total_bytes": 5775872000,
+            "p50_us": 188671,
+            "p99_us": 988671,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 749.9333333333333,
+            "total_requests": 11249,
+            "total_errors": 0,
+            "total_bytes": 5759488000,
+            "p50_us": 223743,
+            "p99_us": 876543,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 743.3333333333334,
+            "total_requests": 11150,
+            "total_errors": 0,
+            "total_bytes": 5708800000,
+            "p50_us": 193151,
+            "p99_us": 1022975,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 1048576,
+        "gateway": "direct",
+        "mean_rps": 1095.9333333333334,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 1095.9333333333334,
+            "total_requests": 16439,
+            "total_errors": 0,
+            "total_bytes": 17237540864,
+            "p50_us": 87743,
+            "p99_us": 190847,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 1048576,
+        "gateway": "envoy",
+        "mean_rps": 375.22222222222223,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 374.53333333333336,
+            "total_requests": 5618,
+            "total_errors": 0,
+            "total_bytes": 5890899968,
+            "p50_us": 267263,
+            "p99_us": 393471,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 377.06666666666666,
+            "total_requests": 5656,
+            "total_errors": 0,
+            "total_bytes": 5930745856,
+            "p50_us": 270335,
+            "p99_us": 394495,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 374.06666666666666,
+            "total_requests": 5611,
+            "total_errors": 0,
+            "total_bytes": 5883559936,
+            "p50_us": 269823,
+            "p99_us": 431359,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 1048576,
+        "gateway": "ferrum",
+        "mean_rps": 306.93333333333334,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 307.53333333333336,
+            "total_requests": 4613,
+            "total_errors": 0,
+            "total_bytes": 4837081088,
+            "p50_us": 331775,
+            "p99_us": 534527,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 307.8666666666667,
+            "total_requests": 4618,
+            "total_errors": 0,
+            "total_bytes": 4842323968,
+            "p50_us": 325887,
+            "p99_us": 511999,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 305.4,
+            "total_requests": 4581,
+            "total_errors": 0,
+            "total_bytes": 4803526656,
+            "p50_us": 331519,
+            "p99_us": 505599,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 1048576,
+        "gateway": "kong",
+        "mean_rps": 233.64444444444445,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 233.0,
+            "total_requests": 3495,
+            "total_errors": 0,
+            "total_bytes": 3664773120,
+            "p50_us": 283903,
+            "p99_us": 1210367,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 234.66666666666666,
+            "total_requests": 3520,
+            "total_errors": 0,
+            "total_bytes": 3690987520,
+            "p50_us": 260479,
+            "p99_us": 1203199,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 233.26666666666668,
+            "total_requests": 3499,
+            "total_errors": 0,
+            "total_bytes": 3668967424,
+            "p50_us": 294399,
+            "p99_us": 1371135,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 1048576,
+        "gateway": "krakend",
+        "mean_rps": 482.6666666666667,
+        "clean": false,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 482.8,
+            "total_requests": 7242,
+            "total_errors": 4,
+            "total_bytes": 7593787392,
+            "p50_us": 201343,
+            "p99_us": 398591,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": [
+              "4 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[http1] task reconnected 1 times over 73 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 69 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 67 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 72 requests",
+                "count": 1
+              }
+            ]
+          },
+          {
+            "iteration": 2,
+            "rps": 483.26666666666665,
+            "total_requests": 7249,
+            "total_errors": 3,
+            "total_bytes": 7601127424,
+            "p50_us": 197887,
+            "p99_us": 453887,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": [
+              "3 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[http1] task reconnected 1 times over 71 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 75 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 76 requests",
+                "count": 1
+              }
+            ]
+          },
+          {
+            "iteration": 3,
+            "rps": 481.93333333333334,
+            "total_requests": 7229,
+            "total_errors": 5,
+            "total_bytes": 7580155904,
+            "p50_us": 199295,
+            "p99_us": 450303,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": [
+              "5 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[http1] task reconnected 1 times over 75 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 67 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 72 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 69 requests",
+                "count": 1
+              },
+              {
+                "message": "[http1] task reconnected 1 times over 73 requests",
+                "count": 1
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 1048576,
+        "gateway": "tyk",
+        "mean_rps": 397.1333333333333,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 396.1333333333333,
+            "total_requests": 5942,
+            "total_errors": 0,
+            "total_bytes": 6230638592,
+            "p50_us": 205567,
+            "p99_us": 861183,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 397.4,
+            "total_requests": 5961,
+            "total_errors": 0,
+            "total_bytes": 6250561536,
+            "p50_us": 212223,
+            "p99_us": 818687,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 397.8666666666667,
+            "total_requests": 5968,
+            "total_errors": 0,
+            "total_bytes": 6257901568,
+            "p50_us": 210815,
+            "p99_us": 835583,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 5242880,
+        "gateway": "direct",
+        "mean_rps": 227.2,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 227.2,
+            "total_requests": 3408,
+            "total_errors": 0,
+            "total_bytes": 17867735040,
+            "p50_us": 209023,
+            "p99_us": 464895,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 5242880,
+        "gateway": "envoy",
+        "mean_rps": 80.17777777777778,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 79.66666666666667,
+            "total_requests": 1195,
+            "total_errors": 0,
+            "total_bytes": 6265241600,
+            "p50_us": 674815,
+            "p99_us": 1008127,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 80.86666666666666,
+            "total_requests": 1213,
+            "total_errors": 0,
+            "total_bytes": 6359613440,
+            "p50_us": 651775,
+            "p99_us": 951807,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 80.0,
+            "total_requests": 1200,
+            "total_errors": 0,
+            "total_bytes": 6291456000,
+            "p50_us": 637951,
+            "p99_us": 1193983,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 5242880,
+        "gateway": "ferrum",
+        "mean_rps": 66.26666666666667,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 65.46666666666667,
+            "total_requests": 982,
+            "total_errors": 0,
+            "total_bytes": 5148508160,
+            "p50_us": 795135,
+            "p99_us": 1143807,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 67.0,
+            "total_requests": 1005,
+            "total_errors": 0,
+            "total_bytes": 5269094400,
+            "p50_us": 758783,
+            "p99_us": 1073151,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 66.33333333333333,
+            "total_requests": 995,
+            "total_errors": 0,
+            "total_bytes": 5216665600,
+            "p50_us": 755199,
+            "p99_us": 1129471,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 5242880,
+        "gateway": "kong",
+        "mean_rps": 53.48888888888889,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 53.06666666666667,
+            "total_requests": 796,
+            "total_errors": 0,
+            "total_bytes": 4173332480,
+            "p50_us": 752127,
+            "p99_us": 2674687,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 53.6,
+            "total_requests": 804,
+            "total_errors": 0,
+            "total_bytes": 4215275520,
+            "p50_us": 827903,
+            "p99_us": 2373631,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 53.8,
+            "total_requests": 807,
+            "total_errors": 0,
+            "total_bytes": 4231004160,
+            "p50_us": 713727,
+            "p99_us": 3096575,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 5242880,
+        "gateway": "krakend",
+        "mean_rps": 108.73333333333333,
+        "clean": false,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 107.6,
+            "total_requests": 1614,
+            "total_errors": 0,
+            "total_bytes": 8462008320,
+            "p50_us": 444159,
+            "p99_us": 966143,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 109.06666666666666,
+            "total_requests": 1636,
+            "total_errors": 0,
+            "total_bytes": 8577351680,
+            "p50_us": 438783,
+            "p99_us": 937983,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 109.53333333333333,
+            "total_requests": 1643,
+            "total_errors": 1,
+            "total_bytes": 8614051840,
+            "p50_us": 438015,
+            "p99_us": 903167,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": [
+              "1 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[http1] task reconnected 1 times over 31 requests",
+                "count": 1
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "protocol": "http1-tls",
+        "payload_bytes": 5242880,
+        "gateway": "tyk",
+        "mean_rps": 89.84444444444443,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 89.33333333333333,
+            "total_requests": 1340,
+            "total_errors": 0,
+            "total_bytes": 7025459200,
+            "p50_us": 547839,
+            "p99_us": 1074175,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 91.33333333333333,
+            "total_requests": 1370,
+            "total_errors": 0,
+            "total_bytes": 7182745600,
+            "p50_us": 530431,
+            "p99_us": 1162239,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 88.86666666666666,
+            "total_requests": 1333,
+            "total_errors": 0,
+            "total_bytes": 6988759040,
+            "p50_us": 558591,
+            "p99_us": 1062911,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http2",
+        "payload_bytes": 10240,
+        "gateway": "direct",
+        "mean_rps": 78087.33333333333,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 78087.33333333333,
+            "total_requests": 1171310,
+            "total_errors": 0,
+            "total_bytes": 11994214400,
+            "p50_us": 2357,
+            "p99_us": 6287,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http2",
+        "payload_bytes": 10240,
+        "gateway": "envoy",
+        "mean_rps": 27745.71111111111,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 25564.666666666668,
+            "total_requests": 383470,
+            "total_errors": 0,
+            "total_bytes": 3926732800,
+            "p50_us": 6543,
+            "p99_us": 47039,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 28649.733333333334,
+            "total_requests": 429746,
+            "total_errors": 0,
+            "total_bytes": 4400599040,
+            "p50_us": 6603,
+            "p99_us": 14399,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 29022.733333333334,
+            "total_requests": 435341,
+            "total_errors": 0,
+            "total_bytes": 4457891840,
+            "p50_us": 6555,
+            "p99_us": 14567,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http2",
+        "payload_bytes": 10240,
+        "gateway": "ferrum",
+        "mean_rps": 23730.666666666668,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 24160.0,
+            "total_requests": 362400,
+            "total_errors": 0,
+            "total_bytes": 3710976000,
+            "p50_us": 8047,
+            "p99_us": 14847,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 24432.933333333334,
+            "total_requests": 366494,
+            "total_errors": 0,
+            "total_bytes": 3752898560,
+            "p50_us": 8059,
+            "p99_us": 14143,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 22599.066666666666,
+            "total_requests": 338986,
+            "total_errors": 0,
+            "total_bytes": 3471216640,
+            "p50_us": 8535,
+            "p99_us": 17679,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http2",
+        "payload_bytes": 10240,
+        "gateway": "tyk",
+        "mean_rps": 8030.8,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 8187.0,
+            "total_requests": 122805,
+            "total_errors": 0,
+            "total_bytes": 1257523200,
+            "p50_us": 24047,
+            "p99_us": 34399,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 8222.0,
+            "total_requests": 123330,
+            "total_errors": 0,
+            "total_bytes": 1262899200,
+            "p50_us": 24351,
+            "p99_us": 30479,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 7683.4,
+            "total_requests": 115251,
+            "total_errors": 0,
+            "total_bytes": 1180170240,
+            "p50_us": 26143,
+            "p99_us": 32015,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http2",
+        "payload_bytes": 71680,
+        "gateway": "direct",
+        "mean_rps": 24086.066666666666,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 24086.066666666666,
+            "total_requests": 361291,
+            "total_errors": 0,
+            "total_bytes": 25897338880,
+            "p50_us": 7875,
+            "p99_us": 18623,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http2",
+        "payload_bytes": 71680,
+        "gateway": "envoy",
+        "mean_rps": 7671.533333333333,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 7456.133333333333,
+            "total_requests": 111842,
+            "total_errors": 0,
+            "total_bytes": 8016834560,
+            "p50_us": 20015,
+            "p99_us": 67775,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 8040.066666666667,
+            "total_requests": 120601,
+            "total_errors": 0,
+            "total_bytes": 8644679680,
+            "p50_us": 25791,
+            "p99_us": 58815,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 7518.4,
+            "total_requests": 112776,
+            "total_errors": 0,
+            "total_bytes": 8083783680,
+            "p50_us": 25215,
+            "p99_us": 53695,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http2",
+        "payload_bytes": 71680,
+        "gateway": "ferrum",
+        "mean_rps": 7447.866666666667,
+        "clean": false,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 7292.733333333334,
+            "total_requests": 109391,
+            "total_errors": 0,
+            "total_bytes": 7841146880,
+            "p50_us": 27375,
+            "p99_us": 41023,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 8913.266666666666,
+            "total_requests": 133699,
+            "total_errors": 169,
+            "total_bytes": 9583544320,
+            "p50_us": 18207,
+            "p99_us": 42175,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "169 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "  HTTP/2 unexpected status 502 Bad Gateway (body 31 bytes)",
+                "count": 30
+              }
+            ]
+          },
+          {
+            "iteration": 3,
+            "rps": 6137.6,
+            "total_requests": 92064,
+            "total_errors": 0,
+            "total_bytes": 6599147520,
+            "p50_us": 31759,
+            "p99_us": 42431,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http2",
+        "payload_bytes": 71680,
+        "gateway": "tyk",
+        "mean_rps": 3023.488888888889,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 3268.4,
+            "total_requests": 49026,
+            "total_errors": 0,
+            "total_bytes": 3514183680,
+            "p50_us": 60511,
+            "p99_us": 85247,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 2840.9333333333334,
+            "total_requests": 42614,
+            "total_errors": 0,
+            "total_bytes": 3054571520,
+            "p50_us": 60863,
+            "p99_us": 277759,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 2961.133333333333,
+            "total_requests": 44417,
+            "total_errors": 0,
+            "total_bytes": 3183810560,
+            "p50_us": 65407,
+            "p99_us": 150399,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http2",
+        "payload_bytes": 512000,
+        "gateway": "direct",
+        "mean_rps": 3822.733333333333,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 3822.733333333333,
+            "total_requests": 57341,
+            "total_errors": 0,
+            "total_bytes": 29358592000,
+            "p50_us": 46495,
+            "p99_us": 177791,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http2",
+        "payload_bytes": 512000,
+        "gateway": "envoy",
+        "mean_rps": 1175.0222222222221,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 1159.2,
+            "total_requests": 17388,
+            "total_errors": 0,
+            "total_bytes": 8902656000,
+            "p50_us": 152703,
+            "p99_us": 361983,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 1194.3333333333333,
+            "total_requests": 17915,
+            "total_errors": 0,
+            "total_bytes": 9172480000,
+            "p50_us": 155775,
+            "p99_us": 367103,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 1171.5333333333333,
+            "total_requests": 17573,
+            "total_errors": 0,
+            "total_bytes": 8997376000,
+            "p50_us": 169727,
+            "p99_us": 269311,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http2",
+        "payload_bytes": 512000,
+        "gateway": "ferrum",
+        "mean_rps": 1281.9777777777776,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 1174.8,
+            "total_requests": 17622,
+            "total_errors": 0,
+            "total_bytes": 9022464000,
+            "p50_us": 166143,
+            "p99_us": 266239,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 1626.5333333333333,
+            "total_requests": 24398,
+            "total_errors": 0,
+            "total_bytes": 12491776000,
+            "p50_us": 27103,
+            "p99_us": 1654783,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 1044.6,
+            "total_requests": 15669,
+            "total_errors": 0,
+            "total_bytes": 8022528000,
+            "p50_us": 189695,
+            "p99_us": 240511,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http2",
+        "payload_bytes": 512000,
+        "gateway": "tyk",
+        "mean_rps": 750.2888888888889,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 759.7333333333333,
+            "total_requests": 11396,
+            "total_errors": 0,
+            "total_bytes": 5834752000,
+            "p50_us": 201215,
+            "p99_us": 1083391,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 752.2666666666667,
+            "total_requests": 11284,
+            "total_errors": 0,
+            "total_bytes": 5777408000,
+            "p50_us": 234111,
+            "p99_us": 950271,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 738.8666666666667,
+            "total_requests": 11083,
+            "total_errors": 0,
+            "total_bytes": 5674496000,
+            "p50_us": 208383,
+            "p99_us": 1095679,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http2",
+        "payload_bytes": 1048576,
+        "gateway": "direct",
+        "mean_rps": 1911.7333333333333,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 1911.7333333333333,
+            "total_requests": 28676,
+            "total_errors": 0,
+            "total_bytes": 30068965376,
+            "p50_us": 49503,
+            "p99_us": 111487,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http2",
+        "payload_bytes": 1048576,
+        "gateway": "envoy",
+        "mean_rps": 587.6444444444444,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 584.1333333333333,
+            "total_requests": 8762,
+            "total_errors": 0,
+            "total_bytes": 9187622912,
+            "p50_us": 115967,
+            "p99_us": 491263,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 601.1333333333333,
+            "total_requests": 9017,
+            "total_errors": 0,
+            "total_bytes": 9455009792,
+            "p50_us": 144383,
+            "p99_us": 423935,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 577.6666666666666,
+            "total_requests": 8665,
+            "total_errors": 0,
+            "total_bytes": 9085911040,
+            "p50_us": 150143,
+            "p99_us": 475903,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http2",
+        "payload_bytes": 1048576,
+        "gateway": "ferrum",
+        "mean_rps": 679.3555555555555,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 619.6,
+            "total_requests": 9294,
+            "total_errors": 0,
+            "total_bytes": 9745465344,
+            "p50_us": 160511,
+            "p99_us": 275199,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 824.9333333333333,
+            "total_requests": 12374,
+            "total_errors": 0,
+            "total_bytes": 12975079424,
+            "p50_us": 40287,
+            "p99_us": 1402879,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 593.5333333333333,
+            "total_requests": 8903,
+            "total_errors": 0,
+            "total_bytes": 9335472128,
+            "p50_us": 169087,
+            "p99_us": 269311,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http2",
+        "payload_bytes": 1048576,
+        "gateway": "tyk",
+        "mean_rps": 364.6,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 379.6,
+            "total_requests": 5694,
+            "total_errors": 0,
+            "total_bytes": 5970591744,
+            "p50_us": 215807,
+            "p99_us": 948223,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 355.73333333333335,
+            "total_requests": 5336,
+            "total_errors": 0,
+            "total_bytes": 5595201536,
+            "p50_us": 281599,
+            "p99_us": 510975,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 358.46666666666664,
+            "total_requests": 5377,
+            "total_errors": 0,
+            "total_bytes": 5638193152,
+            "p50_us": 263423,
+            "p99_us": 818175,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http2",
+        "payload_bytes": 5242880,
+        "gateway": "direct",
+        "mean_rps": 315.6666666666667,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 315.6666666666667,
+            "total_requests": 4735,
+            "total_errors": 0,
+            "total_bytes": 24825036800,
+            "p50_us": 154495,
+            "p99_us": 275455,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http2",
+        "payload_bytes": 5242880,
+        "gateway": "envoy",
+        "mean_rps": 113.13333333333333,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 114.0,
+            "total_requests": 1710,
+            "total_errors": 0,
+            "total_bytes": 8965324800,
+            "p50_us": 319743,
+            "p99_us": 1041919,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 115.53333333333333,
+            "total_requests": 1733,
+            "total_errors": 0,
+            "total_bytes": 9085911040,
+            "p50_us": 417535,
+            "p99_us": 851455,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 109.86666666666666,
+            "total_requests": 1648,
+            "total_errors": 0,
+            "total_bytes": 8640266240,
+            "p50_us": 319487,
+            "p99_us": 1575935,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http2",
+        "payload_bytes": 5242880,
+        "gateway": "ferrum",
+        "mean_rps": 133.46666666666667,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 120.86666666666666,
+            "total_requests": 1813,
+            "total_errors": 0,
+            "total_bytes": 9505341440,
+            "p50_us": 415487,
+            "p99_us": 545791,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 160.46666666666667,
+            "total_requests": 2407,
+            "total_errors": 0,
+            "total_bytes": 12619612160,
+            "p50_us": 183551,
+            "p99_us": 2643967,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 119.06666666666666,
+            "total_requests": 1786,
+            "total_errors": 0,
+            "total_bytes": 9363783680,
+            "p50_us": 417023,
+            "p99_us": 648703,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http2",
+        "payload_bytes": 5242880,
+        "gateway": "tyk",
+        "mean_rps": 76.42222222222222,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 77.46666666666667,
+            "total_requests": 1162,
+            "total_errors": 0,
+            "total_bytes": 6092226560,
+            "p50_us": 639487,
+            "p99_us": 1163263,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 76.33333333333333,
+            "total_requests": 1145,
+            "total_errors": 0,
+            "total_bytes": 6003097600,
+            "p50_us": 641535,
+            "p99_us": 1312767,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 75.46666666666667,
+            "total_requests": 1132,
+            "total_errors": 0,
+            "total_bytes": 5934940160,
+            "p50_us": 660991,
+            "p99_us": 1335295,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http3",
+        "payload_bytes": 10240,
+        "gateway": "direct",
+        "mean_rps": 27157.933333333334,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 27157.933333333334,
+            "total_requests": 407369,
+            "total_errors": 0,
+            "total_bytes": 4171458560,
+            "p50_us": 6331,
+            "p99_us": 20415,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http3",
+        "payload_bytes": 10240,
+        "gateway": "envoy",
+        "mean_rps": 1792.088888888889,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 1719.2666666666667,
+            "total_requests": 25789,
+            "total_errors": 0,
+            "total_bytes": 264079360,
+            "p50_us": 118719,
+            "p99_us": 237823,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 1832.0,
+            "total_requests": 27480,
+            "total_errors": 0,
+            "total_bytes": 281395200,
+            "p50_us": 97151,
+            "p99_us": 181503,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 1825.0,
+            "total_requests": 27375,
+            "total_errors": 0,
+            "total_bytes": 280320000,
+            "p50_us": 96319,
+            "p99_us": 179455,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http3",
+        "payload_bytes": 10240,
+        "gateway": "ferrum",
+        "mean_rps": 9795.577777777778,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 9169.866666666667,
+            "total_requests": 137548,
+            "total_errors": 0,
+            "total_bytes": 1408491520,
+            "p50_us": 20255,
+            "p99_us": 48511,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 10038.8,
+            "total_requests": 150582,
+            "total_errors": 0,
+            "total_bytes": 1541959680,
+            "p50_us": 18671,
+            "p99_us": 42943,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 10178.066666666668,
+            "total_requests": 152671,
+            "total_errors": 0,
+            "total_bytes": 1563351040,
+            "p50_us": 18351,
+            "p99_us": 42655,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http3",
+        "payload_bytes": 71680,
+        "gateway": "direct",
+        "mean_rps": 5094.0,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 5094.0,
+            "total_requests": 76410,
+            "total_errors": 0,
+            "total_bytes": 5477068800,
+            "p50_us": 35039,
+            "p99_us": 119231,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http3",
+        "payload_bytes": 71680,
+        "gateway": "envoy",
+        "mean_rps": 414.26666666666665,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 466.8,
+            "total_requests": 7002,
+            "total_errors": 0,
+            "total_bytes": 501903360,
+            "p50_us": 384767,
+            "p99_us": 728575,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 372.06666666666666,
+            "total_requests": 5581,
+            "total_errors": 0,
+            "total_bytes": 400046080,
+            "p50_us": 478463,
+            "p99_us": 1036799,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 403.93333333333334,
+            "total_requests": 6059,
+            "total_errors": 0,
+            "total_bytes": 434309120,
+            "p50_us": 492031,
+            "p99_us": 1277951,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http3",
+        "payload_bytes": 71680,
+        "gateway": "ferrum",
+        "mean_rps": 1950.4,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 1876.6666666666667,
+            "total_requests": 28150,
+            "total_errors": 0,
+            "total_bytes": 2017792000,
+            "p50_us": 100351,
+            "p99_us": 234751,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 1975.9333333333334,
+            "total_requests": 29639,
+            "total_errors": 0,
+            "total_bytes": 2124523520,
+            "p50_us": 95039,
+            "p99_us": 220159,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 1998.6,
+            "total_requests": 29979,
+            "total_errors": 0,
+            "total_bytes": 2148894720,
+            "p50_us": 94463,
+            "p99_us": 217727,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http3",
+        "payload_bytes": 512000,
+        "gateway": "direct",
+        "mean_rps": 770.4,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 770.4,
+            "total_requests": 11556,
+            "total_errors": 0,
+            "total_bytes": 5916672000,
+            "p50_us": 249727,
+            "p99_us": 500223,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http3",
+        "payload_bytes": 512000,
+        "gateway": "envoy",
+        "mean_rps": 76.88888888888889,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 77.73333333333333,
+            "total_requests": 1166,
+            "total_errors": 0,
+            "total_bytes": 596992000,
+            "p50_us": 2443263,
+            "p99_us": 6275071,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 74.93333333333334,
+            "total_requests": 1124,
+            "total_errors": 0,
+            "total_bytes": 575488000,
+            "p50_us": 2699263,
+            "p99_us": 5169151,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 78.0,
+            "total_requests": 1170,
+            "total_errors": 0,
+            "total_bytes": 599040000,
+            "p50_us": 2217983,
+            "p99_us": 8429567,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http3",
+        "payload_bytes": 512000,
+        "gateway": "ferrum",
+        "mean_rps": 301.75555555555553,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 290.73333333333335,
+            "total_requests": 4361,
+            "total_errors": 0,
+            "total_bytes": 2232832000,
+            "p50_us": 701439,
+            "p99_us": 1173503,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 307.46666666666664,
+            "total_requests": 4612,
+            "total_errors": 0,
+            "total_bytes": 2361344000,
+            "p50_us": 659967,
+            "p99_us": 1133567,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 307.06666666666666,
+            "total_requests": 4606,
+            "total_errors": 0,
+            "total_bytes": 2358272000,
+            "p50_us": 660479,
+            "p99_us": 1155071,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http3",
+        "payload_bytes": 1048576,
+        "gateway": "direct",
+        "mean_rps": 388.8666666666667,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 388.8666666666667,
+            "total_requests": 5833,
+            "total_errors": 0,
+            "total_bytes": 6116343808,
+            "p50_us": 256383,
+            "p99_us": 427519,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http3",
+        "payload_bytes": 1048576,
+        "gateway": "envoy",
+        "mean_rps": 37.62222222222222,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 38.06666666666667,
+            "total_requests": 571,
+            "total_errors": 0,
+            "total_bytes": 598736896,
+            "p50_us": 1469439,
+            "p99_us": 9838591,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 37.93333333333333,
+            "total_requests": 569,
+            "total_errors": 0,
+            "total_bytes": 596639744,
+            "p50_us": 2404351,
+            "p99_us": 6262783,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 36.86666666666667,
+            "total_requests": 553,
+            "total_errors": 0,
+            "total_bytes": 579862528,
+            "p50_us": 2523135,
+            "p99_us": 6066175,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http3",
+        "payload_bytes": 1048576,
+        "gateway": "ferrum",
+        "mean_rps": 172.42222222222222,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 168.06666666666666,
+            "total_requests": 2521,
+            "total_errors": 0,
+            "total_bytes": 2643460096,
+            "p50_us": 593919,
+            "p99_us": 1077247,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 174.13333333333333,
+            "total_requests": 2612,
+            "total_errors": 0,
+            "total_bytes": 2738880512,
+            "p50_us": 576511,
+            "p99_us": 1060863,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 175.06666666666666,
+            "total_requests": 2626,
+            "total_errors": 0,
+            "total_bytes": 2753560576,
+            "p50_us": 566783,
+            "p99_us": 1148927,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http3",
+        "payload_bytes": 5242880,
+        "gateway": "direct",
+        "mean_rps": 82.13333333333334,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 82.13333333333334,
+            "total_requests": 1232,
+            "total_errors": 0,
+            "total_bytes": 6459228160,
+            "p50_us": 577535,
+            "p99_us": 1249279,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http3",
+        "payload_bytes": 5242880,
+        "gateway": "envoy",
+        "mean_rps": 6.866666666666666,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 5.866666666666666,
+            "total_requests": 88,
+            "total_errors": 0,
+            "total_bytes": 461373440,
+            "p50_us": 9527295,
+            "p99_us": 19939327,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 7.466666666666667,
+            "total_requests": 112,
+            "total_errors": 0,
+            "total_bytes": 587202560,
+            "p50_us": 7323647,
+            "p99_us": 16441343,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 7.266666666666667,
+            "total_requests": 109,
+            "total_errors": 0,
+            "total_bytes": 571473920,
+            "p50_us": 6107135,
+            "p99_us": 19546111,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "http3",
+        "payload_bytes": 5242880,
+        "gateway": "ferrum",
+        "mean_rps": 37.82222222222222,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 36.333333333333336,
+            "total_requests": 545,
+            "total_errors": 0,
+            "total_bytes": 2857369600,
+            "p50_us": 1316863,
+            "p99_us": 2756607,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 38.733333333333334,
+            "total_requests": 581,
+            "total_errors": 0,
+            "total_bytes": 3046113280,
+            "p50_us": 1267711,
+            "p99_us": 2793471,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 38.4,
+            "total_requests": 576,
+            "total_errors": 0,
+            "total_bytes": 3019898880,
+            "p50_us": 1316863,
+            "p99_us": 2349055,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "tcp-tls",
+        "payload_bytes": 10240,
+        "gateway": "direct",
+        "mean_rps": 73888.8,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 73888.8,
+            "total_requests": 1108332,
+            "total_errors": 0,
+            "total_bytes": 11349319680,
+            "p50_us": 7,
+            "p99_us": 108863,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "tcp-tls",
+        "payload_bytes": 10240,
+        "gateway": "envoy",
+        "mean_rps": 39569.37777777778,
+        "clean": false,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 38154.6,
+            "total_requests": 572319,
+            "total_errors": 1,
+            "total_bytes": 5860546560,
+            "p50_us": 7,
+            "p99_us": 202111,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "1 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[tcp-tls] read timeout (15s) after 856 requests",
+                "count": 1
+              }
+            ]
+          },
+          {
+            "iteration": 2,
+            "rps": 39841.86666666667,
+            "total_requests": 597628,
+            "total_errors": 1,
+            "total_bytes": 6119710720,
+            "p50_us": 7,
+            "p99_us": 186367,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "1 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[tcp-tls] read timeout (15s) after 2518 requests",
+                "count": 1
+              }
+            ]
+          },
+          {
+            "iteration": 3,
+            "rps": 40711.666666666664,
+            "total_requests": 610675,
+            "total_errors": 2,
+            "total_bytes": 6253312000,
+            "p50_us": 7,
+            "p99_us": 207999,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "2 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[tcp-tls] read timeout (15s) after 1423 requests",
+                "count": 1
+              },
+              {
+                "message": "[tcp-tls] read timeout (15s) after 2283 requests",
+                "count": 1
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "protocol": "tcp-tls",
+        "payload_bytes": 10240,
+        "gateway": "ferrum",
+        "mean_rps": 34012.75555555556,
+        "clean": false,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 31558.4,
+            "total_requests": 473376,
+            "total_errors": 0,
+            "total_bytes": 4847370240,
+            "p50_us": 19,
+            "p99_us": 197375,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 35133.8,
+            "total_requests": 527007,
+            "total_errors": 1,
+            "total_bytes": 5396551680,
+            "p50_us": 17,
+            "p99_us": 185215,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "1 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[tcp-tls] read timeout (15s) after 245 requests",
+                "count": 1
+              }
+            ]
+          },
+          {
+            "iteration": 3,
+            "rps": 35346.066666666666,
+            "total_requests": 530191,
+            "total_errors": 0,
+            "total_bytes": 5429155840,
+            "p50_us": 16,
+            "p99_us": 184191,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "tcp-tls",
+        "payload_bytes": 10240,
+        "gateway": "kong",
+        "mean_rps": 28841.333333333332,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 28712.6,
+            "total_requests": 430689,
+            "total_errors": 0,
+            "total_bytes": 4410255360,
+            "p50_us": 8,
+            "p99_us": 190335,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 29038.333333333332,
+            "total_requests": 435575,
+            "total_errors": 0,
+            "total_bytes": 4460288000,
+            "p50_us": 8,
+            "p99_us": 193535,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 28773.066666666666,
+            "total_requests": 431596,
+            "total_errors": 0,
+            "total_bytes": 4419543040,
+            "p50_us": 8,
+            "p99_us": 165119,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "tcp-tls",
+        "payload_bytes": 71680,
+        "gateway": "direct",
+        "mean_rps": 13730.066666666668,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 13730.066666666668,
+            "total_requests": 205951,
+            "total_errors": 0,
+            "total_bytes": 14762567680,
+            "p50_us": 57,
+            "p99_us": 210815,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "tcp-tls",
+        "payload_bytes": 71680,
+        "gateway": "envoy",
+        "mean_rps": 6174.577777777778,
+        "clean": false,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 6138.933333333333,
+            "total_requests": 92084,
+            "total_errors": 1,
+            "total_bytes": 6600581120,
+            "p50_us": 176,
+            "p99_us": 655359,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "1 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[tcp-tls] read timeout (15s) after 213 requests",
+                "count": 1
+              }
+            ]
+          },
+          {
+            "iteration": 2,
+            "rps": 6207.266666666666,
+            "total_requests": 93109,
+            "total_errors": 0,
+            "total_bytes": 6674053120,
+            "p50_us": 170,
+            "p99_us": 652287,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 6177.533333333334,
+            "total_requests": 92663,
+            "total_errors": 1,
+            "total_bytes": 6642083840,
+            "p50_us": 173,
+            "p99_us": 664575,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "1 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[tcp-tls] read timeout (15s) after 119 requests",
+                "count": 1
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "protocol": "tcp-tls",
+        "payload_bytes": 71680,
+        "gateway": "ferrum",
+        "mean_rps": 5942.666666666667,
+        "clean": false,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 6025.933333333333,
+            "total_requests": 90389,
+            "total_errors": 0,
+            "total_bytes": 6479083520,
+            "p50_us": 334,
+            "p99_us": 319999,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 5834.266666666666,
+            "total_requests": 87514,
+            "total_errors": 0,
+            "total_bytes": 6273003520,
+            "p50_us": 372,
+            "p99_us": 275199,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 5967.8,
+            "total_requests": 89517,
+            "total_errors": 1,
+            "total_bytes": 6416578560,
+            "p50_us": 340,
+            "p99_us": 276735,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "1 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[tcp-tls] read timeout (15s) after 392 requests",
+                "count": 1
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "protocol": "tcp-tls",
+        "payload_bytes": 71680,
+        "gateway": "kong",
+        "mean_rps": 4430.666666666667,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 4431.8,
+            "total_requests": 66477,
+            "total_errors": 0,
+            "total_bytes": 4765071360,
+            "p50_us": 251,
+            "p99_us": 287487,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 4421.466666666666,
+            "total_requests": 66322,
+            "total_errors": 0,
+            "total_bytes": 4753960960,
+            "p50_us": 249,
+            "p99_us": 350975,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 4438.733333333334,
+            "total_requests": 66581,
+            "total_errors": 0,
+            "total_bytes": 4772526080,
+            "p50_us": 252,
+            "p99_us": 256639,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "tcp-tls",
+        "payload_bytes": 512000,
+        "gateway": "direct",
+        "mean_rps": 1963.4666666666667,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 1963.4666666666667,
+            "total_requests": 29452,
+            "total_errors": 0,
+            "total_bytes": 15079424000,
+            "p50_us": 96127,
+            "p99_us": 312575,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "tcp-tls",
+        "payload_bytes": 512000,
+        "gateway": "envoy",
+        "mean_rps": 872.4222222222222,
+        "clean": false,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 873.1333333333333,
+            "total_requests": 13097,
+            "total_errors": 1,
+            "total_bytes": 6705664000,
+            "p50_us": 5887,
+            "p99_us": 1173503,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "1 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[tcp-tls] read timeout (15s) after 27 requests",
+                "count": 1
+              }
+            ]
+          },
+          {
+            "iteration": 2,
+            "rps": 873.8,
+            "total_requests": 13107,
+            "total_errors": 1,
+            "total_bytes": 6710784000,
+            "p50_us": 5635,
+            "p99_us": 1139711,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "1 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[tcp-tls] read timeout (15s) after 21 requests",
+                "count": 1
+              }
+            ]
+          },
+          {
+            "iteration": 3,
+            "rps": 870.3333333333334,
+            "total_requests": 13055,
+            "total_errors": 0,
+            "total_bytes": 6684160000,
+            "p50_us": 5715,
+            "p99_us": 1228799,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "tcp-tls",
+        "payload_bytes": 512000,
+        "gateway": "ferrum",
+        "mean_rps": 839.9333333333334,
+        "clean": false,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 835.0,
+            "total_requests": 12525,
+            "total_errors": 0,
+            "total_bytes": 6412800000,
+            "p50_us": 205951,
+            "p99_us": 860159,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 843.4666666666667,
+            "total_requests": 12652,
+            "total_errors": 0,
+            "total_bytes": 6477824000,
+            "p50_us": 205439,
+            "p99_us": 691711,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 841.3333333333334,
+            "total_requests": 12620,
+            "total_errors": 1,
+            "total_bytes": 6461440000,
+            "p50_us": 207999,
+            "p99_us": 786431,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": [
+              "1 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[tcp-tls] read timeout (15s) after 44 requests",
+                "count": 1
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "protocol": "tcp-tls",
+        "payload_bytes": 512000,
+        "gateway": "kong",
+        "mean_rps": 631.2444444444444,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 628.9333333333333,
+            "total_requests": 9434,
+            "total_errors": 0,
+            "total_bytes": 4830208000,
+            "p50_us": 287231,
+            "p99_us": 750591,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 626.8666666666667,
+            "total_requests": 9403,
+            "total_errors": 0,
+            "total_bytes": 4814336000,
+            "p50_us": 281855,
+            "p99_us": 803839,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 637.9333333333333,
+            "total_requests": 9569,
+            "total_errors": 0,
+            "total_bytes": 4899328000,
+            "p50_us": 220543,
+            "p99_us": 1335295,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "tcp-tls",
+        "payload_bytes": 1048576,
+        "gateway": "direct",
+        "mean_rps": 974.3333333333334,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 974.3333333333334,
+            "total_requests": 14615,
+            "total_errors": 0,
+            "total_bytes": 15324938240,
+            "p50_us": 92415,
+            "p99_us": 298495,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "tcp-tls",
+        "payload_bytes": 1048576,
+        "gateway": "envoy",
+        "mean_rps": 428.9111111111111,
+        "clean": false,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 429.8,
+            "total_requests": 6447,
+            "total_errors": 0,
+            "total_bytes": 6760169472,
+            "p50_us": 211199,
+            "p99_us": 620543,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 431.2,
+            "total_requests": 6468,
+            "total_errors": 1,
+            "total_bytes": 6782189568,
+            "p50_us": 195711,
+            "p99_us": 784383,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": [
+              "1 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[tcp-tls] read timeout (15s) after 15 requests",
+                "count": 1
+              }
+            ]
+          },
+          {
+            "iteration": 3,
+            "rps": 425.73333333333335,
+            "total_requests": 6386,
+            "total_errors": 0,
+            "total_bytes": 6696206336,
+            "p50_us": 209663,
+            "p99_us": 631807,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "tcp-tls",
+        "payload_bytes": 1048576,
+        "gateway": "ferrum",
+        "mean_rps": 427.11111111111114,
+        "clean": false,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 425.2,
+            "total_requests": 6378,
+            "total_errors": 0,
+            "total_bytes": 6687817728,
+            "p50_us": 209279,
+            "p99_us": 582655,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 417.6,
+            "total_requests": 6264,
+            "total_errors": 0,
+            "total_bytes": 6568280064,
+            "p50_us": 212607,
+            "p99_us": 580095,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 438.53333333333336,
+            "total_requests": 6578,
+            "total_errors": 1,
+            "total_bytes": 6897532928,
+            "p50_us": 202879,
+            "p99_us": 602111,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": [
+              "1 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[tcp-tls] read timeout (15s) after 53 requests",
+                "count": 1
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "protocol": "tcp-tls",
+        "payload_bytes": 1048576,
+        "gateway": "kong",
+        "mean_rps": 317.53333333333336,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 316.06666666666666,
+            "total_requests": 4741,
+            "total_errors": 0,
+            "total_bytes": 4971298816,
+            "p50_us": 299519,
+            "p99_us": 707071,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 315.53333333333336,
+            "total_requests": 4733,
+            "total_errors": 0,
+            "total_bytes": 4962910208,
+            "p50_us": 300543,
+            "p99_us": 721919,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 321.0,
+            "total_requests": 4815,
+            "total_errors": 0,
+            "total_bytes": 5048893440,
+            "p50_us": 260095,
+            "p99_us": 821759,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "tcp-tls",
+        "payload_bytes": 5242880,
+        "gateway": "direct",
+        "mean_rps": 195.26666666666668,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 195.26666666666668,
+            "total_requests": 2929,
+            "total_errors": 0,
+            "total_bytes": 15356395520,
+            "p50_us": 247935,
+            "p99_us": 455423,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "tcp-tls",
+        "payload_bytes": 5242880,
+        "gateway": "envoy",
+        "mean_rps": 87.84444444444445,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 87.66666666666667,
+            "total_requests": 1315,
+            "total_errors": 0,
+            "total_bytes": 6894387200,
+            "p50_us": 562175,
+            "p99_us": 1034239,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 88.26666666666667,
+            "total_requests": 1324,
+            "total_errors": 0,
+            "total_bytes": 6941573120,
+            "p50_us": 495615,
+            "p99_us": 1458175,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 87.6,
+            "total_requests": 1314,
+            "total_errors": 0,
+            "total_bytes": 6889144320,
+            "p50_us": 529919,
+            "p99_us": 1095679,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "tcp-tls",
+        "payload_bytes": 5242880,
+        "gateway": "ferrum",
+        "mean_rps": 88.95555555555555,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 87.8,
+            "total_requests": 1317,
+            "total_errors": 0,
+            "total_bytes": 6904872960,
+            "p50_us": 539135,
+            "p99_us": 1247231,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 90.33333333333333,
+            "total_requests": 1355,
+            "total_errors": 0,
+            "total_bytes": 7104102400,
+            "p50_us": 524287,
+            "p99_us": 1134591,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 88.73333333333333,
+            "total_requests": 1331,
+            "total_errors": 0,
+            "total_bytes": 6978273280,
+            "p50_us": 528895,
+            "p99_us": 1172479,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "tcp-tls",
+        "payload_bytes": 5242880,
+        "gateway": "kong",
+        "mean_rps": 65.84444444444445,
+        "clean": false,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 66.66666666666667,
+            "total_requests": 1000,
+            "total_errors": 16,
+            "total_bytes": 5242880000,
+            "p50_us": 465151,
+            "p99_us": 3143679,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": [
+              "16 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[tcp-tls] read error after 42 requests: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+                "count": 1
+              },
+              {
+                "message": "[tcp-tls] read error after 22 requests: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+                "count": 1
+              },
+              {
+                "message": "[tcp-tls] read error after 18 requests: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+                "count": 3
+              },
+              {
+                "message": "[tcp-tls] read error after 21 requests: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+                "count": 1
+              },
+              {
+                "message": "[tcp-tls] read error after 11 requests: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+                "count": 1
+              },
+              {
+                "message": "[tcp-tls] read error after 6 requests: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+                "count": 7
+              },
+              {
+                "message": "[tcp-tls] read error after 7 requests: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+                "count": 2
+              }
+            ]
+          },
+          {
+            "iteration": 2,
+            "rps": 65.2,
+            "total_requests": 978,
+            "total_errors": 13,
+            "total_bytes": 5127536640,
+            "p50_us": 767999,
+            "p99_us": 1369087,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": [
+              "13 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[tcp-tls] read error after 17 requests: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+                "count": 1
+              },
+              {
+                "message": "[tcp-tls] read error after 18 requests: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+                "count": 1
+              },
+              {
+                "message": "[tcp-tls] read error after 27 requests: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+                "count": 3
+              },
+              {
+                "message": "[tcp-tls] read error after 23 requests: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+                "count": 3
+              },
+              {
+                "message": "[tcp-tls] read error after 15 requests: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+                "count": 1
+              },
+              {
+                "message": "[tcp-tls] read error after 20 requests: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+                "count": 4
+              }
+            ]
+          },
+          {
+            "iteration": 3,
+            "rps": 65.66666666666667,
+            "total_requests": 985,
+            "total_errors": 9,
+            "total_bytes": 5164236800,
+            "p50_us": 734719,
+            "p99_us": 1572863,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": [
+              "9 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "[tcp-tls] read error after 57 requests: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+                "count": 1
+              },
+              {
+                "message": "[tcp-tls] read error after 30 requests: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+                "count": 1
+              },
+              {
+                "message": "[tcp-tls] read error after 19 requests: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+                "count": 1
+              },
+              {
+                "message": "[tcp-tls] read error after 11 requests: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+                "count": 2
+              },
+              {
+                "message": "[tcp-tls] read error after 12 requests: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+                "count": 1
+              },
+              {
+                "message": "[tcp-tls] read error after 13 requests: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+                "count": 1
+              },
+              {
+                "message": "[tcp-tls] read error after 16 requests: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+                "count": 1
+              },
+              {
+                "message": "[tcp-tls] read error after 10 requests: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+                "count": 1
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "protocol": "udp",
+        "payload_bytes": 1024,
+        "gateway": "direct",
+        "mean_rps": 123920.8,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 123920.8,
+            "total_requests": 1858812,
+            "total_errors": 0,
+            "total_bytes": 1903423488,
+            "p50_us": 1762,
+            "p99_us": 2693,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "udp",
+        "payload_bytes": 1024,
+        "gateway": "envoy",
+        "mean_rps": 96636.97777777778,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 93789.86666666667,
+            "total_requests": 1406848,
+            "total_errors": 0,
+            "total_bytes": 1440612352,
+            "p50_us": 2006,
+            "p99_us": 5095,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 97972.93333333333,
+            "total_requests": 1469594,
+            "total_errors": 0,
+            "total_bytes": 1504864256,
+            "p50_us": 1941,
+            "p99_us": 4687,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 98148.13333333333,
+            "total_requests": 1472222,
+            "total_errors": 0,
+            "total_bytes": 1507555328,
+            "p50_us": 1948,
+            "p99_us": 4635,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "udp",
+        "payload_bytes": 1024,
+        "gateway": "ferrum",
+        "mean_rps": 101093.08888888889,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 95809.73333333334,
+            "total_requests": 1437146,
+            "total_errors": 0,
+            "total_bytes": 1471637504,
+            "p50_us": 1908,
+            "p99_us": 4699,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 103808.66666666667,
+            "total_requests": 1557130,
+            "total_errors": 0,
+            "total_bytes": 1594501120,
+            "p50_us": 1800,
+            "p99_us": 3941,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 103660.86666666667,
+            "total_requests": 1554913,
+            "total_errors": 0,
+            "total_bytes": 1592230912,
+            "p50_us": 1808,
+            "p99_us": 3905,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "udp",
+        "payload_bytes": 1024,
+        "gateway": "kong",
+        "mean_rps": 106880.42222222223,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 106989.66666666667,
+            "total_requests": 1604845,
+            "total_errors": 0,
+            "total_bytes": 1643361280,
+            "p50_us": 1770,
+            "p99_us": 4595,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 108652.0,
+            "total_requests": 1629780,
+            "total_errors": 0,
+            "total_bytes": 1668894720,
+            "p50_us": 1730,
+            "p99_us": 4711,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 104999.6,
+            "total_requests": 1574994,
+            "total_errors": 0,
+            "total_bytes": 1612793856,
+            "p50_us": 1792,
+            "p99_us": 4699,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "udp-dtls",
+        "payload_bytes": 1024,
+        "gateway": "direct",
+        "mean_rps": 96980.0,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 96980.0,
+            "total_requests": 1454700,
+            "total_errors": 0,
+            "total_bytes": 1489612800,
+            "p50_us": 1980,
+            "p99_us": 3889,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "udp-dtls",
+        "payload_bytes": 1024,
+        "gateway": "ferrum",
+        "mean_rps": 39188.311111111114,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 36972.4,
+            "total_requests": 554586,
+            "total_errors": 0,
+            "total_bytes": 567896064,
+            "p50_us": 5103,
+            "p99_us": 10719,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 41080.6,
+            "total_requests": 616209,
+            "total_errors": 0,
+            "total_bytes": 630998016,
+            "p50_us": 4691,
+            "p99_us": 8815,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 39511.933333333334,
+            "total_requests": 592679,
+            "total_errors": 0,
+            "total_bytes": 606903296,
+            "p50_us": 4859,
+            "p99_us": 9303,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 10240,
+        "gateway": "direct",
+        "mean_rps": 54356.2,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 54356.2,
+            "total_requests": 815343,
+            "total_errors": 0,
+            "total_bytes": 8349112320,
+            "p50_us": 3491,
+            "p99_us": 7879,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 10240,
+        "gateway": "envoy",
+        "mean_rps": 23571.88888888889,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 22721.4,
+            "total_requests": 340821,
+            "total_errors": 0,
+            "total_bytes": 3490007040,
+            "p50_us": 8311,
+            "p99_us": 18783,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 24458.733333333334,
+            "total_requests": 366881,
+            "total_errors": 0,
+            "total_bytes": 3756861440,
+            "p50_us": 7755,
+            "p99_us": 16927,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 23535.533333333333,
+            "total_requests": 353033,
+            "total_errors": 0,
+            "total_bytes": 3615057920,
+            "p50_us": 8079,
+            "p99_us": 17839,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 10240,
+        "gateway": "ferrum",
+        "mean_rps": 26729.355555555554,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 25345.066666666666,
+            "total_requests": 380176,
+            "total_errors": 0,
+            "total_bytes": 3893002240,
+            "p50_us": 7451,
+            "p99_us": 16415,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 27485.666666666668,
+            "total_requests": 412285,
+            "total_errors": 0,
+            "total_bytes": 4221798400,
+            "p50_us": 6979,
+            "p99_us": 14047,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 27357.333333333332,
+            "total_requests": 410360,
+            "total_errors": 0,
+            "total_bytes": 4202086400,
+            "p50_us": 7031,
+            "p99_us": 14015,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 10240,
+        "gateway": "kong",
+        "mean_rps": 12570.155555555555,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 12300.266666666666,
+            "total_requests": 184504,
+            "total_errors": 0,
+            "total_bytes": 1889320960,
+            "p50_us": 8991,
+            "p99_us": 64319,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 13056.533333333333,
+            "total_requests": 195848,
+            "total_errors": 0,
+            "total_bytes": 2005483520,
+            "p50_us": 3183,
+            "p99_us": 96511,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 12353.666666666666,
+            "total_requests": 185305,
+            "total_errors": 0,
+            "total_bytes": 1897523200,
+            "p50_us": 9879,
+            "p99_us": 90047,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 10240,
+        "gateway": "tyk",
+        "mean_rps": 25644.244444444445,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 24028.533333333333,
+            "total_requests": 360428,
+            "total_errors": 0,
+            "total_bytes": 3690782720,
+            "p50_us": 7707,
+            "p99_us": 19231,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 26427.4,
+            "total_requests": 396411,
+            "total_errors": 0,
+            "total_bytes": 4059248640,
+            "p50_us": 6999,
+            "p99_us": 17983,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 26476.8,
+            "total_requests": 397152,
+            "total_errors": 0,
+            "total_bytes": 4066836480,
+            "p50_us": 6991,
+            "p99_us": 17503,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 71680,
+        "gateway": "direct",
+        "mean_rps": 12014.133333333333,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 12014.133333333333,
+            "total_requests": 180212,
+            "total_errors": 0,
+            "total_bytes": 12917596160,
+            "p50_us": 16231,
+            "p99_us": 32047,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 71680,
+        "gateway": "envoy",
+        "mean_rps": 4970.955555555555,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 4966.066666666667,
+            "total_requests": 74491,
+            "total_errors": 0,
+            "total_bytes": 5339514880,
+            "p50_us": 38655,
+            "p99_us": 73279,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 4951.866666666667,
+            "total_requests": 74278,
+            "total_errors": 0,
+            "total_bytes": 5324247040,
+            "p50_us": 39551,
+            "p99_us": 76799,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 4994.933333333333,
+            "total_requests": 74924,
+            "total_errors": 0,
+            "total_bytes": 5370552320,
+            "p50_us": 38719,
+            "p99_us": 69631,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 71680,
+        "gateway": "ferrum",
+        "mean_rps": 5631.066666666667,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 5556.933333333333,
+            "total_requests": 83354,
+            "total_errors": 0,
+            "total_bytes": 5974814720,
+            "p50_us": 34943,
+            "p99_us": 66431,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 5668.266666666666,
+            "total_requests": 85024,
+            "total_errors": 0,
+            "total_bytes": 6094520320,
+            "p50_us": 34207,
+            "p99_us": 63647,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 5668.0,
+            "total_requests": 85020,
+            "total_errors": 0,
+            "total_bytes": 6094233600,
+            "p50_us": 34367,
+            "p99_us": 62015,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 71680,
+        "gateway": "kong",
+        "mean_rps": 2687.266666666667,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 2728.4666666666667,
+            "total_requests": 40927,
+            "total_errors": 0,
+            "total_bytes": 2933647360,
+            "p50_us": 77439,
+            "p99_us": 178559,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 2724.4,
+            "total_requests": 40866,
+            "total_errors": 0,
+            "total_bytes": 2929274880,
+            "p50_us": 38111,
+            "p99_us": 231295,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 2608.9333333333334,
+            "total_requests": 39134,
+            "total_errors": 0,
+            "total_bytes": 2805125120,
+            "p50_us": 67839,
+            "p99_us": 189183,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 71680,
+        "gateway": "tyk",
+        "mean_rps": 5731.222222222223,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 5761.933333333333,
+            "total_requests": 86429,
+            "total_errors": 0,
+            "total_bytes": 6195230720,
+            "p50_us": 32671,
+            "p99_us": 75263,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 5628.133333333333,
+            "total_requests": 84422,
+            "total_errors": 0,
+            "total_bytes": 6051368960,
+            "p50_us": 33343,
+            "p99_us": 77567,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 5803.6,
+            "total_requests": 87054,
+            "total_errors": 0,
+            "total_bytes": 6240030720,
+            "p50_us": 32399,
+            "p99_us": 74943,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 512000,
+        "gateway": "direct",
+        "mean_rps": 1817.7333333333333,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 1817.7333333333333,
+            "total_requests": 27266,
+            "total_errors": 0,
+            "total_bytes": 13960192000,
+            "p50_us": 101567,
+            "p99_us": 272127,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 512000,
+        "gateway": "envoy",
+        "mean_rps": 869.0222222222222,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 879.4666666666667,
+            "total_requests": 13192,
+            "total_errors": 0,
+            "total_bytes": 6754304000,
+            "p50_us": 221183,
+            "p99_us": 411135,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 872.1333333333333,
+            "total_requests": 13082,
+            "total_errors": 0,
+            "total_bytes": 6697984000,
+            "p50_us": 222847,
+            "p99_us": 378879,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 855.4666666666667,
+            "total_requests": 12832,
+            "total_errors": 0,
+            "total_bytes": 6569984000,
+            "p50_us": 228095,
+            "p99_us": 453119,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 512000,
+        "gateway": "ferrum",
+        "mean_rps": 979.2222222222223,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 979.6,
+            "total_requests": 14694,
+            "total_errors": 0,
+            "total_bytes": 7523328000,
+            "p50_us": 190079,
+            "p99_us": 462591,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 938.6,
+            "total_requests": 14079,
+            "total_errors": 0,
+            "total_bytes": 7208448000,
+            "p50_us": 199295,
+            "p99_us": 461823,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 1019.4666666666667,
+            "total_requests": 15292,
+            "total_errors": 0,
+            "total_bytes": 7829504000,
+            "p50_us": 185855,
+            "p99_us": 409855,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 512000,
+        "gateway": "kong",
+        "mean_rps": 404.9777777777778,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 405.53333333333336,
+            "total_requests": 6083,
+            "total_errors": 0,
+            "total_bytes": 3114496000,
+            "p50_us": 461055,
+            "p99_us": 1042943,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 415.6,
+            "total_requests": 6234,
+            "total_errors": 0,
+            "total_bytes": 3191808000,
+            "p50_us": 457215,
+            "p99_us": 948223,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 393.8,
+            "total_requests": 5907,
+            "total_errors": 0,
+            "total_bytes": 3024384000,
+            "p50_us": 486399,
+            "p99_us": 943103,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 512000,
+        "gateway": "tyk",
+        "mean_rps": 990.5555555555555,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 979.8,
+            "total_requests": 14697,
+            "total_errors": 0,
+            "total_bytes": 7524864000,
+            "p50_us": 192767,
+            "p99_us": 420863,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 986.6,
+            "total_requests": 14799,
+            "total_errors": 0,
+            "total_bytes": 7577088000,
+            "p50_us": 192511,
+            "p99_us": 412159,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 1005.2666666666667,
+            "total_requests": 15079,
+            "total_errors": 0,
+            "total_bytes": 7720448000,
+            "p50_us": 187135,
+            "p99_us": 398591,
+            "effective_concurrency": 200,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 1048576,
+        "gateway": "direct",
+        "mean_rps": 958.0,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 958.0,
+            "total_requests": 14370,
+            "total_errors": 0,
+            "total_bytes": 15068037120,
+            "p50_us": 93503,
+            "p99_us": 282367,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 1048576,
+        "gateway": "envoy",
+        "mean_rps": 444.5777777777778,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 450.26666666666665,
+            "total_requests": 6754,
+            "total_errors": 0,
+            "total_bytes": 7082082304,
+            "p50_us": 217599,
+            "p99_us": 382207,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 442.4,
+            "total_requests": 6636,
+            "total_errors": 0,
+            "total_bytes": 6958350336,
+            "p50_us": 220799,
+            "p99_us": 376831,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 441.06666666666666,
+            "total_requests": 6616,
+            "total_errors": 0,
+            "total_bytes": 6937378816,
+            "p50_us": 224383,
+            "p99_us": 407551,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 1048576,
+        "gateway": "ferrum",
+        "mean_rps": 458.9111111111111,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 452.26666666666665,
+            "total_requests": 6784,
+            "total_errors": 0,
+            "total_bytes": 7113539584,
+            "p50_us": 210815,
+            "p99_us": 416511,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 462.26666666666665,
+            "total_requests": 6934,
+            "total_errors": 0,
+            "total_bytes": 7270825984,
+            "p50_us": 204671,
+            "p99_us": 397055,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 462.2,
+            "total_requests": 6933,
+            "total_errors": 0,
+            "total_bytes": 7269777408,
+            "p50_us": 206719,
+            "p99_us": 396031,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 1048576,
+        "gateway": "kong",
+        "mean_rps": 209.51111111111112,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 213.53333333333333,
+            "total_requests": 3203,
+            "total_errors": 0,
+            "total_bytes": 3358588928,
+            "p50_us": 441343,
+            "p99_us": 952831,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 212.8,
+            "total_requests": 3192,
+            "total_errors": 0,
+            "total_bytes": 3347054592,
+            "p50_us": 438783,
+            "p99_us": 1004031,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 202.2,
+            "total_requests": 3033,
+            "total_errors": 0,
+            "total_bytes": 3180331008,
+            "p50_us": 467455,
+            "p99_us": 1185791,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 1048576,
+        "gateway": "tyk",
+        "mean_rps": 523.3555555555555,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 527.4,
+            "total_requests": 7911,
+            "total_errors": 0,
+            "total_bytes": 8295284736,
+            "p50_us": 174975,
+            "p99_us": 473599,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 519.9333333333333,
+            "total_requests": 7799,
+            "total_errors": 0,
+            "total_bytes": 8177844224,
+            "p50_us": 176511,
+            "p99_us": 455423,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 522.7333333333333,
+            "total_requests": 7841,
+            "total_errors": 0,
+            "total_bytes": 8221884416,
+            "p50_us": 178815,
+            "p99_us": 445695,
+            "effective_concurrency": 100,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 5242880,
+        "gateway": "direct",
+        "mean_rps": 180.4,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 180.4,
+            "total_requests": 2706,
+            "total_errors": 0,
+            "total_bytes": 14187233280,
+            "p50_us": 261119,
+            "p99_us": 621055,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 5242880,
+        "gateway": "envoy",
+        "mean_rps": 86.22222222222223,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 85.93333333333334,
+            "total_requests": 1289,
+            "total_errors": 0,
+            "total_bytes": 6758072320,
+            "p50_us": 567807,
+            "p99_us": 858111,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 86.6,
+            "total_requests": 1299,
+            "total_errors": 0,
+            "total_bytes": 6810501120,
+            "p50_us": 589311,
+            "p99_us": 864767,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 86.13333333333334,
+            "total_requests": 1292,
+            "total_errors": 0,
+            "total_bytes": 6773800960,
+            "p50_us": 605695,
+            "p99_us": 849407,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 5242880,
+        "gateway": "ferrum",
+        "mean_rps": 96.88888888888889,
+        "clean": false,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 95.86666666666666,
+            "total_requests": 1438,
+            "total_errors": 23,
+            "total_bytes": 7539261440,
+            "p50_us": 294143,
+            "p99_us": 700415,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": [
+              "23 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "  ws echo error: timed out waiting 30s for echo",
+                "count": 23
+              }
+            ]
+          },
+          {
+            "iteration": 2,
+            "rps": 101.66666666666667,
+            "total_requests": 1525,
+            "total_errors": 33,
+            "total_bytes": 7995392000,
+            "p50_us": 221567,
+            "p99_us": 821247,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": [
+              "33 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "  ws echo error: timed out waiting 30s for echo",
+                "count": 33
+              }
+            ]
+          },
+          {
+            "iteration": 3,
+            "rps": 93.13333333333334,
+            "total_requests": 1397,
+            "total_errors": 5,
+            "total_bytes": 7324303360,
+            "p50_us": 477183,
+            "p99_us": 810495,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": [
+              "5 errors"
+            ],
+            "stderr_messages": [
+              {
+                "message": "  ws echo error: timed out waiting 30s for echo",
+                "count": 5
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 5242880,
+        "gateway": "kong",
+        "mean_rps": 42.82222222222222,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 43.266666666666666,
+            "total_requests": 649,
+            "total_errors": 0,
+            "total_bytes": 3402629120,
+            "p50_us": 808447,
+            "p99_us": 3702783,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 43.6,
+            "total_requests": 654,
+            "total_errors": 0,
+            "total_bytes": 3428843520,
+            "p50_us": 884735,
+            "p99_us": 3512319,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 41.6,
+            "total_requests": 624,
+            "total_errors": 0,
+            "total_bytes": 3271557120,
+            "p50_us": 1011711,
+            "p99_us": 3549183,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      },
+      {
+        "protocol": "wss",
+        "payload_bytes": 5242880,
+        "gateway": "tyk",
+        "mean_rps": 106.57777777777778,
+        "clean": true,
+        "samples": [
+          {
+            "iteration": 1,
+            "rps": 106.73333333333333,
+            "total_requests": 1601,
+            "total_errors": 0,
+            "total_bytes": 8393850880,
+            "p50_us": 438271,
+            "p99_us": 1063935,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 2,
+            "rps": 105.46666666666667,
+            "total_requests": 1582,
+            "total_errors": 0,
+            "total_bytes": 8294236160,
+            "p50_us": 446975,
+            "p99_us": 1035775,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          },
+          {
+            "iteration": 3,
+            "rps": 107.53333333333333,
+            "total_requests": 1613,
+            "total_errors": 0,
+            "total_bytes": 8456765440,
+            "p50_us": 424959,
+            "p99_us": 1104895,
+            "effective_concurrency": 50,
+            "duration_secs": 15,
+            "validity_issues": []
+          }
+        ]
+      }
+    ],
+    "workflow_conclusion": "success",
+    "artifact_name": "gateways-protocol-bench-combined-d8a37c6911aba89112fd2571e9364118964e7955",
+    "diagnostics": {
+      "stderr_files_inspected": 359,
+      "run_logs_inspected": 24,
+      "gateway_backend_logs_available": false,
+      "all_samples_positive_work": true,
+      "all_samples_exact_byte_totals": true,
+      "invalid_opposed_scenarios": 15,
+      "opposed_scenarios": 31
+    }
+  }
 }

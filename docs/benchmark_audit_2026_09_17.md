@@ -18,14 +18,14 @@ comments calling it 512 KiB. [Extracted measurements](benchmark_audit_2026_09_17
 retain per-iteration rates, error counts, byte totals, and p99 latency.
 
 [Run 35195212169](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35195212169)
-tests `d8a37c6911aba89112fd2571e9364118964e7955`. Its results were still pending
-when this initial analysis was written. Its benchmark files are identical to
+tests `d8a37c6911aba89112fd2571e9364118964e7955` and has completed successfully.
+The current-main comparison below audits all 359 samples. Its benchmark files are identical to
 the earlier run; changes between the two commits affect Ferrum. The source
 audit used local checkout `29b751eef` and checked differences against the run's
 commit. The body, TCP relay, UDP relay, and direct-H2 pool findings below apply
 to the run's revision too.
 
-**Clean losses worth pursuing.** Values below are means across all three
+**Original-run clean losses worth pursuing.** Values below are means across all three
 iterations; both named gateways completed work with zero reported errors and
 correct byte totals in all three. Other competitors in the same scenario may
 have failed, so these are pairwise observations, not a complete scoreboard.
@@ -83,7 +83,8 @@ The following limitations remain even after the reporting repair:
   memory, scheduling, and TLS costs. Direct/gateway RPS differences are useful
   diagnostic ratios, not measurements of proxy CPU overhead.
 - Gateway order is fixed and direct baselines are not repeated. Runners differ
-  between protocols: the logs show EPYC 9V45, 9V74, and 7763 machines. Compare
+  between protocols: the original logs show EPYC 9V45, 9V74, 7763, and Xeon
+  Platinum 8370C machines. Compare
   competitors within a job; use paired/interleaved runs for revision comparisons.
 - The H3 deadline starts before sequential connection establishment. Successful
   requests admitted before the deadline can finish afterward, yet RPS divides
@@ -94,6 +95,83 @@ The following limitations remain even after the reporting repair:
   `effective_concurrency` is a requested worker count, not observed active
   streams. Record worker loss and actual concurrency/queueing in a future
   harness revision; invalidate any failed sample rather than retrying it away.
+
+**Completed current-main comparison.** Run 35195212169 has the same 141 groups,
+359 samples, three iterations, 15-second duration, and scaled concurrency as
+the original. All 359 samples completed positive work with exact byte totals,
+but **38 contain reported errors**, across 21 groups: Ferrum 12 samples,
+KrakenD 12, Envoy 11, and Kong 3. Applying the validity rules excludes 15 of
+31 opposed scenarios; five of the remaining scenarios are still H3 with the
+old unfair Envoy admission cap. This is not a clean overall run.
+
+The repeatable priorities persist. Selected pairwise comparisons below require
+all three iterations of both named gateways to pass the reported validity
+checks. Small differences still need paired replication.
+
+| Protocol | Payload | Ferrum RPS | Competitor RPS | Competitor lead |
+|---|---:|---:|---:|---:|
+| HTTPS/1.1 | 10 KiB | 10,674 | Envoy 11,836 | 10.9% |
+| HTTPS/1.1 | 500 KiB | 574 | Tyk 748 | 30.4% |
+| HTTPS/1.1 | 1 MiB | 307 | Tyk 397 | 29.4% |
+| HTTPS/1.1 | 1 MiB | 307 | Envoy 375 | 22.2% |
+| HTTPS/1.1 | 5 MiB | 66 | Tyk 90 | 35.6% |
+| HTTPS/1.1 | 5 MiB | 66 | Envoy 80 | 21.0% |
+| HTTP/2 TLS | 10 KiB | 23,731 | Envoy 27,746 | 16.9% |
+| WSS | 1 MiB | 459 | Tyk 523 | 14.0% |
+| UDP | 1 KiB | 101,093 | Kong 106,880 | 5.7% |
+
+Tyk's WSS leads at 70 KiB and 500 KiB are only 1.8% and 1.2%. Envoy's
+500 KiB HTTPS mean is higher than Ferrum's but includes an error, so it is
+excluded here. Every KrakenD HTTPS group again contains at least one failing
+iteration. Ferrum still leads clean larger H2 and 1/5 MiB gRPC comparisons.
+Its old-cap H3 means are 3.9–5.5 times Envoy's; those are not fair-admission wins.
+
+| Ferrum case | Current errors, iterations 1 / 2 / 3 | Evidence |
+|---|---:|---|
+| HTTP/2, 70 KiB | 0 / 169 / 0 | stderr includes HTTP 502, 31-byte body |
+| gRPC TLS, 10 KiB | 0 / 0 / 141 | JSON counters; stderr empty |
+| gRPC TLS, 70 KiB | 143 / 168 / 0 | JSON counters; stderr empty |
+| gRPC TLS, 500 KiB | 194 / 0 / 0 | JSON counters; stderr empty |
+| WSS, 5 MiB | 23 / 33 / 5 | 30-second echo timeouts |
+| TCP/TLS, 10 KiB | 0 / 1 / 0 | 15-second read timeout |
+| TCP/TLS, 70 KiB | 0 / 0 / 1 | 15-second read timeout |
+| TCP/TLS, 500 KiB | 0 / 0 / 1 | 15-second read timeout |
+| TCP/TLS, 1 MiB | 0 / 0 / 1 | 15-second read timeout |
+
+Kong's earlier zero-work TCP/TLS samples did not recur; its 5 MiB samples
+instead report 16/13/9 errors with missing TLS close-notify in stderr. Envoy
+also has TCP/TLS read timeouts. All 359 stderr files and 24 harness run logs
+were inspected. This old harness retained no per-sample gateway/backend logs,
+so these symptoms cannot yet be assigned a server-side root cause. The new
+diagnostic capture in #5587 is needed for that investigation. The error count
+decreasing from 47 invalid samples to 38 is not proof of a correctness fix.
+
+Hardware makes revision-to-revision RPS especially misleading here:
+
+| Protocol | Original runner CPU | Current-main runner CPU |
+|---|---|---|
+| HTTPS/1.1 | EPYC 9V45 | EPYC 7763 |
+| HTTP/2 | EPYC 9V74 | Xeon 6973P-C |
+| HTTP/3 | EPYC 9V45 | EPYC 7763 |
+| gRPC TLS | Xeon Platinum 8370C | EPYC 9V74 |
+| WSS | EPYC 7763 | EPYC 7763 |
+| TCP/TLS | EPYC 9V74 | EPYC 7763 |
+| UDP | EPYC 7763 | EPYC 9V74 |
+| UDP/DTLS | EPYC 9V74 | EPYC 7763 |
+
+At 10 KiB, Ferrum HTTPS falls 57.0% while direct falls 55.0%; Ferrum H2 rises
+78.4% while direct rises 83.3%; Ferrum H3 falls 50.1% while direct falls 49.1%.
+Those parallel movements are evidence of substantial environment effects,
+not isolated regressions or improvements. Even a matching CPU model does not
+make two hosted VMs a controlled pair. WSS direct rates move only 1.8–6.0%
+down and Ferrum's 1 MiB gap to Tyk persists (12.3% then 14.0%), strengthening
+that investigation priority. UDP's gap also persists (5.1% then 5.7%). The
+evidence JSON retains current per-iteration p50/p99, rates, errors, byte totals,
+stderr summaries, and both runs' CPU models. Use same-host interleaved A/B
+measurements before attributing any cross-run change to code.
+
+Follow-up correctness and profiling work is tracked in
+[issue #5588](https://github.com/ferrum-edge/ferrum-edge/issues/5588).
 
 **Envoy HTTP/3 history and repair.** The configuration history is unusually
 helpful: [PR #533](https://github.com/ferrum-edge/ferrum-edge/pull/533),
