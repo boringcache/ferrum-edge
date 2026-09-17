@@ -128,16 +128,36 @@ impl InboundAdmissionArtifact {
         self.in_force.load_full()
     }
 
-    /// Publish the anchors one accepted publication put in force, or clear the
-    /// cell when a rebind to a different trust slot leaves nothing in force.
+    /// Publish the anchors one accepted publication put in force.
     ///
     /// `HboneAdmissionFence` is the only caller, and only under its single
     /// publication lock: this cell and the fence's in-force revision name the
-    /// same generation. The fence stores HERE FIRST, so the brief overlap in
-    /// which the two surfaces are one generation apart can only make the
-    /// handshake stricter than the fence, never looser.
-    pub(crate) fn put_in_force(&self, anchors: Option<Arc<AdmittedPeerTrustAnchors>>) {
-        self.in_force.store(anchors);
+    /// same generation.
+    ///
+    /// There is deliberately no way to CLEAR the cell. Once a publication has
+    /// taken force the fence never goes back to having no anchors — a rebind to
+    /// a different trust slot whose material does not compile keeps the binding
+    /// already in force rather than clearing this cell, exactly as a rejected
+    /// trust or CRL candidate does. Clearing it would drop the handshake back
+    /// onto the verifier's own last-known-good compile of whatever slot that
+    /// verifier was built with (which a rebind does NOT replace) while the
+    /// fence simultaneously lost its anchors, so live CONNECTs would take the
+    /// unanchored path and stop being judged at all. Taking `Arc` rather than
+    /// `Option<Arc>` is what makes that unrepresentable.
+    ///
+    /// The two surfaces are NOT stored atomically: the fence stores here first
+    /// and advances its own in-force revision second, so for the length of the
+    /// publisher's critical section a handshake can verify against anchors one
+    /// generation NEWER than the fence's in-force snapshot. Which surface is
+    /// stricter in that window depends on the change — an added revocation or a
+    /// withdrawn trust domain makes the handshake stricter; a removed
+    /// revocation or an added trust domain makes it looser, and the fence's
+    /// CONNECT gate then refuses what the handshake just admitted until the
+    /// revision advances. Both directions fail closed, neither is bounded by
+    /// any wall-clock figure, and the surfaces converge the moment the
+    /// publication completes.
+    pub(crate) fn put_in_force(&self, anchors: Arc<AdmittedPeerTrustAnchors>) {
+        self.in_force.store(Some(anchors));
     }
 }
 

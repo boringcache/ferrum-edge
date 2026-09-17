@@ -1006,6 +1006,22 @@ impl HboneAdmissionFence {
     /// inequality comparison stays sound across a rebind. Whatever the slot
     /// already carries is compiled here, so a CONNECT arriving before the first
     /// publication is judged against the material actually installed.
+    ///
+    /// A rebind whose material does NOT compile takes the same last-known-good
+    /// posture a rejected trust or CRL candidate takes (issue #5574 re-review):
+    /// the binding already in force is KEPT — not replaced, not cleared, and not
+    /// given a new revision — and one sampled `warn!` names it. Replacing it
+    /// would clear the shared anchors while an already-built verifier went on
+    /// reading its ORIGINAL slot (installation does not reach a verifier that
+    /// exists), so the handshake would fall back to its own compile of the old
+    /// slot while the fence lost its anchors entirely: arriving CONNECTs would
+    /// take the unanchored path and every credential admitted that way skips
+    /// trust reevaluation for the rest of its tunnel's life.
+    ///
+    /// A FIRST install that compiles nothing is different and unchanged: nothing
+    /// is in force to keep, the verifier's own compile of that slot is the
+    /// documented pre-first-publication fallback, and the trust half of the
+    /// credential gate stays inapplicable until something does compile.
     pub fn install_inbound_admission_trust(&self, slot: &crate::tls::SharedBundleSlot) {
         let _publication = self.publication_lock();
         self.install_inbound_admission_trust_locked(slot);
@@ -1022,21 +1038,40 @@ impl HboneAdmissionFence {
         &self,
         slot: &crate::tls::SharedBundleSlot,
     ) -> Arc<MeshInboundAdmissionTrust> {
-        if let Some(installed) = self.inbound_trust.load_full()
+        let bound = self.inbound_trust.load_full();
+        if let Some(installed) = &bound
             && Arc::ptr_eq(&installed.slot, slot)
         {
-            return installed;
+            return Arc::clone(installed);
         }
         let current = slot.load_full();
         let crls = self.enforced_crl_records();
         let material = current.as_ref().as_ref().map(|svid| &svid.trust_bundles);
-        let compiled = self.compile_in_force(material, &crls).ok();
-        // The handshake verifier adopts the binding's anchors too — including
-        // CLEARING them when a rebind to a different slot compiles nothing, so
-        // the verifier falls back to its own compile of the NEW slot rather
-        // than going on verifying against a previous slot's anchors.
-        self.mesh_inbound_admission
-            .put_in_force(compiled.as_ref().map(|c| Arc::clone(&c.anchors)));
+        let compiled = match self.compile_in_force(material, &crls) {
+            Ok(compiled) => Some(compiled),
+            Err(trust_domain_class) => {
+                // Last-known-good, exactly as a rejected trust or CRL candidate
+                // is treated: a rebind that compiles nothing while anchors ARE
+                // in force keeps the binding it would have replaced. Clearing
+                // the artifact here would leave a live fence with no anchors
+                // while an existing verifier kept reading its own original
+                // slot — see the public installer's doc comment.
+                let keep = bound.filter(|installed| installed.has_anchors_in_force());
+                if let Some(installed) = keep {
+                    self.warn_rebind_not_in_force(trust_domain_class);
+                    return installed;
+                }
+                None
+            }
+        };
+        // The handshake verifier adopts the binding's anchors too, and the cell
+        // is never cleared: `put_in_force` takes the anchors themselves, so a
+        // binding with nothing compiled simply leaves whatever is in force
+        // alone — which, on this branch, is nothing.
+        if let Some(compiled) = &compiled {
+            self.mesh_inbound_admission
+                .put_in_force(Arc::clone(&compiled.anchors));
+        }
         let in_force = InForceInboundTrust {
             revision: self.next_trust_revision(),
             compiled,
@@ -1057,17 +1092,38 @@ impl HboneAdmissionFence {
     /// Put `compiled` in force: publish its anchors to the shared artifact the
     /// handshake verifier reads, then advance the in-force revision.
     ///
-    /// The verifier FIRST, deliberately. The two stores cannot be one atomic
-    /// step, so one of them is briefly ahead; making it the handshake means the
-    /// overlap can only refuse a peer the fence would still admit for a few
-    /// nanoseconds, never admit one the fence has already decided to revoke.
-    /// The revision is drawn after, from the fence-wide sequence, so a reader
-    /// that observes a revision observes anchors at least as new as it names.
+    /// The two stores are NOT one atomic step, and the artifact goes first
+    /// deliberately, so the revision is drawn after: a reader that observes a
+    /// revision observes anchors at least as new as it names, which is what
+    /// keeps the credential gate's skip key sound (a tunnel that skips
+    /// re-verification because its last-verified revision matches can never
+    /// have been verified against anchors OLDER than that revision).
+    ///
+    /// The cost is a window — bounded by this critical section under
+    /// [`Self::publication_lock`], not by any wall-clock figure, since a thread
+    /// can be preempted anywhere inside it — in which a handshake verifies
+    /// against anchors ONE GENERATION NEWER than the fence's in-force snapshot.
+    /// Which surface is stricter there depends on the change, and the ordering
+    /// does not make the handshake universally stricter (issue #5574
+    /// verification re-review):
+    ///
+    /// - A CRL ADDITION or a trust WITHDRAWAL makes the handshake stricter: it
+    ///   already refuses a peer the fence's CONNECT gate would still admit,
+    ///   until the revision advances.
+    /// - A CRL REMOVAL or a trust ADDITION makes the handshake LOOSER: it
+    ///   admits a peer the fence still refuses, and the CONNECT gate then
+    ///   refuses the tunnel that handshake just established, again until the
+    ///   revision advances.
+    ///
+    /// Both directions fail closed — the stricter of the two surfaces decides,
+    /// because a CONNECT is required before any byte is relayed — and the two
+    /// converge as soon as the publication completes. A handshake or CONNECT
+    /// already in flight finishes against the snapshot it loaded.
     ///
     /// Callers hold [`Self::publication_lock`].
     fn store_in_force(&self, trust: &MeshInboundAdmissionTrust, compiled: CompiledInboundTrust) {
         self.mesh_inbound_admission
-            .put_in_force(Some(Arc::clone(&compiled.anchors)));
+            .put_in_force(Arc::clone(&compiled.anchors));
         trust.in_force.store(Arc::new(InForceInboundTrust {
             revision: self.next_trust_revision(),
             compiled: Some(compiled),
@@ -1151,21 +1207,29 @@ impl HboneAdmissionFence {
         self.connect_trust_refusals.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Whether a "publication is not in force" line is due in this sampling
+    /// window, claiming the window when it is.
+    ///
+    /// One window shared by every not-in-force warning, so a deployment failing
+    /// several of them at once prints one line per window rather than one per
+    /// cause.
+    fn not_in_force_warning_due(&self) -> bool {
+        let now = self.monotonic_nanos(tokio::time::Instant::now());
+        let last = self.trust_not_in_force_warned_at.load(Ordering::Relaxed);
+        let due = last == NO_DEADLINE
+            || now.saturating_sub(last) >= TRUST_NOT_IN_FORCE_WARN_INTERVAL_NANOS;
+        due && self
+            .trust_not_in_force_warned_at
+            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    }
+
     /// One sampled operator line per [`TRUST_NOT_IN_FORCE_WARN_INTERVAL_NANOS`]
     /// window. A slice apply republishes the inbound slot from unchanged inputs,
     /// so a set that carries, say, a JWT-only federated trust domain would
     /// otherwise print on every apply for as long as it is configured.
     fn warn_trust_not_in_force(&self, trust_domain_class: &'static str) {
-        let now = self.monotonic_nanos(tokio::time::Instant::now());
-        let last = self.trust_not_in_force_warned_at.load(Ordering::Relaxed);
-        let due = last == NO_DEADLINE
-            || now.saturating_sub(last) >= TRUST_NOT_IN_FORCE_WARN_INTERVAL_NANOS;
-        if !due
-            || self
-                .trust_not_in_force_warned_at
-                .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
-                .is_err()
-        {
+        if !self.not_in_force_warning_due() {
             return;
         }
         warn!(
@@ -1174,6 +1238,26 @@ impl HboneAdmissionFence {
              not compile into a usable peer verifier, so the inbound mTLS verifier keeps its \
              last-known-good set and live HBONE tunnels keep being judged against the trust \
              revision still in force"
+        );
+    }
+
+    /// The rebind form of [`Self::warn_trust_not_in_force`], on the same shared
+    /// sampling window.
+    ///
+    /// Named separately because the operator remediation is different: the
+    /// material that failed to compile is a DIFFERENT trust slot's, so the
+    /// binding an operator would inspect is not the one now being judged
+    /// against.
+    fn warn_rebind_not_in_force(&self, trust_domain_class: &'static str) {
+        if !self.not_in_force_warning_due() {
+            return;
+        }
+        warn!(
+            trust_domain_class,
+            "Inbound admission trust rebind is not in force: the replacement trust slot's \
+             material does not compile into a usable peer verifier, so the previously installed \
+             slot stays in force on both the inbound mTLS handshake and the HBONE credential \
+             gate rather than leaving either surface with no anchors at all"
         );
     }
 
@@ -1202,17 +1286,25 @@ impl HboneAdmissionFence {
     /// What goes IN FORCE for the fence is conditional on BOTH the trust
     /// material actually changing and the candidate compiling as one atomic set
     /// — see `compile_in_force`.
+    ///
+    /// The store lands FIRST inside the critical section, ahead of the binding,
+    /// for two reasons: the candidate is what a first bind of an unbound slot
+    /// should compile (so one publication costs one compile and one revision,
+    /// not two of each), and the slot written is the CALLER's, so a rebind the
+    /// fence refuses still delivers the server identity to the slot it was
+    /// published for instead of into the slot that stayed in force.
     pub fn publish_inbound_admission_trust(
         self: &Arc<Self>,
         slot: &crate::tls::SharedBundleSlot,
         bundle: Arc<Option<crate::identity::SvidBundle>>,
     ) {
         {
-            // ONE critical section covering install, compare, store and the
+            // ONE critical section covering the store, install, compare and the
             // in-force advance. Installing inside it is what keeps a concurrent
             // CRL publisher from deciding "no trust installed" against a
             // binding this call is in the middle of creating.
             let _publication = self.publication_lock();
+            slot.store(Arc::clone(&bundle));
             let trust = self.install_inbound_admission_trust_locked(slot);
             let in_force = trust.in_force.load_full();
             let candidate = (*bundle).as_ref().map(|bundle| &bundle.trust_bundles);
@@ -1249,7 +1341,6 @@ impl HboneAdmissionFence {
             } else {
                 None
             };
-            trust.slot.store(bundle);
             if let Some(compiled) = compiled {
                 self.store_in_force(&trust, compiled);
             }
@@ -1402,16 +1493,7 @@ impl HboneAdmissionFence {
     /// sharing its timestamp so a deployment failing both prints one line per
     /// window rather than two.
     fn warn_crls_not_in_force(&self, record_class: &'static str) {
-        let now = self.monotonic_nanos(tokio::time::Instant::now());
-        let last = self.trust_not_in_force_warned_at.load(Ordering::Relaxed);
-        let due = last == NO_DEADLINE
-            || now.saturating_sub(last) >= TRUST_NOT_IN_FORCE_WARN_INTERVAL_NANOS;
-        if !due
-            || self
-                .trust_not_in_force_warned_at
-                .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
-                .is_err()
-        {
+        if !self.not_in_force_warning_due() {
             return;
         }
         warn!(
@@ -2130,6 +2212,16 @@ impl MeshInboundAdmissionTrust {
 
     fn snapshot(&self) -> InboundTrustSnapshot {
         InboundTrustSnapshot(self.in_force.load_full())
+    }
+
+    /// Whether this binding currently has compiled anchors in force.
+    ///
+    /// The rebind guard's question: with anchors in force, the shared artifact
+    /// the handshake reads is non-empty and every live tunnel is being judged
+    /// against them, so a replacement that compiles nothing must be refused
+    /// rather than allowed to strand both surfaces.
+    fn has_anchors_in_force(&self) -> bool {
+        self.in_force.load().compiled.is_some()
     }
 }
 
