@@ -366,7 +366,7 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
                     }
                 }]
             }),
-            "exponentiall",
+            "unknown variant <redacted scalar>, expected `fixed` or `exponential`",
         ),
         (
             json!({
@@ -443,6 +443,10 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
         assert!(
             error.contains(expected_fragment),
             "expected {expected_fragment:?} in: {error}"
+        );
+        assert!(
+            !error.contains("exponentiall"),
+            "offending variant must be withheld: {error}"
         );
         assert!(
             ferrum_edge::plugins::validate_plugin_config("mesh_route_dispatch", &config).is_err(),

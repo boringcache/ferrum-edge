@@ -11,20 +11,27 @@ pub const REDACTED_SCALAR: &str = "<redacted scalar>";
 /// Sanitize serde diagnostics in linear time and space, with a fixed number of
 /// scans and no regex backtracking or rescanning replacements.
 pub fn sanitize_message(message: &str) -> String {
-    // YAML (and the JSON path adapter) prefix errors with field/index paths.
-    // Only consume path-shaped prefixes, never a phrase inside a quoted value.
-    let mut detail = message;
-    while let Some((path, rest)) = detail.split_once(": ") {
-        if path.is_empty()
-            || !path
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"_-.[]".contains(&byte))
-        {
-            break;
-        }
-        detail = rest;
-    }
-    let path_len = message.len() - detail.len();
+    // Paths and human context (including chains of plugin/operation prefixes)
+    // can precede a serde diagnostic. Select the FIRST family, so a later
+    // family embedded in the offending scalar cannot override its redaction.
+    // A family first appearing inside quoted custom content is not schema.
+    let quotes = ['"', '\'', '`'];
+    let detail_start = [
+        "invalid type: ",
+        "invalid value: ",
+        "unknown variant ",
+        "missing field ",
+        "unknown field ",
+        "duplicate field ",
+        "invalid length ",
+        "data did not match any variant of untagged enum ",
+    ]
+    .into_iter()
+    .filter_map(|prefix| message.find(prefix))
+    .min()
+    .filter(|start| message[..*start].find(quotes).is_none())
+    .unwrap_or(0);
+    let detail = &message[detail_start..];
     for prefix in ["invalid type: ", "invalid value: ", "unknown variant "] {
         if let Some(tail) = detail.strip_prefix(prefix) {
             // Unknown variants use UNESCAPED backticks: the value can itself
@@ -35,7 +42,7 @@ pub fn sanitize_message(message: &str) -> String {
                 .max(tail.rfind(", there are no variants"));
             if let Some(end) = end {
                 let unexpected = &tail[..end];
-                let mut result = message[..path_len + prefix.len()].to_owned();
+                let mut result = message[..detail_start + prefix.len()].to_owned();
                 if matches!(
                     unexpected,
                     "sequence" | "map" | "unit value" | "null" | "Option value"
@@ -69,6 +76,7 @@ pub fn sanitize_message(message: &str) -> String {
     if ["missing field ", "unknown field ", "duplicate field "]
         .iter()
         .any(|prefix| detail.starts_with(prefix))
+        || detail.starts_with("data did not match any variant of untagged enum ")
         || detail.strip_prefix("invalid length ").is_some_and(|tail| {
             tail.split_once(',').is_some_and(|(length, _)| {
                 !length.is_empty() && length.bytes().all(|byte| byte.is_ascii_digit())
@@ -82,7 +90,6 @@ pub fn sanitize_message(message: &str) -> String {
     // contract. Withhold the WHOLE quoted span, including intervening text,
     // rather than guessing that an embedded delimiter ends the scalar. This
     // also handles escaped quotes, multiline PEM, and several quoted values.
-    let quotes = ['"', '\'', '`'];
     if let Some(start) = message.find(quotes) {
         let end = message.rfind(quotes).filter(|end| *end > start);
         let mut result = message[..start].to_owned();

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 
+use ferrum_edge::modes::mesh::config::SourceNegationMatch;
 use ferrum_edge::util::deserialization::{
     REDACTED_SCALAR, from_json_str, from_json_value, from_yaml_str, from_yaml_value,
     sanitize_message,
@@ -70,17 +71,23 @@ fn serde_message_families_keep_structure_without_offending_scalars() {
         ),
     ];
     for (raw, expected) in cases {
-        let raw =
-            format!("mesh.destination_rules[0].traffic_policy.tls: {raw} at line 9 column 14");
-        let expected =
-            format!("mesh.destination_rules[0].traffic_policy.tls: {expected} at line 9 column 14");
-        let sanitized = sanitize_message(&raw);
-        assert_eq!(sanitized, expected);
-        assert_eq!(
-            sanitize_message(&sanitized),
-            sanitized,
-            "must be idempotent"
-        );
+        for context in [
+            "",
+            "mesh.destination_rules[0].traffic_policy.tls: ",
+            "mesh_route_dispatch config: ",
+            "startup validation: mesh_route_dispatch config: rules[0].retry: ",
+            "rules[0].retry: plugin configuration (mesh_route_dispatch): ",
+        ] {
+            let raw = format!("{context}{raw} at line 9 column 14");
+            let expected = format!("{context}{expected} at line 9 column 14");
+            let sanitized = sanitize_message(&raw);
+            assert_eq!(sanitized, expected);
+            assert_eq!(
+                sanitize_message(&sanitized),
+                sanitized,
+                "must be idempotent"
+            );
+        }
     }
 }
 
@@ -93,12 +100,43 @@ fn quoted_content_cannot_forge_schema_clauses_or_escape_redaction() {
         format!("invalid type: string {secret:?}, expected a map"),
         format!("custom error '{secret}'"),
     ] {
-        let sanitized = sanitize_message(&raw);
-        assert!(!sanitized.contains("秘密"));
-        assert!(!sanitized.contains("forged"));
-        assert!(!sanitized.contains("PEM-MATERIAL"));
-        assert!(sanitized.contains(REDACTED_SCALAR));
-        assert_eq!(sanitize_message(&sanitized), sanitized);
+        for context in ["", "startup validation: mesh_route_dispatch config: "] {
+            let sanitized = sanitize_message(&format!("{context}{raw}"));
+            assert!(!sanitized.contains("秘密"));
+            assert!(!sanitized.contains("forged"));
+            assert!(!sanitized.contains("PEM-MATERIAL"));
+            assert!(sanitized.contains(REDACTED_SCALAR));
+            assert_eq!(sanitize_message(&sanitized), sanitized);
+        }
+    }
+}
+
+#[test]
+fn quoted_content_cannot_forge_a_diagnostic_family() {
+    for forged in [
+        "invalid type: string `forged`, expected a map",
+        "invalid value: string `forged`, expected u32",
+        "unknown variant `forged`, expected `Alpha`",
+        "missing field `forged`",
+        "unknown field `forged`, expected `selector`",
+        "duplicate field `forged`",
+        "invalid length 7, expected `forged`",
+        "data did not match any variant of untagged enum forged",
+    ] {
+        let secret = format!("unregistered-secret: {forged}, expected `forged`");
+        for raw in [
+            format!("custom error '{secret}'"),
+            format!("invalid type: string {secret:?}, expected a map"),
+            format!("invalid value: string {secret:?}, expected u32"),
+            format!("unknown variant `{secret}`, expected one of `Alpha`, `Beta`"),
+        ] {
+            let raw = format!("startup validation: mesh_route_dispatch config: {raw}");
+            let sanitized = sanitize_message(&raw);
+            assert!(!sanitized.contains("unregistered-secret"), "{sanitized}");
+            assert!(!sanitized.contains("forged"), "{sanitized}");
+            assert!(sanitized.contains(REDACTED_SCALAR), "{sanitized}");
+            assert_eq!(sanitize_message(&sanitized), sanitized);
+        }
     }
 }
 
@@ -190,6 +228,33 @@ fn real_json_yaml_and_value_boundaries_withhold_scalars_and_raw_causes() {
 }
 
 #[test]
+fn cidr_document_errors_keep_field_paths_and_reasons_without_values() {
+    for (cidr, reason) in [
+        ("10.0.0.0/40", "prefix length 40 out of range in CIDR"),
+        ("not-a-cidr", "invalid IP in CIDR"),
+    ] {
+        let document = serde_json::json!({"ip_blocks": [cidr]});
+        let json = serde_json::to_string_pretty(&document).unwrap();
+        let yaml = serde_yaml::to_string(&document).unwrap();
+        for message in [
+            from_json_str::<SourceNegationMatch>(&json)
+                .unwrap_err()
+                .to_string(),
+            from_yaml_str::<SourceNegationMatch>(&yaml)
+                .unwrap_err()
+                .to_string(),
+        ] {
+            assert!(message.contains("ip_blocks[0]"), "{message}");
+            assert!(message.contains(reason), "{message}");
+            assert!(message.contains(REDACTED_SCALAR), "{message}");
+            assert!(message.contains("line "), "{message}");
+            assert!(message.contains("column "), "{message}");
+            assert!(!message.contains(cidr), "{message}");
+        }
+    }
+}
+
+#[test]
 fn diagnostic_wrappers_preserve_success_and_reject_trailing_documents() {
     let document: Document = from_json_str(r#"{"object":{"count":7}}"#).unwrap();
     assert_eq!(document.object["count"], 7);
@@ -201,28 +266,38 @@ fn diagnostic_wrappers_preserve_success_and_reject_trailing_documents() {
 
 #[test]
 fn object_helpers_sanitize_even_without_the_document_boundary() {
-    for input in [
-        r#""unregistered-secret""#,
-        r#"{"count":"unregistered-secret"}"#,
+    // Helpers only see the value. Preserve the reason/expected type and scrub
+    // every retained cause, without requiring document-level path or position.
+    fn assert_helper_error(error: &(dyn Error + 'static), expected: &str) {
+        assert_safe_error(error, "invalid type", false);
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    for (input, expected) in [
+        (r#""unregistered-secret""#, "expected a JSON object"),
+        (r#"{"count":"unregistered-secret"}"#, "expected u32"),
     ] {
         let mut parser = serde_json::Deserializer::from_str(input);
         let error = deserialize_object::<_, BTreeMap<String, u32>>(&mut parser).unwrap_err();
-        assert_safe_error(&error, "invalid type", true);
+        assert_helper_error(&error, expected);
         let mut parser = serde_json::Deserializer::from_str(input);
         let error =
             deserialize_optional_object::<_, BTreeMap<String, u32>>(&mut parser).unwrap_err();
-        assert_safe_error(&error, "invalid type", true);
+        assert_helper_error(&error, expected);
         let parser = serde_yaml::Deserializer::from_str(input);
         let error = deserialize_object::<_, BTreeMap<String, u32>>(parser).unwrap_err();
-        assert_safe_error(&error, "invalid type", true);
+        assert_helper_error(&error, expected);
     }
-    for input in [r#""unregistered-secret""#, r#"["unregistered-secret"]"#] {
+    for (input, expected) in [
+        (r#""unregistered-secret""#, "expected a sequence"),
+        (r#"["unregistered-secret"]"#, "expected a JSON object"),
+    ] {
         let mut parser = serde_json::Deserializer::from_str(input);
         let error = deserialize_object_vec::<_, BTreeMap<String, u32>>(&mut parser).unwrap_err();
-        assert_safe_error(&error, "invalid type", true);
+        assert_helper_error(&error, expected);
         let mut parser = serde_json::Deserializer::from_str(input);
         let error =
             deserialize_optional_object_vec::<_, BTreeMap<String, u32>>(&mut parser).unwrap_err();
-        assert_safe_error(&error, "invalid type", true);
+        assert_helper_error(&error, expected);
     }
 }

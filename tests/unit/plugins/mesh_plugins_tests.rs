@@ -500,7 +500,11 @@ fn mesh_authz_rejects_invalid_direct_source_ip_block() {
         Err(err) => err,
     };
 
-    assert!(err.contains("10.0.0.0/40"), "error should name CIDR: {err}");
+    assert!(
+        err.contains("prefix length 40 out of range in CIDR <redacted scalar>"),
+        "error should retain the prefix length and reason: {err}"
+    );
+    assert!(!err.contains("10.0.0.0/40"), "CIDR must be withheld: {err}");
 }
 
 #[test]
@@ -524,7 +528,11 @@ fn mesh_authz_rejects_invalid_mesh_slice_source_ip_block() {
         Err(err) => err,
     };
 
-    assert!(err.contains("not-a-cidr"), "error should name CIDR: {err}");
+    assert!(
+        err.contains("invalid IP in CIDR <redacted scalar>"),
+        "error should retain the validation reason: {err}"
+    );
+    assert!(!err.contains("not-a-cidr"), "CIDR must be withheld: {err}");
 }
 
 #[test]

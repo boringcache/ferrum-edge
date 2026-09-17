@@ -15,6 +15,10 @@
 //! wrappers are zero-sized and forward straight to the wrapped type's own
 //! `Deserialize`, so `deny_unknown_fields`, field defaults, and custom field
 //! deserializers all keep working unchanged.
+//!
+//! Errors withhold offending scalars and retain type/schema diagnostics. These
+//! value-level helpers cannot promise enclosing field paths or source positions;
+//! use the document adapters in `deserialization` for that boundary context.
 
 use std::fmt;
 use std::marker::PhantomData;

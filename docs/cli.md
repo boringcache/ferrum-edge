@@ -277,9 +277,12 @@ Startup and validation failures include the full cause chain, from the outer
 operation to the underlying failure. Configuration deserialization withholds
 offending document scalars (including unregistered inline PEM and tokens) before
 retaining the error. Diagnostics keep field paths, available line/column positions,
-expected types, and missing/unknown field names. The final rendering also redacts
-credentials in exact configured primary/replica/failover database URLs and
-registered resolved external-secret values and their bounded derived forms.
+expected types, and missing/unknown field names. Validation messages also withhold
+quoted document values, including CIDRs: use the field path, when available, to
+locate the value; the validation reason and prefix length remain visible.
+The final rendering also redacts credentials in exact configured
+primary/replica/failover database URLs and registered resolved external-secret
+values and their bounded derived forms.
 The URL inventory reads raw settings only: it never fetches database TLS sources
 or materializes temporary PEM files. Owning loaders must sanitize TLS-augmented
 or differently normalized URLs, password-only fragments, provider references,
