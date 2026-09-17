@@ -3,7 +3,8 @@
 use super::harness::{StreamListener, wait_for_spawned_gateway};
 use super::port_registry::TestSocket;
 use super::ports::{reserve_port, unbound_port, unbound_udp_port};
-use crate::common::{GatewayChildGuard, SpawnedGatewayIdentity};
+use crate::common::GatewayChildGuard;
+use crate::common::gateway_harness::SpawnedGatewayIdentity;
 use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
