@@ -75,7 +75,7 @@ fn mode_matches_any(mode: &OperatingMode, candidates: &[&str]) -> bool {
 /// variable materialized from `_FILE`/`_VAULT`/`_AWS`/`_AZURE`/`_GCP` holds
 /// secret material, and a malformed one (`FERRUM_DB_PORT_FILE` pointing at a
 /// password, say) would otherwise print that material verbatim as
-/// `Invalid FERRUM_DB_PORT value '<secret>'`. The key and the expected shape
+/// `Invalid FERRUM_DB_PORT value "<secret>"`. The key and the expected shape
 /// are the actionable parts and are kept; only the value is withheld, and only
 /// for keys known to have come from an external source.
 fn invalid_env_value(key: &str, raw: &str, expected: &str) -> String {
@@ -85,7 +85,7 @@ fn invalid_env_value(key: &str, raw: &str, expected: &str) -> String {
             crate::secrets::EXTERNAL_SECRET_PLACEHOLDER
         );
     }
-    format!("Invalid {key} value '{raw}'. Expected {expected}")
+    format!("Invalid {key} value {raw:?}. Expected {expected}")
 }
 
 macro_rules! impl_env_value_parse {

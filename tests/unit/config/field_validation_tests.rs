@@ -1576,7 +1576,7 @@ fn test_mesh_sd_namespace_must_match_upstream_namespace() {
     let errs = upstream.validate_fields().unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.contains("must match the upstream's namespace")),
+            .any(|e| e.contains("must match the upstream namespace")),
         "cross-namespace mesh SD should be rejected: {:?}",
         errs
     );
@@ -1673,6 +1673,67 @@ fn test_plugin_config_proxy_scope_requires_proxy_id() {
 }
 
 // ---- GatewayConfig.validate_all_fields() tests ----
+
+#[test]
+fn test_validate_all_fields_escapes_resource_ids_and_numeric_values() {
+    for id in [
+        "unregistered-token",
+        "unregistered'token",
+        "unregistered\"token\\tail\n",
+    ] {
+        let mut proxy = make_proxy(id, "/api");
+        proxy.backend_connect_timeout_ms = u64::MAX;
+        let mut upstream = make_upstream(id);
+        upstream.targets[0].port = 0;
+        let mut plugin = make_plugin_config(id);
+        plugin.scope = PluginScope::Proxy;
+        plugin.proxy_id = None;
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            consumers: vec![make_consumer(id, "")],
+            upstreams: vec![upstream],
+            plugin_configs: vec![plugin],
+            ..Default::default()
+        };
+
+        let errors = config.validate_all_fields(30).unwrap_err();
+        for (kind, field) in [
+            ("Proxy", "backend_connect_timeout_ms"),
+            ("Consumer", "username"),
+            ("Upstream", "targets[0].port"),
+            ("PluginConfig", "proxy_id"),
+        ] {
+            let prefix = format!("{kind} {id:?}:");
+            let error = errors
+                .iter()
+                .find(|error| error.starts_with(&prefix) && error.contains(field))
+                .unwrap_or_else(|| panic!("missing escaped {kind} diagnostic: {errors:?}"));
+            let rendered =
+                ferrum_edge::startup::render_startup_error(&anyhow::anyhow!(error.clone()));
+            assert!(rendered.contains(field), "{rendered}");
+            assert!(!rendered.contains("unregistered"), "{rendered}");
+            assert!(!rendered.contains(&u64::MAX.to_string()), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn test_upstream_field_values_are_debug_escaped() {
+    let value = "unregistered'\"token\\tail";
+    let mut upstream = make_upstream("upstream");
+    let locality = format!("region//{value}");
+    upstream.targets[0].locality = Some(locality.clone());
+    let errors = upstream.validate_fields().unwrap_err();
+    let error = errors
+        .iter()
+        .find(|error| error.contains("locality") && error.contains("not a valid"))
+        .unwrap();
+    assert!(error.contains(&format!("{locality:?}")), "{error}");
+    let rendered = ferrum_edge::startup::render_startup_error(&anyhow::anyhow!(error.clone()));
+    assert!(rendered.contains("locality"), "{rendered}");
+    assert!(rendered.contains("not a valid"), "{rendered}");
+    assert!(!rendered.contains("unregistered"), "{rendered}");
+}
 
 #[test]
 fn test_validate_all_fields_catches_proxy_errors() {
@@ -2416,7 +2477,7 @@ fn test_proxy_allowed_ws_origins_load_warns_once_per_proxy() {
         .validate_all_fields(30)
         .expect("legacy star must not fail load validation");
     let output = logs.contents();
-    let warn_count = output.matches("allowed_ws_origins contains '*'").count();
+    let warn_count = output.matches("`allowed_ws_origins` contains '*'").count();
     assert_eq!(
         warn_count, 1,
         "exactly one warning per proxy, got: {output}"
@@ -3011,8 +3072,8 @@ fn test_proxy_dns_override_rejects_different_direct_literal_target() {
     let errs = proxy.validate_fields().unwrap_err();
     assert!(
         errs.iter().any(|e| {
-            e.contains("dns_override IP 127.0.0.2")
-                && e.contains("literal backend_host IP 127.0.0.1")
+            e.contains("`dns_override` IP \"127.0.0.2\"")
+                && e.contains("literal `backend_host` IP \"127.0.0.1\"")
         }),
         "unexpected validation errors: {errs:?}"
     );

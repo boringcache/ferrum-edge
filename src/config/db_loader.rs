@@ -358,7 +358,7 @@ impl std::fmt::Display for RowDecodeRejection {
         match &self.resource_id {
             Some(id) => write!(
                 f,
-                "SQL row decode rejected for {} '{}': {}",
+                "SQL row decode rejected for {} {:?}: {}",
                 self.resource_type, id, self.reason
             ),
             None => write!(
@@ -579,23 +579,23 @@ pub(crate) fn format_consumer_identity_conflict(
 ) -> String {
     match (candidate_field, existing_field) {
         ("username", "username") => format!(
-            "A consumer with username '{}' already exists (consumer '{}')",
+            "A consumer with username {:?} already exists (consumer {:?})",
             candidate_value, existing_id
         ),
         ("custom_id", "custom_id") => format!(
-            "A consumer with custom_id '{}' already exists (consumer '{}')",
+            "A consumer with custom_id {:?} already exists (consumer {:?})",
             candidate_value, existing_id
         ),
         ("username", "custom_id") => format!(
-            "Consumer username '{}' conflicts with custom_id of consumer '{}'",
+            "Consumer username {:?} conflicts with custom_id of consumer {:?}",
             candidate_value, existing_id
         ),
         ("custom_id", "username") => format!(
-            "Consumer custom_id '{}' conflicts with username of consumer '{}'",
+            "Consumer custom_id {:?} conflicts with username of consumer {:?}",
             candidate_value, existing_id
         ),
         _ => format!(
-            "Consumer {} '{}' conflicts with {} of consumer '{}'",
+            "Consumer {} {:?} conflicts with {} of consumer {:?}",
             candidate_field, candidate_value, existing_field, existing_id
         ),
     }
@@ -1481,13 +1481,14 @@ impl DatabaseStore {
             (Some(actual), Some(allowed)) if actual == allowed => {}
             (Some(_), _) => {
                 return Err(anyhow::Error::new(MtlsDnsAdmissionUnavailable).context(format!(
-                    "mTLS DNS admission is blocked while a guarded operation owns namespace '{namespace}'"
+                    "mTLS DNS admission is blocked while a guarded operation owns namespace \
+                     {namespace:?}"
                 )));
             }
             (None, Some(_)) => {
                 return Err(
                     anyhow::Error::new(MtlsDnsAdmissionUnavailable).context(format!(
-                        "mTLS DNS admission guard ownership was lost for namespace '{namespace}'"
+                        "mTLS DNS admission guard ownership was lost for namespace {namespace:?}"
                     )),
                 );
             }
@@ -2493,7 +2494,7 @@ impl DatabaseStore {
         for assoc in associations {
             if !seen_assoc_ids.insert(assoc.plugin_config_id.as_str()) {
                 errors.push(format!(
-                    "Proxy '{}' references plugin_config '{}' more than once",
+                    "Proxy {:?} references plugin_config {:?} more than once",
                     proxy_id, assoc.plugin_config_id
                 ));
             } else {
@@ -2501,14 +2502,15 @@ impl DatabaseStore {
                     Some(plugin) => match plugin.scope {
                         PluginScope::Global => {
                             errors.push(format!(
-                                "Proxy '{}' references global plugin_config '{}'",
+                                "Proxy {:?} references global plugin_config {:?}",
                                 proxy_id, plugin.id
                             ));
                         }
                         PluginScope::ProxyGroup => {
                             if plugin.proxy_id.is_some() {
                                 errors.push(format!(
-                                    "Proxy '{}' references proxy_group plugin_config '{}' with proxy_id '{}'",
+                                    "Proxy {:?} references proxy_group plugin_config {:?} with \
+                                     proxy_id {:?}",
                                     proxy_id,
                                     plugin.id,
                                     plugin.proxy_id.as_deref().unwrap_or("<none>")
@@ -2518,7 +2520,8 @@ impl DatabaseStore {
                         PluginScope::Proxy => {
                             if plugin.proxy_id.as_deref() != Some(proxy_id) {
                                 errors.push(format!(
-                                    "Proxy '{}' references plugin_config '{}' targeted to proxy '{}'",
+                                    "Proxy {:?} references plugin_config {:?} targeted to proxy \
+                                     {:?}",
                                     proxy_id,
                                     plugin.id,
                                     plugin.proxy_id.as_deref().unwrap_or("<none>")
@@ -2527,7 +2530,7 @@ impl DatabaseStore {
                         }
                     },
                     None => errors.push(format!(
-                        "Proxy '{}' references non-existent plugin_config '{}'",
+                        "Proxy {:?} references non-existent plugin_config {:?}",
                         proxy_id, assoc.plugin_config_id
                     )),
                 }
@@ -2979,7 +2982,7 @@ impl DatabaseStore {
                     .await?;
             if proxy_row.is_none() {
                 anyhow::bail!(
-                    "cannot restore api_spec '{}': owning proxy '{}' is missing",
+                    "cannot restore api_spec {:?}: owning proxy {:?} is missing",
                     spec.id,
                     spec.proxy_id
                 );
@@ -3101,7 +3104,10 @@ impl DatabaseStore {
                 let isolation = Self::mysql_transaction_isolation(tx).await?;
                 if !Self::is_mysql_repeatable_read(&isolation) {
                     return Err(anyhow::anyhow!(
-                        "MySQL full-load transactions require REPEATABLE READ isolation; current transaction isolation is '{}'. Configure the MySQL server or Ferrum session default to REPEATABLE READ so full runtime loads fail closed instead of publishing mixed snapshots.",
+                        "MySQL full-load transactions require REPEATABLE READ isolation; current \
+                         transaction isolation is {:?}. Configure the MySQL server or Ferrum \
+                         session default to REPEATABLE READ so full runtime loads fail closed \
+                         instead of publishing mixed snapshots.",
                         isolation
                     ));
                 }
@@ -4199,7 +4205,8 @@ impl DatabaseStore {
         {
             tx.rollback().await?;
             anyhow::bail!(
-                "Consumer {} is referenced by access_control plugin_config '{}' and cannot be deleted",
+                "Consumer {:?} is referenced by access_control plugin_config {:?} and cannot be \
+                 deleted",
                 id,
                 plugin.id
             );
@@ -5599,7 +5606,7 @@ impl DatabaseStore {
         if !ref_rows.is_empty() {
             tx.rollback().await?;
             anyhow::bail!(
-                "Upstream {} is referenced by one or more proxies and cannot be deleted",
+                "Upstream {:?} is referenced by one or more proxies and cannot be deleted",
                 id
             );
         }
@@ -5609,7 +5616,8 @@ impl DatabaseStore {
         {
             tx.rollback().await?;
             anyhow::bail!(
-                "Upstream {} is referenced by mesh_route_dispatch plugin_config '{}' and cannot be deleted",
+                "Upstream {:?} is referenced by mesh_route_dispatch plugin_config {:?} and cannot \
+                 be deleted",
                 id,
                 plugin.id
             );
@@ -5850,7 +5858,7 @@ impl DatabaseStore {
             // Index claimed a collision but the owner row is gone. Fail
             // closed rather than treating an inconclusive index hit as unique.
             return Ok(format!(
-                "Consumer identity '{}' conflicts with consumer '{}'",
+                "Consumer identity {:?} conflicts with consumer {:?}",
                 identity_value, owner_id
             ));
         };
@@ -5875,7 +5883,7 @@ impl DatabaseStore {
             }
         }
         Ok(format!(
-            "Consumer identity '{}' conflicts with consumer '{}'",
+            "Consumer identity {:?} conflicts with consumer {:?}",
             identity_value, owner_id
         ))
     }
@@ -6058,7 +6066,7 @@ impl DatabaseStore {
         for assoc in associations {
             if !seen_assoc_ids.insert(assoc.plugin_config_id.as_str()) {
                 errors.push(format!(
-                    "Proxy '{}' references plugin_config '{}' more than once",
+                    "Proxy {:?} references plugin_config {:?} more than once",
                     proxy_id, assoc.plugin_config_id
                 ));
             } else {
@@ -6079,7 +6087,9 @@ impl DatabaseStore {
                 Some(plugin) => match plugin.scope {
                     PluginScope::Global => {
                         errors.push(format!(
-                            "Proxy '{}' references plugin_config '{}' with scope 'global' — proxy associations may only reference proxy-scoped or proxy_group-scoped plugin configs",
+                            "Proxy {:?} references plugin_config {:?} with scope 'global' — proxy \
+                             associations may only reference proxy-scoped or proxy_group-scoped \
+                             plugin configs",
                             proxy_id, plugin.id
                         ));
                         continue;
@@ -6087,7 +6097,7 @@ impl DatabaseStore {
                     PluginScope::Proxy => {
                         if plugin.proxy_id.as_deref() != Some(proxy_id) {
                             errors.push(format!(
-                                "Proxy '{}' references plugin_config '{}' targeted to proxy '{}'",
+                                "Proxy {:?} references plugin_config {:?} targeted to proxy {:?}",
                                 proxy_id,
                                 plugin.id,
                                 plugin.proxy_id.as_deref().unwrap_or("<none>")
@@ -6097,7 +6107,8 @@ impl DatabaseStore {
                     PluginScope::ProxyGroup => {
                         if plugin.proxy_id.is_some() {
                             errors.push(format!(
-                                "Proxy '{}' references proxy_group plugin_config '{}' with proxy_id '{}'",
+                                "Proxy {:?} references proxy_group plugin_config {:?} with \
+                                 proxy_id {:?}",
                                 proxy_id,
                                 plugin.id,
                                 plugin.proxy_id.as_deref().unwrap_or("<none>")
@@ -6106,7 +6117,7 @@ impl DatabaseStore {
                     }
                 },
                 None => errors.push(format!(
-                    "Proxy '{}' references non-existent plugin_config '{}'",
+                    "Proxy {:?} references non-existent plugin_config {:?}",
                     proxy_id, assoc.plugin_config_id
                 )),
             }
@@ -6204,7 +6215,7 @@ impl DatabaseStore {
         for change in changes {
             if change.operation != "upsert" && change.operation != "delete" {
                 warn!(
-                    "Ignoring config_changes row with unknown operation '{}' for {} {}",
+                    "Ignoring `config_changes` row with unknown operation {:?} for {:?} {:?}",
                     change.operation, change.resource_type, change.resource_id
                 );
                 continue;
@@ -6227,7 +6238,8 @@ impl DatabaseStore {
                 }
                 other => {
                     warn!(
-                        "Ignoring config_changes row with unknown resource_type '{}' for id {}",
+                        "Ignoring `config_changes` row with unknown `resource_type` {:?} for id \
+                         {:?}",
                         other, change.resource_id
                     );
                 }
@@ -6395,7 +6407,7 @@ impl DatabaseStore {
             let retained_sequence = retained_sequence.max(0) as u64;
             if after_sequence < retained_sequence {
                 anyhow::bail!(
-                    "config change cursor {} for namespace '{}' is behind retained sequence {}",
+                    "config change cursor {} for namespace {:?} is behind retained sequence {}",
                     after_sequence,
                     namespace,
                     retained_sequence
@@ -6428,7 +6440,7 @@ impl DatabaseStore {
 
         if rows.len() >= Self::CHANGE_LOG_BATCH_LIMIT as usize {
             anyhow::bail!(
-                "config change batch for namespace '{}' reached limit {}; forcing full reload",
+                "config change batch for namespace {:?} reached limit {}; forcing full reload",
                 namespace,
                 Self::CHANGE_LOG_BATCH_LIMIT
             );
@@ -7717,7 +7729,8 @@ impl DatabaseStore {
             Ok(())
         } else {
             Err(anyhow::Error::new(BatchAdmissionLeaseLost).context(format!(
-                "namespace '{namespace}' config admission lease generation {generation} was not held at commit"
+                "namespace {namespace:?} config admission lease generation {generation} was not \
+                 held at commit"
             )))
         }
     }
@@ -9879,7 +9892,7 @@ impl DatabaseStore {
             // can return 0 changed rows.
             if existing_spec.is_none() {
                 anyhow::bail!(
-                    "API spec row not found for id '{}' in namespace '{}' during \
+                    "API spec row not found for id {:?} in namespace {:?} during \
                      metadata-only replace",
                     spec.id,
                     spec.namespace
@@ -10457,7 +10470,7 @@ impl DatabaseStore {
                 .try_get::<String, _>("upstream_id")
                 .unwrap_or_else(|_| "<unknown>".to_string());
             anyhow::bail!(
-                "proxy '{}' references a spec-owned upstream '{}' from api_spec '{}'; \
+                "proxy {:?} references a spec-owned upstream {:?} from api_spec {:?}; \
                  detach it before replacing or deleting the API spec",
                 proxy_id,
                 upstream_id,
@@ -10511,7 +10524,8 @@ impl DatabaseStore {
                 mesh_route_dispatch_referenced_upstream(&plugin, &spec_upstream_ids)
             {
                 anyhow::bail!(
-                    "mesh_route_dispatch plugin_config '{}' references a spec-owned upstream '{}' from api_spec '{}'; \
+                    "mesh_route_dispatch plugin_config {:?} references a spec-owned upstream {:?} \
+                     from api_spec {:?}; \
                      detach it before replacing or deleting the API spec",
                     plugin.id,
                     upstream_id,
@@ -12566,12 +12580,12 @@ fn required_utf8_text_column(row: &AnyRow, column: &str) -> Result<String, anyho
             // corrupt JSON/config value behind a default.
             let bytes: Vec<u8> = row.try_get(column).map_err(|blob_error| {
                 anyhow::anyhow!(
-                    "column '{column}' could not be decoded as SQL text ({text_error}) \
+                    "column `{column}` could not be decoded as SQL text ({text_error}) \
                      or bytes ({blob_error})"
                 )
             })?;
             String::from_utf8(bytes)
-                .map_err(|error| anyhow::anyhow!("column '{column}' is not valid UTF-8: {error}"))
+                .map_err(|error| anyhow::anyhow!("column `{column}` is not valid UTF-8: {error}"))
         }
     }
 }
@@ -12594,19 +12608,19 @@ fn optional_utf8_text_column(row: &AnyRow, column: &str) -> Result<Option<String
             Ok(None) => Ok(None),
             Ok(Some(bytes)) => String::from_utf8(bytes)
                 .map(Some)
-                .map_err(|error| anyhow::anyhow!("column '{column}' is not valid UTF-8: {error}")),
+                .map_err(|error| anyhow::anyhow!("column `{column}` is not valid UTF-8: {error}")),
             Err(blob_opt_error) => {
                 // Some MySQL/sqlx-Any paths surface non-NULL TEXT-family values
                 // as a bare BLOB rather than Option<BLOB>.
                 let bytes: Vec<u8> = row.try_get(column).map_err(|blob_error| {
                     anyhow::anyhow!(
-                        "column '{column}' could not be decoded as optional SQL text \
+                        "column `{column}` could not be decoded as optional SQL text \
                          ({text_error}), optional bytes ({blob_opt_error}), or bytes \
                          ({blob_error})"
                     )
                 })?;
                 String::from_utf8(bytes).map(Some).map_err(|error| {
-                    anyhow::anyhow!("column '{column}' is not valid UTF-8: {error}")
+                    anyhow::anyhow!("column `{column}` is not valid UTF-8: {error}")
                 })
             }
         },

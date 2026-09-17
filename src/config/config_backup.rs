@@ -213,7 +213,7 @@ pub fn load_config_backup(
     // has already reduced the candidate to the configured namespace, and
     // `known_namespaces` was collapsed to it.
     info!(
-        "Config backup loaded for namespace '{}': {} proxies, {} consumers from {} \
+        "Config backup loaded for namespace {:?}: {} proxies, {} consumers from {:?} \
          ({} namespace(s) present in the file, {} resource(s) excluded as \
          out-of-namespace)",
         namespace,

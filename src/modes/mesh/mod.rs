@@ -917,7 +917,7 @@ impl MeshRuntimeConfig {
         if !(400..=599).contains(&outbound_registry_reject_status) {
             return Err(format!(
                 "Invalid FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS \
-                 '{outbound_registry_reject_status}'. Expected: 400..=599"
+                 \"{outbound_registry_reject_status}\". Expected: 400..=599"
             ));
         }
 
@@ -2162,7 +2162,7 @@ pub(crate) fn node_waypoint_udp_listeners_enabled_from_env() -> Result<bool, Str
             "true" | "1" => Ok(true),
             "false" | "0" => Ok(false),
             _ => Err(format!(
-                "Invalid {VAR} '{value}'. Expected true, false, 1, or 0"
+                "Invalid {VAR} {value:?}. Expected true, false, 1, or 0"
             )),
         },
     }
@@ -11424,7 +11424,11 @@ fn apply_traffic_policy_tls_to_backend_config(
                 }
                 _ if runtime.ca_backend != CaBackend::None && !presents_dynamic_svid => {
                     return Err(anyhow::anyhow!(
-                        "DestinationRule ISTIO_MUTUAL for '{}' cannot use FERRUM_MESH_CA_BACKEND yet because generic backend TLS cannot present dynamic runtime SVID client certificates; configure FERRUM_GATEWAY_SVID_CERT_PATH/FERRUM_GATEWAY_SVID_KEY_PATH or use MUTUAL with explicit client cert/key paths",
+                        "DestinationRule ISTIO_MUTUAL for {:?} cannot use FERRUM_MESH_CA_BACKEND \
+                         yet because generic backend TLS cannot present dynamic runtime SVID \
+                         client certificates; configure \
+                         FERRUM_GATEWAY_SVID_CERT_PATH/FERRUM_GATEWAY_SVID_KEY_PATH or use MUTUAL \
+                         with explicit client cert/key paths",
                         identity
                     ));
                 }
@@ -11446,7 +11450,8 @@ fn apply_traffic_policy_tls_to_backend_config(
                     // source at all, so even a mesh-transport upstream has no
                     // identity to present. Fail closed for EVERY upstream.
                     return Err(anyhow::anyhow!(
-                        "DestinationRule ISTIO_MUTUAL for '{}' requires FERRUM_GATEWAY_SVID_CERT_PATH/FERRUM_GATEWAY_SVID_KEY_PATH",
+                        "DestinationRule ISTIO_MUTUAL for {:?} requires \
+                         FERRUM_GATEWAY_SVID_CERT_PATH/FERRUM_GATEWAY_SVID_KEY_PATH",
                         identity
                     ));
                 }
@@ -13864,7 +13869,7 @@ pub async fn run(
             runtime.mesh_slice_request(),
         )
         .await
-        .with_context(|| format!("failed to load localized mesh config from '{file_path}'"))?;
+        .with_context(|| format!("failed to load localized mesh config from {file_path:?}"))?;
         // Fail-closed beyond mesh-field validity: run the full slice→config
         // preparation (plugin injection, materialization, DestinationRule
         // projection — which can reject e.g. unloadable ISTIO_MUTUAL TLS
@@ -13881,7 +13886,7 @@ pub async fn run(
             federation_activation,
         )
         .with_context(|| {
-            format!("localized mesh config '{file_path}' failed runtime preparation")
+            format!("localized mesh config {file_path:?} failed runtime preparation")
         })?;
         let initial_version = initial_slice.version.clone();
         mesh_state.install_slice(initial_slice);
@@ -13919,7 +13924,7 @@ pub async fn run(
         )
         .await
         .with_context(|| {
-            format!("failed to load the stock xDS mesh policy document from '{policy_path}'")
+            format!("failed to load the stock xDS mesh policy document from {policy_path:?}")
         })?;
         let baseline = Arc::new(baseline);
         let (policy_tx, policy_rx) = tokio::sync::watch::channel(
@@ -16760,9 +16765,9 @@ async fn start_spire_agent_mesh_svid_source(
     if &bundle.spiffe_id != expected_spiffe_id {
         join.abort();
         anyhow::bail!(
-            "SPIRE Workload API returned SVID '{}' but FERRUM_MESH_WORKLOAD_SPIFFE_ID is '{}'",
-            bundle.spiffe_id,
-            expected_spiffe_id
+            "SPIRE Workload API returned SVID {:?} but FERRUM_MESH_WORKLOAD_SPIFFE_ID is {:?}",
+            bundle.spiffe_id.to_string(),
+            expected_spiffe_id.to_string()
         );
     }
 
@@ -20621,7 +20626,7 @@ fn sidecar_capture_listener_addrs(
 
 fn parse_socket_addr(key: &str, raw: &str) -> Result<SocketAddr, String> {
     raw.parse::<SocketAddr>()
-        .map_err(|e| format!("{key} must be a socket address (got '{raw}'): {e}"))
+        .map_err(|e| format!("{key} must be a socket address (got {raw:?}): {e}"))
 }
 
 /// Parse the SOURCE-side EgressGateway endpoint (issue #3263) from its two
@@ -21075,7 +21080,7 @@ fn parse_stock_xds_limits() -> Result<crate::xds::stock::StockXdsLimits, String>
 fn parse_port(key: &str, raw: &str) -> Result<u16, String> {
     let port = raw
         .parse::<u16>()
-        .map_err(|e| format!("{key} must be a TCP port (got '{raw}'): {e}"))?;
+        .map_err(|e| format!("{key} must be a TCP port (got {raw:?}): {e}"))?;
     if port == 0 {
         Err(format!("{key} must be between 1 and 65535 (got 0)"))
     } else {
@@ -21085,7 +21090,7 @@ fn parse_port(key: &str, raw: &str) -> Result<u16, String> {
 
 fn parse_duration_seconds(key: &str, raw: &str) -> Result<u64, String> {
     raw.parse::<u64>()
-        .map_err(|e| format!("{key} must be a duration in seconds (got '{raw}'): {e}"))
+        .map_err(|e| format!("{key} must be a duration in seconds (got {raw:?}): {e}"))
 }
 
 /// Parse the stock xDS bearer-credential authorization-lifetime policy

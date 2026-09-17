@@ -733,7 +733,7 @@ impl OperatingMode {
                         crate::secrets::EXTERNAL_SECRET_PLACEHOLDER
                     ));
                 }
-                Err(format!("Invalid FERRUM_MODE '{other}'. Expected: {MODES}"))
+                Err(format!("Invalid FERRUM_MODE {other:?}. Expected: {MODES}"))
             }
         }
     }
@@ -865,13 +865,13 @@ fn validate_k8s_namespace(ns: &str) -> Result<(), String> {
     let last = bytes[bytes.len() - 1];
     if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
         return Err(format!(
-            "namespace '{}' is invalid: must start with lowercase alphanumeric",
+            "namespace {:?} is invalid: must start with lowercase alphanumeric",
             ns
         ));
     }
     if !last.is_ascii_lowercase() && !last.is_ascii_digit() {
         return Err(format!(
-            "namespace '{}' is invalid: must end with lowercase alphanumeric",
+            "namespace {:?} is invalid: must end with lowercase alphanumeric",
             ns
         ));
     }
@@ -880,7 +880,7 @@ fn validate_k8s_namespace(ns: &str) -> Result<(), String> {
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
         return Err(format!(
-            "namespace '{}' is invalid: use lowercase alphanumeric characters or '-'",
+            "namespace {:?} is invalid: use lowercase alphanumeric characters or '-'",
             ns
         ));
     }
@@ -5937,7 +5937,7 @@ impl EnvConfig {
         }
         Some(format!(
             "Refusing to start {mode:?} mode: the plaintext admin HTTP listener \
-             (FERRUM_ADMIN_HTTP_PORT={port}) is bound to '{bind}', a non-loopback address \
+             (FERRUM_ADMIN_HTTP_PORT={port}) is bound to {bind:?}, a non-loopback address \
              reachable beyond this host, with no FERRUM_ADMIN_ALLOWED_CIDRS allowlist. The \
              admin API (read endpoints still serve sensitive management-plane data, e.g. \
              unredacted backups) and any operator bearer tokens would be served in cleartext to \
@@ -6200,14 +6200,14 @@ impl EnvConfig {
             .map_err(|e| format!("Failed to create database TLS temp PEM file: {e}"))?;
         let (_file, material_path) = temp_file.keep().map_err(|e| {
             format!(
-                "Failed to persist database TLS temp PEM file '{}': {}",
+                "Failed to persist database TLS temp PEM file {:?}: {}",
                 e.file.path().display(),
                 e.error
             )
         })?;
         std::fs::write(&material_path, material.bytes.expose_secret()).map_err(|e| {
             format!(
-                "Failed to write database TLS material to '{}': {}",
+                "Failed to write database TLS material to {:?}: {}",
                 material_path.display(),
                 e
             )
@@ -6841,7 +6841,7 @@ impl EnvConfig {
                     self.mesh_config_authority_id.as_str(),
                 ) {
                     return Err(format!(
-                        "FERRUM_MESH_CONFIG_AUTHORITY_ID must not use the reserved '{}' \
+                        "FERRUM_MESH_CONFIG_AUTHORITY_ID must not use the reserved `{}` \
                          ordering domain (that domain sequences from Kubernetes \
                          resourceVersion, not from the config change log); choose another \
                          authority id",
@@ -7183,7 +7183,7 @@ impl EnvConfig {
                     let v = raw.trim().to_ascii_lowercase();
                     if !matches!(v.as_str(), "" | "true" | "false" | "1" | "0") {
                         return Err(format!(
-                            "Invalid FERRUM_MESH_PRODUCTION_MODE value '{raw}'. \
+                            "Invalid FERRUM_MESH_PRODUCTION_MODE value {raw:?}. \
                              Expected true, false, 1, or 0"
                         ));
                     }
@@ -7484,7 +7484,7 @@ impl EnvConfig {
             "1.2" | "1.3" => {}
             other => {
                 return Err(format!(
-                    "Invalid FERRUM_TLS_MIN_VERSION '{}'. Expected: 1.2, 1.3",
+                    "Invalid FERRUM_TLS_MIN_VERSION {:?}. Expected: 1.2, 1.3",
                     other
                 ));
             }
@@ -7493,7 +7493,7 @@ impl EnvConfig {
             "1.2" | "1.3" => {}
             other => {
                 return Err(format!(
-                    "Invalid FERRUM_TLS_MAX_VERSION '{}'. Expected: 1.2, 1.3",
+                    "Invalid FERRUM_TLS_MAX_VERSION {:?}. Expected: 1.2, 1.3",
                     other
                 ));
             }
@@ -8238,7 +8238,7 @@ impl EnvConfig {
     pub fn cp_grpc_socket_addr(&self) -> Result<std::net::SocketAddr, String> {
         if let Some(addr) = &self.cp_grpc_listen_addr {
             addr.parse().map_err(|e| {
-                format!("FERRUM_CP_GRPC_LISTEN_ADDR '{addr}' is not a valid socket address: {e}")
+                format!("FERRUM_CP_GRPC_LISTEN_ADDR {addr:?} is not a valid socket address: {e}")
             })
         } else {
             Ok(std::net::SocketAddr::new(
@@ -8486,7 +8486,7 @@ impl EnvConfig {
                 if cp_dp_grpc_url_is_nonloopback_plaintext(url)? && !self.cp_dp_grpc_allow_plaintext
                 {
                     return Err(format!(
-                        "DP CP URL '{url}' is PLAINTEXT to a non-loopback host — the DP \
+                        "DP CP URL {url:?} is PLAINTEXT to a non-loopback host — the DP \
                          authentication JWT and config data would be exposed to the network. Use \
                          an https:// URL with FERRUM_DP_GRPC_TLS_CA_CERT_PATH, target a loopback \
                          host, or set FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true to explicitly permit \

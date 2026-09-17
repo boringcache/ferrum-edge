@@ -189,7 +189,7 @@ pub fn load_stock_policy_baseline(path: &Path) -> Result<MeshConfig, anyhow::Err
     let mesh = read_mesh_config_document(path)?;
     if !mesh.services.is_empty() || !mesh.workloads.is_empty() {
         anyhow::bail!(
-            "mesh policy document '{}' declares `services` or `workloads`, which the stock xDS \
+            "mesh policy document {:?} declares `services` or `workloads`, which the stock xDS \
              profile sources from the control plane. Remove them, or use \
              FERRUM_MESH_CONFIG_PROTOCOL=file for a fully local mesh.",
             path.display()

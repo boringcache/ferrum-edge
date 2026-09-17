@@ -1005,8 +1005,8 @@ impl MeshRevisionGate {
             reason.as_metric_label(),
         );
         let detail = format!(
-            "candidate revision '{authority}'/{sequence} refused against accepted revision \
-             '{accepted_authority}'/{accepted_sequence}"
+            "candidate revision {authority:?}/{sequence} refused against accepted revision \
+             {accepted_authority:?}/{accepted_sequence}"
         );
         tracing::warn!(
             reason = reason.as_metric_label(),

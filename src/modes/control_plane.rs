@@ -523,7 +523,8 @@ async fn resolve_polled_namespaces(
                 ns
             } else {
                 warn!(
-                    "CP scope=All: authoritative namespace discovery failed ({}); falling back to FERRUM_NAMESPACE='{}'",
+                    "CP scope=All: authoritative namespace discovery failed ({}); falling back to \
+                     FERRUM_NAMESPACE={:?}",
                     e, fallback
                 );
                 vec![fallback.to_string()]
@@ -866,7 +867,7 @@ impl MultiNsFullLoadAcc {
                 let errors: Vec<String> = self
                     .rejected_namespaces
                     .iter()
-                    .map(|(ns, msg)| format!("namespace '{ns}': {msg}"))
+                    .map(|(ns, msg)| format!("namespace {ns:?}: {msg}"))
                     .collect();
                 return Err(ConfigValidationRejection {
                     backend: "CP",
@@ -1100,7 +1101,7 @@ async fn load_full_config_multi_with_sequence(
             let errors = outcome
                 .rejected_namespaces
                 .iter()
-                .map(|(namespace, message)| format!("namespace '{namespace}': {message}"))
+                .map(|(namespace, message)| format!("namespace {namespace:?}: {message}"))
                 .collect();
             return Err(ConfigValidationRejection {
                 backend: "CP",
@@ -1362,7 +1363,7 @@ fn namespace_rejection_error(rejected_namespaces: &[(String, String)]) -> Option
     }
     let errors: Vec<String> = rejected_namespaces
         .iter()
-        .map(|(namespace, message)| format!("namespace '{namespace}': {message}"))
+        .map(|(namespace, message)| format!("namespace {namespace:?}: {message}"))
         .collect();
     Some(
         ConfigValidationRejection {
@@ -1743,7 +1744,7 @@ fn collect_rejecting_cp_incremental_errors(
         errors.extend(
             collect_rejecting_runtime_config_errors(&namespace_config)
                 .into_iter()
-                .map(|error| format!("namespace '{namespace}': {error}")),
+                .map(|error| format!("namespace {namespace:?}: {error}")),
         );
     }
     errors
@@ -2088,13 +2089,13 @@ pub async fn run(
         let mut details: Vec<String> = full_load
             .rejected_namespaces
             .iter()
-            .map(|(namespace, message)| format!("namespace '{namespace}' rejected: {message}"))
+            .map(|(namespace, message)| format!("namespace {namespace:?} rejected: {message}"))
             .collect();
         details.extend(
             full_load
                 .failed_namespaces
                 .iter()
-                .map(|namespace| format!("namespace '{namespace}': initial full load failed")),
+                .map(|namespace| format!("namespace {namespace:?}: initial full load failed")),
         );
         anyhow::bail!(
             "CP startup aborted: {} of {} namespace(s) failed the initial full config load, and \
@@ -3083,7 +3084,7 @@ pub async fn run(
                         };
                         if needs_reconnect {
                             info!(
-                                "Database DNS changed for '{}': {:?} -> {:?}, reconnecting pool",
+                                "Database DNS changed for {:?}: {:?} -> {:?}, reconnecting pool",
                                 hostname, last_db_ips.as_deref().unwrap_or(&[]), ips
                             );
                             match db_poll.reconnect(&db_url_for_reconnect).await {
@@ -3095,7 +3096,8 @@ pub async fn run(
                                 }
                                 Err(e) => {
                                     error!(
-                                        "Failed to reconnect database pool after DNS change for '{}': {}",
+                                        "Failed to reconnect database pool after DNS change for \
+                                         {:?}: {}",
                                         hostname, e
                                     );
                                 }

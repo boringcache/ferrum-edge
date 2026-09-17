@@ -140,7 +140,7 @@ fn invalid_pool_value(key: &str, raw: &str, expected: &str) -> String {
             crate::secrets::EXTERNAL_SECRET_PLACEHOLDER
         );
     }
-    format!("Invalid {key} value '{raw}'. Expected {expected}")
+    format!("Invalid {key} value {raw:?}. Expected {expected}")
 }
 
 fn parse_pool_int<T: std::str::FromStr>(key: &str, raw: &str, expected: &str) -> Result<T, String> {
@@ -588,7 +588,7 @@ impl PoolConfig {
     pub fn validate_max_idle_per_host(value: usize, source: &str) -> usize {
         if value < MIN_IDLE_PER_HOST {
             tracing::warn!(
-                "pool_max_idle_per_host={} for '{}' is below the minimum ({}). \
+                "pool_max_idle_per_host={} for {:?} is below the minimum ({}). \
                  Values this low cause excessive connection churn under load, \
                  leading to high latency and errors. Clamping to {}.",
                 value,
@@ -599,7 +599,7 @@ impl PoolConfig {
             MIN_IDLE_PER_HOST
         } else if value > MAX_IDLE_PER_HOST {
             tracing::warn!(
-                "pool_max_idle_per_host={} for '{}' exceeds the maximum ({}). \
+                "pool_max_idle_per_host={} for {:?} exceeds the maximum ({}). \
                  Very high values waste file descriptors and memory without \
                  improving performance. Clamping to {}.",
                 value,

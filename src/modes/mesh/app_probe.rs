@@ -237,7 +237,7 @@ impl AppProbeSpec {
             Ok(())
         } else {
             Err(format!(
-                "app probe '{key}' must carry exactly one of httpGet/tcpSocket/grpc, found \
+                "app probe {key:?} must carry exactly one of httpGet/tcpSocket/grpc, found \
 {populated}"
             ))
         }
@@ -270,7 +270,7 @@ pub fn app_probe_path(container: &str, probe_field: &str) -> String {
 pub fn validate_probe_container_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name.len() > 63 {
         return Err(format!(
-            "container name '{name}' is empty or too long to address as a rewritten kubelet \
+            "container name {name:?} is empty or too long to address as a rewritten kubelet \
 probe target; refusing injection"
         ));
     }
@@ -279,7 +279,7 @@ probe target; refusing injection"
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     {
         return Err(format!(
-            "container name '{name}' is not a DNS-1123 label, so it cannot be addressed as a \
+            "container name {name:?} is not a DNS-1123 label, so it cannot be addressed as a \
 rewritten kubelet probe target; refusing injection"
         ));
     }
@@ -299,13 +299,13 @@ pub fn parse_app_probes(raw: &str) -> Result<BTreeMap<String, AppProbeSpec>, Str
         spec.validate(key)?;
         let Some((container, probe_field)) = key.split_once('/') else {
             return Err(format!(
-                "app probe key '{key}' must be '<container>/<probeField>'"
+                "app probe key {key:?} must be '<container>/<probeField>'"
             ));
         };
         validate_probe_container_name(container)?;
         if !APP_PROBE_FIELDS.contains(&probe_field) {
             return Err(format!(
-                "app probe key '{key}' names an unknown probe field '{probe_field}'"
+                "app probe key {key:?} names an unknown probe field {probe_field:?}"
             ));
         }
     }
@@ -322,7 +322,7 @@ pub fn app_probe_port_from_env() -> Result<u16, String> {
             }
             trimmed
                 .parse::<u16>()
-                .map_err(|e| format!("invalid {APP_PROBE_PORT_ENV}='{trimmed}': {e}"))
+                .map_err(|e| format!("invalid {APP_PROBE_PORT_ENV}={trimmed:?}: {e}"))
         }
         None => Ok(DEFAULT_APP_PROBE_PORT),
     }

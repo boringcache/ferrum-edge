@@ -306,7 +306,8 @@ impl<'a> ExpressionParser<'a> {
                 // Field labels end with "filter"; do not append another "filter"
                 // before "filters" or the diagnostic becomes "...filter filters...".
                 return Err(format!(
-                    "Telemetry access log response.duration filters only support '>' and '>=' (got '{other}')"
+                    "Telemetry access log response.duration filters only support '>' and '>=' \
+                     (got {other:?})"
                 ));
             }
         }
@@ -356,7 +357,7 @@ impl<'a> ExpressionParser<'a> {
         if !self.peek_is_ascii_digit() {
             let fragment = self.input.get(start..self.pos).unwrap_or("");
             return Err(format!(
-                "{field} comparison value '{fragment}' is not a number"
+                "{field} comparison value {fragment:?} is not a number"
             ));
         }
         while self.peek_is_ascii_digit() {

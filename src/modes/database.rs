@@ -1401,7 +1401,7 @@ pub async fn run(
                         // generation atomically through the ordinary
                         // `update_config` / `ArcSwap` reload path.
                         warn!(
-                            "Starting with backup config for namespace '{}' \
+                            "Starting with backup config for namespace {:?} \
                              ({} proxies, {} consumers). \
                              Database polling will retry and update when DB recovers. \
                              Gateway-to-mesh identity is refused until an authoritative \
@@ -2528,7 +2528,8 @@ pub async fn run(
                             };
                             if needs_reconnect {
                                 info!(
-                                    "Database DNS changed for '{}': {:?} -> {:?}, reconnecting pool",
+                                    "Database DNS changed for {:?}: {:?} -> {:?}, reconnecting \
+                                     pool",
                                     hostname, last_db_ips.as_deref().unwrap_or(&[]), ips
                                 );
                                 match db_poll.reconnect(&db_url_for_reconnect).await {
@@ -2545,7 +2546,8 @@ pub async fn run(
                                     }
                                     Err(e) => {
                                         error!(
-                                            "Failed to reconnect database pool after DNS change for '{}': {}",
+                                            "Failed to reconnect database pool after DNS change \
+                                             for {:?}: {}",
                                             hostname, e
                                         );
                                     }

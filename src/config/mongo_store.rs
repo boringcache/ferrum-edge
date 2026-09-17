@@ -608,7 +608,7 @@ mod inner {
         ) -> Result<(String, MongoAdmissionConnectionPin), anyhow::Error> {
             let generation_guard = self.connection_generation_guard.take().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "MongoDB {} guard '{}' has no connection-generation pin",
+                    "MongoDB {} guard {:?} has no connection-generation pin",
                     self.label,
                     self.lock_id
                 )
@@ -648,7 +648,7 @@ mod inner {
             // locks additionally require majority acknowledgement so an
             // election cannot revive stale ownership.
             debug!(
-                "Releasing MongoDB {} lease '{}' (mode={:?})",
+                "Releasing MongoDB {} lease {:?} (mode={:?})",
                 self.label, self.lock_id, self.mode
             );
             let delete = self.collection.delete_one(doc! {
@@ -669,7 +669,7 @@ mod inner {
                     // let Drop retry, but do not turn durable success into a
                     // false failed response that suppresses hooks/audit.
                     error!(
-                        "MongoDB {} lock '{}' cleanup failed after a committed operation: {}",
+                        "MongoDB {} lock {:?} cleanup failed after a committed operation: {}",
                         self.label, self.lock_id, error
                     );
                     return Ok(());
@@ -679,7 +679,7 @@ mod inner {
             self.released = true;
             if !self.valid.load(Ordering::Acquire) {
                 anyhow::bail!(
-                    "MongoDB {} lease '{}' expired or was lost while the operation ran",
+                    "MongoDB {} lease {:?} expired or was lost while the operation ran",
                     self.label,
                     self.lock_id
                 );
@@ -687,13 +687,14 @@ mod inner {
             if result.deleted_count != 1 {
                 if self.mode == MongoLockMode::UntilExplicitRelease {
                     error!(
-                        "MongoDB {} lock '{}' cleanup did not match its owner after a committed operation",
+                        "MongoDB {} lock {:?} cleanup did not match its owner after a committed \
+                         operation",
                         self.label, self.lock_id
                     );
                     return Ok(());
                 }
                 anyhow::bail!(
-                    "MongoDB {} lease '{}' release did not match the owning document",
+                    "MongoDB {} lease {:?} release did not match the owning document",
                     self.label,
                     self.lock_id
                 );
@@ -713,7 +714,8 @@ mod inner {
                 {
                     uncertain.store(true, Ordering::Release);
                     error!(
-                        "Retaining outer MongoDB {} guard '{}' because a borrowed mutation outcome is uncertain",
+                        "Retaining outer MongoDB {} guard {:?} because a borrowed mutation \
+                         outcome is uncertain",
                         self.label, self.lock_id
                     );
                 }
@@ -731,7 +733,9 @@ mod inner {
                     );
                 }
                 error!(
-                    "Retaining MongoDB {} lock '{}' and its connection generation because the protected mutation outcome is uncertain; verify the write outcome and restart this admin process before manually removing the owner-qualified lock",
+                    "Retaining MongoDB {} lock {:?} and its connection generation because the \
+                     protected mutation outcome is uncertain; verify the write outcome and \
+                     restart this admin process before manually removing the owner-qualified lock",
                     self.label, self.lock_id
                 );
                 return;
@@ -1209,7 +1213,7 @@ mod inner {
                     .credential
                     .get_or_insert_with(Default::default)
                     .mechanism = Some(mechanism.parse().map_err(|e| {
-                    anyhow::anyhow!("Invalid MongoDB auth mechanism '{}': {}", mechanism, e)
+                    anyhow::anyhow!("Invalid MongoDB auth mechanism {:?}: {}", mechanism, e)
                 })?);
             }
             apply_mongo_timeout_overrides(
@@ -1298,14 +1302,14 @@ mod inner {
             // Verify connectivity
             db.run_command(doc! { "ping": 1 }).await.map_err(|e| {
                 anyhow::anyhow!(
-                    "MongoDB connectivity check failed (database='{}'): {}",
+                    "MongoDB connectivity check failed (database={:?}): {}",
                     settings.database_name,
                     e
                 )
             })?;
 
             info!(
-                "MongoDB connected (database='{}', url={}, replica_set={})",
+                "MongoDB connected (database={:?}, url={}, replica_set={})",
                 settings.database_name,
                 crate::config::db_backend::redact_url(mongo_url),
                 replica_set_configured
@@ -1399,13 +1403,13 @@ mod inner {
                 .map_err(|e| anyhow::anyhow!("Failed to create temporary {label}: {e}"))?;
             temp_file.as_file_mut().write_all(contents).map_err(|e| {
                 anyhow::anyhow!(
-                    "Failed to write temporary {label} '{}': {e}",
+                    "Failed to write temporary {label} {:?}: {e}",
                     temp_file.path().display()
                 )
             })?;
             temp_file.as_file_mut().flush().map_err(|e| {
                 anyhow::anyhow!(
-                    "Failed to flush temporary {label} '{}': {e}",
+                    "Failed to flush temporary {label} {:?}: {e}",
                     temp_file.path().display()
                 )
             })?;
@@ -1425,7 +1429,7 @@ mod inner {
             let mut permissions = std::fs::metadata(path)
                 .map_err(|e| {
                     anyhow::anyhow!(
-                        "Failed to inspect permissions for temporary {label} '{}': {e}",
+                        "Failed to inspect permissions for temporary {label} {:?}: {e}",
                         path.display()
                     )
                 })?
@@ -1433,7 +1437,7 @@ mod inner {
             permissions.set_mode(0o600);
             std::fs::set_permissions(path, permissions).map_err(|e| {
                 anyhow::anyhow!(
-                    "Failed to set private permissions on temporary {label} '{}': {e}",
+                    "Failed to set private permissions on temporary {label} {:?}: {e}",
                     path.display()
                 )
             })
@@ -2009,7 +2013,7 @@ mod inner {
                 Err(err) if is_namespace_not_found(&err) => return Ok(Vec::new()),
                 Err(err) => {
                     return Err(anyhow::anyhow!(
-                        "Failed to list indexes on MongoDB collection '{collection_name}': {err}"
+                        "Failed to list indexes on MongoDB collection `{collection_name}`: {err}"
                     ));
                 }
             };
@@ -2017,7 +2021,7 @@ mod inner {
             while cursor.advance().await? {
                 let model = cursor.deserialize_current().map_err(|err| {
                     anyhow::anyhow!(
-                        "Failed to decode index on MongoDB collection '{collection_name}': {err}"
+                        "Failed to decode index on MongoDB collection `{collection_name}`: {err}"
                     )
                 })?;
                 indexes.push(model);
@@ -2507,7 +2511,8 @@ mod inner {
                         .get(&owner)
                         .ok_or_else(|| {
                             anyhow::Error::new(MtlsDnsAdmissionUnavailable).context(format!(
-                                "MongoDB {label} guard '{lock_id}' is not active in this admin process"
+                                "MongoDB {label} guard {lock_id:?} is not active in this admin \
+                                 process"
                             ))
                         })?;
                     if persistent_pin.namespace != lock_id {
@@ -2615,7 +2620,7 @@ mod inner {
                 if tokio::time::Instant::now() >= deadline {
                     return Err(
                         anyhow::Error::new(MtlsDnsAdmissionUnavailable).context(format!(
-                            "MongoDB {label} lock '{lock_id}' remained held for {} seconds; \
+                            "MongoDB {label} lock {lock_id:?} remained held for {} seconds; \
                          admission locks do not expire because reclaiming one could permit a \
                          stale writer, so verify the prior owner is stopped before removing the \
                          lock document",
@@ -3654,7 +3659,7 @@ mod inner {
         async fn compact_config_changes_best_effort(&self, namespace: &str) {
             if let Err(e) = self.compact_config_changes(namespace).await {
                 warn!(
-                    "MongoDB config change compaction failed for namespace '{}': {}",
+                    "MongoDB config change compaction failed for namespace {:?}: {}",
                     namespace, e
                 );
             }
@@ -3678,21 +3683,25 @@ mod inner {
             {
                 Ok(result) if result.deleted_count > 0 => {
                     warn!(
-                        "Rolled back MongoDB standalone {} create for id '{}' in namespace '{}' after config_changes write failed: {}",
+                        "Rolled back MongoDB standalone {} create for id {:?} in namespace {:?} \
+                         after config_changes write failed: {}",
                         resource_type, resource_id, namespace, change_error
                     );
                     true
                 }
                 Ok(_) => {
                     warn!(
-                        "MongoDB standalone {} create for id '{}' in namespace '{}' failed to record config_changes, but rollback confirmed no inserted document remains: {}",
+                        "MongoDB standalone {} create for id {:?} in namespace {:?} failed to \
+                         record config_changes, but rollback confirmed no inserted document \
+                         remains: {}",
                         resource_type, resource_id, namespace, change_error
                     );
                     true
                 }
                 Err(rollback_err) => {
                     warn!(
-                        "MongoDB standalone {} create for id '{}' in namespace '{}' failed to record config_changes and rollback failed: {}; original error: {}",
+                        "MongoDB standalone {} create for id {:?} in namespace {:?} failed to \
+                         record config_changes and rollback failed: {}; original error: {}",
                         resource_type, resource_id, namespace, rollback_err, change_error
                     );
                     false
@@ -3806,7 +3815,7 @@ mod inner {
         ) -> bool {
             let Some(previous_doc) = previous_doc else {
                 warn!(
-                    "MongoDB standalone {} update for id '{}' failed to record config_changes, \
+                    "MongoDB standalone {} update for id {:?} failed to record config_changes, \
                      but no previous document was available to restore: {}",
                     resource_type, resource_id, change_error
                 );
@@ -3822,21 +3831,24 @@ mod inner {
             {
                 Ok(result) if result.matched_count > 0 => {
                     warn!(
-                        "Restored MongoDB standalone {} update for id '{}' after config_changes write failed: {}",
+                        "Restored MongoDB standalone {} update for id {:?} after config_changes \
+                         write failed: {}",
                         resource_type, resource_id, change_error
                     );
                     true
                 }
                 Ok(_) => {
                     warn!(
-                        "MongoDB standalone {} update for id '{}' failed to record config_changes, but rollback found no document to restore: {}",
+                        "MongoDB standalone {} update for id {:?} failed to record \
+                         config_changes, but rollback found no document to restore: {}",
                         resource_type, resource_id, change_error
                     );
                     false
                 }
                 Err(rollback_err) => {
                     warn!(
-                        "MongoDB standalone {} update for id '{}' failed to record config_changes and rollback failed: {}; original error: {}",
+                        "MongoDB standalone {} update for id {:?} failed to record config_changes \
+                         and rollback failed: {}; original error: {}",
                         resource_type, resource_id, rollback_err, change_error
                     );
                     false
@@ -3867,12 +3879,14 @@ mod inner {
                     let sequence = mongo_change_sequence_from_bson(Some(value), "sequence")?;
                     let sequence = i64::try_from(sequence).map_err(|_| {
                         anyhow::anyhow!(
-                            "MongoDB config_changes row has invalid 'sequence': expected a positive integral number"
+                            "MongoDB config_changes row has invalid `sequence`: expected a \
+                             positive integral number"
                         )
                     })?;
                     if sequence <= 0 {
                         anyhow::bail!(
-                            "MongoDB config_changes row has invalid 'sequence': expected a positive integral number"
+                            "MongoDB config_changes row has invalid `sequence`: expected a \
+                             positive integral number"
                         );
                     }
                     Some(sequence)
@@ -3920,7 +3934,7 @@ mod inner {
                 };
                 if after_sequence < retained_sequence {
                     anyhow::bail!(
-                        "config change cursor {} for namespace '{}' is behind retained sequence {}",
+                        "config change cursor {} for namespace {:?} is behind retained sequence {}",
                         after_sequence,
                         namespace,
                         retained_sequence
@@ -4345,7 +4359,7 @@ mod inner {
                     .is_some();
                 if !exists {
                     return Err(mongodb::error::Error::custom(format!(
-                        "referenced upstream '{}' does not exist in namespace '{}'",
+                        "referenced upstream {:?} does not exist in namespace {:?}",
                         upstream_id, params.namespace
                     )));
                 }
@@ -4556,7 +4570,7 @@ mod inner {
                         if owner.as_str() != consumer_id {
                             return Err(mongodb::error::Error::custom(format!(
                                 "E11000 duplicate key error: consumer identity reservation \
-                                 '{doc_id}' is reserved by consumer '{owner}'"
+                                 {doc_id:?} is reserved by consumer {owner:?}"
                             )));
                         }
                         // Same owner ⇒ adopt the existing reservation.
@@ -4660,8 +4674,9 @@ mod inner {
                                     .to_vec();
                             if inserted_prefix.is_none() {
                                 warn!(
-                                    "Retaining MongoDB consumer identity reservations for '{}' in \
-                                     namespace '{}' that may have been inserted by a failed ordered \
+                                    "Retaining MongoDB consumer identity reservations for {:?} in \
+                                     namespace {:?} that may have been inserted by a failed \
+                                     ordered \
                                      insert without a verifiable write-error index; rollback will \
                                      only release values newly inserted during same-owner adoption",
                                     consumer_id, namespace
@@ -4678,8 +4693,9 @@ mod inner {
                             let inserted_prefix = Self::ordered_insert_inserted_prefix_len(&err);
                             if inserted_prefix.is_none() {
                                 warn!(
-                                    "Retaining MongoDB consumer identity reservations for '{}' in \
-                                     namespace '{}' because the failed ordered insert did not report \
+                                    "Retaining MongoDB consumer identity reservations for {:?} in \
+                                     namespace {:?} because the failed ordered insert did not \
+                                     report \
                                      a verifiable write-error index; still releasing vacant \
                                      reservations inserted during this adoption attempt",
                                     consumer_id, namespace
@@ -4709,8 +4725,8 @@ mod inner {
                     .await;
                 } else {
                     warn!(
-                        "Retaining MongoDB consumer identity reservations for '{}' in namespace \
-                         '{}' because the failed ordered insert did not report a verifiable \
+                        "Retaining MongoDB consumer identity reservations for {:?} in namespace \
+                         {:?} because the failed ordered insert did not report a verifiable \
                          write-error index",
                         consumer_id, namespace
                     );
@@ -4761,7 +4777,7 @@ mod inner {
                                 return Err(ConsumerIdentityEnsureOwnedError::new(
                                     newly_inserted,
                                     anyhow::anyhow!(
-                                        "consumer_identity_index doc '{}' missing consumer_id: {}",
+                                        "consumer_identity_index doc {:?} missing consumer_id: {}",
                                         doc_id,
                                         e
                                     ),
@@ -4776,8 +4792,8 @@ mod inner {
                             return Err(ConsumerIdentityEnsureOwnedError::new(
                                 newly_inserted,
                                 anyhow::anyhow!(
-                                    "E11000 duplicate key error: identity value '{}' in \
-                                     namespace '{}' is reserved by consumer '{}'",
+                                    "E11000 duplicate key error: identity value {:?} in \
+                                     namespace {:?} is reserved by consumer {:?}",
                                     value,
                                     namespace,
                                     owner
@@ -4819,7 +4835,7 @@ mod inner {
                                     return Err(ConsumerIdentityEnsureOwnedError::new(
                                         newly_inserted,
                                         anyhow::anyhow!(
-                                            "consumer_identity_index doc '{}' missing \
+                                            "consumer_identity_index doc {:?} missing \
                                              consumer_id: {}",
                                             doc_id,
                                             e
@@ -4831,8 +4847,8 @@ mod inner {
                                 return Err(ConsumerIdentityEnsureOwnedError::new(
                                     newly_inserted,
                                     anyhow::anyhow!(
-                                        "E11000 duplicate key error: identity value '{}' in \
-                                         namespace '{}' is reserved by consumer '{}'",
+                                        "E11000 duplicate key error: identity value {:?} in \
+                                         namespace {:?} is reserved by consumer {:?}",
                                         value,
                                         namespace,
                                         owner
@@ -4887,7 +4903,7 @@ mod inner {
             {
                 warn!(
                     "MongoDB best-effort consumer identity reservation rollback failed for \
-                     consumer '{}' in namespace '{}': {}",
+                     consumer {:?} in namespace {:?}: {}",
                     consumer_id, namespace, err
                 );
             }
@@ -5144,7 +5160,7 @@ mod inner {
                     let proxy_id = doc.get_str("id").unwrap_or("<unknown>");
                     let upstream_id = doc.get_str("upstream_id").unwrap_or("<unknown>");
                     anyhow::bail!(
-                        "proxy '{}' references a spec-owned upstream '{}' from api_spec '{}'; \
+                        "proxy {:?} references a spec-owned upstream {:?} from api_spec {:?}; \
                          detach it before replacing or deleting the API spec",
                         proxy_id,
                         upstream_id,
@@ -5171,7 +5187,8 @@ mod inner {
                         mesh_route_dispatch_referenced_upstream(&plugin, &spec_upstream_ids)
                     {
                         anyhow::bail!(
-                            "mesh_route_dispatch plugin_config '{}' references a spec-owned upstream '{}' from api_spec '{}'; \
+                            "mesh_route_dispatch plugin_config {:?} references a spec-owned \
+                             upstream {:?} from api_spec {:?}; \
                              detach it before replacing or deleting the API spec",
                             plugin.id,
                             upstream_id,
@@ -5220,7 +5237,7 @@ mod inner {
                     let proxy_id = doc.get_str("id").unwrap_or("<unknown>");
                     let upstream_id = doc.get_str("upstream_id").unwrap_or("<unknown>");
                     anyhow::bail!(
-                        "proxy '{}' references a spec-owned upstream '{}' from api_spec '{}'; \
+                        "proxy {:?} references a spec-owned upstream {:?} from api_spec {:?}; \
                          detach it before replacing or deleting the API spec",
                         proxy_id,
                         upstream_id,
@@ -5246,7 +5263,8 @@ mod inner {
                         mesh_route_dispatch_referenced_upstream(&plugin, &spec_upstream_ids)
                     {
                         anyhow::bail!(
-                            "mesh_route_dispatch plugin_config '{}' references a spec-owned upstream '{}' from api_spec '{}'; \
+                            "mesh_route_dispatch plugin_config {:?} references a spec-owned \
+                             upstream {:?} from api_spec {:?}; \
                              detach it before replacing or deleting the API spec",
                             plugin.id,
                             upstream_id,
@@ -6069,7 +6087,7 @@ mod inner {
             };
             let id = document.get_str("id").map_err(|_| {
                 mongodb::error::Error::custom(format!(
-                    "gateway trust bundle for namespace '{namespace}' is missing its string id"
+                    "gateway trust bundle for namespace {namespace:?} is missing its string id"
                 ))
             })?;
             Ok(Some(id.to_string()))
@@ -7015,7 +7033,7 @@ mod inner {
         let existing = store.get_consumer(namespace, owner_id).await?;
         let Some(existing) = existing else {
             return Ok(format!(
-                "Consumer identity '{}' conflicts with consumer '{}'",
+                "Consumer identity {:?} conflicts with consumer {:?}",
                 identity_value, owner_id
             ));
         };
@@ -7037,7 +7055,7 @@ mod inner {
             }
         }
         Ok(format!(
-            "Consumer identity '{}' conflicts with consumer '{}'",
+            "Consumer identity {:?} conflicts with consumer {:?}",
             identity_value, owner_id
         ))
     }
@@ -7052,7 +7070,7 @@ mod inner {
     ) -> mongodb::error::Result<&'a str> {
         doc.get_str(field).map_err(|_| {
             mongodb::error::Error::custom(format!(
-                "consumer_identity_index reservation doc missing field '{field}'"
+                "consumer_identity_index reservation doc missing field `{field}`"
             ))
         })
     }
@@ -7855,8 +7873,8 @@ mod inner {
     ) -> Result<&'a str, anyhow::Error> {
         match doc.get(field) {
             Some(Bson::String(value)) => Ok(value.as_str()),
-            Some(_) => anyhow::bail!("MongoDB config_changes row has non-string field '{field}'"),
-            None => anyhow::bail!("MongoDB config_changes row is missing field '{field}'"),
+            Some(_) => anyhow::bail!("MongoDB config_changes row has non-string field `{field}`"),
+            None => anyhow::bail!("MongoDB config_changes row is missing field `{field}`"),
         }
     }
 
@@ -7891,7 +7909,8 @@ mod inner {
                 Ok(*value as u64)
             }
             _ => anyhow::bail!(
-                "MongoDB config_changes row has invalid '{field}': expected a non-negative integral number"
+                "MongoDB config_changes row has invalid `{field}`: expected a non-negative \
+                 integral number"
             ),
         }
     }
@@ -8133,7 +8152,8 @@ mod inner {
             self.check_slow_query("load_full_config", start);
 
             info!(
-                "MongoDB loaded config (namespace='{}'): {} proxies, {} consumers, {} plugins, {} upstreams",
+                "MongoDB loaded config (namespace={:?}): {} proxies, {} consumers, {} plugins, {} \
+                 upstreams",
                 namespace,
                 proxies.len(),
                 consumers.len(),
@@ -8566,7 +8586,8 @@ mod inner {
                 .await?;
             if change_count >= CHANGE_LOG_BATCH_LIMIT as usize {
                 anyhow::bail!(
-                    "MongoDB config change batch for namespace '{}' reached limit {}; forcing full reload",
+                    "MongoDB config change batch for namespace {:?} reached limit {}; forcing \
+                     full reload",
                     namespace,
                     CHANGE_LOG_BATCH_LIMIT
                 );
@@ -8822,7 +8843,7 @@ mod inner {
                         .await?
                 {
                     anyhow::bail!(
-                        "referenced upstream '{}' does not exist in namespace '{}'",
+                        "referenced upstream {:?} does not exist in namespace {:?}",
                         upstream_id,
                         proxy.namespace
                     );
@@ -8854,7 +8875,7 @@ mod inner {
                         {
                             warn!(
                                 "MongoDB standalone proxy route-conflict self-revert failed \
-                                 for '{}': {}",
+                                 for {:?}: {}",
                                 proxy.id, err
                             );
                         }
@@ -8876,12 +8897,12 @@ mod inner {
                     {
                         warn!(
                             "MongoDB standalone proxy upstream-vanished self-revert failed \
-                             for '{}': {}",
+                             for {:?}: {}",
                             proxy.id, err
                         );
                     }
                     anyhow::bail!(
-                        "referenced upstream '{}' does not exist in namespace '{}'",
+                        "referenced upstream {:?} does not exist in namespace {:?}",
                         upstream_id,
                         proxy.namespace
                     );
@@ -9077,7 +9098,7 @@ mod inner {
                     .await?
             {
                 anyhow::bail!(
-                    "referenced upstream '{}' does not exist in namespace '{}'",
+                    "referenced upstream {:?} does not exist in namespace {:?}",
                     upstream_id,
                     proxy.namespace
                 );
@@ -9128,7 +9149,7 @@ mod inner {
                         .await
                     {
                         warn!(
-                            "MongoDB standalone proxy route-conflict restore failed for '{}': {}",
+                            "MongoDB standalone proxy route-conflict restore failed for {:?}: {}",
                             proxy.id, err
                         );
                     }
@@ -9153,12 +9174,12 @@ mod inner {
                     .await
                 {
                     warn!(
-                        "MongoDB standalone proxy upstream-vanished restore failed for '{}': {}",
+                        "MongoDB standalone proxy upstream-vanished restore failed for {:?}: {}",
                         proxy.id, err
                     );
                 }
                 anyhow::bail!(
-                    "referenced upstream '{}' does not exist in namespace '{}'",
+                    "referenced upstream {:?} does not exist in namespace {:?}",
                     upstream_id,
                     proxy.namespace
                 );
@@ -9837,7 +9858,8 @@ mod inner {
                         .await;
                     } else {
                         warn!(
-                            "Retaining MongoDB consumer identity reservations for '{}' in namespace '{}' because create rollback could not be verified",
+                            "Retaining MongoDB consumer identity reservations for {:?} in \
+                             namespace {:?} because create rollback could not be verified",
                             consumer.id, consumer.namespace
                         );
                     }
@@ -10119,7 +10141,7 @@ mod inner {
                                             .get_str("username")
                                             .map_err(|error| {
                                                 mongodb::error::Error::custom(format!(
-                                                    "consumer '{}' is missing username: {}",
+                                                    "consumer {:?} is missing username: {}",
                                                     id, error
                                                 ))
                                             })?
@@ -10136,7 +10158,8 @@ mod inner {
                                             })?
                                         {
                                             return Err(mongodb::error::Error::custom(format!(
-                                                "Consumer {} is referenced by access_control plugin_config '{}' and cannot be deleted",
+                                                "Consumer {:?} is referenced by access_control \
+                                                 plugin_config {:?} and cannot be deleted",
                                                 id,
                                                 plugin.id
                                             )));
@@ -10186,7 +10209,7 @@ mod inner {
                             return Ok(false);
                         };
                         let username = existing.get_str("username").map_err(|error| {
-                            anyhow::anyhow!("consumer '{}' is missing username: {}", id, error)
+                            anyhow::anyhow!("consumer {:?} is missing username: {}", id, error)
                         })?;
                         if let Some(plugin) = self
                             .find_access_control_consumer_ref_opt_session(
@@ -10197,7 +10220,8 @@ mod inner {
                             .await?
                         {
                             anyhow::bail!(
-                                "Consumer {} is referenced by access_control plugin_config '{}' and cannot be deleted",
+                                "Consumer {:?} is referenced by access_control plugin_config {:?} \
+                                 and cannot be deleted",
                                 id,
                                 plugin.id
                             );
@@ -10222,7 +10246,7 @@ mod inner {
                             {
                                 warn!(
                                     "MongoDB standalone consumer identity index cleanup failed for \
-                             consumer '{}' in namespace '{}': {}",
+                             consumer {:?} in namespace {:?}: {}",
                                     id, namespace, err
                                 );
                             }
@@ -11067,7 +11091,8 @@ mod inner {
                                     .await?;
                                 if proxy_refs > 0 {
                                     return Err(mongodb::error::Error::custom(format!(
-                                        "Upstream {} is referenced by one or more proxies and cannot be deleted",
+                                        "Upstream {:?} is referenced by one or more proxies and \
+                                         cannot be deleted",
                                         id
                                     )));
                                 }
@@ -11081,7 +11106,8 @@ mod inner {
                                     .map_err(|e| mongodb::error::Error::custom(e.to_string()))?
                                 {
                                     return Err(mongodb::error::Error::custom(format!(
-                                        "Upstream {} is referenced by mesh_route_dispatch plugin_config '{}' and cannot be deleted",
+                                        "Upstream {:?} is referenced by mesh_route_dispatch \
+                                         plugin_config {:?} and cannot be deleted",
                                         id, plugin.id
                                     )));
                                 }
@@ -11147,7 +11173,7 @@ mod inner {
                     .await?;
                 if proxy_refs > 0 {
                     anyhow::bail!(
-                        "Upstream {} is referenced by one or more proxies and cannot be deleted",
+                        "Upstream {:?} is referenced by one or more proxies and cannot be deleted",
                         id
                     );
                 }
@@ -11156,7 +11182,8 @@ mod inner {
                     .await?
                 {
                     anyhow::bail!(
-                        "Upstream {} is referenced by mesh_route_dispatch plugin_config '{}' and cannot be deleted",
+                        "Upstream {:?} is referenced by mesh_route_dispatch plugin_config {:?} \
+                         and cannot be deleted",
                         id,
                         plugin.id
                     );
@@ -11188,12 +11215,13 @@ mod inner {
                 if proxy_refs_after > 0 {
                     if let Err(err) = self.upstreams().insert_one(existing).await {
                         return Err(anyhow::Error::new(err).context(format!(
-                            "MongoDB standalone delete_upstream could not restore '{}' after a late proxy reference",
+                            "MongoDB standalone delete_upstream could not restore {:?} after a \
+                             late proxy reference",
                             id
                         )));
                     }
                     anyhow::bail!(
-                        "Upstream {} is referenced by one or more proxies and cannot be deleted",
+                        "Upstream {:?} is referenced by one or more proxies and cannot be deleted",
                         id
                     );
                 }
@@ -11985,7 +12013,7 @@ mod inner {
                 let doc_namespace = doc.get_str("namespace").unwrap_or("");
                 if doc_namespace != namespace {
                     return Ok(Some(format!(
-                        "Consumer identity '{}' conflicts with consumer '{}'",
+                        "Consumer identity {:?} conflicts with consumer {:?}",
                         value,
                         doc.get_str("consumer_id").unwrap_or("unknown")
                     )));
@@ -11994,7 +12022,7 @@ mod inner {
                     Ok(id) => id.to_string(),
                     Err(_) => {
                         return Ok(Some(format!(
-                            "Consumer identity '{}' conflicts with an existing consumer",
+                            "Consumer identity {:?} conflicts with an existing consumer",
                             value
                         )));
                     }
@@ -12562,7 +12590,7 @@ mod inner {
                             let Ok(consumer_id) = doc.get_str("consumer_id") else {
                                 adopt_ok = false;
                                 adopt_err = Some(anyhow::anyhow!(
-                                    "batch consumer identity reservation '{}' missing consumer_id",
+                                    "batch consumer identity reservation {:?} missing consumer_id",
                                     doc_id
                                 ));
                                 break;
@@ -12570,7 +12598,7 @@ mod inner {
                             let Ok(namespace) = doc.get_str("namespace") else {
                                 adopt_ok = false;
                                 adopt_err = Some(anyhow::anyhow!(
-                                    "batch consumer identity reservation '{}' missing namespace",
+                                    "batch consumer identity reservation {:?} missing namespace",
                                     doc_id
                                 ));
                                 break;
@@ -12578,7 +12606,8 @@ mod inner {
                             let Ok(identity_value) = doc.get_str("identity_value") else {
                                 adopt_ok = false;
                                 adopt_err = Some(anyhow::anyhow!(
-                                    "batch consumer identity reservation '{}' missing identity_value",
+                                    "batch consumer identity reservation {:?} missing \
+                                     identity_value",
                                     doc_id
                                 ));
                                 break;
@@ -13097,7 +13126,7 @@ mod inner {
             };
             let delete_error = |source: anyhow::Error| DeleteAllResourcesError::new(mode, source);
             mtls_lease.release().await.map_err(&delete_error)?;
-            info!("All MongoDB resources deleted (namespace='{}')", namespace);
+            info!("All MongoDB resources deleted (namespace={:?})", namespace);
             Ok(mode)
         }
 
@@ -13129,17 +13158,20 @@ mod inner {
                     .get(guard_owner)
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "MongoDB mTLS DNS admission guard is not active in this admin process for namespace '{namespace}'"
+                            "MongoDB mTLS DNS admission guard is not active in this admin process \
+                             for namespace {namespace:?}"
                         )
                     })?;
                 if persistent_pin.namespace != namespace {
                     anyhow::bail!(
-                        "MongoDB mTLS DNS admission guard belongs to a different namespace than '{namespace}'"
+                        "MongoDB mTLS DNS admission guard belongs to a different namespace than \
+                         {namespace:?}"
                     );
                 }
                 if persistent_pin.uncertain_outcome.load(Ordering::Acquire) {
                     anyhow::bail!(
-                        "MongoDB mTLS DNS admission guard for namespace '{namespace}' retained because a protected mutation outcome is uncertain"
+                        "MongoDB mTLS DNS admission guard for namespace {namespace:?} retained \
+                         because a protected mutation outcome is uncertain"
                     );
                 }
                 persistent_pin.pin.connection.clone()
@@ -14199,7 +14231,7 @@ mod inner {
                     // and this guarded write — never report that as a success.
                     if replace_result.matched_count != 1 {
                         anyhow::bail!(
-                            "API spec document not found for id '{}' in namespace '{}' during \
+                            "API spec document not found for id {:?} in namespace {:?} during \
                              metadata-only replace (matched_count={})",
                             spec.id,
                             spec.namespace,
@@ -14959,7 +14991,7 @@ mod inner {
                 let bson_bytes = mongodb::bson::to_vec(&spec_doc)?;
                 if bson_bytes.len() > 15 * 1024 * 1024 {
                     anyhow::bail!(
-                        "MongoDB document limit exceeded restoring api_spec '{}': \
+                        "MongoDB document limit exceeded restoring api_spec {:?}: \
                          serialized size is {} bytes (limit ~15 MiB)",
                         spec.id,
                         bson_bytes.len()
@@ -14986,7 +15018,7 @@ mod inner {
                         .await?;
                     if proxy_doc.is_none() {
                         anyhow::bail!(
-                            "cannot restore api_spec '{}': owning proxy '{}' is missing",
+                            "cannot restore api_spec {:?}: owning proxy {:?} is missing",
                             spec.id,
                             spec.proxy_id
                         );
@@ -16341,7 +16373,8 @@ mod inner {
             for (plugin_id, _) in &prepared.plugins {
                 if !seen_plugin_ids.insert(plugin_id.as_str()) {
                     anyhow::bail!(
-                        "duplicate key preflight: plugin_config id '{}' appears more than once in api_spec '{}' replacement bundle",
+                        "duplicate key preflight: plugin_config id {:?} appears more than once in \
+                         api_spec {:?} replacement bundle",
                         plugin_id,
                         spec.id
                     );
@@ -16381,7 +16414,8 @@ mod inner {
                     let owner = doc.get_str("api_spec_id").unwrap_or("<none>");
                     let owner_namespace = doc.get_str("namespace").unwrap_or("<unknown>");
                     anyhow::bail!(
-                        "duplicate key preflight: {} id '{}' already exists in namespace '{}' owned by api_spec '{}'; cannot replace api_spec '{}'",
+                        "duplicate key preflight: {} id {:?} already exists in namespace {:?} \
+                         owned by api_spec {:?}; cannot replace api_spec {:?}",
                         resource_type,
                         id,
                         owner_namespace,

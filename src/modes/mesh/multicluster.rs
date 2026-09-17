@@ -2027,13 +2027,15 @@ fn validate_remote_endpoints(
 ) -> Result<(), String> {
     if endpoints.workloads.len() > REMOTE_MAX_WORKLOADS_PER_CLUSTER {
         return Err(format!(
-            "remote cluster '{cluster_name}' returned {} workloads (max {REMOTE_MAX_WORKLOADS_PER_CLUSTER})",
+            "remote cluster {cluster_name:?} returned {} workloads (max \
+             {REMOTE_MAX_WORKLOADS_PER_CLUSTER})",
             endpoints.workloads.len()
         ));
     }
     if endpoints.services.len() > REMOTE_MAX_SERVICES_PER_CLUSTER {
         return Err(format!(
-            "remote cluster '{cluster_name}' returned {} services (max {REMOTE_MAX_SERVICES_PER_CLUSTER})",
+            "remote cluster {cluster_name:?} returned {} services (max \
+             {REMOTE_MAX_SERVICES_PER_CLUSTER})",
             endpoints.services.len()
         ));
     }
@@ -2153,7 +2155,7 @@ struct MissingSecretSource {
 impl RemoteServiceSource for MissingSecretSource {
     async fn fetch(&self) -> Result<RemoteDiscoveryCandidate, String> {
         Err(format!(
-            "remote cluster '{}' has no CP↔DP gRPC JWT secret configured; cannot authenticate to \
+            "remote cluster {:?} has no CP↔DP gRPC JWT secret configured; cannot authenticate to \
              the remote control plane (set FERRUM_CP_DP_GRPC_JWT_SECRET)",
             self.cluster_name
         ))

@@ -187,7 +187,7 @@ fn collect_plugin_config_errors(
             rejected.push(RejectedPluginConfig {
                 index,
                 message: format!(
-                    "Plugin '{}' (id={}): {error}",
+                    "Plugin {:?} (`id`={:?}): {error}",
                     plugin_config.plugin_name, plugin_config.id
                 ),
             });
@@ -877,7 +877,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_single_rejecting_error(config, "Duplicate listen_path '/duplicate'");
+        assert_single_rejecting_error(config, "Duplicate `listen_path` \"/duplicate\"");
     }
 
     #[test]

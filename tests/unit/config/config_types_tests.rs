@@ -1031,6 +1031,32 @@ fn stream_proxy(id: &str, scheme: BackendScheme, frontend_tls: bool) -> Proxy {
 }
 
 #[test]
+fn mtls_auth_compatibility_escapes_document_ids() {
+    let proxy_id = "unregistered'proxy\"\\tail";
+    let plugin_id = "unregistered'plugin\"\\tail";
+    let config = GatewayConfig {
+        proxies: vec![stream_proxy(proxy_id, BackendScheme::Tcp, false)],
+        plugin_configs: vec![mtls_plugin(
+            plugin_id,
+            PluginScope::Global,
+            None,
+            serde_json::json!({}),
+        )],
+        ..empty_config()
+    };
+    let errors = config.validate_mtls_auth_compatibility().unwrap_err();
+    assert_eq!(errors.len(), 1);
+    let error = &errors[0];
+    assert!(error.contains(&format!("Proxy {proxy_id:?}")), "{error}");
+    assert!(error.contains(&format!("PluginConfig {plugin_id:?}")), "{error}");
+    let rendered = ferrum_edge::startup::render_startup_error(&anyhow::anyhow!(error.clone()));
+    assert!(rendered.contains("`mtls_auth`"), "{rendered}");
+    assert!(rendered.contains("`frontend_tls=true`"), "{rendered}");
+    assert!(rendered.contains("`passthrough=false`"), "{rendered}");
+    assert!(!rendered.contains("unregistered"), "{rendered}");
+}
+
+#[test]
 fn mtls_auth_compatibility_rejects_plaintext_and_passthrough_streams() {
     let plaintext = stream_proxy("plain", BackendScheme::Tcp, false);
     let mut passthrough = stream_proxy("passthrough", BackendScheme::Tcp, false);
@@ -4099,7 +4125,7 @@ fn test_plugin_config_priority_override_too_high() {
         updated_at: Utc::now(),
     };
     let err = pc.validate_fields().unwrap_err();
-    assert!(err[0].contains("priority_override must be between 0 and 10000"));
+    assert!(err[0].contains("`priority_override` must be between 0 and 10000"));
 }
 
 #[test]
@@ -5102,7 +5128,7 @@ fn test_unique_listen_paths_same_path_catchall_conflict() {
     config.proxies = vec![make_proxy("p1", "/api"), make_proxy("p2", "/api")];
     let err = config.validate_unique_listen_paths().unwrap_err();
     assert_eq!(err.len(), 1);
-    assert!(err[0].contains("Duplicate listen_path"));
+    assert!(err[0].contains("Duplicate `listen_path`"));
 }
 
 #[test]

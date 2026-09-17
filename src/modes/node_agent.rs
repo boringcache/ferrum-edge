@@ -972,7 +972,7 @@ fn insert_node_source_ip(ips: &mut NodeSourceIps, var_name: &str, raw: &str) -> 
             Ok(())
         }
         Err(e) => Err(format!(
-            "{var_name} contains invalid IP address '{raw}': {e}"
+            "{var_name} contains invalid IP address {raw:?}: {e}"
         )),
     }
 }
@@ -10029,7 +10029,7 @@ fn initialize_backend_after_load(
                 metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
                 anyhow::bail!(
                     "Failed to attach the NodeWaypoint inbound tc ingress redirect to \
-                     '{iface}': {e}. Verify the interface exists on this node \
+                     {iface:?}: {e}. Verify the interface exists on this node \
                      (FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES) and the container has \
                      NET_ADMIN."
                 );

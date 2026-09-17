@@ -443,7 +443,7 @@ fn acquire_socket_ownership(socket_path: &str) -> std::io::Result<Option<File>> 
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
-                "CNI socket ownership lock '{}' must be a single-link regular file",
+                "CNI socket ownership lock {:?} must be a single-link regular file",
                 lock_path.display()
             ),
         ));
@@ -467,7 +467,7 @@ fn acquire_socket_ownership(socket_path: &str) -> std::io::Result<Option<File>> 
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "CNI socket ownership lock '{}' changed identity during acquisition",
+                    "CNI socket ownership lock {:?} changed identity during acquisition",
                     lock_path.display()
                 ),
             ));
@@ -547,7 +547,7 @@ impl SocketIdentity {
         if !metadata.file_type().is_socket() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("'{}' is not a Unix socket", path.display()),
+                format!("{:?} is not a Unix socket", path.display()),
             ));
         }
         Ok(Self {

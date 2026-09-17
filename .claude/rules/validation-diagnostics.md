@@ -42,5 +42,13 @@ paths:
   validators; plugin provider/schema/tag-name and numeric-bound diagnostics;
   regex admission in plugin triggers, route dispatch, response mock, OpenAPI,
   AI prompt/response/tool/PII filters, bot detection and WAF; OpenAPI/AI tool
-  JSON Schema compilation and plugin JSON type-rejection diagnostics. Preserve these
+  JSON Schema compilation and plugin JSON type-rejection diagnostics; gateway
+  mTLS compatibility and field-validation resource prefixes, consumer identity
+  collisions, locality/subset names, methods/IPs, numeric field bounds, TLS/MaxMind sources,
+  and plugin-construction identities; SQL/Mongo restore, reference, namespace,
+  row-decode and admission diagnostics; conf/env/pool parsers and namespace/file
+  load messages; CP namespace rejection, mesh startup paths, xDS carriers,
+  federation/remote clusters, probe/injector names, node-agent addresses/paths,
+  and revision identities. SQL literals, fixed migration/listener/fault labels,
+  and schema-only constants are not document-value interpolation. Preserve these
   conventions when adding sibling validators; keep field/index and reason.

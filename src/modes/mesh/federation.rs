@@ -491,19 +491,21 @@ pub(crate) fn parse_federation_document(
             {
                 return Err(format!(
                     "federation bundle trust_domain <redacted scalar> does not match remote \
-                     cluster trust domain '{expected_trust_domain}'"
+                     cluster trust domain {expected_trust_domain:?}"
                 ));
             }
             if native.x509_authorities.len() > FEDERATION_MAX_X509_AUTHORITIES {
                 return Err(format!(
-                    "federation bundle for '{expected_trust_domain}' has {} x509 authorities (max {})",
+                    "federation bundle for {expected_trust_domain:?} has {} x509 authorities (max \
+                     {})",
                     native.x509_authorities.len(),
                     FEDERATION_MAX_X509_AUTHORITIES
                 ));
             }
             if native.jwt_authorities.len() > FEDERATION_MAX_JWT_AUTHORITIES {
                 return Err(format!(
-                    "federation bundle for '{expected_trust_domain}' has {} JWT authorities (max {})",
+                    "federation bundle for {expected_trust_domain:?} has {} JWT authorities (max \
+                     {})",
                     native.jwt_authorities.len(),
                     FEDERATION_MAX_JWT_AUTHORITIES
                 ));
@@ -518,7 +520,7 @@ pub(crate) fn parse_federation_document(
         FederationDocument::SpiffeJwks(jwks) => {
             if jwks.keys.len() > FEDERATION_MAX_X509_AUTHORITIES + FEDERATION_MAX_JWT_AUTHORITIES {
                 return Err(format!(
-                    "federation JWKS for '{expected_trust_domain}' has {} keys (max {})",
+                    "federation JWKS for {expected_trust_domain:?} has {} keys (max {})",
                     jwks.keys.len(),
                     FEDERATION_MAX_X509_AUTHORITIES + FEDERATION_MAX_JWT_AUTHORITIES
                 ));
@@ -576,14 +578,14 @@ pub(crate) fn parse_federation_document(
 pub(crate) fn validate_polled_bundle(bundle: &TrustBundle) -> Result<(), String> {
     if bundle.x509_authorities.is_empty() && bundle.jwt_authorities.is_empty() {
         return Err(format!(
-            "federation bundle for trust domain '{}' has no authorities",
+            "federation bundle for trust domain {:?} has no authorities",
             bundle.trust_domain
         ));
     }
     bundle
         .decode_x509_authorities()
         .map(|_| ())
-        .map_err(|e| format!("federation bundle for '{}': {}", bundle.trust_domain, e))
+        .map_err(|e| format!("federation bundle for {:?}: {}", bundle.trust_domain, e))
 }
 
 /// One polling task per [`RemoteCluster.federation_endpoint`].
@@ -1162,7 +1164,7 @@ fn sanitize_endpoint_for_logging(endpoint: &str) -> String {
 pub(crate) fn validate_federation_endpoint(endpoint: &str) -> Result<(), String> {
     let url = reqwest::Url::parse(endpoint).map_err(|e| {
         format!(
-            "federation_endpoint '{}' is not a valid URL: {e}",
+            "federation_endpoint {:?} is not a valid URL: {e}",
             sanitize_endpoint_for_logging(endpoint)
         )
     })?;
@@ -1175,7 +1177,7 @@ pub(crate) fn validate_federation_endpoint(endpoint: &str) -> Result<(), String>
     }
     let Some(host) = url.host() else {
         return Err(format!(
-            "federation_endpoint '{}' has no host component",
+            "federation_endpoint {:?} has no host component",
             sanitize_endpoint_for_logging(endpoint)
         ));
     };

@@ -534,15 +534,15 @@ impl std::fmt::Display for NamespaceRegistryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NameInUse { name } => {
-                write!(f, "namespace '{name}' already exists")
+                write!(f, "namespace {name:?} already exists")
             }
-            Self::NotFound { name } => write!(f, "namespace '{name}' not found"),
+            Self::NotFound { name } => write!(f, "namespace {name:?} not found"),
             Self::NotEmpty { name } => write!(
                 f,
-                "namespace '{name}' still has resources; pass ?confirm=true to cascade-delete them"
+                "namespace {name:?} still has resources; pass ?confirm=true to cascade-delete them"
             ),
             Self::Protected { name, reason } => {
-                write!(f, "namespace '{name}' cannot be removed: {reason}")
+                write!(f, "namespace {name:?} cannot be removed: {reason}")
             }
         }
     }

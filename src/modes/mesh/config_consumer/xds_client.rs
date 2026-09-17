@@ -511,7 +511,7 @@ impl ResourceAccumulator {
             && (is_required_mesh_slice_type(type_url) || !resources.is_empty())
         {
             return Err(format!(
-                "xDS response for type_url '{type_url}' has empty version_info"
+                "xDS response for type_url {type_url:?} has empty version_info"
             ));
         }
 
@@ -521,13 +521,13 @@ impl ResourceAccumulator {
             if !resource.type_url.is_empty() && resource.type_url != type_url {
                 return Err(format!(
                     "resource type_url <redacted scalar> does not match response \
-                     type_url '{type_url}'"
+                     type_url {type_url:?}"
                 ));
             }
             let name = decode_resource_name(type_url, &resource.value)?;
             if name.is_empty() {
                 return Err(format!(
-                    "xDS resource for type_url '{type_url}' has an empty name"
+                    "xDS resource for type_url {type_url:?} has an empty name"
                 ));
             }
             validate_resource_name_shape(type_url, &name)?;
@@ -1270,7 +1270,7 @@ async fn handle_ads_response(
 ) -> Result<Option<PendingXdsSlice>, XdsAttemptError> {
     let type_url = response.type_url.clone();
     if !is_known_type_url(&type_url) {
-        let message = format!("unknown xDS response type_url '{type_url}'");
+        let message = format!("unknown xDS response type_url {type_url:?}");
         let mut nack = subscriptions.build_nack(&type_url, message.clone());
         nack.response_nonce = response.nonce.clone();
         send_ads_request(tx, nack, XDS_OUTBOUND_BOUND).await?;
@@ -1639,7 +1639,7 @@ fn reverse_translate(
             Err(e) => {
                 if reserved_dr_name.is_some() {
                     return Err(format!(
-                        "xDS reserved DestinationRule ECDS carrier '{}' failed JSON decode: {e}",
+                        "xDS reserved DestinationRule ECDS carrier {:?} failed JSON decode: {e}",
                         typed_extension.name
                     ));
                 }
@@ -1973,7 +1973,9 @@ fn validate_recovered_ext_authz_binding(
                 .any(|candidate| candidate.name == provider)
             {
                 return Err(format!(
-                    "xDS mesh slice recovery: AuthorizationPolicy '{}' in namespace '{}' uses action CUSTOM with external authorization provider '{}', which the recovered ExtAuthzProviders carrier does not declare",
+                    "xDS mesh slice recovery: AuthorizationPolicy {:?} in namespace {:?} uses \
+                     action CUSTOM with external authorization provider {:?}, which the recovered \
+                     ExtAuthzProviders carrier does not declare",
                     sanitize_mesh_ext_authz_diagnostic(&policy.name),
                     sanitize_mesh_ext_authz_diagnostic(&policy.namespace),
                     sanitize_mesh_ext_authz_diagnostic(provider)
@@ -2177,7 +2179,7 @@ fn recover_slice_carriers(
             Ok(None) => {}
             Err(e) => {
                 return Err(format!(
-                    "xDS mesh-slice ECDS carrier '{}' failed JSON decode for '{}': {e}",
+                    "xDS mesh-slice ECDS carrier {:?} failed JSON decode for {:?}: {e}",
                     typed_extension.name, inner.type_url
                 ));
             }
@@ -2253,7 +2255,7 @@ fn validate_ecds_mesh_slice_carrier(resource: &AccumulatedResource) -> Result<()
         Ok(Some(carrier)) => validate_recognized_mesh_slice_carrier(&carrier),
         Ok(None) => Ok(()),
         Err(e) => Err(format!(
-            "xDS mesh-slice ECDS carrier '{}' failed JSON decode for '{}': {e}",
+            "xDS mesh-slice ECDS carrier {:?} failed JSON decode for {:?}: {e}",
             typed_extension.name, inner.type_url
         )),
     }
@@ -2348,12 +2350,12 @@ fn validate_ecds_destination_rule_carrier(resource: &AccumulatedResource) -> Res
         .map_err(|e| {
             if reserved.is_some() {
                 format!(
-                    "xDS reserved DestinationRule ECDS carrier '{}' failed JSON decode: {e}",
+                    "xDS reserved DestinationRule ECDS carrier {:?} failed JSON decode: {e}",
                     typed_extension.name
                 )
             } else {
                 format!(
-                    "xDS DestinationRule ECDS carrier '{}' failed JSON decode: {e}",
+                    "xDS DestinationRule ECDS carrier {:?} failed JSON decode: {e}",
                     typed_extension.name
                 )
             }
@@ -2385,7 +2387,7 @@ fn decode_ecds_typed_extension(
 ) -> Result<proto::TypedExtensionConfig, String> {
     proto::TypedExtensionConfig::decode(resource.bytes.as_slice()).map_err(|e| {
         format!(
-            "xDS ECDS resource '{}' failed TypedExtensionConfig decode: {e}",
+            "xDS ECDS resource {:?} failed TypedExtensionConfig decode: {e}",
             resource.name
         )
     })
@@ -2431,7 +2433,8 @@ fn destination_rule_carrier_inner<'a>(
     let Some(inner) = typed_extension.typed_config.as_ref() else {
         if resource_name_is_reserved {
             return Err(format!(
-                "xDS ECDS resource '{}' uses reserved Ferrum DestinationRule carrier name without typed_config",
+                "xDS ECDS resource {:?} uses reserved Ferrum DestinationRule carrier name without \
+                 typed_config",
                 resource.name
             ));
         }
@@ -2440,7 +2443,7 @@ fn destination_rule_carrier_inner<'a>(
     if inner.type_url != FERRUM_ECDS_DESTINATION_RULE_TYPE_URL {
         if resource_name_is_reserved {
             return Err(format!(
-                "xDS ECDS resource '{}' uses reserved Ferrum DestinationRule carrier name \
+                "xDS ECDS resource {:?} uses reserved Ferrum DestinationRule carrier name \
                  with non-DR type_url <redacted scalar>",
                 resource.name
             ));
@@ -2466,7 +2469,8 @@ fn mesh_slice_carrier_inner<'a>(
     let Some(inner) = typed_extension.typed_config.as_ref() else {
         if resource_name_is_reserved {
             return Err(format!(
-                "xDS ECDS resource '{}' uses reserved Ferrum mesh-slice carrier name without typed_config",
+                "xDS ECDS resource {:?} uses reserved Ferrum mesh-slice carrier name without \
+                 typed_config",
                 resource.name
             ));
         }
@@ -2478,7 +2482,7 @@ fn mesh_slice_carrier_inner<'a>(
     if inner.type_url == FERRUM_ECDS_DESTINATION_RULE_TYPE_URL {
         if resource_name_is_reserved {
             return Err(format!(
-                "xDS ECDS resource '{}' uses reserved Ferrum mesh-slice carrier name \
+                "xDS ECDS resource {:?} uses reserved Ferrum mesh-slice carrier name \
                  with non-carrier type_url <redacted scalar>",
                 resource.name
             ));
@@ -2488,7 +2492,7 @@ fn mesh_slice_carrier_inner<'a>(
     let Some(expected_name) = carrier_resource_name_for_type_url(&inner.type_url) else {
         if resource_name_is_reserved {
             return Err(format!(
-                "xDS ECDS resource '{}' uses reserved Ferrum mesh-slice carrier name \
+                "xDS ECDS resource {:?} uses reserved Ferrum mesh-slice carrier name \
                  with non-carrier type_url <redacted scalar>",
                 resource.name
             ));
@@ -2498,8 +2502,8 @@ fn mesh_slice_carrier_inner<'a>(
     if resource.name != expected_name {
         if resource_name_is_reserved {
             return Err(format!(
-                "xDS ECDS resource <redacted scalar> uses carrier type_url '{}' \
-                 but must be named '{}'",
+                "xDS ECDS resource <redacted scalar> uses carrier type_url {:?} \
+                 but must be named `{}`",
                 inner.type_url, expected_name
             ));
         }

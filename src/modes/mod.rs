@@ -142,7 +142,8 @@ pub(crate) async fn schedule_admin_read_replica_reconnect_if_needed(
     };
     if needs_reconnect {
         info!(
-            "Read replica DNS changed for '{}': {:?} -> {:?}, scheduling admin-read replica reconnect",
+            "Read replica DNS changed for {:?}: {:?} -> {:?}, scheduling admin-read replica \
+             reconnect",
             replica_hostname, previous_ips, ips
         );
         let _scheduled = spawn_admin_read_replica_reconnect(

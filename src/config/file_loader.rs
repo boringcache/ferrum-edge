@@ -392,7 +392,7 @@ pub fn load_config_from_file(
         - config.upstreams.len();
     if filtered_out > 0 {
         info!(
-            "Namespace filter '{}': excluded {} resources from other namespaces",
+            "Namespace filter {:?}: excluded {} resources from other namespaces",
             namespace, filtered_out
         );
     }

@@ -822,7 +822,7 @@ mod mongo_incremental_poll_contract {
         );
         let message = error.to_string();
         assert!(
-            message.contains("non-string field 'resource_id'"),
+            message.contains("non-string field `resource_id`"),
             "typed decode error must name the field, got: {message}"
         );
         assert!(
@@ -841,7 +841,7 @@ mod mongo_incremental_poll_contract {
         let error = poll_cursor(1, &[missing, later])
             .expect_err("missing operation must abort before the cursor can move");
         assert!(
-            error.to_string().contains("missing field 'operation'"),
+            error.to_string().contains("missing field `operation`"),
             "missing field must fail closed, got: {error}"
         );
     }
@@ -886,7 +886,7 @@ mod mongo_incremental_poll_contract {
             };
             let message = error.to_string();
             assert!(
-                message.contains("invalid 'sequence'"),
+                message.contains("invalid `sequence`"),
                 "{label} sequence error must name the field, got: {message}"
             );
             assert!(
@@ -908,7 +908,7 @@ mod mongo_incremental_poll_contract {
         let error = decode_mongo_config_change_record(&malformed)
             .expect_err("a Double beyond 2^53 must fail closed");
         assert!(
-            error.to_string().contains("invalid 'sequence'"),
+            error.to_string().contains("invalid `sequence`"),
             "out-of-range sequence must fail closed, got: {error}"
         );
     }
@@ -923,7 +923,7 @@ mod mongo_incremental_poll_contract {
         let error = decode_mongo_config_change_record(&malformed)
             .expect_err("a string sequence must fail closed");
         assert!(
-            error.to_string().contains("invalid 'sequence'"),
+            error.to_string().contains("invalid `sequence`"),
             "string sequence must fail closed, got: {error}"
         );
     }
