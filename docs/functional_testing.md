@@ -354,6 +354,21 @@ filters its candidates. The generic harness's historical `ephemeral_port` and
 kernel source-port race during release/rebind; explicit binds by unrelated
 processes still require the existing bounded startup retries.
 
+TCP reservation binds use `socket2` with `SO_REUSEADDR=false`, matching the
+gateway's exclusive listener bind. A candidate still in TIME_WAIT, or held by
+an exiting child, is skipped on `AddrInUse` before a lease is granted. This also
+applies to native TCP fixtures and the generic harness's bare/held helpers;
+ordinary `std::net::TcpListener::bind` enables address reuse on Unix and cannot
+establish that a gateway could bind the same port exclusively.
+
+Each process starts scanning at a pseudo-random offset derived from its PID
+and a time-based nonce, then wraps through the eligible candidates once.
+Filtering precedes the offset, including for bounded and mesh ranges, so the
+excluded source range cannot concentrate allocations at its upper edge.
+Consecutive nextest processes therefore spread across the non-ephemeral range
+instead of repeatedly recycling its lowest ports. The same advisory locks and
+lease tables still coordinate ownership; exhaustion remains an explicit error.
+
 Keep `reserve_refused_tcp_port` bound for unavailable-backend fixtures. A future
 subprocess listener that must refuse connections before it starts instead uses
 `reserve_future_tcp_port`, which retains that behavior outside the source range.

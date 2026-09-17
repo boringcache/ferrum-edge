@@ -59,6 +59,9 @@
 //!   cargo test --test service_integration clickhouse
 
 mod common;
+#[path = "../scaffolding/mod.rs"]
+#[allow(dead_code)]
+mod scaffolding;
 
 mod clickhouse;
 mod consul;

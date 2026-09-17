@@ -10,6 +10,11 @@
 //! subprocess, release only the socket with `drop_and_take_port`: the registry
 //! lease survives until the test process exits. Reservations exclude the host's
 //! ephemeral source range so outbound connects cannot steal a released port.
+//! TCP reservations bind exclusively with `SO_REUSEADDR` disabled, skipping
+//! TIME_WAIT ports that the gateway could not bind. Each process scans from a
+//! PID/time-derived pseudo-random offset in the eligible range and wraps once,
+//! spreading consecutive test processes across ports instead of recycling the
+//! lowest numbers. Registry coordination and lease retention still apply.
 //! Native `TestSocket::bind_test(...:0)` fixtures must keep their socket bound.
 //! Keep the gateway's bounded bind retries for unrelated OS users, which do not
 //! participate in this registry.
@@ -32,7 +37,9 @@
 //! will itself bind), use [`PortReservation::drop_and_take_port`] explicitly
 //! so the reasoning is captured in the test source.
 
-use super::port_registry::{PortLease, TestSocket, process_registry};
+use super::port_registry::{
+    PortLease, TestSocket, bind_tcp_listener, bind_tcp_socket, process_registry,
+};
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -129,12 +136,13 @@ pub fn ephemeral_source_port_range() -> io::Result<RangeInclusive<u16>> {
 /// ports. Never fall back to port zero when this candidate set is exhausted.
 fn handoff_ports() -> io::Result<impl Iterator<Item = u16>> {
     let ephemeral = ephemeral_source_port_range()?;
-    Ok((10_240..=u16::MAX).filter(move |port| !ephemeral.contains(port)))
+    let candidates = (10_240..=u16::MAX).filter(move |port| !ephemeral.contains(port));
+    Ok(process_registry()?.candidates(candidates))
 }
 
 fn reserve_tcp_listener() -> io::Result<(PortLease, std::net::TcpListener)> {
     process_registry()?.lease_with(handoff_ports()?, |port| {
-        let listener = std::net::TcpListener::bind(("127.0.0.1", port))?;
+        let listener = bind_tcp_listener(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
         Ok((port, listener))
     })
 }
@@ -156,13 +164,13 @@ pub async fn reserve_port() -> io::Result<PortReservation> {
 /// ports when a fixture must release and rebind the socket during startup.
 pub fn reserve_port_in_range(ports: std::ops::Range<u16>) -> io::Result<PortReservation> {
     let ephemeral = ephemeral_source_port_range()?;
-    let (lease, listener) = process_registry()?.lease_with(
-        ports.filter(|port| *port >= 10_240 && !ephemeral.contains(port)),
-        |port| {
-            let listener = std::net::TcpListener::bind(("127.0.0.1", port))?;
-            Ok((port, listener))
-        },
-    )?;
+    let registry = process_registry()?;
+    let candidates =
+        registry.candidates(ports.filter(|port| *port >= 10_240 && !ephemeral.contains(port)));
+    let (lease, listener) = registry.lease_with(candidates, |port| {
+        let listener = bind_tcp_listener(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
+        Ok((port, listener))
+    })?;
     listener.set_nonblocking(true)?;
     Ok(PortReservation {
         port: lease.port,
@@ -252,7 +260,7 @@ pub async fn unbound_udp_port() -> io::Result<u16> {
 /// bind at the same port generally succeeds on the first try.
 pub async fn reserve_colocated_tcp_udp() -> io::Result<(PortReservation, UdpPortReservation)> {
     let (lease, (tcp, udp)) = process_registry()?.lease_with(handoff_ports()?, |port| {
-        let tcp = std::net::TcpListener::bind(("127.0.0.1", port))?;
+        let tcp = bind_tcp_listener(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
         let udp = std::net::UdpSocket::bind(("127.0.0.1", port))?;
         Ok((port, (tcp, udp)))
     })?;
@@ -342,15 +350,7 @@ impl RefusedTcpPort {
 }
 
 fn bind_unlistened_tcp_port(port: u16) -> io::Result<(u16, socket2::Socket)> {
-    let socket = socket2::Socket::new(
-        socket2::Domain::IPV4,
-        socket2::Type::STREAM,
-        Some(socket2::Protocol::TCP),
-    )?;
-    // Keep SO_REUSEADDR off so a parallel listener cannot steal the port
-    // while this reservation is held.
-    socket.set_reuse_address(false)?;
-    socket.bind(&SocketAddr::from((Ipv4Addr::LOCALHOST, port)).into())?;
+    let socket = bind_tcp_socket(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
     let port = socket
         .local_addr()?
         .as_socket()
