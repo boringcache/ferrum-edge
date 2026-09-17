@@ -1142,6 +1142,22 @@ impl Plugin for PluginInstanceWrapper {
     fn is_authorize_plugin(&self) -> bool {
         self.inner.is_authorize_plugin()
     }
+    /// Both halves of the HBONE live-admission contract must be forwarded, and
+    /// together (issues #5042, #5583). Their trait defaults are `false` and
+    /// `!is_authorize_plugin()`, so an unforwarded pair would resolve against
+    /// THIS wrapper: a wrapped `mesh_authz` would stop being re-evaluated by a
+    /// fence sweep while still classifying itself reusable — which is exactly
+    /// the stranded-decision reuse the classification exists to prevent — and a
+    /// wrapped IP-mode `rate_limiting` (`is_authorize_plugin() == false`) would
+    /// inherit `true` and let one charged CONNECT carry unbounded operations.
+    /// An operator setting `priority_override` or a trigger must not be able to
+    /// reach either state.
+    fn reevaluates_live_admission(&self) -> bool {
+        self.inner.reevaluates_live_admission()
+    }
+    fn allows_hbone_inner_reuse(&self) -> bool {
+        self.inner.allows_hbone_inner_reuse()
+    }
     fn modifies_request_headers(&self) -> bool {
         self.inner.modifies_request_headers()
     }

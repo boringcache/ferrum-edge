@@ -371,6 +371,19 @@ impl Plugin for StdoutLogging {
         super::ALL_PROTOCOLS
     }
 
+    /// Reusable (issue #5583): pure observability. It is a SINK — it acts only
+    /// in the post-transaction logging hooks, serializing summaries the proxy
+    /// already produced. It takes no admission decision, holds no per-request
+    /// budget, makes no external
+    /// admission call, and never rejects — so nothing an elided CONNECT would
+    /// have decided is lost. What reuse costs here is FIDELITY, not
+    /// enforcement: one tunnel summary stands for every operation the tunnel
+    /// carried, the same trade the relay already makes for the inner requests
+    /// it byte-copies without ever parsing them.
+    fn allows_hbone_inner_reuse(&self) -> bool {
+        true
+    }
+
     async fn log(&self, summary: &TransactionSummary) {
         if !self.should_log_transaction(summary) {
             return;

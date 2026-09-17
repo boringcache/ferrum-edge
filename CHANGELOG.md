@@ -70,6 +70,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fail_closed` through the same disjunction as the HTTP path, and a missed
   deadline is now warned about independently of `log_to_stdout`, since messages
   carry no `waf.*` metadata.
+- **HBONE inner-connection reuse is now advertised only when every admitting
+  plugin is reuse-safe** (issue #5583). A mesh destination stamps
+  `x-ferrum-mesh-tunnel-reuse: fenced` on a CONNECT `200` only when the HBONE
+  admission fence really holds the tunnel **and** every plugin in the chain that
+  admitted that CONNECT declares `Plugin::allows_hbone_inner_reuse()`. Reuse
+  elides CONNECTs whose request attributes would have been identical, so the
+  only thing they could have decided differently is time-varying state — and the
+  fence re-issues exactly two kinds: the local authorize verdict, on every
+  published generation, and the peer's mTLS credential. Anything that charges an
+  operation, or authenticates the CONNECT with a bearer credential the fence
+  does not track, previously had its single CONNECT-time decision honoured for
+  every later operation the reused tunnel carried. The classification is
+  fail-closed (`!is_authorize_plugin()` over a marker that itself defaults to
+  `true`), so every unclassified built-in and **every custom plugin** now
+  refuses. Reusable built-ins: `mesh_authz` (only while no external
+  authorization provider is bound to the generation — a sweep never re-consults
+  one), `access_control`, `spiffe_identity`, `workload_metrics`,
+  `stdout_logging`, `prometheus_metrics`, `otel_tracing`, `proxy_alerts`.
+  Explicitly non-reusable: `rate_limiting` (a token per operation, in every
+  `limit_by` mode), `adaptive_concurrency` (a permit), `request_mirror` (a
+  shadow dispatch). Datagram-over-HBONE tunnels never advertise at all. The only
+  operator-visible effect of a refusal is one CONNECT per operation, exactly as
+  before reuse existed; nothing is rejected that was not rejected before.
 
 ## [0.9.5] - 2026-09-13
 

@@ -586,6 +586,28 @@ pub(super) struct HboneAdmissionView {
     pub(super) sweep_epoch: u64,
 }
 
+/// Whether the plugin chain that ADMITTED this CONNECT permits the source to
+/// keep the application connection inside the tunnel and carry later
+/// operations over it (issue #5583).
+///
+/// The slice is the protocol-scoped chain the dispatcher resolved for THIS
+/// CONNECT (`PluginCacheView::plugins()` for the request's own protocol /
+/// gRPC-Web view), which is what actually decided it. A sweep later re-resolves
+/// the same view key — route overrides never move a request's `namespace|id`,
+/// so the key is stable — but it resolves it from whatever generation is then
+/// current, and it consults only `authorize_plugins()` that opt into
+/// `reevaluates_live_admission()`. The classification therefore has to run over
+/// the ADMITTING set: a plugin present at admission but absent from a later
+/// sweep is precisely the one whose decision reuse would strand.
+///
+/// Fail-closed and allocation-free: one boolean fold over a short slice, with
+/// an empty chain — nothing decided anything — reusable.
+fn admitting_chain_allows_inner_reuse(plugins: &[Arc<dyn Plugin>]) -> bool {
+    plugins
+        .iter()
+        .all(|plugin| plugin.allows_hbone_inner_reuse())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_hbone_request(
     state: &ProxyState,
@@ -1134,15 +1156,26 @@ pub(super) async fn handle_hbone_request(
         // is allowed to be seeded from.
         peer_credential,
     });
-    // Reuse is safe only when the fence holds the tunnel AND every plugin that
-    // admitted this CONNECT classifies its verdict as connection-reusable.
-    // In particular, rate limits and external authorization must run once per
-    // application operation rather than once per pooled tunnel.
-    let advertise_tunnel_reuse = tunnel.fence_in_force()
-        && admission_view
-            .plugins()
-            .iter()
-            .all(|plugin| plugin.allows_hbone_inner_reuse());
+    // Advertise the receiver-side admission fence on the CONNECT `200` (issue
+    // #5042 step 2) only when BOTH halves hold.
+    //
+    // The fence must really hold this tunnel: source-side reuse of the
+    // application connection inside it is admissible only because a later
+    // policy or credential generation can still reach the tunnel and cut it.
+    // Read BEFORE the relay task takes ownership of the handle, and never
+    // assumed from `admit()` having returned — see
+    // `AdmittedHboneTunnel::fence_in_force`.
+    //
+    // And every plugin that ADMITTED this CONNECT must classify its own
+    // verdict as connection-reusable (issue #5583). The fence re-issues the
+    // local authorize verdict and the peer credential, and nothing else: a
+    // rate limit that charged one CONNECT, an external CUSTOM authorization
+    // verdict no sweep re-consults, or a bearer credential whose lifetime the
+    // fence does not track would each be spent once and then honoured for an
+    // unbounded number of later operations. One `false` anywhere in the chain
+    // costs one CONNECT per operation, exactly as before reuse existed.
+    let advertise_tunnel_reuse =
+        tunnel.fence_in_force() && admitting_chain_allows_inner_reuse(plugins);
     let relay_proxy = proxy.clone();
     let relay_method = method.to_string();
     let relay_backend_target = backend_target.clone();
@@ -2012,6 +2045,19 @@ pub(super) async fn handle_hbone_udp_request(
     });
 
     record_request(state, StatusCode::OK.as_u16());
+    // A datagram tunnel NEVER advertises inner reuse, whatever its admitting
+    // chain would classify (issue #5583). There is no inner application
+    // connection to keep: this tunnel unframes into a local `UdpSocket` and
+    // carries no request/response exchange the source could pool, so the
+    // capability the mesh tunnel-reuse header names does not exist on this
+    // surface at all. Stamping nothing is therefore the same refusal
+    // `admitting_chain_allows_inner_reuse` gives the byte-stream relay, reached
+    // unconditionally rather than by classification — which is also why the gate
+    // must never be relaxed into "advertise when the chain allows it" here. Do
+    // not grow an advertisement on this response:
+    // `a_datagram_connect_never_advertises_reuse` and the source pin in
+    // `the_datagram_connect_path_never_stamps_the_reuse_header` both fail if
+    // one appears.
     Response::builder()
         .status(StatusCode::OK)
         .body(ProxyBody::empty())

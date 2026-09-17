@@ -1026,6 +1026,19 @@ impl Plugin for ProxyAlerts {
         false
     }
 
+    /// Reusable (issue #5583). This plugin acts only in the post-transaction
+    /// observability hooks (`log`, `on_stream_disconnect`, `on_ws_disconnect`):
+    /// it takes no admission decision, holds no per-request budget, and never
+    /// rejects. Reuse changes only how many tunnel summaries its alert windows
+    /// sample — the same fidelity trade every observability surface makes when
+    /// one tunnel carries many operations — not what any operation is allowed
+    /// to do. The trait default already says `true` here; this override makes
+    /// that a classification rather than a consequence of
+    /// `is_authorize_plugin()`.
+    fn allows_hbone_inner_reuse(&self) -> bool {
+        true
+    }
+
     fn warmup_hostnames(&self) -> Vec<String> {
         let mut hosts: Vec<String> = self
             .channel_by_id

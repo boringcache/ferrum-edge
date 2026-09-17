@@ -85,8 +85,8 @@ use ferrum_edge::identity::{
     TrustBundleSet as RuntimeTrustBundleSet, TrustDomain,
 };
 use ferrum_edge::modes::mesh::config::{
-    MeshConfig, MeshInboundRelayDestination, MeshInboundRelayHost, MeshPolicy,
-    MeshRelayEnrollmentEvidence, MtlsMode, PolicyScope,
+    MeshConfig, MeshExtAuthzProvider, MeshInboundRelayDestination, MeshInboundRelayHost,
+    MeshPolicy, MeshRelayEnrollmentEvidence, MtlsMode, PolicyAction, PolicyScope,
 };
 use ferrum_edge::modes::mesh::{MeshTrafficDirection, prepare_gateway_config_for_mesh};
 use ferrum_edge::plugins::{ProxyProtocol, RequestContext};
@@ -202,6 +202,23 @@ fn prepared_config_with(
     policies: Vec<MeshPolicy>,
     plugin_configs: Vec<PluginConfig>,
 ) -> GatewayConfig {
+    prepared_config_from_mesh(
+        proxy_backend_port,
+        proxy_id,
+        mesh_config_with(Vec::new(), Vec::new(), policies),
+        plugin_configs,
+    )
+}
+
+/// [`prepared_config_with`] over a fully-built [`MeshConfig`], for the cases
+/// that need slice state the policy list alone cannot express (the external
+/// authorization provider registry, for one).
+fn prepared_config_from_mesh(
+    proxy_backend_port: Option<u16>,
+    proxy_id: Option<&str>,
+    mesh: MeshConfig,
+    plugin_configs: Vec<PluginConfig>,
+) -> GatewayConfig {
     let runtime = default_mesh_runtime();
     let proxies = proxy_backend_port
         .map(|port| {
@@ -213,16 +230,102 @@ fn prepared_config_with(
         })
         .into_iter()
         .collect();
-    let mut config = gateway_config_with_mesh(
-        proxies,
-        Vec::new(),
-        mesh_config_with(Vec::new(), Vec::new(), policies),
-    );
+    let mut config = gateway_config_with_mesh(proxies, Vec::new(), mesh);
     config.plugin_configs = plugin_configs;
     let mut prepared =
         prepare_gateway_config_for_mesh(config, &runtime).expect("mesh-prepared config");
     retag_mesh_managed_plugins(&mut prepared);
     prepared
+}
+
+/// The `meshConfig.extensionProviders` entry a CUSTOM policy delegates to.
+/// Loopback so the provider validator accepts plaintext; nothing ever dials it
+/// in these tests.
+const FENCE_EXT_AUTHZ_PROVIDER: &str = "fence-ext-authz";
+
+fn ext_authz_provider() -> MeshExtAuthzProvider {
+    MeshExtAuthzProvider {
+        name: FENCE_EXT_AUTHZ_PROVIDER.to_string(),
+        service: "127.0.0.1".to_string(),
+        port: 9999,
+        tls: false,
+        path_prefix: Some("/check".to_string()),
+        timeout_ms: 500,
+        fail_open: false,
+        status_on_error: 403,
+        include_request_headers_in_check: Vec::new(),
+        include_additional_headers_in_check: Vec::new(),
+        include_request_body_in_check: None,
+        headers_to_upstream_on_allow: Vec::new(),
+        headers_to_downstream_on_deny: Vec::new(),
+        headers_to_downstream_on_allow: Vec::new(),
+    }
+}
+
+/// An `action: CUSTOM` policy that binds the provider above but whose rule can
+/// never match this suite's client — it names a DIFFERENT principal.
+///
+/// That is deliberate. `MeshAuthz` binds its executor per GENERATION, from the
+/// CUSTOM actions present in the slice, not per request; so this generation is
+/// one whose CONNECT is decided entirely by the local ALLOW tier and for which
+/// no external check is ever issued. It must STILL refuse reuse: the refusal is
+/// a property of the generation, because a sweep never re-consults a provider
+/// and the classification cannot depend on which rules a particular CONNECT
+/// happened to match.
+fn custom_policy_for_other_principal() -> MeshPolicy {
+    let mut policy = allow_other();
+    policy.name = "delegate-other".to_string();
+    policy.rules[0].action = PolicyAction::Custom {
+        provider: FENCE_EXT_AUTHZ_PROVIDER.to_string(),
+    };
+    policy
+}
+
+/// A globally scoped plugin row the reuse classification has never looked at.
+///
+/// `correlation_id` takes no authorization decision of any kind and never
+/// rejects, so it is the sharpest possible statement of the fail-closed rule:
+/// `Plugin::allows_hbone_inner_reuse` defaults to `!is_authorize_plugin()`, and
+/// `is_authorize_plugin` itself defaults to `true`, so ANY plugin nobody has
+/// classified — built-in or custom — refuses reuse.
+fn unclassified_plugin() -> PluginConfig {
+    PluginConfig {
+        labels: Default::default(),
+        id: "operator-correlation-id".to_string(),
+        plugin_name: "correlation_id".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        config: json!({}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+/// A globally scoped `access_control` row that admits any authenticated
+/// external identity. See
+/// `an_access_control_chain_refuses_the_connect_it_would_have_let_reuse` for
+/// why this never reaches the advertisement.
+fn access_control_plugin() -> PluginConfig {
+    PluginConfig {
+        labels: Default::default(),
+        id: "operator-access-control".to_string(),
+        plugin_name: "access_control".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        config: json!({ "allow_authenticated_identity": true }),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
 }
 
 /// A globally scoped `rate_limiting` instance keyed by the peer's SPIFFE
@@ -2728,14 +2831,25 @@ fn every_trust_publisher_stores_before_it_requests_a_sweep() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #5042 step 2: the fence's CAPABILITY ADVERTISEMENT.
+// Issue #5042 step 2: the fence's CAPABILITY ADVERTISEMENT, and issue #5583:
+// the PLUGIN CLASSIFICATION that qualifies it.
 //
 // Source-side reuse of the application connection inside a tunnel is
 // admissible only because a later policy or credential generation can still
 // reach that tunnel and cut it. The destination therefore SAYS so, on the
-// CONNECT `200`, and only while the fence really holds the tunnel. These tests
-// pin both directions of that contract; the source-side half — what a peer
-// does with the header — lives in `hbone_inner_pool_tests.rs`.
+// CONNECT `200`, and only while the fence really holds the tunnel.
+//
+// The fence re-issues two things and no more: the local authorize verdict, on
+// every publication, and the peer's mTLS credential. Reuse elides CONNECTs
+// whose request attributes would have been IDENTICAL, so the ONLY thing those
+// elided runs could have decided differently is time-varying state — and any
+// plugin whose time-varying state the fence does not re-issue must force a
+// fresh CONNECT per operation. `Plugin::allows_hbone_inner_reuse` is that
+// classification, fail-closed by default; these tests pin it end to end over a
+// real mTLS CONNECT. The static table of who classifies what lives in
+// `tests/unit/gateway_core/hbone_inner_reuse_classification_tests.rs`, and the
+// source-side half — what a peer does with the header — in
+// `hbone_inner_pool_tests.rs`.
 // ---------------------------------------------------------------------------
 
 /// The advertised value, read off the CONNECT response head.
@@ -2747,6 +2861,15 @@ fn tunnel_reuse_advertisement(response: &hyper::Response<h2::RecvStream>) -> Opt
         .map(str::to_string)
 }
 
+/// The ordinary mesh inbound chain is reusable end to end.
+///
+/// `prepare_gateway_config_for_mesh` injects `spiffe_identity`, `mesh_authz`,
+/// `workload_metrics`, and the `stdout_logging` access log, so this is not a
+/// one-plugin assertion: EVERY member of the production chain must classify
+/// itself reusable for the header to appear at all. Demoting any one of them —
+/// or adding a fifth injected plugin without classifying it — turns this
+/// advertisement off, which is the fail-closed direction and exactly what this
+/// test is here to notice.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_admitted_connect_advertises_the_fence_capability_on_its_200() {
     let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
@@ -2782,6 +2905,12 @@ async fn an_admitted_connect_advertises_the_fence_capability_on_its_200() {
     conn_task.abort();
 }
 
+/// A rate limit is a per-operation CHARGE, so it must not be spent once and
+/// then honoured for an unbounded number of operations.
+///
+/// The tunnel is still admitted and still fenced — the classification governs
+/// the CAPABILITY, never the admission — so the only observable difference is
+/// the absent header, and with it one CONNECT (and one charge) per operation.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_connect_with_per_request_rate_limiting_does_not_advertise_reuse() {
     let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
@@ -2799,11 +2928,219 @@ async fn a_connect_with_per_request_rate_limiting_does_not_advertise_reuse() {
 
     let (response, _request_body) = send_connect(&mut sender, None).await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(tunnel_reuse_advertisement(&response), None);
+    assert_eq!(
+        tunnel_reuse_advertisement(&response),
+        None,
+        "a chain that charges a token per operation must force one CONNECT per operation"
+    );
+    assert_eq!(
+        state.hbone_admission_fence.live_tunnels(),
+        1,
+        "the classification withholds the capability, it does not refuse the tunnel"
+    );
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0]);
+
+    let _ = shutdown_tx.send(true);
+    backend_handle.abort();
+    conn_task.abort();
+}
+
+/// `mesh_authz` with an external authorization provider bound is not reusable,
+/// because a sweep deliberately never re-consults that provider: the
+/// admission-time verdict stands for the tunnel's whole life
+/// (`MESH_AUTHZ_REEVALUATION_METADATA_KEY`). Reuse would therefore buy one
+/// external `allow` and honour it indefinitely.
+///
+/// The CUSTOM rule here matches a principal this client never presents, so the
+/// CONNECT is decided purely by the local ALLOW tier and no check is ever
+/// issued. The refusal must hold anyway — it is a property of the GENERATION,
+/// not of which rules one CONNECT happened to match.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connect_whose_mesh_authz_binds_an_external_authorizer_does_not_advertise_reuse() {
+    let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
+    let (backend_addr, backend_handle) = start_interactive_echo_backend().await;
+    let mesh = MeshConfig {
+        mesh_policies: vec![allow_client(), custom_policy_for_other_principal()],
+        ext_authz_providers: vec![ext_authz_provider()],
+        ..MeshConfig::default()
+    };
+    let state = build_state(prepared_config_from_mesh(
+        Some(backend_addr.port()),
+        None,
+        mesh,
+        Vec::new(),
+    ));
+    let (gateway_addr, shutdown_tx) =
+        start_inbound_gateway(state.clone(), hbone_server_config(&certs)).await;
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let (response, _request_body) = send_connect(&mut sender, None).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the local ALLOW tier still admits this CONNECT; only the capability is withheld"
+    );
+    assert_eq!(
+        tunnel_reuse_advertisement(&response),
+        None,
+        "a generation whose mesh_authz can delegate externally must force a fresh CONNECT, and \
+         a fresh external verdict, per operation"
+    );
+    assert_eq!(state.hbone_admission_fence.live_tunnels(), 1);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0]);
+
+    let _ = shutdown_tx.send(true);
+    backend_handle.abort();
+    conn_task.abort();
+}
+
+/// An UNCLASSIFIED plugin in the admitting chain withholds the capability, even
+/// when it takes no authorization decision at all.
+///
+/// `correlation_id` only stamps a header and never rejects, but nobody has
+/// declared it reuse-safe, so `!is_authorize_plugin()` over a marker that
+/// itself defaults to `true` refuses it — and one refusal anywhere in the chain
+/// is the whole chain's answer. That is the intended direction: a new built-in,
+/// or any custom plugin, must be looked at before it can ride a reused tunnel.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connect_whose_chain_carries_an_unclassified_plugin_does_not_advertise_reuse() {
+    let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
+    let (backend_addr, backend_handle) = start_interactive_echo_backend().await;
+    let state = build_state(prepared_config_with(
+        Some(backend_addr.port()),
+        None,
+        vec![allow_client()],
+        vec![unclassified_plugin()],
+    ));
+    let (gateway_addr, shutdown_tx) =
+        start_inbound_gateway(state.clone(), hbone_server_config(&certs)).await;
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let (response, _request_body) = send_connect(&mut sender, None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        tunnel_reuse_advertisement(&response),
+        None,
+        "an unclassified plugin must fail closed, whatever it actually does"
+    );
     assert_eq!(state.hbone_admission_fence.live_tunnels(), 1);
 
     let _ = shutdown_tx.send(true);
     backend_handle.abort();
+    conn_task.abort();
+}
+
+/// `access_control` IS classified reusable — its verdict is a pure function of
+/// the request's identity inputs and immutable allow/deny sets, and every
+/// published generation requests a sweep that re-runs exactly that hook
+/// (`reevaluates_live_admission`). The classification is pinned statically in
+/// `hbone_inner_reuse_classification_tests.rs`.
+///
+/// It cannot be pinned end to end in the ADVERTISING direction, and this test
+/// records why rather than leaving a silent gap: an HBONE CONNECT carries no
+/// mapped gateway Consumer and no `authenticated_identity` — `spiffe_identity`
+/// admits a certificate PRINCIPAL, which is a different field — so
+/// `access_control` refuses every such CONNECT before a tunnel can exist. Its
+/// reuse classification is therefore unreachable on this path today, and the
+/// refusal below is what would have to change first.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_access_control_chain_refuses_the_connect_it_would_have_let_reuse() {
+    let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
+    let (backend_addr, backend_handle) = start_interactive_echo_backend().await;
+    let state = build_state(prepared_config_with(
+        Some(backend_addr.port()),
+        None,
+        vec![allow_client()],
+        vec![access_control_plugin()],
+    ));
+    let (gateway_addr, shutdown_tx) =
+        start_inbound_gateway(state.clone(), hbone_server_config(&certs)).await;
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let (response, _request_body) = send_connect(&mut sender, None).await;
+    assert_ne!(
+        response.status(),
+        StatusCode::OK,
+        "access_control has no mapped Consumer for an HBONE CONNECT and refuses it"
+    );
+    assert_eq!(
+        tunnel_reuse_advertisement(&response),
+        None,
+        "a refused CONNECT advertises nothing"
+    );
+    assert_eq!(
+        state.hbone_admission_fence.live_tunnels(),
+        0,
+        "no tunnel was admitted, so none can be reused"
+    );
+
+    let _ = shutdown_tx.send(true);
+    backend_handle.abort();
+    conn_task.abort();
+}
+
+/// The datagram CONNECT path never advertises reuse, whatever its admitting
+/// chain classified.
+///
+/// A datagram tunnel unframes into a local `UdpSocket` and carries no inner
+/// request/response exchange the source could pool, so the capability does not
+/// exist on that surface at all.
+///
+/// The distinction matters, and this fixture is what makes it observable: the
+/// egress-UDP gateway carries no plugin that refuses reuse — its only
+/// configured global is `spiffe_identity`, which IS classified reusable — so
+/// the classification would have said yes here. The absent header is therefore
+/// the SURFACE refusing unconditionally, not a plugin declining, which is
+/// exactly the property that must survive someone later "fixing" the datagram
+/// path to consult its chain.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_datagram_connect_never_advertises_reuse() {
+    let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
+    let (external_addr, external_handle) = start_external_udp_echo().await;
+    let state = create_egress_udp_gateway_state(egress_udp_mesh_config(
+        "127.0.0.1",
+        external_addr.port(),
+        external_addr.port(),
+    ));
+    let (gateway_addr, shutdown_tx) =
+        start_inbound_gateway(state.clone(), hbone_server_config(&certs)).await;
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let (response_fut, mut request_body) = sender
+        .send_request(
+            udp_connect_request(&format!("127.0.0.1:{}", external_addr.port())),
+            false,
+        )
+        .expect("send udp CONNECT");
+    let response = tokio::time::timeout(DEADLINE, response_fut)
+        .await
+        .expect("udp CONNECT response within deadline")
+        .expect("udp CONNECT response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        tunnel_reuse_advertisement(&response),
+        None,
+        "a datagram tunnel has no inner application connection to keep"
+    );
+    let mut response_body = response.into_body();
+
+    // The tunnel is genuinely live and fenced — the absent header is the
+    // surface having no such capability, not a failed admission.
+    request_body
+        .send_data(frame_datagram(b"ping"), false)
+        .expect("send framed datagram");
+    let echoed = tokio::time::timeout(DEADLINE, read_framed_datagram(&mut response_body))
+        .await
+        .expect("external udp reply");
+    assert_eq!(echoed, b"pong:ping".to_vec());
+    assert_eq!(state.hbone_admission_fence.live_tunnels(), 1);
+
+    let _ = shutdown_tx.send(true);
+    external_handle.abort();
     conn_task.abort();
 }
 

@@ -11300,13 +11300,49 @@ pub trait Plugin: Send + Sync {
         false
     }
 
-    /// Returns `true` when an admitted HBONE CONNECT may safely carry later
-    /// application requests without running this plugin again.
+    /// Returns `true` when one admitted HBONE CONNECT may carry LATER
+    /// application operations without this plugin running again (issue #5583).
     ///
-    /// Non-authorization plugins are reusable by default. Authorization
-    /// plugins must opt in explicitly; the default `is_authorize_plugin()` is
-    /// `true`, so an unknown/custom plugin fails closed. Plugins with admission
-    /// side effects outside `authorize` must also override this to `false`.
+    /// The destination stamps
+    /// [`crate::modes::mesh::hbone::TUNNEL_REUSE_HEADER`] on a CONNECT `200`
+    /// only when every plugin in the ADMITTING request view returns `true`
+    /// here, so one `false` anywhere in the chain forces one CONNECT — and one
+    /// full destination admission decision — per application operation, exactly
+    /// as before reuse existed.
+    ///
+    /// The question this answers is narrow, because the relay is a transparent
+    /// byte tunnel: the destination never parses the inner application
+    /// requests, reused or not. What reuse changes is only how MANY times this
+    /// chain runs, and it runs with IDENTICAL request attributes each time (the
+    /// same peer, the same CONNECT authority, the same `CONNECT` method). So
+    /// the only thing that can differ between the CONNECT the source made and
+    /// the CONNECTs reuse elided is TIME. A plugin may therefore return `true`
+    /// only when one of these holds:
+    ///
+    /// 1. it takes no per-operation decision and has no per-operation side
+    ///    effect — pure request rewriting, or observability that holds no
+    ///    per-request quota; or
+    /// 2. every decision it takes for this tunnel is RE-ISSUED for the tunnel's
+    ///    whole life by the admission fence
+    ///    ([`crate::proxy::hbone_admission_fence`]) on every generation change
+    ///    that could flip it.
+    ///
+    /// Anything that consumes a budget, takes a permit, dispatches a mirror, or
+    /// asks an external service must return `false`: reuse would spend one
+    /// token, permit, or external verdict for an unbounded number of
+    /// operations. So must anything that authenticates the CONNECT with a
+    /// BEARER credential (`jwt_auth`, `oidc`, `oauth2_introspection`,
+    /// `key_auth`, `basic_auth`, `hmac_auth`, `ldap_auth`, `opa`, ...): the
+    /// fence bounds the mTLS leaf and nothing else, so a bearer token's own
+    /// expiry would never reach a reused tunnel. The default already refuses
+    /// every one of them; do not opt any of them in.
+    ///
+    /// The default is `!is_authorize_plugin()`, and
+    /// [`Self::is_authorize_plugin`] itself defaults to `true` — so a plugin
+    /// nobody has classified, including every custom plugin, refuses reuse. A
+    /// plugin whose `is_authorize_plugin()` is `false` inherits `true` from
+    /// that default, which is NOT a classification: every such built-in
+    /// overrides this method explicitly so nothing is reusable by accident.
     fn allows_hbone_inner_reuse(&self) -> bool {
         !self.is_authorize_plugin()
     }

@@ -819,9 +819,14 @@ impl Plugin for RateLimiting {
         matches!(self.limit_by, LimitBy::Consumer | LimitBy::SpiffeIdentity)
     }
 
-    // Every application operation must consume its own token. This is also
-    // required for IP limiting, which runs in `on_request_received` rather
-    // than in the authorize phase.
+    /// Never reusable, in any `limit_by` mode (issue #5583). A limit is a
+    /// per-operation CHARGE: reuse would consume one token on the CONNECT and
+    /// then let an unbounded number of later operations ride free, which is the
+    /// budget bypass this classification exists to prevent. The mode matters
+    /// for the default, not for the answer — `is_authorize_plugin()` is `false`
+    /// for IP limiting (it charges in `on_request_received`, not in the
+    /// authorize phase), so the trait default would have said `true` exactly
+    /// there.
     fn allows_hbone_inner_reuse(&self) -> bool {
         false
     }

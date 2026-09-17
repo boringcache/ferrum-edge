@@ -87,6 +87,17 @@ impl Plugin for AdaptiveConcurrency {
         false
     }
 
+    /// Admission here is a PERMIT, taken once per operation and held for its
+    /// life (issue #5583). Reuse would take one permit and then let an
+    /// unbounded number of later operations run outside the in-flight count
+    /// this plugin exists to bound, so the limiter would under-count exactly
+    /// the load it is shedding against. `is_authorize_plugin()` is `false`
+    /// here, so the trait default would have said `true`; this override is the
+    /// classification.
+    fn allows_hbone_inner_reuse(&self) -> bool {
+        false
+    }
+
     fn is_backend_admission_plugin(&self) -> bool {
         true
     }

@@ -6321,6 +6321,19 @@ impl Plugin for PrometheusMetrics {
         );
     }
 
+    /// Reusable (issue #5583): pure observability. Its request-phase hooks
+    /// stamp one observed-marker key on the context; everything else it does is
+    /// recording completed transactions. It takes no admission decision, holds
+    /// no per-request budget, makes no external
+    /// admission call, and never rejects — so nothing an elided CONNECT would
+    /// have decided is lost. What reuse costs here is FIDELITY, not
+    /// enforcement: one tunnel summary stands for every operation the tunnel
+    /// carried, the same trade the relay already makes for the inner requests
+    /// it byte-copies without ever parsing them.
+    fn allows_hbone_inner_reuse(&self) -> bool {
+        true
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         ctx.metadata.insert(
             prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA.to_string(),
