@@ -1978,6 +1978,11 @@ enum ServerTimeMode {
     /// A restrictive ACL: `TIME` is refused, and the client must fall back to
     /// local-clock mode instead of failing admission.
     Denied,
+    /// The standalone probe answers a real clock, but the `TIME` queued inside
+    /// a transaction answers something that is not one. The client must treat
+    /// that as an unusable endpoint rather than silently reinstating its own
+    /// clock on an endpoint that claimed to support the server's.
+    MalformedInTransaction,
 }
 
 /// Knobs for one fake server. Defaults answer everything immediately from the
@@ -1990,6 +1995,9 @@ struct KeyspaceServerOptions {
     compensation_delay: Duration,
     delayed_compensations: usize,
     time_mode: ServerTimeMode,
+    /// Append one bogus element to every `EXEC` array, so the client's
+    /// reply-length validation sees a shape it cannot pair with its windows.
+    extra_exec_element: bool,
 }
 
 impl Default for KeyspaceServerOptions {
@@ -2001,6 +2009,7 @@ impl Default for KeyspaceServerOptions {
             compensation_delay: Duration::ZERO,
             delayed_compensations: 0,
             time_mode: ServerTimeMode::RealClock,
+            extra_exec_element: false,
         }
     }
 }
@@ -2060,20 +2069,28 @@ impl KeyspaceState {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
         match self.options.time_mode {
-            ServerTimeMode::RealClock => Some(real),
+            ServerTimeMode::RealClock | ServerTimeMode::MalformedInTransaction => Some(real),
             ServerTimeMode::Ahead(shift) => Some(real.saturating_add(shift)),
             ServerTimeMode::Denied => None,
         }
     }
 
+    /// Whether a `TIME` queued inside a transaction answers a non-clock.
+    fn breaks_transaction_time(&self) -> bool {
+        self.options.time_mode == ServerTimeMode::MalformedInTransaction
+    }
+
     /// Apply ONE command to the fake keyspace and return its RESP reply.
-    fn apply(&self, args: &[String]) -> Vec<u8> {
+    fn apply(&self, args: &[String], in_transaction: bool) -> Vec<u8> {
         let name = args
             .first()
             .map(|arg| arg.to_uppercase())
             .unwrap_or_default();
         // Read the clock before taking the keyspace lock; `TIME` touches no key.
         if name == "TIME" {
+            if in_transaction && self.breaks_transaction_time() {
+                return b"+OK\r\n".to_vec();
+            }
             return match self.server_now() {
                 Some(now) => encode_server_time(now),
                 None => TIME_DENIED_REPLY.to_vec(),
@@ -2170,9 +2187,14 @@ impl KeyspaceState {
                 if !schedule.hold.is_zero() && schedule.phase == HoldPhase::BeforeApply {
                     tokio::time::sleep(schedule.hold).await;
                 }
-                let mut body = format!("*{}\r\n", batch.len()).into_bytes();
+                let extra = usize::from(self.options.extra_exec_element);
+                let values = batch.len() + extra;
+                let mut body = format!("*{values}\r\n").into_bytes();
                 for command in &batch {
-                    body.extend_from_slice(&self.apply(command));
+                    body.extend_from_slice(&self.apply(command, true));
+                }
+                if self.options.extra_exec_element {
+                    body.extend_from_slice(b":1\r\n");
                 }
                 if !schedule.hold.is_zero() && schedule.phase == HoldPhase::AfterApply {
                     tokio::time::sleep(schedule.hold).await;
@@ -2184,7 +2206,7 @@ impl KeyspaceState {
                     batch.push(args);
                     reply.extend_from_slice(b"+QUEUED\r\n");
                 }
-                None => reply.extend_from_slice(&self.apply(&args)),
+                None => reply.extend_from_slice(&self.apply(&args, false)),
             },
         }
     }
@@ -3109,6 +3131,92 @@ async fn an_acl_that_denies_time_falls_back_to_local_clock_mode() {
         server.charged_total(),
         1,
         "a refusal leaves no lasting charge"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// Reply-shape validation for the server-clock transaction: a reply this code
+/// cannot pair with its windows is an unusable ENDPOINT, never a quota
+/// decision.
+///
+/// The `INCR`s have already landed when the mismatch is seen, so the client
+/// marks itself unavailable and hands the next decision to
+/// `redis_failure_policy` rather than re-charging a reply it cannot read on
+/// every request.
+#[tokio::test]
+async fn a_charge_reply_with_an_extra_element_is_refused_in_server_clock_mode() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        extra_exec_element: true,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 5,
+        duration: Duration::from_secs(1),
+    }]);
+    assert!(
+        client.server_clock().server_time_permitted(),
+        "this coverage is about the SERVER-CLOCK reply shape"
+    );
+    let result = algorithm.check_redis(&client, "ip:127.0.0.1", &op).await;
+    assert!(
+        result.is_err(),
+        "a reply one element longer than the ladder plus its clock must refuse: {result:?}"
+    );
+    assert!(
+        !client.is_available(),
+        "an unpairable reply is an unusable endpoint, so the NEXT decision goes \
+         through redis_failure_policy instead of re-charging"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// A `TIME` the transaction answered with something that is not a clock fails
+/// closed instead of silently falling back to this gateway's own clock.
+///
+/// The standalone probe succeeded, so the endpoint claimed the server-clock
+/// contract. Quietly reinstating the local clock there would put the skew term
+/// back into the ladder on exactly the deployments that believe they do not
+/// have one.
+#[tokio::test]
+async fn a_transaction_clock_this_code_cannot_read_fails_closed() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        time_mode: ServerTimeMode::MalformedInTransaction,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 5,
+        duration: Duration::from_secs(1),
+    }]);
+    assert!(
+        client.server_clock().server_time_permitted(),
+        "the standalone probe must have succeeded for this to be the case under test"
+    );
+    let result = algorithm.check_redis(&client, "ip:127.0.0.1", &op).await;
+    assert!(
+        result.is_err(),
+        "an unreadable server clock must refuse, not read as a local instant: {result:?}"
+    );
+    assert!(
+        !client.is_available(),
+        "the endpoint claimed the server-clock contract and did not honour it"
     );
 
     let _ = server.shutdown.send(());
