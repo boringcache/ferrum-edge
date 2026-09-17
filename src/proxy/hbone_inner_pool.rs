@@ -506,14 +506,15 @@ impl KeySlot {
     fn is_empty(&self) -> bool {
         self.h1_idle.is_empty() && self.h2.is_none()
     }
-
-    fn len(&self) -> usize {
-        self.h1_idle.len() + usize::from(self.h2.is_some())
-    }
 }
 
-/// Fixed-cardinality counters this pool exports through
-/// `/metrics/runtime`-adjacent surfaces and the Prometheus registry.
+/// A snapshot of this pool's own process-lifetime counters.
+///
+/// The operator-facing view is the Prometheus family
+/// `ferrum_mesh_hbone_inner_pool_events_total`, which every recorder below
+/// increments in step; this struct is the same accounting read back directly,
+/// which is what lets a test assert "one CONNECT, two hits" rather than
+/// scraping an exposition.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HboneInnerPoolStats {
     pub h1_hits: u64,
