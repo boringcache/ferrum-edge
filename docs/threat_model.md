@@ -283,8 +283,9 @@ request content through a logging or AI plugin.
 - Log field redaction and a process-wide retained-byte ceiling on logging
   plugins — [log_schema.md](log_schema.md),
   [Process-wide retained-byte ceiling](plugins.md#process-wide-retained-byte-ceiling).
-- Redis-backed rate limiting fails closed by default when the store cannot be
-  consulted — [rate_limiting](plugins.md#rate_limiting).
+- Redis-backed rate limiting fails closed **only** with an explicit
+  `redis_failure_policy: fail_closed`; the `rate_limiting` default is
+  `local_fallback` — [rate_limiting](plugins.md#rate_limiting).
 
 **Residuals at this boundary.**
 
@@ -301,6 +302,14 @@ request content through a logging or AI plugin.
   boundary; review [plugins.md](plugins.md) and
   [log_schema.md](log_schema.md) before enabling one.
 - `kafka_logging` cannot be egress-screened at all (see Boundary 2).
+- **A `rate_limiting` outage multiplies the configured budget by the number of
+  reachable pods.** `rate_limiting` defaults to
+  `redis_failure_policy: local_fallback`, so while the centralized store cannot
+  be consulted each gateway process enforces the configured quota out of its own
+  memory: a caller spread across the fleet gets one budget per pod for the
+  duration of the outage. Set `fail_closed` on the policies where refusing is
+  preferable to over-admitting; the other five rate-limit plugins already
+  default to it — [rate_limiting](plugins.md#rate_limiting).
 
 ## Residuals
 
@@ -322,6 +331,7 @@ release, not an open defect awaiting a fix in this document's scope.
 | Mesh capability varies by topology; node waypoint is experimental | 5 | [Maturity and Support Status](mesh.md#maturity-and-support-status) |
 | The node agent's blast radius exceeds the gateway's | 5 | [Blast radius if compromised](node_agent_security.md#blast-radius-if-compromised) |
 | WAF default rules ship monitor-only | 1 | [Default rules ship monitor-only](waf.md#default-rules-ship-monitor-only--and-how-to-enforce-them) |
+| A `rate_limiting` Redis outage yields one budget per pod (`local_fallback` default) | 6 | [rate_limiting](plugins.md#rate_limiting) |
 | Non-loopback plaintext admin only warns in `file`/`dp`/`mesh` | 3 | [Admin API](configuration.md#admin-api) |
 
 ## Out of scope

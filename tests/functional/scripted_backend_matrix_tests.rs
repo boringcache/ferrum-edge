@@ -116,6 +116,8 @@ gateway_matrix! {
 // (`TcpStep::Reset` — `SO_LINGER=0` then drop). Distinct error
 // class from "refuse" — exercises the gateway's "request error"
 // classifier rather than its "connect error" classifier.
+// The fixture repeats Reset on EVERY connection, including any capability
+// probe. Issue #5575 was not a Once-mode scenario; preserve that distinction.
 //
 // Generated tests (after skips):
 //
@@ -162,7 +164,12 @@ gateway_matrix! {
             .spawn()
             .await?;
 
-        let response = frontend.send_get(&harness, backend.request_path()).await?;
+        let response = frontend.send_get(&harness, backend.request_path()).await;
+        // Nextest prints captured output on failure. Keep the original cold
+        // in-process path, but expose whether the fixture accepted and reset
+        // the socket instead of inferring that from the HTTP status alone.
+        eprintln!("RST fixture: {}", backend_handle.diagnostics().await);
+        let response = response?;
         frontend.assert_status(&response, 502);
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     },

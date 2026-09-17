@@ -191,7 +191,7 @@ topology. Node-agent deployments have their own posture document:
 |---|---|---|---|
 | Always verify token expiry on JWT auth | plugin `jwt` config | expiry validation is required, never disabled | [Plugin reference](plugins.md) |
 | Bound remote signing-key trust | `jwks_auth` `jwks_max_stale_seconds` | shorter than the default hour when revocation must converge fast | [SECURITY.md](../SECURITY.md) |
-| Fail closed when the shared rate-limit store is unreachable | `rate_limiting` `redis_failure_policy` | `fail_closed` (the default) | [rate_limiting](plugins.md#rate_limiting) |
+| Fail closed when the shared rate-limit store is unreachable | `rate_limiting` `redis_failure_policy` | `fail_closed` — must be set explicitly; the default is now `local_fallback` | [rate_limiting](plugins.md#rate_limiting) |
 | Enforce, do not just monitor, the WAF | WAF plugin mode | enforcement mode; the default rule pack ships monitor-only | [Default rules ship monitor-only](waf.md#default-rules-ship-monitor-only--and-how-to-enforce-them) |
 | Bound request bodies | `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` | a real ceiling; `0` is unlimited | [Size limits](size_limits.md) |
 | Keep plugin egress inside the backend policy | `FERRUM_BACKEND_ALLOW_IPS` and the CIDR lists | see §4 — plugin endpoints are screened by the same policy | [Backend Egress / SSRF Protection](configuration.md#backend-egress--ssrf-protection) |

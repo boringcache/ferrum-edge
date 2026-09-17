@@ -1664,7 +1664,7 @@ fn redis_rate_limit_config(extra: Value) -> Value {
 }
 
 #[test]
-fn redis_failure_policy_defaults_to_fail_closed_for_every_consumer() {
+fn redis_failure_policy_defaults_to_local_fallback_for_http_rate_limiting() {
     use ferrum_edge::_test_support::{RedisFailurePolicy, rate_limit_redis_failure_policy};
 
     let default_config = redis_rate_limit_config(json!({}));
@@ -1672,19 +1672,19 @@ fn redis_failure_policy_defaults_to_fail_closed_for_every_consumer() {
         .expect("valid redis config");
     assert_eq!(
         policy,
-        Some(RedisFailurePolicy::FailClosed),
-        "an unspecified redis_failure_policy must not silently degrade to per-process budgets"
+        Some(RedisFailurePolicy::LocalFallback),
+        "an unspecified HTTP rate-limiter policy preserves per-pod availability"
     );
 
     let explicit = rate_limit_redis_failure_policy(
         "rate_limiting",
-        &redis_rate_limit_config(json!({ "redis_failure_policy": "local_fallback" })),
+        &redis_rate_limit_config(json!({ "redis_failure_policy": "fail_closed" })),
     )
     .expect("valid redis config");
     assert_eq!(
         explicit,
-        Some(RedisFailurePolicy::LocalFallback),
-        "per-process fallback must require an explicit operator opt-in"
+        Some(RedisFailurePolicy::FailClosed),
+        "operators can explicitly require centralized enforcement"
     );
 
     // A local-only policy has no centralized store to lose.
@@ -1784,13 +1784,26 @@ fn redis_failure_policy_is_accepted_by_every_rate_limit_consumer() {
         ),
     ];
 
-    for (plugin, config) in cases {
+    for (plugin, mut config) in cases {
         let policy = rate_limit_redis_failure_policy(plugin, &config)
             .unwrap_or_else(|error| panic!("{plugin} must accept redis_failure_policy: {error}"));
         assert_eq!(
             policy,
             Some(RedisFailurePolicy::LocalFallback),
             "{plugin} must honor the configured redis_failure_policy"
+        );
+        config
+            .as_object_mut()
+            .unwrap()
+            .remove("redis_failure_policy");
+        assert_eq!(
+            rate_limit_redis_failure_policy(plugin, &config).unwrap(),
+            Some(if plugin == "rate_limiting" {
+                RedisFailurePolicy::LocalFallback
+            } else {
+                RedisFailurePolicy::FailClosed
+            }),
+            "only rate_limiting changes its default"
         );
     }
 }
@@ -1804,7 +1817,10 @@ async fn fail_closed_policy_refuses_while_redis_is_unavailable() {
     use ferrum_edge::_test_support::rate_limiting_refusal_under_redis_outage;
 
     let refusal = rate_limiting_refusal_under_redis_outage(
-        &redis_rate_limit_config(json!({ "expose_headers": true })),
+        &redis_rate_limit_config(json!({
+            "expose_headers": true,
+            "redis_failure_policy": "fail_closed"
+        })),
         "ip:203.0.113.7",
     )
     .await
@@ -1824,13 +1840,13 @@ async fn fail_closed_policy_refuses_while_redis_is_unavailable() {
     );
 }
 
-/// The availability escape hatch still works — but only when asked for.
+/// Omitted policy keeps the API available under per-pod limiting.
 #[tokio::test]
 async fn local_fallback_policy_admits_while_redis_is_unavailable() {
     use ferrum_edge::_test_support::rate_limiting_refusal_under_redis_outage;
 
     let refusal = rate_limiting_refusal_under_redis_outage(
-        &redis_rate_limit_config(json!({ "redis_failure_policy": "local_fallback" })),
+        &redis_rate_limit_config(json!({})),
         "ip:203.0.113.7",
     )
     .await
@@ -1840,6 +1856,44 @@ async fn local_fallback_policy_admits_while_redis_is_unavailable() {
         refusal.is_none(),
         "local_fallback must admit on per-process state, got {refusal:?}"
     );
+}
+
+#[tokio::test]
+async fn default_fallback_retains_budget_on_reload_and_marks_request_metadata() {
+    use ferrum_edge::_test_support::rate_limiting_mark_redis_unavailable_for_test;
+
+    let config = json!({
+        "sync_mode": "redis",
+        "redis_url": "redis://127.0.0.1:1/0",
+        "redis_health_check_interval_seconds": 3600,
+        "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 2}]
+    });
+    let first = RateLimiting::new_with_policy_identity(
+        &config,
+        PluginHttpClient::default(),
+        "fallback-reload-test",
+        "policy",
+    )
+    .unwrap();
+    assert!(rate_limiting_mark_redis_unavailable_for_test(&first));
+    for _ in 0..2 {
+        let mut ctx = create_test_context();
+        assert_continue(first.on_request_received(&mut ctx).await);
+        assert_eq!(meta(&ctx, "ratelimit_local_fallback"), Some("true"));
+    }
+    let mut explicit = config.clone();
+    explicit["redis_failure_policy"] = json!("local_fallback");
+    let reloaded = RateLimiting::new_with_policy_identity(
+        &explicit,
+        PluginHttpClient::default(),
+        "fallback-reload-test",
+        "policy",
+    )
+    .unwrap();
+    assert!(rate_limiting_mark_redis_unavailable_for_test(&reloaded));
+    let mut ctx = create_test_context();
+    expect_reject(reloaded.on_request_received(&mut ctx).await, 429);
+    assert_eq!(meta(&ctx, "ratelimit_local_fallback"), Some("true"));
 }
 
 // ── Composed limiters and the single public header set (issue #5003) ──────
@@ -1977,6 +2031,7 @@ async fn an_admitted_sibling_budget_is_not_published_on_a_fail_closed_503() {
     let generous = composed_limiter(100, true);
     let centralized = make_rate_limiter(redis_rate_limit_config(json!({
         "expose_headers": true,
+        "redis_failure_policy": "fail_closed",
         // Nothing listens on port 1; the client is then forced unavailable so
         // the outage is deterministic rather than dial-timing dependent.
         "redis_url": "redis://127.0.0.1:1/0",
