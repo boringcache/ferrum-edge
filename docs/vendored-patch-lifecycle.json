@@ -56,6 +56,39 @@
   ],
   "patches": [
     {
+      "id": "sqlx-core-001-verify-ca-name-context",
+      "label": "SQLx verify-ca context-bearing hostname errors",
+      "crate": "sqlx-core",
+      "vendored_version": "0.8.6",
+      "vendor_path": "vendor/sqlx-core-0.8.6-ferrum-patched",
+      "docs_path": "docs/upstream-sqlx-patches/001-verify-ca-name-context/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "PostgreSQL and MySQL verify-ca must accept trusted certificate chains without checking the requested hostname, including rustls context-bearing name errors.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "launchbadge/sqlx",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "A compatible SQLx release handles both rustls hostname-error variants while retaining certificate chain, validity, and handshake signature verification.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/sqlx-core-0.8.6-ferrum-patched (tls_rustls::tests)",
+        "tests/unit/config/db_tls_snapshot_tests.rs",
+        "tests/unit/config/env_config_tests.rs",
+        "tests/service_integration/db_tls.rs"
+      ]
+    },
+    {
       "id": "reqwest-001-per-request-connect-timeout",
       "label": "reqwest per-request connect_timeout",
       "crate": "reqwest",

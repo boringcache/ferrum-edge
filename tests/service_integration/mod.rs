@@ -26,6 +26,9 @@
 //!     concurrency regression against ER_LOCK_DEADLOCK 1213 plus per-namespace
 //!     sequence-lock isolation (issue #4130), and byte-exact
 //!     NFC/NFD consumer identity uniqueness under `utf8mb4_0900_bin` (#2994).
+//!   - **db_tls** — PostgreSQL 17 and MySQL 8.4. Verifies chain-only and full
+//!     hostname policies, expired/untrusted certificate rejection, and writes
+//!     after a rejected CA reload followed by fresh TLS connections.
 //!   - **oidc** — Ory Hydra. Drives `oidc_relying_party` through live discovery,
 //!     authorization-code + PKCE, JWKS/UserInfo/end-session, encrypted sessions,
 //!     claim headers, idle/absolute expiry, refresh, and logout (#3333).
@@ -59,6 +62,7 @@ mod common;
 
 mod clickhouse;
 mod consul;
+mod db_tls;
 mod host_port_allocation;
 mod kafka;
 mod ldap;

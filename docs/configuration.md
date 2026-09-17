@@ -349,15 +349,42 @@ keeps the last known-good runtime config instead of publishing a mixed snapshot.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_DB_TLS_MODE` | No | — | Database TLS policy. PostgreSQL: `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`; MySQL: `disable`, `prefer`, `require`, `verify-ca`, `verify-full`; MongoDB: `disable`, `require`, `verify-full` |
-| `FERRUM_DB_TLS_CA_CERT_PATH` | No | — | Path to CA certificate for database server verification |
-| `FERRUM_DB_TLS_CA_CERT_SOURCE` | No | — | Source override for `FERRUM_DB_TLS_CA_CERT_PATH`; accepts path, `file://`, inline PEM, or provider URI |
+| `FERRUM_DB_TLS_MODE` | No | — | Database TLS policy. PostgreSQL: `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`; MySQL: `disable`, `prefer`, `require`, `verify-ca`, `verify-full`; MongoDB: `disable`, `require`, `verify-full`. PostgreSQL/MySQL `verify-ca` is refused unless `FERRUM_DB_TLS_CA_CERT_PATH` or `FERRUM_DB_TLS_CA_CERT_SOURCE` is configured |
+| `FERRUM_DB_TLS_CA_CERT_PATH` | No | — | Path to CA certificate for database server verification. For PostgreSQL/MySQL this CA is EXCLUSIVE: it replaces the bundled public root store rather than adding to it. Required with `FERRUM_DB_TLS_MODE=verify-ca` |
+| `FERRUM_DB_TLS_CA_CERT_SOURCE` | No | — | Source override for `FERRUM_DB_TLS_CA_CERT_PATH`; accepts path, `file://`, inline PEM, or provider URI. Satisfies the `verify-ca` CA requirement |
 | `FERRUM_DB_TLS_CLIENT_CERT_PATH` | No | — | Path to client certificate for database mTLS. SQL requires pairing with `FERRUM_DB_TLS_CLIENT_KEY_PATH`; MongoDB may use this alone as an already-combined cert+key PEM |
 | `FERRUM_DB_TLS_CLIENT_CERT_SOURCE` | No | — | Source override for `FERRUM_DB_TLS_CLIENT_CERT_PATH`; accepts path, `file://`, inline PEM, or provider URI |
 | `FERRUM_DB_TLS_CLIENT_KEY_PATH` | No | — | Path to client private key for database mTLS; must be paired with `FERRUM_DB_TLS_CLIENT_CERT_PATH` |
 | `FERRUM_DB_TLS_CLIENT_KEY_SOURCE` | No | — | Source override for `FERRUM_DB_TLS_CLIENT_KEY_PATH`; accepts path, `file://`, inline PEM, or provider URI |
 | `FERRUM_DB_TLS_LIVE_RELOAD_ENABLED` | No | `false` | Opt in to live reload of database TLS CA/client cert/client key sources in database and CP modes. On changed bytes, Ferrum reconnects the active primary pool/client and SQL admin-read replica pool so new database connections use rotated material. Inline PEM is static until config reload |
 | `FERRUM_DB_TLS_WATCH_INTERVAL_SECONDS` | No | `30` | Poll interval for file-backed database TLS source watching. External sources use `FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` unless their URI includes `?poll=`. Ignored unless database TLS live reload is enabled |
+
+PostgreSQL and MySQL `verify-ca` verify the server chain and validity, plus TLS
+handshake signatures, without checking the URL hostname against the certificate.
+`verify-full` also checks that hostname. This applies to database, CP, and migrate
+modes and to primary, failover, and admin-read replica SQL connections. A
+configured `FERRUM_DB_TLS_CA_CERT_PATH` (or `FERRUM_DB_TLS_CA_CERT_SOURCE`) is
+the ONLY trust anchor for those connections — it replaces the bundled public
+roots instead of joining them — and `verify-ca` is refused at startup without
+one, because a hostname-waived mode over public roots authenticates nothing.
+`verify-full` with no configured CA stays valid and uses the bundled public
+roots plus the hostname check.
+
+PostgreSQL/MySQL TLS material is snapshotted into private `0600` temporary
+files per pool, so those modes need a writable temporary directory (`TMPDIR`,
+or `/tmp` when unset).
+
+SQL pools retain private, immutable CA/client-cert/client-key PEM snapshots for
+their lifetime, including replacement connections after idle eviction or server
+disconnects. A rejected reload leaves those accepted snapshots usable even when
+the watched files have been replaced or removed. SQL reloads connect both the
+primary and any configured replica candidates before publishing either; failure
+retains both old pools and the existing watcher logging, metrics, and retries.
+Accepted reloads replace the pools under the reconnect transition guard. Snapshot
+files are removed with their owning pools. Without live reload, an existing pool
+keeps its snapshot until reconnection or restart. Migrate takes a command-lifetime
+snapshot without a watcher. SQL URL-only material paths are also snapshotted,
+but only canonical env/source settings are enrolled in live watching.
 
 For MongoDB, configure TLS in exactly one place. When
 `FERRUM_DB_TLS_MODE` is set (including `disable`), `FERRUM_DB_URL` and every

@@ -8060,11 +8060,23 @@ pub(crate) fn restore_envelope_admits_for_test(body: &[u8]) -> bool {
     crate::util::json_object::from_json_object_slice::<RestorePayload>(body).is_ok()
 }
 
+/// Whether the closed `POST /batch` envelope admits `body` (issue #5565).
+///
+/// Same object-only parse `POST /batch` maps to `400` with
+/// `{"error": "Invalid JSON body: …"}` — the restore envelope's error shape.
+///
+/// Reached through `_test_support`; the binary target has no consumer.
+#[allow(dead_code)]
+pub(crate) fn batch_envelope_admits_for_test(body: &[u8]) -> bool {
+    crate::util::json_object::from_json_object_slice::<BatchCreateRequest>(body).is_ok()
+}
+
 /// Captures the accepted field list a derived `Deserialize` hands to
 /// `deserialize_struct` before it reads any value.
 ///
-/// Test-only support for [`restore_envelope_field_names_for_test`]; nothing in
-/// the serving paths constructs one.
+/// Test-only support for [`restore_envelope_field_names_for_test`] and
+/// [`batch_envelope_field_names_for_test`]; nothing in the serving paths
+/// constructs one.
 #[allow(dead_code)]
 #[derive(Default)]
 struct RestoreFieldNameCollector {
@@ -8115,10 +8127,31 @@ impl<'de> serde::Deserializer<'de> for &mut RestoreFieldNameCollector {
 /// Reached through `_test_support`; the binary target has no consumer.
 #[allow(dead_code)]
 pub(crate) fn restore_envelope_field_names_for_test() -> Vec<String> {
+    serde_struct_field_names::<RestorePayload>()
+}
+
+/// Serde-accepted member names of the closed `POST /batch` envelope
+/// (issue #5565).
+///
+/// Recovered from the derived `Deserialize` itself via the same collector
+/// [`restore_envelope_field_names_for_test`] uses. The OpenAPI contract test
+/// asserts set-equality against `BatchCreateRequest.properties`.
+///
+/// Reached through `_test_support`; the binary target has no consumer.
+#[allow(dead_code)]
+pub(crate) fn batch_envelope_field_names_for_test() -> Vec<String> {
+    serde_struct_field_names::<BatchCreateRequest>()
+}
+
+#[allow(dead_code)]
+fn serde_struct_field_names<T>() -> Vec<String>
+where
+    T: for<'de> Deserialize<'de>,
+{
     let mut collector = RestoreFieldNameCollector::default();
     // The collector deliberately fails the parse once it has the inventory;
     // the captured names, not the outcome, are the result.
-    let _ = RestorePayload::deserialize(&mut collector);
+    let _ = T::deserialize(&mut collector);
     collector.fields
 }
 

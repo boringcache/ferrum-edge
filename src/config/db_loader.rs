@@ -65,10 +65,11 @@ pub use crate::config::batch_atomicity::{
 #[allow(unused_imports)]
 pub use crate::config::db_backend::{
     ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend,
-    DbFailoverTopologyState, FullConfigLoadPurpose, IncrementalResult, MtlsDnsAdmissionUnavailable,
-    MtlsDnsIdentityConflict, NamespaceConfigAdmissionLeaseBackend, NamespaceResourceCounts,
-    NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError,
-    SortOrder, TcpConnectionThrottleAttachmentConflict, extract_db_hostname, redact_url,
+    DbFailoverTopologyState, DbTlsReconnectError, DbTlsReconnectStage, FullConfigLoadPurpose,
+    IncrementalResult, MtlsDnsAdmissionUnavailable, MtlsDnsIdentityConflict,
+    NamespaceConfigAdmissionLeaseBackend, NamespaceResourceCounts, NamespacedResourceId,
+    PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError, SortOrder,
+    TcpConnectionThrottleAttachmentConflict, extract_db_hostname, redact_url,
 };
 
 pub(crate) const CONFIG_ADMISSION_LEASE_DURATION_MILLIS: i64 = 120_000;
@@ -730,9 +731,15 @@ impl Default for DbPoolConfig {
 /// Centralized so initial, failover, replica, reconnect, and migrate paths
 /// cannot drift. `timeout_seconds == 0` leaves the future unbounded (OS /
 /// `acquire_timeout` still apply inside sqlx). On expiry the connect future is
-/// dropped — no detached attempt — and the error is a typed
+/// dropped — no detached connect attempt — and the error is a typed
 /// `sqlx::Error::Io(TimedOut)` with a non-secret message so failover / backup
 /// classification stays transient without embedding the DSN.
+///
+/// [`connect_any_pool_with_timeout`] reads TLS material before dialing; that
+/// read runs on a detached OS thread fenced by a process-wide one-permit
+/// semaphore, so a stalled mount leaves at most one blocked reader for the
+/// whole process rather than one per attempt, and never a pinned blocking-pool
+/// thread that would hold up runtime teardown.
 pub(crate) async fn await_pool_connect_with_timeout<F, T>(
     timeout_seconds: u64,
     connect: F,
@@ -754,8 +761,12 @@ where
 
 /// Connect an `AnyPool` under [`await_pool_connect_with_timeout`].
 ///
-/// Does not mutate the URL: TLS / DSN query parameters are left untouched, and
-/// no ignored `connect_timeout=` query parameter is appended.
+/// Snapshot TLS paths before connecting so a rejected rotation cannot change
+/// the material used by replacement connections in the retained pool. The
+/// snapshot read goes through `SqlTlsSnapshot::load_detached`, never
+/// `spawn_blocking`: a stalled CA mount must not pin a blocking-pool thread
+/// that runtime teardown then waits for, and the one-permit fence keeps a fast
+/// reload watcher from accumulating abandoned readers.
 pub(crate) async fn connect_any_pool_with_timeout(
     options: AnyPoolOptions,
     url: &str,
@@ -764,7 +775,12 @@ pub(crate) async fn connect_any_pool_with_timeout(
 ) -> Result<AnyPool, sqlx::Error> {
     await_pool_connect_with_timeout(
         effective_pool_connect_timeout_seconds(db_type, connect_timeout_seconds),
-        options.connect(url),
+        async {
+            let snapshot =
+                crate::config::db_tls_snapshot::SqlTlsSnapshot::load_detached(url, db_type).await?;
+            let (options, url) = snapshot.pin(options);
+            options.connect(&url).await
+        },
     )
     .await
 }
@@ -2065,6 +2081,16 @@ impl DatabaseStore {
     /// `reconnect()` (primary or failover) will run migrations, because a DB
     /// that comes back with a fresh or outdated schema must be brought up to
     /// the expected version before the polling loop can read from it.
+    ///
+    /// TLS material is snapshotted best-effort here and ONLY here. This path
+    /// exists so the gateway can come up on `FERRUM_DB_CONFIG_BACKUP_PATH`
+    /// while the database environment is broken, and an unreadable CA secret
+    /// (not yet projected, unwritable `TMPDIR`) is part of that broken
+    /// environment — failing closed would defeat the one path whose purpose is
+    /// surviving it. The pool is lazy, so no connection uses this URL until a
+    /// query runs, and every later `reconnect*` goes through
+    /// [`connect_any_pool_with_timeout`], which snapshots properly: the first
+    /// successful reconnect restores the retained-material guarantee in full.
     pub fn connect_offline_with_pool_config(
         db_type: &str,
         db_url: &str,
@@ -2078,8 +2104,20 @@ impl DatabaseStore {
         // the database becomes reachable and the polling loop drives a
         // successful `reconnect()`. Eager reconnect/failover paths apply
         // `connect_timeout_seconds` via [`connect_any_pool_with_timeout`].
-        let pool =
-            Self::build_pool_options_from_config(&pool_config, db_type).connect_lazy(db_url)?;
+        let options = Self::build_pool_options_from_config(&pool_config, db_type);
+        let (options, snapshot_url) = match crate::config::db_tls_snapshot::SqlTlsSnapshot::load(
+            db_url, db_type,
+        ) {
+            Ok(snapshot) => snapshot.pin(options),
+            Err(error) => {
+                let safe_error = crate::config::db_backend::redact_error_text(&error, &[db_url]);
+                warn!(
+                    "Database TLS material could not be snapshotted for the backup-bootstrap pool; starting from the unmodified URL and retrying on reconnect: {safe_error}"
+                );
+                (options, db_url.to_string())
+            }
+        };
+        let pool = options.connect_lazy(&snapshot_url)?;
 
         Ok(Self {
             pool: Arc::new(ArcSwap::from_pointee(pool)),
@@ -7930,6 +7968,64 @@ impl DatabaseStore {
         )
         .await?;
 
+        self.publish_reconnected_pool(db_url, topology, new_pool, None)
+            .await
+    }
+
+    /// Stage the primary and (when configured) the admin-read replica, then
+    /// publish both together so a rejected candidate cannot leave one pool on
+    /// new material and the other on old.
+    ///
+    /// Each staged pool gets the same liveness probe its dedicated sibling
+    /// performs (`reconnect_read_replica` for the replica): a pool that
+    /// connects but cannot answer `SELECT 1` must not replace a working one.
+    async fn reconnect_tls_pools(
+        &self,
+        db_url: &str,
+        replica_url: Option<&str>,
+    ) -> Result<(), DbTlsReconnectError> {
+        // Symmetry with `reconnect_for_topology` / `reconnect_read_replica`:
+        // every reachable store is constructed through a path that already
+        // installs the drivers, but this must not depend on that.
+        sqlx::any::install_default_drivers();
+
+        let new_pool = connect_any_pool_with_timeout(
+            self.build_pool_options(),
+            db_url,
+            &self.db_type,
+            self.pool_config.connect_timeout_seconds,
+        )
+        .await
+        .map_err(|error| DbTlsReconnectError::primary(error.into()))?;
+        let new_replica = if let Some(replica_url) = replica_url {
+            let replica_pool = connect_any_pool_with_timeout(
+                self.build_pool_options(),
+                replica_url,
+                &self.db_type,
+                self.pool_config.connect_timeout_seconds,
+            )
+            .await
+            .map_err(|error| DbTlsReconnectError::read_replica(error.into()))?;
+            sqlx::query("SELECT 1")
+                .fetch_one(&replica_pool)
+                .await
+                .map_err(|error| DbTlsReconnectError::read_replica(error.into()))?;
+            Some(replica_pool)
+        } else {
+            None
+        };
+        self.publish_reconnected_pool(db_url, DatabaseTopology::Primary, new_pool, new_replica)
+            .await
+            .map_err(DbTlsReconnectError::primary)
+    }
+
+    async fn publish_reconnected_pool(
+        &self,
+        db_url: &str,
+        topology: DatabaseTopology,
+        new_pool: AnyPool,
+        new_replica: Option<AnyPool>,
+    ) -> Result<(), anyhow::Error> {
         let topology_kind = match topology {
             DatabaseTopology::Primary => SqlReconnectTopology::Primary,
             DatabaseTopology::Failover => SqlReconnectTopology::Failover,
@@ -7962,6 +8058,15 @@ impl DatabaseStore {
 
         // Atomic swap — readers that already loaded the old pool keep using it.
         let old_pool = self.pool.swap(Arc::new(new_pool));
+        let published_replica = new_replica.is_some();
+        if let Some(new_replica) = new_replica {
+            let old_replica = self.read_replica_pool.swap(Some(Arc::new(new_replica)));
+            if let Some(old_replica) = old_replica {
+                tokio::spawn(async move {
+                    old_replica.close().await;
+                });
+            }
+        }
         self.topology_epoch
             .store(next_topology_epoch, Ordering::Release);
         info!(
@@ -7988,7 +8093,18 @@ impl DatabaseStore {
         // The helper uses a CAS so concurrent callers don't run migrations
         // twice, and restores the flag on failure so a transient error
         // doesn't silently skip migrations forever.
-        self.maybe_apply_deferred_migrations().await?;
+        if let Err(error) = self.maybe_apply_deferred_migrations().await {
+            // `mark_primary` below never runs on this path, so a replica this
+            // call just published would stay live but inert (admin reads gate
+            // on `primary_active()`), holding connections and its snapshot
+            // files until some later replica reconnect replaced it. Retract it.
+            if published_replica && let Some(raced_replica) = self.read_replica_pool.swap(None) {
+                tokio::spawn(async move {
+                    raced_replica.close().await;
+                });
+            }
+            return Err(error);
+        }
 
         // Primary failback stays fail-closed for writes until publication and
         // deferred migrations succeed: mark_primary only after the await.
@@ -11861,6 +11977,14 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn reconnect_read_replica(&self, replica_url: &str) -> Result<(), anyhow::Error> {
         DatabaseStore::reconnect_read_replica(self, replica_url).await
+    }
+
+    async fn reconnect_tls(
+        &self,
+        db_url: &str,
+        replica_url: Option<&str>,
+    ) -> Result<(), DbTlsReconnectError> {
+        self.reconnect_tls_pools(db_url, replica_url).await
     }
 
     async fn try_failover_reconnect(&self, primary_url: &str) -> Result<String, anyhow::Error> {

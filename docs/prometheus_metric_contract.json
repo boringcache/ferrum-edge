@@ -2669,7 +2669,7 @@
   {
     "name": "ferrum_mesh_bpf_drops_total",
     "type": "counter",
-    "help": "Connection-bypass decisions by reason, produced by the connect4/connect6 capture hooks.",
+    "help": "Connection-bypass decisions by reason, produced by the connect4/connect6 capture hooks and counted on per-CPU kernel counters, so an overrun of the event ringbuf cannot silently lose a decision.",
     "labels": [
       "reason"
     ],
@@ -4373,6 +4373,18 @@
     "emission": "when_series_present"
   },
   {
+    "name": "ferrum_rate_limit_enforcement_unavailable_total",
+    "type": "counter",
+    "help": "Requests refused because centralized rate-limit enforcement was unavailable.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "prometheus_metrics",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_rate_limit_exceeded_total",
     "type": "counter",
     "help": "Total rate limit rejections.",
@@ -4382,6 +4394,18 @@
     "subsystem": "prometheus_metrics",
     "export_surface": "/metrics",
     "bundled": "dashboard",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_rate_limit_local_fallback_decisions_total",
+    "type": "counter",
+    "help": "Rate-limit decisions taken on the per-process fallback budget.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "prometheus_metrics",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
     "emission": "always"
   },
   {

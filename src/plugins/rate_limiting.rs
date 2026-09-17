@@ -651,6 +651,20 @@ impl RateLimiting {
         }
     }
 
+    /// Attribute one decision to the per-process fallback budget.
+    ///
+    /// The metadata marker is sticky across composed instances: any fallback is
+    /// operationally relevant, even when another limiter owns the public
+    /// headers. The counter is the alertable form of the same fact —
+    /// `rate_limiting` defaults to `redis_failure_policy: local_fallback`, so
+    /// degraded enforcement is the silent common case and the latched
+    /// once-per-outage warning is not enough on its own.
+    fn mark_local_fallback(&self, ctx: &mut RequestContext) {
+        ctx.metadata
+            .insert("ratelimit_local_fallback".to_string(), "true".to_string());
+        super::prometheus_metrics::global_registry().record_rate_limit_local_fallback_decision();
+    }
+
     async fn check_rate(
         &self,
         key: String,
@@ -675,16 +689,32 @@ impl RateLimiting {
             // A capacity denial carries no budget of its own, and a composed
             // sibling's admitted budget must not be published as its verdict.
             self.claim_published_headers(ctx, HeaderAuthority::Refused);
+            // A capacity denial reached while the backend is serving the
+            // per-process fallback budget IS a fallback-caused refusal, and the
+            // one an operator most needs attributed: a Redis-backed policy
+            // suddenly hitting the local key cap is an outage symptom, not
+            // client behaviour. The `Some(outcome)` arms below carry the marker
+            // on the outcome; this arm has no outcome to carry it, so it asks
+            // the backend directly.
+            if self.limiter.local_fallback_active() {
+                self.mark_local_fallback(ctx);
+            }
             return self.reject_capacity();
         };
+        if outcome.local_fallback {
+            self.mark_local_fallback(ctx);
+        }
         if !outcome.allowed {
             // The refusing limiter owns the client-visible telemetry from here
             // on; see `claim_refusal_headers`.
             self.claim_refusal_headers(&outcome, ctx);
             if outcome.enforcement_unavailable {
                 // The shared failover backend emits one bounded operational
-                // warning per outage. Avoid an attacker-rate warning/metric for
-                // every request while centralized enforcement is unavailable.
+                // warning per outage. Avoid an attacker-rate warning for every
+                // request while centralized enforcement is unavailable; the
+                // bounded counter is the per-request operational signal.
+                super::prometheus_metrics::global_registry()
+                    .record_rate_limit_enforcement_unavailable();
                 return self.reject(&outcome);
             }
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();

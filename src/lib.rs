@@ -123,6 +123,24 @@ pub mod _test_support {
         crate::admin::restore_envelope_field_names_for_test()
     }
 
+    /// Whether the closed `POST /batch` envelope admits `body` (issue #5565).
+    ///
+    /// Same object-only parse the batch handler maps to `400` with
+    /// `{"error": "Invalid JSON body: …"}`.
+    pub fn batch_envelope_admits_for_test(body: &[u8]) -> bool {
+        crate::admin::batch_envelope_admits_for_test(body)
+    }
+
+    /// Serde-accepted member names of the `POST /batch` envelope
+    /// (issue #5565).
+    ///
+    /// Recovered from the derived `Deserialize` itself, so a new Rust member
+    /// appears here without anyone updating a manifest. The OpenAPI contract
+    /// test compares this inventory with `BatchCreateRequest.properties`.
+    pub fn batch_envelope_field_names_for_test() -> Vec<String> {
+        crate::admin::batch_envelope_field_names_for_test()
+    }
+
     /// Exercise the dispatch coordinate rebase and its cloned diagnostic context.
     pub fn rebase_backend_path_for_test(
         ctx: &mut crate::plugins::RequestContext,
@@ -5953,6 +5971,7 @@ pub mod _test_support {
         DbPoolConfig, SqlReconnectTopology, SqlReconnectTransitionHook,
         SqlReconnectTransitionTestHooks,
     };
+    pub use crate::config::db_tls_snapshot::SqlTlsSnapshot;
 
     /// Install (or clear) SQL reconnect transition test hooks on one store.
     pub fn database_store_set_reconnect_transition_hooks_for_test(
@@ -10547,6 +10566,25 @@ pub mod _test_support {
                 biased;
                 () = tokio::time::sleep(observation) => true,
                 () = join.backend_write_watermark_expired() => false,
+            }
+        }
+
+        /// Race the dispatcher's response-header wait against the relay's
+        /// backend write watermark, exactly as `proxy_to_backend` does.
+        ///
+        /// The mirror of [`BufferedUploadPumpProbe::write_watermark_wins_header_wait`]
+        /// for a STREAMING client body: `true` means the watermark won, which
+        /// is what makes the request end as 504 / `ReadWriteTimeout` at
+        /// `backend_write_timeout_ms` rather than running on to
+        /// `backend_read_timeout_ms`.
+        pub async fn write_watermark_wins_header_wait(&mut self, header_wait: Duration) -> bool {
+            let Some(join) = self.join.as_mut() else {
+                return false;
+            };
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep(header_wait) => false,
+                () = join.backend_write_watermark_expired() => true,
             }
         }
 

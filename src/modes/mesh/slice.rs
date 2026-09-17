@@ -324,6 +324,7 @@ pub struct MeshSlice {
     /// content, and CP-side dedupe must keep suppressing frames whose resources
     /// did not change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub revision: Option<crate::modes::mesh::revision::MeshConfigRevision>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workloads: Vec<Workload>,
@@ -480,8 +481,10 @@ pub struct MeshSlice {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proxy_configs: Vec<MeshProxyConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub trust_bundles: Option<TrustBundleSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub multi_cluster: Option<MultiClusterConfig>,
     /// Mesh-wide outbound traffic policy. `None` keeps the legacy
     /// `AllowAny` behavior. When `Some(RegistryOnly)`, the slice-apply
@@ -514,6 +517,7 @@ pub struct MeshSlice {
     /// Cold-path operator view of the Sidecar egress scope that was applied,
     /// or would have been applied when dry-run is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub sidecar_egress_scope: Option<MeshEgressScopeSnapshot>,
     /// Operator-defined ECDS (Extension Config Discovery Service) entries.
     /// These flow through xDS as
@@ -536,6 +540,7 @@ pub struct MeshSlice {
     /// Received-but-rejected slices stay visible only on the raw runtime
     /// snapshot and never reach either live surface.
     #[serde(default, skip_serializing_if = "MeshRuntimeOverlay::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
     pub runtime_overlay: MeshRuntimeOverlay,
 }
 

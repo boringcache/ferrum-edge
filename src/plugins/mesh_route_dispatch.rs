@@ -110,7 +110,8 @@ pub struct MeshRouteDispatchConfig {
 
 impl MeshRouteDispatchConfig {
     pub fn from_value(config: &Value) -> Result<Self, String> {
-        serde_json::from_value(config.clone())
+        serde_json::from_value::<crate::util::json_object::JsonObject<Self>>(config.clone())
+            .map(|object| object.0)
             .map_err(|e| format!("mesh_route_dispatch config: {e}"))
     }
 
@@ -580,8 +581,14 @@ struct RouteRetryConfig {
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum RouteBackoffStrategy {
-    Fixed(RouteFixedBackoff),
-    Exponential(RouteExponentialBackoff),
+    Fixed(
+        #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
+        RouteFixedBackoff,
+    ),
+    Exponential(
+        #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
+        RouteExponentialBackoff,
+    ),
 }
 
 #[derive(Deserialize)]
@@ -645,7 +652,8 @@ fn deserialize_route_retry<'de, D>(deserializer: D) -> Result<Option<RetryConfig
 where
     D: serde::Deserializer<'de>,
 {
-    Option::<RouteRetryConfig>::deserialize(deserializer).map(|retry| retry.map(RetryConfig::from))
+    crate::util::json_object::deserialize_optional_object::<D, RouteRetryConfig>(deserializer)
+        .map(|retry| retry.map(RetryConfig::from))
 }
 
 /// Route-local backend TLS wire shape for the same reason as
@@ -688,7 +696,7 @@ fn deserialize_route_backend_tls<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    Option::<RouteBackendTlsConfig>::deserialize(deserializer)
+    crate::util::json_object::deserialize_optional_object::<D, RouteBackendTlsConfig>(deserializer)
         .map(|tls| tls.map(BackendTlsConfig::from))
 }
 
@@ -775,12 +783,14 @@ fn normalize_and_validate_backend_tls(
 pub struct RouteRule {
     /// Match criteria — all configured fields must match for the rule to fire.
     #[serde(default, rename = "match")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
     pub match_: MatchCriteria,
     /// What to override on a matching request. At least one override field
     /// MUST be set unless the rule carries a `redirect` (which answers the
     /// request itself and needs no backend); otherwise the rule would be a
     /// no-op. Defaults to empty so a redirect-only rule can omit it.
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
     pub destination: RouteDestination,
     /// Override the proxy's backend response/read timeout for this rule.
     /// Istio `VirtualService.http[].timeout` is projected here when route
@@ -831,6 +841,7 @@ pub struct RouteRule {
     /// percentages should use a global / proxy-scoped `fault_injection`
     /// plugin instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub fault: Option<FaultActionConfig>,
     /// Optional per-rule URI / authority rewrite. Projects Istio
     /// `VirtualService.http[].rewrite` onto each emitted dispatch rule so a
@@ -838,6 +849,7 @@ pub struct RouteRule {
     /// proxy without rewriting the siblings' traffic. Applied when the rule
     /// matches and no redirect fires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub rewrite: Option<RouteRewriteConfig>,
     /// Optional per-rule HTTP redirect. Projects Istio
     /// `VirtualService.http[].redirect` onto each emitted dispatch rule. When
@@ -845,6 +857,7 @@ pub struct RouteRule {
     /// `Location` response and never reaches a backend. Takes precedence over
     /// `rewrite` and the route-override destination.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub redirect: Option<RouteRedirectConfig>,
     /// Per-rule fault roller. Constructed at config-load time whenever
     /// `fault` is `Some` so the request hot path does one atomic counter
@@ -1406,8 +1419,10 @@ fn node_waypoint_backend_metadata_contains(values: Option<&str>, backend: &str) 
 #[serde(deny_unknown_fields)]
 pub struct FaultActionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub delay: Option<FaultDelayConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub abort: Option<FaultAbortConfig>,
 }
 
