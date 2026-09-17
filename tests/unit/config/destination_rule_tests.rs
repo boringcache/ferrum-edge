@@ -439,7 +439,7 @@ fn passive_health_check_validates_ejection_percent_over_100() {
     assert!(
         errors
             .iter()
-            .any(|e| e.contains("max_ejection_percent must be between")),
+            .any(|e| e.contains("`passive.max_ejection_percent` must be between 0 and 100")),
         "Expected max_ejection_percent validation error, got: {:?}",
         errors
     );

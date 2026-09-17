@@ -7526,6 +7526,21 @@ fn validate_u32_range(field_name: &str, value: u32, min: u32, max: u32) -> Resul
     Ok(())
 }
 
+/// Nest a child validator diagnostic under its parent field path.
+///
+/// Child validators render their own field name in backticks
+/// (`` `max_retries` must be between ... ``). The parent path is spliced
+/// inside that span so the rendered diagnostic names the full schema path
+/// (`` `retry.max_retries` ``) instead of splitting it around the backtick
+/// (`` retry.`max_retries` ``). Diagnostics that do not open with a
+/// backticked field name are prefixed verbatim.
+fn nest_field_diagnostic(parent: &str, diagnostic: &str) -> String {
+    match diagnostic.strip_prefix('`') {
+        Some(rest) => format!("`{}.{}", parent, rest),
+        None => format!("{}.{}", parent, diagnostic),
+    }
+}
+
 /// Validate a list of HTTP status codes.
 fn validate_status_codes(field_name: &str, codes: &[u16]) -> Result<(), String> {
     if codes.len() > MAX_STATUS_CODES {
@@ -8501,7 +8516,7 @@ impl Proxy {
             && let Err(cb_errors) = cb.validate_fields()
         {
             for e in cb_errors {
-                errors.push(format!("circuit_breaker.{}", e));
+                errors.push(nest_field_diagnostic("circuit_breaker", &e));
             }
         }
 
@@ -8510,7 +8525,7 @@ impl Proxy {
             && let Err(retry_errors) = retry.validate_fields()
         {
             for e in retry_errors {
-                errors.push(format!("retry.{}", e));
+                errors.push(nest_field_diagnostic("retry", &e));
             }
         }
 
@@ -9416,7 +9431,7 @@ impl Upstream {
             && let Err(hc_errors) = hc.validate_fields()
         {
             for e in hc_errors {
-                errors.push(format!("health_checks.{}", e));
+                errors.push(nest_field_diagnostic("health_checks", &e));
             }
         }
 
@@ -9425,7 +9440,7 @@ impl Upstream {
             && let Err(sd_errors) = sd.validate_fields(&self.namespace)
         {
             for e in sd_errors {
-                errors.push(format!("service_discovery.{}", e));
+                errors.push(nest_field_diagnostic("service_discovery", &e));
             }
         }
 
@@ -9452,7 +9467,7 @@ impl Upstream {
                 if let Err(e) =
                     validate_string_field("subsets.name", &subset.name, MAX_SUBSET_NAME_LENGTH)
                 {
-                    errors.push(format!("subsets[{}].{}", i, e));
+                    errors.push(nest_field_diagnostic(&format!("subsets[{}]", i), &e));
                 }
                 if !seen_names.insert(&subset.name) {
                     errors.push(format!(
@@ -9545,7 +9560,10 @@ impl Upstream {
         }
         for (i, san) in self.backend_tls_san_allow_list.iter().enumerate() {
             if let Err(e) = validate_backend_tls_san_allow_list_entry(san) {
-                errors.push(format!("backend_tls_san_allow_list[{}].{}", i, e));
+                errors.push(nest_field_diagnostic(
+                    &format!("backend_tls_san_allow_list[{}]", i),
+                    &e,
+                ));
             }
         }
 

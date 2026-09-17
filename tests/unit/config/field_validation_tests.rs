@@ -593,7 +593,7 @@ fn test_proxy_circuit_breaker_validated() {
     let errs = proxy.validate_fields().unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.contains("circuit_breaker.failure_threshold"))
+            .any(|e| e.contains("`circuit_breaker.failure_threshold`"))
     );
 }
 
@@ -608,7 +608,7 @@ fn test_proxy_retry_validated() {
         retry_on_connect_failure: true,
     });
     let errs = proxy.validate_fields().unwrap_err();
-    assert!(errs.iter().any(|e| e.contains("retry.max_retries")));
+    assert!(errs.iter().any(|e| e.contains("`retry.max_retries`")));
 }
 
 #[test]
@@ -1466,7 +1466,7 @@ fn test_upstream_health_check_validated() {
     let errs = upstream.validate_fields().unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.contains("health_checks.active.interval_seconds"))
+            .any(|e| e.contains("`health_checks.active.interval_seconds`"))
     );
 }
 
@@ -1721,7 +1721,9 @@ fn test_validate_all_fields_escapes_resource_ids_and_numeric_values() {
 fn test_upstream_field_values_are_debug_escaped() {
     let value = "unregistered'\"token\\tail";
     let mut upstream = make_upstream("upstream");
-    let locality = format!("region//{value}");
+    // An empty region is the rejection case: `LocalityPreference::parse`
+    // tolerates empty zone/sub-zone segments.
+    let locality = format!("/{value}");
     upstream.targets[0].locality = Some(locality.clone());
     let errors = upstream.validate_fields().unwrap_err();
     let error = errors
