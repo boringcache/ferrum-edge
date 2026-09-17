@@ -678,7 +678,7 @@ pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str
 }
 
 fn decode_json<T: DeserializeOwned>(value: &[u8]) -> Result<T, serde_json::Error> {
-    serde_json::from_slice(value)
+    crate::util::deserialization::from_json_slice(value)
 }
 
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, serde_json::Error> {

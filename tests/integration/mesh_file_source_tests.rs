@@ -90,6 +90,55 @@ fn loads_json_mesh_document() {
 }
 
 #[test]
+fn hostile_map_keys_cannot_bypass_mesh_document_scalar_redaction() {
+    for key in [
+        "missing field bait",
+        "invalid type: string \"x\", expected",
+        "map'key\"with quotes",
+    ] {
+        for secret in ["UNREGISTERED_TOKEN", "missing field `UNREGISTERED_TOKEN`"] {
+            let document = serde_json::json!({
+                "mesh": {
+                    "service_entries": [{
+                        "name": "fixture",
+                        "namespace": "ferrum",
+                        "hosts": ["fixture.example"],
+                        "endpoints": [{
+                            "address": "192.0.2.1",
+                            "ports": {(key): secret}
+                        }]
+                    }]
+                }
+            });
+            for extension in ["json", "yaml"] {
+                let content = if extension == "json" {
+                    serde_json::to_string_pretty(&document).unwrap()
+                } else {
+                    serde_yaml::to_string(&document).unwrap()
+                };
+                let path = write_temp(extension, &content);
+                let error = load_mesh_slice_from_file(&path, request_for_namespace("ferrum"))
+                    .unwrap_err();
+                let diagnostic = format!("{error:#}");
+                assert!(!diagnostic.contains("UNREGISTERED_TOKEN"), "{diagnostic}");
+                assert!(!format!("{error:?}").contains("UNREGISTERED_TOKEN"));
+                for required in [
+                    "mesh.service_entries[0].endpoints[0].ports",
+                    key,
+                    "invalid type",
+                    "expected u16",
+                    "<redacted scalar>",
+                    "line ",
+                    "column ",
+                ] {
+                    assert!(diagnostic.contains(required), "{extension}: {diagnostic}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn slice_building_scopes_by_request_namespace() {
     // Namespace scoping happens DP-side for the file source — the same
     // `MeshSlice::from_gateway_config` narrowing the CP applies.

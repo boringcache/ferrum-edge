@@ -836,7 +836,8 @@ fn optional_u16(value: &Value, field: &str) -> Result<Option<u16>, String> {
     };
     if port == 0 || port > u16::MAX as u64 {
         return Err(format!(
-            "meshConfig.extensionProviders[].{field} must be between 1 and 65535 (got {port})"
+            "meshConfig.extensionProviders[].{field} must be between 1 and 65535 \
+             (got <redacted scalar>)"
         ));
     }
     Ok(Some(port as u16))

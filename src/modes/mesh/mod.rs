@@ -3045,9 +3045,9 @@ fn effective_node_waypoint_scoped_authz_policy_labels(config: &GatewayConfig) ->
 
 fn mesh_authz_config_policies(config: &serde_json::Value) -> Vec<MeshPolicy> {
     if let Some(value) = config.get("mesh_slice") {
-        return serde_json::from_value::<crate::util::json_object::JsonObject<MeshSlice>>(
-            value.clone(),
-        )
+        return crate::util::deserialization::from_json_value::<
+            crate::util::json_object::JsonObject<MeshSlice>,
+        >(value.clone())
         .map(|object| object.0.mesh_policies)
         .unwrap_or_else(|_| {
             warn!(
@@ -3058,7 +3058,7 @@ fn mesh_authz_config_policies(config: &serde_json::Value) -> Vec<MeshPolicy> {
         });
     }
     if let Some(value) = config.get("mesh_policies") {
-        let policies = crate::util::json_object::deserialize_object_vec(value.clone());
+        let policies = crate::util::json_object::from_json_object_vec_value(value.clone());
         return policies.unwrap_or_else(|_| {
             warn!(
                 field = "mesh_policies",
@@ -3992,7 +3992,7 @@ fn decode_virtual_service_l4_proxies(slice: &MeshSlice) -> Result<Vec<Proxy>, an
         .iter()
         .enumerate()
         .map(|(index, value)| {
-            let proxy: Proxy = crate::util::json_object::deserialize_object(value.clone())
+            let proxy: Proxy = crate::util::json_object::from_json_object_value(value.clone())
                 .map_err(|error| {
                     anyhow::anyhow!(
                         "Mesh slice VirtualService L4 proxy {index} is malformed: {error}"
@@ -4037,7 +4037,7 @@ fn decode_virtual_service_l4_upstreams(
         .enumerate()
         .map(|(index, value)| {
             let upstream: crate::config::types::Upstream =
-                crate::util::json_object::deserialize_object(value.clone())
+                crate::util::json_object::from_json_object_value(value.clone())
                     .map_err(|error| {
                         anyhow::anyhow!(
                             "Mesh slice VirtualService L4 upstream {index} is malformed: {error}"

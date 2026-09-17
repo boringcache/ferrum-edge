@@ -1609,7 +1609,13 @@ pub(crate) fn validate_control_plane_url_with_posture(
         reqwest::Url::parse(&normalized).map_err(|e| format!("invalid control_plane_url: {e}"))?;
     match parsed.scheme() {
         "http" | "https" => {}
-        other => return Err(format!("unsupported control_plane_url scheme '{other}'")),
+        _ => {
+            return Err(
+                "unsupported control_plane_url scheme <redacted scalar>; supported: \
+                 http, https, grpc, grpcs"
+                    .to_string(),
+            );
+        }
     }
     if production_mode && parsed.scheme() != "https" {
         return Err(

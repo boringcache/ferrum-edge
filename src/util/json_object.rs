@@ -16,9 +16,10 @@
 //! `Deserialize`, so `deny_unknown_fields`, field defaults, and custom field
 //! deserializers all keep working unchanged.
 //!
-//! Errors withhold offending scalars and retain type/schema diagnostics. These
-//! value-level helpers cannot promise enclosing field paths or source positions;
-//! use the document adapters in `deserialization` for that boundary context.
+//! These generic serde visitors enforce shape only. Sanitize errors at the
+//! document/value adapters in `deserialization`, where path and inner error are
+//! separate. A generic `D::Error` may already contain a native YAML path and must
+//! never be classified as a bare diagnostic here.
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -54,9 +55,7 @@ where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    deserializer
-        .deserialize_map(ObjectVisitor(PhantomData))
-        .map_err(super::deserialization::sanitize_error)
+    deserializer.deserialize_map(ObjectVisitor(PhantomData))
 }
 
 /// Visitor for an optional object-valued field.
@@ -103,9 +102,7 @@ where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    deserializer
-        .deserialize_option(OptionalObjectVisitor(PhantomData))
-        .map_err(super::deserialization::sanitize_error)
+    deserializer.deserialize_option(OptionalObjectVisitor(PhantomData))
 }
 
 /// Newtype whose `Deserialize` requires the input to be a JSON object.
@@ -132,7 +129,6 @@ where
 {
     Vec::<JsonObject<T>>::deserialize(deserializer)
         .map(|objects| objects.into_iter().map(|object| object.0).collect())
-        .map_err(super::deserialization::sanitize_error)
 }
 
 /// Optional counterpart to [`deserialize_object_vec`]. Use `serde(default)`
@@ -147,7 +143,6 @@ where
 {
     Option::<Vec<JsonObject<T>>>::deserialize(deserializer)
         .map(|objects| objects.map(|objects| objects.into_iter().map(|object| object.0).collect()))
-        .map_err(super::deserialization::sanitize_error)
 }
 
 /// `serde_json::from_slice` for a request body that must be a JSON object.
@@ -159,4 +154,19 @@ where
     T: DeserializeOwned,
 {
     super::deserialization::from_json_slice::<JsonObject<T>>(body).map(|object| object.0)
+}
+
+/// Object admission from a value tree, with a separate path and sanitized cause.
+pub fn from_json_object_value<T: DeserializeOwned>(
+    value: serde_json::Value,
+) -> Result<T, serde_json::Error> {
+    super::deserialization::from_json_value::<JsonObject<T>>(value).map(|object| object.0)
+}
+
+/// Object-array admission from a value tree, with sanitized causes.
+pub fn from_json_object_vec_value<T: DeserializeOwned>(
+    value: serde_json::Value,
+) -> Result<Vec<T>, serde_json::Error> {
+    super::deserialization::from_json_value::<Vec<JsonObject<T>>>(value)
+        .map(|objects| objects.into_iter().map(|object| object.0).collect())
 }

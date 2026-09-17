@@ -11,7 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Startup failures now print the full cause chain (#5589), including mesh field
   paths and YAML/JSON positions, without requiring `-v`. Configuration parsers
-  withhold offending document scalars before retaining errors; diagnostics also
+  classify serde families from the bare inner error, separately from document
+  paths, and withhold offending scalars before retaining errors. Custom validators
+  withhold double/single-quoted values (including unterminated spans) while keeping
+  backticked schema names. Paths and unknown-field messages echo document keys.
+  Mesh document version rejections withhold the supplied value. Diagnostics also
   redact credentials in exact configured database URLs and registered external
   secret values. The URL inventory reads only raw settings, without fetching
   dormant database TLS sources or creating PEM files. Owning loaders remain

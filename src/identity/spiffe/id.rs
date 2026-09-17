@@ -207,29 +207,29 @@ impl<'de> Deserialize<'de> for SpiffeId {
 pub enum SpiffeIdError {
     #[error("SPIFFE ID is empty")]
     Empty,
-    #[error("SPIFFE ID '{0}' is too long (max {1}, got {2})")]
+    #[error("SPIFFE ID {0:?} is too long (max {1}, got {2})")]
     TooLong(String, usize, usize),
-    #[error("SPIFFE ID scheme must be 'spiffe' (lowercase), got '{0}'")]
+    #[error("SPIFFE ID scheme must be `spiffe` (lowercase), got {0:?}")]
     InvalidScheme(String),
-    #[error("SPIFFE ID '{0}' must use the form 'spiffe://<trust-domain>/<path>'")]
+    #[error("SPIFFE ID {0:?} must use the form `spiffe://<trust-domain>/<path>`")]
     Malformed(String),
-    #[error("SPIFFE ID '{0}' must not include a query string")]
+    #[error("SPIFFE ID {0:?} must not include a query string")]
     HasQuery(String),
-    #[error("SPIFFE ID '{0}' must not include a fragment")]
+    #[error("SPIFFE ID {0:?} must not include a fragment")]
     HasFragment(String),
-    #[error("SPIFFE ID '{0}' must not have a trailing slash")]
+    #[error("SPIFFE ID {0:?} must not have a trailing slash")]
     TrailingSlash(String),
-    #[error("SPIFFE ID '{uri}' has empty path segment between slashes")]
+    #[error("SPIFFE ID {uri:?} has empty path segment between slashes")]
     EmptyPathSegment { uri: String },
-    #[error("SPIFFE ID '{uri}' has forbidden dot-only path segment '{segment}'")]
+    #[error("SPIFFE ID {uri:?} has forbidden dot-only path segment {segment:?}")]
     DotPathSegment { uri: String, segment: String },
-    #[error("SPIFFE ID '{uri}' path segment '{segment}' contains invalid character '{ch}'")]
+    #[error("SPIFFE ID {uri:?} path segment {segment:?} contains invalid character {ch:?}")]
     InvalidPathChar {
         uri: String,
         segment: String,
         ch: char,
     },
-    #[error("SPIFFE ID '{0}' has an invalid trust domain: {1}")]
+    #[error("SPIFFE ID {0:?} has an invalid trust domain: {1}")]
     InvalidTrustDomain(String, TrustDomainError),
 }
 

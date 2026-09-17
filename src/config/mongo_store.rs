@@ -6919,9 +6919,18 @@ mod inner {
     /// `doc_to_*` helper strips MongoDB's `_id` before deserialization.
     fn doc_to_proxy(mut doc: Document) -> Result<Proxy, anyhow::Error> {
         doc.remove("_id");
-        let proxy: Proxy = mongodb::bson::from_document(doc)
-            .map_err(crate::util::deserialization::sanitize_error)?;
+        let proxy: Proxy = deserialize_config_document(doc)?;
         Ok(proxy)
+    }
+
+    /// Keep BSON field paths separate from the bare serde error just like the
+    /// JSON/YAML value adapters. Never classify a composed BSON diagnostic.
+    fn deserialize_config_document<T: serde::de::DeserializeOwned>(
+        doc: Document,
+    ) -> Result<T, mongodb::bson::de::Error> {
+        let deserializer = mongodb::bson::Deserializer::new(Bson::Document(doc));
+        serde_path_to_error::deserialize(deserializer)
+            .map_err(crate::util::deserialization::sanitize_value_error)
     }
 
     /// Composite MongoDB `_id` for every namespaced resource document:
@@ -7159,8 +7168,7 @@ mod inner {
     fn doc_to_consumer(mut doc: Document) -> Result<Consumer, anyhow::Error> {
         doc.remove("_id");
         doc.remove(HMAC_SECRET_HASHES_FIELD);
-        Ok(mongodb::bson::from_document(doc)
-            .map_err(crate::util::deserialization::sanitize_error)?)
+        Ok(deserialize_config_document(doc)?)
     }
 
     /// Convert a domain `PluginConfig` into a BSON `Document`.
@@ -7173,8 +7181,7 @@ mod inner {
 
     fn doc_to_plugin_config(mut doc: Document) -> Result<PluginConfig, anyhow::Error> {
         doc.remove("_id");
-        Ok(mongodb::bson::from_document(doc)
-            .map_err(crate::util::deserialization::sanitize_error)?)
+        Ok(deserialize_config_document(doc)?)
     }
 
     /// Convert a domain `Upstream` into a BSON `Document`.
@@ -7191,8 +7198,7 @@ mod inner {
 
     fn doc_to_upstream(mut doc: Document) -> Result<Upstream, anyhow::Error> {
         doc.remove("_id");
-        Ok(mongodb::bson::from_document(doc)
-            .map_err(crate::util::deserialization::sanitize_error)?)
+        Ok(deserialize_config_document(doc)?)
     }
 
     /// Encode a gateway trust-bundle record (issue #3727).

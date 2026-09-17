@@ -276,10 +276,22 @@ Error: Startup security validation failed: Invalid TLS configuration: ...
 Startup and validation failures include the full cause chain, from the outer
 operation to the underlying failure. Configuration deserialization withholds
 offending document scalars (including unregistered inline PEM and tokens) before
-retaining the error. Diagnostics keep field paths, available line/column positions,
-expected types, and missing/unknown field names. Validation messages also withhold
-quoted document values, including CIDRs: use the field path, when available, to
-locate the value; the validation reason and prefix length remain visible.
+retaining the error. Serde families are sanitized structurally: the path is kept
+separate and only the bare inner diagnostic's exact leading family is classified.
+Diagnostics keep field paths, available line/column positions, expected types,
+and missing/unknown/duplicate field names. Paths and unknown-field messages echo
+document **keys**; they are diagnostic context, not confidential value storage.
+Custom validators use backticks for schema names and Debug-escaped double quotes
+for document values. The custom boundary withholds double- and single-quoted
+spans, through the end if unterminated, and keeps backticked names. This also
+applies to parser-level errors, which are never classified as serde families.
+For withheld CIDRs, use the field path to locate the value; the reason and prefix
+length remain visible. Localized mesh and stock-xDS policy version rejections
+withhold the supplied `version` and retain the supported version and reason.
+Generic object visitors enforce shape; their document/value adapters own error
+sanitization. YAML preserves native admission and original error positions, then
+replays failed typed deserialization through a value tree to separate the error
+from its path. In-memory trees have no original source position to recover.
 The final rendering also redacts credentials in exact configured
 primary/replica/failover database URLs and registered resolved external-secret
 values and their bounded derived forms.

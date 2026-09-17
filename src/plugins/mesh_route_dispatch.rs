@@ -111,9 +111,11 @@ pub struct MeshRouteDispatchConfig {
 
 impl MeshRouteDispatchConfig {
     pub fn from_value(config: &Value) -> Result<Self, String> {
-        serde_json::from_value::<crate::util::json_object::JsonObject<Self>>(config.clone())
-            .map(|object| object.0)
-            .map_err(|e| format!("mesh_route_dispatch config: {e}"))
+        crate::util::deserialization::from_json_value::<crate::util::json_object::JsonObject<Self>>(
+            config.clone(),
+        )
+        .map(|object| object.0)
+        .map_err(|e| format!("mesh_route_dispatch config: {e}"))
     }
 
     pub fn from_value_normalized(config: &Value) -> Result<Self, String> {

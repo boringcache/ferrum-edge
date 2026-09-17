@@ -1262,19 +1262,19 @@ impl ParsedCidr {
             Some((net, plen)) => {
                 let prefix = plen
                     .parse::<u8>()
-                    .map_err(|_| format!("invalid prefix length in CIDR '{s}'"))?;
+                    .map_err(|_| format!("invalid prefix length in CIDR {s:?}"))?;
                 (net, Some(prefix))
             }
             None => (trimmed, None),
         };
         let ip: IpAddr = network_str
             .parse()
-            .map_err(|_| format!("invalid IP in CIDR '{s}'"))?;
+            .map_err(|_| format!("invalid IP in CIDR {s:?}"))?;
         let (network, prefix) =
-            Self::canonicalize(ip, prefix).map_err(|reason| format!("{reason} in CIDR '{s}'"))?;
+            Self::canonicalize(ip, prefix).map_err(|reason| format!("{reason} in CIDR {s:?}"))?;
         let max = if network.is_ipv4() { 32 } else { 128 };
         if prefix > max {
-            return Err(format!("prefix length {prefix} out of range in CIDR '{s}'"));
+            return Err(format!("prefix length {prefix} out of range in CIDR {s:?}"));
         }
         Ok(Self { network, prefix })
     }
@@ -4513,7 +4513,7 @@ impl<'de> Deserialize<'de> for MeshCorsOriginMatch {
             "prefix" => Ok(MeshCorsOriginMatch::Prefix(value)),
             "regex" => Ok(MeshCorsOriginMatch::Regex(value)),
             other => Err(D::Error::custom(format!(
-                "unknown CORS origin matcher `{other}` (expected `exact`, `prefix`, or `regex`)"
+                "unknown CORS origin matcher {other:?} (expected `exact`, `prefix`, or `regex`)"
             ))),
         }
     }

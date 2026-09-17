@@ -505,7 +505,7 @@ impl ResourceAccumulator {
         version: &str,
     ) -> Result<(), String> {
         if !is_known_type_url(type_url) {
-            return Err(format!("unknown xDS type_url '{type_url}'"));
+            return Err("unknown xDS type_url <redacted scalar>".to_string());
         }
         if version.trim().is_empty()
             && (is_required_mesh_slice_type(type_url) || !resources.is_empty())
@@ -520,8 +520,8 @@ impl ResourceAccumulator {
         for resource in resources {
             if !resource.type_url.is_empty() && resource.type_url != type_url {
                 return Err(format!(
-                    "resource type_url '{}' does not match response type_url '{}'",
-                    resource.type_url, type_url
+                    "resource type_url <redacted scalar> does not match response \
+                     type_url '{type_url}'"
                 ));
             }
             let name = decode_resource_name(type_url, &resource.value)?;
@@ -532,9 +532,10 @@ impl ResourceAccumulator {
             }
             validate_resource_name_shape(type_url, &name)?;
             if type_url == RTDS_TYPE_URL && !runtime_names.insert(name.clone()) {
-                return Err(format!(
-                    "xDS RTDS response contains duplicate Runtime resource name '{name}'"
-                ));
+                return Err(
+                    "xDS RTDS response contains duplicate Runtime resource name <redacted scalar>"
+                        .to_string(),
+                );
             }
             // ECDS reverse-translation reads the full bytes back to decode
             // its inner TypedExtensionConfig. RTDS reverse-translation does
@@ -2397,14 +2398,16 @@ fn reserved_destination_rule_carrier_name(name: &str) -> Result<Option<(&str, &s
     let parts: Vec<&str> = rest.split('/').collect();
     if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
         return Err(format!(
-            "xDS ECDS resource '{name}' uses reserved Ferrum DestinationRule carrier name but must be named '{FERRUM_DR_CARRIER_RESOURCE_NAME_PREFIX}{{namespace}}/{{name}}'"
+            "xDS ECDS resource <redacted scalar> uses reserved Ferrum DestinationRule carrier \
+             name but must be named \
+             '{FERRUM_DR_CARRIER_RESOURCE_NAME_PREFIX}{{namespace}}/{{name}}'"
         ));
     }
     Ok(Some((parts[0], parts[1])))
 }
 
 fn validate_reserved_destination_rule_carrier_name(
-    resource_name: &str,
+    _resource_name: &str,
     expected_namespace: &str,
     expected_name: &str,
     dr: &MeshDestinationRule,
@@ -2412,10 +2415,11 @@ fn validate_reserved_destination_rule_carrier_name(
     if dr.namespace == expected_namespace && dr.name == expected_name {
         return Ok(());
     }
-    Err(format!(
-        "xDS reserved DestinationRule ECDS carrier '{resource_name}' embeds DestinationRule '{}/{}' but reserved name targets '{}/{}'",
-        dr.namespace, dr.name, expected_namespace, expected_name
-    ))
+    Err(
+        "xDS reserved DestinationRule ECDS carrier <redacted scalar> embeds DestinationRule \
+         <redacted scalar> but reserved name targets a different namespace/name"
+            .to_string(),
+    )
 }
 
 fn destination_rule_carrier_inner<'a>(
@@ -2436,8 +2440,9 @@ fn destination_rule_carrier_inner<'a>(
     if inner.type_url != FERRUM_ECDS_DESTINATION_RULE_TYPE_URL {
         if resource_name_is_reserved {
             return Err(format!(
-                "xDS ECDS resource '{}' uses reserved Ferrum DestinationRule carrier name with non-DR type_url '{}'",
-                resource.name, inner.type_url
+                "xDS ECDS resource '{}' uses reserved Ferrum DestinationRule carrier name \
+                 with non-DR type_url <redacted scalar>",
+                resource.name
             ));
         }
         return Ok(None);
@@ -2473,8 +2478,9 @@ fn mesh_slice_carrier_inner<'a>(
     if inner.type_url == FERRUM_ECDS_DESTINATION_RULE_TYPE_URL {
         if resource_name_is_reserved {
             return Err(format!(
-                "xDS ECDS resource '{}' uses reserved Ferrum mesh-slice carrier name with non-carrier type_url '{}'",
-                resource.name, inner.type_url
+                "xDS ECDS resource '{}' uses reserved Ferrum mesh-slice carrier name \
+                 with non-carrier type_url <redacted scalar>",
+                resource.name
             ));
         }
         return Ok(None);
@@ -2482,8 +2488,9 @@ fn mesh_slice_carrier_inner<'a>(
     let Some(expected_name) = carrier_resource_name_for_type_url(&inner.type_url) else {
         if resource_name_is_reserved {
             return Err(format!(
-                "xDS ECDS resource '{}' uses reserved Ferrum mesh-slice carrier name with non-carrier type_url '{}'",
-                resource.name, inner.type_url
+                "xDS ECDS resource '{}' uses reserved Ferrum mesh-slice carrier name \
+                 with non-carrier type_url <redacted scalar>",
+                resource.name
             ));
         }
         return Ok(None);
@@ -2491,8 +2498,9 @@ fn mesh_slice_carrier_inner<'a>(
     if resource.name != expected_name {
         if resource_name_is_reserved {
             return Err(format!(
-                "xDS ECDS resource '{}' uses carrier type_url '{}' but must be named '{}'",
-                resource.name, inner.type_url, expected_name
+                "xDS ECDS resource <redacted scalar> uses carrier type_url '{}' \
+                 but must be named '{}'",
+                inner.type_url, expected_name
             ));
         }
         if warn_on_non_reserved_name {
@@ -2623,7 +2631,7 @@ fn decode_resource_name(type_url: &str, value: &[u8]) -> Result<String, String> 
         RTDS_TYPE_URL => runtime_proto::Runtime::decode(value)
             .map(|resource| resource.name)
             .map_err(|e| format!("failed to decode Runtime resource: {e}")),
-        other => Err(format!("unknown xDS type_url '{other}'")),
+        _ => Err("unknown xDS type_url <redacted scalar>".to_string()),
     }
 }
 
@@ -2658,24 +2666,23 @@ fn parse_service_port_resource_name(
     let parts: Vec<&str> = name.split('/').collect();
     if parts.len() != 4 || parts[0] != expected_prefix {
         return Err(format!(
-            "resource name '{name}' must use '{expected_prefix}/{{namespace}}/{{service}}/{{port}}'"
+            "resource name <redacted scalar> must use \
+             '{expected_prefix}/{{namespace}}/{{service}}/{{port}}'"
         ));
     }
     let namespace = parts[1];
     let service = parts[2];
     if namespace.is_empty() || service.is_empty() {
-        return Err(format!(
-            "resource name '{name}' must include non-empty namespace and service"
-        ));
+        return Err(
+            "resource name <redacted scalar> must include non-empty namespace and service"
+                .to_string(),
+        );
     }
     let port = parts[3].parse::<u16>().map_err(|e| {
-        format!(
-            "resource name '{name}' has invalid port '{}': {e}",
-            parts[3]
-        )
+        format!("resource name <redacted scalar> has invalid port <redacted scalar>: {e}")
     })?;
     if port == 0 {
-        return Err(format!("resource name '{name}' must use a non-zero port"));
+        return Err("resource name <redacted scalar> must use a non-zero port".to_string());
     }
     Ok(ServicePortResourceName {
         namespace: namespace.to_string(),
@@ -2687,16 +2694,17 @@ fn parse_service_port_resource_name(
 fn parse_route_resource_name(name: &str) -> Result<ServiceResourceName, String> {
     let parts: Vec<&str> = name.split('/').collect();
     if parts.len() != 3 || parts[0] != "route" {
-        return Err(format!(
-            "resource name '{name}' must use 'route/{{namespace}}/{{service}}'"
-        ));
+        return Err(
+            "resource name <redacted scalar> must use 'route/{namespace}/{service}'".to_string(),
+        );
     }
     let namespace = parts[1];
     let service = parts[2];
     if namespace.is_empty() || service.is_empty() {
-        return Err(format!(
-            "resource name '{name}' must include non-empty namespace and service"
-        ));
+        return Err(
+            "resource name <redacted scalar> must include non-empty namespace and service"
+                .to_string(),
+        );
     }
     Ok(ServiceResourceName {
         namespace: namespace.to_string(),
@@ -2707,15 +2715,14 @@ fn parse_route_resource_name(name: &str) -> Result<ServiceResourceName, String> 
 fn parse_spiffe_bundle_secret_name(name: &str) -> Result<String, String> {
     let parts: Vec<&str> = name.split('/').collect();
     if parts.len() != 3 || parts[0] != "secret" || parts[1] != "spiffe-bundle" {
-        return Err(format!(
-            "resource name '{name}' must use 'secret/spiffe-bundle/{{trust_domain}}'"
-        ));
+        return Err(
+            "resource name <redacted scalar> must use 'secret/spiffe-bundle/{trust_domain}'"
+                .to_string(),
+        );
     }
     let trust_domain = parts[2];
     if trust_domain.is_empty() {
-        return Err(format!(
-            "resource name '{name}' must include a trust domain"
-        ));
+        return Err("resource name <redacted scalar> must include a trust domain".to_string());
     }
     Ok(trust_domain.to_string())
 }
@@ -3038,7 +3045,8 @@ mod tests {
             .apply_sotw_response(RTDS_TYPE_URL, &[duplicate_a, duplicate_b], "rtds-v2")
             .expect_err("duplicate Runtime names must NACK");
 
-        assert!(error.contains("duplicate Runtime resource name 'duplicate'"));
+        assert!(error.contains("duplicate Runtime resource name <redacted scalar>"));
+        assert!(!error.contains("'duplicate'"));
         assert_eq!(accumulator.resources(RTDS_TYPE_URL).len(), 1);
         assert_eq!(accumulator.resources(RTDS_TYPE_URL)[0].name, "stable");
         assert_eq!(

@@ -490,7 +490,8 @@ pub(crate) fn parse_federation_document(
                 && td.as_str() != expected_trust_domain.as_str()
             {
                 return Err(format!(
-                    "federation bundle trust_domain '{td}' does not match remote cluster trust domain '{expected_trust_domain}'"
+                    "federation bundle trust_domain <redacted scalar> does not match remote \
+                     cluster trust domain '{expected_trust_domain}'"
                 ));
             }
             if native.x509_authorities.len() > FEDERATION_MAX_X509_AUTHORITIES {
@@ -548,11 +549,11 @@ pub(crate) fn parse_federation_document(
                             public_key_pem: serialised,
                         });
                     }
-                    Some(other) => {
+                    Some(_) => {
                         // Unknown SPIFFE `use` claim — skip with a warning so a
                         // newer SPIFFE spec key type does not break the
                         // existing keys.
-                        debug!(unsupported_use = %other, "Skipping SPIFFE JWKS key with unsupported 'use'");
+                        debug!("Skipping SPIFFE JWKS key with unsupported `use` <redacted scalar>");
                     }
                     None => {
                         return Err("federation bundle JWKS key missing 'use' claim".to_string());
@@ -1167,9 +1168,10 @@ pub(crate) fn validate_federation_endpoint(endpoint: &str) -> Result<(), String>
     })?;
     let scheme = url.scheme();
     if scheme != "https" {
-        return Err(format!(
-            "federation_endpoint must use authenticated https scheme (got '{scheme}')"
-        ));
+        return Err(
+            "federation_endpoint must use authenticated https scheme (got <redacted scalar>)"
+                .to_string(),
+        );
     }
     let Some(host) = url.host() else {
         return Err(format!(
@@ -1387,6 +1389,8 @@ mod tests {
         let err = parse_federation_document(body.as_bytes(), &td("remote.example.com"))
             .expect_err("mismatch should reject");
         assert!(err.contains("does not match"), "{err}");
+        assert!(!err.contains("other.example.com"), "{err}");
+        assert!(err.contains("<redacted scalar>"), "{err}");
     }
 
     #[test]

@@ -1489,9 +1489,9 @@ fn parse_direction_emit(config: &Value) -> Result<DirectionEmit, String> {
     match config.get("direction_emit") {
         None | Some(Value::Null) => Ok(DirectionEmit::server_only()),
         Some(value) => {
-            serde_json::from_value::<crate::util::json_object::JsonObject<DirectionEmit>>(
-                value.clone(),
-            )
+            crate::util::deserialization::from_json_value::<
+                crate::util::json_object::JsonObject<DirectionEmit>,
+            >(value.clone())
             .map(|object| object.0)
             .map_err(|e| format!("workload_metrics: invalid direction_emit config: {e}"))
         }

@@ -3648,13 +3648,54 @@ async fn functional_cli_mesh_startup_redacts_secret_in_inner_cause() {
         assert_eq!(output.status.code(), Some(1), "{subcommand}: {diagnostic}");
         assert!(!diagnostic.contains(secret), "{subcommand}: {diagnostic}");
         assert!(
-            diagnostic.contains("mesh configuration file declares version '"),
+            diagnostic.contains("unsupported mesh document version"),
             "{subcommand}: {diagnostic}"
         );
         assert!(
-            diagnostic.contains(ferrum_edge::secrets::EXTERNAL_SECRET_PLACEHOLDER),
+            diagnostic.contains(ferrum_edge::util::deserialization::REDACTED_SCALAR),
             "{subcommand}: {diagnostic}"
         );
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_mesh_versions_are_redacted_without_registration() {
+    let secret = "UNREGISTERED_VERSION_TOKEN_5589";
+    let document = serde_json::json!({"version": secret, "mesh": {}});
+    for extension in ["yaml", "json"] {
+        let directory = TempDir::new().unwrap();
+        let mesh_path = directory.path().join(format!("mesh-invalid-version.{extension}"));
+        let content = if extension == "yaml" {
+            serde_yaml::to_string(&document).unwrap()
+        } else {
+            serde_json::to_string_pretty(&document).unwrap()
+        };
+        std::fs::write(&mesh_path, content).unwrap();
+        for protocol in ["file", "stock_xds"] {
+            for subcommand in ["run", "validate"] {
+                let mut command = installed_cli_command(&directory, &[subcommand, "-m", "mesh"]);
+                command
+                    .env("FERRUM_MESH_CONFIG_PROTOCOL", protocol)
+                    .env("FERRUM_MESH_FILE_CONFIG_PATH", &mesh_path)
+                    .env("FERRUM_MESH_ALLOW_NO_CA", "true")
+                    .env("FERRUM_MESH_STOCK_XDS_URLS", "https://127.0.0.1:1")
+                    .env("FERRUM_MESH_STOCK_XDS_NODE_ID", "diagnostic-fixture")
+                    .env("FERRUM_PROXY_HTTP_PORT", "0")
+                    .env("FERRUM_ADMIN_HTTP_PORT", "0");
+                let output = cli_contract_output(command).await;
+                let diagnostic = cli_contract_diagnostic(&output);
+                assert_eq!(output.status.code(), Some(1), "{diagnostic}");
+                assert!(!diagnostic.contains(secret), "{diagnostic}");
+                for required in [
+                    "unsupported mesh document version (<redacted scalar>)",
+                    "supported: 1",
+                    "the mesh model has no file migrations",
+                ] {
+                    assert!(diagnostic.contains(required), "{diagnostic}");
+                }
+            }
+        }
     }
 }
 

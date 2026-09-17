@@ -2358,7 +2358,12 @@ fn plugin_struct_lists_behind_raw_json_values_retain_element_admission() {
     ] {
         let text = admission_source_without_line_comments(&source(path));
         assert!(
-            item_body(&text, signature, terminator).contains("json_object::deserialize_object_vec"),
+            [
+                "json_object::deserialize_object_vec",
+                "json_object::from_json_object_vec_value",
+            ]
+            .iter()
+            .any(|guard| item_body(&text, signature, terminator).contains(guard)),
             "{path}: raw JSON lists must guard every typed struct element"
         );
     }
@@ -2390,7 +2395,7 @@ fn plugin_struct_lists_behind_raw_json_values_retain_element_admission() {
         "fn decode_virtual_service_l4_upstreams(",
     ] {
         assert!(
-            item_body(&text, signature, "\n}").contains("json_object::deserialize_object("),
+            item_body(&text, signature, "\n}").contains("json_object::from_json_object_value("),
             "{signature}: typed L4 resource elements must require objects"
         );
     }

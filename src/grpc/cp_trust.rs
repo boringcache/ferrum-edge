@@ -1269,8 +1269,8 @@ impl CpDpTrustBundle {
             && version != 1
         {
             return Err(invalid(format!(
-                "CP/DP trust bundle '{origin}' declares unsupported version {version}; only \
-                 version 1 is understood"
+                "CP/DP trust bundle '{origin}' declares unsupported version <redacted scalar>; \
+                 only version 1 is understood"
             )));
         }
         if document.keys.is_empty() {
@@ -2003,8 +2003,8 @@ impl TrustBundleKeyDocument {
 
         let algorithm: Algorithm = self.algorithm.trim().parse().map_err(|_| {
             format!(
-                "CP/DP trust bundle '{origin}': key '{kid}' declares unsupported algorithm '{}'",
-                self.algorithm.trim()
+                "CP/DP trust bundle '{origin}': key '{kid}' declares unsupported algorithm \
+                 <redacted scalar>"
             )
         })?;
         if crate::fips::is_enforcing()

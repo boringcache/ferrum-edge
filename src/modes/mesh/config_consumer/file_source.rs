@@ -123,8 +123,8 @@ pub fn read_mesh_config_document(
         && version != CURRENT_CONFIG_VERSION
     {
         anyhow::bail!(
-            "mesh configuration file declares version '{version}' but this gateway expects \
-             '{CURRENT_CONFIG_VERSION}' (the mesh model has no file migrations)"
+            "unsupported mesh document version (<redacted scalar>); supported: \
+             {CURRENT_CONFIG_VERSION} (the mesh model has no file migrations)"
         );
     }
 
@@ -250,7 +250,8 @@ pub fn normalized_mesh_gateway_config(
 /// who fed a full gateway config file gets steered instead of puzzled by a
 /// bare "unknown field `proxies`".
 fn mesh_doc_parse_error(err: impl std::fmt::Display) -> String {
-    let err = crate::util::deserialization::sanitize_message(&err.to_string());
+    // Document adapters already sanitize the inner error. Never classify this
+    // composed diagnostic: its leading path may contain document map keys.
     format!(
         "invalid mesh configuration document: {err} (the localized mesh source consumes only an \
          optional `version` plus the `mesh` section; gateway resources such as proxies/upstreams \

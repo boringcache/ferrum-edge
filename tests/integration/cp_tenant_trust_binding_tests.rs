@@ -1651,6 +1651,33 @@ fn malformed_bundles_are_refused_without_echoing_material() {
 }
 
 #[test]
+fn trust_bundle_version_and_algorithm_errors_withhold_unregistered_values() {
+    for (document, secret, required) in [
+        (
+            json!({"version": 429400001, "keys": []}),
+            "429400001",
+            "unsupported version <redacted scalar>; only version 1 is understood",
+        ),
+        (
+            json!({"keys": [{
+                "kid": "fixture",
+                "algorithm": "UNREGISTERED_ALGORITHM_TOKEN",
+                "secret": TENANT_A_SECRET,
+                "namespaces": [TENANT_A]
+            }]}),
+            "UNREGISTERED_ALGORITHM_TOKEN",
+            "unsupported algorithm <redacted scalar>",
+        ),
+    ] {
+        let error = CpDpTrustBundle::from_document_str(&document.to_string(), "fixture", None)
+            .expect_err("unsupported document scalar must be refused");
+        assert!(!error.contains(secret), "{error}");
+        assert!(!error.contains(TENANT_A_SECRET), "{error}");
+        assert!(error.contains(required), "{error}");
+    }
+}
+
+#[test]
 fn trust_bundle_and_file_backed_material_reads_are_bounded_regular_files() {
     const FILE_LIMIT: usize = 1024 * 1024;
 
