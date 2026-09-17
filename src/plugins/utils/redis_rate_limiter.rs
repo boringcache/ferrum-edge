@@ -160,16 +160,52 @@
 //! transactions run on the ordinary pooled multiplexed connections: no `WATCH`,
 //! no per-request connection, no retry budget, and still no scripting.
 //!
+//! **The bucket clock is the Redis server's clock, not the gateway's.**
+//! Sub-buckets are only as shared as the clock that selects them, and every
+//! gateway's local wall clock drifts independently. Each charge transaction
+//! therefore carries a `TIME` as its last command, inside the same
+//! `MULTI`/`EXEC` and at no extra round trip, and the reply is the server's own
+//! clock at `EXEC`. Every successful transaction updates a per-client offset
+//! (`server_time − local_time_at_reply`, see [`RedisServerClock`]), and the
+//! NEXT request selects its bucket from `local_now + offset`. Bucket selection
+//! and settlement are therefore judged on the Redis server clock; the local
+//! clock is used only through that continuously corrected offset. Before the
+//! first transaction of a client's life there is no offset yet, so that one
+//! request selects from the raw local clock.
+//!
+//! Residual inter-gateway skew is then bounded by each gateway's own Redis
+//! round trip rather than by NTP discipline: the offset is learned from a reply
+//! observed one round trip after the server read its clock, so it is stale by
+//! at most that RTT plus jitter. That is far below one sub-bucket unless the
+//! RTT itself exceeds a sub-bucket — the same regime in which the staleness
+//! rebuild below already degrades the policy into `redis_failure_policy`
+//! territory. NTP remains ordinary host hygiene (it keeps logs, TLS, and the
+//! token-accounting `{tag}:{window_index}` layout honest); it is no longer what
+//! the quota ladder's correctness rests on.
+//!
+//! `TIME` is an additional command for restrictive Redis ACLs. It is probed
+//! ONCE per established connection with a plain `TIME` before the socket
+//! carries a policy command; a server that refuses it (`NOPERM`), or does not
+//! implement it, puts this client in **local-clock mode** with a sampled
+//! warning: no `TIME` is placed in the transaction (an ACL failure inside
+//! `MULTI` aborts the whole `EXEC`), and the weaker documented contract applies
+//! — gateway clocks within one sub-bucket of each other.
+//!
 //! **Bucket staleness has a bounded rebuild, and it is not a retry budget.**
 //! Bucket selection precedes connection acquisition, so a charge is always
 //! slightly stale when it lands. One sub-bucket of that is covered by the
-//! forward `GET`. Past that the caller samples the clock ONCE after `EXEC`
-//! ([`sub_bucket_charge_is_settled`]) and, if the clock has reached `b + 2` or
-//! later, hands its charge back and rebuilds the ladder from that same sample
-//! for exactly ONE more transaction; a second rollover fails closed with a
-//! sampled warning. That is a staleness rebuild on a SUCCESSFUL transaction,
-//! not a retry of a failed command — a Redis error still costs exactly one
-//! round trip and is never retried.
+//! forward `GET`. Past that the transaction's own `TIME` reply settles it
+//! ([`sub_bucket_charge_is_settled`]): if the server executed `EXEC` at
+//! `b + 2` or later, a peer may have charged a bucket this ladder neither read
+//! nor charged, so the caller hands its charge back and rebuilds the ladder
+//! from that server instant for exactly ONE more transaction; a second rollover
+//! fails closed with a sampled warning. The rebuild first WAITS for its own
+//! hand-back to be confirmed, because the rebuilt ladder reads the bucket the
+//! abandoned pass charged and would otherwise count that charge against the
+//! request that abandoned it. A compensation that cannot be confirmed refuses
+//! instead of rebuilding. That is a staleness rebuild on a SUCCESSFUL
+//! transaction, not a retry of a failed command — a Redis error still costs
+//! exactly one round trip and is never retried.
 //!
 //! # DNS
 //!
@@ -270,7 +306,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::Weak;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::AbortHandle;
 use tracing::{info, warn};
@@ -341,6 +377,15 @@ pub const REDIS_WINDOW_SUB_BUCKETS: usize = 8;
 /// transaction executes SECOND always observes the other, and the direction is
 /// conservative: in the ordinary case nothing has charged a bucket the clock
 /// has not reached yet, so the forward counter is empty and costs nothing.
+///
+/// This ONE sub-bucket of cover absorbs transaction staleness. It must not be
+/// asked to absorb clock skew as well — that is what [`RedisServerClock`] is
+/// for. Two gateways whose local clocks differ, each also stalling, can
+/// otherwise consume the same allowance twice: the peer's charge lands outside
+/// the ladder at BOTH ends (a faster peer charges past `b + 1`, and a faster
+/// gateway drops a still-live charge off the oldest end), and both requests are
+/// admitted. Anchoring selection on the server clock removes the skew term so
+/// the forward read only ever has to cover staleness.
 pub const REDIS_WINDOW_SUB_BUCKET_KEYS: usize = REDIS_WINDOW_SUB_BUCKETS + 2;
 
 /// The sub-bucket one request falls in, derived from a single epoch timestamp.
@@ -357,40 +402,205 @@ pub struct RedisSubBucket {
     pub window_seconds: u64,
 }
 
-/// Whether a ladder built for `bucket` is still usable after its transaction
-/// executed, judged against ONE wall-clock sample taken after `EXEC`.
+/// The ONE local wall-clock sample this process can take.
 ///
-/// Bucket selection necessarily precedes connection acquisition and execution,
-/// so a charge is always slightly stale by the time it lands. One sub-bucket of
-/// staleness is covered by construction, because the ladder also reads the
-/// bucket immediately after the charged one (see
-/// [`REDIS_WINDOW_SUB_BUCKET_KEYS`]): a peer that selected `b + 1` is visible
-/// to a request that selected `b`, and vice versa.
-///
-/// Beyond that the cover is gone. If the clock has reached `b + 2` or later —
-/// a stall longer than a whole sub-bucket, which the 500ms screened response
-/// timeout still admits for a one-second window — a peer may have charged a
-/// bucket this ladder neither read nor charged, and the decision derived from
-/// it could over-admit. That is what this reports, so the caller can hand its
-/// charge back and rebuild once rather than publish an admission it cannot
-/// stand behind.
-///
-/// A clock that moved BACKWARD is not a staleness problem: the charged bucket
-/// is then ahead of the fresh one and the ladder still covers everything a
-/// peer could have charged, so only forward travel is rejected.
-/// The ONE wall-clock sample an admission decision derives its whole ladder
-/// from.
-///
-/// Every window of one request shares this sample, so a policy mixing a
-/// per-second and a per-minute window cannot pair one window's bucket with
-/// another window's instant. A pre-epoch clock reads as the epoch rather than
-/// panicking; admission never panics.
+/// It is never the bucket clock on its own: [`RedisServerClock`] shifts it onto
+/// the Redis server's clock, which is the only instant every gateway sharing a
+/// quota agrees on. A pre-epoch clock reads as the epoch rather than panicking;
+/// admission never panics.
 pub fn redis_epoch_now() -> Duration {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
 }
 
+/// Offset learned from one `TIME` reply: `server_time − local_time_at_reply`,
+/// in nanoseconds.
+///
+/// The local sample is taken when the reply is decoded, one round trip after
+/// the server read its own clock, so the offset lags reality by at most that
+/// round trip. That is the residual error the whole server-clock design
+/// carries, and it is why a store slower than a sub-bucket degrades the policy
+/// rather than silently mis-bucketing it.
+///
+/// Integer throughout (no `f64` ever reaches the quota path), and saturating:
+/// a nonsense clock on either side clamps instead of wrapping into a
+/// plausible-looking offset.
+pub fn clock_offset_nanos(server_time: Duration, local_at_reply: Duration) -> i64 {
+    let server = server_time.as_nanos() as i128;
+    let local = local_at_reply.as_nanos() as i128;
+    (server - local).clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+/// Shift a local epoch instant onto the server clock by a learned offset.
+///
+/// Clamped at the epoch rather than wrapping: an offset large enough to push
+/// the corrected instant negative is a broken clock, and a wrapped instant
+/// would select a sub-bucket at the far end of the index space.
+pub fn apply_clock_offset(local_now: Duration, offset_nanos: i64) -> Duration {
+    let corrected = (local_now.as_nanos() as i128).saturating_add(offset_nanos as i128);
+    if corrected <= 0 {
+        return Duration::ZERO;
+    }
+    let corrected = corrected as u128;
+    let seconds = (corrected / 1_000_000_000).min(u64::MAX as u128) as u64;
+    // Strictly below one second, so `Duration::new` cannot carry and overflow.
+    let subsec_nanos = (corrected % 1_000_000_000) as u32;
+    Duration::new(seconds, subsec_nanos)
+}
+
+/// Parse a Redis `TIME` reply into an epoch instant.
+///
+/// `TIME` answers a two-element array: Unix seconds and the microseconds
+/// elapsed inside the current second, both as decimal strings. Anything else —
+/// a server that does not implement the command, a reply shape this code
+/// cannot pair, a microsecond field outside `[0, 1_000_000)` — is `None`. The
+/// caller never guesses at a partial reading: an unusable server clock is
+/// handled as an unusable reply, not as a zero.
+pub fn parse_redis_server_time(value: &redis::Value) -> Option<Duration> {
+    let redis::Value::Array(items) = value else {
+        return None;
+    };
+    let [seconds, micros] = items.as_slice() else {
+        return None;
+    };
+    let seconds: u64 = redis::from_redis_value(seconds).ok()?;
+    let micros: u64 = redis::from_redis_value(micros).ok()?;
+    if micros >= 1_000_000 {
+        return None;
+    }
+    Some(Duration::from_secs(seconds).saturating_add(Duration::from_micros(micros)))
+}
+
+/// One client's view of the shared bucket clock: the Redis server's own clock,
+/// tracked as a continuously corrected offset from this process's wall clock.
+///
+/// Sub-buckets are only as shared as the clock that picks them. Two gateways
+/// reading their own wall clocks can disagree by more than a sub-bucket while
+/// both believing they enforce one budget, and the forward `GET` covers one
+/// sub-bucket of drift ONCE — it cannot absorb transaction staleness and clock
+/// skew at the same time. Anchoring both endpoints of the ladder and the
+/// settlement check on the server's clock removes the second term entirely:
+/// every gateway's charge is ordered on the clock of the process that applies
+/// it.
+///
+/// The offset is learned from the `TIME` that rides inside every charge
+/// transaction, so it costs no round trip and refreshes on every admission.
+/// Its error is one Redis round trip (the reply is decoded after the server
+/// read its clock), which is why a store slower than a sub-bucket is treated as
+/// an unavailable store rather than a quietly wrong one.
+///
+/// Three states, and the difference matters:
+///
+/// - **Unprobed / denied** (`server_time_permitted() == false`): no `TIME` is
+///   placed in the transaction. The client runs in local-clock mode under the
+///   weaker documented contract (gateway clocks within one sub-bucket). An ACL
+///   failure inside `MULTI` aborts the whole `EXEC`, so a denied command must
+///   never be queued in the first place.
+/// - **Permitted, no sample yet**: the first transaction of the client's life
+///   selects its bucket from the raw local clock, exactly as before, and learns
+///   the offset from its own reply.
+/// - **Permitted, sample known**: every selection and every settlement
+///   judgement is on the server clock.
+#[derive(Debug, Default)]
+pub struct RedisServerClock {
+    /// `server_time − local_time_at_reply`, nanoseconds. Meaningless until
+    /// `offset_known`.
+    offset_nanos: AtomicI64,
+    /// Whether any successful `TIME` reply has been folded in.
+    offset_known: AtomicBool,
+    /// Whether this client's connections are allowed to run `TIME` at all.
+    server_time_permitted: AtomicBool,
+}
+
+impl RedisServerClock {
+    /// Local-clock mode with no sample: what every client starts as, until a
+    /// screened connection probes `TIME`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether charge transactions may carry `TIME`.
+    pub fn server_time_permitted(&self) -> bool {
+        self.server_time_permitted.load(Ordering::Acquire)
+    }
+
+    /// Record the ACL verdict for `TIME`, returning the previous value.
+    ///
+    /// Re-probed on every established connection, and revoked in place when a
+    /// live ACL change aborts a transaction, so the verdict follows the server
+    /// rather than latching at startup.
+    pub fn set_server_time_permitted(&self, permitted: bool) -> bool {
+        self.server_time_permitted.swap(permitted, Ordering::AcqRel)
+    }
+
+    /// Fold one `TIME` reply into the offset.
+    ///
+    /// `local_at_reply` is this process's wall clock when the reply was
+    /// decoded. It is bookkeeping for the offset only: no admission decision is
+    /// judged against it.
+    pub fn record_reply(&self, server_time: Duration, local_at_reply: Duration) {
+        self.offset_nanos.store(
+            clock_offset_nanos(server_time, local_at_reply),
+            Ordering::Relaxed,
+        );
+        self.offset_known.store(true, Ordering::Release);
+    }
+
+    /// The learned offset, or `None` while no `TIME` reply has been seen.
+    pub fn offset_nanos(&self) -> Option<i64> {
+        if self.offset_known.load(Ordering::Acquire) {
+            Some(self.offset_nanos.load(Ordering::Relaxed))
+        } else {
+            None
+        }
+    }
+
+    /// Shift a captured local instant onto the server clock. Deterministic
+    /// twin of [`Self::now`].
+    pub fn at(&self, local_now: Duration) -> Duration {
+        match self.offset_nanos() {
+            Some(offset) => apply_clock_offset(local_now, offset),
+            None => local_now,
+        }
+    }
+
+    /// The instant a bucket is selected at: this process's wall clock,
+    /// corrected onto the server's.
+    ///
+    /// Two lock-free atomic loads and no allocation, on the admission hot path.
+    pub fn now(&self) -> Duration {
+        self.at(redis_epoch_now())
+    }
+}
+
+/// Whether a ladder built for `bucket` is still usable, judged against the
+/// Redis server clock the transaction's own `TIME` returned.
+///
+/// Bucket selection necessarily precedes connection acquisition and execution,
+/// so a charge is always slightly stale by the time the server applies it. One
+/// sub-bucket of staleness is covered by construction, because the ladder also
+/// reads the bucket immediately after the charged one (see
+/// [`REDIS_WINDOW_SUB_BUCKET_KEYS`]): a peer that selected `b + 1` is visible
+/// to a request that selected `b`, and vice versa.
+///
+/// Beyond that the cover is gone. If the server executed `EXEC` at `b + 2` or
+/// later — a queueing stall longer than a whole sub-bucket, which the 500ms
+/// screened response timeout still admits for a one-second window — a peer may
+/// have charged a bucket this ladder neither read nor charged, and the decision
+/// derived from it could over-admit. That is what this reports, so the caller
+/// can hand its charge back and rebuild once rather than publish an admission
+/// it cannot stand behind.
+///
+/// `now` is the server's clock at `EXEC`, not a local post-reply sample: reply
+/// latency after `EXEC` is harmless (a peer that charges later reads this
+/// request's own increment), while execution latency before it is exactly the
+/// hazard. In local-clock mode there is no server sample and the corrected
+/// local clock stands in, which is the weaker contract that mode documents.
+///
+/// A clock that moved BACKWARD is not a staleness problem: the charged bucket
+/// is then ahead of the fresh one and the ladder still covers everything a
+/// peer could have charged, so only forward travel is rejected.
 pub fn sub_bucket_charge_is_settled(bucket: RedisSubBucket, now: Duration) -> bool {
     let fresh = RedisRateLimitClient::sub_bucket_at(now, bucket.window_seconds);
     fresh.index <= bucket.index.saturating_add(1)
@@ -1047,6 +1257,27 @@ pub fn is_cluster_topology_error(error: &redis::RedisError) -> bool {
     errors
         .iter()
         .any(|(_, err)| is_cluster_topology_code(Some(err.code())))
+}
+
+/// Whether a failed command was refused by the server's ACL rather than by the
+/// transport.
+///
+/// Read with the same care as [`is_cluster_topology_error`]: `TIME` rides
+/// inside the admission `MULTI`, and a Redis that revokes it between the
+/// connection's probe and a later transaction answers the queued command with
+/// `NOPERM` and aborts the whole `EXEC` under an `EXECABORT` outer code. Only
+/// the per-command server errors carry the real reason, so admission would
+/// otherwise read a permanent ACL change as an endless outage.
+pub fn is_permission_denied_error(error: &redis::RedisError) -> bool {
+    if matches!(error.code(), Some("NOPERM")) {
+        return true;
+    }
+    // `into_server_errors` consumes the error; `RedisError` is `Clone` and the
+    // aggregated variants are `Arc`-backed, so this is a refcount bump.
+    let Some(errors) = error.clone().into_server_errors() else {
+        return false;
+    };
+    errors.iter().any(|(_, err)| err.code() == "NOPERM")
 }
 
 /// Read `cluster_enabled` out of an `INFO CLUSTER` reply.
@@ -2114,6 +2345,14 @@ pub struct RedisRateLimitClient {
     /// by coverage that must observe a hand-back landing instead of racing it;
     /// admission never reads it.
     pending_compensations: AtomicUsize,
+    /// The shared bucket clock: this endpoint's server clock, tracked as a
+    /// correction to the local one.
+    ///
+    /// Owned by the client rather than by a caller because it is a property of
+    /// the endpoint, not of one policy: every window, every plugin instance,
+    /// and every pooled connection sharing this client must select buckets on
+    /// the same clock, or they would count one identity against two ladders.
+    server_clock: RedisServerClock,
 }
 
 /// Logging policy for one Redis client.
@@ -2511,6 +2750,93 @@ impl RedisWindowCounts {
     }
 }
 
+/// Everything one atomic charge transaction told the caller: each configured
+/// window's trailing-window count, and the instant the SERVER applied the
+/// transaction.
+///
+/// The two travel together because a count is only meaningful paired with the
+/// instant its ladder was built for. Judging settlement on a separate local
+/// sample taken after the reply arrived conflated reply latency (harmless — a
+/// later peer reads this request's own increment) with execution latency (the
+/// actual hazard), and it reintroduced the local clock into a decision the
+/// whole sub-bucket layout exists to take on one shared clock.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RedisChargeOutcome {
+    counts: RedisWindowCounts,
+    settled_at: Option<Duration>,
+}
+
+impl RedisChargeOutcome {
+    /// Per-window trailing counts, in the order the windows were charged.
+    pub fn as_slice(&self) -> &[u64] {
+        self.counts.as_slice()
+    }
+
+    pub fn len(&self) -> usize {
+        self.counts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.counts.is_empty()
+    }
+
+    /// The Redis server's own clock at `EXEC`, from the `TIME` that rode inside
+    /// this transaction.
+    ///
+    /// `None` only in local-clock mode ([`RedisServerClock`]), where the caller
+    /// falls back to the corrected local clock under the weaker contract that
+    /// mode documents.
+    pub fn settled_at(&self) -> Option<Duration> {
+        self.settled_at
+    }
+}
+
+/// Completion handle for a detached compensation.
+///
+/// The spawned task owns the compensation outright, so dropping this handle
+/// never cancels it: a quota refusal drops it and pays no second round trip
+/// inline, exactly as before. The staleness rebuild is the one caller that
+/// AWAITS it, because the rebuilt ladder reads the sub-bucket the abandoned
+/// pass charged — dispatching the hand-back is not the same as landing it, and
+/// a rebuild that raced ahead of its own `DECR` would count that abandoned
+/// charge and refuse a request the quota admits.
+pub struct RedisCompensationHandle {
+    /// `None` when there was nothing to compensate.
+    completed: Option<tokio::sync::oneshot::Receiver<bool>>,
+}
+
+impl RedisCompensationHandle {
+    /// Nothing was charged, so nothing is outstanding.
+    fn resolved() -> Self {
+        Self { completed: None }
+    }
+
+    /// Whether the hand-back's `DECR` actually landed.
+    ///
+    /// Bounded by the same screened per-command deadline every other Redis
+    /// command on this path carries, so a store that went silent cannot hold an
+    /// admission decision open. `false` means the charge is still on its
+    /// windows and the caller must not build a ladder that reads them.
+    pub async fn confirmed(self) -> bool {
+        let Some(completed) = self.completed else {
+            return true;
+        };
+        // Without a Tokio runtime the compensation already ran inline, so the
+        // value is waiting; `tokio::time::timeout` needs a timer driver and
+        // must not be reached there.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return completed.await.unwrap_or(false);
+        }
+        let bound = SCREENED_COMMAND_RESPONSE_TIMEOUT;
+        match tokio::time::timeout(bound, completed).await {
+            // A dropped sender cannot happen (the task always sends), but it
+            // would mean the hand-back's fate is unknown — same answer.
+            Ok(landed) => landed.unwrap_or(false),
+            Err(_elapsed) => false,
+        }
+    }
+}
+
 impl RedisRateLimitClient {
     /// Create a new Redis rate limit client.
     ///
@@ -2638,6 +2964,7 @@ impl RedisRateLimitClient {
             retention,
             shared_replay_health: OnceLock::new(),
             pending_compensations: AtomicUsize::new(0),
+            server_clock: RedisServerClock::new(),
         })
     }
 
@@ -3568,7 +3895,64 @@ impl RedisRateLimitClient {
             return false;
         }
         conn.set_response_timeout(SCREENED_COMMAND_RESPONSE_TIMEOUT);
+        self.probe_server_time(conn).await;
         true
+    }
+
+    /// The shared bucket clock for every policy on this endpoint.
+    ///
+    /// Admission reads it to select sub-buckets; nothing else may keep a second
+    /// view of the same endpoint's clock.
+    pub fn server_clock(&self) -> &RedisServerClock {
+        &self.server_clock
+    }
+
+    /// Ask a freshly screened connection whether it may run `TIME`, and seed
+    /// the offset from the answer.
+    ///
+    /// Run once per established connection — at first use and after every
+    /// reconnect — because the verdict belongs to the server's ACL, which an
+    /// operator can change under a live gateway. It is deliberately a STANDALONE
+    /// command rather than a trial `TIME` inside a real transaction: a denied
+    /// command queued in `MULTI` aborts the whole `EXEC`, so a probe that
+    /// guessed wrong would fail an admission rather than downgrade a mode.
+    ///
+    /// A denial (or a server that does not implement `TIME`) is not an outage
+    /// and never marks the client unavailable: it selects local-clock mode,
+    /// whose weaker contract is documented at the module level. The reply is
+    /// bounded by the per-command deadline armed just above, so a silent server
+    /// costs one screened timeout at connect rather than hanging the slot.
+    async fn probe_server_time(&self, conn: &mut impl redis::aio::ConnectionLike) {
+        let probed: Result<redis::Value, redis::RedisError> =
+            redis::cmd("TIME").query_async(conn).await;
+        let sampled_at = redis_epoch_now();
+        let server_time = match probed {
+            Ok(value) => parse_redis_server_time(&value),
+            Err(_) => None,
+        };
+        match server_time {
+            Some(server_time) => {
+                // Seed before publishing the verdict: a transaction that starts
+                // the moment `TIME` is permitted must already have an offset to
+                // select its bucket with.
+                self.server_clock.record_reply(server_time, sampled_at);
+                self.server_clock.set_server_time_permitted(true);
+            }
+            None => {
+                // Sampled, not latched: a flapping endpoint re-probes on every
+                // reconnect, and the fact an operator needs (this deployment is
+                // on the weaker clock contract) is worth restating without
+                // becoming per-connection noise.
+                self.server_clock.set_server_time_permitted(false);
+                warn_sampled!(
+                    redis_url = %self.config.redacted_url(),
+                    operation = "TIME",
+                    "Redis endpoint does not permit TIME; request-quota sub-buckets fall \
+                     back to this gateway's local clock, so gateways sharing this quota \
+                     must keep their clocks within one sub-bucket of each other"
+                );
+            }
+        }
     }
 
     /// Start a background task that periodically probes Redis to detect recovery.
@@ -4563,8 +4947,17 @@ impl RedisRateLimitClient {
     /// The forward `GET` is what makes the pair of decisions independent of the
     /// order two concurrent transactions reach the server in; see
     /// [`REDIS_WINDOW_SUB_BUCKET_KEYS`]. It does NOT cover a stall longer than
-    /// one whole sub-bucket — that is the caller's post-`EXEC` check
-    /// ([`sub_bucket_charge_is_settled`]).
+    /// one whole sub-bucket — that is the caller's settlement check
+    /// ([`sub_bucket_charge_is_settled`]), judged on the server clock this
+    /// transaction returns.
+    ///
+    /// When the endpoint permits it, one `TIME` rides at the end of the same
+    /// transaction (see [`RedisServerClock`]). It answers the server's own
+    /// clock at `EXEC` — the instant every gateway's charge is ordered on — for
+    /// no extra round trip, and it both settles this ladder and refreshes the
+    /// offset the NEXT request selects its bucket with. In local-clock mode no
+    /// `TIME` is queued, because a command the ACL denies would abort the whole
+    /// `EXEC` rather than degrade one field.
     ///
     /// Charging before deciding is what keeps concurrent gateways honest, and
     /// it is why a caller that then REFUSES must hand the charge back with
@@ -4585,9 +4978,9 @@ impl RedisRateLimitClient {
     pub async fn charge_rate_limit_windows(
         &self,
         windows: &[RedisWindowCharge],
-    ) -> Result<RedisWindowCounts, ()> {
+    ) -> Result<RedisChargeOutcome, ()> {
         if windows.is_empty() {
-            return Ok(RedisWindowCounts::default());
+            return Ok(RedisChargeOutcome::default());
         }
         if windows.len() > MAX_REDIS_ADMISSION_WINDOWS {
             warn_sampled!(
@@ -4600,6 +4993,10 @@ impl RedisRateLimitClient {
             return Err(());
         }
         let mut conn = self.get_connection().await.ok_or(())?;
+        // Captured ONCE. The reply-shape validation below has to agree with
+        // what this transaction actually queued, and a concurrent reconnect can
+        // flip the ACL verdict in between.
+        let server_clock_mode = self.server_clock.server_time_permitted();
 
         let mut pipeline = redis::pipe();
         pipeline.atomic();
@@ -4619,22 +5016,72 @@ impl RedisRateLimitClient {
                 .arg(expire_seconds(window.ttl_seconds()))
                 .ignore();
         }
+        if server_clock_mode {
+            // Last, and once per transaction rather than once per window: it is
+            // the instant the SERVER applied this whole `EXEC`, which is what
+            // orders this charge against every other gateway's.
+            pipeline.cmd("TIME");
+        }
 
-        // `GET` answers a bulk string or nil and `INCR` an integer; `Option<i64>`
-        // accepts all three, so one element type covers the whole reply.
-        let result: Result<Vec<Option<i64>>, redis::RedisError> =
+        // `GET` answers a bulk string or nil, `INCR` an integer, and `TIME` a
+        // two-element array, so the reply is decoded one element at a time
+        // rather than through a single scalar type. `Vec<redis::Value>` consumes
+        // redis-rs's own decode allocation; the admission path adds none of its
+        // own on top of it.
+        let ladder_values = windows.len() * REDIS_WINDOW_SUB_BUCKET_KEYS;
+        let expected_values = ladder_values + usize::from(server_clock_mode);
+        let result: Result<Vec<redis::Value>, redis::RedisError> =
             pipeline.query_async(&mut conn).await;
+        // Bookkeeping for the offset only: no admission decision is judged
+        // against this sample. See `RedisServerClock`.
+        let local_at_reply = redis_epoch_now();
         match result {
-            Ok(reply) if reply.len() == windows.len() * REDIS_WINDOW_SUB_BUCKET_KEYS => {
+            Ok(reply) if reply.len() == expected_values => {
                 self.note_command_success()?;
-                // Decoded straight into the fixed-capacity buffer: the reply
-                // `Vec` is redis-rs's own decode allocation, and the admission
-                // path adds none of its own on top of it.
+                let (ladders, tail) = reply.split_at(ladder_values);
                 let mut counts = RedisWindowCounts::default();
-                for ladder in reply.as_chunks::<REDIS_WINDOW_SUB_BUCKET_KEYS>().0 {
-                    counts.push(redis_trailing_window_count(ladder));
+                let mut ladder = [None; REDIS_WINDOW_SUB_BUCKET_KEYS];
+                for chunk in ladders.chunks_exact(REDIS_WINDOW_SUB_BUCKET_KEYS) {
+                    for (slot, value) in ladder.iter_mut().zip(chunk) {
+                        let Ok(count) = redis::from_redis_value::<Option<i64>>(value) else {
+                            // A counter this code cannot read is NOT a zero: it
+                            // would under-count and over-admit. Same posture as
+                            // the short-reply arm below — an unusable endpoint,
+                            // with the `INCR`s already landed.
+                            self.mark_unavailable();
+                            warn_sampled!(
+                                redis_url = %self.config.redacted_url(),
+                                operation = "GET+INCR+EXPIRE",
+                                "Redis rate-limit charge returned an unreadable sub-bucket \
+                                 counter"
+                            );
+                            return Err(());
+                        };
+                        *slot = count;
+                    }
+                    counts.push(redis_trailing_window_count(&ladder));
                 }
-                Ok(counts)
+                let settled_at = if server_clock_mode {
+                    let Some(server_time) = tail.first().and_then(parse_redis_server_time) else {
+                        // `TIME` was queued and the server answered something
+                        // this code cannot pair with a clock. Falling back to
+                        // the local clock here would silently reinstate the
+                        // skew term on an endpoint that claimed to support the
+                        // server clock, so refuse instead.
+                        self.mark_unavailable();
+                        warn_sampled!(
+                            redis_url = %self.config.redacted_url(),
+                            operation = "GET+INCR+EXPIRE+TIME",
+                            "Redis rate-limit charge returned an unreadable server clock"
+                        );
+                        return Err(());
+                    };
+                    self.server_clock.record_reply(server_time, local_at_reply);
+                    Some(server_time)
+                } else {
+                    None
+                };
+                Ok(RedisChargeOutcome { counts, settled_at })
             }
             Ok(reply) => {
                 // A short reply would silently pair one window's counter with
@@ -4658,6 +5105,20 @@ impl RedisRateLimitClient {
                 Err(())
             }
             Err(e) => {
+                if server_clock_mode && is_permission_denied_error(&e) {
+                    // `TIME` was permitted when this connection was probed and
+                    // is not now: the queued command aborted the whole `EXEC`.
+                    // Drop to local-clock mode in place rather than failing
+                    // every admission until the next reconnect re-probes.
+                    self.server_clock.set_server_time_permitted(false);
+                    warn_sampled!(
+                        redis_url = %self.config.redacted_url(),
+                        operation = "TIME",
+                        "Redis endpoint revoked TIME mid-flight; request-quota sub-buckets \
+                         fall back to this gateway's local clock, so gateways sharing this \
+                         quota must keep their clocks within one sub-bucket of each other"
+                    );
+                }
                 warn!(
                     redis_url = %self.config.redacted_url(),
                     operation = "GET+INCR+EXPIRE",
@@ -4783,21 +5244,40 @@ impl RedisRateLimitClient {
     /// Without a Tokio runtime (direct construction in tests, or a non-Tokio
     /// executor) the compensation is awaited inline rather than dropped;
     /// spawning would panic, and a proxy path never panics.
-    pub async fn spawn_uncharge_rate_limit_windows(self: Arc<Self>, charges: RedisWindowCharges) {
+    ///
+    /// The returned [`RedisCompensationHandle`] reports whether the `DECR`
+    /// actually landed. Dropping it does not cancel anything — the task owns
+    /// the compensation — so the refusal path keeps its fire-and-forget
+    /// latency, while the staleness rebuild can wait for a hand-back it is
+    /// about to read back through its own rebuilt ladder.
+    pub async fn spawn_uncharge_rate_limit_windows(
+        self: Arc<Self>,
+        charges: RedisWindowCharges,
+    ) -> RedisCompensationHandle {
         if charges.is_empty() {
-            return;
+            return RedisCompensationHandle::resolved();
         }
         self.pending_compensations.fetch_add(1, Ordering::AcqRel);
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
         let client = self;
         let compensate = async move {
-            let _ = client.uncharge_rate_limit_windows(charges.as_slice()).await;
+            let landed = client
+                .uncharge_rate_limit_windows(charges.as_slice())
+                .await
+                .is_ok();
             client.pending_compensations.fetch_sub(1, Ordering::AcqRel);
+            // The refusal path drops its receiver, so a failed send is the
+            // ordinary case and never affects the compensation itself.
+            let _ = completed_tx.send(landed);
         };
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(compensate);
             }
             Err(_) => compensate.await,
+        }
+        RedisCompensationHandle {
+            completed: Some(completed_rx),
         }
     }
 

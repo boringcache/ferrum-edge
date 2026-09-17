@@ -1896,6 +1896,63 @@ async fn default_fallback_retains_budget_on_reload_and_marks_request_metadata() 
     assert_eq!(meta(&ctx, "ratelimit_local_fallback"), Some("true"));
 }
 
+/// The capacity `429` is attributed from the DECISION's provenance, not from
+/// the backend's current availability.
+///
+/// `check_rate` is the one arm with no outcome to carry the marker, and a
+/// per-decision fallback — a sub-bucket rollover, a reply this code cannot pair
+/// — leaves the client available, so `local_fallback_active()` answers the
+/// wrong question there. The runtime regression for the provenance itself lives
+/// in `redis_rate_limiter_tests.rs`
+/// (`a_second_rollover_attributes_its_capacity_refusal_to_the_fallback_budget`);
+/// this pins the plugin wiring that consumes it, including that one attribution
+/// call publishes BOTH the metadata and the counter.
+#[test]
+fn the_capacity_refusal_is_attributed_from_the_decision_not_from_availability() {
+    let source = include_str!("../../../src/plugins/rate_limiting.rs");
+    let body = source
+        .split("    async fn check_rate(")
+        .nth(1)
+        .expect("check_rate must exist")
+        .split("\n    async fn ")
+        .next()
+        .expect("the next method ends the body");
+
+    assert!(
+        body.contains("check_with_redis_key_and_local_capacity_attributed("),
+        "admission must ask for the decision's provenance"
+    );
+    assert!(
+        body.contains("let Some(outcome) = decision.outcome else {"),
+        "the capacity arm is the `None` outcome of that decision"
+    );
+    assert!(
+        body.contains("if decision.local_fallback {"),
+        "the capacity refusal must be attributed from the decision it came with"
+    );
+    assert!(
+        !body.contains("local_fallback_active()"),
+        "reconstructing the attribution from the backend's current availability \
+         drops it for every per-decision fallback that leaves the client healthy"
+    );
+
+    let marker = source
+        .split("    fn mark_local_fallback(")
+        .nth(1)
+        .expect("mark_local_fallback must exist")
+        .split("\n    async fn ")
+        .next()
+        .expect("the next method ends the body");
+    assert!(
+        marker.contains("\"ratelimit_local_fallback\""),
+        "attribution must publish the request metadata"
+    );
+    assert!(
+        marker.contains("record_rate_limit_local_fallback_decision()"),
+        "attribution must publish the alertable counter alongside the metadata"
+    );
+}
+
 // ── Composed limiters and the single public header set (issue #5003) ──────
 //
 // `x-ratelimit-limit` / `-remaining` / `-window` are one fixed public contract,

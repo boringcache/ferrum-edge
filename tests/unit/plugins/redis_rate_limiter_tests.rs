@@ -1757,8 +1757,9 @@ fn traffic_one_sub_bucket_slower_than_the_configured_rate_is_fully_admitted() {
     }
 }
 
-/// The post-`EXEC` staleness judgement: one sub-bucket of drift is covered by
-/// the forward `GET`, anything beyond it is not.
+/// The staleness judgement, against the server clock that `EXEC` returned: one
+/// sub-bucket of drift is covered by the forward `GET`, anything beyond it is
+/// not.
 #[test]
 fn a_charge_is_settled_only_within_one_sub_bucket_of_its_selection() {
     use ferrum_edge::plugins::utils::redis_rate_limiter::{
@@ -1784,10 +1785,15 @@ fn a_charge_is_settled_only_within_one_sub_bucket_of_its_selection() {
     assert!(sub_bucket_charge_is_settled(selected, ms(99_000)));
 }
 
-/// One admission decision must cost at most ONE extra wall-clock sample, and
-/// the rebuild must reuse the sample that proved the rollover.
+/// The admission decision reads the bucket clock only through the client's
+/// server-clock correction, and settles on the instant `EXEC` returned.
+///
+/// The bare local clock must not appear here at all: a raw `SystemTime` sample
+/// is what let two gateways disagree about which sub-bucket "now" is, and a
+/// local post-`EXEC` sample is what conflated harmless reply latency with a
+/// genuinely late execution.
 #[test]
-fn a_quota_decision_takes_one_clock_sample_per_pass_and_reuses_the_rollover_sample() {
+fn a_quota_decision_reads_the_bucket_clock_only_through_the_server_correction() {
     let source = include_str!("../../../src/plugins/utils/rate_limit.rs");
     let body = source
         .split("async fn check_http_windows_redis(")
@@ -1798,13 +1804,11 @@ fn a_quota_decision_takes_one_clock_sample_per_pass_and_reuses_the_rollover_samp
         .next()
         .expect("function body ends before the test-only items");
 
-    // Exactly two samples in the source: the one that builds the first ladder
-    // and the one taken after EXEC. The rebuild reuses the second, so a
-    // rolled-over request costs no third read.
     assert_eq!(
         body.matches("redis_epoch_now()").count(),
-        2,
-        "one sample builds the ladder and one judges it after EXEC"
+        0,
+        "admission must never read this process's clock directly; every instant \
+         comes from the client's server-clock correction"
     );
     // Per-window live sampling is what the shared sample replaced.
     assert!(
@@ -1812,12 +1816,28 @@ fn a_quota_decision_takes_one_clock_sample_per_pass_and_reuses_the_rollover_samp
         "every window must derive its bucket from the shared sample"
     );
     assert!(
-        body.contains("RedisRateLimitClient::sub_bucket_at(sampled_at, window_seconds)"),
-        "the ladder must be derived from the captured sample"
+        body.contains("let mut sampled_at = redis.server_clock().now();"),
+        "the first ladder must be built on the corrected server clock"
     );
     assert!(
-        body.contains("sub_bucket_charge_is_settled(charge.bucket(), sampled_at)"),
-        "the post-EXEC check must use the shared staleness helper"
+        body.contains("RedisRateLimitClient::sub_bucket_at(sampled_at, window_seconds)"),
+        "the ladder must be derived from the captured instant"
+    );
+    assert!(
+        body.contains("charged.settled_at()"),
+        "settlement must use the server clock the charge transaction returned"
+    );
+    assert!(
+        body.contains("sub_bucket_charge_is_settled(charge.bucket(), settled_at)"),
+        "the settlement check must use the shared staleness helper"
+    );
+    assert!(
+        body.contains("sampled_at = settled_at;"),
+        "the rebuild must reuse the server instant that proved the rollover"
+    );
+    assert!(
+        body.contains("compensation.confirmed().await"),
+        "the rebuild must wait for its own hand-back to land"
     );
 }
 
@@ -1928,6 +1948,94 @@ fn parse_resp_command_args(buf: &[u8]) -> Option<(Vec<String>, usize)> {
     Some((args, cursor))
 }
 
+/// Where a held `EXEC` sleeps relative to APPLYING its commands.
+///
+/// The distinction is the whole point of judging settlement on the server's
+/// own clock: only one of these two is a hazard.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HoldPhase {
+    /// Sleep BEFORE applying: the transaction genuinely executes late, so its
+    /// own `TIME` reports the late instant and a peer may have charged a bucket
+    /// this ladder never read. This is the real hazard.
+    BeforeApply,
+    /// Sleep AFTER applying: the transaction executed on time and only its
+    /// REPLY is late. Harmless — a peer charging afterwards reads this
+    /// request's own increment — but a local post-`EXEC` sample cannot tell the
+    /// two apart and would roll the ladder over for nothing.
+    AfterApply,
+}
+
+/// How the fake server answers `TIME`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ServerTimeMode {
+    /// The server's real clock, which is also the clock the client's local
+    /// samples read, so the learned offset settles near zero.
+    RealClock,
+    /// A server clock genuinely ahead of this process's, so a client that used
+    /// its own clock would pick different sub-buckets than the server orders
+    /// charges on.
+    Ahead(Duration),
+    /// A restrictive ACL: `TIME` is refused, and the client must fall back to
+    /// local-clock mode instead of failing admission.
+    Denied,
+}
+
+/// Knobs for one fake server. Defaults answer everything immediately from the
+/// real clock.
+#[derive(Clone, Copy)]
+struct KeyspaceServerOptions {
+    charge_delay: Duration,
+    delayed_charges: usize,
+    hold_phase: HoldPhase,
+    compensation_delay: Duration,
+    delayed_compensations: usize,
+    time_mode: ServerTimeMode,
+}
+
+impl Default for KeyspaceServerOptions {
+    fn default() -> Self {
+        Self {
+            charge_delay: Duration::ZERO,
+            delayed_charges: 0,
+            hold_phase: HoldPhase::BeforeApply,
+            compensation_delay: Duration::ZERO,
+            delayed_compensations: 0,
+            time_mode: ServerTimeMode::RealClock,
+        }
+    }
+}
+
+/// What one `EXEC` does about timing: how long it is held, and on which side of
+/// applying its commands.
+struct ExecSchedule {
+    hold: Duration,
+    phase: HoldPhase,
+}
+
+/// Whether an `EXEC` batch queued a command with this name.
+fn batch_contains(batch: &[Vec<String>], command: &str) -> bool {
+    batch
+        .iter()
+        .filter_map(|queued| queued.first())
+        .any(|name| name.eq_ignore_ascii_case(command))
+}
+
+/// What a restrictive Redis ACL answers when `TIME` is not granted.
+const TIME_DENIED_REPLY: &[u8] = b"-NOPERM this user has no permissions to run 'time'\r\n";
+
+/// RESP encoding of a Redis `TIME` reply: Unix seconds and the microseconds
+/// inside that second, both as bulk strings.
+fn encode_server_time(now: Duration) -> Vec<u8> {
+    let seconds = now.as_secs().to_string();
+    let micros = now.subsec_micros().to_string();
+    format!(
+        "*2\r\n${}\r\n{seconds}\r\n${}\r\n{micros}\r\n",
+        seconds.len(),
+        micros.len()
+    )
+    .into_bytes()
+}
+
 /// Shared keyspace and counters of the fake server, cloned into each
 /// connection task.
 #[derive(Clone)]
@@ -1936,17 +2044,41 @@ struct KeyspaceState {
     incrs: Arc<AtomicUsize>,
     decrs: Arc<AtomicUsize>,
     charges: Arc<AtomicUsize>,
-    charge_delay: Duration,
-    delayed_charges: usize,
+    compensations: Arc<AtomicUsize>,
+    /// Applied mutations in the order the keyspace saw them. Recorded under the
+    /// keyspace lock, so it is the real serialization order across connections
+    /// and not a dispatch order — which is what an ordering assertion needs.
+    ops: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    options: KeyspaceServerOptions,
 }
 
 impl KeyspaceState {
+    /// This server's own clock, as `TIME` would report it. `None` when the
+    /// fixture's ACL refuses the command.
+    fn server_now(&self) -> Option<Duration> {
+        let real = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        match self.options.time_mode {
+            ServerTimeMode::RealClock => Some(real),
+            ServerTimeMode::Ahead(shift) => Some(real.saturating_add(shift)),
+            ServerTimeMode::Denied => None,
+        }
+    }
+
     /// Apply ONE command to the fake keyspace and return its RESP reply.
     fn apply(&self, args: &[String]) -> Vec<u8> {
         let name = args
             .first()
             .map(|arg| arg.to_uppercase())
             .unwrap_or_default();
+        // Read the clock before taking the keyspace lock; `TIME` touches no key.
+        if name == "TIME" {
+            return match self.server_now() {
+                Some(now) => encode_server_time(now),
+                None => TIME_DENIED_REPLY.to_vec(),
+            };
+        }
         let key = args.get(1).cloned().unwrap_or_default();
         let mut store = self.keys.lock().expect("keyspace mutex");
         match name.as_str() {
@@ -1959,6 +2091,7 @@ impl KeyspaceState {
             },
             "INCR" => {
                 self.incrs.fetch_add(1, Ordering::Relaxed);
+                self.ops.lock().expect("op log mutex").push("INCR");
                 let slot = store.entry(key).or_insert(0);
                 *slot += 1;
                 let value = *slot;
@@ -1966,6 +2099,7 @@ impl KeyspaceState {
             }
             "DECR" => {
                 self.decrs.fetch_add(1, Ordering::Relaxed);
+                self.ops.lock().expect("op log mutex").push("DECR");
                 let slot = store.entry(key).or_insert(0);
                 *slot -= 1;
                 let value = *slot;
@@ -1976,14 +2110,46 @@ impl KeyspaceState {
         }
     }
 
-    /// Handle one received command, append its reply, and report how long the
-    /// whole batch's reply must be held before it is written.
-    fn handle(
+    /// Classify one `EXEC`'s queued batch and consume its place in the
+    /// fixture's schedule. Called exactly once per transaction.
+    fn schedule_for(&self, batch: &[Vec<String>]) -> ExecSchedule {
+        if batch_contains(batch, "INCR") {
+            let index = self.charges.fetch_add(1, Ordering::Relaxed);
+            return ExecSchedule {
+                hold: if index < self.options.delayed_charges {
+                    self.options.charge_delay
+                } else {
+                    Duration::ZERO
+                },
+                phase: self.options.hold_phase,
+            };
+        }
+        if batch_contains(batch, "DECR") {
+            let index = self.compensations.fetch_add(1, Ordering::Relaxed);
+            return ExecSchedule {
+                // A held compensation is held before it applies: the point is
+                // that the `DECR` has genuinely not landed yet.
+                hold: if index < self.options.delayed_compensations {
+                    self.options.compensation_delay
+                } else {
+                    Duration::ZERO
+                },
+                phase: HoldPhase::BeforeApply,
+            };
+        }
+        ExecSchedule {
+            hold: Duration::ZERO,
+            phase: HoldPhase::BeforeApply,
+        }
+    }
+
+    /// Handle one received command and append its reply.
+    async fn handle(
         &self,
         queued: &mut Option<Vec<Vec<String>>>,
         args: Vec<String>,
         reply: &mut Vec<u8>,
-    ) -> Duration {
+    ) {
         let name = args
             .first()
             .map(|arg| arg.to_uppercase())
@@ -1993,46 +2159,33 @@ impl KeyspaceState {
                 let text = "# Cluster\r\ncluster_enabled:0\r\n";
                 let bulk = format!("${}\r\n{text}\r\n", text.len());
                 reply.extend_from_slice(bulk.as_bytes());
-                Duration::ZERO
             }
             "MULTI" => {
                 *queued = Some(Vec::new());
                 reply.extend_from_slice(b"+OK\r\n");
-                Duration::ZERO
             }
             "EXEC" => {
                 let batch = queued.take().unwrap_or_default();
-                // Only CHARGE transactions are held. Holding a compensation as
-                // well would serialize behind the charge on a shared
-                // connection and could push it past the client's 500ms
-                // response deadline, which is not the behavior under test.
-                let charging = batch
-                    .iter()
-                    .filter_map(|command| command.first())
-                    .any(|name| name.eq_ignore_ascii_case("INCR"));
-                let held = if charging
-                    && self.charges.fetch_add(1, Ordering::Relaxed) < self.delayed_charges
-                {
-                    self.charge_delay
-                } else {
-                    Duration::ZERO
-                };
-                reply.extend_from_slice(format!("*{}\r\n", batch.len()).as_bytes());
+                let schedule = self.schedule_for(&batch);
+                if !schedule.hold.is_zero() && schedule.phase == HoldPhase::BeforeApply {
+                    tokio::time::sleep(schedule.hold).await;
+                }
+                let mut body = format!("*{}\r\n", batch.len()).into_bytes();
                 for command in &batch {
-                    reply.extend_from_slice(&self.apply(command));
+                    body.extend_from_slice(&self.apply(command));
                 }
-                held
-            }
-            _ => {
-                match queued.as_mut() {
-                    Some(batch) => {
-                        batch.push(args);
-                        reply.extend_from_slice(b"+QUEUED\r\n");
-                    }
-                    None => reply.extend_from_slice(&self.apply(&args)),
+                if !schedule.hold.is_zero() && schedule.phase == HoldPhase::AfterApply {
+                    tokio::time::sleep(schedule.hold).await;
                 }
-                Duration::ZERO
+                reply.extend_from_slice(&body);
             }
+            _ => match queued.as_mut() {
+                Some(batch) => {
+                    batch.push(args);
+                    reply.extend_from_slice(b"+QUEUED\r\n");
+                }
+                None => reply.extend_from_slice(&self.apply(&args)),
+            },
         }
     }
 }
@@ -2062,6 +2215,25 @@ impl KeyspaceServer {
         self.state.decrs.load(Ordering::Relaxed)
     }
 
+    /// Every key the fake keyspace holds.
+    fn keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .state
+            .keys
+            .lock()
+            .expect("keyspace mutex")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// Applied `INCR`/`DECR` mutations, in keyspace order.
+    fn ops(&self) -> Vec<&'static str> {
+        self.state.ops.lock().expect("op log mutex").clone()
+    }
+
     fn charged_total(&self) -> i64 {
         self.state
             .keys
@@ -2076,19 +2248,18 @@ impl KeyspaceServer {
 /// Minimal RESP server with a REAL integer keyspace and working `MULTI`/`EXEC`.
 ///
 /// `GET` answers the stored value (or nil), `INCR`/`DECR` mutate and answer the
-/// new value, `EXPIRE` answers `:1`, `INFO` reports a non-Cluster server, and
-/// anything else answers `+OK`. Inside a transaction every queued command
-/// answers `+QUEUED` and `EXEC` answers the array of their results, which is the
-/// shape `redis::pipe().atomic()` decodes.
+/// new value, `EXPIRE` answers `:1`, `TIME` answers this fixture's server clock
+/// (or `NOPERM` under [`ServerTimeMode::Denied`]), `INFO` reports a non-Cluster
+/// server, and anything else answers `+OK`. Inside a transaction every queued
+/// command answers `+QUEUED` and `EXEC` answers the array of their results,
+/// which is the shape `redis::pipe().atomic()` decodes.
 ///
-/// `delayed_charges` holds the reply to the FIRST `delayed_charges` CHARGE
-/// transactions for `charge_delay`, so a test can land a charge whose
-/// sub-bucket has rolled over by the time the caller sees the reply. The count
-/// is per server, not per connection; compensations are never held.
-async fn spawn_keyspace_redis_server(
-    charge_delay: Duration,
-    delayed_charges: usize,
-) -> KeyspaceServer {
+/// `delayed_charges` holds the FIRST `delayed_charges` CHARGE transactions for
+/// `charge_delay`, and `delayed_compensations` does the same for hand-backs.
+/// `hold_phase` decides whether a held charge sleeps before applying (a real
+/// execution stall, so its own `TIME` reports the late instant) or after (only
+/// the reply is late). All counts are per server, not per connection.
+async fn spawn_keyspace_redis_server(options: KeyspaceServerOptions) -> KeyspaceServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("local_addr").port();
     let state = KeyspaceState {
@@ -2096,8 +2267,9 @@ async fn spawn_keyspace_redis_server(
         incrs: Arc::new(AtomicUsize::new(0)),
         decrs: Arc::new(AtomicUsize::new(0)),
         charges: Arc::new(AtomicUsize::new(0)),
-        charge_delay,
-        delayed_charges,
+        compensations: Arc::new(AtomicUsize::new(0)),
+        ops: Arc::new(std::sync::Mutex::new(Vec::new())),
+        options,
     };
     let accept_state = state.clone();
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
@@ -2135,16 +2307,12 @@ async fn serve_keyspace_connection(mut stream: tokio::net::TcpStream, state: Key
         };
         pending.extend_from_slice(&buf[..n]);
         let mut reply = Vec::new();
-        let mut hold = Duration::ZERO;
         while let Some((args, consumed)) = parse_resp_command_args(&pending) {
             pending.drain(..consumed);
-            hold = hold.max(state.handle(&mut queued, args, &mut reply));
+            state.handle(&mut queued, args, &mut reply).await;
         }
         if reply.is_empty() {
             continue;
-        }
-        if !hold.is_zero() {
-            tokio::time::sleep(hold).await;
         }
         if stream.write_all(&reply).await.is_err() {
             break;
@@ -2180,7 +2348,7 @@ async fn a_reordered_transaction_across_a_sub_bucket_boundary_cannot_double_admi
         REDIS_WINDOW_SUB_BUCKETS, RedisWindowCharges,
     };
 
-    let server = spawn_keyspace_redis_server(Duration::ZERO, 0).await;
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
     let client = keyspace_client(server.port);
 
     let earlier = RedisRateLimitClient::sub_bucket_at(Duration::from_micros(100_124_000), 1);
@@ -2256,17 +2424,25 @@ async fn a_reordered_transaction_across_a_sub_bucket_boundary_cannot_double_admi
 /// Beyond one sub-bucket the forward `GET` no longer covers the drift: a peer
 /// may have charged a bucket the ladder neither read nor charged. The decision
 /// is therefore not published — the charge is compensated and the ladder is
-/// rebuilt from the same post-`EXEC` sample for one more transaction.
+/// rebuilt from the server instant that proved the rollover, for one more
+/// transaction.
 #[tokio::test]
 async fn a_charge_that_rolls_past_its_sub_bucket_is_handed_back_and_rebuilt_once() {
     use ferrum_edge::plugins::utils::rate_limit::{
         DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
     };
 
-    // A one-second window has 125ms sub-buckets, so holding the first reply for
-    // 250ms guarantees the clock has reached at least `b + 2`. It stays inside
-    // the 500ms screened per-command response deadline.
-    let server = spawn_keyspace_redis_server(Duration::from_millis(250), 1).await;
+    // A one-second window has 125ms sub-buckets, so stalling the first
+    // transaction for 250ms before it EXECUTES guarantees the server applies it
+    // at `b + 2` and reports that instant in its own `TIME`. The hold stays
+    // inside the 500ms screened per-command response deadline.
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        charge_delay: Duration::from_millis(250),
+        delayed_charges: 1,
+        hold_phase: HoldPhase::BeforeApply,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
     let client = Arc::new(keyspace_client(server.port));
 
     let algorithm = DynamicHttpRateLimitAlgorithm::new();
@@ -2314,8 +2490,15 @@ async fn a_second_sub_bucket_rollover_fails_closed() {
         DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
     };
 
-    // Every CHARGE is held, so the rebuild rolls over as well.
-    let server = spawn_keyspace_redis_server(Duration::from_millis(250), usize::MAX).await;
+    // Every CHARGE stalls 250ms before it executes, so the rebuild rolls over
+    // as well.
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        charge_delay: Duration::from_millis(250),
+        delayed_charges: usize::MAX,
+        hold_phase: HoldPhase::BeforeApply,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
     let client = Arc::new(keyspace_client(server.port));
 
     let algorithm = DynamicHttpRateLimitAlgorithm::new();
@@ -2351,6 +2534,773 @@ async fn a_second_sub_bucket_rollover_fails_closed() {
         0,
         "a fail-closed refusal leaves no lasting charge"
     );
+
+    let _ = server.shutdown.send(());
+}
+
+// ── The shared bucket clock is Redis's own (review round 3 of PR #5584) ───
+//
+// Sub-buckets are only as shared as the clock that selects them. The forward
+// `GET` covers ONE sub-bucket of drift, and it has to spend that allowance on
+// transaction staleness; asking it to absorb clock skew as well lets a pair of
+// gateways consume it twice and both be admitted. Every charge transaction
+// therefore carries a `TIME`, and selection plus settlement run on the offset
+// it teaches the client.
+
+/// The offset arithmetic itself, without a server: integer, saturating, and
+/// clamped at the epoch.
+#[test]
+fn a_learned_offset_shifts_the_local_clock_onto_the_server_clock() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        RedisServerClock, apply_clock_offset, clock_offset_nanos,
+    };
+
+    let local = Duration::from_millis(100_251);
+    let server = Duration::from_millis(100_151);
+    let offset = clock_offset_nanos(server, local);
+    assert_eq!(offset, -100_000_000, "a gateway 100ms fast learns -100ms");
+    assert_eq!(apply_clock_offset(local, offset), server);
+
+    let behind = clock_offset_nanos(Duration::from_millis(500), Duration::from_millis(200));
+    assert_eq!(behind, 300_000_000);
+    assert_eq!(
+        apply_clock_offset(Duration::from_millis(200), behind),
+        Duration::from_millis(500)
+    );
+
+    // A nonsense offset clamps at the epoch instead of wrapping into a
+    // plausible-looking sub-bucket at the far end of the index space.
+    assert_eq!(
+        apply_clock_offset(Duration::from_millis(1), i64::MIN),
+        Duration::ZERO
+    );
+
+    // Unsampled, the clock IS the local clock; one reply is enough to move it.
+    let clock = RedisServerClock::new();
+    assert_eq!(clock.offset_nanos(), None);
+    assert_eq!(clock.at(local), local);
+    clock.record_reply(server, local);
+    assert_eq!(clock.offset_nanos(), Some(-100_000_000));
+    assert_eq!(clock.at(local), server);
+    assert_eq!(
+        clock.at(local + Duration::from_millis(40)),
+        server + Duration::from_millis(40),
+        "the correction is an offset, not a pinned instant"
+    );
+}
+
+/// A `TIME` reply is accepted only in the exact shape Redis documents.
+#[test]
+fn a_server_time_reply_is_parsed_strictly_or_not_at_all() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::parse_redis_server_time;
+
+    let ok = redis::Value::Array(vec![
+        redis::Value::BulkString(b"100".to_vec()),
+        redis::Value::BulkString(b"151000".to_vec()),
+    ]);
+    assert_eq!(
+        parse_redis_server_time(&ok),
+        Some(Duration::from_millis(100_151))
+    );
+
+    for rejected in [
+        // Not an array at all: a server that answered `+OK` to `TIME`.
+        redis::Value::Okay,
+        // One element, or three: a shape this code cannot pair with a clock.
+        redis::Value::Array(vec![redis::Value::BulkString(b"100".to_vec())]),
+        redis::Value::Array(vec![
+            redis::Value::BulkString(b"100".to_vec()),
+            redis::Value::BulkString(b"1".to_vec()),
+            redis::Value::BulkString(b"1".to_vec()),
+        ]),
+        // A microsecond field outside its second.
+        redis::Value::Array(vec![
+            redis::Value::BulkString(b"100".to_vec()),
+            redis::Value::BulkString(b"1000000".to_vec()),
+        ]),
+        // Non-numeric text.
+        redis::Value::Array(vec![
+            redis::Value::BulkString(b"now".to_vec()),
+            redis::Value::BulkString(b"0".to_vec()),
+        ]),
+    ] {
+        assert_eq!(
+            parse_redis_server_time(&rejected),
+            None,
+            "an unusable server clock must never be guessed at: {rejected:?}"
+        );
+    }
+}
+
+/// Review finding 1, first counterexample: skew PLUS transaction staleness.
+///
+/// Gateway B's clock runs 100ms ahead of A's, inside the retired 125ms
+/// contract. On their own clocks A samples `100.124` (bucket 800) and B samples
+/// `100.251` (bucket 802) for the same real instant `100.151`; B executes
+/// first, A's ladder stops at `801`, and both are admitted against a
+/// one-request quota. Corrected onto the one server clock both pick adjacent
+/// buckets, so whichever lands second sees the other.
+#[tokio::test]
+async fn skewed_gateways_corrected_to_the_server_clock_cannot_double_admit() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{RedisServerClock, RedisWindowCharges};
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = keyspace_client(server.port);
+
+    // Gateway A's clock IS the server's; gateway B's runs 100ms fast. Each
+    // learns its own offset from a `TIME` reply taken at its own local instant.
+    let a_clock = RedisServerClock::new();
+    a_clock.record_reply(Duration::from_millis(90_000), Duration::from_millis(90_000));
+    let b_clock = RedisServerClock::new();
+    b_clock.record_reply(Duration::from_millis(90_000), Duration::from_millis(90_100));
+    assert_eq!(a_clock.offset_nanos(), Some(0));
+    assert_eq!(b_clock.offset_nanos(), Some(-100_000_000));
+
+    // The real instants: A at 100.124 on the server clock, B 27ms later.
+    let a_local = Duration::from_micros(100_124_000);
+    let b_local = Duration::from_micros(100_251_000);
+
+    let a_raw = RedisRateLimitClient::sub_bucket_at(a_local, 1);
+    let b_raw = RedisRateLimitClient::sub_bucket_at(b_local, 1);
+    assert_eq!(a_raw.index, 800);
+    assert_eq!(
+        b_raw.index, 802,
+        "on its own fast clock B selects two buckets past A's — the gap the \
+         forward GET cannot cover"
+    );
+
+    let a_bucket = RedisRateLimitClient::sub_bucket_at(a_clock.at(a_local), 1);
+    let b_bucket = RedisRateLimitClient::sub_bucket_at(b_clock.at(b_local), 1);
+    assert_eq!(a_bucket.index, 800);
+    assert_eq!(
+        b_bucket.index, 801,
+        "corrected onto the server clock the two land in ADJACENT sub-buckets"
+    );
+
+    let mut a_charge = RedisWindowCharges::default();
+    assert!(a_charge.push(client.window_charge("ip:127.0.0.1", a_bucket, 3)));
+    let mut b_charge = RedisWindowCharges::default();
+    assert!(b_charge.push(client.window_charge("ip:127.0.0.1", b_bucket, 3)));
+
+    // B executes FIRST, exactly as the finding describes.
+    let b_counts = client
+        .charge_rate_limit_windows(b_charge.as_slice())
+        .await
+        .expect("B's transaction must execute");
+    let a_counts = client
+        .charge_rate_limit_windows(a_charge.as_slice())
+        .await
+        .expect("A's transaction must execute");
+
+    let limit = 1_u64;
+    let admitted = [&b_counts, &a_counts]
+        .iter()
+        .filter(|counts| counts.as_slice()[0] <= limit)
+        .count();
+    assert_eq!(
+        admitted, 1,
+        "exactly one of two requests inside one trailing second may be admitted; \
+         b={b_counts:?} a={a_counts:?}"
+    );
+    assert_eq!(
+        a_counts.as_slice()[0],
+        2,
+        "A must observe B one bucket ahead"
+    );
+
+    // What the uncorrected pair would have read: A's ladder stops at 801 and
+    // never reaches B's charge in 802, so BOTH would have been admitted. Read
+    // straight off the fake keyspace.
+    let mut uncorrected = RedisWindowCharges::default();
+    assert!(uncorrected.push(client.window_charge("ip:127.0.0.1", b_raw, 3)));
+    let skewed_slot = &uncorrected.as_slice()[0];
+    let skewed_key = skewed_slot.charged_key().to_string();
+    let a_slot = &a_charge.as_slice()[0];
+    let mut a_ladder: Vec<String> = a_slot.trailing_keys().map(str::to_string).collect();
+    a_ladder.push(a_slot.charged_key().to_string());
+    a_ladder.push(a_slot.next_key().to_string());
+    assert!(
+        !a_ladder.contains(&skewed_key),
+        "the skewed bucket is outside A's ladder, which is exactly the \
+         over-admission the server clock removes"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// Review finding 1, second counterexample: skew alone, at the OLDEST end.
+///
+/// No transaction delay at all. A admits at `100.124` (bucket 800). 901ms later
+/// B, whose clock is 100ms fast, reads `101.125` and selects bucket 809, whose
+/// ladder starts at 801 — dropping A's admission although it is still inside
+/// the real trailing second. Corrected onto the server clock B selects 808 and
+/// its ladder still covers 800.
+#[tokio::test]
+async fn a_skewed_gateway_corrected_to_the_server_clock_keeps_the_oldest_live_charge() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{RedisServerClock, RedisWindowCharges};
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = keyspace_client(server.port);
+
+    let b_clock = RedisServerClock::new();
+    b_clock.record_reply(Duration::from_millis(90_000), Duration::from_millis(90_100));
+
+    let a_bucket = RedisRateLimitClient::sub_bucket_at(Duration::from_micros(100_124_000), 1);
+    assert_eq!(a_bucket.index, 800);
+    let mut a_charge = RedisWindowCharges::default();
+    assert!(a_charge.push(client.window_charge("ip:127.0.0.1", a_bucket, 3)));
+    let a_counts = client
+        .charge_rate_limit_windows(a_charge.as_slice())
+        .await
+        .expect("A's admission must execute");
+    assert_eq!(a_counts.as_slice()[0], 1);
+    let a_key = a_charge.as_slice()[0].charged_key().to_string();
+
+    // B's own clock reads 101.125 for the real instant 101.025.
+    let b_local = Duration::from_micros(101_125_000);
+    let b_raw = RedisRateLimitClient::sub_bucket_at(b_local, 1);
+    let b_bucket = RedisRateLimitClient::sub_bucket_at(b_clock.at(b_local), 1);
+    assert_eq!(b_raw.index, 809);
+    assert_eq!(b_bucket.index, 808);
+
+    let mut skewed = RedisWindowCharges::default();
+    assert!(skewed.push(client.window_charge("ip:127.0.0.1", b_raw, 3)));
+    let raw_slot = &skewed.as_slice()[0];
+    let raw_ladder: Vec<String> = raw_slot.trailing_keys().map(str::to_string).collect();
+    assert!(
+        !raw_ladder.contains(&a_key),
+        "on its own fast clock B drops a still-live charge off the oldest end"
+    );
+
+    let mut corrected = RedisWindowCharges::default();
+    assert!(corrected.push(client.window_charge("ip:127.0.0.1", b_bucket, 3)));
+    let fixed_slot = &corrected.as_slice()[0];
+    let fixed_ladder: Vec<String> = fixed_slot.trailing_keys().map(str::to_string).collect();
+    assert!(
+        fixed_ladder.contains(&a_key),
+        "corrected onto the server clock the oldest live sub-bucket is still read"
+    );
+
+    let b_counts = client
+        .charge_rate_limit_windows(corrected.as_slice())
+        .await
+        .expect("B's transaction must execute");
+    assert_eq!(
+        b_counts.as_slice()[0],
+        2,
+        "B must count A's still-live admission; a one-request quota refuses it"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// The offset is learned from a real `EXEC` and used by the NEXT selection.
+///
+/// The fake server's clock runs ten minutes ahead of this process's, so a
+/// gateway that selected buckets from its own wall clock would write keys ten
+/// minutes away from the ones every other gateway charges.
+#[tokio::test]
+async fn a_charge_transaction_teaches_the_client_the_server_clock() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+    use ferrum_edge::plugins::utils::redis_rate_limiter::redis_epoch_now;
+
+    const SHIFT: Duration = Duration::from_secs(600);
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        time_mode: ServerTimeMode::Ahead(SHIFT),
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    // Before any connection there is no sample, and the clock IS the local one.
+    assert_eq!(
+        client.server_clock().offset_nanos(),
+        None,
+        "a client that has never reached Redis has no offset to apply"
+    );
+    let local_before = redis_epoch_now();
+    let unsampled = client.server_clock().at(local_before);
+    assert_eq!(unsampled, local_before);
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 5,
+        duration: Duration::from_secs(1),
+    }]);
+    assert!(
+        algorithm
+            .check_redis(&client, "ip:127.0.0.1", &op)
+            .await
+            .expect("the charge must land")
+            .allowed
+    );
+
+    let offset = client
+        .server_clock()
+        .offset_nanos()
+        .expect("a successful EXEC must teach the client the server clock");
+    let shift_nanos = SHIFT.as_nanos() as i64;
+    assert!(
+        (offset - shift_nanos).abs() < 5_000_000_000,
+        "the learned offset must be the server's ten-minute lead, not zero: {offset}"
+    );
+
+    // And the selection USED it: the one key the charge wrote names a
+    // sub-bucket ten minutes ahead of this process's clock. Read the index off
+    // the keyspace rather than recomputing it, so a sub-bucket boundary
+    // crossing between the charge and this assertion cannot decide the result.
+    let keys = server.keys();
+    assert_eq!(
+        keys.len(),
+        1,
+        "exactly one sub-bucket was charged: {keys:?}"
+    );
+    let sub_index: u64 = keys[0]
+        .rsplit(':')
+        .next()
+        .expect("the key names its sub-bucket last")
+        .parse()
+        .expect("sub-bucket index");
+    let server_bucket = RedisRateLimitClient::sub_bucket_at(client.server_clock().now(), 1);
+    let local_bucket = RedisRateLimitClient::sub_bucket_at(redis_epoch_now(), 1);
+    assert!(
+        sub_index.abs_diff(server_bucket.index) <= 1,
+        "the charge must sit in the SERVER-clock sub-bucket: charged={sub_index} \
+         server={}",
+        server_bucket.index
+    );
+    // Ten minutes is 4800 sub-buckets of a one-second window, so a bucket
+    // chosen on this process's own clock could never be mistaken for it.
+    assert!(
+        sub_index.abs_diff(local_bucket.index) > 4_000,
+        "the charge must NOT sit in this process's own sub-bucket: \
+         charged={sub_index} local={}",
+        local_bucket.index
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// Settlement is judged on the server's clock at `EXEC`, not on a local sample
+/// taken after the reply arrives.
+///
+/// The transaction executes on time and only its REPLY is held for two whole
+/// sub-buckets. A local post-`EXEC` sample would read `b + 2` and roll the
+/// ladder over for nothing; the server's own `TIME` says `b`, and reply latency
+/// after `EXEC` is harmless because a peer charging later reads this request's
+/// own increment.
+#[tokio::test]
+async fn settlement_is_judged_on_the_server_clock_not_a_local_post_exec_sample() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        charge_delay: Duration::from_millis(250),
+        delayed_charges: 1,
+        hold_phase: HoldPhase::AfterApply,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 5,
+        duration: Duration::from_secs(1),
+    }]);
+    let outcome = algorithm
+        .check_redis(&client, "ip:127.0.0.1", &op)
+        .await
+        .expect("a late REPLY is not a stale ladder");
+    assert!(outcome.allowed);
+
+    assert_eq!(
+        server.incrs(),
+        1,
+        "the ladder executed inside its own sub-bucket, so nothing may be rebuilt"
+    );
+    assert_eq!(
+        server.decrs(),
+        0,
+        "nothing was abandoned, so nothing is handed back"
+    );
+    assert_eq!(client.pending_compensations_for_test(), 0);
+
+    let _ = server.shutdown.send(());
+}
+
+/// Review finding 2: a rebuilt ladder must not count the charge its own
+/// abandoned pass left behind.
+///
+/// The rebuilt ladder reads the sub-bucket the abandoned pass charged, so
+/// dispatching the hand-back is not enough — the rebuild has to wait for the
+/// `DECR` to land. With a one-request quota and a deliberately slow
+/// compensation, a rebuild that raced ahead would read its own abandoned charge
+/// plus its new one, see usage `2`, and refuse a request the quota admits.
+#[tokio::test]
+async fn a_rebuilt_ladder_does_not_count_the_charge_it_abandoned() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    // Timing budget, all against a one-second window's 125ms sub-buckets:
+    //
+    // - The first charge stalls 250ms BEFORE executing, so the server applies
+    //   it exactly two sub-buckets late and its own `TIME` proves the rollover.
+    //   250ms stays inside the 500ms screened per-command response deadline.
+    // - Its hand-back is then held 80ms, which is long enough that a rebuild
+    //   which only DISPATCHED the compensation would reach the server first,
+    //   and short enough (< one sub-bucket) that the rebuilt ladder cannot roll
+    //   over in turn and turn this into the two-rollover refusal.
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        charge_delay: Duration::from_millis(250),
+        delayed_charges: 1,
+        hold_phase: HoldPhase::BeforeApply,
+        compensation_delay: Duration::from_millis(80),
+        delayed_compensations: 1,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 1,
+        duration: Duration::from_secs(1),
+    }]);
+    let outcome = algorithm
+        .check_redis(&client, "ip:127.0.0.1", &op)
+        .await
+        .expect("the rebuilt pass must produce a decision");
+    assert!(
+        outcome.allowed,
+        "an empty one-request quota admits: the abandoned charge was handed \
+         back before the rebuilt ladder read its bucket"
+    );
+
+    for _ in 0..6_000 {
+        if client.pending_compensations_for_test() == 0 && server.decrs() >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(server.incrs(), 2, "the abandoned pass and the rebuild");
+    assert_eq!(server.decrs(), 1, "exactly one hand-back");
+    // The decisive ordering, read off the keyspace rather than off the clock:
+    // the hand-back must be APPLIED between the abandoned charge and the
+    // rebuild. Dispatch order alone would put the rebuild's `INCR` second.
+    assert_eq!(
+        server.ops(),
+        vec!["INCR", "DECR", "INCR"],
+        "the rebuild must execute only after its own hand-back landed"
+    );
+    assert_eq!(
+        server.charged_total(),
+        1,
+        "exactly one charge survives: the admitted request's"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// A hand-back that cannot be confirmed refuses instead of rebuilding.
+///
+/// The compensation is held past the screened per-command deadline that bounds
+/// the confirmation, so the rebuild would have to read a bucket that still
+/// holds the abandoned charge. Refusing routes the request through
+/// `redis_failure_policy` (an unavailable centralized store) rather than
+/// publishing a quota decision derived from a charge this request abandoned.
+#[tokio::test]
+async fn a_rollover_whose_hand_back_is_unconfirmed_refuses_instead_of_rebuilding() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        charge_delay: Duration::from_millis(250),
+        delayed_charges: 1,
+        hold_phase: HoldPhase::BeforeApply,
+        // Past both the 500ms screened per-command deadline and the equal
+        // bound on the confirmation wait.
+        compensation_delay: Duration::from_millis(900),
+        delayed_compensations: 1,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 5,
+        duration: Duration::from_secs(1),
+    }]);
+    let result = algorithm.check_redis(&client, "ip:127.0.0.1", &op).await;
+    assert!(
+        result.is_err(),
+        "an unconfirmed hand-back must refuse through redis_failure_policy, \
+         not rebuild against its own abandoned charge: {result:?}"
+    );
+    assert_eq!(
+        server.incrs(),
+        1,
+        "the rebuild must never be issued once the hand-back is in doubt"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// An endpoint whose ACL refuses `TIME` runs in local-clock mode instead of
+/// failing admission.
+///
+/// The probe is a STANDALONE command for exactly this reason: a denied command
+/// queued inside `MULTI` aborts the whole `EXEC`, so a client that guessed
+/// would refuse every request rather than degrade one contract.
+#[tokio::test]
+async fn an_acl_that_denies_time_falls_back_to_local_clock_mode() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        time_mode: ServerTimeMode::Denied,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 1,
+        duration: Duration::from_secs(1),
+    }]);
+    let first = algorithm
+        .check_redis(&client, "ip:127.0.0.1", &op)
+        .await
+        .expect("a denied TIME is not an outage");
+    assert!(first.allowed);
+    assert!(
+        !client.server_clock().server_time_permitted(),
+        "a NOPERM probe must put the client in local-clock mode"
+    );
+    assert_eq!(
+        client.server_clock().offset_nanos(),
+        None,
+        "local-clock mode learns no offset at all"
+    );
+
+    // Enforcement still works, on the weaker contract: the second request over
+    // a one-request quota is refused, and its charge is handed back.
+    let second = algorithm
+        .check_redis(&client, "ip:127.0.0.1", &op)
+        .await
+        .expect("local-clock mode still enforces centrally");
+    assert!(!second.allowed);
+    assert_eq!(server.incrs(), 2);
+    for _ in 0..6_000 {
+        if client.pending_compensations_for_test() == 0 && server.decrs() >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        server.charged_total(),
+        1,
+        "a refusal leaves no lasting charge"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// Design pins for the shared bucket clock.
+///
+/// `TIME` rides inside the charge transaction and nowhere else, it is queued
+/// only when a standalone probe has proven the ACL permits it, and the
+/// compensation stays a pure `DECR`/`EXPIRE` pair.
+#[test]
+fn the_server_clock_rides_inside_the_charge_transaction_and_is_probed_first() {
+    let redis = include_str!("../../../src/plugins/utils/redis_rate_limiter.rs");
+
+    fn method_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} must exist"));
+        let rest = &source[start..];
+        let end = rest[1..]
+            .find("\n    /// ")
+            .map(|index| index + 1)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    let charge = method_body(redis, "pub async fn charge_rate_limit_windows(");
+    assert!(
+        charge.contains("let server_clock_mode = self.server_clock.server_time_permitted();"),
+        "the ACL verdict must be captured ONCE per transaction, so the reply-shape \
+         check cannot disagree with what was queued"
+    );
+    assert!(
+        charge.contains("if server_clock_mode {") && charge.contains("pipeline.cmd(\"TIME\");"),
+        "TIME must be queued only when the endpoint permits it: a denied command \
+         inside MULTI aborts the whole EXEC"
+    );
+    assert!(
+        charge.contains("usize::from(server_clock_mode)"),
+        "the expected reply length must account for the TIME element exactly"
+    );
+    assert!(
+        charge.contains("self.server_clock.record_reply(server_time, local_at_reply)"),
+        "every successful EXEC must refresh the offset the NEXT request selects with"
+    );
+
+    let compensate = method_body(redis, "pub async fn uncharge_rate_limit_windows(");
+    assert!(
+        !compensate.contains("TIME"),
+        "a hand-back settles nothing and must not carry the server clock"
+    );
+
+    // The probe is STANDALONE and runs on every screened connection, before the
+    // socket may carry a policy command.
+    let screen = method_body(
+        redis,
+        "async fn screen_and_arm(&self, conn: &mut redis::aio::MultiplexedConnection) -> bool {",
+    );
+    assert!(
+        screen.contains("self.probe_server_time(conn).await;"),
+        "every established connection must re-probe TIME; an ACL can change under \
+         a live gateway"
+    );
+    let probe = method_body(redis, "async fn probe_server_time(");
+    assert!(
+        probe.contains("redis::cmd(\"TIME\").query_async(conn)"),
+        "the probe must be a plain standalone TIME, never a trial run inside MULTI"
+    );
+    assert!(
+        !probe.contains("mark_unavailable") && !probe.contains("note_command_failure"),
+        "a denied TIME selects local-clock mode; it is not an outage"
+    );
+
+    // Bucket selection everywhere in production goes through the correction.
+    let limiter = include_str!("../../../src/plugins/utils/rate_limit.rs");
+    let admission = limiter
+        .split("async fn check_http_windows_redis(")
+        .nth(1)
+        .expect("check_http_windows_redis must exist")
+        .split("\n#[cfg(test)]")
+        .next()
+        .expect("function body ends before the test-only items");
+    assert_eq!(
+        admission.matches("redis.server_clock()").count(),
+        2,
+        "selection and the local-clock-mode settlement fallback are the only two \
+         bucket-clock reads on the quota path"
+    );
+}
+
+/// Review finding 3: a capacity refusal taken during a per-decision fallback
+/// must still be attributed to the fallback budget.
+///
+/// A second sub-bucket rollover refuses through `redis_failure_policy` while
+/// every transaction it issued SUCCEEDED, so the client's availability signal
+/// stays true. Reconstructing the attribution from "is the store unreachable
+/// now" therefore answers `false`, and the `429` a previously unseen identity
+/// gets at the local key cap loses both its `ratelimit_local_fallback` metadata
+/// and its fallback-decision counter — exactly where degraded enforcement is
+/// least visible. The decision carries its own provenance instead.
+#[tokio::test]
+async fn a_second_rollover_attributes_its_capacity_refusal_to_the_fallback_budget() {
+    use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitBackend, RateLimitWindowSpec,
+        RedisFailurePolicy,
+    };
+
+    // Every charge stalls past its sub-bucket, so both passes roll over and the
+    // decision fails closed into `redis_failure_policy`.
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        charge_delay: Duration::from_millis(250),
+        delayed_charges: usize::MAX,
+        hold_phase: HoldPhase::BeforeApply,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let backend: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm> =
+        RateLimitBackend::from_plugin_config(
+            "rate_limiting",
+            &json!({
+                "sync_mode": "redis",
+                "redis_url": format!("redis://127.0.0.1:{}/0", server.port),
+                "redis_pool_size": 4,
+                "redis_failure_policy": "local_fallback",
+                "redis_health_check_interval_seconds": 3600,
+            }),
+            &PluginHttpClient::default(),
+            DynamicHttpRateLimitAlgorithm::new(),
+        )
+        .expect("failover backend");
+    assert_eq!(
+        backend.redis_failure_policy(),
+        Some(RedisFailurePolicy::LocalFallback),
+        "this coverage is about the fallback budget, not a fail-closed refusal"
+    );
+    let client = backend
+        .redis_client_arc_for_test()
+        .expect("failover backend must own a Redis client");
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 5,
+        duration: Duration::from_secs(1),
+    }]);
+
+    // One local slot, and the first identity takes it on the fallback budget.
+    let seen = backend
+        .check_with_redis_key_and_local_capacity_attributed(
+            "identity-a".to_string(),
+            || "{ferrum%3Atest:identity-a}".to_string(),
+            &op,
+            1,
+        )
+        .await;
+    assert!(
+        seen.outcome.expect("an admitted fallback decision").allowed,
+        "the per-process budget admits the first identity"
+    );
+    assert!(
+        seen.local_fallback,
+        "a rollover refusal routes THIS decision onto the fallback budget"
+    );
+
+    // The signal the old attribution read: the client is perfectly healthy,
+    // because both of its transactions succeeded.
+    assert!(
+        client.is_available(),
+        "a rollover is not a command failure; the endpoint is reachable"
+    );
+    assert!(
+        !backend.local_fallback_active(),
+        "the backend-level outage question answers 'no', which is why a \
+         capacity refusal must not be attributed from it"
+    );
+
+    // A previously unseen identity at the cap: no outcome to carry the marker.
+    let denied = backend
+        .check_with_redis_key_and_local_capacity_attributed(
+            "identity-b".to_string(),
+            || "{ferrum%3Atest:identity-b}".to_string(),
+            &op,
+            1,
+        )
+        .await;
+    assert!(
+        denied.outcome.is_none(),
+        "an unseen identity at the local cap is a capacity refusal"
+    );
+    assert!(
+        denied.local_fallback,
+        "the capacity 429 belongs to the fallback budget and must stay attributed"
+    );
+    assert_eq!(backend.tracked_keys_count(), 1);
 
     let _ = server.shutdown.send(());
 }
