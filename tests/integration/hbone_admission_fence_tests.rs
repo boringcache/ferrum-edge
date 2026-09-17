@@ -3226,7 +3226,7 @@ fn intermediate_peer_credential(
     HbonePeerCredential {
         spiffe_id: SpiffeId::new(CLIENT_SPIFFE).expect("client spiffe id"),
         leaf_der: Arc::new(chain.leaf_der.clone()),
-        intermediates_der: Some(vec![chain.intermediate_der.clone()]),
+        intermediates_der: Some(Arc::new(vec![chain.intermediate_der.clone()])),
         leaf_expiry: live_expiry(),
         anchored_at_admission: true,
         admitted_trust_revision,
