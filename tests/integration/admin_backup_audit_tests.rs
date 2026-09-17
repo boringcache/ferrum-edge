@@ -1442,13 +1442,21 @@ async fn restore_and_batch_reject_positional_collection_elements_before_writing(
                 json!([])
             };
             let payload = json!({field: [element]});
-            assert!(
-                !ferrum_edge::_test_support::restore_envelope_admits_for_test(
-                    &serde_json::to_vec(&payload).unwrap()
-                )
-            );
+            let error = ferrum_edge::_test_support::restore_envelope_admission_for_test(
+                &serde_json::to_vec(&payload).unwrap(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("expected a JSON object"), "{field}: {error}");
             let (status, body) = post_admin_raw(&base, path, &admin, &payload.to_string()).await;
             assert_eq!(status, 400, "{path} {field}: {body}");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("expected a JSON object"),
+                "{path} {field}: {body}"
+            );
             let (status, after, _) = get_backup(&base, "/backup", &admin, None).await;
             assert_eq!(status, 200);
             for resource in ["proxies", "consumers", "plugin_configs", "upstreams"] {

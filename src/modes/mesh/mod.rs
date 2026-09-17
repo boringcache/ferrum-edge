@@ -3049,10 +3049,23 @@ fn mesh_authz_config_policies(config: &serde_json::Value) -> Vec<MeshPolicy> {
             value.clone(),
         )
         .map(|object| object.0.mesh_policies)
-        .unwrap_or_default();
+        .unwrap_or_else(|_| {
+            warn!(
+                field = "mesh_slice",
+                "Cannot derive NodeWaypoint scoped policy labels from invalid mesh_authz input"
+            );
+            Vec::new()
+        });
     }
     if let Some(value) = config.get("mesh_policies") {
-        return crate::util::json_object::deserialize_object_vec(value.clone()).unwrap_or_default();
+        let policies = crate::util::json_object::deserialize_object_vec(value.clone());
+        return policies.unwrap_or_else(|_| {
+            warn!(
+                field = "mesh_policies",
+                "Cannot derive NodeWaypoint scoped policy labels from invalid mesh_authz input"
+            );
+            Vec::new()
+        });
     }
     Vec::new()
 }

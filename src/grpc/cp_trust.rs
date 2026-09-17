@@ -1892,6 +1892,7 @@ pub fn resolve_authorized_namespaces(
 struct TrustBundleDocument {
     #[serde(default)]
     version: Option<u32>,
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     keys: Vec<TrustBundleKeyDocument>,
 }
 

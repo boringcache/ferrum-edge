@@ -1325,8 +1325,8 @@ fn admin_typed_body_boundaries_require_a_json_object_envelope() {
 }
 
 // The original three-resource check above remains the regression table for
-// #5538. This source inventory checks derived Deserialize structs/enums in the
-// admission modules below, including private plugin wire and mesh-slice types.
+// #5538. This source inventory scans ALL Rust files recursively under src/ for
+// derived Deserialize structs/enums, including private wire and persisted types.
 // It covers named struct fields (direct, Option, Box), Vec<Struct> and
 // Option<Vec<Struct>> elements, and newtype enum variants carrying a named
 // struct. Named fields inside enum struct variants are also checked; the
@@ -1335,25 +1335,14 @@ fn admin_typed_body_boundaries_require_a_json_object_envelope() {
 // deserializers and raw serde_json::Value boundaries are not discovered here.
 // Separate behavioral/boundary tests cover the raw-Value sites changed here.
 // Skipped runtime fields are not JSON inputs. Scalar identity parsers and
-// field-specific exceptions below must justify why they need no object guard.
-fn object_admission_source(path: &str) -> bool {
-    path.starts_with("src/config/")
-        || path.starts_with("src/admin/")
-        || path.starts_with("src/plugins/")
-        || path.starts_with("src/modes/mesh/config_consumer/")
-        || matches!(
-            path,
-            "src/modes/mesh/config.rs"
-                | "src/modes/mesh/revision.rs"
-                | "src/modes/mesh/slice.rs"
-                | "src/proxy/stream_match.rs"
-        )
-}
+// field-specific exceptions below must justify why they remain outside this
+// admission change. File-backed records are inputs, even when Ferrum wrote them.
 
 /// Field-specific exceptions, never a blanket exception for a config type.
-/// These are internal records, response-only types or remote-provider responses,
-/// not admin configuration. Custom scalar identity types are checked separately
-/// below against their string parser.
+/// These identify internal records, response-only types, remote responses, and
+/// non-collection Kubernetes envelopes outside admin/config admission. An
+/// exception is a scope decision, not proof that a deserializer rejects arrays.
+/// Custom scalar identity types are checked separately against their parser.
 const OBJECT_ADMISSION_EXCEPTIONS: &[(&str, &str, &str, &str)] = &[
     (
         "src/modes/mesh/config.rs",
@@ -1362,46 +1351,118 @@ const OBJECT_ADMISSION_EXCEPTIONS: &[(&str, &str, &str, &str)] = &[
         "Runtime-only allowlist; MeshConfig.egress_udp_destinations is serde(skip).",
     ),
     (
-        "src/config/db_backend.rs",
-        "IncrementalResultDe",
-        "added_or_modified_proxies",
-        "Private CP/DP delta wire record, not an admin body or mesh config file.",
+        "src/modes/mesh/federation.rs",
+        "NativeFederationBundle",
+        "jwt_authorities",
+        "Remote federation response, like JwksResponse.keys; not local trust configuration.",
     ),
     (
-        "src/config/db_backend.rs",
-        "IncrementalResultDe",
-        "removed_proxy_keys",
-        "Private CP/DP delta wire record, not an admin body or mesh config file.",
+        "src/modes/mesh/federation.rs",
+        "SpiffeJwksDocument",
+        "keys",
+        "Remote SPIFFE JWKS response, like JwksResponse.keys; not local trust configuration.",
     ),
     (
-        "src/config/db_backend.rs",
-        "IncrementalResultDe",
-        "added_or_modified_consumers",
-        "Private CP/DP delta wire record, not an admin body or mesh config file.",
+        "src/modes/mesh/federation.rs",
+        "FederationDocument",
+        "Native",
+        "Remote federation envelope; same scope as NativeFederationBundle.jwt_authorities.",
     ),
     (
-        "src/config/db_backend.rs",
-        "IncrementalResultDe",
-        "added_or_modified_plugin_configs",
-        "Private CP/DP delta wire record, not an admin body or mesh config file.",
+        "src/modes/mesh/federation.rs",
+        "FederationDocument",
+        "SpiffeJwks",
+        "Remote SPIFFE JWKS response envelope; same scope as SpiffeJwksDocument.keys.",
     ),
     (
-        "src/config/db_backend.rs",
-        "IncrementalResultDe",
-        "removed_plugin_config_keys",
-        "Private CP/DP delta wire record, not an admin body or mesh config file.",
+        "src/tls/acme.rs",
+        "AcmeOrderRecord",
+        "http01_challenges",
+        "Persisted CA-order state, read from Ferrum's ACME store; not admin request configuration.",
     ),
     (
-        "src/config/db_backend.rs",
-        "IncrementalResultDe",
-        "added_or_modified_upstreams",
-        "Private CP/DP delta wire record, not an admin body or mesh config file.",
+        "src/tls/acme.rs",
+        "AcmeOrderRecord",
+        "tls_alpn01_challenges",
+        "Persisted CA-order state, read from Ferrum's ACME store; not admin request configuration.",
     ),
     (
-        "src/config/db_backend.rs",
-        "IncrementalResultDe",
-        "removed_upstream_keys",
-        "Private CP/DP delta wire record, not an admin body or mesh config file.",
+        "src/tls/acme.rs",
+        "AcmeOrderRecord",
+        "dns01_challenges",
+        "Persisted CA-order state, read from Ferrum's ACME store; not admin request configuration.",
+    ),
+    (
+        "src/tls/acme.rs",
+        "AcmeOrderRecord",
+        "finalization",
+        "Persisted generated key/CSR state in the ACME store; not admin request configuration.",
+    ),
+    (
+        "src/tls/events.rs",
+        "TlsSourceEvent",
+        "sources",
+        "Persisted rotation diagnostics, read from Ferrum's event log; not configuration.",
+    ),
+    (
+        "src/tls/events.rs",
+        "TlsEventLogFile",
+        "events",
+        "Persisted rotation diagnostics, read from Ferrum's event log; not configuration.",
+    ),
+    (
+        "src/config_sources/k8s/mod.rs",
+        "K8sObject",
+        "metadata",
+        "Kubernetes API object metadata; a non-collection input outside admin JSON admission.",
+    ),
+    (
+        "src/modes/injector.rs",
+        "AdmissionReview",
+        "request",
+        "Kubernetes webhook request envelope; a non-collection input outside admin JSON admission.",
+    ),
+    (
+        "src/modes/injector.rs",
+        "AdmissionRequest",
+        "kind",
+        "Kubernetes webhook kind metadata; a non-collection input outside admin JSON admission.",
+    ),
+    (
+        "src/modes/injector.rs",
+        "AdmissionRequest",
+        "resource",
+        "Kubernetes webhook resource metadata; non-collection input outside admin JSON admission.",
+    ),
+    (
+        "src/proxy/udp_placement_migration.rs",
+        "NodeAttestation",
+        "node",
+        "Node-local persisted preflight proof; not an admin or mesh configuration document.",
+    ),
+    (
+        "src/proxy/udp_placement_migration.rs",
+        "PendingMigration",
+        "transition",
+        "Node-local persisted placement lifecycle state; not admin or mesh configuration.",
+    ),
+    (
+        "src/proxy/udp_placement_migration.rs",
+        "DurablePlacementState",
+        "pending",
+        "Node-local persisted placement lifecycle state; not admin or mesh configuration.",
+    ),
+    (
+        "src/proxy/udp_placement_migration.rs",
+        "DurablePlacementState",
+        "completed",
+        "Node-local persisted placement lifecycle state; not admin or mesh configuration.",
+    ),
+    (
+        "src/proxy/udp_placement_migration.rs",
+        "DurablePlacementState",
+        "incarnation",
+        "Node-local persisted node-incarnation binding; not admin or mesh configuration.",
     ),
     (
         "src/admin/mesh_remote_clusters.rs",
@@ -1420,12 +1481,6 @@ const OBJECT_ADMISSION_EXCEPTIONS: &[(&str, &str, &str, &str)] = &[
         "JwksResponse",
         "keys",
         "Remote JWKS response, not plugin configuration or a gateway trust bundle.",
-    ),
-    (
-        "src/config/db_backend.rs",
-        "RemovalKeyWire",
-        "Qualified",
-        "Private CP/DP incremental removal entry, not an admin configuration body.",
     ),
     (
         "src/admin/audit_spool.rs",
@@ -1453,6 +1508,7 @@ const OBJECT_ADMISSION_EXCEPTIONS: &[(&str, &str, &str, &str)] = &[
 const EXPECTED_OBJECT_ADMISSION_FIELDS: &[&str] = &[
     "src/admin/api_specs/external_refs.rs:ExternalRefSnapshot.documents",
     "src/admin/backup.rs:ApiSpecsBackupSection.items",
+    "src/admin/backup.rs:BatchCreateRequest._gateway_trust_bundles",
     "src/admin/backup.rs:BatchCreateRequest.consumers",
     "src/admin/backup.rs:BatchCreateRequest.plugin_configs",
     "src/admin/backup.rs:BatchCreateRequest.proxies",
@@ -1462,6 +1518,18 @@ const EXPECTED_OBJECT_ADMISSION_FIELDS: &[&str] = &[
     "src/admin/backup.rs:RestorePayload.plugin_configs",
     "src/admin/backup.rs:RestorePayload.proxies",
     "src/admin/backup.rs:RestorePayload.upstreams",
+    "src/cni/ownership.rs:DurableCniOwnershipDocument.attachments",
+    "src/cni/ownership.rs:DurableCniOwnershipRecord.cleanup",
+    "src/cni/rpc.rs:WireRequest.valid_attachments",
+    "src/cni/spec.rs:CniNetConfig.ferrum",
+    "src/cni/spec.rs:CniNetConfig.valid_attachments",
+    "src/config/db_backend.rs:IncrementalResultDe.added_or_modified_consumers",
+    "src/config/db_backend.rs:IncrementalResultDe.added_or_modified_plugin_configs",
+    "src/config/db_backend.rs:IncrementalResultDe.added_or_modified_proxies",
+    "src/config/db_backend.rs:IncrementalResultDe.added_or_modified_upstreams",
+    "src/config/db_backend.rs:IncrementalResultDe.removed_plugin_config_keys",
+    "src/config/db_backend.rs:IncrementalResultDe.removed_proxy_keys",
+    "src/config/db_backend.rs:IncrementalResultDe.removed_upstream_keys",
     "src/config/plugin_trigger.rs:PluginTriggerNode.all",
     "src/config/plugin_trigger.rs:PluginTriggerNode.any",
     "src/config/types.rs:GatewayConfig.consumers",
@@ -1474,6 +1542,11 @@ const EXPECTED_OBJECT_ADMISSION_FIELDS: &[&str] = &[
     "src/config/types.rs:Upstream.targets",
     "src/config/types.rs:UpstreamLocalityLbSetting.distribute",
     "src/config/types.rs:UpstreamLocalityLbSetting.failover",
+    "src/grpc/cp_trust.rs:TrustBundleDocument.keys",
+    "src/modes/mesh/app_probe.rs:AppProbeHttpGet.http_headers",
+    "src/modes/mesh/app_probe.rs:AppProbeSpec.grpc",
+    "src/modes/mesh/app_probe.rs:AppProbeSpec.http_get",
+    "src/modes/mesh/app_probe.rs:AppProbeSpec.tcp_socket",
     "src/modes/mesh/config.rs:MeshConfig.destination_rules",
     "src/modes/mesh/config.rs:MeshConfig.ext_authz_providers",
     "src/modes/mesh/config.rs:MeshConfig.extension_configs",
@@ -1637,8 +1710,8 @@ fn admission_source_without_line_comments(text: &str) -> String {
 #[test]
 fn every_nested_admin_struct_field_has_an_object_admission_decision() {
     // Named structs are the serde shape that accepts positional sequences.
-    // Include definitions outside the admission modules, so an imported or
-    // fully qualified struct cannot evade the inventory.
+    // Include definitions across src/, so an imported or fully qualified
+    // struct cannot evade the inventory.
     let declaration =
         regex::Regex::new(r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?struct\s+(\w+)[^{;\n]*\{").unwrap();
     let items = regex::Regex::new(concat!(
@@ -1672,9 +1745,6 @@ fn every_nested_admin_struct_field_has_an_object_admission_decision() {
     let mut exceptions_seen = BTreeSet::new();
 
     for (path, text) in &sources {
-        if !object_admission_source(path) {
-            continue;
-        }
         let text = admission_source_without_line_comments(text);
         for item in items.captures_iter(&text) {
             if !item[2]
@@ -2020,22 +2090,20 @@ fn plugin_wire_objects_reject_arrays_before_construction() {
 
 #[test]
 fn api_spec_restore_section_requires_an_object_and_preserves_absence() {
-    use ferrum_edge::_test_support::restore_envelope_admits_for_test;
+    use ferrum_edge::_test_support::restore_envelope_admission_for_test;
 
     for rejected in [json!([]), json!(["1", []]), json!([{}])] {
         let body = json!({"api_specs": rejected});
-        assert!(!restore_envelope_admits_for_test(
-            &serde_json::to_vec(&body).unwrap()
-        ));
+        assert!(
+            restore_envelope_admission_for_test(&serde_json::to_vec(&body).unwrap()).is_err()
+        );
     }
     for accepted in [
         json!({}),
         json!({"api_specs": null}),
         json!({"api_specs": {"section_version": "1", "items": []}}),
     ] {
-        assert!(restore_envelope_admits_for_test(
-            &serde_json::to_vec(&accepted).unwrap()
-        ));
+        restore_envelope_admission_for_test(&serde_json::to_vec(&accepted).unwrap()).unwrap();
     }
 }
 
@@ -2240,14 +2308,22 @@ fn plugin_struct_lists_behind_raw_json_values_retain_element_admission() {
         );
     }
     let text = admission_source_without_line_comments(&source("src/modes/mesh/slice.rs"));
+    let body = item_body(&text, "pub struct MeshSlice {", "\n}");
+    let field_attributes = regex::Regex::new(r"(?:#\[[^\]]*\]\s*)+$").unwrap();
     for field in ["virtual_service_l4_proxies", "virtual_service_l4_upstreams"] {
-        let helper = "deserialize_object_vec";
-        let guarded_field = format!(
-            "#[serde(deserialize_with = \"crate::util::json_object::{helper}\")]\n    \
-             pub {field}: Vec<serde_json::Value>"
-        );
+        let declaration = format!("pub {field}:");
+        let start = body
+            .find(&declaration)
+            .expect("MeshSlice L4 field must exist");
+        // Inspect this field's full attribute group independently of ordering
+        // or whether serde options share one attribute or use separate ones.
+        let attributes = field_attributes
+            .find(&body[..start])
+            .expect("MeshSlice L4 field must carry attributes");
         assert!(
-            text.contains(&guarded_field),
+            attributes
+                .as_str()
+                .contains("json_object::deserialize_object_vec"),
             "MeshSlice.{field}: require objects"
         );
     }

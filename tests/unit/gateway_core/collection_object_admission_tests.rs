@@ -326,6 +326,177 @@ fn gateway_resources_and_nested_lists_require_object_elements() {
 }
 
 #[test]
+fn delta_resource_and_qualified_removal_lists_require_objects() {
+    use ferrum_edge::config::db_backend::IncrementalResult;
+
+    // Kind 1 ConfigUpdate.config_json must enforce the same resource-element
+    // admission as the kind 0 GatewayConfig tested above.
+    let base = json!({
+        "added_or_modified_proxies": [], "removed_proxy_ids": [],
+        "added_or_modified_consumers": [], "removed_consumer_ids": [],
+        "added_or_modified_plugin_configs": [], "removed_plugin_config_ids": [],
+        "added_or_modified_upstreams": [], "removed_upstream_ids": [],
+        "poll_timestamp": "2026-09-16T00:00:00Z"
+    });
+    let key = json!({"namespace": "ferrum", "id": "removed"});
+    assert_lists::<IncrementalResult>(
+        base.clone(),
+        &[
+            ("added_or_modified_proxies", json!({"id": "p"})),
+            ("added_or_modified_consumers", json!({"username": "user"})),
+            (
+                "added_or_modified_plugin_configs",
+                json!({"plugin_name": "cors", "scope": "global"}),
+            ),
+            ("added_or_modified_upstreams", json!({"targets": []})),
+            ("removed_proxy_keys", key.clone()),
+            ("removed_plugin_config_keys", key.clone()),
+            ("removed_upstream_keys", key.clone()),
+        ],
+    );
+
+    let positional = json!([
+        {}, "replacement", null, "ferrum", [], "/replacement", "http", "127.0.0.1", 12345
+    ]);
+    let proxy: config::Proxy = serde_json::from_value(positional.clone()).unwrap();
+    assert_eq!(proxy.id, "replacement");
+    let mut delta = base.clone();
+    delta["added_or_modified_proxies"] = json!([positional]);
+    let error = match serde_json::from_value::<IncrementalResult>(delta) {
+        Ok(_) => panic!("the delta must reject the otherwise-valid positional Proxy"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("expected a JSON object"), "{error}");
+
+    // The legacy removal arrays deliberately also admit bare strings. Guard
+    // only their object variant, keeping both documented wire forms usable.
+    for field in [
+        "removed_proxy_ids",
+        "removed_consumer_ids",
+        "removed_plugin_config_ids",
+        "removed_upstream_ids",
+    ] {
+        let mut delta = base.clone();
+        delta[field] = json!(["bare-id", key]);
+        assert!(serde_json::from_value::<IncrementalResult>(delta.clone()).is_ok());
+        delta[field] = json!([["ferrum", "removed"]]);
+        assert!(serde_json::from_value::<IncrementalResult>(delta).is_err());
+    }
+}
+
+#[test]
+fn cp_dp_trust_bundle_key_elements_require_objects() {
+    use ferrum_edge::grpc::cp_trust::CpDpTrustBundle;
+
+    let secret = "test-only-cp-trust-key-at-least-32-bytes";
+    let key = json!({
+        "kid": "tenant", "algorithm": "HS256", "namespaces": ["ferrum"], "secret": secret
+    });
+    let valid = json!({"version": 1, "keys": [key]});
+    assert_eq!(
+        CpDpTrustBundle::from_document_str(&valid.to_string(), "test-bundle", None)
+            .unwrap()
+            .key_count(),
+        1
+    );
+    for rejected in [
+        json!(["tenant", "HS256", ["ferrum"], secret]),
+        json!([]),
+        json!(null),
+        json!(7),
+    ] {
+        for keys in [json!([rejected]), json!([key, rejected])] {
+            let body = json!({"version": 1, "keys": keys});
+            let parsed = CpDpTrustBundle::from_document_str(&body.to_string(), "test-bundle", None);
+            let error = match parsed {
+                Ok(_) => panic!("trust keys must require objects"),
+                Err(error) => error,
+            };
+            assert!(error.contains("expected a JSON object"), "{error}");
+        }
+    }
+}
+
+#[test]
+fn cni_and_application_probe_collection_inputs_require_objects() {
+    use ferrum_edge::cni::rpc::CniRpcRequest;
+    use ferrum_edge::cni::spec::CniNetConfig;
+    use ferrum_edge::modes::mesh::app_probe::{AppProbeHttpGet, AppProbeSpec};
+
+    let attachment = json!({"containerID": "container", "ifname": "eth0"});
+    assert_lists::<CniNetConfig>(
+        json!({"cniVersion": "1.1.0", "name": "mesh", "type": "ferrum-cni"}),
+        &[("cni.dev/valid-attachments", attachment.clone())],
+    );
+    assert_lists::<CniRpcRequest>(
+        json!({"verb": "gc", "network_name": "mesh", "valid_attachments": []}),
+        &[("valid_attachments", attachment)],
+    );
+    for verb in ["gc", "status"] {
+        for attachments in [None, Some(Value::Null)] {
+            let mut body = json!({"verb": verb, "network_name": "mesh"});
+            if let Some(attachments) = attachments {
+                body["valid_attachments"] = attachments;
+            }
+            assert_eq!(
+                serde_json::from_value::<CniRpcRequest>(body).is_ok(),
+                verb == "status"
+            );
+        }
+    }
+    assert_lists::<AppProbeHttpGet>(
+        json!({"port": 8080}),
+        &[("httpHeaders", json!({"name": "x-probe", "value": "ready"}))],
+    );
+    for field in ["httpGet", "tcpSocket", "grpc"] {
+        let mut body = json!({field: {"port": 8080}});
+        assert!(serde_json::from_value::<AppProbeSpec>(body.clone()).is_ok());
+        body[field] = json!([]);
+        let error = serde_json::from_value::<AppProbeSpec>(body)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("expected a JSON object"), "{field}: {error}");
+    }
+    let mut net = json!({"name": "mesh", "type": "ferrum-cni", "ferrum": {}});
+    assert!(serde_json::from_value::<CniNetConfig>(net.clone()).is_ok());
+    net["ferrum"] = json!([]);
+    let error = serde_json::from_value::<CniNetConfig>(net)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("expected a JSON object"), "ferrum: {error}");
+}
+
+#[test]
+fn durable_cni_attachment_file_rejects_otherwise_valid_positional_records() {
+    use ferrum_edge::cni::ownership::{
+        CNI_OWNERSHIP_STORE_VERSION, CniOwnershipStoreError, DurableCniOwnershipRecord,
+        parse_durable_cni_ownership_bytes,
+    };
+
+    let positional = json!(["mesh", "container", "eth0", "pod-uid", {"attached": true}]);
+    let record: DurableCniOwnershipRecord = serde_json::from_value(positional.clone()).unwrap();
+    let valid = json!({"version": CNI_OWNERSHIP_STORE_VERSION, "attachments": [record]});
+    assert_eq!(
+        parse_durable_cni_ownership_bytes(&serde_json::to_vec(&valid).unwrap()).unwrap(),
+        vec![record]
+    );
+    for rejected in [positional, json!([]), json!(null), json!(7)] {
+        let mut body = valid.clone();
+        body["attachments"].as_array_mut().unwrap().push(rejected);
+        assert_eq!(
+            parse_durable_cni_ownership_bytes(&serde_json::to_vec(&body).unwrap()).unwrap_err(),
+            CniOwnershipStoreError::TruncatedOrInvalid
+        );
+    }
+    let mut malformed = valid["attachments"][0].clone();
+    malformed["cleanup"] = json!([]);
+    let error = serde_json::from_value::<DurableCniOwnershipRecord>(malformed)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("expected a JSON object"), "cleanup: {error}");
+}
+
+#[test]
 fn route_dispatch_lists_and_external_ref_snapshots_require_object_elements() {
     use ferrum_edge::admin::api_specs::external_refs::ExternalRefSnapshot;
     use ferrum_edge::plugins::mesh_route_dispatch::{MeshRouteDispatchConfig, RouteRule};
@@ -354,7 +525,7 @@ fn route_dispatch_lists_and_external_ref_snapshots_require_object_elements() {
 
 #[test]
 fn restore_resource_lists_and_api_spec_items_require_objects() {
-    use ferrum_edge::_test_support::restore_envelope_admits_for_test;
+    use ferrum_edge::_test_support::restore_envelope_admission_for_test;
 
     let fields = [
         ("proxies", json!({"id": "p"})),
@@ -371,14 +542,13 @@ fn restore_resource_lists_and_api_spec_items_require_objects() {
     ];
     for (field, element) in fields {
         let body = json!({field: [element]});
-        assert!(restore_envelope_admits_for_test(
-            &serde_json::to_vec(&body).unwrap()
-        ));
+        restore_envelope_admission_for_test(&serde_json::to_vec(&body).unwrap()).unwrap();
         for rejected in [json!([]), json!([{}, "positional"]), json!(null), json!(7)] {
             let body = json!({field: [element, rejected]});
-            assert!(!restore_envelope_admits_for_test(
-                &serde_json::to_vec(&body).unwrap()
-            ));
+            let error = restore_envelope_admission_for_test(&serde_json::to_vec(&body).unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("expected a JSON object"), "{field}: {error}");
         }
     }
     let item = json!({
@@ -388,14 +558,16 @@ fn restore_resource_lists_and_api_spec_items_require_objects() {
         "updated_at": "2026-09-16T00:00:00Z"
     });
     let body = json!({"api_specs": {"section_version": "2", "items": [item]}});
-    assert!(restore_envelope_admits_for_test(
-        &serde_json::to_vec(&body).unwrap()
-    ));
+    restore_envelope_admission_for_test(&serde_json::to_vec(&body).unwrap()).unwrap();
     let mut rejected = body;
     rejected["api_specs"]["items"] = json!([[]]);
-    assert!(!restore_envelope_admits_for_test(
-        &serde_json::to_vec(&rejected).unwrap()
-    ));
+    let error = restore_envelope_admission_for_test(&serde_json::to_vec(&rejected).unwrap())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("expected a JSON object"),
+        "api_specs.items: {error}"
+    );
 }
 
 #[test]

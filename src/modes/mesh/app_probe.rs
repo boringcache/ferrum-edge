@@ -152,6 +152,7 @@ pub struct AppProbeHttpGet {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub http_headers: Vec<AppProbeHeader>,
 }
 
@@ -181,10 +182,13 @@ pub struct AppProbeGrpc {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AppProbeSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub http_get: Option<AppProbeHttpGet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub tcp_socket: Option<AppProbeTcpSocket>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub grpc: Option<AppProbeGrpc>,
     /// The original probe's `timeoutSeconds`, bounded at parse time.
     #[serde(default = "default_probe_timeout_seconds")]
