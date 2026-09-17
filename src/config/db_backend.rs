@@ -1632,6 +1632,63 @@ impl FullConfigLoadPurpose {
     }
 }
 
+/// Which staged pool refused a database TLS reload candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbTlsReconnectStage {
+    /// The primary pool (or the publication of an already-staged pair).
+    Primary,
+    /// The admin-read replica pool.
+    ReadReplica,
+}
+
+impl DbTlsReconnectStage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::ReadReplica => "admin-read replica",
+        }
+    }
+}
+
+/// A failed database TLS reload, tagged with the stage that refused it.
+///
+/// Both pools are staged before either is published, so an undifferentiated
+/// error would report a replica-only rotation failure as a primary failure and
+/// send an operator to the wrong pool.
+#[derive(Debug)]
+pub struct DbTlsReconnectError {
+    pub stage: DbTlsReconnectStage,
+    pub error: anyhow::Error,
+}
+
+impl DbTlsReconnectError {
+    pub fn primary(error: anyhow::Error) -> Self {
+        Self {
+            stage: DbTlsReconnectStage::Primary,
+            error,
+        }
+    }
+
+    pub fn read_replica(error: anyhow::Error) -> Self {
+        Self {
+            stage: DbTlsReconnectStage::ReadReplica,
+            error,
+        }
+    }
+}
+
+impl std::fmt::Display for DbTlsReconnectError {
+    /// Renders the stage plus the underlying error. Callers that log this must
+    /// still redact URLs themselves; this type carries no URL of its own.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} reconnect failed: {}", self.stage.label(), self.error)
+    }
+}
+
+// `source()` is deliberately the default `None`: `anyhow::Error` already
+// renders its own chain, and `Display` above includes it.
+impl std::error::Error for DbTlsReconnectError {}
+
 /// Unified database backend trait.
 ///
 /// This trait defines all operations needed by the admin API, operating modes,
@@ -2178,6 +2235,28 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
 
     /// Atomically replace the admin-read replica pool with a freshly connected one.
     async fn reconnect_read_replica(&self, replica_url: &str) -> Result<(), anyhow::Error>;
+
+    /// Admit a TLS reload. SQL stages both pools before publishing either;
+    /// backends without SQL read replicas retain their normal reconnect path.
+    ///
+    /// The error names the stage that refused the candidate so the watcher can
+    /// tell an operator which pool failed — the first question when only one of
+    /// the two has rotated material.
+    async fn reconnect_tls(
+        &self,
+        db_url: &str,
+        replica_url: Option<&str>,
+    ) -> Result<(), DbTlsReconnectError> {
+        self.reconnect(db_url)
+            .await
+            .map_err(DbTlsReconnectError::primary)?;
+        if let Some(replica_url) = replica_url {
+            self.reconnect_read_replica(replica_url)
+                .await
+                .map_err(DbTlsReconnectError::read_replica)?;
+        }
+        Ok(())
+    }
 
     /// Try to reconnect to any available database URL (primary first, then failover).
     async fn try_failover_reconnect(&self, primary_url: &str) -> Result<String, anyhow::Error>;

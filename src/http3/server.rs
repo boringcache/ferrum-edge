@@ -6428,7 +6428,11 @@ async fn handle_h3_request(
     if use_native_h3_grpc {
         let grpc_client_ip = ctx.client_ip.clone();
         let grpc_is_early_data = ctx.is_early_data;
-        return dispatch_grpc_native_h3(
+        // Boxed out of line — see `boxed_dispatch_grpc_native_h3`. A bare
+        // `.await` of `dispatch_grpc_native_h3` here materializes the whole
+        // native-gRPC relay into `handle_h3_request`'s poll frame and is
+        // charged to every H3 request, including ordinary Plain over mesh.
+        return boxed_dispatch_grpc_native_h3(
             &state,
             &epoch,
             &proxy,
@@ -6471,7 +6475,9 @@ async fn handle_h3_request(
             matches!(backend_http_flavor, HttpFlavor::Grpc) && can_stream_request_body;
         let outcome = if stream_grpc_request {
             let client_ip_owned = ctx.client_ip.clone();
-            crate::http3::cross_protocol::dispatch_grpc_streaming(
+            // Boxed out of line — see `boxed_dispatch_grpc_streaming`; same
+            // poll-frame accounting as the native-gRPC relay above.
+            crate::http3::cross_protocol::boxed_dispatch_grpc_streaming(
                 &state,
                 &epoch,
                 &selected_base_proxy,
@@ -8430,7 +8436,9 @@ async fn handle_h3_request(
         let h3_stream_result = if let Some(result) = refined_streaming_response {
             result
         } else {
-            let streaming_result = proxy_to_backend_h3_streaming(
+            // Boxed out of line — see `boxed_proxy_to_backend_h3_streaming`;
+            // same poll-frame accounting as the native-gRPC relay above.
+            let streaming_result = boxed_proxy_to_backend_h3_streaming(
                 &state,
                 &proxy,
                 &backend_url,
@@ -12781,6 +12789,96 @@ impl Drop for H3GrpcUploadPumpGuard {
     }
 }
 
+/// One native-H3 gRPC dispatch future, heap-allocated so it is not a frame slot
+/// in `handle_h3_request`. See [`boxed_dispatch_grpc_native_h3`].
+type BoxedGrpcNativeH3DispatchFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + Send + 'a>>;
+
+/// The native-H3 gRPC relay, CONSTRUCTED OUT OF LINE and returned boxed.
+///
+/// The same stack-budget invariant `boxed_handle_h3_connect_udp` and
+/// `boxed_proxy_h3_plain_http_mesh_buffered` carry (issue #3764).
+/// `handle_h3_request` is THE generic HTTP/3 request future every H3 stream is
+/// polled through — Plain, gRPC, WebSocket, CONNECT-UDP — and at
+/// `opt-level = 0` every future awaited inline in it gets its OWN fixed
+/// `alloca` in that one poll frame, with no slot sharing between branches. The
+/// frame is therefore the SUM of those futures, charged to every request
+/// whether or not its branch runs. [`dispatch_grpc_native_h3`] owns backend
+/// admission, the duplex stream split, the spawned upload pump, the response
+/// relay and the trailer section, which makes it the single largest of those
+/// slots; an ordinary H3 Plain request dispatching over Sidecar mesh-mTLS was
+/// paying for the whole native-gRPC state machine and overflowed a 2 MiB Tokio
+/// worker on the hosted functional shard.
+///
+/// A bare `Box::pin(dispatch_grpc_native_h3(..))` would not help: that still
+/// materializes the relay future as a temporary before moving it to the heap.
+/// What this factory boxes is the thin `async move` trampoline, whose frame is
+/// only the captured arguments; the relay future is built later, when the
+/// heap-resident trampoline is first polled, after `handle_h3_request` has
+/// stored only a pointer. The cost is one allocation, and only for a request
+/// already classified as native-H3 gRPC. Do not fold this back into the call
+/// site without re-measuring that generic future's stack frame.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_dispatch_grpc_native_h3<'a>(
+    state: &'a ProxyState,
+    epoch: &'a crate::request_epoch::RequestEpoch,
+    proxy: &'a Proxy,
+    stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    method: &'a str,
+    proxy_headers: &'a HashMap<String, String>,
+    backend_url: &'a str,
+    original_request_path: &'a str,
+    upstream_target: Option<&'a UpstreamTarget>,
+    upstream_balancer: Option<&'a Arc<crate::load_balancer::LoadBalancer>>,
+    cb_target_key: Option<&'a str>,
+    cb_probe: &'a crate::proxy::HalfOpenProbeGuard,
+    client_ip: &'a str,
+    xff_append_ip: &'a str,
+    backend_resolved_ip: Option<&'a str>,
+    sticky_cookie_needed: bool,
+    is_early_data: bool,
+    backend_start: std::time::Instant,
+    start_time: std::time::Instant,
+    ctx: &'a mut RequestContext,
+    plugins: &'a [Arc<dyn Plugin>],
+    backend_admission_plugins: &'a [Arc<dyn Plugin>],
+    plugin_execution_ns: &'a mut u64,
+    initial_response_header_policy_plugins: &'a [Arc<dyn Plugin>],
+    response_trailer_governance: ResponseTrailerGovernance<'a>,
+) -> BoxedGrpcNativeH3DispatchFuture<'a> {
+    Box::pin(async move {
+        dispatch_grpc_native_h3(
+            state,
+            epoch,
+            proxy,
+            stream,
+            method,
+            proxy_headers,
+            backend_url,
+            original_request_path,
+            upstream_target,
+            upstream_balancer,
+            cb_target_key,
+            cb_probe,
+            client_ip,
+            xff_append_ip,
+            backend_resolved_ip,
+            sticky_cookie_needed,
+            is_early_data,
+            backend_start,
+            start_time,
+            ctx,
+            plugins,
+            backend_admission_plugins,
+            plugin_execution_ns,
+            initial_response_header_policy_plugins,
+            response_trailer_governance,
+        )
+        .await
+    })
+}
+
 /// Dispatch a gRPC request received over HTTP/3 to a **native HTTP/3** backend.
 ///
 /// The gRPC sibling of the inline native-H3 streaming path in
@@ -15134,6 +15232,73 @@ async fn log_h3_grpc_transaction(
         proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
     };
     crate::plugins::log_with_mirror(plugins, &summary, ctx).await;
+}
+
+/// Terminal outcome of one buffered-request H3 streaming dispatch. Named so
+/// the boxed-future alias below stays inside the line budget.
+type H3StreamingDispatchResult = Result<H3StreamResult, anyhow::Error>;
+
+/// One buffered-request H3 streaming dispatch future, heap-allocated so it is
+/// not a frame slot in `handle_h3_request`. See
+/// [`boxed_proxy_to_backend_h3_streaming`].
+type BoxedH3StreamingDispatchFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = H3StreamingDispatchResult> + Send + 'a>>;
+
+/// The buffered-request H3 streaming relay, CONSTRUCTED OUT OF LINE and
+/// returned boxed.
+///
+/// Second half of the same stack-budget invariant as
+/// [`boxed_dispatch_grpc_native_h3`], and for the same reason: at
+/// `opt-level = 0` this relay's state machine is a fixed `alloca` in
+/// `handle_h3_request`'s single poll frame, charged to every H3 request
+/// including the Plain-over-mesh-mTLS dispatch that never reaches it. It is
+/// the largest remaining inline slot once the native-gRPC relay is boxed.
+/// Boxing the thin `async move` trampoline keeps the concrete relay future off
+/// that frame; it is built when the heap-resident trampoline is first polled.
+/// Do not fold this back into the call site without re-measuring.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_proxy_to_backend_h3_streaming<'a>(
+    state: &'a ProxyState,
+    proxy: &'a Proxy,
+    backend_url: &'a str,
+    method: &'a str,
+    headers: &'a HashMap<String, String>,
+    body_bytes: Vec<u8>,
+    client_ip: &'a str,
+    xff_append_ip: &'a str,
+    upstream_target: Option<&'a UpstreamTarget>,
+    epoch: &'a crate::request_epoch::RequestEpoch,
+    sticky_cookie_needed: bool,
+    h3_stream: &'a mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a mut RequestContext,
+    plugin_execution_ns: &'a mut u64,
+    backend_admission_start: std::time::Instant,
+    trailer_governance: ResponseTrailerGovernance<'a>,
+) -> BoxedH3StreamingDispatchFuture<'a> {
+    Box::pin(async move {
+        proxy_to_backend_h3_streaming(
+            state,
+            proxy,
+            backend_url,
+            method,
+            headers,
+            body_bytes,
+            client_ip,
+            xff_append_ip,
+            upstream_target,
+            epoch,
+            sticky_cookie_needed,
+            h3_stream,
+            plugins,
+            ctx,
+            plugin_execution_ns,
+            backend_admission_start,
+            trailer_governance,
+        )
+        .await
+    })
 }
 
 /// Streaming proxy path: sends backend response chunks directly to the H3 client

@@ -187,6 +187,15 @@ pub struct HboneRelayFailureKey {
     pub error_class: &'static str,
 }
 
+/// Composite key for live HBONE tunnels revoked by the receiver-side
+/// admission fence (issue #5042 step 1). `reason` is a compiled-in
+/// [`crate::proxy::hbone_admission_fence::HboneRevocationReason`] label.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HboneTunnelRevocationKey {
+    pub proxy_id: Arc<str>,
+    pub reason: &'static str,
+}
+
 /// Composite key for raw-TCP mesh egress relay connections, labelled by the
 /// transport that carried them (`hbone` for Ambient, `mtls` for Sidecar) and
 /// the relay outcome. Bounded cardinality: both labels are compiled-in
@@ -760,6 +769,17 @@ pub struct MetricsRegistry {
     pub mesh_grpc_response_messages_counter: DashMap<MeshRequestKey, TimestampedCounter>,
     /// Rate limit exceeded counter
     pub rate_limit_exceeded: AtomicU64,
+    /// `rate_limiting` decisions served from the per-process fallback budget
+    /// while centralized (Redis) enforcement was unavailable.
+    ///
+    /// The default `redis_failure_policy` for that plugin is `local_fallback`,
+    /// so degraded enforcement is the silent common case rather than an opt-in:
+    /// this is the alertable signal that the configured quota is currently
+    /// being enforced once per gateway process instead of once per fleet.
+    pub rate_limit_fallback_decisions: AtomicU64,
+    /// `rate_limiting` requests refused because centralized enforcement was
+    /// unavailable and `redis_failure_policy` is `fail_closed`.
+    pub rate_limit_unavailable_denials: AtomicU64,
     pub ai_rate_limit_local_accounting_tokens: AtomicU64,
     pub ai_rate_limit_unaccounted_tokens: AtomicU64,
     /// Live OAuth2 introspection cache entries, partitioned into the fixed
@@ -872,6 +892,10 @@ pub struct MetricsRegistry {
     /// Incremented when the background CONNECT relay observes a copy failure
     /// after the client already received `200 OK`.
     pub hbone_relay_failure_counter: DashMap<HboneRelayFailureKey, TimestampedCounter>,
+    /// Live HBONE tunnels revoked by the admission fence, keyed by
+    /// (proxy_id, reason). Incremented once per revoked tunnel when a later
+    /// policy generation would no longer admit its CONNECT (issue #5042).
+    pub hbone_tunnel_revocation_counter: DashMap<HboneTunnelRevocationKey, TimestampedCounter>,
     /// Raw-TCP mesh egress relay connections keyed by (transport, result).
     /// Incremented once per captured raw-TCP connection that established a
     /// tunnel, labelled by the transport (`hbone`/`mtls`) and relay outcome
@@ -1009,6 +1033,8 @@ impl MetricsRegistry {
             mesh_grpc_request_messages_counter: DashMap::new(),
             mesh_grpc_response_messages_counter: DashMap::new(),
             rate_limit_exceeded: AtomicU64::new(0),
+            rate_limit_fallback_decisions: AtomicU64::new(0),
+            rate_limit_unavailable_denials: AtomicU64::new(0),
             ai_rate_limit_local_accounting_tokens: AtomicU64::new(0),
             ai_rate_limit_unaccounted_tokens: AtomicU64::new(0),
             oauth2_introspection_cache_entries: std::array::from_fn(|_| AtomicI64::new(0)),
@@ -1062,6 +1088,7 @@ impl MetricsRegistry {
             stream_disconnect_counter: DashMap::new(),
             mesh_dns_upstream_id_exhaustions: AtomicU64::new(0),
             hbone_relay_failure_counter: DashMap::new(),
+            hbone_tunnel_revocation_counter: DashMap::new(),
             mesh_tcp_egress_connection_counter: DashMap::new(),
             mesh_outbound_registry_decisions: DashMap::new(),
             mesh_outbound_registry_stream_decisions: DashMap::new(),
@@ -1397,6 +1424,26 @@ impl MetricsRegistry {
     /// rate-limiter plugin.
     pub fn record_rate_limit_exceeded(&self) {
         self.rate_limit_exceeded.fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    /// Record one rate-limit decision taken on the per-process fallback budget
+    /// because the centralized store could not be consulted.
+    ///
+    /// Counts admissions, quota refusals, and capacity refusals alike: the
+    /// alertable fact is that enforcement was degraded for this decision, not
+    /// which way it went.
+    pub fn record_rate_limit_local_fallback_decision(&self) {
+        self.rate_limit_fallback_decisions
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    /// Record one request refused because centralized rate-limit enforcement
+    /// was unavailable under `redis_failure_policy: fail_closed`.
+    pub fn record_rate_limit_enforcement_unavailable(&self) {
+        self.rate_limit_unavailable_denials
+            .fetch_add(1, Ordering::Relaxed);
         self.maybe_invalidate_cache();
     }
 
@@ -1812,6 +1859,24 @@ impl MetricsRegistry {
             error_class: error_class.as_str(),
         };
         self.hbone_relay_failure_counter
+            .entry(key)
+            .or_insert_with(|| TimestampedCounter::new(self.epoch))
+            .increment(self.epoch);
+
+        self.maybe_invalidate_cache();
+    }
+
+    /// Record one live HBONE tunnel revoked by the admission fence.
+    pub fn record_hbone_tunnel_revocation(
+        &self,
+        proxy_id: &str,
+        reason: crate::proxy::hbone_admission_fence::HboneRevocationReason,
+    ) {
+        let key = HboneTunnelRevocationKey {
+            proxy_id: Arc::from(proxy_id),
+            reason: reason.as_str(),
+        };
+        self.hbone_tunnel_revocation_counter
             .entry(key)
             .or_insert_with(|| TimestampedCounter::new(self.epoch))
             .increment(self.epoch);
@@ -2755,6 +2820,14 @@ impl MetricsRegistry {
             keep
         });
 
+        self.hbone_tunnel_revocation_counter.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
         self.mesh_tcp_egress_connection_counter.retain(|_, v| {
             let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
             if !keep {
@@ -3354,6 +3427,7 @@ impl MetricsRegistry {
             + self.ws_bytes_counter.len() * 180
             + self.ws_frames_counter.len() * 180
             + self.hbone_relay_failure_counter.len() * 240
+            + self.hbone_tunnel_revocation_counter.len() * 200
             + self.mesh_tcp_egress_connection_counter.len() * 120
             + self
                 .mesh_outbound_registry_decisions
@@ -3688,6 +3762,16 @@ impl MetricsRegistry {
 
         // Rate limit exceeded
         for (name, help, value) in [
+            (
+                "ferrum_rate_limit_local_fallback_decisions_total",
+                "Rate-limit decisions taken on the per-process fallback budget.",
+                self.rate_limit_fallback_decisions.load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_rate_limit_enforcement_unavailable_total",
+                "Requests refused because centralized rate-limit enforcement was unavailable.",
+                self.rate_limit_unavailable_denials.load(Ordering::Relaxed),
+            ),
             (
                 "ferrum_ai_rate_limit_local_accounting_tokens_total",
                 "AI tokens charged locally after centralized reconciliation failed.",
@@ -4456,6 +4540,22 @@ impl MetricsRegistry {
                 output.push_str(&format!(
                     "ferrum_mesh_hbone_relay_failures_total{{proxy_id=\"{}\",direction=\"{}\",error_class=\"{}\"{}}} {}\n",
                     proxy_id, key.direction, error_class, ns_label, count
+                ));
+            }
+        }
+
+        if !self.hbone_tunnel_revocation_counter.is_empty() {
+            output.push_str(
+                "# HELP ferrum_mesh_hbone_tunnel_revocations_total Live HBONE tunnels revoked by the admission fence because a later policy generation would no longer admit their CONNECT.\n",
+            );
+            output.push_str("# TYPE ferrum_mesh_hbone_tunnel_revocations_total counter\n");
+            for entry in self.hbone_tunnel_revocation_counter.iter() {
+                let key = entry.key();
+                let count = entry.value().value.load(Ordering::Relaxed);
+                let proxy_id = escape_label_value(&key.proxy_id);
+                output.push_str(&format!(
+                    "ferrum_mesh_hbone_tunnel_revocations_total{{proxy_id=\"{}\",reason=\"{}\"{}}} {}\n",
+                    proxy_id, key.reason, ns_label, count
                 ));
             }
         }

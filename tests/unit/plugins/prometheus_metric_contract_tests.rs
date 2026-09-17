@@ -733,6 +733,8 @@ fn representative_exposition() -> String {
     registry.record_stream(&tcp_summary);
 
     registry.record_rate_limit_exceeded();
+    registry.record_rate_limit_local_fallback_decision();
+    registry.record_rate_limit_enforcement_unavailable();
     registry.record_request_mirror_dispatched();
     registry.record_mesh_tcp_egress_connection("hbone", true);
     registry.record_mesh_tcp_egress_connection("mtls", false);

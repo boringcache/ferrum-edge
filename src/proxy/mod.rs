@@ -79,6 +79,7 @@ pub const PARSE_HINT_INVALID_REQUEST_TARGET_UTF8_FOR_TEST: u8 =
 /// Hyper's client handshake proves only the client half, so both h2c transports
 /// — the pooled gRPC path and the Unix-socket path — establish through here.
 pub(crate) mod h2c_preface;
+pub mod hbone_admission_fence;
 pub mod hbone_pool;
 mod hbone_proxy;
 #[allow(unused_imports)]
@@ -6867,6 +6868,13 @@ pub struct ProxyState {
     /// effective-mode snapshot. Captured traffic selects before the handshake;
     /// direct traffic checks the resolved app-port mode after routing.
     pub mesh_inbound_tls_policy: SharedMeshInboundTlsPolicy,
+    /// Registry of live admitted HBONE tunnels and the sweep that re-applies
+    /// their CONNECT admission gates on every epoch publication and inbound
+    /// PeerAuthentication swap (issue #5042 step 1). Publication paths must
+    /// schedule it through [`Self::publish_mesh_inbound_tls_policy`] and
+    /// [`Self::publish_request_epoch_with_gateway_trust`]; storing into the
+    /// slots directly would leave admitted tunnels unfenced.
+    pub hbone_admission_fence: Arc<hbone_admission_fence::HboneAdmissionFence>,
     /// Whether the current mesh inbound TLS posture is actually terminating
     /// inbound TLS with a SPIFFE peer verifier. This is operator status, not a
     /// dispatch hot-path flag: it distinguishes inbound trust from the outbound
@@ -8755,6 +8763,13 @@ impl ProxyState {
         let published = self
             .request_epoch
             .update_config_with_trust(staging, build, mirror)?;
+        if published.is_some() {
+            // Every published generation may carry a new authorize chain, a
+            // changed mesh termination inventory, or a withdrawn proxy. Live
+            // HBONE tunnels admitted under the previous generation are re-judged
+            // against this one off the request path (issue #5042 step 1).
+            self.hbone_admission_fence.request_sweep();
+        }
         if published.is_some() || fenced {
             self.commit_gateway_trust_generation_locked(commit);
         } else {
@@ -8776,6 +8791,52 @@ impl ProxyState {
             );
         }
         Ok(published)
+    }
+
+    /// Publish the effective mesh inbound TLS / PeerAuthentication snapshot.
+    ///
+    /// This is the ONE way the policy slot changes: the store is followed by an
+    /// HBONE admission-fence sweep, so a live tunnel whose transport no longer
+    /// satisfies its application port's mode (for example PERMISSIVE → STRICT
+    /// for a plaintext-admitted tunnel) is revoked instead of outliving the
+    /// posture that admitted it (issue #5042 step 1).
+    pub fn publish_mesh_inbound_tls_policy(&self, policy: MeshInboundTlsPolicy) {
+        self.mesh_inbound_tls_policy.store(Arc::new(policy));
+        self.hbone_admission_fence.request_sweep();
+    }
+
+    /// Republish only the captured-listener-port → application-port alias table,
+    /// carrying every other field of the live snapshot forward.
+    ///
+    /// A read-modify-write is NOT a store: this uses `ArcSwap::rcu` so a
+    /// concurrent [`Self::publish_mesh_inbound_tls_policy`] cannot be clobbered
+    /// by a snapshot taken before it landed, and it schedules the same
+    /// admission-fence sweep so the one-publication rule holds for every writer
+    /// of the slot (issue #5042 step 1). Returns whether the table changed;
+    /// an unchanged table republishes nothing and schedules no sweep.
+    pub fn publish_mesh_inbound_app_port_aliases(
+        &self,
+        aliases: std::collections::BTreeMap<u16, u16>,
+    ) -> bool {
+        let mut changed = false;
+        self.mesh_inbound_tls_policy.rcu(|current| {
+            if current.app_port_by_orig_dst_port == aliases {
+                changed = false;
+                return Arc::clone(current);
+            }
+            changed = true;
+            Arc::new(MeshInboundTlsPolicy {
+                default: current.default.clone(),
+                by_port: current.by_port.clone(),
+                default_mode: current.default_mode,
+                modes_by_port: current.modes_by_port.clone(),
+                app_port_by_orig_dst_port: aliases.clone(),
+            })
+        });
+        if changed {
+            self.hbone_admission_fence.request_sweep();
+        }
+        changed
     }
 
     /// Install a freshly loaded source/CA-backed gateway SVID as the live
@@ -9938,6 +9999,10 @@ impl ProxyState {
                 max: udp_max_sessions_per_ip,
             },
         );
+        let hbone_admission_fence = Arc::new(hbone_admission_fence::HboneAdmissionFence::new(
+            Arc::clone(&request_epoch),
+            Arc::clone(&mesh_inbound_tls_policy),
+        ));
 
         let state = Self {
             config: config_arc,
@@ -10045,6 +10110,7 @@ impl ProxyState {
             mesh_trust_registry,
             mesh_inbound_tls,
             mesh_inbound_tls_policy,
+            hbone_admission_fence,
             mesh_inbound_spiffe_verifier_active,
             mesh_outbound_enforcement,
             backend_svid_rotation_tx,
@@ -21038,12 +21104,38 @@ fn mesh_inbound_peer_auth_transport_mismatch(
     is_tls: bool,
     has_verified_peer_certificate: bool,
 ) -> Option<MeshInboundPeerAuthTransportMismatch> {
-    let resolved_app_port = mesh_inbound_peer_auth_app_port(proxy, upstream_target);
     if !mesh_inbound_requires_post_route_transport_gate(mesh_direction) {
         return None;
     }
-
     let policy = state.mesh_inbound_tls_policy.load();
+    mesh_inbound_peer_auth_transport_mismatch_for_policy(
+        &policy,
+        mesh_direction,
+        pre_handshake_app_port,
+        proxy,
+        upstream_target,
+        is_tls,
+        has_verified_peer_certificate,
+    )
+}
+
+/// [`mesh_inbound_peer_auth_transport_mismatch`] against an explicit policy
+/// snapshot. The HBONE admission fence re-applies this gate to live tunnels
+/// after a PeerAuthentication swap, so it must share one decision function
+/// with the request path rather than a second reading of the mode table.
+fn mesh_inbound_peer_auth_transport_mismatch_for_policy(
+    policy: &MeshInboundTlsPolicy,
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    pre_handshake_app_port: Option<u16>,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+    is_tls: bool,
+    has_verified_peer_certificate: bool,
+) -> Option<MeshInboundPeerAuthTransportMismatch> {
+    if !mesh_inbound_requires_post_route_transport_gate(mesh_direction) {
+        return None;
+    }
+    let resolved_app_port = mesh_inbound_peer_auth_app_port(proxy, upstream_target);
     let required_mode = policy
         .modes_by_port
         .get(&resolved_app_port)
@@ -30583,6 +30675,17 @@ async fn handle_proxy_request_inner(
     });
     ctx.request_authority = request_authority;
 
+    // HBONE admission-fence publish-then-recheck (issue #5042 step 1). Captured
+    // BEFORE the epoch load and before the PeerAuthentication policy read the
+    // HBONE gates perform, because both publishers bump this counter AFTER their
+    // store: a gate that read stale state necessarily captured a stale counter
+    // too, and `HboneAdmissionFence::admit` turns that into a fresh sweep.
+    // Deliberately unconditional even though only an HBONE CONNECT can consume
+    // it: the capture has to precede the epoch load, so it cannot move into the
+    // HBONE branch below, and no mesh/inbound predicate is available this early
+    // that is cheaper than the load it would guard — one uncontended atomic
+    // load (a plain `mov` on x86-64, `ldar` on aarch64).
+    let hbone_admission_sweep_epoch = state.hbone_admission_fence.sweep_epoch();
     let epoch = state.request_epoch.load();
     ctx.lb_generation = epoch.lb_generation;
     ctx.config_generation = epoch.config_generation;
@@ -32230,6 +32333,11 @@ async fn handle_proxy_request_inner(
             start_time,
             &method,
             plugin_execution_ns,
+            hbone_proxy::HboneAdmissionView {
+                request_protocol,
+                grpc_web_request,
+                sweep_epoch: hbone_admission_sweep_epoch,
+            },
         )
         .await);
     }
@@ -32250,6 +32358,11 @@ async fn handle_proxy_request_inner(
             start_time,
             &method,
             plugin_execution_ns,
+            hbone_proxy::HboneAdmissionView {
+                request_protocol,
+                grpc_web_request,
+                sweep_epoch: hbone_admission_sweep_epoch,
+            },
         )
         .await);
     }
@@ -32882,26 +32995,19 @@ async fn handle_proxy_request_inner(
                     &transformed,
                 )
                 .await;
-                if let Some(body_hook_ctx) = body_hook_ctx {
+                if let Some(mut body_hook_ctx) = body_hook_ctx {
                     // Typed gateway terminals selected by the representation gate
                     // inside the hook stage. Adopted BEFORE the metadata move so the
                     // finalizer on the real context knows it is publishing a
                     // gateway-authored error payload rather than an application one.
                     ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
+                    ctx.adopt_final_request_body_hook_plugin_state(&mut body_hook_ctx);
                     let request_body = ctx.metadata.remove("request_body");
                     ctx.metadata = body_hook_ctx.metadata;
                     if let Some(body) = request_body {
                         ctx.metadata.insert("request_body".to_string(), body);
                     }
                     ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
-                    ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
-                    ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
-                    // `ai_semantic_cache` stages its semantic miss (scope key +
-                    // embedding) from the final-request-body hook, and its store hook
-                    // runs later against the real context. Without carrying these two
-                    // maps back, every semantic miss would silently store as exact-only.
-                    ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
-                    ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
                 }
                 // Irreversible outbound egress runs here and nowhere earlier:
                 // `transformed` is the backend-visible body and every final
@@ -33338,7 +33444,7 @@ async fn handle_proxy_request_inner(
                     &transformed,
                 )
                 .await;
-                if let Some(body_hook_ctx) = body_hook_ctx {
+                if let Some(mut body_hook_ctx) = body_hook_ctx {
                     if body_hook_ctx.gateway_deadline_response_selected() {
                         ctx.mark_gateway_deadline_response_selected();
                     }
@@ -33347,6 +33453,7 @@ async fn handle_proxy_request_inner(
                     // finalizer on the real context knows it is publishing a
                     // gateway-authored error payload rather than an application one.
                     ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
+                    ctx.adopt_final_request_body_hook_plugin_state(&mut body_hook_ctx);
                     let request_body = ctx.metadata.remove("request_body");
                     ctx.metadata = body_hook_ctx.metadata;
                     ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
@@ -33354,14 +33461,6 @@ async fn handle_proxy_request_inner(
                         ctx.metadata.insert("request_body".to_string(), body);
                     }
                     ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
-                    ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
-                    ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
-                    // `ai_semantic_cache` stages its semantic miss (scope key +
-                    // embedding) from the final-request-body hook, and its store hook
-                    // runs later against the real context. Without carrying these two
-                    // maps back, every semantic miss would silently store as exact-only.
-                    ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
-                    ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
                 }
                 // Finalized-request-egress boundary (GHSA-4vr5-4wm3-x5xv): the
                 // backend-visible body has been transformed and accepted by every
@@ -34167,7 +34266,7 @@ async fn handle_proxy_request_inner(
                 &grpc_req_body,
             )
             .await;
-            if let Some(body_hook_ctx) = body_hook_ctx {
+            if let Some(mut body_hook_ctx) = body_hook_ctx {
                 if body_hook_ctx.gateway_deadline_response_selected() {
                     ctx.mark_gateway_deadline_response_selected();
                 }
@@ -34179,6 +34278,7 @@ async fn handle_proxy_request_inner(
                 // finalizer on the real context knows it is publishing a
                 // gateway-authored error payload rather than an application one.
                 ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
+                ctx.adopt_final_request_body_hook_plugin_state(&mut body_hook_ctx);
                 let request_body = ctx.metadata.remove("request_body");
                 ctx.metadata = body_hook_ctx.metadata;
                 ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
@@ -34186,14 +34286,6 @@ async fn handle_proxy_request_inner(
                     ctx.metadata.insert("request_body".to_string(), body);
                 }
                 ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
-                ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
-                ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
-                // `ai_semantic_cache` stages its semantic miss (scope key +
-                // embedding) from the final-request-body hook, and its store hook
-                // runs later against the real context. Without carrying these two
-                // maps back, every semantic miss would silently store as exact-only.
-                ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
-                ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
             }
             // Finalized-request-egress boundary for native gRPC
             // (GHSA-4vr5-4wm3-x5xv). `grpc_req_body` is the transformed,
@@ -35713,13 +35805,42 @@ async fn handle_proxy_request_inner(
                     let bytes_sent = ctx
                         .bytes_sent_observed
                         .load(std::sync::atomic::Ordering::Acquire);
-                    let mut metadata = clone_log_metadata(&ctx);
-                    metadata
-                        .entry("request_protocol".to_string())
-                        .or_insert_with(|| "grpc".to_string());
+                    // A gRPC terminal without a trailer status is UNKNOWN, not
+                    // an unqualified 200. The deferred arm captures that fact
+                    // directly instead of reading it back off a metadata
+                    // projection that its own fire-time rebuild replaces. The
+                    // absent-key default is `true` on THIS arm only, because the
+                    // projection it replaces went through
+                    // `entry("request_protocol").or_insert("grpc")`.
+                    let request_protocol_is_grpc =
+                        crate::proxy::deferred_log::native_grpc_request_protocol_is_grpc(
+                            &ctx.metadata,
+                        );
+                    // Only the synchronous body-exceeded terminal below reads a
+                    // header-commit projection. The streaming arm rebuilds it
+                    // from the finalized context at fire time, so building it
+                    // here would be the second of two `clone_log_metadata`
+                    // calls per streamed request (issue #5537).
+                    let metadata = if body_exceeded {
+                        let mut metadata = clone_log_metadata(&ctx);
+                        metadata
+                            .entry("request_protocol".to_string())
+                            .or_insert_with(|| "grpc".to_string());
+                        metadata
+                    } else {
+                        HashMap::new()
+                    };
                     let summary = TransactionSummary {
                         namespace: proxy.namespace.clone(),
-                        timestamp_received: ctx.timestamp_received.to_rfc3339(),
+                        // Formatted at fire time on the deferred arm, for the
+                        // same reason its metadata is: no sink reads either
+                        // before the terminal rebuild, and the context that
+                        // carries the instant is owned by the logger.
+                        timestamp_received: if body_exceeded {
+                            ctx.timestamp_received.to_rfc3339()
+                        } else {
+                            String::new()
+                        },
                         client_ip: ctx.client_ip.clone(),
                         consumer_username: ctx.effective_identity().map(str::to_owned),
                         auth_method: ctx.auth_method,
@@ -35774,6 +35895,7 @@ async fn handle_proxy_request_inner(
                             Arc::clone(&plugins),
                             ctx.clone(),
                             start_time,
+                            request_protocol_is_grpc,
                         ))
                     }
                 } else {
@@ -37449,7 +37571,7 @@ async fn handle_proxy_request_inner(
             &mut backend_admission_started_at,
         )
         .await;
-        if let Some(body_hook_ctx) = body_hook_ctx.take() {
+        if let Some(mut body_hook_ctx) = body_hook_ctx.take() {
             if body_hook_ctx.gateway_deadline_response_selected() {
                 ctx.mark_gateway_deadline_response_selected();
             }
@@ -37461,6 +37583,7 @@ async fn handle_proxy_request_inner(
             // finalizer on the real context knows it is publishing a
             // gateway-authored error payload rather than an application one.
             ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
+            ctx.adopt_final_request_body_hook_plugin_state(&mut body_hook_ctx);
             let request_body = ctx.metadata.remove("request_body");
             ctx.metadata = body_hook_ctx.metadata;
             ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
@@ -37468,14 +37591,6 @@ async fn handle_proxy_request_inner(
                 ctx.metadata.insert("request_body".to_string(), body);
             }
             ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
-            ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
-            ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
-            // `ai_semantic_cache` stages its semantic miss (scope key +
-            // embedding) from the final-request-body hook, and its store hook
-            // runs later against the real context. Without carrying these two
-            // maps back, every semantic miss would silently store as exact-only.
-            ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
-            ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
         }
         let (mut result, retained_body) = match initial_dispatch {
             BackendDispatchResult::Response {
@@ -38155,7 +38270,7 @@ async fn handle_proxy_request_inner(
             &mut backend_admission_started_at,
         )
         .await;
-        if let Some(body_hook_ctx) = body_hook_ctx {
+        if let Some(mut body_hook_ctx) = body_hook_ctx {
             if body_hook_ctx.gateway_deadline_response_selected() {
                 ctx.mark_gateway_deadline_response_selected();
             }
@@ -38167,6 +38282,7 @@ async fn handle_proxy_request_inner(
             // finalizer on the real context knows it is publishing a
             // gateway-authored error payload rather than an application one.
             ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
+            ctx.adopt_final_request_body_hook_plugin_state(&mut body_hook_ctx);
             let request_body = ctx.metadata.remove("request_body");
             ctx.metadata = body_hook_ctx.metadata;
             ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
@@ -38174,14 +38290,6 @@ async fn handle_proxy_request_inner(
                 ctx.metadata.insert("request_body".to_string(), body);
             }
             ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
-            ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
-            ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
-            // `ai_semantic_cache` stages its semantic miss (scope key +
-            // embedding) from the final-request-body hook, and its store hook
-            // runs later against the real context. Without carrying these two
-            // maps back, every semantic miss would silently store as exact-only.
-            ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
-            ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
         }
         let resp = match dispatch {
             BackendDispatchResult::Response {
@@ -39222,15 +39330,37 @@ async fn handle_proxy_request_inner(
     // summary below. Response framing still needs the request-method semantic,
     // but the hot path does not need to clone the method string.
     let is_head = method.eq_ignore_ascii_case("HEAD");
-    // A streaming response with no plugin on the proxy still owes the runtime
-    // metrics its terminal accounting, but that is *all* it owes: no `log`,
-    // termination hook, inspector, or mirror exists to receive a summary. Hand
-    // the body a compact terminal that records exactly what the summary path
-    // would have recorded, without the summary, the context clone, or the
-    // delivery task.
-    let compact_terminal_only = plugins.is_empty() && body_will_stream;
+    // Whether ANY consumer of a terminal `TransactionSummary` exists for this
+    // exchange. With no plugin on the chain and no mirror dispatched there is
+    // no `log`, no termination hook, no inspector, and no mirror to receive
+    // one: `log_with_mirror` reaches nothing but
+    // `RuntimeMetrics::record_transaction`, which reads five facts.
+    // `record_terminal_outcome` is that same recording spelled out for a path
+    // that never builds a summary, so building one would exist only to be read
+    // five times and dropped — at the cost of an rfc3339 timestamp string, a
+    // `clone_log_metadata` projection, and a handful of owned clones per
+    // request (issue #5537).
+    let terminal_summary_has_no_consumer = plugins.is_empty() && ctx.mirror_result_rxs.is_empty();
+    // A streaming response still owes the runtime metrics its terminal
+    // accounting after the body ends. Hand the body a compact terminal that
+    // records exactly what the summary path would have recorded, without the
+    // summary, the context, or the delivery task.
+    let compact_terminal_only = terminal_summary_has_no_consumer && body_will_stream;
+    // A buffered response is already terminal here, so its accounting can be
+    // recorded synchronously below. Only an error class produces any counter at
+    // all; a clean buffered response with no consumer records nothing, exactly
+    // as it did when no summary was built for it either.
+    let buffered_terminal_outcome_only =
+        terminal_summary_has_no_consumer && !body_will_stream && backend_error_class.is_some();
     let needs_transaction_summary = !compact_terminal_only
+        && !buffered_terminal_outcome_only
         && (!plugins.is_empty() || body_will_stream || backend_error_class.is_some());
+    // A streaming terminal's summary is captured here, at header commit, but
+    // its logger is built at the very end of this function: the logger owns a
+    // `RequestContext`, and every remaining handler read of `ctx` happens
+    // before then, so the context is MOVED into it instead of cloned whole for
+    // each streamed request (issue #5537).
+    let mut pending_stream_terminal: Option<Box<PendingStreamTerminal>> = None;
     let deferred_logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>> =
         if compact_terminal_only {
             Some(
@@ -39274,7 +39404,17 @@ async fn handle_proxy_request_inner(
                 .load(std::sync::atomic::Ordering::Acquire);
             let mut summary = TransactionSummary {
                 namespace: proxy.namespace.clone(),
-                timestamp_received: ctx.timestamp_received.to_rfc3339(),
+                // A deferred terminal formats this at fire time from the
+                // context it owns. `timestamp_received` is fixed when the
+                // context is built, and no sink sees the summary before that
+                // rebuild, so the value is identical — it just stops costing an
+                // rfc3339 format and a String allocation on the request path of
+                // every streamed response.
+                timestamp_received: if body_will_stream {
+                    String::new()
+                } else {
+                    ctx.timestamp_received.to_rfc3339()
+                },
                 client_ip: ctx.client_ip.clone(),
                 consumer_username: ctx.effective_identity().map(str::to_owned),
                 auth_method: ctx.auth_method,
@@ -39299,25 +39439,39 @@ async fn handle_proxy_request_inner(
                 bytes_received: bytes_received_buffered,
                 grpc_request_messages,
                 grpc_response_messages,
-                metadata: clone_log_metadata(&ctx),
+                // Only a buffered terminal consumes a header-commit projection.
+                // The deferred terminal rebuilds this map from the finalized
+                // context at fire time and overwrites whatever is here, so
+                // projecting it now would be the second of two
+                // `clone_log_metadata` calls per streamed request.
+                metadata: if body_will_stream {
+                    HashMap::new()
+                } else {
+                    clone_log_metadata(&ctx)
+                },
                 ai_usage_export: ctx.ai_usage_export.clone(),
                 proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
                 ..TransactionSummary::default()
             };
 
             if body_will_stream {
-                // Thread `start_time` so `latency_total_ms` / derived gateway
-                // fields are re-derived at body-completion time — closes the
-                // header-flush snapshot gap for streaming responses.
-                Some(
-                    crate::proxy::deferred_log::DeferredTransactionLogger::new_with_start_time(
-                        summary,
-                        Arc::clone(&plugins),
-                        ctx.clone(),
-                        start_time,
-                    )
-                    .with_passthrough_request_bytes_latch(passthrough_request_bytes_latch.clone()),
-                )
+                // Deferred: hold the summary until every handler read of `ctx`
+                // is done. `start_time` is threaded at construction so
+                // `latency_total_ms` / derived gateway fields are re-derived at
+                // body-completion time — that closes the header-flush snapshot
+                // gap for streaming responses.
+                //
+                // The summary carries no header-commit projection on this arm,
+                // so this is exactly what the fire-time probe used to resolve
+                // to: the request's own declared protocol, with an absent key
+                // meaning "not gRPC".
+                let request_protocol_is_grpc =
+                    crate::proxy::deferred_log::streaming_request_protocol_is_grpc(&ctx.metadata);
+                pending_stream_terminal = Some(Box::new(PendingStreamTerminal {
+                    summary,
+                    request_protocol_is_grpc,
+                }));
+                None
             } else {
                 // ── Buffered commitment / audit boundary (#3815) ─────────────
                 //
@@ -39378,6 +39532,23 @@ async fn handle_proxy_request_inner(
                 None
             }
         } else {
+            if buffered_terminal_outcome_only {
+                // Exactly what `record_transaction` would have read off the
+                // summary this arm no longer builds: a buffered terminal has
+                // already ended, so it carries no body error and no client
+                // disconnect, and its `error_class` is the one the summary
+                // would have carried after the gateway output-policy
+                // refinement.
+                crate::runtime_metrics::global_ref().record_terminal_outcome(
+                    crate::runtime_metrics::TerminalOutcome {
+                        proxy_id: Some(proxy.id.as_str()),
+                        grpc: crate::runtime_metrics::terminal_metadata_is_grpc(&ctx.metadata),
+                        error_class: ctx.response_policy_error_class(backend_error_class),
+                        body_error_class: None,
+                        client_disconnected: false,
+                    },
+                );
+            }
             None
         };
 
@@ -40217,6 +40388,35 @@ async fn handle_proxy_request_inner(
         body
     };
 
+    // Build the streaming terminal's logger LAST. Every handler read of `ctx`
+    // is behind us and nothing above mutated it after the summary was
+    // captured, so the logger takes the context by MOVE rather than forcing a
+    // whole `RequestContext` clone on every streamed request (issue #5537).
+    let deferred_logger = match pending_stream_terminal {
+        Some(pending) => {
+            // The clone this replaces never carried the bounded response-buffer
+            // permit, the mirror admission leases, or the hmac prebuffer stage.
+            // Release them here so the move does not extend a bounded admission
+            // to body-termination time.
+            ctx.release_leases_before_terminal_handoff();
+            let PendingStreamTerminal {
+                summary,
+                request_protocol_is_grpc,
+            } = *pending;
+            Some(
+                crate::proxy::deferred_log::DeferredTransactionLogger::new_with_start_time(
+                    summary,
+                    Arc::clone(&plugins),
+                    ctx,
+                    start_time,
+                    request_protocol_is_grpc,
+                )
+                .with_passthrough_request_bytes_latch(passthrough_request_bytes_latch.clone()),
+            )
+        }
+        None => deferred_logger,
+    };
+
     // Attach deferred logger to the body so `log_with_mirror` fires when the
     // body reaches a terminal state (completion, streaming error, or client
     // disconnect via the Drop safety net) rather than at header-flush time.
@@ -40259,6 +40459,23 @@ async fn handle_proxy_request_inner(
             )))
         }
     }
+}
+
+/// A streaming terminal's transaction summary, captured at header commit and
+/// held until the handler is done reading the request context.
+///
+/// [`crate::proxy::deferred_log::DeferredTransactionLogger`] owns a
+/// `RequestContext` from the moment it is constructed. Constructing it at
+/// header commit therefore cost a full `RequestContext` clone per streamed
+/// request, purely so the handler could keep reading `grpc_deadline_at`, the
+/// frontend listen port, the H3 method, and the gRPC message-counter handle
+/// from the original. Holding the summary in this two-field box instead lets
+/// the context be moved into the logger after the last of those reads
+/// (issue #5537).
+struct PendingStreamTerminal {
+    summary: TransactionSummary,
+    /// See [`crate::proxy::deferred_log::request_protocol_is_grpc`].
+    request_protocol_is_grpc: bool,
 }
 
 /// Build the backend URL based on proxy config and path forwarding logic.
@@ -58556,17 +58773,32 @@ mod tests {
         hook_ctx.set_waf_metadata("waf.rule_hits", "FE-XSS-001");
         hook_ctx.set_waf_metadata("waf.action", "monitored");
 
+        // `ai_semantic_cache` is the other half of the adopt. It derives its
+        // scope key and query embedding in the final-request-body hook, on the
+        // hook context, and its store hook runs later against the LIVE context —
+        // so a scope key or embedding that does not survive the adopt makes
+        // every semantic miss store as exact-only.
+        const SEMANTIC_INSTANCE: u64 = 7;
+        let staged_embedding: Vec<f32> = vec![0.25, -0.5, 0.75];
+        hook_ctx
+            .plugin_state_mut()
+            .ai_semantic_cache_scope_keys
+            .insert(SEMANTIC_INSTANCE, "tenant-a|chat".to_string());
+        hook_ctx
+            .plugin_state_mut()
+            .ai_semantic_cache_embeddings
+            .insert(SEMANTIC_INSTANCE, staged_embedding.clone());
+
         // Mirror the handler's writeback: take the hook context's metadata + WAF
         // state, carrying the omitted request_body across the swap.
         ctx.adopt_final_request_body_hook_terminals(&hook_ctx);
+        ctx.adopt_final_request_body_hook_plugin_state(&mut hook_ctx);
         let request_body = ctx.metadata.remove("request_body");
         ctx.metadata = hook_ctx.metadata;
         if let Some(body) = request_body {
             ctx.metadata.insert("request_body".to_string(), body);
         }
         ctx.waf_metadata_initialized = hook_ctx.waf_metadata_initialized;
-        ctx.waf_owned_metadata = hook_ctx.waf_owned_metadata;
-        ctx.waf_instance_scores = hook_ctx.waf_instance_scores;
 
         // The hook's metadata write propagated back to the live context.
         assert_eq!(
@@ -58587,6 +58819,54 @@ mod tests {
         assert_eq!(
             metadata.get("waf.action").map(String::as_str),
             Some("monitored")
+        );
+        // The semantic-cache staging reached the live context too.
+        assert_eq!(
+            ctx.plugin_state()
+                .and_then(|state| state.ai_semantic_cache_scope_keys.get(&SEMANTIC_INSTANCE))
+                .map(String::as_str),
+            Some("tenant-a|chat"),
+            "the hook context's scope key must reach the live store hook"
+        );
+        assert_eq!(
+            ctx.plugin_state()
+                .and_then(|state| state.ai_semantic_cache_embeddings.get(&SEMANTIC_INSTANCE)),
+            Some(&staged_embedding),
+            "the hook context's query embedding must reach the live store hook"
+        );
+
+        // A donor that materialized no plugin state means all four adopted
+        // families are empty, so the live context's copies are cleared to match
+        // — exactly what the unconditional field moves this replaced produced.
+        let mut empty_donor =
+            RequestContext::new("203.0.113.10".into(), "POST".into(), "/submit".into());
+        assert!(
+            empty_donor.plugin_state().is_none(),
+            "fixture precondition: the donor stages nothing"
+        );
+        ctx.adopt_final_request_body_hook_plugin_state(&mut empty_donor);
+        let state = ctx
+            .plugin_state()
+            .expect("the live context already materialized its state");
+        assert!(state.ai_semantic_cache_scope_keys.is_empty());
+        assert!(state.ai_semantic_cache_embeddings.is_empty());
+        assert!(state.waf_instance_scores.is_empty());
+        assert!(state.waf_owned_metadata.is_empty());
+        // Observable consequence of the WAF clear: nothing owns `waf.*` any
+        // more, so the fail-closed strip removes it from log metadata.
+        let metadata = clone_log_metadata(&ctx);
+        assert!(!metadata.contains_key("waf.rule_hits"));
+        assert!(!metadata.contains_key("waf.action"));
+
+        // Both sides absent: the adopt has nothing to carry and nothing to
+        // clear, so it must not allocate live state to hold four empty maps.
+        let mut plugin_free = RequestContext::new("203.0.113.10".into(), "GET".into(), "/".into());
+        let mut plugin_free_donor =
+            RequestContext::new("203.0.113.10".into(), "GET".into(), "/".into());
+        plugin_free.adopt_final_request_body_hook_plugin_state(&mut plugin_free_donor);
+        assert!(
+            plugin_free.plugin_state().is_none(),
+            "an adopt with nothing to move must not materialize per-plugin state"
         );
     }
 

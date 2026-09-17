@@ -81,6 +81,15 @@ use crate::util::unknown_keys::reject_unknown_keys;
 
 pub(crate) const IGNORED_UDP_SOURCE_SCOPE_METADATA: &str = "mesh_authz.ignored_udp_source_scope";
 
+/// Request-metadata marker the HBONE admission fence sets when it re-runs
+/// `authorize` for a LIVE tunnel against a later policy generation (issue
+/// #5042 step 1). The DENY / ALLOW tiers are re-applied in full; a matched
+/// `action: CUSTOM` delegation is NOT re-consulted — the provider's
+/// admission-time verdict stands for the tunnel's life, exactly as it did
+/// before the fence existed — so one publication cannot fan out into one
+/// external authorization call per open tunnel.
+pub const MESH_AUTHZ_REEVALUATION_METADATA_KEY: &str = "mesh_authz.reevaluation";
+
 pub struct MeshAuthz {
     slice: MeshSlice,
     /// Istio `action: CUSTOM` external-authorization executor (issue #3235).
@@ -2479,6 +2488,12 @@ impl MeshAuthz {
             destination: self.slice.workload_spiffe_id.clone(),
             reason: rule,
             at: Utc::now(),
+            // An HBONE admission-fence sweep re-judging a live tunnel is not a
+            // request the peer made; the drilldown must be able to separate the
+            // two instead of showing byte-identical rows. Read from the same
+            // marker the CUSTOM-delegation skip reads, so the two can never
+            // disagree about whether this call is a re-evaluation.
+            reevaluation: metadata.contains_key(MESH_AUTHZ_REEVALUATION_METADATA_KEY),
         });
     }
 }
@@ -2752,6 +2767,15 @@ impl Plugin for MeshAuthz {
         ALL_PROTOCOLS
     }
 
+    /// The local ALLOW/DENY/AUDIT tiers are a pure evaluation of the request
+    /// context against the published slice, so the HBONE admission fence may
+    /// re-run them against a live tunnel. The one side-effecting arm —
+    /// `action: CUSTOM` external delegation — is skipped on a re-evaluation;
+    /// see [`MESH_AUTHZ_REEVALUATION_METADATA_KEY`].
+    fn reevaluates_live_admission(&self) -> bool {
+        true
+    }
+
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         // Istio parity: `AuthorizationPolicy` is an INBOUND contract, so the
         // outbound capture leg is not judged at all (issue #4158). This is the
@@ -2816,6 +2840,19 @@ impl Plugin for MeshAuthz {
         // pod evidence. `source_principal` is moved into `MeshAuthzRequest`
         // below, so we own a separate `String` here.
         let source_for_log = source_principal.as_ref().map(|id| id.as_str().to_string());
+        // An HBONE admission-fence sweep re-judging an already-admitted live
+        // tunnel (`MESH_AUTHZ_REEVALUATION_METADATA_KEY`) is not a request the
+        // peer made. The verdict is still enforced — that is the fence's whole
+        // job — but the request-shaped observability surfaces below must not
+        // record it as one: the NodeWaypoint destination-policy rejection
+        // counter and the mesh ext_authz provider-conflict counter are both
+        // scrape contracts describing REQUESTS, and a routine policy apply that
+        // revoked N tunnels would otherwise look like N denied requests from a
+        // principal that sent none. `record_policy_deny` still records the
+        // event, tagged `reevaluation: true`, so the drilldown keeps it.
+        let live_admission_reevaluation = ctx
+            .metadata
+            .contains_key(MESH_AUTHZ_REEVALUATION_METADATA_KEY);
         let trust_domain_mismatch = baggage_outcome == BaggageOutcome::TrustDomainMismatch;
         let untrusted_assertor = baggage_outcome == BaggageOutcome::UntrustedAssertor;
         let assertion_out_of_scope = baggage_outcome == BaggageOutcome::AssertionOutOfScope;
@@ -2846,7 +2883,9 @@ impl Plugin for MeshAuthz {
                 "true".to_string(),
             );
         }
-        if self.per_pod_policy_scoping {
+        // The asserted-identity counters are request-shaped too: a sweep that
+        // re-judges N live tunnels must not read as N identity decisions.
+        if self.per_pod_policy_scoping && !live_admission_reevaluation {
             if unauthenticated_hbone_baggage {
                 crate::modes::mesh::node_waypoint_observability::record_asserted_identity_rejected(
                     crate::modes::mesh::node_waypoint_observability::NodeWaypointAssertedIdentityRejectReason::UnauthenticatedHbone,
@@ -2911,7 +2950,10 @@ impl Plugin for MeshAuthz {
             Err(rejection) => {
                 let reject = non_canonical_authorization_path_reject(ctx, rejection);
                 self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
-                if self.per_pod_policy_scoping && !asserted_identity_rejected {
+                if self.per_pod_policy_scoping
+                    && !asserted_identity_rejected
+                    && !live_admission_reevaluation
+                {
                     crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
                         crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::AuthzDeny,
                     );
@@ -3238,10 +3280,14 @@ impl Plugin for MeshAuthz {
         // which operator's authorizer enforces. The refusal carries a stable,
         // bounded reason and is counted once.
         if evaluation.custom_provider_conflict {
-            crate::plugins::mesh::ext_authz::record(
-                crate::plugins::mesh::ext_authz::MeshExtAuthzReason::ProviderConflict,
-                false,
-            );
+            // Not on a live-tunnel re-evaluation: the mesh ext_authz counters
+            // describe checks a REQUEST provoked, and a sweep provokes none.
+            if !live_admission_reevaluation {
+                crate::plugins::mesh::ext_authz::record(
+                    crate::plugins::mesh::ext_authz::MeshExtAuthzReason::ProviderConflict,
+                    false,
+                );
+            }
             ctx.metadata.insert(
                 "mesh_authz.ext_authz_outcome".to_string(),
                 crate::plugins::mesh::ext_authz::MeshExtAuthzReason::ProviderConflict
@@ -3253,7 +3299,10 @@ impl Plugin for MeshAuthz {
                 crate::modes::mesh::policy::MESH_AUTHZ_CUSTOM_PROVIDER_CONFLICT.to_string(),
             );
             self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
-            if self.per_pod_policy_scoping && !asserted_identity_rejected {
+            if self.per_pod_policy_scoping
+                && !asserted_identity_rejected
+                && !live_admission_reevaluation
+            {
                 crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
                     crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::AuthzDeny,
                 );
@@ -3266,6 +3315,15 @@ impl Plugin for MeshAuthz {
         }
         let decision = match evaluation.custom {
             None => evaluation.decision,
+            // Live-tunnel re-evaluation keeps the provider's admission-time
+            // verdict (see `MESH_AUTHZ_REEVALUATION_METADATA_KEY`).
+            Some(_)
+                if ctx
+                    .metadata
+                    .contains_key(MESH_AUTHZ_REEVALUATION_METADATA_KEY) =>
+            {
+                evaluation.decision
+            }
             Some(delegation) => {
                 match self
                     .run_custom_delegation(ctx, &delegation, request.host.clone())
@@ -3278,7 +3336,10 @@ impl Plugin for MeshAuthz {
                             format!("custom:{}", delegation.policy),
                         );
                         self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
-                        if self.per_pod_policy_scoping && !asserted_identity_rejected {
+                        if self.per_pod_policy_scoping
+                            && !asserted_identity_rejected
+                            && !live_admission_reevaluation
+                        {
                             crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
                                 crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::AuthzDeny,
                             );
@@ -3356,7 +3417,7 @@ impl Plugin for MeshAuthz {
                     "mesh_authz.deny_policy".to_string(),
                     "assertion_out_of_scope".to_string(),
                 );
-            } else if self.per_pod_policy_scoping {
+            } else if self.per_pod_policy_scoping && !live_admission_reevaluation {
                 // Identity accept/reject already recorded above; AuthorizationPolicy
                 // denies are a distinct ADR signal.
                 crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(

@@ -221,6 +221,74 @@ struct LogState {
     /// in hyper's detached pipe. Wait for the latch before emitting so
     /// `TransactionSummary.bytes_sent` / `api_chargeback` see forwarded bytes.
     request_bytes_latch: Option<Arc<DirectH2BytesLatch>>,
+    /// Whether a terminal that carries no trailer `grpc-status` must be
+    /// recorded as gRPC UNKNOWN rather than an unqualified HTTP 200.
+    ///
+    /// Captured at header commit from exactly the inputs `fire_once` used to
+    /// read: the caller's summary protocol when it set one, otherwise the
+    /// request's. Neither can change after construction — the context is moved
+    /// or cloned in here — so deciding early is decision-identical, and it is
+    /// what lets the streaming terminal skip projecting the summary's log
+    /// metadata at header commit when the fire-time rebuild replaces it
+    /// wholesale anyway (issue #5537).
+    request_protocol_is_grpc: bool,
+}
+
+/// The gRPC terminal-status classification a deferred logger captures at
+/// header commit. `summary_metadata` is the projection the caller put on the
+/// summary, which may be empty when that caller defers it to fire time.
+pub(crate) fn request_protocol_is_grpc(
+    summary_metadata: &std::collections::HashMap<String, String>,
+    ctx: &RequestContext,
+) -> bool {
+    summary_metadata
+        .get("request_protocol")
+        .or_else(|| ctx.metadata.get("request_protocol"))
+        .is_some_and(|protocol| protocol == "grpc")
+}
+
+/// The classification the generic HTTP streaming terminal passes to
+/// [`DeferredTransactionLogger::new_with_start_time`].
+///
+/// An ABSENT `request_protocol` is **not** gRPC here. This arm carries every
+/// streamed HTTP-family response — plain HTTP, WebSocket bridges, gRPC-Web —
+/// and the summary it stages carries no header-commit metadata projection, so
+/// the request's own declared protocol is the whole input. That is exactly what
+/// `request_protocol_is_grpc` resolved to when the projection was still built
+/// at header commit: an empty summary map falls through to `ctx.metadata`, and
+/// a missing key there is `is_some_and(..) == false`.
+///
+/// It deliberately differs from [`native_grpc_request_protocol_is_grpc`]; see
+/// that function for why the two defaults are opposites.
+pub fn streaming_request_protocol_is_grpc(
+    request_metadata: &std::collections::HashMap<String, String>,
+) -> bool {
+    request_metadata
+        .get("request_protocol")
+        .is_some_and(|protocol| protocol == "grpc")
+}
+
+/// The classification the native-gRPC streaming terminal passes to
+/// [`DeferredTransactionLogger::new_with_start_time`].
+///
+/// An ABSENT `request_protocol` **is** gRPC here, which is the opposite default
+/// from [`streaming_request_protocol_is_grpc`] and is not an oversight. Only the
+/// native-gRPC branch reaches this, and the summary it used to build ran its
+/// metadata projection through
+/// `metadata.entry("request_protocol").or_insert("grpc")` — "gRPC unless the
+/// request already declared another protocol". `fire_once` then read that
+/// stamped projection back through `request_protocol_is_grpc`, so an absent
+/// key resolved to `true`. Reading `ctx.metadata` directly with
+/// `is_some_and` would classify an unlabelled native-gRPC stream as a clean
+/// HTTP 200 and drop its UNKNOWN terminal status; using this function on the
+/// generic arm would stamp `grpc_status: 2` on every streamed non-gRPC
+/// response. Keep the two apart.
+pub fn native_grpc_request_protocol_is_grpc(
+    request_metadata: &std::collections::HashMap<String, String>,
+) -> bool {
+    request_metadata
+        .get("request_protocol")
+        .is_none_or(|protocol| protocol == "grpc")
 }
 
 impl DeferredTransactionLogger {
@@ -242,6 +310,7 @@ impl DeferredTransactionLogger {
         plugins: Arc<Vec<Arc<dyn Plugin>>>,
         ctx: RequestContext,
     ) -> Arc<Self> {
+        let request_protocol_is_grpc = request_protocol_is_grpc(&summary.metadata, &ctx);
         Arc::new(Self {
             state: Mutex::new(Some(Captured::Full(Box::new(LogState {
                 summary,
@@ -249,6 +318,7 @@ impl DeferredTransactionLogger {
                 ctx,
                 start_time: None,
                 request_bytes_latch: None,
+                request_protocol_is_grpc,
             })))),
             fired: AtomicBool::new(false),
             #[cfg(test)]
@@ -312,6 +382,7 @@ impl DeferredTransactionLogger {
         plugins: Arc<Vec<Arc<dyn Plugin>>>,
         ctx: RequestContext,
         start_time: Instant,
+        request_protocol_is_grpc: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(Some(Captured::Full(Box::new(LogState {
@@ -320,6 +391,7 @@ impl DeferredTransactionLogger {
                 ctx,
                 start_time: Some(start_time),
                 request_bytes_latch: None,
+                request_protocol_is_grpc,
             })))),
             fired: AtomicBool::new(false),
             #[cfg(test)]
@@ -393,6 +465,7 @@ impl DeferredTransactionLogger {
             mut ctx,
             start_time,
             request_bytes_latch,
+            request_protocol_is_grpc,
         } = state;
         summary.body_completed = outcome.body_completed;
         summary.body_error_class = outcome.body_error_class;
@@ -413,12 +486,7 @@ impl DeferredTransactionLogger {
         if let Some(grpc_status) = outcome.grpc_status {
             ctx.metadata
                 .insert("grpc_status".to_string(), grpc_status.to_string());
-        } else if summary
-            .metadata
-            .get("request_protocol")
-            .or_else(|| ctx.metadata.get("request_protocol"))
-            .is_some_and(|protocol| protocol == "grpc")
-        {
+        } else if request_protocol_is_grpc {
             // A gRPC stream that ends without terminal status is UNKNOWN, not
             // an unqualified successful HTTP 200. Preserve a Trailers-Only
             // header status when one was captured; otherwise seed code 2.
@@ -473,6 +541,16 @@ impl DeferredTransactionLogger {
             // decision at body termination. Refresh metadata after the
             // mutable terminal hooks so every log sink sees the finalized
             // per-request values.
+            //
+            // The rfc3339 timestamp is formatted here for the same reason it is
+            // not formatted at header commit: no sink sees the summary before
+            // this point, and `ctx.timestamp_received` is fixed when the
+            // context is built, so the value is identical and the allocation
+            // stays off the request path (issue #5537). A caller that already
+            // formatted one keeps it.
+            if summary.timestamp_received.is_empty() {
+                summary.timestamp_received = ctx.timestamp_received.to_rfc3339();
+            }
             summary.metadata = crate::proxy::clone_log_metadata(&ctx);
             log_with_mirror(plugins.as_slice(), &summary, &ctx).await;
         };
@@ -514,6 +592,7 @@ impl DeferredTransactionLogger {
         ctx: RequestContext,
         start_time: Option<Instant>,
     ) -> Arc<Self> {
+        let request_protocol_is_grpc = request_protocol_is_grpc(&summary.metadata, &ctx);
         Arc::new(Self {
             state: Mutex::new(Some(Captured::Full(Box::new(LogState {
                 summary,
@@ -521,6 +600,7 @@ impl DeferredTransactionLogger {
                 ctx,
                 start_time,
                 request_bytes_latch: None,
+                request_protocol_is_grpc,
             })))),
             fired: AtomicBool::new(false),
             delivery: Some(delivery),

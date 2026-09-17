@@ -105,6 +105,24 @@ pub mod _test_support {
         crate::admin::restore_envelope_field_names_for_test()
     }
 
+    /// Whether the closed `POST /batch` envelope admits `body` (issue #5565).
+    ///
+    /// Same object-only parse the batch handler maps to `400` with
+    /// `{"error": "Invalid JSON body: …"}`.
+    pub fn batch_envelope_admits_for_test(body: &[u8]) -> bool {
+        crate::admin::batch_envelope_admits_for_test(body)
+    }
+
+    /// Serde-accepted member names of the `POST /batch` envelope
+    /// (issue #5565).
+    ///
+    /// Recovered from the derived `Deserialize` itself, so a new Rust member
+    /// appears here without anyone updating a manifest. The OpenAPI contract
+    /// test compares this inventory with `BatchCreateRequest.properties`.
+    pub fn batch_envelope_field_names_for_test() -> Vec<String> {
+        crate::admin::batch_envelope_field_names_for_test()
+    }
+
     /// Exercise the dispatch coordinate rebase and its cloned diagnostic context.
     pub fn rebase_backend_path_for_test(
         ctx: &mut crate::plugins::RequestContext,
@@ -5935,6 +5953,7 @@ pub mod _test_support {
         DbPoolConfig, SqlReconnectTopology, SqlReconnectTransitionHook,
         SqlReconnectTransitionTestHooks,
     };
+    pub use crate::config::db_tls_snapshot::SqlTlsSnapshot;
 
     /// Install (or clear) SQL reconnect transition test hooks on one store.
     pub fn database_store_set_reconnect_transition_hooks_for_test(
@@ -8431,6 +8450,30 @@ pub mod _test_support {
         crate::proxy::clone_log_metadata(ctx)
     }
 
+    /// Whether this request has materialized the boxed per-plugin working state
+    /// (issue #5537).
+    ///
+    /// The plugin-free hot path must answer `false` for the whole lifetime of
+    /// the context: that box is precisely what a request with no configured
+    /// plugin family exists not to allocate. Exposed for external unit tests so
+    /// the property can be asserted without widening the field.
+    pub fn request_context_has_plugin_state(ctx: &crate::plugins::RequestContext) -> bool {
+        ctx.plugin_state().is_some()
+    }
+
+    /// Stage one WAF-owned metadata field exactly as a `waf` instance would.
+    ///
+    /// The setter is `pub(crate)` so only the plugin can claim ownership of a
+    /// `waf.*` field; this wrapper lets external tests assert the staging
+    /// lifecycle (and its log projection) without widening that boundary.
+    pub fn set_waf_metadata_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        key: &str,
+        value: &str,
+    ) {
+        ctx.set_waf_metadata(key, value);
+    }
+
     pub fn ai_prompt_compressor_marker_scan_work_for_test(
         body: &[u8],
         tag: &str,
@@ -8450,14 +8493,17 @@ pub mod _test_support {
         ctx: &crate::plugins::RequestContext,
         instance_id: u64,
     ) -> Option<&Vec<f32>> {
-        ctx.ai_semantic_cache_embeddings.get(&instance_id)
+        ctx.plugin_state()?
+            .ai_semantic_cache_embeddings
+            .get(&instance_id)
     }
 
     pub fn ai_semantic_cache_scope_key(
         ctx: &crate::plugins::RequestContext,
         instance_id: u64,
     ) -> Option<&str> {
-        ctx.ai_semantic_cache_scope_keys
+        ctx.plugin_state()?
+            .ai_semantic_cache_scope_keys
             .get(&instance_id)
             .map(String::as_str)
     }
@@ -8469,10 +8515,14 @@ pub mod _test_support {
     ) {
         match embedding {
             Some(values) => {
-                ctx.ai_semantic_cache_embeddings.insert(instance_id, values);
+                ctx.plugin_state_mut()
+                    .ai_semantic_cache_embeddings
+                    .insert(instance_id, values);
             }
             None => {
-                ctx.ai_semantic_cache_embeddings.remove(&instance_id);
+                if let Some(state) = ctx.plugin_state_opt_mut() {
+                    state.ai_semantic_cache_embeddings.remove(&instance_id);
+                }
             }
         }
     }
@@ -8484,10 +8534,14 @@ pub mod _test_support {
     ) {
         match scope_key {
             Some(key) => {
-                ctx.ai_semantic_cache_scope_keys.insert(instance_id, key);
+                ctx.plugin_state_mut()
+                    .ai_semantic_cache_scope_keys
+                    .insert(instance_id, key);
             }
             None => {
-                ctx.ai_semantic_cache_scope_keys.remove(&instance_id);
+                if let Some(state) = ctx.plugin_state_opt_mut() {
+                    state.ai_semantic_cache_scope_keys.remove(&instance_id);
+                }
             }
         }
     }
@@ -10494,6 +10548,25 @@ pub mod _test_support {
                 biased;
                 () = tokio::time::sleep(observation) => true,
                 () = join.backend_write_watermark_expired() => false,
+            }
+        }
+
+        /// Race the dispatcher's response-header wait against the relay's
+        /// backend write watermark, exactly as `proxy_to_backend` does.
+        ///
+        /// The mirror of [`BufferedUploadPumpProbe::write_watermark_wins_header_wait`]
+        /// for a STREAMING client body: `true` means the watermark won, which
+        /// is what makes the request end as 504 / `ReadWriteTimeout` at
+        /// `backend_write_timeout_ms` rather than running on to
+        /// `backend_read_timeout_ms`.
+        pub async fn write_watermark_wins_header_wait(&mut self, header_wait: Duration) -> bool {
+            let Some(join) = self.join.as_mut() else {
+                return false;
+            };
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep(header_wait) => false,
+                () = join.backend_write_watermark_expired() => true,
             }
         }
 

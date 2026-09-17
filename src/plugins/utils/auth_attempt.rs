@@ -49,8 +49,11 @@ impl AuthenticationAttempt {
     /// attempt owns this state; later accepted instances cannot replace or mix
     /// claim headers, mesh claims, or identity metadata from that principal.
     pub(super) fn commit_principal_state(self, ctx: &mut RequestContext) {
-        for (key, value) in self.claim_headers {
-            ctx.pending_claim_headers.entry(key).or_insert(value);
+        if !self.claim_headers.is_empty() {
+            let pending = &mut ctx.plugin_state_mut().pending_claim_headers;
+            for (key, value) in self.claim_headers {
+                pending.entry(key).or_insert(value);
+            }
         }
         for (key, value) in self.principal_metadata {
             ctx.metadata.entry(key).or_insert(value);

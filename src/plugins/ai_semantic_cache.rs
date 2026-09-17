@@ -1309,8 +1309,10 @@ impl AiSemanticCache {
         ctx.metadata.remove(&self.meta_cache_key);
         ctx.metadata.remove(&self.meta_match);
         ctx.metadata.remove(&self.meta_similarity);
-        ctx.ai_semantic_cache_embeddings.remove(&self.instance_id);
-        ctx.ai_semantic_cache_scope_keys.remove(&self.instance_id);
+        if let Some(state) = ctx.plugin_state_opt_mut() {
+            state.ai_semantic_cache_embeddings.remove(&self.instance_id);
+            state.ai_semantic_cache_scope_keys.remove(&self.instance_id);
+        }
     }
 
     fn stage_semantic_miss(
@@ -1319,9 +1321,12 @@ impl AiSemanticCache {
         scope_key: String,
         embedding: Vec<f32>,
     ) {
-        ctx.ai_semantic_cache_embeddings
+        let state = ctx.plugin_state_mut();
+        state
+            .ai_semantic_cache_embeddings
             .insert(self.instance_id, embedding);
-        ctx.ai_semantic_cache_scope_keys
+        state
+            .ai_semantic_cache_scope_keys
             .insert(self.instance_id, scope_key);
     }
 
@@ -1329,8 +1334,11 @@ impl AiSemanticCache {
         &self,
         ctx: &mut RequestContext,
     ) -> (Option<String>, Option<EmbeddingPoint>) {
-        let scope_key = ctx.ai_semantic_cache_scope_keys.remove(&self.instance_id);
-        let embedding = ctx
+        let Some(state) = ctx.plugin_state_opt_mut() else {
+            return (None, None);
+        };
+        let scope_key = state.ai_semantic_cache_scope_keys.remove(&self.instance_id);
+        let embedding = state
             .ai_semantic_cache_embeddings
             .remove(&self.instance_id)
             .and_then(|values| EmbeddingPoint::from_raw(values).ok());
@@ -5957,16 +5965,20 @@ mod tests {
             staging_metadata_key(sibling_id, CACHE_KEY_SUFFIX),
             "sibling-key".to_string(),
         );
-        ctx.ai_semantic_cache_embeddings
+        ctx.plugin_state_mut()
+            .ai_semantic_cache_embeddings
             .insert(sibling_id, vec![0.1, 0.2, 0.3]);
-        ctx.ai_semantic_cache_scope_keys
+        ctx.plugin_state_mut()
+            .ai_semantic_cache_scope_keys
             .insert(sibling_id, "sibling-scope".to_string());
         // And a stale entry under this instance that bypass must clear.
         ctx.metadata
             .insert(plugin.meta_cache_key.clone(), "stale-key".to_string());
-        ctx.ai_semantic_cache_embeddings
+        ctx.plugin_state_mut()
+            .ai_semantic_cache_embeddings
             .insert(plugin.instance_id, vec![9.0, 9.0, 9.0]);
-        ctx.ai_semantic_cache_scope_keys
+        ctx.plugin_state_mut()
+            .ai_semantic_cache_scope_keys
             .insert(plugin.instance_id, "stale-scope".to_string());
 
         let mut headers = HashMap::new();
@@ -5982,13 +5994,19 @@ mod tests {
             "reject bypass must remove this instance's staged cache key"
         );
         assert!(
-            !ctx.ai_semantic_cache_embeddings
-                .contains_key(&plugin.instance_id),
+            !ctx.plugin_state().is_some_and(|state| {
+                state
+                    .ai_semantic_cache_embeddings
+                    .contains_key(&plugin.instance_id)
+            }),
             "reject bypass must clear this instance's staged embedding"
         );
         assert!(
-            !ctx.ai_semantic_cache_scope_keys
-                .contains_key(&plugin.instance_id),
+            !ctx.plugin_state().is_some_and(|state| {
+                state
+                    .ai_semantic_cache_scope_keys
+                    .contains_key(&plugin.instance_id)
+            }),
             "reject bypass must clear this instance's staged scope key"
         );
         assert_eq!(plugin.cache_status(&ctx), Some("BYPASS"));
@@ -6001,12 +6019,13 @@ mod tests {
             Some("sibling-key")
         );
         assert_eq!(
-            ctx.ai_semantic_cache_embeddings.get(&sibling_id),
+            ctx.plugin_state()
+                .and_then(|state| state.ai_semantic_cache_embeddings.get(&sibling_id)),
             Some(&vec![0.1, 0.2, 0.3])
         );
         assert_eq!(
-            ctx.ai_semantic_cache_scope_keys
-                .get(&sibling_id)
+            ctx.plugin_state()
+                .and_then(|state| state.ai_semantic_cache_scope_keys.get(&sibling_id))
                 .map(String::as_str),
             Some("sibling-scope")
         );

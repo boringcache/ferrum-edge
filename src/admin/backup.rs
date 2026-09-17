@@ -496,25 +496,53 @@ pub(crate) struct BatchCreateRequest {
     _exported_at: Option<String>,
     #[serde(default, rename = "source")]
     _source: Option<String>,
+    /// Same object-only `counts` the restore envelope and `openapi.yaml` publish.
+    /// A non-object is a `400` instead of being accepted and ignored.
     #[serde(default, rename = "counts")]
-    _counts: Option<serde_json::Value>,
-    #[serde(default, rename = "api_specs")]
-    _api_specs: Option<serde_json::Value>,
+    _counts: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Same object-only `api_specs` section restore types. Batch still ignores
+    /// the section after admission; `deserialize_optional_object` rejects a
+    /// JSON array so it cannot be read as a positional struct.
+    #[serde(
+        default,
+        rename = "api_specs",
+        deserialize_with = "crate::util::json_object::deserialize_optional_object"
+    )]
+    _api_specs: Option<ApiSpecsBackupSection>,
     #[serde(default, rename = "gateway_trust_bundles")]
-    _gateway_trust_bundles: Option<serde_json::Value>,
+    _gateway_trust_bundles: Option<Vec<GatewayTrustBundleRecord>>,
 }
 
 impl From<BatchCreateRequest> for RestorePayload {
     fn from(request: BatchCreateRequest) -> Self {
+        // Every `RestorePayload` member is listed so a new section is a
+        // compile error here rather than silently defaulting. Backup metadata
+        // and backup-only sections stay `None`: batch does not persist them.
+        let BatchCreateRequest {
+            proxies,
+            consumers,
+            plugin_configs,
+            upstreams,
+            _version: _,
+            _ferrum_version: _,
+            _exported_at: _,
+            _source: _,
+            _counts: _,
+            _api_specs: _,
+            _gateway_trust_bundles: _,
+        } = request;
         RestorePayload {
             version: String::new(),
-            proxies: request.proxies,
-            consumers: request.consumers,
-            plugin_configs: request.plugin_configs,
-            upstreams: request.upstreams,
+            proxies,
+            consumers,
+            plugin_configs,
+            upstreams,
             api_specs: None,
             gateway_trust_bundles: None,
-            ..Default::default()
+            _ferrum_version: None,
+            _exported_at: None,
+            _source: None,
+            _counts: None,
         }
     }
 }
@@ -564,7 +592,7 @@ pub(crate) fn restore_missing_resource_id_errors(payload: &RestorePayload) -> Ve
 /// accept sequences positionally. The handler therefore parses through
 /// [`crate::util::json_object::from_json_object_slice`], which forces the map
 /// branch before any deletion.
-#[derive(Default, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RestorePayload {
     #[serde(default)]

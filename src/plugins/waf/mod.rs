@@ -1015,23 +1015,27 @@ impl Waf {
     ///   `waf.instance_scores` as `id=score,...` and clears conflated `waf.score`.
     fn publish_instance_score_metadata(&self, ctx: &mut RequestContext, total: u32) {
         ctx.set_waf_metadata(self.score_metadata_key.as_ref(), total.to_string());
-        if ctx.waf_instance_scores.len() <= 1 {
+        if ctx
+            .plugin_state()
+            .is_none_or(|state| state.waf_instance_scores.len() <= 1)
+        {
             ctx.set_waf_metadata("waf.score", total.to_string());
             ctx.clear_waf_metadata("waf.instance_scores");
             return;
         }
-        let mut parts: Vec<(&str, u32)> = ctx
-            .waf_instance_scores
-            .values()
-            .map(|state| (state.identity.as_ref(), state.total()))
+        let mut parts: Vec<(std::sync::Arc<str>, u32)> = ctx
+            .plugin_state()
+            .into_iter()
+            .flat_map(|state| state.waf_instance_scores.values())
+            .map(|state| (std::sync::Arc::clone(&state.identity), state.total()))
             .collect();
-        parts.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        parts.sort_unstable_by(|left, right| left.0.as_ref().cmp(right.0.as_ref()));
         let mut aggregate = String::new();
         for (index, (identity, score)) in parts.iter().enumerate() {
             if index > 0 {
                 aggregate.push(',');
             }
-            aggregate.push_str(identity);
+            aggregate.push_str(identity.as_ref());
             aggregate.push('=');
             push_decimal_u32(&mut aggregate, *score);
         }
@@ -1743,7 +1747,8 @@ impl Plugin for Waf {
             // scanned again by the bounded fail-closed recheck. Only successful
             // decisions are safe to memoize.
             if matches!(&result, PluginResult::Continue) {
-                ctx.waf_response_header_digests
+                ctx.plugin_state_mut()
+                    .waf_response_header_digests
                     .insert(self.instance_id, digest);
             }
             if !matches!(&result, PluginResult::Continue) {
@@ -1937,8 +1942,8 @@ impl Plugin for Waf {
         }
         let digest = response_header_map_digest(response_headers);
         if ctx
-            .waf_response_header_digests
-            .get(&self.instance_id)
+            .plugin_state()
+            .and_then(|state| state.waf_response_header_digests.get(&self.instance_id))
             .is_some_and(|scanned| *scanned == digest)
         {
             return PluginResult::Continue;
@@ -1949,7 +1954,8 @@ impl Plugin for Waf {
         // Do not memoize refused maps: the final response pipeline deliberately
         // rechecks a rebuilt rejection, which can be byte-for-byte identical.
         if matches!(&result, PluginResult::Continue) {
-            ctx.waf_response_header_digests
+            ctx.plugin_state_mut()
+                .waf_response_header_digests
                 .insert(self.instance_id, digest);
         }
         result

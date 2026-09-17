@@ -785,7 +785,11 @@ async fn a_stalled_backend_read_cannot_starve_the_tcp_authorization_deadline() {
 /// The userspace fast path parks both halves on the opposite endpoint and
 /// cannot observe the client-leg wrapper. An authorization-bound session
 /// must take the direction-tracking path and pass the deadline into both
-/// TLS Deadline arms.
+/// TLS Deadline arms. The HBONE admission fence's revocation bound
+/// (`RelayRevocation`, issue #5042) is raced at the same top-level points and
+/// is equally load-bearing: tokio's `copy_bidirectional_with_sizes` never polls
+/// the revocation future, so a relay with every timeout disabled would take the
+/// fast path and ignore revocation entirely — a fail-open with no signal.
 #[test]
 fn an_authorization_bound_tcp_relay_refuses_the_unbounded_fast_path() {
     let src = include_str!("../../../src/proxy/tcp_proxy.rs");
@@ -793,8 +797,12 @@ fn an_authorization_bound_tcp_relay_refuses_the_unbounded_fast_path() {
         src.contains("&& auth_deadline.is_none()"),
         "the copy_bidirectional_with_sizes fast path must refuse an authorization bound"
     );
+    assert!(
+        src.contains("&& revocation.is_none()"),
+        "the copy_bidirectional_with_sizes fast path must refuse an admission-revocation bound"
+    );
     assert!(src.contains("copy_bidirectional_with_sizes"));
-    assert!(src.contains("drain_remaining_or_authorization_expire"));
+    assert!(src.contains("drain_remaining_or_terminate"));
     let tls = src
         .split("ClientRelayStream::Tls(tls_stream) => {")
         .nth(1)
@@ -3494,6 +3502,63 @@ async fn an_inline_pump_waiting_on_the_client_keeps_the_write_watermark_dormant(
     assert_eq!(probe.cancel_and_join().await, ProbePumpOutcome::Cancelled);
 }
 
+/// The positive counterpart of the test above, and the one the HTTP/1.1 TLS
+/// POST workload actually exercises (issue #5537, item 4): a STREAMING client
+/// body that keeps producing while the transport stops taking.
+///
+/// This is the whole reason the streaming arm keeps a relay instead of the
+/// direct hand-over buffered uploads get. The relay's one-frame lookahead is
+/// the only evidence the gateway has that the transport has stopped consuming
+/// while bytes were available: with the client body polled in place by the
+/// transport, a transport parked on socket writability simply stops polling,
+/// and "no poll" is indistinguishable from "the client sent nothing".
+#[tokio::test(start_paused = true)]
+async fn the_backend_write_watermark_ends_a_streaming_upload_the_transport_stopped_taking() {
+    let mut probe = UploadPumpProbe::start_watermark_only(800);
+    assert_eq!(
+        probe.pump_runs_on_its_own_task(),
+        Some(false),
+        "a watermark-only relay is driven by the dispatcher's header race"
+    );
+    // The client keeps sending, so the relay always has a frame in hand: any
+    // idleness from here on is the TRANSPORT's, not the client's.
+    assert!(probe.feed("first"));
+    assert!(probe.feed("second"));
+
+    // One transport poll arms the watermark (#4074) — the connection exists
+    // and the request head is written — and takes the frame the relay staged.
+    // Then the transport stops, as a connection task parked on socket
+    // writability against a peer that stopped reading does.
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeTransportPoll::Data(_) | ProbeTransportPoll::Pending
+    ));
+
+    // A much longer response-header wait, i.e. the operator's read watermark.
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await,
+        "backend_write_timeout_ms must end the header wait before backend_read_timeout_ms"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::WriteTimeout);
+    assert!(
+        probe.client_body_released(),
+        "the gateway must stop owning the inbound client body at the watermark"
+    );
+
+    // A frame the relay read before the deadline but never handed over is
+    // discarded rather than forwarded afterwards, and the body reports the
+    // same redacted, typed terminal the direct buffered source reports.
+    match probe.poll_transport_once() {
+        ProbeTransportPoll::Errored(message) => assert!(
+            message.contains("backend request body write timeout"),
+            "unexpected termination message: {message}"
+        ),
+        other => panic!("expected a transport error, got {other:?}"),
+    }
+}
+
 // --- Backend write watermark on a REPLAYABLE upload (#4055) ----------------
 //
 // The buffered/body-policy/retry-replay bodies dispatched by the specialized
@@ -4315,6 +4380,147 @@ fn every_streaming_h1h2_upload_installs_the_gateway_owned_pump() {
     // Unauthenticated requests with write timeout disabled keep the previous
     // zero-overhead path (no pump, no timer).
     assert!(installer.contains("write_timeout_ms == 0"));
+}
+
+/// Only a STREAMING client body may pay the bridged relay (issue #5537,
+/// item 4; see `docs/protocol_perf_regression.md` → "Request-upload hand-off
+/// on the H1 TLS POST path").
+///
+/// A fully buffered / replayable upload owns its bytes already, so #5505 hands
+/// them to the transport directly and keeps only the watcher that enforces
+/// `backend_write_timeout_ms`. That is the complete set of classifications for
+/// which a direct hand-off is safe, and this pins it from both ends: the relay
+/// channel is built in exactly one function, the direct source in exactly one
+/// other, and no buffered dispatch site reaches the relay. A new buffered
+/// dispatch that regressed onto the relay — or a streaming one that lost it,
+/// and with it the only evidence the watermark has — fails here.
+#[test]
+fn only_streaming_uploads_pay_the_bridged_relay() {
+    const CROSS_PROTOCOL_SOURCE: &str = include_str!("../../../src/http3/cross_protocol.rs");
+
+    fn function_body<'a>(source: &'a str, signature: &str, label: &str) -> &'a str {
+        source
+            .split(signature)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{label} definition"))
+            .split("\n}\n")
+            .next()
+            .unwrap_or_else(|| panic!("bounded {label} definition"))
+    }
+
+    // One relay, built in one place, and it is the only thing that allocates
+    // the bridge channel.
+    assert_eq!(
+        UPLOAD_PUMP_SOURCE
+            .matches("controls.source(UploadFrames::Bridged(receiver)")
+            .count(),
+        1,
+        "the bridged relay must be constructed in exactly one installer"
+    );
+    let bridged = function_body(
+        UPLOAD_PUMP_SOURCE,
+        "fn spawn_upload_pump_with_write_start<B>(",
+        "bridged relay installer",
+    );
+    assert!(
+        bridged.contains("tokio::sync::mpsc::channel(UPLOAD_PUMP_CHANNEL_CAPACITY)")
+            && bridged.contains("run_upload_pump(")
+            && bridged.contains("controls.source(UploadFrames::Bridged(receiver)"),
+        "the streaming installer must keep the bounded bridge and the relay future"
+    );
+
+    // One direct hand-off, built in one place, and it allocates no channel and
+    // relays nothing: the transport takes refcounted slices of the collected
+    // buffer itself, and the watcher only judges.
+    assert_eq!(
+        UPLOAD_PUMP_SOURCE
+            .matches("controls.source(UploadFrames::Direct { frames, progress }")
+            .count(),
+        1,
+        "the direct buffered source must be constructed in exactly one installer"
+    );
+    let direct = function_body(
+        UPLOAD_PUMP_SOURCE,
+        "fn spawn_direct_upload_watch(",
+        "direct buffered installer",
+    );
+    assert!(
+        direct.contains("run_direct_upload_watch("),
+        "the buffered installer must keep the watcher that enforces the watermark"
+    );
+    assert!(
+        direct.contains("DirectUploadProgress::new"),
+        "the watcher must judge the watermark from the transport's recorded progress"
+    );
+    assert!(
+        !direct.contains("mpsc::channel"),
+        "a buffered upload owns its bytes; it must never allocate a relay bridge"
+    );
+
+    // Every buffered / replayable entry point reaches the direct installer and
+    // none of them reaches the relay.
+    for entry in [
+        "pub(crate) fn spawn_buffered_upload_pump(",
+        "pub(crate) fn spawn_replayable_upload_pump(",
+        "pub(crate) fn spawn_replayable_upload_pump_with_deferred_write(",
+    ] {
+        let body = function_body(UPLOAD_PUMP_SOURCE, entry, entry);
+        assert!(
+            body.contains("spawn_direct_upload_watch("),
+            "{entry} must hand its owned bytes over directly"
+        );
+        assert!(
+            !body.contains("spawn_upload_pump("),
+            "{entry} must not relay bytes it already owns"
+        );
+        // The operator opt-out and the nothing-to-write case stay
+        // allocation-, task-, and timer-free.
+        assert!(
+            body.contains("write_timeout_ms == 0"),
+            "{entry} must keep the zero-overhead path when the watermark is disabled"
+        );
+    }
+
+    // The streaming client-body installer is the ONE production caller of the
+    // relay, on both of its arming variants.
+    let streaming_installer = PROXY_BODY_SOURCE
+        .split("fn install_pump_with_write_start(")
+        .nth(1)
+        .expect("streaming upload-source installer")
+        .split("// -- SizeLimitedIncoming")
+        .next()
+        .expect("bounded streaming upload-source installer");
+    assert!(
+        streaming_installer.contains("spawn_upload_pump_with_deferred_write(")
+            && streaming_installer.contains("spawn_upload_pump(incoming, plan, write_timeout_ms)"),
+        "the streaming client body must keep the gateway-owned relay"
+    );
+
+    // No dispatch site outside that installer relays. Every buffered site in
+    // these files goes through the direct installers above.
+    for (label, source) in [
+        ("proxy/mod.rs", PROXY_SOURCE),
+        ("proxy/grpc_proxy.rs", GRPC_PROXY_SOURCE),
+        ("http3/cross_protocol.rs", CROSS_PROTOCOL_SOURCE),
+    ] {
+        assert!(
+            !source.contains("spawn_upload_pump(")
+                && !source.contains("spawn_upload_pump_with_deferred_write("),
+            "{label} must reach the relay only through UploadSource::install_pump*"
+        );
+    }
+    assert!(
+        PROXY_SOURCE.contains("spawn_buffered_upload_pump(body_bytes, write_timeout_ms)"),
+        "the buffered reqwest dispatch lost its direct hand-off"
+    );
+    assert!(
+        CROSS_PROTOCOL_SOURCE.contains("install_buffered_upload_write_watermark("),
+        "the H3 cross-protocol buffered dispatch lost its direct hand-off"
+    );
+    assert!(
+        GRPC_PROXY_SOURCE.contains("spawn_replayable_upload_pump_with_deferred_write("),
+        "the buffered native-gRPC dispatch lost its direct hand-off"
+    );
 }
 
 #[test]
