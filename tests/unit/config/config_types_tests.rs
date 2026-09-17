@@ -1052,7 +1052,7 @@ fn mtls_auth_compatibility_escapes_document_ids() {
         error.contains(&format!("PluginConfig {plugin_id:?}")),
         "{error}"
     );
-    let rendered = ferrum_edge::startup::render_startup_error(&anyhow::anyhow!(error.clone()));
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error.clone()), &[]);
     assert!(rendered.contains("`mtls_auth`"), "{rendered}");
     assert!(rendered.contains("`frontend_tls=true`"), "{rendered}");
     assert!(rendered.contains("`passthrough=false`"), "{rendered}");

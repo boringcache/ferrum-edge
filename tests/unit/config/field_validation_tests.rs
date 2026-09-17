@@ -1709,7 +1709,7 @@ fn test_validate_all_fields_escapes_resource_ids_and_numeric_values() {
                 .find(|error| error.starts_with(&prefix) && error.contains(field))
                 .unwrap_or_else(|| panic!("missing escaped {kind} diagnostic: {errors:?}"));
             let rendered =
-                ferrum_edge::startup::render_startup_error(&anyhow::anyhow!(error.clone()));
+                ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error.clone()), &[]);
             assert!(rendered.contains(field), "{rendered}");
             assert!(!rendered.contains("unregistered"), "{rendered}");
             assert!(!rendered.contains(&u64::MAX.to_string()), "{rendered}");
@@ -1729,7 +1729,7 @@ fn test_upstream_field_values_are_debug_escaped() {
         .find(|error| error.contains("locality") && error.contains("not a valid"))
         .unwrap();
     assert!(error.contains(&format!("{locality:?}")), "{error}");
-    let rendered = ferrum_edge::startup::render_startup_error(&anyhow::anyhow!(error.clone()));
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error.clone()), &[]);
     assert!(rendered.contains("locality"), "{rendered}");
     assert!(rendered.contains("not a valid"), "{rendered}");
     assert!(!rendered.contains("unregistered"), "{rendered}");
