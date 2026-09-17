@@ -86,13 +86,30 @@ pub use router_cache::{RouteMatch, RouterCache};
 /// The leading underscore signals that this module is not part of the public API.
 #[doc(hidden)]
 pub mod _test_support {
+    /// Build the inner HTTP/1.1 request body the Ambient HBONE dispatch
+    /// constructs, so an external test can drive a real pooled inner exchange
+    /// end to end (issue #5042 step 2).
+    ///
+    /// This is the `Replayable` arm of
+    /// [`crate::proxy::hbone_inner_pool::HboneInnerH1RequestBody`], built with
+    /// no backend write watermark — `write_timeout_ms = 0` is the documented
+    /// allocation-, task-, and timer-free direct path — so the body a test
+    /// sends is byte-identical in shape to a buffered dispatch's, with no pump
+    /// for the test to own.
+    pub fn hbone_inner_h1_request_body_for_test(
+        data: bytes::Bytes,
+    ) -> crate::proxy::hbone_inner_pool::HboneInnerH1RequestBody {
+        let (body, _no_pump) =
+            crate::proxy::body::ReplayableRequestBody::with_gateway_upload_pump(data, None, 0);
+        http_body_util::Either::Right(body)
+    }
+
     /// Structural admission of a `POST /restore` envelope (issue #5538).
     ///
-    /// `true` when the body is a JSON object whose keys are all recognized
-    /// restore/backup members; `false` for a JSON array, a positional
-    /// sequence, a scalar, or an unknown/misspelled key.
-    pub fn restore_envelope_admits_for_test(body: &[u8]) -> bool {
-        crate::admin::restore_envelope_admits_for_test(body)
+    /// Preserve the parser error so tests can distinguish object admission
+    /// from a later required-field or value-shape rejection.
+    pub fn restore_envelope_admission_for_test(body: &[u8]) -> Result<(), serde_json::Error> {
+        crate::admin::restore_envelope_admission_for_test(body)
     }
 
     /// Serde-accepted member names of the `POST /restore` envelope
@@ -103,6 +120,24 @@ pub mod _test_support {
     /// test compares this inventory with `RestoreRequest.properties`.
     pub fn restore_envelope_field_names_for_test() -> Vec<String> {
         crate::admin::restore_envelope_field_names_for_test()
+    }
+
+    /// Whether the closed `POST /batch` envelope admits `body` (issue #5565).
+    ///
+    /// Same object-only parse the batch handler maps to `400` with
+    /// `{"error": "Invalid JSON body: …"}`.
+    pub fn batch_envelope_admits_for_test(body: &[u8]) -> bool {
+        crate::admin::batch_envelope_admits_for_test(body)
+    }
+
+    /// Serde-accepted member names of the `POST /batch` envelope
+    /// (issue #5565).
+    ///
+    /// Recovered from the derived `Deserialize` itself, so a new Rust member
+    /// appears here without anyone updating a manifest. The OpenAPI contract
+    /// test compares this inventory with `BatchCreateRequest.properties`.
+    pub fn batch_envelope_field_names_for_test() -> Vec<String> {
+        crate::admin::batch_envelope_field_names_for_test()
     }
 
     /// Exercise the dispatch coordinate rebase and its cloned diagnostic context.
@@ -10530,6 +10565,25 @@ pub mod _test_support {
                 biased;
                 () = tokio::time::sleep(observation) => true,
                 () = join.backend_write_watermark_expired() => false,
+            }
+        }
+
+        /// Race the dispatcher's response-header wait against the relay's
+        /// backend write watermark, exactly as `proxy_to_backend` does.
+        ///
+        /// The mirror of [`BufferedUploadPumpProbe::write_watermark_wins_header_wait`]
+        /// for a STREAMING client body: `true` means the watermark won, which
+        /// is what makes the request end as 504 / `ReadWriteTimeout` at
+        /// `backend_write_timeout_ms` rather than running on to
+        /// `backend_read_timeout_ms`.
+        pub async fn write_watermark_wins_header_wait(&mut self, header_wait: Duration) -> bool {
+            let Some(join) = self.join.as_mut() else {
+                return false;
+            };
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep(header_wait) => false,
+                () = join.backend_write_watermark_expired() => true,
             }
         }
 

@@ -3045,12 +3045,27 @@ fn effective_node_waypoint_scoped_authz_policy_labels(config: &GatewayConfig) ->
 
 fn mesh_authz_config_policies(config: &serde_json::Value) -> Vec<MeshPolicy> {
     if let Some(value) = config.get("mesh_slice") {
-        return serde_json::from_value::<MeshSlice>(value.clone())
-            .map(|slice| slice.mesh_policies)
-            .unwrap_or_default();
+        return serde_json::from_value::<crate::util::json_object::JsonObject<MeshSlice>>(
+            value.clone(),
+        )
+        .map(|object| object.0.mesh_policies)
+        .unwrap_or_else(|_| {
+            warn!(
+                field = "mesh_slice",
+                "Cannot derive NodeWaypoint scoped policy labels from invalid mesh_authz input"
+            );
+            Vec::new()
+        });
     }
     if let Some(value) = config.get("mesh_policies") {
-        return serde_json::from_value::<Vec<MeshPolicy>>(value.clone()).unwrap_or_default();
+        let policies = crate::util::json_object::deserialize_object_vec(value.clone());
+        return policies.unwrap_or_else(|_| {
+            warn!(
+                field = "mesh_policies",
+                "Cannot derive NodeWaypoint scoped policy labels from invalid mesh_authz input"
+            );
+            Vec::new()
+        });
     }
     Vec::new()
 }
@@ -3977,11 +3992,12 @@ fn decode_virtual_service_l4_proxies(slice: &MeshSlice) -> Result<Vec<Proxy>, an
         .iter()
         .enumerate()
         .map(|(index, value)| {
-            let proxy: Proxy = serde_json::from_value(value.clone()).map_err(|error| {
-                anyhow::anyhow!(
-                    "Mesh slice VirtualService L4 proxy {index} is malformed: {error}"
-                )
-            })?;
+            let proxy: Proxy = crate::util::json_object::deserialize_object(value.clone())
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "Mesh slice VirtualService L4 proxy {index} is malformed: {error}"
+                    )
+                })?;
             if proxy.namespace != slice.namespace
                 || !proxy
                     .id
@@ -4020,12 +4036,13 @@ fn decode_virtual_service_l4_upstreams(
         .iter()
         .enumerate()
         .map(|(index, value)| {
-            let upstream: crate::config::types::Upstream = serde_json::from_value(value.clone())
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "Mesh slice VirtualService L4 upstream {index} is malformed: {error}"
-                    )
-                })?;
+            let upstream: crate::config::types::Upstream =
+                crate::util::json_object::deserialize_object(value.clone())
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "Mesh slice VirtualService L4 upstream {index} is malformed: {error}"
+                        )
+                    })?;
             if upstream.namespace != slice.namespace
                 || !upstream.id.starts_with("istio-vs-l4-upstream-")
                 || !referenced.contains(upstream.id.as_str())
@@ -15392,6 +15409,15 @@ async fn arm_mesh_runtime_startup(
         federation_activation,
         mesh_ca_svid_slot.as_ref(),
     );
+    // The inbound SPIFFE verifier's slot IS the HBONE admission fence's trust
+    // input (issue #5568): the fence revokes a live tunnel whose peer chain
+    // would no longer complete a handshake here, so it must judge against the
+    // anchors this verifier reads, not against the request epoch's gateway
+    // trust — those two are built by different code from different material.
+    // Installed before the first `publish_staged_spiffe_bundle` below.
+    if let Some(slot) = mesh_inbound_spiffe_slot.as_ref() {
+        proxy_state.install_mesh_inbound_admission_trust(slot);
+    }
     if let Some(slice) = initial_applied_mesh_slice.as_deref() {
         let gateway_trust = stage_gateway_active_trust_bundles(
             &proxy_state,
@@ -15432,6 +15458,7 @@ async fn arm_mesh_runtime_startup(
         env_config,
         &tls_policy,
         &crls,
+        &proxy_state.mesh_inbound_admission,
         inbound_mtls_mode,
         runtime.topology,
         mesh_frontend_identity.as_deref(),
@@ -15443,6 +15470,7 @@ async fn arm_mesh_runtime_startup(
             env_config,
             &tls_policy,
             &crls,
+            &proxy_state.mesh_inbound_admission,
             &inbound_mtls_modes_by_port,
             runtime.topology,
             mesh_frontend_identity.as_deref(),
@@ -16620,7 +16648,11 @@ async fn start_mesh_ca_backend_svid_source(
     }
 
     let workload_spiffe_id = configured_mesh_workload_spiffe_id(runtime)?;
-    let inbound_slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
+    let inbound_slot: tls::SharedBundleSlot = tls::shared_bundle_slot(None);
+    // Bind the slot to the HBONE admission fence BEFORE the first SVID is
+    // fetched (issue #5568): the blocking initial fetch publishes into it, and
+    // the fence has to be able to identify that publication's trust revision.
+    proxy_state.install_mesh_inbound_admission_trust(&inbound_slot);
     // The Workload API's rotation signal IS the existing backend SVID rotation
     // channel: one revision counter for the whole runtime authority path, so an
     // X.509 rotation and a JWT key rotation both wake the open streams and no
@@ -17208,6 +17240,13 @@ fn empty_mesh_inbound_trust_overlay_slot() -> SharedMeshInboundTrustOverlaySlot 
 /// snapshot. Without this, a rotation that completes between a slice apply's
 /// staging and publish could be clobbered by the older staged SVID, leaving the
 /// inbound verifier pinned to stale (possibly near-expiry) cert/key + roots.
+///
+/// The store goes through `ProxyState::publish_mesh_inbound_trust_bundle`, the
+/// ONE writer of this slot (issue #5568), which advances the slot's trust
+/// revision when the X.509 material actually changed and then requests an HBONE
+/// admission-fence sweep — so a SPIRE CA rotation that this path merges
+/// additively into the inbound roots is the same material the fence re-judges
+/// live tunnels against.
 fn publish_runtime_svid_to_inbound_slot(
     proxy_state: &ProxyState,
     inbound_slot: &tls::SharedBundleSlot,
@@ -17226,7 +17265,7 @@ fn publish_runtime_svid_to_inbound_slot(
         Some(overlay) => merge_trust_overlay_into_svid_bundle(&mut bundle, overlay),
         None => retain_svid_local_trust_only(&mut bundle),
     }
-    inbound_slot.store(Arc::new(Some(bundle)));
+    proxy_state.publish_mesh_inbound_trust_bundle(inbound_slot, Arc::new(Some(bundle)));
 }
 
 fn start_mesh_inbound_svid_rotation_republisher(
@@ -17411,7 +17450,7 @@ fn build_mesh_inbound_spiffe_slot_with_federation(
         return None;
     }
 
-    Some(Arc::new(arc_swap::ArcSwap::new(Arc::new(Some(bundle)))))
+    Some(tls::shared_bundle_slot(Some(bundle)))
 }
 
 /// Overlay the effective federated (and any extra local) trust bundles onto the
@@ -17641,29 +17680,32 @@ fn stage_gateway_runtime_spiffe_bundle_with_federation(
 /// STRICT requires + validates a peer cert. Returns `None` when no slot is
 /// available or the mode is DISABLE.
 ///
-/// `crls` is threaded into the verifier so inbound mesh peers get end-entity
-/// revocation checking, matching the operator-CA mTLS path. An empty CRL list
+/// `admission` is the LIVE shared inbound admission artifact, not a snapshot:
+/// the verifier reads the enforced CRL records on every handshake so an
+/// operator's rotation reaches the next peer without rebinding the listener,
+/// and once the HBONE admission fence has compiled a trust-and-CRL set into
+/// force the verifier verifies against THAT set — the same one the fence
+/// sweeps already-admitted peers with (issue #5574). An empty enforced set
 /// disables revocation checking (the pre-CRL behavior).
 fn mesh_inbound_spiffe_verifier(
     slot: Option<&tls::SharedBundleSlot>,
     mtls_mode: config::MtlsMode,
-    crls: tls::CrlList,
+    admission: crate::tls::SharedInboundAdmissionArtifact,
 ) -> Option<Arc<dyn rustls::server::danger::ClientCertVerifier>> {
     let slot = slot?;
-    match mtls_mode {
-        config::MtlsMode::Strict => Some(tls::build_spiffe_client_cert_verifier(
-            slot.clone(),
-            true,
-            crls,
-        )),
-        config::MtlsMode::Permissive => Some(tls::build_spiffe_client_cert_verifier(
-            slot.clone(),
-            false,
-            crls,
-        )),
+    let peer_required = match mtls_mode {
+        config::MtlsMode::Strict => true,
+        config::MtlsMode::Permissive => false,
         // DISABLE has no TLS; client-side DR modes never reach here.
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some(
+        tls::build_spiffe_client_cert_verifier_for_inbound_admission(
+            slot.clone(),
+            peer_required,
+            admission,
+        ),
+    )
 }
 
 fn mesh_inbound_tls_reload_snapshot(
@@ -17923,6 +17965,7 @@ fn load_mesh_frontend_tls(
     env_config: &EnvConfig,
     tls_policy: &TlsPolicy,
     crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
+    mesh_inbound_admission: &crate::tls::SharedInboundAdmissionArtifact,
     mtls_mode: config::MtlsMode,
     topology: MeshTopology,
     server_identity: Option<&tls::MeshServerIdentity>,
@@ -17952,8 +17995,8 @@ fn load_mesh_frontend_tls(
     // gateway CRLs are threaded in so inbound mesh peers get the same
     // end-entity revocation enforcement the operator-CA path already applies
     // (empty CRLs => no revocation checking, unchanged behavior).
-    let spiffe_verifier =
-        mesh_inbound_spiffe_verifier(spiffe_bundle_slot, mtls_mode, Arc::new(crls.to_vec()));
+    let admission = Arc::clone(mesh_inbound_admission);
+    let spiffe_verifier = mesh_inbound_spiffe_verifier(spiffe_bundle_slot, mtls_mode, admission);
 
     let client_ca_bundle_path = client_ca_bundle
         .map(|bundle| bundle.path.as_str())
@@ -18073,6 +18116,7 @@ fn load_mesh_frontend_tls_by_port(
     env_config: &EnvConfig,
     tls_policy: &TlsPolicy,
     crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
+    mesh_inbound_admission: &crate::tls::SharedInboundAdmissionArtifact,
     modes: &std::collections::BTreeMap<u16, config::MtlsMode>,
     topology: MeshTopology,
     server_identity: Option<&tls::MeshServerIdentity>,
@@ -18096,6 +18140,7 @@ fn load_mesh_frontend_tls_by_port(
                 env_config,
                 tls_policy,
                 crls,
+                mesh_inbound_admission,
                 mode,
                 topology,
                 server_identity,
@@ -18510,6 +18555,7 @@ fn plan_mesh_inbound_tls_reload_with_federation(
         &proxy_state.env_config,
         tls_policy,
         &proxy_state.crls,
+        &proxy_state.mesh_inbound_admission,
         mtls_mode,
         runtime.topology,
         server_identity,
@@ -18522,6 +18568,7 @@ fn plan_mesh_inbound_tls_reload_with_federation(
                     &proxy_state.env_config,
                     tls_policy,
                     &proxy_state.crls,
+                    &proxy_state.mesh_inbound_admission,
                     &next_snapshot.port_modes,
                     runtime.topology,
                     server_identity,
@@ -19170,10 +19217,16 @@ fn start_remote_cluster_discovery_reconcile_task(
 /// trusts (or stops trusting) peer domains for a slice the runtime rejected.
 /// The verifier holds an `Arc` to this slot and observes the new bundle on its
 /// next handshake.
+///
+/// Both arms publish through `ProxyState::publish_mesh_inbound_trust_bundle`
+/// (issue #5568), so every accepted change to inbound trust re-judges live
+/// HBONE tunnels against it. A republish that carries the same X.509 material
+/// costs one coalesced sweep and no certificate path building, because the
+/// slot's trust revision does not move.
 fn publish_staged_spiffe_bundle(proxy_state: &ProxyState, staged: Option<StagedSpiffeBundle>) {
     match staged {
         Some(StagedSpiffeBundle::DirectSlot { slot, bundle }) => {
-            slot.store(bundle);
+            proxy_state.publish_mesh_inbound_trust_bundle(&slot, bundle);
         }
         Some(StagedSpiffeBundle::RuntimeSlot {
             slot,
@@ -21259,6 +21312,15 @@ mod tests {
             .push(rcgen::DnType::CommonName, common_name);
         let cert = params.self_signed(&key).expect("test CA self-signs");
         base64::engine::general_purpose::STANDARD.encode(cert.der())
+    }
+
+    /// An inbound admission artifact carrying no records and nothing in force,
+    /// i.e. revocation checking off and the verifier on its own compile — the
+    /// pre-CRL posture every TLS-shape test here asserts against (issue #5574).
+    /// The rotation behavior itself is pinned where the verifier reads the
+    /// artifact, in the SPIFFE and admission-fence suites.
+    fn no_enforced_crls() -> crate::tls::SharedInboundAdmissionArtifact {
+        crate::tls::inbound_admission_artifact(Arc::new(Vec::new()))
     }
 
     /// The SVID slot `load_mesh_frontend_server_identity` resolves the
@@ -34910,44 +34972,30 @@ mod tests {
 
     #[test]
     fn mesh_inbound_spiffe_verifier_respects_mode_and_slot() {
+        let crls = no_enforced_crls();
         // No slot → no verifier regardless of mode.
-        assert!(
-            mesh_inbound_spiffe_verifier(None, config::MtlsMode::Strict, Arc::new(Vec::new()))
-                .is_none()
-        );
+        let no_slot = mesh_inbound_spiffe_verifier(None, config::MtlsMode::Strict, crls.clone());
+        assert!(no_slot.is_none());
 
         // A present (even empty) slot yields a verifier for STRICT/PERMISSIVE
         // with the correct client-auth-mandatory posture, and none for DISABLE.
         let slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
-        let strict = mesh_inbound_spiffe_verifier(
-            Some(&slot),
-            config::MtlsMode::Strict,
-            Arc::new(Vec::new()),
-        )
-        .expect("STRICT yields a verifier");
+        let strict_mode = config::MtlsMode::Strict;
+        let strict = mesh_inbound_spiffe_verifier(Some(&slot), strict_mode, crls.clone())
+            .expect("STRICT yields a verifier");
         assert!(
             rustls::server::danger::ClientCertVerifier::client_auth_mandatory(strict.as_ref()),
             "STRICT must mandate client auth"
         );
-        let permissive = mesh_inbound_spiffe_verifier(
-            Some(&slot),
-            config::MtlsMode::Permissive,
-            Arc::new(Vec::new()),
-        )
-        .expect("PERMISSIVE yields a verifier");
+        let permissive_mode = config::MtlsMode::Permissive;
+        let permissive = mesh_inbound_spiffe_verifier(Some(&slot), permissive_mode, crls.clone())
+            .expect("PERMISSIVE yields a verifier");
         assert!(
             !rustls::server::danger::ClientCertVerifier::client_auth_mandatory(permissive.as_ref()),
             "PERMISSIVE must not mandate client auth"
         );
-        assert!(
-            mesh_inbound_spiffe_verifier(
-                Some(&slot),
-                config::MtlsMode::Disable,
-                Arc::new(Vec::new())
-            )
-            .is_none(),
-            "DISABLE has no TLS, so no verifier"
-        );
+        let disabled = mesh_inbound_spiffe_verifier(Some(&slot), config::MtlsMode::Disable, crls);
+        assert!(disabled.is_none(), "DISABLE has no TLS, so no verifier");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -36203,6 +36251,7 @@ mod tests {
             &env,
             &tls_policy,
             &[],
+            &no_enforced_crls(),
             config::MtlsMode::Strict,
             MeshTopology::Sidecar,
             None,
@@ -36226,6 +36275,7 @@ mod tests {
             &env,
             &tls_policy,
             &[],
+            &no_enforced_crls(),
             config::MtlsMode::Permissive,
             MeshTopology::Sidecar,
             None,
@@ -36255,6 +36305,7 @@ mod tests {
             &env,
             &tls_policy,
             &[],
+            &no_enforced_crls(),
             config::MtlsMode::Permissive,
             MeshTopology::Sidecar,
             mesh_frontend_identity.as_deref(),
@@ -36434,6 +36485,7 @@ mod tests {
             &env,
             &tls_policy,
             &[],
+            &no_enforced_crls(),
             config::MtlsMode::Permissive,
             MeshTopology::Sidecar,
             Some(identity.as_ref()),
@@ -36573,6 +36625,7 @@ mod tests {
             &env,
             &tls_policy,
             &[],
+            &no_enforced_crls(),
             config::MtlsMode::Permissive,
             MeshTopology::Sidecar,
             identity.as_deref(),
@@ -36800,7 +36853,7 @@ mod tests {
         let verifier = mesh_inbound_spiffe_verifier(
             Some(&slot),
             config::MtlsMode::Permissive,
-            Arc::new(Vec::new()),
+            no_enforced_crls(),
         )
         .expect("PERMISSIVE with an SVID slot must yield a verifier");
         assert!(
@@ -36816,6 +36869,7 @@ mod tests {
             &env,
             &tls_policy,
             &[],
+            &no_enforced_crls(),
             config::MtlsMode::Permissive,
             MeshTopology::Sidecar,
             mesh_frontend_identity.as_deref(),
@@ -36865,6 +36919,7 @@ mod tests {
             &env,
             &tls_policy,
             &[],
+            &no_enforced_crls(),
             config::MtlsMode::Permissive,
             MeshTopology::Sidecar,
             mesh_frontend_identity.as_deref(),
@@ -36905,6 +36960,7 @@ mod tests {
             &env,
             &tls_policy,
             &[],
+            &no_enforced_crls(),
             config::MtlsMode::Strict,
             MeshTopology::Sidecar,
             mesh_frontend_identity.as_deref(),
@@ -36945,6 +37001,7 @@ mod tests {
             &env,
             &tls_policy,
             &[],
+            &no_enforced_crls(),
             config::MtlsMode::Strict,
             MeshTopology::Sidecar,
             mesh_frontend_identity.as_deref(),
@@ -37518,6 +37575,7 @@ mod tests {
             &env,
             &tls_policy,
             &[],
+            &no_enforced_crls(),
             config::MtlsMode::Permissive,
             MeshTopology::Sidecar,
             mesh_frontend_identity.as_deref(),

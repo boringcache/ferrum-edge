@@ -196,6 +196,82 @@ pub struct HboneTunnelRevocationKey {
     pub reason: &'static str,
 }
 
+/// Wire protocol of an inner application connection pooled inside a fenced
+/// HBONE tunnel (issue #5042 step 2). A compiled-in label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HboneInnerPoolProtocol {
+    /// The plain-HTTP dispatch's inner HTTP/1.1 sender.
+    Http1,
+    /// The native-gRPC dispatch's shared nested HTTP/2 sender.
+    H2,
+}
+
+impl HboneInnerPoolProtocol {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http1 => "http1",
+            Self::H2 => "h2",
+        }
+    }
+}
+
+/// What happened to an inner application connection (issue #5042 step 2). A
+/// compiled-in label; fixed cardinality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HboneInnerPoolEvent {
+    /// A dispatch reused a pooled inner connection: no CONNECT, no inner
+    /// handshake, and no `accept(2)` at the destination application.
+    Hit,
+    /// Nothing reusable existed, so the dispatch opened a fresh CONNECT and a
+    /// fresh inner connection — the pre-#5042 per-request cost.
+    Miss,
+    /// A pooled connection was removed because it was closed, idle-expired, or
+    /// its source credential deadline elapsed, or because a source trust drain
+    /// retired it.
+    Eviction,
+    /// A connection finished its exchange healthy but was NOT pooled: the peer
+    /// does not advertise the admission fence, keep-alive is off, the source
+    /// credential deadline had elapsed, or a bound was reached.
+    Discard,
+    /// A check-in or publication a RETIREMENT refused: a trust drain, an SVID
+    /// rotation, or a publication that withdrew the route ran while the lease
+    /// was outstanding, so the connection was dropped rather than filed back
+    /// under its old key.
+    ///
+    /// Deliberately its own label value rather than part of [`Self::Discard`]
+    /// (issue #5042 step 2 re-review): a discard says the destination did not
+    /// offer reuse or a bound was reached, while this is the security-relevant
+    /// event — revocation reached a live lease. An operator cannot act on the
+    /// second without being able to see it apart from the first.
+    Fenced,
+}
+
+impl HboneInnerPoolEvent {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Miss => "miss",
+            Self::Eviction => "eviction",
+            Self::Discard => "discard",
+            Self::Fenced => "fenced",
+        }
+    }
+}
+
+/// Composite key for inner-application-connection pool events inside fenced
+/// HBONE tunnels (issue #5042 step 2).
+///
+/// Deliberately NOT keyed by proxy or namespace: the pool is process-wide and
+/// bounded globally, so the useful operator question is "is reuse working on
+/// this gateway", not "on this route". Both labels are compiled-in constants,
+/// so the family is ten series at most — two inner wire protocols times the
+/// five [`HboneInnerPoolEvent`] values.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HboneInnerPoolEventKey {
+    pub protocol: &'static str,
+    pub event: &'static str,
+}
+
 /// Composite key for raw-TCP mesh egress relay connections, labelled by the
 /// transport that carried them (`hbone` for Ambient, `mtls` for Sidecar) and
 /// the relay outcome. Bounded cardinality: both labels are compiled-in
@@ -769,6 +845,17 @@ pub struct MetricsRegistry {
     pub mesh_grpc_response_messages_counter: DashMap<MeshRequestKey, TimestampedCounter>,
     /// Rate limit exceeded counter
     pub rate_limit_exceeded: AtomicU64,
+    /// `rate_limiting` decisions served from the per-process fallback budget
+    /// while centralized (Redis) enforcement was unavailable.
+    ///
+    /// The default `redis_failure_policy` for that plugin is `local_fallback`,
+    /// so degraded enforcement is the silent common case rather than an opt-in:
+    /// this is the alertable signal that the configured quota is currently
+    /// being enforced once per gateway process instead of once per fleet.
+    pub rate_limit_fallback_decisions: AtomicU64,
+    /// `rate_limiting` requests refused because centralized enforcement was
+    /// unavailable and `redis_failure_policy` is `fail_closed`.
+    pub rate_limit_unavailable_denials: AtomicU64,
     pub ai_rate_limit_local_accounting_tokens: AtomicU64,
     pub ai_rate_limit_unaccounted_tokens: AtomicU64,
     /// Live OAuth2 introspection cache entries, partitioned into the fixed
@@ -885,6 +972,10 @@ pub struct MetricsRegistry {
     /// (proxy_id, reason). Incremented once per revoked tunnel when a later
     /// policy generation would no longer admit its CONNECT (issue #5042).
     pub hbone_tunnel_revocation_counter: DashMap<HboneTunnelRevocationKey, TimestampedCounter>,
+    /// Inner application connections reused inside fenced HBONE tunnels, keyed
+    /// by (protocol, event) (issue #5042 step 2). A `hit` is one CONNECT and
+    /// one destination `accept(2)` the gateway did not have to pay for.
+    pub hbone_inner_pool_event_counter: DashMap<HboneInnerPoolEventKey, TimestampedCounter>,
     /// Raw-TCP mesh egress relay connections keyed by (transport, result).
     /// Incremented once per captured raw-TCP connection that established a
     /// tunnel, labelled by the transport (`hbone`/`mtls`) and relay outcome
@@ -1022,6 +1113,8 @@ impl MetricsRegistry {
             mesh_grpc_request_messages_counter: DashMap::new(),
             mesh_grpc_response_messages_counter: DashMap::new(),
             rate_limit_exceeded: AtomicU64::new(0),
+            rate_limit_fallback_decisions: AtomicU64::new(0),
+            rate_limit_unavailable_denials: AtomicU64::new(0),
             ai_rate_limit_local_accounting_tokens: AtomicU64::new(0),
             ai_rate_limit_unaccounted_tokens: AtomicU64::new(0),
             oauth2_introspection_cache_entries: std::array::from_fn(|_| AtomicI64::new(0)),
@@ -1076,6 +1169,7 @@ impl MetricsRegistry {
             mesh_dns_upstream_id_exhaustions: AtomicU64::new(0),
             hbone_relay_failure_counter: DashMap::new(),
             hbone_tunnel_revocation_counter: DashMap::new(),
+            hbone_inner_pool_event_counter: DashMap::new(),
             mesh_tcp_egress_connection_counter: DashMap::new(),
             mesh_outbound_registry_decisions: DashMap::new(),
             mesh_outbound_registry_stream_decisions: DashMap::new(),
@@ -1411,6 +1505,26 @@ impl MetricsRegistry {
     /// rate-limiter plugin.
     pub fn record_rate_limit_exceeded(&self) {
         self.rate_limit_exceeded.fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    /// Record one rate-limit decision taken on the per-process fallback budget
+    /// because the centralized store could not be consulted.
+    ///
+    /// Counts admissions, quota refusals, and capacity refusals alike: the
+    /// alertable fact is that enforcement was degraded for this decision, not
+    /// which way it went.
+    pub fn record_rate_limit_local_fallback_decision(&self) {
+        self.rate_limit_fallback_decisions
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    /// Record one request refused because centralized rate-limit enforcement
+    /// was unavailable under `redis_failure_policy: fail_closed`.
+    pub fn record_rate_limit_enforcement_unavailable(&self) {
+        self.rate_limit_unavailable_denials
+            .fetch_add(1, Ordering::Relaxed);
         self.maybe_invalidate_cache();
     }
 
@@ -1844,6 +1958,28 @@ impl MetricsRegistry {
             reason: reason.as_str(),
         };
         self.hbone_tunnel_revocation_counter
+            .entry(key)
+            .or_insert_with(|| TimestampedCounter::new(self.epoch))
+            .increment(self.epoch);
+
+        self.maybe_invalidate_cache();
+    }
+
+    /// Record one inner-application-connection pool event inside a fenced
+    /// HBONE tunnel (issue #5042 step 2).
+    ///
+    /// Both labels are compiled-in constants, so this family is bounded at ten
+    /// series regardless of traffic, principals, or destinations.
+    pub fn record_hbone_inner_pool_event(
+        &self,
+        protocol: HboneInnerPoolProtocol,
+        event: HboneInnerPoolEvent,
+    ) {
+        let key = HboneInnerPoolEventKey {
+            protocol: protocol.as_str(),
+            event: event.as_str(),
+        };
+        self.hbone_inner_pool_event_counter
             .entry(key)
             .or_insert_with(|| TimestampedCounter::new(self.epoch))
             .increment(self.epoch);
@@ -2795,6 +2931,14 @@ impl MetricsRegistry {
             keep
         });
 
+        self.hbone_inner_pool_event_counter.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
         self.mesh_tcp_egress_connection_counter.retain(|_, v| {
             let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
             if !keep {
@@ -3395,6 +3539,7 @@ impl MetricsRegistry {
             + self.ws_frames_counter.len() * 180
             + self.hbone_relay_failure_counter.len() * 240
             + self.hbone_tunnel_revocation_counter.len() * 200
+            + self.hbone_inner_pool_event_counter.len() * 160
             + self.mesh_tcp_egress_connection_counter.len() * 120
             + self
                 .mesh_outbound_registry_decisions
@@ -3729,6 +3874,16 @@ impl MetricsRegistry {
 
         // Rate limit exceeded
         for (name, help, value) in [
+            (
+                "ferrum_rate_limit_local_fallback_decisions_total",
+                "Rate-limit decisions taken on the per-process fallback budget.",
+                self.rate_limit_fallback_decisions.load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_rate_limit_enforcement_unavailable_total",
+                "Requests refused because centralized rate-limit enforcement was unavailable.",
+                self.rate_limit_unavailable_denials.load(Ordering::Relaxed),
+            ),
             (
                 "ferrum_ai_rate_limit_local_accounting_tokens_total",
                 "AI tokens charged locally after centralized reconciliation failed.",
@@ -4503,7 +4658,7 @@ impl MetricsRegistry {
 
         if !self.hbone_tunnel_revocation_counter.is_empty() {
             output.push_str(
-                "# HELP ferrum_mesh_hbone_tunnel_revocations_total Live HBONE tunnels revoked by the admission fence because a later policy generation would no longer admit their CONNECT.\n",
+                "# HELP ferrum_mesh_hbone_tunnel_revocations_total Live HBONE tunnels revoked by the admission fence because the current policy generation, peer credential, or enforced revocation list would no longer admit their CONNECT.\n",
             );
             output.push_str("# TYPE ferrum_mesh_hbone_tunnel_revocations_total counter\n");
             for entry in self.hbone_tunnel_revocation_counter.iter() {
@@ -4513,6 +4668,21 @@ impl MetricsRegistry {
                 output.push_str(&format!(
                     "ferrum_mesh_hbone_tunnel_revocations_total{{proxy_id=\"{}\",reason=\"{}\"{}}} {}\n",
                     proxy_id, key.reason, ns_label, count
+                ));
+            }
+        }
+
+        if !self.hbone_inner_pool_event_counter.is_empty() {
+            output.push_str(
+                "# HELP ferrum_mesh_hbone_inner_pool_events_total Inner application connections reused inside fenced HBONE tunnels, by inner wire protocol and outcome (hit, miss, eviction, discard, fenced).\n",
+            );
+            output.push_str("# TYPE ferrum_mesh_hbone_inner_pool_events_total counter\n");
+            for entry in self.hbone_inner_pool_event_counter.iter() {
+                let key = entry.key();
+                let count = entry.value().value.load(Ordering::Relaxed);
+                output.push_str(&format!(
+                    "ferrum_mesh_hbone_inner_pool_events_total{{protocol=\"{}\",event=\"{}\"{}}} {}\n",
+                    key.protocol, key.event, ns_label, count
                 ));
             }
         }

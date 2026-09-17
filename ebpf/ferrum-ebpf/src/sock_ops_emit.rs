@@ -5,7 +5,8 @@
 //! including the same ring-buffer-full → per-CPU dropped counter contract.
 
 use ferrum_ebpf_common::{
-    SockOpsRecord, SOCK_OPS_EVENT_DROP_REASON, SOCK_OPS_STATS_EVENTS_DROPPED,
+    sock_ops_stats_index_for_drop_reason, SockOpsRecord, SOCK_OPS_EVENT_DROP_REASON,
+    SOCK_OPS_STATS_EVENTS_DROPPED,
 };
 
 use crate::maps::{FERRUM_SOCK_OPS_EVENTS, FERRUM_SOCK_OPS_STATS};
@@ -25,26 +26,43 @@ pub fn emit(record: SockOpsRecord) {
         None => {
             // Ringbuf full — bump the per-CPU kernel-side dropped counter
             // so the userspace consumer can flip into the overrun regime.
-            // PerCpuArray slots are CPU-local, so a non-atomic increment
-            // is safe (no other CPU touches this slot until userspace
-            // reads). Userspace sums across CPUs when polling.
-            if let Some(slot) = FERRUM_SOCK_OPS_STATS.get_ptr_mut(SOCK_OPS_STATS_EVENTS_DROPPED) {
-                // Safety: `slot` points into a per-CPU array slot the
-                // verifier already proved valid for the current CPU.
-                unsafe {
-                    *slot = (*slot).wrapping_add(1);
-                }
-            }
+            bump_stats_slot(SOCK_OPS_STATS_EVENTS_DROPPED);
+        }
+    }
+}
+
+/// Increment one `FERRUM_SOCK_OPS_STATS` per-CPU slot.
+///
+/// PerCpuArray slots are CPU-local, so a non-atomic increment is safe (no
+/// other CPU touches this slot until userspace reads it). Userspace sums
+/// across CPUs when polling.
+#[inline(always)]
+fn bump_stats_slot(index: u32) {
+    if let Some(slot) = FERRUM_SOCK_OPS_STATS.get_ptr_mut(index) {
+        // Safety: `slot` points into a per-CPU array slot the verifier
+        // already proved valid for the current CPU.
+        unsafe {
+            *slot = (*slot).wrapping_add(1);
         }
     }
 }
 
 /// Emit a capture-bypass decision (`SOCK_OPS_EVENT_DROP_REASON`).
 ///
-/// `reason` must be one of the `SOCK_OPS_DROP_*` discriminants. Best-effort:
-/// ringbuf failure only increments the dropped counter (same as [`emit`]).
+/// `reason` must be one of the `SOCK_OPS_DROP_*` discriminants.
+///
+/// The per-reason `FERRUM_SOCK_OPS_STATS` slot is bumped FIRST and
+/// unconditionally: it is the accounting authority behind
+/// `ferrum_mesh_bpf_drops_total`. The ringbuf record that follows is the
+/// event stream and is best-effort — when the ring is full it is discarded
+/// and only [`SOCK_OPS_STATS_EVENTS_DROPPED`] moves. Counting the decision
+/// separately is what keeps a bypass classification from disappearing with
+/// the record that used to carry it.
 #[inline(always)]
 pub fn emit_drop_reason(reason: u32) {
+    if let Some(index) = sock_ops_stats_index_for_drop_reason(reason) {
+        bump_stats_slot(index);
+    }
     emit(SockOpsRecord {
         event_type: SOCK_OPS_EVENT_DROP_REASON,
         direction: 0,

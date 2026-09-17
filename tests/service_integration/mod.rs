@@ -59,6 +59,8 @@
 //!   cargo test --test service_integration clickhouse
 
 mod common;
+#[path = "../scaffolding/mod.rs"]
+mod scaffolding;
 
 mod clickhouse;
 mod consul;

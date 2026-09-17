@@ -24,7 +24,7 @@
 //!
 //! - [`HarnessMode::InProcess`]: run the gateway as a tokio task in the
 //!   test's own process via [`ferrum_edge::modes::file::serve`]. Reserves
-//!   ephemeral TCP ports via `tests/scaffolding/ports.rs`, hands the
+//!   TCP ports via `tests/scaffolding/ports.rs`, hands the
 //!   pre-bound listeners to the gateway, and skips subprocess overhead
 //!   entirely. Typical end-to-end harness setup is well under 100 ms,
 //!   versus 2-3 s for binary mode. Use this for fast iteration on
@@ -96,7 +96,7 @@
 //!   installed. `captured_combined()` returns `Err` in in-process mode —
 //!   tests that depend on log assertions must stay on binary mode.
 
-use crate::common::gateway_harness::{DbType, TestGateway, TestGatewayBuilder};
+use crate::common::gateway_harness::{DbType, GatewayChildGuard, TestGateway, TestGatewayBuilder};
 use crate::scaffolding::clients::Http1Client;
 use crate::scaffolding::port_registry::TestSocket;
 use crate::scaffolding::ports::{PortReservation, reserve_port_pair};
@@ -110,7 +110,6 @@ use reqwest::StatusCode;
 use serde_json::{Value, json};
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::process::Child;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -1131,25 +1130,40 @@ pub enum StreamListener {
 /// The HTTP and stream stages share one deadline. Child exit is checked before and
 /// after every probe, and errors identify the stage and port. Fixtures with an
 /// authenticated identity barrier must retain it before calling this helper.
+/// Spawn through `GatewayChildGuard::spawn` so failures also include both output
+/// tails and the command's configured listener ports.
 pub async fn wait_for_spawned_gateway(
-    child: &mut Child,
+    child: &mut GatewayChildGuard,
     http_port: u16,
     stream_listener: Option<StreamListener>,
 ) -> io::Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    wait_for_spawned_listener(child, StreamListener::Tcp(http_port), "HTTP", deadline).await?;
-    if let Some(listener) = stream_listener {
-        let stage = match listener {
-            StreamListener::Tcp(_) => "TCP stream",
-            StreamListener::Udp(_) => "UDP stream",
-        };
-        wait_for_spawned_listener(child, listener, stage, deadline).await?;
+    let result = async {
+        wait_for_spawned_listener(child, StreamListener::Tcp(http_port), "HTTP", deadline).await?;
+        if let Some(listener) = stream_listener {
+            let stage = match listener {
+                StreamListener::Tcp(_) => "TCP stream",
+                StreamListener::Udp(_) => "UDP stream",
+            };
+            wait_for_spawned_listener(child, listener, stage, deadline).await?;
+        }
+        Ok(())
     }
-    Ok(())
+    .await;
+    result.map_err(|error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "{error}\nrequested HTTP port: {http_port}; \
+                 stream listener: {stream_listener:?}\n{}",
+                child.startup_diagnostics()
+            ),
+        )
+    })
 }
 
 async fn wait_for_spawned_listener(
-    child: &mut Child,
+    child: &mut GatewayChildGuard,
     listener: StreamListener,
     stage: &str,
     deadline: tokio::time::Instant,
@@ -1202,7 +1216,8 @@ async fn wait_for_spawned_listener(
     }
 }
 
-fn check_gateway_child(child: &mut Child, stage: &str, port: u16) -> io::Result<()> {
+fn check_gateway_child(child: &mut GatewayChildGuard, stage: &str, port: u16) -> io::Result<()> {
+    let child = child.child_mut();
     match child.try_wait().map_err(|error| {
         io::Error::new(
             error.kind(),

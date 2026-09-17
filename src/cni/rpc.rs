@@ -146,6 +146,10 @@ impl<'de> Deserialize<'de> for CniRpcRequest {
             netns_path: Option<String>,
             #[serde(default)]
             args: std::collections::HashMap<String, String>,
+            #[serde(
+                default,
+                deserialize_with = "crate::util::json_object::deserialize_optional_object_vec"
+            )]
             valid_attachments: Option<Vec<CniValidAttachment>>,
         }
 

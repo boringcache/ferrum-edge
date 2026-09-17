@@ -371,6 +371,9 @@ impl BackendKind {
                 let port = reservation.port;
                 let backend = ScriptedTcpBackend::builder(reservation.into_listener())
                     .step(TcpStep::Reset)
+                    // Pin the scenario contract even if the builder default
+                    // changes: probes and requests must all execute Reset.
+                    .repeat_each_connection()
                     .spawn()?;
                 Ok(MatrixBackend::new_tcp(port, backend))
             }
@@ -511,6 +514,20 @@ enum BackendHandle {
 impl MatrixBackend {
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Include fixture execution evidence in a failed matrix assertion.
+    pub async fn diagnostics(&self) -> String {
+        match &self._backend {
+            BackendHandle::Tcp(backend) => format!(
+                "port={} accepted={} resets={} step_errors={:?}",
+                self.port,
+                backend.accepted_connections(),
+                backend.reset_connections(),
+                backend.step_errors().await,
+            ),
+            _ => format!("port={}", self.port),
+        }
     }
 
     pub(crate) fn new_tcp(port: u16, backend: ScriptedTcpBackend) -> Self {
@@ -785,6 +802,62 @@ macro_rules! __gateway_matrix_test_emit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn reset_matrix_repeats_after_probe_and_before_first_write() {
+        for kind in [
+            BackendKind::H1,
+            BackendKind::H2,
+            BackendKind::Grpc,
+            BackendKind::Tcp,
+        ] {
+            let backend = kind.spawn_accept_then_rst().await.expect("reset backend");
+            let BackendHandle::Tcp(tcp) = &backend._backend else {
+                panic!("reset matrix must use the TCP reset fixture");
+            };
+            let payloads: [&[u8]; 3] = [
+                b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+                b"",
+                b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            ];
+            for (index, payload) in payloads.into_iter().enumerate() {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", backend.port()))
+                        .await
+                        .expect("connect to held listener");
+                    // Deliberately put the h2c preface first. The next connection
+                    // sends nothing, forcing Reset before its first write; the
+                    // third models a request after a probe. No sleeps or retries.
+                    if !payload.is_empty()
+                        && let Err(error) = client.write_all(payload).await
+                    {
+                        assert!(matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                        ));
+                    }
+                    let mut byte = [0];
+                    match client.read(&mut byte).await {
+                        Ok(0) => {}
+                        Err(error) => assert!(matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                        )),
+                        Ok(_) => panic!("reset fixture returned data"),
+                    }
+                })
+                .await
+                .expect("every connection must close without the gateway's 5s read timeout");
+                let expected = (index + 1) as u32;
+                assert_eq!(tcp.accepted_connections(), expected);
+                // EOF alone would also pass for Once's accept-and-drop branch.
+                // Require evidence that this connection actually executed Reset.
+                assert_eq!(tcp.reset_connections(), expected);
+                tcp.assert_no_step_errors().await;
+            }
+        }
+    }
 
     #[tokio::test]
     async fn refusal_matrix_handle_keeps_connect_refused_and_port_owned() {

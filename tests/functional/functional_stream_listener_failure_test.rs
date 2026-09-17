@@ -31,7 +31,7 @@
 //! refactored to allow injecting a bad-port proxy from an in-process CP.
 
 use crate::scaffolding::port_registry::TestSocket;
-use crate::scaffolding::ports::reserve_refused_tcp_port;
+use crate::scaffolding::ports::reserve_future_tcp_port;
 
 use serde_json::json;
 use std::io::Write;
@@ -622,7 +622,7 @@ async fn functional_stream_listener_reload_remove_and_add() {
 
     for attempt in 1..=MAX_ATTEMPTS {
         let stream_port_a = ephemeral_port().await;
-        let reserved_b = reserve_refused_tcp_port().expect("reserve future stream listener port");
+        let reserved_b = reserve_future_tcp_port().expect("reserve future stream listener port");
         let stream_port_b = reserved_b.port;
         // Sanity: ensure they don't collide
         if stream_port_a == stream_port_b {

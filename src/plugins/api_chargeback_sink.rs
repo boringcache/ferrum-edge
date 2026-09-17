@@ -1158,6 +1158,7 @@ pub struct ClickHouseConfig {
     pub username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_ref: Option<String>,
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
     pub tls: ClickHouseTlsConfig,
     pub insert_query_params: HashMap<String, String>,
     /// Explicit opt-in to fire-and-forget ClickHouse async inserts
@@ -1301,10 +1302,15 @@ impl Default for SnapshotSettings {
 #[serde(default, deny_unknown_fields)]
 pub struct ApiChargebackSinkConfig {
     pub mode: SinkMode,
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
     pub clickhouse: ClickHouseConfig,
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
     pub batch: BatchSettings,
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
     pub retry: RetrySettings,
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
     pub spool: SpoolSettings,
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
     pub snapshot: SnapshotSettings,
     pub pricing_version: String,
     pub currency: String,

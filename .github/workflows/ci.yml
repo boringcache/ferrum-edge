@@ -1240,6 +1240,7 @@ jobs:
               integration::gateway_hbone_pool_tests
               integration::hbone_pool_width_tests
               integration::hbone_admission_fence_tests
+              integration::hbone_inner_pool_tests
               integration::gateway_mesh_trust_retirement_tests
               integration::gateway_listener_observability_tests
               integration::replay_authority_readiness_tests
@@ -2398,10 +2399,29 @@ jobs:
           FERRUM_REDIS_REQUIRED: "1"
           RUST_BACKTRACE: 1
 
+      - name: Run rate limiting Redis regressions
+        # Issues #5517-#5519: sustained single/multi-window admission, shared
+        # concurrent budgets, and default per-pod fallback with live recovery.
+        run: |
+          set -euo pipefail
+          archive_file="functional-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
+          cargo nextest run \
+            --archive-file "$archive_file" \
+            --workspace-remap . \
+            --run-ignored=all \
+            --no-fail-fast \
+            -j 1 \
+            test_rate_limiting_redis
+        env:
+          FERRUM_SKIP_GATEWAY_BUILD: "1"
+          FERRUM_REDIS_REQUIRED: "1"
+          RUST_BACKTRACE: 1
+
       - name: Summarize plugin hardening Redis regression
         if: always()
         run: |
           echo "## Plugin Hardening Redis Regression" >> $GITHUB_STEP_SUMMARY
+          echo "- test_rate_limiting_redis (all HTTP rate-limit Redis regressions)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- test_request_deduplication_redis_blocks_concurrent_cross_instance" >> $GITHUB_STEP_SUMMARY
           echo "- test_request_deduplication_redis_same_proxy_sibling_instances_do_not_self_conflict" >> $GITHUB_STEP_SUMMARY
@@ -6009,11 +6029,17 @@ jobs:
         # Keep all-target lint below the hosted runner's peak-memory limit on
         # cold caches. Large integration targets can otherwise overlap several
         # clippy-driver processes and starve the runner heartbeat before Cargo
-        # has a chance to emit a diagnostic. Clippy does not need DWARF, so
-        # omit debuginfo (same as the test-artifact archives) to lower per-
-        # process RSS and allow modest parallel compilation again.
+        # has a chance to emit a diagnostic (the step then dies with exit 143
+        # and no output). Clippy does not need DWARF, so omit debuginfo (same
+        # as the test-artifact archives) to lower per-process RSS. Two parallel
+        # jobs were still enough to overlap two large integration targets on a
+        # cold cache once the test tree grew (2026-09-17: four consecutive
+        # kills on one branch, none on branches with a warm `ci-lint` cache),
+        # and the cache is only saved on success, so a cold branch never
+        # warmed. One job removes the overlap entirely; the cost is wall
+        # clock, not coverage.
         env:
-          CARGO_BUILD_JOBS: 2
+          CARGO_BUILD_JOBS: 1
         run: |
           cargo clippy \
             --config profile.test.debug=0 \

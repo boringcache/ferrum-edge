@@ -504,6 +504,7 @@ pub struct SubsetTrafficPolicy {
     /// small and to share the SVID/SAN/SNI projection logic with the
     /// upstream-level apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub tls: Option<crate::modes::mesh::config::MeshTrafficPolicyTls>,
     /// Override the upstream's backend connect timeout (ms) for this subset
     /// (Istio `subsets[].trafficPolicy.connectionPool.tcp.connectTimeout`).
@@ -567,6 +568,7 @@ pub struct SubsetTrafficPolicy {
     /// subset-routed dispatch on a multi-port upstream the subset cap governs
     /// (see `max_ejection_percent_resolved_from`'s pre-selection-asymmetry note).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub passive_health_check: Option<PassiveHealthCheck>,
 }
 
@@ -648,6 +650,7 @@ pub struct UpstreamPortOverride {
     /// Per-port passive health override mapped from DestinationRule
     /// `outlierDetection`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub passive_health_check: Option<PassiveHealthCheck>,
     /// Raw per-port `outlierDetection` field overlay retained for cold-path
     /// projection onto a selected subset's inherited passive-health policy.
@@ -660,6 +663,7 @@ pub struct UpstreamPortOverride {
     /// HTTP-family / gRPC / WebSocket / HBONE dispatch consults this before
     /// the upstream-level `Upstream.locality_lb_setting`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub locality_lb_setting: Option<UpstreamLocalityLbSetting>,
     /// Per-port cap on concurrent open backend connections, mapped from
     /// DestinationRule `connectionPool.tcp.maxConnections`. Enforced by
@@ -700,6 +704,7 @@ pub struct UpstreamPortOverride {
     /// stream-family backend dispatch on the newly connected backend socket
     /// (HTTP-family dispatch is a follow-on PR).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub tcp_keepalive: Option<TcpKeepaliveCfg>,
     /// Per-port bidirectional TCP idle bound, mapped from DestinationRule
     /// `connectionPool.tcp.idleTimeout` (whole seconds). `Some(0)` disables
@@ -768,6 +773,7 @@ pub struct UpstreamPortOverride {
     /// of the backend pool key, so a distinct per-port TLS posture fragments
     /// its own pool rather than sharing a connection with another port.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub tls: Option<BackendTlsConfig>,
     /// Per-port HTTP/2 upgrade policy, mapped from DestinationRule
     /// `connectionPool.http.h2UpgradePolicy`. Projected onto the per-target
@@ -1126,6 +1132,7 @@ pub struct SubsetDefinition {
     pub name: String,
     pub labels: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub traffic_policy: Option<SubsetTrafficPolicy>,
 }
 
@@ -1314,8 +1321,10 @@ pub struct UpstreamLocalityLbSetting {
     #[serde(default = "default_true_locality_lb_enabled")]
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub distribute: Vec<LocalityDistribute>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub failover: Vec<LocalityFailover>,
     /// Ordered Istio `failoverPriority` label keys (`key`) or key/value
     /// overrides containing exactly one equals sign (`key=value`). Mutually
@@ -1614,8 +1623,10 @@ fn default_passive_window() -> u64 {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HealthCheckConfig {
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub active: Option<ActiveHealthCheck>,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub passive: Option<PassiveHealthCheck>,
 }
 
@@ -1834,6 +1845,7 @@ pub struct Upstream {
     /// Namespace this resource belongs to. Defaults to "ferrum".
     #[serde(default = "default_namespace")]
     pub namespace: String,
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub targets: Vec<UpstreamTarget>,
     #[serde(default)]
     pub algorithm: LoadBalancerAlgorithm,
@@ -1861,6 +1873,7 @@ pub struct Upstream {
     /// Used for Istio DestinationRule subset routing. Targets whose `tags`
     /// are a superset of a subset's `labels` belong to that subset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object_vec")]
     pub subsets: Option<Vec<SubsetDefinition>>,
     /// Per-destination-port traffic policy overrides populated by Istio
     /// `DestinationRule.trafficPolicy.portLevelSettings[]`. Keyed by
@@ -2190,15 +2203,19 @@ pub struct ServiceDiscoveryConfig {
     pub provider: SdProvider,
     /// DNS-SD provider configuration. Required when `provider` is `dns_sd`.
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub dns_sd: Option<DnsSdConfig>,
     /// Kubernetes provider configuration. Required when `provider` is `kubernetes`.
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub kubernetes: Option<KubernetesConfig>,
     /// Consul provider configuration. Required when `provider` is `consul`.
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub consul: Option<ConsulConfig>,
     /// Ferrum mesh provider configuration. Required when `provider` is `mesh`.
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub mesh: Option<MeshSdConfig>,
     /// Default weight assigned to discovered targets. Default: 1.
     #[serde(default = "default_weight")]
@@ -2749,6 +2766,7 @@ pub struct Proxy {
     #[serde(default)]
     pub auth_mode: AuthMode,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub plugins: Vec<PluginAssociation>,
     // Connection pooling settings (optional - override global defaults)
     // Note: pool_max_idle_per_host is intentionally global-only (FERRUM_POOL_MAX_IDLE_PER_HOST).
@@ -3228,11 +3246,15 @@ pub struct ApiSpec {
 pub struct GatewayConfig {
     /// Configuration schema version.
     pub version: String,
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub proxies: Vec<Proxy>,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub consumers: Vec<Consumer>,
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub plugin_configs: Vec<PluginConfig>,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub upstreams: Vec<Upstream>,
     #[serde(default = "Utc::now")]
     pub loaded_at: DateTime<Utc>,
@@ -3270,6 +3292,7 @@ pub struct GatewayConfig {
     /// one into `frontend_tls_*` (which stays the fallback certificate served
     /// when a ClientHello carries no usable SNI).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub frontend_tls_certificate_sources: Vec<FrontendTlsCertificateSource>,
     /// Gateway-consumable mesh trust material delivered by CPs to DPs.
     ///
@@ -3277,6 +3300,7 @@ pub struct GatewayConfig {
     /// gateway config top level so non-mesh gateway DPs can verify mesh peer
     /// certificates without loading the entire mesh model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub trust_bundles: Option<Box<crate::modes::mesh::config::TrustBundleSet>>,
     /// Namespace-keyed gateway trust-bundle resources loaded from the
     /// authoritative configuration store (issue #3727).
@@ -3310,6 +3334,7 @@ pub struct GatewayConfig {
     #[serde(skip)]
     pub quarantined_plugin_configs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub mesh: Option<Box<crate::modes::mesh::config::MeshConfig>>,
     /// `(namespace, listen_port)` pairs whose Gateway API listener terminates
     /// TLS on the frontend.
